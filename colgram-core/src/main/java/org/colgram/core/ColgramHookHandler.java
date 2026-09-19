@@ -21,16 +21,8 @@ public class ColgramHookHandler {
         ColgramStorageSandbox.init(appContext);
         ColgramDatabase.getInstance(appContext);
 
-        // Always activate high-speed anti-censorship proxy immediately
+        // Start embedded DPI bypass engine and connection doctor immediately
         ColgramProxyManager.activateBuiltinProxy(appContext);
-
-        if (ColgramConfig.isBuiltinProxyEnabled()) {
-            ColgramProxyManager.autoSelectFastestProxy(proxy -> {
-                if (proxy != null) {
-                    ColgramProxyManager.applyProxy(appContext, proxy);
-                }
-            });
-        }
     }
 
     /**
