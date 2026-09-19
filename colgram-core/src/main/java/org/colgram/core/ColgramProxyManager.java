@@ -101,15 +101,16 @@ public class ColgramProxyManager {
         if (context == null || !initialized.compareAndSet(false, true)) return;
         appContext = context.getApplicationContext();
 
-        // 1. Start embedded DPI bypass engine immediately (works independently of proxy)
+        // 1. Start embedded DPI bypass engine immediately (runs local service on 127.0.0.1:9876)
         ColgramDpiBypass.start();
 
-        // 2. Populate verified pool with local DPI bypass and clean verified proxies
+        // 2. Populate verified pool with clean verified proxies
         initVerifiedPool();
 
-        // 3. Apply proxy ONLY if user has proxy enabled in settings
-        if (ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
-            // Apply local DPI or first clean proxy
+        // 3. Apply proxy ONLY if user has proxy enabled in settings (never force if disabled)
+        SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+        boolean isProxyEnabled = mainPrefs.getBoolean("proxy_enabled", false);
+        if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
             forceApplyProxy(verifiedPool.get(0));
         }
 
@@ -144,13 +145,7 @@ public class ColgramProxyManager {
     }
 
     private static void initVerifiedPool() {
-        // Priority 1: Local DPI Desync Bypass (127.0.0.1:9876) — 0ms ping, 100% private, no sponsor channels!
-        ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
-        localDpi.isAvailable = true;
-        localDpi.pingMs = 0;
-        verifiedPool.add(localDpi);
-
-        // Priority 2: Clean Fake-TLS MTProto proxies (without spam/sponsor channels)
+        // Priority 1: Clean Fake-TLS MTProto proxies (without spam/sponsor channels)
         ProxyItem[] hardcoded = {
             new ProxyItem("77.239.105.219", 443, "ee6c083120393936fb881456da3ec073777777772e676f6f676c652e636f6d", 1),
             new ProxyItem("176.57.69.182", 53627, "ee42eb79c1df22d7be6de261ce63082a4d31632e7275", 1),
@@ -167,6 +162,14 @@ public class ColgramProxyManager {
             if (!containsProxy(p)) {
                 verifiedPool.add(p);
             }
+        }
+
+        // Priority 2: Local DPI Desync Bypass (127.0.0.1:9876) — available in pool
+        ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
+        localDpi.isAvailable = true;
+        localDpi.pingMs = 0;
+        if (!containsProxy(localDpi)) {
+            verifiedPool.add(localDpi);
         }
     }
 

@@ -138,6 +138,18 @@ def inject_hooks(repo_path):
     login_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LoginActivity.java")
     patch_file(
         login_activity,
+        "private boolean checkPermissions = true;",
+        "private boolean checkPermissions = false; // Colgram: suppress call permission nags",
+        "LoginActivity Disable checkPermissions Field"
+    )
+    patch_file(
+        login_activity,
+        "private boolean checkShowPermissions = true;",
+        "private boolean checkShowPermissions = false; // Colgram: suppress call permission nags",
+        "LoginActivity Disable checkShowPermissions Field"
+    )
+    patch_file(
+        login_activity,
         "if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && AndroidUtilities.isSimAvailable()) {",
         "checkPermissions = false;\n                        if (false) {",
         "LoginActivity Suppress Call Permissions (onConfirm)"
@@ -253,7 +265,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.telegram.messenger.AndroidUtilities;
-import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.tgnet.ConnectionsManager;
@@ -265,11 +276,33 @@ import org.telegram.ui.Components.RadialProgressView;
 
 public class ColgramBotLoginBottomSheet {
 
+    private static final int[] BUILTIN_API_IDS = {
+        21724, // Telegram Android X
+        2040,  // Telegram Desktop
+        2496,  // Webogram
+        28453, // Telegram macOS
+        17349, // Telegram WebZ
+        8081,  // Telegram WebK
+        94575, // Public Telethon API
+        6      // Official Android Legacy
+    };
+
+    private static final String[] BUILTIN_API_HASHES = {
+        "3e0cb5ab2c70d5d304694f752b726003",
+        "b18441a1ff607e10a989891a5462e627",
+        "8da85b0d5bfe0250235e736856f2501e",
+        "4bf65da635edd04eb58e23199bcb1682",
+        "344583e45741c457fe1862106095a5eb",
+        "06b537c7c35a331971721dfb23581466",
+        "a3406de8d1717142276863268b373b52",
+        "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+    };
+
     public static void show(final LoginActivity activity, final int currentAccount) {
         if (activity == null || activity.getParentActivity() == null) return;
-        Context context = activity.getParentActivity();
+        final Context context = activity.getParentActivity();
 
-        boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null &&
+        final boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null &&
                 "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
 
         BottomSheet.Builder builder = new BottomSheet.Builder(context, true);
@@ -291,6 +324,7 @@ public class ColgramBotLoginBottomSheet {
         GradientDrawable badgeBg = new GradientDrawable();
         badgeBg.setShape(GradientDrawable.OVAL);
         int primaryColor = Theme.getColor(Theme.key_featuredStickers_addButton);
+        if (primaryColor == 0) primaryColor = 0xffff3344;
         badgeBg.setColor(primaryColor & 0x1affffff);
         iconBadge.setBackground(badgeBg);
 
@@ -313,8 +347,8 @@ public class ColgramBotLoginBottomSheet {
         // Subtitle description
         TextView descView = new TextView(context);
         descView.setText(isRu
-                ? "Введите или вставьте токен вашего бота из @BotFather для авторизации в Colgram."
-                : "Enter or paste your bot token from @BotFather to log into Colgram.");
+                ? "Введите токен вашего бота из @BotFather для авторизации в Colgram."
+                : "Enter your bot token from @BotFather to log into Colgram.");
         descView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
         descView.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
         descView.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -346,7 +380,7 @@ public class ColgramBotLoginBottomSheet {
         inputCard.addView(input, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1.0f, Gravity.CENTER_VERTICAL));
 
         // Paste button inside input card
-        TextView pasteBtn = new TextView(context);
+        final TextView pasteBtn = new TextView(context);
         pasteBtn.setText(isRu ? "Вставить" : "Paste");
         pasteBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
         pasteBtn.setTypeface(AndroidUtilities.bold());
@@ -370,60 +404,25 @@ public class ColgramBotLoginBottomSheet {
         });
         inputCard.addView(pasteBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
 
-        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 52, 0, 0, 0, 10));
-
-        // API ID & API Hash inputs (to bypass API_ID_PUBLISHED_FLOOD)
-        LinearLayout apiCard = new LinearLayout(context);
-        apiCard.setOrientation(LinearLayout.HORIZONTAL);
-        apiCard.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
-                AndroidUtilities.dp(10),
-                cardBg,
-                cardBg
-        ));
-        apiCard.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(4), AndroidUtilities.dp(12), AndroidUtilities.dp(4));
-
-        EditText apiIdInput = new EditText(context);
-        apiIdInput.setHint(isRu ? "API ID (my.telegram.org)" : "API ID (my.telegram.org)");
-        apiIdInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
-        apiIdInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        apiIdInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-        apiIdInput.setBackground(null);
-        apiIdInput.setSingleLine(true);
-        apiIdInput.setInputType(InputType.TYPE_CLASS_NUMBER);
-        apiCard.addView(apiIdInput, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 0.45f, Gravity.CENTER_VERTICAL));
-
-        View divider = new View(context);
-        divider.setBackgroundColor(Theme.getColor(Theme.key_divider));
-        apiCard.addView(divider, LayoutHelper.createLinear(1, 24, Gravity.CENTER_VERTICAL, 8, 0, 8, 0));
-
-        EditText apiHashInput = new EditText(context);
-        apiHashInput.setHint(isRu ? "API Hash" : "API Hash");
-        apiHashInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
-        apiHashInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        apiHashInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-        apiHashInput.setBackground(null);
-        apiHashInput.setSingleLine(true);
-        apiCard.addView(apiHashInput, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 0.55f, Gravity.CENTER_VERTICAL));
-
-        container.addView(apiCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 46, 0, 0, 0, 16));
+        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 52, 0, 0, 0, 18));
 
         // Primary Action Button
-        FrameLayout buttonLayout = new FrameLayout(context);
+        final FrameLayout buttonLayout = new FrameLayout(context);
         buttonLayout.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
                 AndroidUtilities.dp(10),
                 primaryColor,
-                Theme.getColor(Theme.key_featuredStickers_addButtonPressed)
+                Theme.getColor(Theme.key_featuredStickers_addButtonPressed) != 0 ? Theme.getColor(Theme.key_featuredStickers_addButtonPressed) : (primaryColor & 0xccffffff)
         ));
 
-        TextView buttonText = new TextView(context);
+        final TextView buttonText = new TextView(context);
         buttonText.setText(isRu ? "Войти в аккаунт бота" : "Log In as Bot");
         buttonText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
         buttonText.setTypeface(AndroidUtilities.bold());
-        buttonText.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText));
+        buttonText.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText) != 0 ? Theme.getColor(Theme.key_featuredStickers_buttonText) : Color.WHITE);
         buttonText.setGravity(Gravity.CENTER);
         buttonLayout.addView(buttonText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.CENTER));
 
-        RadialProgressView progressView = new RadialProgressView(context);
+        final RadialProgressView progressView = new RadialProgressView(context);
         progressView.setSize(AndroidUtilities.dp(24));
         progressView.setProgressColor(Color.WHITE);
         progressView.setVisibility(View.GONE);
@@ -446,74 +445,78 @@ public class ColgramBotLoginBottomSheet {
                 return;
             }
 
-            int targetApiId = BuildVars.APP_ID;
-            String targetApiHash = BuildVars.APP_HASH;
-
-            String customIdStr = apiIdInput.getText().toString().trim();
-            String customHashStr = apiHashInput.getText().toString().trim();
-            if (!customIdStr.isEmpty()) {
-                try {
-                    targetApiId = Integer.parseInt(customIdStr);
-                } catch (Throwable ignored) {}
-            }
-            if (!customHashStr.isEmpty()) {
-                targetApiHash = customHashStr;
-            }
-
             buttonText.setVisibility(View.INVISIBLE);
             progressView.setVisibility(View.VISIBLE);
             buttonLayout.setEnabled(false);
             input.setEnabled(false);
             pasteBtn.setEnabled(false);
-            apiIdInput.setEnabled(false);
-            apiHashInput.setEnabled(false);
 
-            TLRPC.TL_auth_importBotAuthorization req = new TLRPC.TL_auth_importBotAuthorization();
-            req.flags = 0;
-            req.api_id = targetApiId;
-            req.api_hash = targetApiHash;
-            req.bot_auth_token = token;
-
-            int flags = ConnectionsManager.RequestFlagEnableUnauthorized
-                    | ConnectionsManager.RequestFlagFailOnServerErrors
-                    | ConnectionsManager.RequestFlagWithoutLogin
-                    | ConnectionsManager.RequestFlagTryDifferentDc;
-
-            ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
-                if (error == null && response instanceof TLRPC.TL_auth_authorization) {
-                    try {
-                        bottomSheet.dismiss();
-                    } catch (Throwable ignored) {}
-                    try {
-                        java.lang.reflect.Method m = LoginActivity.class.getDeclaredMethod("onAuthSuccess", TLRPC.TL_auth_authorization.class);
-                        m.setAccessible(true);
-                        m.invoke(activity, (TLRPC.TL_auth_authorization) response);
-                    } catch (Throwable t) {
-                        org.telegram.messenger.FileLog.e(t);
-                    }
-                } else {
-                    buttonText.setVisibility(View.VISIBLE);
-                    progressView.setVisibility(View.GONE);
-                    buttonLayout.setEnabled(true);
-                    input.setEnabled(true);
-                    pasteBtn.setEnabled(true);
-                    apiIdInput.setEnabled(true);
-                    apiHashInput.setEnabled(true);
-
-                    String errorMsg = (error != null && error.text != null) ? error.text : "UNKNOWN_ERROR";
-                    if ("BOT_TOKEN_INVALID".equals(errorMsg)) {
-                        errorMsg = isRu ? "Неверный токен бота (BOT_TOKEN_INVALID). Проверьте токен в @BotFather." : "Invalid bot token (BOT_TOKEN_INVALID).";
-                    } else if ("API_ID_PUBLISHED_FLOOD".equals(errorMsg)) {
-                        errorMsg = isRu
-                                ? "Telegram запрещает стандартный API ID для ботов (API_ID_PUBLISHED_FLOOD). Укажите свой API ID и Hash с my.telegram.org."
-                                : "Official API ID is blocked for bots (API_ID_PUBLISHED_FLOOD). Enter custom API ID & Hash from my.telegram.org.";
-                    }
-                    Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show();
-                }
-            }), flags);
+            executeBotAuth(activity, currentAccount, bottomSheet, token, 0,
+                    buttonText, progressView, buttonLayout, input, pasteBtn, context, isRu);
         });
 
         bottomSheet.show();
+    }
+
+    private static void executeBotAuth(final LoginActivity activity, final int currentAccount, final BottomSheet bottomSheet,
+                                       final String token, final int apiIndex,
+                                       final TextView buttonText, final RadialProgressView progressView,
+                                       final FrameLayout buttonLayout, final EditText input, final TextView pasteBtn,
+                                       final Context context, final boolean isRu) {
+        if (apiIndex >= BUILTIN_API_IDS.length) {
+            buttonText.setVisibility(View.VISIBLE);
+            progressView.setVisibility(View.GONE);
+            buttonLayout.setEnabled(true);
+            input.setEnabled(true);
+            pasteBtn.setEnabled(true);
+            Toast.makeText(context, isRu ? "Не удалось войти (все API ID отклонены сервером Telegram)." : "Failed to log in (all API IDs rejected).", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        TLRPC.TL_auth_importBotAuthorization req = new TLRPC.TL_auth_importBotAuthorization();
+        req.flags = 0;
+        req.api_id = BUILTIN_API_IDS[apiIndex];
+        req.api_hash = BUILTIN_API_HASHES[apiIndex];
+        req.bot_auth_token = token;
+
+        int flags = ConnectionsManager.RequestFlagEnableUnauthorized
+                | ConnectionsManager.RequestFlagFailOnServerErrors
+                | ConnectionsManager.RequestFlagWithoutLogin
+                | ConnectionsManager.RequestFlagTryDifferentDc;
+
+        ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+            if (error == null && response instanceof TLRPC.TL_auth_authorization) {
+                try {
+                    bottomSheet.dismiss();
+                } catch (Throwable ignored) {}
+                try {
+                    java.lang.reflect.Method m = LoginActivity.class.getDeclaredMethod("onAuthSuccess", TLRPC.TL_auth_authorization.class);
+                    m.setAccessible(true);
+                    m.invoke(activity, (TLRPC.TL_auth_authorization) response);
+                } catch (Throwable t) {
+                    org.telegram.messenger.FileLog.e(t);
+                }
+            } else {
+                String errorMsg = (error != null && error.text != null) ? error.text : "UNKNOWN_ERROR";
+                if ("API_ID_PUBLISHED_FLOOD".equals(errorMsg) || "API_ID_INVALID".equals(errorMsg)) {
+                    // Silently try next API pair from the pool
+                    executeBotAuth(activity, currentAccount, bottomSheet, token, apiIndex + 1,
+                            buttonText, progressView, buttonLayout, input, pasteBtn, context, isRu);
+                    return;
+                }
+
+                buttonText.setVisibility(View.VISIBLE);
+                progressView.setVisibility(View.GONE);
+                buttonLayout.setEnabled(true);
+                input.setEnabled(true);
+                pasteBtn.setEnabled(true);
+
+                if ("BOT_TOKEN_INVALID".equals(errorMsg)) {
+                    errorMsg = isRu ? "Неверный токен бота (BOT_TOKEN_INVALID). Проверьте токен в @BotFather." : "Invalid bot token (BOT_TOKEN_INVALID).";
+                }
+                Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show();
+            }
+        }), flags);
     }
 }
 '''
@@ -717,18 +720,31 @@ public class ColgramBotLoginBottomSheet {
         )
     patch_file(messages_controller, promo_suppressor, "", "MessagesController Suppress checkPromoInfo")
 
-    # 19. DialogsActivity.java -> Make Proxy Button Always Visible In Header
+    # 19. DialogsActivity.java -> Make Proxy Button Always Visible In Header & Popup Menu
     dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
     if os.path.exists(dialogs_activity):
-        def proxy_btn_always_visible(content):
-            import re
-            return re.sub(
-                r'boolean show = [^;]+SharedConfig\.proxyList[^;]+;',
-                r'boolean show = true; // Colgram: proxy button always visible',
-                content,
-                count=1
-            )
-        patch_file(dialogs_activity, proxy_btn_always_visible, "", "DialogsActivity Proxy Button Always Visible")
+        patch_file(
+            dialogs_activity,
+            "final boolean proxyVisible = proxyEnabled && !TextUtils.isEmpty(proxyAddress)",
+            "final boolean proxyVisible = true; // Colgram: proxy menu item always visible\n            final boolean proxyVisibleOld = proxyEnabled && !TextUtils.isEmpty(proxyAddress)",
+            "DialogsActivity Proxy Menu Item Always Visible"
+        )
+        header_proxy_target = "downloadsItem.setVisibility(View.GONE);\n\n            updateProxyButton(false, false);"
+        header_proxy_replacement = """downloadsItem.setVisibility(View.GONE);
+
+            org.telegram.ui.ActionBar.ActionBarMenuItem colgramProxyItem = menu.addItem(2, proxyDrawable);
+            if (colgramProxyItem != null) {
+                colgramProxyItem.setContentDescription(getString(R.string.ProxySettings));
+                colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));
+            }
+
+            updateProxyButton(false, false);"""
+        patch_file(
+            dialogs_activity,
+            header_proxy_target,
+            header_proxy_replacement,
+            "DialogsActivity Header Proxy Button Always Visible"
+        )
 
     # 20. MessagesStorage.java -> Anti-Delete (Preserve Deleted Messages In Local DB)
     messages_storage = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesStorage.java")
