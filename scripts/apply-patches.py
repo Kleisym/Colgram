@@ -743,7 +743,7 @@ public class ColgramBotLoginBottomSheet {
             }
 
             updateProxyButton(false, false);"""
-            if "colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy" in content:
+            if "org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity())" in content:
                 return content
             if "colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));" in content:
                 return content.replace(
@@ -754,9 +754,20 @@ public class ColgramBotLoginBottomSheet {
                     return true;
                 });"""
                 )
-            target = "downloadsItem.setVisibility(View.GONE);\\n\\n            updateProxyButton(false, false);"
+            target = "downloadsItem.setVisibility(View.GONE);"
+            inject = """downloadsItem.setVisibility(View.GONE);
+
+            org.telegram.ui.ActionBar.ActionBarMenuItem colgramProxyItem = menu.addItem(2, proxyDrawable);
+            if (colgramProxyItem != null) {
+                colgramProxyItem.setContentDescription(getString(R.string.ProxySettings));
+                colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity()));
+                colgramProxyItem.setOnLongClickListener(v -> {
+                    presentFragment(new ProxyListActivity());
+                    return true;
+                });
+            }"""
             if target in content:
-                return content.replace(target, target_replacement, 1)
+                return content.replace(target, inject, 1)
             return content
         patch_file(
             dialogs_activity,
@@ -877,7 +888,8 @@ public class ColgramBotLoginBottomSheet {
         patch_file(
             dialogs_activity,
             "private void askForPermissons(boolean alert) {",
-            "private void askForPermissons(boolean alert) {\\n        if (true) return;",
+            """private void askForPermissons(boolean alert) {
+        if (true) return;""",
             "DialogsActivity Suppress askForPermissons"
         )
 
@@ -886,7 +898,8 @@ public class ColgramBotLoginBottomSheet {
         patch_file(
             contacts_activity,
             "private void askForPermissons(boolean alert) {",
-            "private void askForPermissons(boolean alert) {\\n        if (true) return;",
+            """private void askForPermissons(boolean alert) {
+        if (true) return;""",
             "ContactsActivity Suppress askForPermissons"
         )
 
@@ -961,21 +974,21 @@ public class ColgramBotLoginBottomSheet {
 
     # 29. ChatActivity.java -> Retain Deleted Messages in UI (Anti-Delete AyuGram Style)
     if os.path.exists(chat_activity):
-        anti_delete_ui_target = "processDeletedMessages(markAsDeletedMessages, channelId, sent, !movedToScheduled);"
-        anti_delete_ui_replacement = """if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled()) {
-                for (int msg_id : markAsDeletedMessages) {
-                    MessageObject msg = messagesDict[0].get(msg_id);
-                    if (msg != null) {
-                        msg.deleted = true;
-                        org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialog_id, msg_id);
-                    }
+        anti_delete_ui_target = "private void processDeletedMessages(ArrayList<Integer> markAsDeletedMessages, long channelId, boolean sent, boolean thanos) {"
+        anti_delete_ui_replacement = """private void processDeletedMessages(ArrayList<Integer> markAsDeletedMessages, long channelId, boolean sent, boolean thanos) {
+        if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled() && markAsDeletedMessages != null) {
+            for (int msg_id : markAsDeletedMessages) {
+                MessageObject msg = (messagesDict != null && messagesDict.length > 0 && messagesDict[0] != null) ? messagesDict[0].get(msg_id) : null;
+                if (msg != null) {
+                    msg.deleted = true;
+                    org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialog_id, msg_id);
                 }
-                if (chatAdapter != null) {
-                    chatAdapter.notifyDataSetChanged(false);
-                }
-                return;
             }
-            processDeletedMessages(markAsDeletedMessages, channelId, sent, !movedToScheduled);"""
+            if (chatAdapter != null) {
+                chatAdapter.notifyDataSetChanged(false);
+            }
+            return;
+        }"""
         patch_file(
             chat_activity,
             anti_delete_ui_target,
