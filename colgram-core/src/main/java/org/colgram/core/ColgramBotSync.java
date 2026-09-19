@@ -3,14 +3,21 @@ package org.colgram.core;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.SharedPreferences;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.View;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONArray;
@@ -231,7 +238,6 @@ public class ColgramBotSync {
                     // Create TLRPC.TL_message
                     Object message = messageClass.getConstructor().newInstance();
                     messageClass.getField("id").setInt(message, msgId);
-                    messageClass.getField("dialog_id").setLong(message, chatId);
                     messageClass.getField("date").setInt(message, date);
                     messageClass.getField("message").set(message, text);
 
@@ -332,15 +338,124 @@ public class ColgramBotSync {
         });
     }
 
+    private static int getThemeColor(Class<?> themeClass, String keyName, int defaultColor) {
+        if (themeClass == null) return defaultColor;
+        try {
+            Field keyField = themeClass.getField(keyName);
+            int key = keyField.getInt(null);
+            Method getColorMethod = themeClass.getMethod("getColor", int.class);
+            return (int) getColorMethod.invoke(null, key);
+        } catch (Throwable t) {
+            return defaultColor;
+        }
+    }
+
     /**
      * Opens a dialog allowing the bot to initiate a conversation with any user by username or ID.
      */
     public static void showStartChatDialog(final Activity activity, final int account) {
-        if (activity == null) return;
+        showStartChatDialog(activity, account, null);
+    }
 
+    public static void showStartChatDialog(final Activity activity, final int account, final Object fragmentObj) {
+        if (activity == null || activity.isFinishing()) return;
+
+        boolean isRu = false;
+        try {
+            Class<?> lcClass = Class.forName("org.telegram.messenger.LocaleController");
+            Object lc = lcClass.getMethod("getInstance").invoke(null);
+            Field currField = lcClass.getDeclaredField("currentLocaleInfo");
+            currField.setAccessible(true);
+            Object li = currField.get(lc);
+            if (li != null) {
+                String sn = (String) li.getClass().getField("shortName").get(li);
+                isRu = "ru".equalsIgnoreCase(sn);
+            }
+        } catch (Throwable ignored) {}
+
+        final boolean isRussian = isRu;
+
+        try {
+            Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
+            Class<?> themeClass = Class.forName("org.telegram.ui.ActionBar.Theme");
+            Class<?> alertBuilderClass = Class.forName("org.telegram.ui.ActionBar.AlertDialog$Builder");
+
+            Method dpMethod = auClass.getMethod("dp", float.class);
+            int dp8 = (int) dpMethod.invoke(null, 8f);
+            int dp12 = (int) dpMethod.invoke(null, 12f);
+            int dp16 = (int) dpMethod.invoke(null, 16f);
+            int dp20 = (int) dpMethod.invoke(null, 20f);
+
+            int textColor = getThemeColor(themeClass, "key_dialogTextBlack", Color.parseColor("#222222"));
+            int grayColor = getThemeColor(themeClass, "key_dialogTextGray", Color.parseColor("#888888"));
+            int hintColor = getThemeColor(themeClass, "key_dialogTextHint", Color.parseColor("#AAAAAA"));
+            int accentColor = getThemeColor(themeClass, "key_featuredStickers_addButton", Color.parseColor("#2AABEE"));
+            int fieldBgColor = getThemeColor(themeClass, "key_dialogInputField", Color.parseColor("#0F000000"));
+
+            LinearLayout container = new LinearLayout(activity);
+            container.setOrientation(LinearLayout.VERTICAL);
+            container.setPadding(dp20, dp8, dp20, dp8);
+
+            TextView descView = new TextView(activity);
+            descView.setText(isRussian
+                    ? "Введите @username или числовой ID пользователя, чтобы открыть чат от имени бота:"
+                    : "Enter @username or user ID to start a chat as bot:");
+            descView.setTextColor(grayColor);
+            descView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+            descView.setPadding(0, 0, 0, dp16);
+            container.addView(descView);
+
+            LinearLayout inputCard = new LinearLayout(activity);
+            inputCard.setOrientation(LinearLayout.HORIZONTAL);
+            inputCard.setGravity(Gravity.CENTER_VERTICAL);
+            inputCard.setPadding(dp12, dp8, dp12, dp8);
+
+            GradientDrawable cardBg = new GradientDrawable();
+            cardBg.setCornerRadius(dp8);
+            cardBg.setColor(fieldBgColor != 0 ? fieldBgColor : Color.parseColor("#15000000"));
+            cardBg.setStroke((int) dpMethod.invoke(null, 1.0f), accentColor & 0x4DFFFFFF);
+            inputCard.setBackground(cardBg);
+
+            final EditText input = new EditText(activity);
+            input.setHint("@username или 123456789");
+            input.setHintTextColor(hintColor);
+            input.setTextColor(textColor);
+            input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+            input.setBackground(null);
+            input.setSingleLine(true);
+            input.setInputType(InputType.TYPE_CLASS_TEXT);
+            LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            input.setLayoutParams(inputParams);
+            inputCard.addView(input);
+
+            container.addView(inputCard);
+
+            Object builder = alertBuilderClass.getConstructor(Context.class).newInstance(activity);
+            alertBuilderClass.getMethod("setTitle", CharSequence.class).invoke(builder, isRussian ? "✉️ Написать пользователю" : "✉️ Message User");
+            alertBuilderClass.getMethod("setView", View.class).invoke(builder, container);
+
+            alertBuilderClass.getMethod("setPositiveButton", CharSequence.class, DialogInterface.OnClickListener.class)
+                    .invoke(builder, isRussian ? "Открыть чат" : "Open Chat", (DialogInterface.OnClickListener) (dialog, which) -> {
+                        String query = input.getText().toString().trim();
+                        if (query.isEmpty()) return;
+                        openChatAsBot(activity, account, fragmentObj, query);
+                    });
+
+            alertBuilderClass.getMethod("setNegativeButton", CharSequence.class, DialogInterface.OnClickListener.class)
+                    .invoke(builder, isRussian ? "Отмена" : "Cancel", null);
+
+            alertBuilderClass.getMethod("show").invoke(builder);
+
+        } catch (Throwable t) {
+            Log.e(TAG, "showStartChatDialog fallback error", t);
+            fallbackShowStartChatDialog(activity, account, fragmentObj, isRussian);
+        }
+    }
+
+    private static void fallbackShowStartChatDialog(final Activity activity, final int account, final Object fragmentObj, final boolean isRussian) {
         AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        builder.setTitle("✉️ Написать от имени бота");
-        builder.setMessage("Введите @username или числовой User ID пользователя:");
+        builder.setTitle(isRussian ? "✉️ Написать пользователю" : "✉️ Message User");
+        builder.setMessage(isRussian ? "Введите @username или числовой User ID пользователя:" : "Enter @username or numerical User ID:");
 
         LinearLayout layout = new LinearLayout(activity);
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -353,56 +468,55 @@ public class ColgramBotSync {
         layout.addView(input);
 
         builder.setView(layout);
-        builder.setPositiveButton("Открыть чат", (dialog, which) -> {
+        builder.setPositiveButton(isRussian ? "Открыть чат" : "Open Chat", (dialog, which) -> {
             String query = input.getText().toString().trim();
             if (query.isEmpty()) return;
-
-            try {
-                if (query.startsWith("@")) query = query.substring(1);
-
-                if (query.matches("^\\d+$")) {
-                    long userId = Long.parseLong(query);
-                    openChatWithUserId(activity, userId);
-                } else {
-                    // Try open by username via MessagesController
-                    Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-                    Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
-
-                    Class<?> launchActivityClass = Class.forName("org.telegram.ui.LaunchActivity");
-                    if (launchActivityClass.isInstance(activity)) {
-                        Method runWhenDone = mcClass.getMethod("openByUserName", String.class, Class.forName("org.telegram.ui.ActionBar.BaseFragment"), int.class);
-                        runWhenDone.invoke(mc, query, null, 1);
-                    } else {
-                        Toast.makeText(activity, "Поиск пользователя: @" + query, Toast.LENGTH_SHORT).show();
-                    }
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "Error starting chat", t);
-                Toast.makeText(activity, "Не удалось открыть чат: " + t.getMessage(), Toast.LENGTH_SHORT).show();
-            }
+            openChatAsBot(activity, account, fragmentObj, query);
         });
-        builder.setNegativeButton("Отмена", null);
+        builder.setNegativeButton(isRussian ? "Отмена" : "Cancel", null);
         builder.show();
     }
 
-    private static void openChatWithUserId(Activity activity, long userId) {
+    private static void openChatAsBot(Activity activity, int account, Object fragmentObj, String query) {
         try {
-            Class<?> chatActivityClass = Class.forName("org.telegram.ui.ChatActivity");
+            if (query.startsWith("@")) query = query.substring(1);
+
             Class<?> baseFragmentClass = Class.forName("org.telegram.ui.ActionBar.BaseFragment");
             Class<?> launchActivityClass = Class.forName("org.telegram.ui.LaunchActivity");
+            Class<?> chatActivityClass = Class.forName("org.telegram.ui.ChatActivity");
 
-            Bundle args = new Bundle();
-            args.putLong("user_id", userId);
+            Object targetFragment = fragmentObj;
+            if (targetFragment == null) {
+                try {
+                    Method getSafeLast = launchActivityClass.getMethod("getSafeLastFragment");
+                    targetFragment = getSafeLast.invoke(null);
+                } catch (Throwable ignored) {}
+            }
 
-            Constructor<?> ctor = chatActivityClass.getConstructor(Bundle.class);
-            Object fragment = ctor.newInstance(args);
+            if (query.matches("^\\d+$")) {
+                long userId = Long.parseLong(query);
+                Bundle args = new Bundle();
+                args.putLong("user_id", userId);
+                Constructor<?> ctor = chatActivityClass.getConstructor(Bundle.class);
+                Object chatFrag = ctor.newInstance(args);
 
-            if (launchActivityClass.isInstance(activity)) {
-                Method presentFragment = launchActivityClass.getMethod("presentFragment", baseFragmentClass);
-                presentFragment.invoke(activity, fragment);
+                if (targetFragment != null) {
+                    Method presentFragment = baseFragmentClass.getMethod("presentFragment", baseFragmentClass);
+                    presentFragment.invoke(targetFragment, chatFrag);
+                } else if (launchActivityClass.isInstance(activity)) {
+                    Method presentFragment = launchActivityClass.getMethod("presentFragment", baseFragmentClass);
+                    presentFragment.invoke(activity, chatFrag);
+                }
+            } else {
+                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+
+                Method openByUserName = mcClass.getMethod("openByUserName", String.class, baseFragmentClass, int.class);
+                openByUserName.invoke(mc, query, targetFragment, 1);
             }
         } catch (Throwable t) {
-            Log.e(TAG, "openChatWithUserId error", t);
+            Log.e(TAG, "openChatAsBot error", t);
+            Toast.makeText(activity, "Ошибка открытия чата: " + t.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
 }

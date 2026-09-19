@@ -244,12 +244,18 @@ def inject_hooks(repo_path):
         "TLRPC Inject TL_auth_importBotAuthorization"
     )
 
-    # 10. ColgramBotLoginBottomSheet.java -> Deploy Telegram-Native BottomSheet for Bot Login
+    # 10. ColgramBotLoginBottomSheet.java & ColgramQRLoginBottomSheet.java -> Deploy Telegram-Native BottomSheets
     bot_sheet_template = os.path.join(os.path.dirname(__file__), "templates", "ColgramBotLoginBottomSheet.java")
     bot_sheet_dest = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ColgramBotLoginBottomSheet.java")
     if os.path.exists(bot_sheet_template):
         shutil.copyfile(bot_sheet_template, bot_sheet_dest)
         print(" [+] Deployed Telegram-Native ColgramBotLoginBottomSheet.java")
+
+    qr_sheet_template = os.path.join(os.path.dirname(__file__), "templates", "ColgramQRLoginBottomSheet.java")
+    qr_sheet_dest = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ColgramQRLoginBottomSheet.java")
+    if os.path.exists(qr_sheet_template):
+        shutil.copyfile(qr_sheet_template, qr_sheet_dest)
+        print(" [+] Deployed Telegram-Native ColgramQRLoginBottomSheet.java")
 
     # 11. LoginActivity.java -> Make onAuthSuccess public
     patch_file(
@@ -259,8 +265,60 @@ def inject_hooks(repo_path):
         "LoginActivity Make onAuthSuccess Public"
     )
 
-    # 12. LoginActivity.java -> Inject Bot Token Login button in PhoneView (with 76dp margin to avoid FAB collision)
-    bot_login_btn = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
+    # 12. LoginActivity.java -> Inject QR Login & Bot Token Login buttons in PhoneView (with 76dp margin to avoid FAB collision)
+    alt_login_btn = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
+            LinearLayout altLoginButtonsLayout = new LinearLayout(context);
+            altLoginButtonsLayout.setOrientation(LinearLayout.VERTICAL);
+            boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            int accentBtnColor = Theme.getColor(Theme.key_featuredStickers_addButton);
+            if (accentBtnColor == 0) accentBtnColor = 0xFF2AABEE;
+
+            // 1. QR Login Button
+            TextView qrLoginBtn = new TextView(context);
+            qrLoginBtn.setText(isRuLang ? "Быстрый вход по QR-коду" : "Quick log in using QR code");
+            qrLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+            qrLoginBtn.setTypeface(AndroidUtilities.bold());
+            qrLoginBtn.setTextColor(accentBtnColor);
+            qrLoginBtn.setGravity(Gravity.CENTER);
+            try {
+                android.graphics.drawable.Drawable qrIcon = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.msg_qrcode).mutate();
+                qrIcon.setColorFilter(new android.graphics.PorterDuffColorFilter(accentBtnColor, android.graphics.PorterDuff.Mode.SRC_IN));
+                qrLoginBtn.setCompoundDrawablesWithIntrinsicBounds(qrIcon, null, null, null);
+                qrLoginBtn.setCompoundDrawablePadding(dp(8));
+            } catch (Throwable ignored) {}
+            qrLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
+            qrLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(8), accentBtnColor & 0x14ffffff, accentBtnColor & 0x33ffffff));
+            qrLoginBtn.setOnClickListener(v -> {
+                org.telegram.ui.ColgramQRLoginBottomSheet.show(LoginActivity.this, currentAccount);
+            });
+            altLoginButtonsLayout.addView(qrLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44, Gravity.CENTER_HORIZONTAL, 0, 4, 0, 8));
+
+            // 2. Bot Token Login Button
+            TextView botLoginBtn = new TextView(context);
+            botLoginBtn.setText(isRuLang ? "Войти через токен бота" : "Log in via Bot Token");
+            botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+            botLoginBtn.setTypeface(AndroidUtilities.bold());
+            botLoginBtn.setTextColor(accentBtnColor);
+            botLoginBtn.setGravity(Gravity.CENTER);
+            try {
+                android.graphics.drawable.Drawable botIcon = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.msg_bot).mutate();
+                botIcon.setColorFilter(new android.graphics.PorterDuffColorFilter(accentBtnColor, android.graphics.PorterDuff.Mode.SRC_IN));
+                botLoginBtn.setCompoundDrawablesWithIntrinsicBounds(botIcon, null, null, null);
+                botLoginBtn.setCompoundDrawablePadding(dp(8));
+            } catch (Throwable ignored) {}
+            botLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
+            botLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(8), accentBtnColor & 0x14ffffff, accentBtnColor & 0x33ffffff));
+            botLoginBtn.setOnClickListener(v -> {
+                org.telegram.ui.ColgramBotLoginBottomSheet.show(LoginActivity.this, currentAccount);
+            });
+            altLoginButtonsLayout.addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 4));
+
+            addView(altLoginButtonsLayout, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 16, 2, 76, 4));"""
+
+    def login_btn_replacer(content):
+        if "ColgramQRLoginBottomSheet.show" in content:
+            return content
+        old_pattern = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
             TextView botLoginBtn = new TextView(context);
             boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
             botLoginBtn.setText(isRuLang ? "🤖  Войти через токен бота" : "🤖  Log in via Bot Token");
@@ -274,11 +332,18 @@ def inject_hooks(repo_path):
                 org.telegram.ui.ColgramBotLoginBottomSheet.show(LoginActivity.this, currentAccount);
             });
             addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44, Gravity.CENTER_HORIZONTAL, 16, 12, 76, 8));"""
+        if old_pattern in content:
+            return content.replace(old_pattern, alt_login_btn, 1)
+        target = "addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));"
+        if target in content:
+            return content.replace(target, alt_login_btn, 1)
+        return content
+
     patch_file(
         login_activity,
-        "addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));",
-        bot_login_btn,
-        "LoginActivity Bot Token Login Button"
+        login_btn_replacer,
+        "",
+        "LoginActivity QR Login & Bot Token Buttons"
     )
 
     # 13. LoginActivity.java -> Fix back button on VIEW_PHONE_INPUT (return to IntroActivity)
@@ -1067,6 +1132,99 @@ def inject_hooks(repo_path):
             'switchLanguageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));',
             'switchLanguageTextView.setTextColor(0xFFEF5350);',
             "IntroActivity Red Switch Language Text"
+        )
+
+    # 41. DialogsActivity.java -> Bot Account Chat Initiator on Floating Button
+    dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
+    if os.path.exists(dialogs_activity):
+        bot_write_contacts_target = """    private void openWriteContacts() {
+        Bundle args = new Bundle();
+        args.putBoolean("destroyAfterSelect", true);
+        presentFragment(new ContactsActivity(args));
+    }"""
+        bot_write_contacts_replacement = """    private void openWriteContacts() {
+        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+            org.colgram.core.ColgramBotSync.showStartChatDialog(getParentActivity(), currentAccount, DialogsActivity.this);
+            return;
+        }
+        Bundle args = new Bundle();
+        args.putBoolean("destroyAfterSelect", true);
+        presentFragment(new ContactsActivity(args));
+    }"""
+        patch_file(
+            dialogs_activity,
+            bot_write_contacts_target,
+            bot_write_contacts_replacement,
+            "DialogsActivity Bot Account openWriteContacts Hook"
+        )
+
+    # 42. DialogsEmptyCell.java -> Custom Bot Account Empty State
+    dialogs_empty_cell = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "DialogsEmptyCell.java")
+    if os.path.exists(dialogs_empty_cell):
+        empty_cell_target = """        if (icon != 0) {
+            imageView.setVisibility(VISIBLE);"""
+        empty_cell_replacement = """        if (org.telegram.messenger.UserConfig.getInstance(currentAccount).getCurrentUser() != null && org.telegram.messenger.UserConfig.getInstance(currentAccount).getCurrentUser().bot) {
+            boolean isRuBot = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            titleView.setText(isRuBot ? "Аккаунт бота" : "Bot Account");
+            help = isRuBot ? "Здесь будут отображаться сообщения от пользователей.\\n\\nНажмите на карандаш внизу или сюда, чтобы написать пользователю."
+                           : "Messages from users will appear here.\\n\\nTap the compose button below or here to message a user.";
+            setOnClickListener(v -> {
+                org.colgram.core.ColgramBotSync.showStartChatDialog(org.telegram.messenger.AndroidUtilities.getActivity(), currentAccount);
+            });
+        }
+        if (icon != 0) {
+            imageView.setVisibility(VISIBLE);"""
+        patch_file(
+            dialogs_empty_cell,
+            empty_cell_target,
+            empty_cell_replacement,
+            "DialogsEmptyCell Custom Bot Account Empty State"
+        )
+
+    # 43. BulletinFactory.java -> Suppress BOT_METHOD_INVALID error bulletins
+    bulletin_factory = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Components", "BulletinFactory.java")
+    if os.path.exists(bulletin_factory):
+        patch_file(
+            bulletin_factory,
+            "if (!LaunchActivity.isActive) return new Bulletin.EmptyBulletin();",
+            'if (!LaunchActivity.isActive || (error != null && error.text != null && error.text.contains("BOT_METHOD_INVALID"))) return new Bulletin.EmptyBulletin();',
+            "BulletinFactory Suppress BOT_METHOD_INVALID in makeForError"
+        )
+        patch_file(
+            bulletin_factory,
+            """    public void showForError(TLRPC.TL_error error, boolean top) {
+        if (!LaunchActivity.isActive) return;""",
+            """    public void showForError(TLRPC.TL_error error, boolean top) {
+        if (!LaunchActivity.isActive || (error != null && error.text != null && error.text.contains("BOT_METHOD_INVALID"))) return;""",
+            "BulletinFactory Suppress BOT_METHOD_INVALID in showForError(TL_error)"
+        )
+        patch_file(
+            bulletin_factory,
+            """    public void showForError(String errorCode, boolean top) {
+        if (!LaunchActivity.isActive) return;""",
+            """    public void showForError(String errorCode, boolean top) {
+        if (!LaunchActivity.isActive || (errorCode != null && errorCode.contains("BOT_METHOD_INVALID"))) return;""",
+            "BulletinFactory Suppress BOT_METHOD_INVALID in showForError(String)"
+        )
+        patch_file(
+            bulletin_factory,
+            """    public static void showError(TLRPC.TL_error error) {
+        if (!LaunchActivity.isActive) return;
+        if (error != null && error.code == 406) return;""",
+            """    public static void showError(TLRPC.TL_error error) {
+        if (!LaunchActivity.isActive) return;
+        if (error != null && (error.code == 406 || (error.text != null && error.text.contains("BOT_METHOD_INVALID")))) return;""",
+            "BulletinFactory Suppress BOT_METHOD_INVALID in showError"
+        )
+
+    # 44. AlertsCreator.java -> Suppress BOT_METHOD_INVALID in processError
+    alerts_creator = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Components", "AlertsCreator.java")
+    if os.path.exists(alerts_creator):
+        patch_file(
+            alerts_creator,
+            "if (error == null || error.code == 406 || error.text == null) {",
+            'if (error == null || error.code == 406 || error.text == null || error.text.contains("BOT_METHOD_INVALID")) {',
+            "AlertsCreator Suppress BOT_METHOD_INVALID in processError"
         )
 
 def download_official_binaries(repo_path):

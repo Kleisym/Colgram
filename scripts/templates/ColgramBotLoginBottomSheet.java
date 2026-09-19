@@ -4,6 +4,8 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.graphics.Color;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffColorFilter;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.text.InputType;
@@ -12,13 +14,16 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
+import org.telegram.messenger.UserConfig;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.BottomSheet;
@@ -58,10 +63,15 @@ public class ColgramBotLoginBottomSheet {
                 "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
 
         BottomSheet.Builder builder = new BottomSheet.Builder(context, true);
+        builder.setApplyTopPadding(false);
+
+        int accentColor = Theme.getColor(Theme.key_featuredStickers_addButton);
+        if (accentColor == 0) accentColor = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4);
+        if (accentColor == 0) accentColor = 0xFF2AABEE;
 
         LinearLayout container = new LinearLayout(context);
         container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(20), AndroidUtilities.dp(24), AndroidUtilities.dp(24));
+        container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(24));
 
         // Drag handle
         View dragHandle = new View(context);
@@ -71,21 +81,21 @@ public class ColgramBotLoginBottomSheet {
         dragHandle.setBackground(handleDrawable);
         container.addView(dragHandle, LayoutHelper.createLinear(36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16));
 
-        // Bot Icon Badge
+        // Telegram Native Bot Icon Badge
         FrameLayout iconBadge = new FrameLayout(context);
         GradientDrawable badgeBg = new GradientDrawable();
         badgeBg.setShape(GradientDrawable.OVAL);
-        int primaryColor = Theme.getColor(Theme.key_featuredStickers_addButton);
-        if (primaryColor == 0) primaryColor = 0xffff3344;
-        badgeBg.setColor(primaryColor & 0x1affffff);
+        badgeBg.setColor(accentColor & 0x1AFFFFFF);
         iconBadge.setBackground(badgeBg);
 
-        TextView iconText = new TextView(context);
-        iconText.setText("🤖");
-        iconText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 32);
-        iconText.setGravity(Gravity.CENTER);
-        iconBadge.addView(iconText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.CENTER));
-        container.addView(iconBadge, LayoutHelper.createLinear(64, 64, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16));
+        ImageView botIconView = new ImageView(context);
+        try {
+            botIconView.setImageResource(R.drawable.msg_bot);
+            botIconView.setColorFilter(new PorterDuffColorFilter(accentColor, PorterDuff.Mode.SRC_IN));
+        } catch (Throwable ignored) {}
+        botIconView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        iconBadge.addView(botIconView, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
+        container.addView(iconBadge, LayoutHelper.createLinear(56, 56, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
 
         // Title
         TextView titleView = new TextView(context);
@@ -105,23 +115,25 @@ public class ColgramBotLoginBottomSheet {
         descView.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
         descView.setGravity(Gravity.CENTER_HORIZONTAL);
         descView.setLineSpacing(AndroidUtilities.dp(2), 1.0f);
-        container.addView(descView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 20));
+        container.addView(descView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 18));
 
         // Input card
         LinearLayout inputCard = new LinearLayout(context);
         inputCard.setOrientation(LinearLayout.HORIZONTAL);
         inputCard.setGravity(Gravity.CENTER_VERTICAL);
-        inputCard.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(4), AndroidUtilities.dp(10), AndroidUtilities.dp(4));
+        inputCard.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(4), AndroidUtilities.dp(8), AndroidUtilities.dp(4));
 
         GradientDrawable inputBg = new GradientDrawable();
-        inputBg.setCornerRadius(AndroidUtilities.dp(12));
+        inputBg.setCornerRadius(AndroidUtilities.dp(10));
         int fieldBg = Theme.getColor(Theme.key_dialogInputField);
-        inputBg.setColor(fieldBg != 0 ? fieldBg : 0x0c000000);
-        inputBg.setStroke(AndroidUtilities.dp(1.5f), primaryColor & 0x4dffffff);
+        inputBg.setColor(fieldBg != 0 ? fieldBg : 0x0C000000);
+        int strokeColor = Theme.getColor(Theme.key_dialogInputFieldActivated);
+        if (strokeColor == 0) strokeColor = accentColor & 0x4DFFFFFF;
+        inputBg.setStroke(AndroidUtilities.dp(1f), strokeColor);
         inputCard.setBackground(inputBg);
 
         final EditText input = new EditText(context);
-        input.setHint("8931400108:AAFtZOC...");
+        input.setHint("123456789:AAFtZOC...");
         input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
         input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
         input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
@@ -131,14 +143,14 @@ public class ColgramBotLoginBottomSheet {
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         inputCard.addView(input, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1.0f, Gravity.CENTER_VERTICAL));
 
-        // Paste button inside input card
+        // Quick Paste button
         final TextView pasteBtn = new TextView(context);
         pasteBtn.setText(isRu ? "Вставить" : "Paste");
         pasteBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
         pasteBtn.setTypeface(AndroidUtilities.bold());
-        pasteBtn.setTextColor(primaryColor);
-        pasteBtn.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(8), AndroidUtilities.dp(10), AndroidUtilities.dp(8));
-        pasteBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(6), primaryColor & 0x14ffffff, primaryColor & 0x28ffffff));
+        pasteBtn.setTextColor(accentColor);
+        pasteBtn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8));
+        pasteBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(6), accentColor & 0x14FFFFFF, accentColor & 0x28FFFFFF));
         pasteBtn.setOnClickListener(v -> {
             try {
                 ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
@@ -156,14 +168,14 @@ public class ColgramBotLoginBottomSheet {
         });
         inputCard.addView(pasteBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
 
-        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 52, 0, 0, 0, 18));
+        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50, 0, 0, 0, 16));
 
-        // Primary Action Button
+        // Primary Action Button (Telegram style rounded 10dp)
         final FrameLayout buttonLayout = new FrameLayout(context);
         buttonLayout.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
                 AndroidUtilities.dp(10),
-                primaryColor,
-                Theme.getColor(Theme.key_featuredStickers_addButtonPressed) != 0 ? Theme.getColor(Theme.key_featuredStickers_addButtonPressed) : (primaryColor & 0xccffffff)
+                accentColor,
+                Theme.getColor(Theme.key_featuredStickers_addButtonPressed) != 0 ? Theme.getColor(Theme.key_featuredStickers_addButtonPressed) : (accentColor & 0xCCFFFFFF)
         ));
 
         final TextView buttonText = new TextView(context);
@@ -180,9 +192,21 @@ public class ColgramBotLoginBottomSheet {
         progressView.setVisibility(View.GONE);
         buttonLayout.addView(progressView, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
 
-        container.addView(buttonLayout, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, 0, 0, 0, 8));
+        container.addView(buttonLayout, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, 0, 0, 0, 12));
 
-        builder.setCustomView(container);
+        // Subtitle Tip
+        TextView tipView = new TextView(context);
+        tipView.setText(isRu
+                ? "Токен бота можно бесплатно получить у официального @BotFather"
+                : "You can create and get a bot token for free from @BotFather");
+        tipView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
+        tipView.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
+        tipView.setGravity(Gravity.CENTER_HORIZONTAL);
+        container.addView(tipView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 4));
+
+        ScrollView scrollView = new ScrollView(context);
+        scrollView.addView(container);
+        builder.setCustomView(scrollView);
         final BottomSheet bottomSheet = builder.create();
 
         buttonLayout.setOnClickListener(v -> {
@@ -249,11 +273,14 @@ public class ColgramBotLoginBottomSheet {
                     bottomSheet.dismiss();
                 } catch (Throwable ignored) {}
                 try {
+                    // Pre-save token to current account and all slots so getBotToken is never empty
                     org.colgram.core.ColgramBotSync.saveBotToken(context, currentAccount, token);
-                    java.lang.reflect.Method m = LoginActivity.class.getDeclaredMethod("onAuthSuccess", TLRPC.TL_auth_authorization.class);
-                    m.setAccessible(true);
-                    m.invoke(activity, (TLRPC.TL_auth_authorization) response);
-                    org.colgram.core.ColgramBotSync.saveBotToken(context, org.telegram.messenger.UserConfig.selectedAccount, token);
+                    for (int slot = 0; slot < 4; slot++) {
+                        org.colgram.core.ColgramBotSync.saveBotToken(context, slot, token);
+                    }
+                    activity.onAuthSuccess((TLRPC.TL_auth_authorization) response);
+                    org.colgram.core.ColgramBotSync.saveBotToken(context, UserConfig.selectedAccount, token);
+                    org.colgram.core.ColgramBotSync.syncBotDialogs(context, UserConfig.selectedAccount, false);
                 } catch (Throwable t) {
                     org.telegram.messenger.FileLog.e(t);
                 }
