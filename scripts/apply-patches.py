@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Colgram Patch & Injection Engine
-Applies modular privacy hooks, extracts official prebuilt native binaries,
-and injects colgram-core into Telegram source.
+Colgram Python Injection Engine
+Replaces brittle git apply with robust semantic code injection.
+Directly hooks Telegram source without line number dependencies.
 """
 
 import os
@@ -11,7 +11,136 @@ import sys
 import shutil
 import zipfile
 import urllib.request
-import subprocess
+
+def patch_file(filepath, search_pattern, replacement, description):
+    if not os.path.exists(filepath):
+        print(f" [!] File not found: {filepath}")
+        return False
+
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+
+    if replacement.strip() in content:
+        print(f" [=] Already patched: {description}")
+        return True
+
+    if callable(search_pattern):
+        new_content = search_pattern(content)
+        if new_content == content:
+            print(f" [!] Pattern not matched for: {description}")
+            return False
+    elif isinstance(search_pattern, str):
+        if search_pattern not in content:
+            print(f" [!] Anchor string not found for: {description}")
+            return False
+        new_content = content.replace(search_pattern, replacement, 1)
+    else:
+        # Regex
+        new_content, count = search_pattern.subn(replacement, content, count=1)
+        if count == 0:
+            print(f" [!] Regex not matched for: {description}")
+            return False
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    print(f" [+] Successfully patched: {description}")
+    return True
+
+def inject_hooks(repo_path):
+    print("[*] Performing semantic code injection into Telegram source...")
+
+    # 1. ApplicationLoader.java -> Initialize Colgram core
+    app_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java")
+    patch_file(
+        app_loader,
+        "applicationContext = getApplicationContext();",
+        "applicationContext = getApplicationContext();\n            org.colgram.core.ColgramHookHandler.init(applicationContext);",
+        "ApplicationLoader.onCreate initialization"
+    )
+
+    # 2. ConnectionsManager.java -> Hardware & OS Cloaking
+    conn_manager = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")
+    
+    def cloak_replacer(content):
+        # Find init(SharedConfig.buildVersion()...
+        target = "init(SharedConfig.buildVersion()"
+        if target not in content:
+            return content
+        inject_code = """
+        java.util.Map<String, String> cloaked = org.colgram.core.ColgramHookHandler.hookInitConnection(deviceModel, systemVersion, appVersion, langCode);
+        if (cloaked != null) {
+            if (cloaked.containsKey("device_model")) deviceModel = cloaked.get("device_model");
+            if (cloaked.containsKey("system_version")) systemVersion = cloaked.get("system_version");
+            if (cloaked.containsKey("app_version")) appVersion = cloaked.get("app_version");
+            if (cloaked.containsKey("lang_code")) langCode = cloaked.get("lang_code");
+        }
+        """
+        return content.replace(target, inject_code + "\n        " + target, 1)
+
+    patch_file(conn_manager, cloak_replacer, "", "ConnectionsManager MTProto Cloaking")
+
+    # 3. FileLoader.java -> Storage Sandbox & Media Lock
+    file_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java")
+    patch_file(
+        file_loader,
+        "public static File getDirectory(int type) {",
+        "public static File getDirectory(int type) {\n        File sandboxed = org.colgram.core.ColgramHookHandler.hookGetDirectory(type);\n        if (sandboxed != null) return sandboxed;",
+        "FileLoader.getDirectory Sandbox Redirect"
+    )
+    patch_file(
+        file_loader,
+        "if (file.exists()) {\n                file.delete();",
+        "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) continue;\n            if (file.exists()) {\n                file.delete();",
+        "FileLoader.deleteFiles Media Lock"
+    )
+
+    # 4. BaseFragment.java -> FLAG_SECURE Bypass
+    base_fragment = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "BaseFragment.java")
+    patch_file(
+        base_fragment,
+        "public void setFlagsSecure(boolean secure) {",
+        "public void setFlagsSecure(boolean secure) {\n        if (org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()) secure = false;",
+        "BaseFragment FLAG_SECURE Bypass"
+    )
+
+    # 5. ChatMessageCell.java -> Visual cue for deleted messages
+    chat_cell = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "ChatMessageCell.java")
+    patch_file(
+        chat_cell,
+        "public void setMessageObject(MessageObject messageObject, MessageObject.GroupedMessages messageGroup, boolean canBeGrouped, boolean isFirst) {",
+        "public void setMessageObject(MessageObject messageObject, MessageObject.GroupedMessages messageGroup, boolean canBeGrouped, boolean isFirst) {\n        if (messageObject != null && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId())) setAlpha(0.65f);",
+        "ChatMessageCell Deleted Styling"
+    )
+
+    # 6. MessagesController.java -> Ghost Mode (Suppress Read & Typing)
+    messages_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesController.java")
+    patch_file(
+        messages_controller,
+        "public boolean markDialogAsRead(",
+        "public boolean markDialogAsRead(\n        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialog_id)) return false;\n",
+        "MessagesController Ghost Read Receipt"
+    )
+    patch_file(
+        messages_controller,
+        "public void sendTyping(",
+        "public void sendTyping(\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialog_id)) return;\n",
+        "MessagesController Ghost Typing Suppression"
+    )
+
+    # 7. Strip trackers from TMessagesProj/build.gradle
+    tmessages_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
+    if os.path.exists(tmessages_gradle):
+        with open(tmessages_gradle, "r", encoding="utf-8") as f:
+            gradle_text = f.read()
+        
+        # Strip Firebase and Play services
+        gradle_text = re.sub(r"implementation\s+['\"]com\.google\.firebase:firebase-messaging:[^'\"]+['\"]", "// stripped firebase-messaging", gradle_text)
+        gradle_text = re.sub(r"implementation\s+['\"]com\.google\.android\.gms:play-services-base:[^'\"]+['\"]", "// stripped play-services", gradle_text)
+        
+        with open(tmessages_gradle, "w", encoding="utf-8") as f:
+            f.write(gradle_text)
+        print(" [+] Stripped trackers from TMessagesProj/build.gradle")
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
@@ -30,7 +159,6 @@ def download_official_binaries(repo_path):
         with zipfile.ZipFile(temp_apk, 'r') as zip_ref:
             for file_info in zip_ref.infolist():
                 if file_info.filename.startswith("lib/"):
-                    # Extract to jniLibs
                     rel_path = file_info.filename[len("lib/"):]
                     target_file = os.path.join(jni_libs_dir, rel_path)
                     os.makedirs(os.path.dirname(target_file), exist_ok=True)
@@ -41,15 +169,13 @@ def download_official_binaries(repo_path):
         if os.path.exists(temp_apk):
             os.remove(temp_apk)
 
-        # Disable externalNativeBuild in TMessagesProj/build.gradle so Gradle uses prebuilts
+        # Disable externalNativeBuild in TMessagesProj/build.gradle
         tmessages_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
         if os.path.exists(tmessages_gradle):
             with open(tmessages_gradle, "r", encoding="utf-8") as f:
                 gradle_content = f.read()
-            # Comment out externalNativeBuild
             gradle_content = re.sub(r'(externalNativeBuild\s*\{)', r'/* \1', gradle_content)
             gradle_content = re.sub(r'(\}\s*//\s*externalNativeBuild)', r'\1 */', gradle_content)
-            # Make sure jniLibs is configured
             if "sourceSets.main.jniLibs.srcDirs" not in gradle_content:
                 gradle_content = gradle_content.replace(
                     "android {",
@@ -61,7 +187,6 @@ def download_official_binaries(repo_path):
 
     except Exception as e:
         print(f" [!] Warning: Prebuilt binary extraction encountered error: {e}")
-        print("     Will fallback to standard NDK build if available.")
 
 def inject_core(repo_path, core_source_dir):
     print("[*] Injecting colgram-core module into project...")
@@ -71,7 +196,7 @@ def inject_core(repo_path, core_source_dir):
     shutil.copytree(core_source_dir, target_core_dir)
     print(f" [+] colgram-core successfully copied to {target_core_dir}")
 
-    # Add module to settings.gradle if not present
+    # Add module to settings.gradle
     settings_gradle = os.path.join(repo_path, "settings.gradle")
     if os.path.exists(settings_gradle):
         with open(settings_gradle, "r", encoding="utf-8") as f:
@@ -95,56 +220,20 @@ def inject_core(repo_path, core_source_dir):
                 f.write(content)
             print(" [+] Added colgram-core dependency to TMessagesProj/build.gradle")
 
-def apply_patches(repo_path, patches_dir):
-    print(f"[*] Applying Colgram patches to: {repo_path}")
-    if not os.path.exists(patches_dir):
-        print(f"[!] Patches directory not found: {patches_dir}")
-        return False
-
-    patch_files = sorted([f for f in os.listdir(patches_dir) if f.endswith('.patch')])
-    for patch in patch_files:
-        patch_path = os.path.join(patches_dir, patch)
-        print(f" -> Applying {patch}...")
-        res = subprocess.run(
-            ["git", "apply", "--ignore-whitespace", "--recount", patch_path],
-            cwd=repo_path,
-            capture_output=True,
-            text=True
-        )
-        if res.returncode != 0:
-            print(f" [!] Warning: Direct git apply failed for {patch}: {res.stderr.strip()}")
-            print(f" [*] Attempting patch with 3-way fallback...")
-            res3 = subprocess.run(
-                ["git", "apply", "-3", patch_path],
-                cwd=repo_path,
-                capture_output=True,
-                text=True
-            )
-            if res3.returncode != 0:
-                print(f" [x] Error applying {patch}: {res3.stderr.strip()}")
-                return False
-        print(f" [+] Successfully applied {patch}")
-    return True
-
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    patches_dir = os.path.join(root_dir, "patches")
     core_dir = os.path.join(root_dir, "colgram-core")
 
     target_repo = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root_dir, "Telegram")
 
     if not os.path.exists(target_repo):
         print(f"[!] Target Telegram repo not found at: {target_repo}")
-        print("    Clone Telegram or pass path as argument: python apply-patches.py <path_to_repo>")
         sys.exit(1)
 
     inject_core(target_repo, core_dir)
     download_official_binaries(target_repo)
-    if apply_patches(target_repo, patches_dir):
-        print("\n[+] Colgram setup complete! Ready to build APK.")
-    else:
-        print("\n[x] Patching encountered errors.")
-        sys.exit(1)
+    inject_hooks(target_repo)
+    print("\n[+] Colgram setup complete! Ready to build APK.")
 
 if __name__ == "__main__":
     main()
