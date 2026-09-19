@@ -11,6 +11,7 @@ import sys
 import shutil
 import zipfile
 import urllib.request
+import subprocess
 
 def patch_file(filepath, search_pattern, replacement, description):
     if not os.path.exists(filepath):
@@ -63,7 +64,6 @@ def inject_hooks(repo_path):
     conn_manager = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")
     
     def cloak_replacer(content):
-        # Find init(SharedConfig.buildVersion()...
         target = "init(SharedConfig.buildVersion()"
         if target not in content:
             return content
@@ -90,26 +90,26 @@ def inject_hooks(repo_path):
     )
     patch_file(
         file_loader,
-        "if (file.exists()) {\n                file.delete();",
-        "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) continue;\n            if (file.exists()) {\n                file.delete();",
+        "if (!file.delete()) {",
+        "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) continue;\n                if (!file.delete()) {",
         "FileLoader.deleteFiles Media Lock"
     )
 
-    # 4. BaseFragment.java -> FLAG_SECURE Bypass
-    base_fragment = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "BaseFragment.java")
+    # 4. FlagSecureReason.java -> FLAG_SECURE Bypass
+    flag_secure = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FlagSecureReason.java")
     patch_file(
-        base_fragment,
-        "public void setFlagsSecure(boolean secure) {",
-        "public void setFlagsSecure(boolean secure) {\n        if (org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()) secure = false;",
-        "BaseFragment FLAG_SECURE Bypass"
+        flag_secure,
+        "public static boolean isSecuredNow(Window window) {",
+        "public static boolean isSecuredNow(Window window) {\n        if (org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()) return false;",
+        "FlagSecureReason Bypass"
     )
 
     # 5. ChatMessageCell.java -> Visual cue for deleted messages
     chat_cell = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "ChatMessageCell.java")
     patch_file(
         chat_cell,
-        "public void setMessageObject(MessageObject messageObject, MessageObject.GroupedMessages messageGroup, boolean canBeGrouped, boolean isFirst) {",
-        "public void setMessageObject(MessageObject messageObject, MessageObject.GroupedMessages messageGroup, boolean canBeGrouped, boolean isFirst) {\n        if (messageObject != null && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId())) setAlpha(0.65f);",
+        "public void setMessageObject(MessageObject messageObject,",
+        "public void setMessageObject(MessageObject messageObject,\n        if (messageObject != null && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId())) setAlpha(0.65f); else setAlpha(1.0f);",
         "ChatMessageCell Deleted Styling"
     )
 
@@ -117,14 +117,14 @@ def inject_hooks(repo_path):
     messages_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesController.java")
     patch_file(
         messages_controller,
-        "public boolean markDialogAsRead(",
-        "public boolean markDialogAsRead(\n        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialog_id)) return false;\n",
+        "public void markDialogAsRead(long dialogId, int maxPositiveId",
+        "public void markDialogAsRead(long dialogId, int maxPositiveId,\n        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId)) return;\n",
         "MessagesController Ghost Read Receipt"
     )
     patch_file(
         messages_controller,
-        "public void sendTyping(",
-        "public void sendTyping(\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialog_id)) return;\n",
+        "public boolean sendTyping(long dialogId, long threadMsgId",
+        "public boolean sendTyping(long dialogId, long threadMsgId,\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialogId)) return false;\n",
         "MessagesController Ghost Typing Suppression"
     )
 
@@ -134,7 +134,6 @@ def inject_hooks(repo_path):
         with open(tmessages_gradle, "r", encoding="utf-8") as f:
             gradle_text = f.read()
         
-        # Strip Firebase and Play services
         gradle_text = re.sub(r"implementation\s+['\"]com\.google\.firebase:firebase-messaging:[^'\"]+['\"]", "// stripped firebase-messaging", gradle_text)
         gradle_text = re.sub(r"implementation\s+['\"]com\.google\.android\.gms:play-services-base:[^'\"]+['\"]", "// stripped play-services", gradle_text)
         
@@ -223,15 +222,17 @@ def inject_core(repo_path, core_source_dir):
 def clone_required_submodules(repo_path):
     print("[*] Cloning required submodules for Gradle (media & jlatexmath)...")
     media_dir = os.path.join(repo_path, "TMessagesProj_Modules", "media")
-    if not os.path.exists(media_dir):
-        os.makedirs(os.path.dirname(media_dir), exist_ok=True)
-        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/Arseny271/media.git", media_dir])
+    if not os.path.exists(os.path.join(media_dir, "core_settings.gradle")):
+        shutil.rmtree(media_dir, ignore_errors=True)
+        print(" -> Cloning media submodule...")
+        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/Arseny271/media.git", media_dir], check=True)
         print(" [+] Cloned media submodule")
 
     jlatex_dir = os.path.join(repo_path, "TMessagesProj", "lib", "jlatexmath")
-    if not os.path.exists(jlatex_dir):
-        os.makedirs(os.path.dirname(jlatex_dir), exist_ok=True)
-        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/dkaraush/jlatexmath-android.git", jlatex_dir])
+    if not os.path.exists(os.path.join(jlatex_dir, "jlatexmath")):
+        shutil.rmtree(jlatex_dir, ignore_errors=True)
+        print(" -> Cloning jlatexmath submodule...")
+        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/dkaraush/jlatexmath-android.git", jlatex_dir], check=True)
         print(" [+] Cloned jlatexmath submodule")
 
 def main():
