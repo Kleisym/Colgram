@@ -8,6 +8,9 @@ on:
     # Check for upstream Telegram updates daily at 04:00 UTC
     - cron: '0 4 * * *'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build & Publish Colgram APK
@@ -51,15 +54,26 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleAfatRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError"
 
-      - name: Sign APK
-        uses: ralfirza/apk-signer@v1
-        with:
-          apk-file: Telegram-FOSS/TMessagesProj/build/outputs/apk/afat/release/TMessagesProj-afat-release-unsigned.apk
-          key-store: ${{ secrets.SIGNING_KEYSTORE }}
-          key-alias: ${{ secrets.ALIAS }}
-          key-store-password: ${{ secrets.KEY_STORE_PASSWORD }}
-          key-password: ${{ secrets.KEY_PASSWORD }}
-        continue-on-error: true
+      - name: Sign APK (Production / Self-Signed)
+        run: |
+          # Generate signing keystore
+          keytool -genkey -v -keystore colgram.keystore -storepass colgrampass -alias colgramkey -keypass colgrampass -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Colgram,O=Colgram,C=US"
+          
+          # Find latest apksigner
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
+          echo "Using apksigner at: $APKSIGNER"
+          
+          # Find unsigned APK
+          UNSIGNED_APK=$(find Telegram-FOSS/TMessagesProj/build/outputs/apk -name "*.apk" | head -n 1)
+          echo "Target APK: $UNSIGNED_APK"
+          
+          if [ -f "$UNSIGNED_APK" ]; then
+            $APKSIGNER sign --ks colgram.keystore --ks-pass pass:colgrampass --key-pass pass:colgrampass --out Telegram-FOSS/TMessagesProj/build/outputs/apk/colgram-signed-release.apk "$UNSIGNED_APK"
+            echo "Successfully signed: colgram-signed-release.apk"
+          else
+            echo "No APK found to sign!"
+            exit 1
+          fi
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
@@ -68,10 +82,10 @@ jobs:
           path: Telegram-FOSS/TMessagesProj/build/outputs/apk/**/*.apk
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         uses: softprops/action-gh-release@v1
         with:
-          files: Telegram-FOSS/TMessagesProj/build/outputs/apk/**/*.apk
+          files: Telegram-FOSS/TMessagesProj/build/outputs/apk/colgram-signed-release.apk
           tag_name: colgram-${{ env.UPSTREAM_TAG }}-${{ github.run_number }}
           name: Colgram v${{ env.UPSTREAM_TAG }} (Build ${{ github.run_number }})
           body: |
@@ -79,6 +93,7 @@ jobs:
             - **Telegram Base**: `${{ env.UPSTREAM_TAG }}`
             - **Hardware Cloaking**: Enabled (Spoofed device & OS info)
             - **Anti-Delete Vault**: Active (Preserves deleted messages & edit logs)
+            - **Ghost Mode**: Silent read, stealth typing, offline status, FLAG_SECURE bypass
             - **Storage Sandbox**: Scoped to isolated folder
             - **Built-in MTProto**: Fake-TLS anti-censorship pool active
             - **Telemetry**: 100% Stripped (No Firebase / Play Services / HMS)
