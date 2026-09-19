@@ -350,6 +350,54 @@ def inject_core(repo_path, core_source_dir):
                 f.write(content)
             print(" [+] Added colgram-core dependency to TMessagesProj/build.gradle")
 
+def configure_chaquopy_build(repo_path):
+    print("[*] Configuring Chaquopy CPython plugin in root and module build.gradle...")
+    root_gradle = os.path.join(repo_path, "build.gradle")
+    if os.path.exists(root_gradle):
+        with open(root_gradle, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if "com.chaquo.python:gradle" not in content:
+            if "buildscript {" in content:
+                content = content.replace(
+                    "dependencies {",
+                    "dependencies {\n        classpath 'com.chaquo.python:gradle:15.0.1'",
+                    1
+                )
+                if "mavenCentral()" not in content:
+                    content = content.replace(
+                        "repositories {",
+                        "repositories {\n        mavenCentral()",
+                        1
+                    )
+            else:
+                buildscript_block = """buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.chaquo.python:gradle:15.0.1'
+    }
+}
+"""
+                content = buildscript_block + content
+
+            with open(root_gradle, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(" [+] Configured Chaquopy plugin in root build.gradle")
+
+    # Ensure minSdkVersion 24 in TMessagesProj and TMessagesProj_AppStandalone
+    for mod in ["TMessagesProj", "TMessagesProj_AppStandalone"]:
+        mod_gradle = os.path.join(repo_path, mod, "build.gradle")
+        if os.path.exists(mod_gradle):
+            with open(mod_gradle, "r", encoding="utf-8") as f:
+                m_content = f.read()
+            m_content = re.sub(r'minSdkVersion\s+\d+', 'minSdkVersion 24', m_content)
+            with open(mod_gradle, "w", encoding="utf-8") as f:
+                f.write(m_content)
+            print(f" [+] Ensured minSdkVersion 24 in {mod}/build.gradle")
+
 def clone_required_submodules(repo_path):
     print("[*] Checking out required submodules for Gradle (media & jlatexmath)...")
     media_dir = os.path.join(repo_path, "TMessagesProj_Modules", "media")
@@ -551,6 +599,7 @@ def main():
     configure_package_and_branding(target_repo)
     apply_custom_app_icon(target_repo, custom_icon)
     inject_core(target_repo, core_dir)
+    configure_chaquopy_build(target_repo)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)
     print("\n[+] Colgram setup complete! Ready to build APK.")

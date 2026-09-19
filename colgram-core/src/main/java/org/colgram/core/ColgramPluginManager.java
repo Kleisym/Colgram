@@ -73,6 +73,9 @@ public class ColgramPluginManager {
 
         if (pluginsDir == null || !pluginsDir.exists()) return;
 
+        // Register plugins directory in Python sys.path
+        ColgramPythonEngine.addPythonPath(pluginsDir.getAbsolutePath());
+
         File[] files = pluginsDir.listFiles((dir, name) -> name.endsWith(".py") || name.endsWith(".json"));
         if (files == null) return;
 
