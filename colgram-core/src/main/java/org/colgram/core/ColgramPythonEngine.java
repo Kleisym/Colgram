@@ -227,7 +227,11 @@ public class ColgramPythonEngine {
      * Mobile Python Expression & Script Evaluator.
      * Uses real CPython (Chaquopy) if available, or falls back to Java evaluator.
      */
-    private static String runPythonCode(String code) {
+    public static String executeCode(String code) {
+        return runPythonCode(code);
+    }
+
+    public static String runPythonCode(String code) {
         if (code == null || code.trim().isEmpty()) return "None";
 
         // 1. Try real CPython runtime

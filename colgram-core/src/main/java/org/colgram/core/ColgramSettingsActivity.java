@@ -12,13 +12,13 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.appcompat.app.AppCompatActivity;
+import android.app.Activity;
 
 /**
  * ColgramSettingsActivity — Complete native settings panel for Colgram features:
  * Hardware cloaking, Ghost Mode, Storage Sandboxing, MTProto Proxies, and OTA Updates.
  */
-public class ColgramSettingsActivity extends AppCompatActivity {
+public class ColgramSettingsActivity extends Activity {
 
     public static void start(Context context) {
         Intent intent = new Intent(context, ColgramSettingsActivity.class);

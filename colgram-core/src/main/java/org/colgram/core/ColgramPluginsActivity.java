@@ -17,7 +17,7 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.appcompat.app.AppCompatActivity;
+import android.app.Activity;
 
 import java.util.List;
 
@@ -29,7 +29,7 @@ import java.util.List;
  * 2. Marketplace tab with 1-click curated Python plugin installations.
  * 3. Custom creator for user scripts.
  */
-public class ColgramPluginsActivity extends AppCompatActivity {
+public class ColgramPluginsActivity extends Activity {
 
     public static void start(Context context) {
         Intent intent = new Intent(context, ColgramPluginsActivity.class);

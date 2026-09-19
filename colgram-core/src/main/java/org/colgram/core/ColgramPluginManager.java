@@ -182,6 +182,32 @@ public class ColgramPluginManager {
         return false;
     }
 
+    public static boolean dispatchCommand(long dialogId, String cmd, String args) {
+        if (activeCommands.containsKey(cmd)) {
+            PluginInfo p = activeCommands.get(cmd);
+            if (p != null && p.isEnabled) {
+                executePluginCommand(dialogId, p, cmd, args);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static String getLoadedPluginsSummary() {
+        if (loadedPlugins.isEmpty()) {
+            return "🧩 **Плагины Colgram**\nНет установленных плагинов.\nОткрой Настройки -> Плагины для установки из Маркетплейса.";
+        }
+        StringBuilder sb = new StringBuilder("🧩 **Установленные плагины Colgram (" + loadedPlugins.size() + "):**\n\n");
+        for (PluginInfo p : loadedPlugins) {
+            sb.append(p.isEnabled ? "✅ " : "⏸️ ").append("**").append(p.name).append("** (v").append(p.version).append(")\n");
+            if (p.command != null && !p.command.isEmpty()) {
+                sb.append("   • Команда: `.").append(p.command).append("`\n");
+            }
+            sb.append("   • ").append(p.description).append("\n\n");
+        }
+        return sb.toString().trim();
+    }
+
     private static void handleSpamCommand(long dialogId, String args) {
         new Thread(() -> {
             try {
