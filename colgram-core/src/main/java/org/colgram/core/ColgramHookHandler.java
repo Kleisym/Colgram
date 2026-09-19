@@ -26,7 +26,7 @@ public class ColgramHookHandler {
 
         // Start embedded DPI bypass engine and background connection doctor immediately
         ColgramProxyManager.activateBuiltinProxy(appContext);
-        ColgramProxyDoctor.start(appContext);
+        ColgramProxyDoctor.init(appContext);
     }
 
     /**

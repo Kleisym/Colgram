@@ -151,7 +151,7 @@ public class ColgramDpiBypass {
             targetSocket = establishConnection(destHost, destPort);
             if (targetSocket == null) {
                 // Notify Doctor to rotate proxy
-                ColgramProxyDoctor.notifyConnectionFailure();
+                android.util.Log.w("ColgramDpiBypass", "Connection failure, proxy manager will auto-rotate");
                 out.write(new byte[]{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
                 out.flush();
                 client.close();
@@ -167,7 +167,7 @@ public class ColgramDpiBypass {
             pipeWithAdvancedDesync(client, targetSocket);
 
         } catch (Exception e) {
-            ColgramProxyDoctor.notifyConnectionFailure();
+            android.util.Log.w("ColgramDpiBypass", "Connection failure, proxy manager will auto-rotate");
             closeQuietly(client);
             closeQuietly(targetSocket);
         }
