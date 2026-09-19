@@ -569,10 +569,16 @@ def inject_hooks(repo_path):
                 content = content.replace(old_switch_pattern, new_switch_code, 1)
 
             # 3. Fast checkContinueText without network request
-            import re
-            content = re.sub(
-                r'private void checkContinueText\(\) \{.*?^\s*\}\s*$',
-                '''private void checkContinueText() {
+            start_tag = "private void checkContinueText() {"
+            end_tag = "ConnectionsManager.RequestFlagWithoutLogin);"
+            idx1 = content.find(start_tag)
+            if idx1 != -1:
+                idx2 = content.find(end_tag, idx1)
+                if idx2 != -1:
+                    brace_idx = content.find("}", idx2 + len(end_tag))
+                    if brace_idx != -1:
+                        end_pos = brace_idx + 1
+                        new_check = """private void checkContinueText() {
         boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null
                 && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
         if (startMessagingButton != null) {
@@ -581,15 +587,13 @@ def inject_hooks(repo_path):
         if (switchLanguageTextView != null) {
             switchLanguageTextView.setText(isRu ? "Continue in English" : "Продолжить на русском");
         }
-    }''',
-                content,
-                flags=re.DOTALL | re.MULTILINE
-            )
+    }"""
+                        content = content[:idx1] + new_check + content[end_pos:]
 
             # 4. onResume resets startPressed & destroyed
-            target_resume = "public void onResume() {\\n        super.onResume();"
+            target_resume = "public void onResume() {\n        super.onResume();"
             if target_resume in content and "startPressed = false;" not in content:
-                content = content.replace(target_resume, target_resume + "\\n        startPressed = false;\\n        destroyed = false;", 1)
+                content = content.replace(target_resume, target_resume + "\n        startPressed = false;\n        destroyed = false;", 1)
 
             return content
 
