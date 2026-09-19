@@ -41,7 +41,7 @@ public class ColgramConfig {
     public static final String DEFAULT_SYSTEM_VERSION = "SDK 34 (Android 14)";
     public static final String DEFAULT_LANG = "en";
     public static final String DEFAULT_STORAGE_FOLDER = "Colgram";
-    public static final String DEFAULT_UPDATE_REPO = "Colgram/Colgram";
+    public static final String DEFAULT_UPDATE_REPO = "Kleisym/Colgram";
 
     private static SharedPreferences prefs;
 
