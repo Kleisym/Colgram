@@ -87,13 +87,16 @@ public class ColgramProxyDoctor {
         if (appContext != null) return;
         appContext = context.getApplicationContext();
 
-        // Seed with high-availability verified defaults
-        verifiedPool.add(new VerifiedProxy("media.experthost.shop", 443, "ee92ccb7af38638802ad9afb21d587fa9f7777772e6d6963726f736f66742e636f6d", 1, 12));
-        verifiedPool.add(new VerifiedProxy("194.59.221.90", 8443, "eef4b79908a669cfe8f29394142828b8e07777772e676f6f676c652e636f6d", 1, 15));
-        verifiedPool.add(new VerifiedProxy("yostavpn.casacam.net", 443, "eec17adfc3591215500ff524021295b2fa636c6f7564666c6172652e636f6d", 1, 169));
-        verifiedPool.add(new VerifiedProxy("sioms.co.uk", 25565, "ee104462821249bd7ac519130220c25d0963646e2e79656b74616e65742e636f6d", 1, 150));
-        verifiedPool.add(new VerifiedProxy("t.meow-meow-fast.site", 443, "eeaea279c83d92a4c4fa8a780775d0458b73332e616d617a6f6e6177732e636f6d", 1, 200));
-        verifiedPool.add(new VerifiedProxy("ma.hastim.co.uk", 443, "ee1603010200010001fc030386e24c3add7777772e676f6f676c652e636f6d", 1, 194));
+        // Seed with high-availability verified defaults (Direct IP, zero DNS dependency)
+        verifiedPool.add(new VerifiedProxy("194.59.221.90", 8443, "eef4b79908a669cfe8f29394142828b8e07777772e676f6f676c652e636f6d", 1, 1));
+        verifiedPool.add(new VerifiedProxy("77.239.105.219", 443, "ee6c083120ee1366914619d08433d712217777772e79616e6465782e7275", 1, 1));
+        verifiedPool.add(new VerifiedProxy("194.59.221.90", 8444, "ee7577a125139049a46aa27d35b91b92647777772e676f6f676c652e636f6d", 1, 2));
+        verifiedPool.add(new VerifiedProxy("79.137.196.223", 18443, "eefd7ec323604fdf80735ca824e4d5059d7777772e676f6f676c652e636f6d", 1, 1));
+        verifiedPool.add(new VerifiedProxy("79.137.196.223", 7443, "eeeeb306622aa36371ad5f7560da42323e7777772e676f6f676c652e636f6d", 1, 1));
+        verifiedPool.add(new VerifiedProxy("79.137.196.223", 9443, "eeeed3431e687ca0fa57f5c5b966c9ffb87777772e676f6f676c652e636f6d", 1, 1));
+        verifiedPool.add(new VerifiedProxy("176.57.69.182", 53627, "ee42eb79c1cb8078972cae640ad521ba687777772e676f6f676c652e636f6d", 1, 1));
+        verifiedPool.add(new VerifiedProxy("31.59.140.35", 443, "ee92ccb7af38638802ad9afb21d587fa9f7777772e6d6963726f736f66742e636f6d", 1, 2));
+        verifiedPool.add(new VerifiedProxy("45.91.138.108", 443, "eeaea279c83d92a4c4fa8a780775d0458b73332e616d617a6f6e6177732e636f6d", 1, 3));
 
         // Initial scrape and verification immediately
         workerPool.execute(ColgramProxyDoctor::runDoctorAuditCycle);

@@ -3,7 +3,9 @@ package org.colgram.core;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.text.InputType;
 import android.util.TypedValue;
@@ -22,10 +24,22 @@ import java.util.ArrayList;
 /**
  * ColgramBotLogin — Telegram-Native Bot Token Authentication UI and MTProto Importer.
  * 
- * Styled entirely using Telegram's custom UI theme engine (AlertDialog.Builder,
+ * Styled with Telegram's custom UI theme engine (AlertDialog.Builder,
  * Theme keys, AndroidUtilities dp scaling, and typography) for a seamless, premium feel.
  */
 public class ColgramBotLogin {
+
+    private static int getThemeColor(Class<?> themeClass, String keyName, int defaultColor) {
+        if (themeClass == null) return defaultColor;
+        try {
+            Field keyField = themeClass.getField(keyName);
+            int key = keyField.getInt(null);
+            Method getColorMethod = themeClass.getMethod("getColor", int.class);
+            return (int) getColorMethod.invoke(null, key);
+        } catch (Throwable t) {
+            return defaultColor;
+        }
+    }
 
     public static void showBotLoginDialog(final Context context, final int currentAccount, final Runnable onLoggedIn) {
         try {
@@ -34,19 +48,17 @@ public class ColgramBotLogin {
             Class<?> alertBuilderClass = Class.forName("org.telegram.ui.ActionBar.AlertDialog$Builder");
 
             Method dpMethod = auClass.getMethod("dp", float.class);
-            Method getColorMethod = themeClass.getMethod("getColor", String.class);
 
             int dp8 = (int) dpMethod.invoke(null, 8f);
             int dp12 = (int) dpMethod.invoke(null, 12f);
             int dp16 = (int) dpMethod.invoke(null, 16f);
-            int dp20 = (int) dpMethod.invoke(null, 20f);
             int dp24 = (int) dpMethod.invoke(null, 24f);
 
-            int textColor = (int) getColorMethod.invoke(null, "dialogTextBlack");
-            int grayColor = (int) getColorMethod.invoke(null, "dialogTextGray");
-            int hintColor = (int) getColorMethod.invoke(null, "dialogTextHint");
-            int blueColor = (int) getColorMethod.invoke(null, "dialogTextBlue2");
-            int fieldBgColor = (int) getColorMethod.invoke(null, "dialogInputField");
+            int textColor = getThemeColor(themeClass, "key_dialogTextBlack", Color.parseColor("#222222"));
+            int grayColor = getThemeColor(themeClass, "key_dialogTextGray", Color.parseColor("#888888"));
+            int hintColor = getThemeColor(themeClass, "key_dialogTextHint", Color.parseColor("#AAAAAA"));
+            int blueColor = getThemeColor(themeClass, "key_dialogTextBlue2", Color.parseColor("#2AABEE"));
+            int fieldBgColor = getThemeColor(themeClass, "key_dialogInputField", Color.parseColor("#0F000000"));
 
             // Main container
             LinearLayout container = new LinearLayout(context);
@@ -56,7 +68,7 @@ public class ColgramBotLogin {
             // Bot Icon Badge
             TextView iconView = new TextView(context);
             iconView.setText("🤖");
-            iconView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 36);
+            iconView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 38);
             iconView.setGravity(Gravity.CENTER);
             iconView.setPadding(0, 0, 0, dp8);
             container.addView(iconView);
@@ -79,7 +91,7 @@ public class ColgramBotLogin {
             GradientDrawable cardBg = new GradientDrawable();
             cardBg.setCornerRadius(dp12);
             cardBg.setColor(fieldBgColor != 0 ? fieldBgColor : Color.parseColor("#15000000"));
-            cardBg.setStroke((int) dpMethod.invoke(null, 1f), Color.parseColor("#207F7F7F"));
+            cardBg.setStroke((int) dpMethod.invoke(null, 1.5f), Color.parseColor("#257F7F7F"));
             inputCard.setBackground(cardBg);
 
             // EditText for token
@@ -88,7 +100,7 @@ public class ColgramBotLogin {
             input.setHintTextColor(hintColor);
             input.setTextColor(textColor);
             input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-            input.setTypeface(android.graphics.Typeface.MONOSPACE);
+            input.setTypeface(Typeface.MONOSPACE);
             input.setBackground(null);
             input.setSingleLine(true);
             input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
@@ -101,7 +113,9 @@ public class ColgramBotLogin {
             pasteBtn.setText("Вставить");
             pasteBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
             pasteBtn.setTextColor(blueColor);
-            pasteBtn.setTypeface((android.graphics.Typeface) auClass.getMethod("bold").invoke(null));
+            try {
+                pasteBtn.setTypeface((Typeface) auClass.getMethod("bold").invoke(null));
+            } catch (Throwable ignored) {}
             pasteBtn.setPadding(dp8, dp8, dp8, dp8);
             pasteBtn.setOnClickListener(v -> {
                 ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
@@ -125,8 +139,8 @@ public class ColgramBotLogin {
             alertBuilderClass.getMethod("setTitle", CharSequence.class).invoke(builder, "Вход по токену бота");
             alertBuilderClass.getMethod("setView", View.class).invoke(builder, container);
 
-            alertBuilderClass.getMethod("setPositiveButton", CharSequence.class, android.content.DialogInterface.OnClickListener.class)
-                    .invoke(builder, "Войти", (android.content.DialogInterface.OnClickListener) (dialog, which) -> {
+            alertBuilderClass.getMethod("setPositiveButton", CharSequence.class, DialogInterface.OnClickListener.class)
+                    .invoke(builder, "Войти", (DialogInterface.OnClickListener) (dialog, which) -> {
                         String token = input.getText().toString().trim();
                         if (token.isEmpty() || !token.contains(":")) {
                             Toast.makeText(context, "Введите корректный токен (например, 123456:ABC-DEF)", Toast.LENGTH_LONG).show();
@@ -135,24 +149,37 @@ public class ColgramBotLogin {
                         loginWithBotToken(context, currentAccount, token, onLoggedIn);
                     });
 
-            alertBuilderClass.getMethod("setNegativeButton", CharSequence.class, android.content.DialogInterface.OnClickListener.class)
+            alertBuilderClass.getMethod("setNegativeButton", CharSequence.class, DialogInterface.OnClickListener.class)
                     .invoke(builder, "Отмена", null);
 
             alertBuilderClass.getMethod("show").invoke(builder);
 
         } catch (Throwable t) {
             t.printStackTrace();
-            fallbackDialog(context, currentAccount, onLoggedIn);
+            fallbackStyledDialog(context, currentAccount, onLoggedIn);
         }
     }
 
-    private static void fallbackDialog(final Context context, final int currentAccount, final Runnable onLoggedIn) {
+    private static void fallbackStyledDialog(final Context context, final int currentAccount, final Runnable onLoggedIn) {
         android.app.AlertDialog.Builder builder = new android.app.AlertDialog.Builder(context);
         builder.setTitle("🤖 Вход по токену бота");
+
+        LinearLayout layout = new LinearLayout(context);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(48, 24, 48, 24);
+
+        TextView sub = new TextView(context);
+        sub.setText("Вставьте токен вашего бота из @BotFather:");
+        sub.setPadding(0, 0, 0, 16);
+        layout.addView(sub);
+
         final EditText input = new EditText(context);
         input.setHint("123456789:ABCdefGhIJKlmNoPQRsTuVwxyZ");
+        input.setTypeface(Typeface.MONOSPACE);
         input.setSingleLine(true);
-        builder.setView(input);
+        layout.addView(input);
+
+        builder.setView(layout);
         builder.setPositiveButton("Войти", (dialog, which) -> {
             String token = input.getText().toString().trim();
             if (!token.isEmpty()) {
@@ -232,7 +259,7 @@ public class ColgramBotLogin {
                                 Method runOnUI = auClass.getMethod("runOnUIThread", Runnable.class);
                                 runOnUI.invoke(null, (Runnable) () -> {
                                     dismissProgress(finalProgress);
-                                    Toast.makeText(context, "Вход выполнен успешно!", Toast.LENGTH_SHORT).show();
+                                    Toast.makeText(context, "Успешный вход в аккаунт бота!", Toast.LENGTH_SHORT).show();
                                     if (onLoggedIn != null) {
                                         onLoggedIn.run();
                                     }

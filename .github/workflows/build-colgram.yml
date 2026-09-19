@@ -31,10 +31,8 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r25c
+      - name: Set up Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Clone Telegram Upstream (Official Base)
         run: |
@@ -42,13 +40,13 @@ jobs:
           echo "Target Telegram version: $TARGET_VERSION"
           if [ "$TARGET_VERSION" = "latest" ] || [ -z "$TARGET_VERSION" ]; then
             echo "Cloning latest Telegram release from DrKLO/Telegram..."
-            git clone --depth 1 https://github.com/DrKLO/Telegram.git Telegram-Src
+            git clone --depth 1 --no-tags --single-branch https://github.com/DrKLO/Telegram.git Telegram-Src
           else
             echo "Cloning specific Telegram version $TARGET_VERSION from DrKLO/Telegram..."
-            git clone --depth 1 --branch "$TARGET_VERSION" https://github.com/DrKLO/Telegram.git Telegram-Src
+            git clone --depth 1 --no-tags --single-branch --branch "$TARGET_VERSION" https://github.com/DrKLO/Telegram.git Telegram-Src
           fi
           cd Telegram-Src
-          git submodule update --init TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
+          git submodule update --init --depth 1 TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
           UPSTREAM_TAG=$(git describe --tags --always)
           echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
           echo "Base Telegram Tag: $UPSTREAM_TAG"
@@ -65,7 +63,7 @@ jobs:
         run: |
           cd Telegram-Src
           chmod +x gradlew
-          ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError"
+          ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --build-cache --parallel -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled"
 
       - name: Sign APK (Production / Self-Signed)
         run: |
