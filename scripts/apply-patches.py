@@ -108,8 +108,8 @@ def inject_hooks(repo_path):
     chat_cell = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "ChatMessageCell.java")
     patch_file(
         chat_cell,
-        "public void setMessageObject(MessageObject messageObject,",
-        "public void setMessageObject(MessageObject messageObject,\n        if (messageObject != null && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId())) setAlpha(0.65f); else setAlpha(1.0f);",
+        "if (attachedToWindow && !frozen) {",
+        "if (messageObject != null && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId())) setAlpha(0.65f); else setAlpha(1.0f);\n        if (attachedToWindow && !frozen) {",
         "ChatMessageCell Deleted Styling"
     )
 
@@ -117,15 +117,21 @@ def inject_hooks(repo_path):
     messages_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesController.java")
     patch_file(
         messages_controller,
-        "public void markDialogAsRead(long dialogId, int maxPositiveId",
-        "public void markDialogAsRead(long dialogId, int maxPositiveId,\n        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId)) return;\n",
+        "public void markDialogAsRead(long dialogId, int maxPositiveId, int maxNegativeId, int maxDate, boolean popup, long threadId, int countDiff, boolean readNow, int scheduledCount) {",
+        "public void markDialogAsRead(long dialogId, int maxPositiveId, int maxNegativeId, int maxDate, boolean popup, long threadId, int countDiff, boolean readNow, int scheduledCount) {\n        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId)) return;",
         "MessagesController Ghost Read Receipt"
     )
     patch_file(
         messages_controller,
-        "public boolean sendTyping(long dialogId, long threadMsgId",
-        "public boolean sendTyping(long dialogId, long threadMsgId,\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialogId)) return false;\n",
-        "MessagesController Ghost Typing Suppression"
+        "public boolean sendTyping(long dialogId, long threadMsgId, int action, int classGuid) {",
+        "public boolean sendTyping(long dialogId, long threadMsgId, int action, int classGuid) {\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialogId)) return false;",
+        "MessagesController Ghost Typing Suppression (int)"
+    )
+    patch_file(
+        messages_controller,
+        "public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {",
+        "public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialogId)) return false;",
+        "MessagesController Ghost Typing Suppression (String)"
     )
 
     # 7. Strip trackers from TMessagesProj/build.gradle
