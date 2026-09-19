@@ -711,14 +711,12 @@ public class ColgramBotLoginBottomSheet {
 
     # 18. MessagesController.java -> Suppress checkPromoInfo completely (kill proxy sponsor channels)
     def promo_suppressor(content):
-        import re
-        return re.sub(
-            r'public void checkPromoInfo\s*\([^)]*\)\s*\{',
-            r'public void checkPromoInfo(boolean force) {\n        if (true) return;',
-            content,
-            count=1
-        )
-    patch_file(messages_controller, promo_suppressor, "", "MessagesController Suppress checkPromoInfo")
+        target = "private void checkPromoInfoInternal(boolean reset) {"
+        if target not in content:
+            return content
+        inject = "private void checkPromoInfoInternal(boolean reset) {\n        if (true) return; // Colgram: kill proxy sponsor channels"
+        return content.replace(target, inject, 1)
+    patch_file(messages_controller, promo_suppressor, "if (true) return; // Colgram: kill proxy sponsor channels", "MessagesController Suppress checkPromoInfo")
 
     # 19. DialogsActivity.java -> Make Proxy Button Always Visible In Header & Popup Menu
     dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
