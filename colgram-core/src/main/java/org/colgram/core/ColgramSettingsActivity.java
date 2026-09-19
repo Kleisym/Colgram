@@ -83,13 +83,30 @@ public class ColgramSettingsActivity extends AppCompatActivity {
         });
 
         // Section: Network & Censorship Bypass
-        addSectionHeader(root, "Сеть и обход блокировок");
+        addSectionHeader(root, "Сеть и обход блокировок (Анти-ТСПУ)");
+        addSwitch(root, "Обход блокировок (TCP Desync / 1-байт сплит)", ColgramDpiBypass.isRunning(), (btn, isChecked) -> {
+            if (isChecked) {
+                ColgramDpiBypass.start();
+                ColgramProxyManager.forceApplyProxy(new ColgramProxyManager.ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0));
+                Toast.makeText(this, "Обход блокировок активирован (127.0.0.1:9876)", Toast.LENGTH_SHORT).show();
+            } else {
+                ColgramDpiBypass.stop();
+                Toast.makeText(this, "Обход блокировок выключен", Toast.LENGTH_SHORT).show();
+            }
+        });
         addSwitch(root, "Встроенный Fake-TLS MTProto пул", ColgramConfig.isBuiltinProxyEnabled(), (btn, isChecked) -> {
             ColgramConfig.setBuiltinProxyEnabled(isChecked);
         });
         addSwitch(root, "DNS-over-HTTPS (DoH Cloudflare/Google)", ColgramConfig.isDohEnabled(), (btn, isChecked) -> {
             ColgramConfig.setDohEnabled(isChecked);
         });
+
+        Button switchProxyBtn = new Button(this);
+        switchProxyBtn.setText("🔄 Сменить текущий прокси / обходник");
+        switchProxyBtn.setOnClickListener(v -> {
+            ColgramProxyManager.switchToNextProxy();
+        });
+        root.addView(switchProxyBtn);
 
         // Section: Updates
         addSectionHeader(root, "Обновления Colgram");

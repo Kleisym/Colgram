@@ -1,5 +1,7 @@
 package org.colgram.core;
 
+import android.util.Log;
+
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -11,26 +13,21 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * ColgramDpiBypass — Advanced Embedded Local SOCKS5 Proxy with Multi-Strategy TCP Desync & Anonymity Relay.
+ * ColgramDpiBypass — Embedded Local SOCKS5 Proxy with Multi-Stage TCP Desync.
  * 
  * Evades TSPU / RKN DPI by:
  * 1. 1-Byte TCP Head Splitting with microsecond timing desync.
- * 2. TLS ClientHello SNI Fragmentation to prevent deep packet inspection of domain signatures.
- * 3. Mandatory Anonymity Relay: routes through vetted upstream nodes to guarantee Telegram NEVER
- *    observes the user's real device IP.
+ * 2. Multi-port DC fallback: connects to 443, 80, 5222, 8443 if primary port is throttled.
+ * 3. TLS ClientHello SNI Fragmentation to prevent deep packet inspection of domain signatures.
+ * 4. Completely local (127.0.0.1:9876): zero third-party servers, maximum speed, complete privacy.
  */
 public class ColgramDpiBypass {
 
+    private static final String TAG = "ColgramDpiBypass";
     public static final int LOCAL_PORT = 9876;
     private static ServerSocket serverSocket;
     private static volatile boolean isRunning = false;
     private static final ExecutorService workerPool = Executors.newCachedThreadPool();
-
-    // Upstream fallback / anonymizing relay
-    private static volatile String upstreamHost = null;
-    private static volatile int upstreamPort = 0;
-    private static volatile String upstreamUser = "";
-    private static volatile String upstreamPass = "";
 
     public static synchronized void start() {
         if (isRunning) return;
@@ -41,7 +38,8 @@ public class ColgramDpiBypass {
                 serverSocket = new ServerSocket();
                 serverSocket.setReuseAddress(true);
                 serverSocket.bind(new InetSocketAddress("127.0.0.1", LOCAL_PORT));
-                
+                Log.d(TAG, "ColgramDpiBypass started on 127.0.0.1:" + LOCAL_PORT);
+
                 while (isRunning) {
                     try {
                         Socket clientSocket = serverSocket.accept();
@@ -51,7 +49,7 @@ public class ColgramDpiBypass {
                     }
                 }
             } catch (Exception e) {
-                e.printStackTrace();
+                Log.e(TAG, "ColgramDpiBypass server error", e);
             }
         });
     }
@@ -64,24 +62,11 @@ public class ColgramDpiBypass {
             } catch (Exception ignored) {}
             serverSocket = null;
         }
+        Log.d(TAG, "ColgramDpiBypass stopped");
     }
 
     public static boolean isRunning() {
         return isRunning;
-    }
-
-    public static void setUpstreamProxy(String host, int port, String user, String pass) {
-        upstreamHost = host;
-        upstreamPort = port;
-        upstreamUser = user != null ? user : "";
-        upstreamPass = pass != null ? pass : "";
-    }
-
-    public static void clearUpstreamProxy() {
-        upstreamHost = null;
-        upstreamPort = 0;
-        upstreamUser = "";
-        upstreamPass = "";
     }
 
     private static void handleClient(Socket client) {
@@ -92,28 +77,29 @@ public class ColgramDpiBypass {
             InputStream in = client.getInputStream();
             OutputStream out = client.getOutputStream();
 
-            // SOCKS5 greeting
+            // 1. SOCKS5 greeting
             int ver = in.read();
             if (ver != 5) {
-                client.close();
+                closeQuietly(client);
                 return;
             }
             int nmethods = in.read();
             if (nmethods <= 0) {
-                client.close();
+                closeQuietly(client);
                 return;
             }
             byte[] methods = new byte[nmethods];
             int read = in.read(methods);
             if (read <= 0) {
-                client.close();
+                closeQuietly(client);
                 return;
             }
 
+            // Reply: NO AUTH REQUIRED
             out.write(new byte[]{0x05, 0x00});
             out.flush();
 
-            // SOCKS5 request
+            // 2. SOCKS5 request
             int reqVer = in.read();
             int cmd = in.read();
             int rsv = in.read();
@@ -122,7 +108,7 @@ public class ColgramDpiBypass {
             if (reqVer != 5 || cmd != 1) { // CONNECT only
                 out.write(new byte[]{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
                 out.flush();
-                client.close();
+                closeQuietly(client);
                 return;
             }
 
@@ -141,96 +127,69 @@ public class ColgramDpiBypass {
                 in.read(ip6);
                 destHost = InetAddress.getByAddress(ip6).getHostAddress();
             } else {
-                client.close();
+                closeQuietly(client);
                 return;
             }
 
             int destPort = ((in.read() & 0xFF) << 8) | (in.read() & 0xFF);
 
-            // Connect to target through anonymizing relay or direct with desync
+            // 3. Connect to destination with multi-port fallback & TCP desync
             targetSocket = establishConnection(destHost, destPort);
             if (targetSocket == null) {
-                // Notify Doctor to rotate proxy
-                android.util.Log.w("ColgramDpiBypass", "Connection failure, proxy manager will auto-rotate");
+                Log.w(TAG, "Failed to connect to target: " + destHost + ":" + destPort);
                 out.write(new byte[]{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
                 out.flush();
-                client.close();
+                closeQuietly(client);
                 return;
             }
 
+            // SOCKS5 success reply
             out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
             out.flush();
 
             client.setSoTimeout(0);
             targetSocket.setSoTimeout(0);
 
+            // 4. Pipe traffic with TCP Desync (1-byte head split)
             pipeWithAdvancedDesync(client, targetSocket);
 
         } catch (Exception e) {
-            android.util.Log.w("ColgramDpiBypass", "Connection failure, proxy manager will auto-rotate");
             closeQuietly(client);
             closeQuietly(targetSocket);
         }
     }
 
+    /**
+     * Connects to target host with multi-port fallback:
+     * If port 443 is blocked/throttled by TSPU, automatically attempts 80, 5222, 8443.
+     */
     private static Socket establishConnection(String host, int port) {
-        // Priority 1: Upstream anonymizing relay (guarantees Telegram never sees client IP)
-        if (upstreamHost != null && upstreamPort > 0) {
+        int[] candidatePorts;
+        if (port == 443) {
+            candidatePorts = new int[]{443, 80, 5222, 8443};
+        } else {
+            candidatePorts = new int[]{port};
+        }
+
+        for (int p : candidatePorts) {
             try {
-                Socket s = new Socket();
-                s.setTcpNoDelay(true);
-                s.connect(new InetSocketAddress(upstreamHost, upstreamPort), 3500);
-
-                // Perform SOCKS5 handshake to upstream
-                OutputStream uout = s.getOutputStream();
-                InputStream uin = s.getInputStream();
-                uout.write(new byte[]{0x05, 0x01, 0x00});
-                uout.flush();
-                byte[] r = new byte[2];
-                if (uin.read(r) == 2 && r[0] == 0x05 && r[1] == 0x00) {
-                    // Connect to destHost:destPort through upstream
-                    byte[] hostBytes = host.getBytes(StandardCharsets.UTF_8);
-                    byte[] req = new byte[7 + hostBytes.length];
-                    req[0] = 0x05;
-                    req[1] = 0x01; // CONNECT
-                    req[2] = 0x00;
-                    req[3] = 0x03; // Domain
-                    req[4] = (byte) hostBytes.length;
-                    System.arraycopy(hostBytes, 0, req, 5, hostBytes.length);
-                    req[5 + hostBytes.length] = (byte) ((port >> 8) & 0xFF);
-                    req[6 + hostBytes.length] = (byte) (port & 0xFF);
-
-                    uout.write(req);
-                    uout.flush();
-
-                    byte[] resp = new byte[10];
-                    int readLen = uin.read(resp);
-                    if (readLen >= 4 && resp[1] == 0x00) {
-                        return s;
-                    }
-                }
-                s.close();
+                Socket directSocket = new Socket();
+                directSocket.setTcpNoDelay(true);
+                directSocket.connect(new InetSocketAddress(host, p), 3000);
+                return directSocket;
             } catch (Exception ignored) {}
         }
-
-        // Priority 2: Direct with TCP Desync
-        try {
-            Socket directSocket = new Socket();
-            directSocket.setTcpNoDelay(true);
-            directSocket.connect(new InetSocketAddress(host, port), 3500);
-            return directSocket;
-        } catch (Exception e) {
-            return null;
-        }
+        return null;
     }
 
     /**
      * Advanced TCP Desync:
-     * 1. 1-byte head split.
-     * 2. SNI / MTProto handshake fragmenting.
-     * 3. Microsecond timing jitter to desynchronize DPI state tracking.
+     * 1. 1-byte head split: sends the first byte in a separate TCP packet.
+     * 2. 3ms delay to desynchronize TSPU DPI state machines.
+     * 3. Sends the remainder of the handshake.
      */
     private static void pipeWithAdvancedDesync(final Socket client, final Socket dest) {
+        // Client -> Target (Desynced)
         workerPool.execute(() -> {
             try {
                 InputStream cin = client.getInputStream();
@@ -242,24 +201,22 @@ public class ColgramDpiBypass {
                 while ((len = cin.read(buffer)) != -1) {
                     if (firstPacket) {
                         firstPacket = false;
-                        // Multi-Stage TCP Desync for Handshake
                         if (len > 5 && buffer[0] == 0x16 && buffer[1] == 0x03) {
-                            // TLS ClientHello detected: Split across record header (5 bytes)
+                            // TLS ClientHello: Split across record header (5 bytes)
                             dout.write(buffer, 0, 5);
                             dout.flush();
-                            try { Thread.sleep(2); } catch (Exception ignored) {}
-                            // Split SNI payload
+                            try { Thread.sleep(3); } catch (Exception ignored) {}
                             int mid = 5 + Math.min(20, len - 5);
                             dout.write(buffer, 5, mid - 5);
                             dout.flush();
-                            try { Thread.sleep(2); } catch (Exception ignored) {}
+                            try { Thread.sleep(3); } catch (Exception ignored) {}
                             dout.write(buffer, mid, len - mid);
                             dout.flush();
                         } else if (len > 1) {
                             // MTProto handshake: 1-byte split
                             dout.write(buffer, 0, 1);
                             dout.flush();
-                            try { Thread.sleep(2); } catch (Exception ignored) {}
+                            try { Thread.sleep(3); } catch (Exception ignored) {}
                             dout.write(buffer, 1, len - 1);
                             dout.flush();
                         } else {
@@ -278,6 +235,7 @@ public class ColgramDpiBypass {
             }
         });
 
+        // Target -> Client (Direct)
         workerPool.execute(() -> {
             try {
                 InputStream din = dest.getInputStream();

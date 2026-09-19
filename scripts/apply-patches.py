@@ -244,6 +244,48 @@ def inject_hooks(repo_path):
             "IntroActivity Apply Language Configuration"
         )
 
+    # 13. LoginActivity.java -> Visual Alert and Auto-Rotation on -1000 Connection Error in PhoneView
+    phone_error_target = """fillNextCodeParams(params, (TLRPC.auth_SentCode) response);
+                    }
+                } else {
+                    if (error.text != null) {"""
+    phone_error_replacement = """fillNextCodeParams(params, (TLRPC.auth_SentCode) response);
+                    }
+                } else {
+                    if (error != null && (error.code == -1000 || error.text == null)) {
+                        try {
+                            android.widget.Toast.makeText(getParentActivity(), "Ошибка соединения с Telegram (-1000). Переключаем прокси...", android.widget.Toast.LENGTH_SHORT).show();
+                            org.colgram.core.ColgramProxyManager.switchToNextProxy();
+                        } catch (Throwable ignored) {}
+                    }
+                    if (error.text != null) {"""
+    patch_file(
+        login_activity,
+        phone_error_target,
+        phone_error_replacement,
+        "LoginActivity Handle -1000 Connection Error In PhoneView"
+    )
+
+    phone_error_target2 = """} else if (error.code != -1000) {
+                            AlertsCreator.processError(currentAccount, error, LoginActivity.this, req, phoneInputData.phoneNumber);
+                        }"""
+    phone_error_replacement2 = """} else {
+                            if (error.code != -1000) {
+                                AlertsCreator.processError(currentAccount, error, LoginActivity.this, req, phoneInputData.phoneNumber);
+                            } else {
+                                try {
+                                    android.widget.Toast.makeText(getParentActivity(), "Ошибка соединения с Telegram (-1000). Переключаем прокси...", android.widget.Toast.LENGTH_SHORT).show();
+                                    org.colgram.core.ColgramProxyManager.switchToNextProxy();
+                                } catch (Throwable ignored) {}
+                            }
+                        }"""
+    patch_file(
+        login_activity,
+        phone_error_target2,
+        phone_error_replacement2,
+        "LoginActivity Process -1000 Alerts In PhoneView"
+    )
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
