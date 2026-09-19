@@ -220,6 +220,20 @@ def inject_core(repo_path, core_source_dir):
                 f.write(content)
             print(" [+] Added colgram-core dependency to TMessagesProj/build.gradle")
 
+def clone_required_submodules(repo_path):
+    print("[*] Cloning required submodules for Gradle (media & jlatexmath)...")
+    media_dir = os.path.join(repo_path, "TMessagesProj_Modules", "media")
+    if not os.path.exists(media_dir):
+        os.makedirs(os.path.dirname(media_dir), exist_ok=True)
+        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/Arseny271/media.git", media_dir])
+        print(" [+] Cloned media submodule")
+
+    jlatex_dir = os.path.join(repo_path, "TMessagesProj", "lib", "jlatexmath")
+    if not os.path.exists(jlatex_dir):
+        os.makedirs(os.path.dirname(jlatex_dir), exist_ok=True)
+        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/dkaraush/jlatexmath-android.git", jlatex_dir])
+        print(" [+] Cloned jlatexmath submodule")
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
@@ -230,6 +244,7 @@ def main():
         print(f"[!] Target Telegram repo not found at: {target_repo}")
         sys.exit(1)
 
+    clone_required_submodules(target_repo)
     inject_core(target_repo, core_dir)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)
