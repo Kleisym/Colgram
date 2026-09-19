@@ -1,0 +1,20 @@
+--- a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
++++ b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
+@@ -1024,6 +1024,19 @@ public class ConnectionsManager {
+         String systemVersion = Build.VERSION.RELEASE;
+         String appVersion = BuildVars.BUILD_VERSION_STRING;
+         String langCode = LocaleController.getInstance().getSystemDefaultLocale().getLanguage();
++
++        // Colgram Cloak: Spoof hardware model, Android OS version, and locale parameters
++        java.util.Map<String, String> cloaked = org.colgram.core.ColgramHookHandler.hookInitConnection(
++            deviceModel, systemVersion, appVersion, langCode
++        );
++        if (cloaked != null) {
++            if (cloaked.containsKey("device_model")) deviceModel = cloaked.get("device_model");
++            if (cloaked.containsKey("system_version")) systemVersion = cloaked.get("system_version");
++            if (cloaked.containsKey("app_version")) appVersion = cloaked.get("app_version");
++            if (cloaked.containsKey("lang_code")) langCode = cloaked.get("lang_code");
++        }
++
+         initConnection(currentDatacenterId, BuildVars.APP_ID, deviceModel, systemVersion, appVersion, langCode, langCode, "android", null, null, 0, 0, currentLayer);
+     }

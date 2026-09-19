@@ -1,0 +1,18 @@
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
+@@ -2150,6 +2150,13 @@ public class ChatMessageCell extends View {
+         if (currentMessageObject == null) {
+             return;
+         }
++
++        // Colgram: Check if this message was deleted by the sender
++        boolean isDeleted = org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(
++            currentMessageObject.getDialogId(), currentMessageObject.getId()
++        );
++        if (isDeleted) {
++            // Apply subtle gray alpha styling to indicate deleted status
++            setAlpha(0.65f);
++        } else {
++            setAlpha(1.0f);
++        }
+     }

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.colgram.core">
+
+    <application>
+        <activity
+            android:name=".ColgramSettingsActivity"
+            android:label="Colgram Settings"
+            android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar"
+            android:exported="false" />
+    </application>
+
+</manifest>

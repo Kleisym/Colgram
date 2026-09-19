@@ -1,0 +1,32 @@
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
+@@ -3420,6 +3420,13 @@ public class MessagesController {
+     public void markMessageContentAsDeleted(ArrayList<Integer> markAsDeletedMessages, int channelId) {
+         if (markAsDeletedMessages == null || markAsDeletedMessages.isEmpty()) {
+             return;
+         }
++        // Colgram: Intercept deletion and record deleted messages in local vault
++        ArrayList<Integer> filtered = new ArrayList<>();
++        for (int i = 0; i < markAsDeletedMessages.size(); i++) {
++            int msgId = markAsDeletedMessages.get(i);
++            if (!org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(channelId != 0 ? -channelId : 0, msgId)) {
++                filtered.add(msgId);
++            }
++        }
++        markAsDeletedMessages = filtered;
++        if (markAsDeletedMessages.isEmpty()) return;
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
+@@ -4890,6 +4890,14 @@ public class MessagesController {
+     public void checkMessageForEdits(TLRPC.Message message, TLRPC.Message existingMessage) {
+         if (message == null || existingMessage == null) {
+             return;
+         }
++        // Colgram: Save previous message text and edit timestamp to history
++        if (existingMessage.message != null && !existingMessage.message.equals(message.message)) {
++            long dialogId = message.dialog_id != 0 ? message.dialog_id : message.peer_id.channel_id;
++            org.colgram.core.ColgramHookHandler.hookOnMessageEdited(
++                dialogId, message.id, existingMessage.message, message.edit_date
++            );
++        }
+     }

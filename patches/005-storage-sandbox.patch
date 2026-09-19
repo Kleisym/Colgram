@@ -1,0 +1,15 @@
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
+@@ -880,6 +880,11 @@ public class FileLoader {
+     public static File getDirectory(int type) {
++        // Colgram: Divert storage into isolated sandbox directory
++        File sandboxed = org.colgram.core.ColgramHookHandler.hookGetDirectory(type);
++        if (sandboxed != null) {
++            return sandboxed;
++        }
+         File dir = mediaDirs.get(type);
+         if (dir == null && type != 4) {
+             dir = mediaDirs.get(MEDIA_DIR_CACHE);
+         }
+         return dir;
+     }

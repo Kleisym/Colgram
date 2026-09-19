@@ -1,0 +1,18 @@
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
+@@ -1120,6 +1120,11 @@ public class FileLoader {
+     public static void deleteFiles(ArrayList<File> files, int type) {
+         if (files == null || files.isEmpty()) {
+             return;
+         }
+         for (int a = 0; a < files.size(); a++) {
+             File file = files.get(a);
++            // Colgram: Preserve media files belonging to deleted messages
++            if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) {
++                continue;
++            }
+             if (file.exists()) {
+                 file.delete();
+             }
+         }
+     }

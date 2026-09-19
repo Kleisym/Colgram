@@ -1,0 +1,29 @@
+--- a/TMessagesProj/build.gradle
++++ b/TMessagesProj/build.gradle
+@@ -100,18 +100,6 @@ dependencies {
+     implementation "androidx.core:core:1.12.0"
+     implementation "androidx.palette:palette:1.0.0"
+     implementation "androidx.exifinterface:exifinterface:1.3.6"
+-    // Stripped telemetry and proprietary trackers
+-    // implementation 'com.google.firebase:firebase-messaging:23.2.1'
+-    // implementation 'com.google.firebase:firebase-analytics:21.3.0'
+-    // implementation 'com.google.android.gms:play-services-base:18.2.0'
+-    // implementation 'com.google.android.gms:play-services-maps:18.1.0'
+-    // implementation 'com.google.android.gms:play-services-location:21.0.1'
+-    // implementation 'com.google.firebase:firebase-crashlytics:18.4.1'
+-    // implementation 'com.huawei.hms:push:6.7.0.300'
++    
++    // Colgram isolated privacy core
++    implementation project(':colgram-core')
+ }
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
+@@ -420,6 +420,9 @@ public class ApplicationLoader extends Application {
+         applicationContext = this;
++
++        // Initialize Colgram Privacy & Security Core
++        org.colgram.core.ColgramHookHandler.init(this);
++
+-        // Stripped Google / Firebase tracker initialization
+-        // FirebaseApp.initializeApp(this);
+-        // FirebaseCrashlytics.getInstance().setCrashlyticsCollectionEnabled(false);

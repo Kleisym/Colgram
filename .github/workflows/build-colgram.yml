@@ -1,0 +1,86 @@
+name: Build Colgram (Automated Privacy Telegram)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    # Check for upstream Telegram updates daily at 04:00 UTC
+    - cron: '0 4 * * *'
+
+jobs:
+  build:
+    name: Build & Publish Colgram APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Colgram Mod Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Clone Telegram Upstream (FOSS Base)
+        run: |
+          echo "Cloning latest Telegram-FOSS release..."
+          git clone --depth 1 https://github.com/Telegram-FOSS/Telegram-FOSS.git Telegram-FOSS
+          cd Telegram-FOSS
+          UPSTREAM_TAG=$(git describe --tags --always)
+          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
+          echo "Base Telegram Tag: $UPSTREAM_TAG"
+
+      - name: Apply Colgram Core & Surgical Patches
+        run: |
+          python3 scripts/apply-patches.py Telegram-FOSS
+
+      - name: Audit Privacy & Check for Trackers
+        run: |
+          python3 scripts/verify-privacy.py Telegram-FOSS
+
+      - name: Build Colgram APK
+        run: |
+          cd Telegram-FOSS
+          chmod +x gradlew
+          ./gradlew assembleAfatRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError"
+
+      - name: Sign APK
+        uses: ralfirza/apk-signer@v1
+        with:
+          apk-file: Telegram-FOSS/TMessagesProj/build/outputs/apk/afat/release/TMessagesProj-afat-release-unsigned.apk
+          key-store: ${{ secrets.SIGNING_KEYSTORE }}
+          key-alias: ${{ secrets.ALIAS }}
+          key-store-password: ${{ secrets.KEY_STORE_PASSWORD }}
+          key-password: ${{ secrets.KEY_PASSWORD }}
+        continue-on-error: true
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Colgram-Release-APK
+          path: Telegram-FOSS/TMessagesProj/build/outputs/apk/**/*.apk
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Telegram-FOSS/TMessagesProj/build/outputs/apk/**/*.apk
+          tag_name: colgram-${{ env.UPSTREAM_TAG }}-${{ github.run_number }}
+          name: Colgram v${{ env.UPSTREAM_TAG }} (Build ${{ github.run_number }})
+          body: |
+            ## Colgram Automated Release
+            - **Telegram Base**: `${{ env.UPSTREAM_TAG }}`
+            - **Hardware Cloaking**: Enabled (Spoofed device & OS info)
+            - **Anti-Delete Vault**: Active (Preserves deleted messages & edit logs)
+            - **Storage Sandbox**: Scoped to isolated folder
+            - **Built-in MTProto**: Fake-TLS anti-censorship pool active
+            - **Telemetry**: 100% Stripped (No Firebase / Play Services / HMS)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

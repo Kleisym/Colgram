@@ -1,0 +1,16 @@
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/BaseFragment.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/BaseFragment.java
+@@ -350,6 +350,11 @@ public class BaseFragment {
+     public void setFlagsSecure(boolean secure) {
++        // Colgram: Bypass screenshot and screen recording restrictions
++        if (org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()) {
++            secure = false;
++        }
+         if (parentActivity != null && parentActivity.getWindow() != null) {
+             if (secure) {
+                 parentActivity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+             } else {
+                 parentActivity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+             }
+         }
+     }

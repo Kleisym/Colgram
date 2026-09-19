@@ -1,0 +1,22 @@
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
+@@ -5120,6 +5120,11 @@ public class MessagesController {
+     public boolean markDialogAsRead(long dialog_id, int max_id, int max_date, int count, boolean isChat, int channelId, int ttl, int force) {
++        // Colgram Ghost Mode: Prevent sending read receipt to server
++        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialog_id)) {
++            return false;
++        }
+         TLRPC.TL_messages_readHistory req = new TLRPC.TL_messages_readHistory();
+         req.peer = getInputPeer((int) dialog_id);
+         req.max_id = max_id;
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
+@@ -6320,6 +6320,11 @@ public class MessagesController {
+     public void sendTyping(long dialog_id, int threadId, int action, int classGuid) {
++        // Colgram Ghost Mode: Prevent sending typing status
++        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialog_id)) {
++            return;
++        }
+         TLRPC.TL_messages_setTyping req = new TLRPC.TL_messages_setTyping();
+         req.peer = getInputPeer((int) dialog_id);
+         req.action = new TLRPC.TL_sendMessageTypingAction();

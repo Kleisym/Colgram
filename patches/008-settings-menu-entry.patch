@@ -1,0 +1,15 @@
+--- a/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
+@@ -820,6 +820,13 @@ public class SettingsActivity extends BaseFragment {
+                 if (position == privacyRow) {
+                     presentFragment(new PrivacySettingsActivity());
++                } else if (position == colgramRow) {
++                    org.colgram.core.ColgramHookHandler.openSettings(getParentActivity());
+                 }
++                // Colgram: Added settings entry row
+--- a/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
+@@ -1240,6 +1240,9 @@ public class SettingsActivity extends BaseFragment {
+         privacyRow = rowCount++;
++        colgramRow = rowCount++;
+         securityRow = rowCount++;
