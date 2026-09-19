@@ -342,7 +342,7 @@ def inject_hooks(repo_path):
     patch_file(
         login_activity,
         login_btn_replacer,
-        "",
+        alt_login_btn,
         "LoginActivity QR Login & Bot Token Buttons"
     )
 

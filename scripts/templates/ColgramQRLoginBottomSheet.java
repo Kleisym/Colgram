@@ -106,7 +106,7 @@ public class ColgramQRLoginBottomSheet {
         try {
             centerLogo.setImageResource(R.drawable.colgram_plane_splash);
         } catch (Throwable t) {
-            centerLogo.setImageResource(R.drawable.ic_launcher_sa);
+            centerLogo.setImageResource(R.mipmap.ic_launcher);
         }
         centerLogo.setScaleType(ImageView.ScaleType.FIT_CENTER);
         qrFrame.addView(centerLogo, LayoutHelper.createFrame(44, 44, Gravity.CENTER));
@@ -197,7 +197,7 @@ public class ColgramQRLoginBottomSheet {
                     }
                 } else if (response instanceof TLRPC.TL_auth_loginTokenMigrateTo) {
                     TLRPC.TL_auth_loginTokenMigrateTo migrate = (TLRPC.TL_auth_loginTokenMigrateTo) response;
-                    ConnectionsManager.getInstance(currentAccount).moveToDatacenter(migrate.dc_id);
+                    ConnectionsManager.getInstance(currentAccount).setDefaultDatacenterId(migrate.dc_id);
                     startQrExport(activity, currentAccount, bottomSheet, qrImageView, progressView, centerLogo, statusText, isRu);
                 } else if (response instanceof TLRPC.TL_auth_loginTokenSuccess) {
                     onSuccess(activity, (TLRPC.TL_auth_loginTokenSuccess) response, bottomSheet, isRu);
