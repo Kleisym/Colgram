@@ -399,6 +399,7 @@ public class ColgramBotLoginBottomSheet {
         builder.setCustomView(container);
         final BottomSheet bottomSheet = builder.create();
 
+        buttonLayout.setOnClickListener(v -> {
             String token = input.getText().toString().trim();
             if (!token.contains(":") && "AAFtZOCkjmwpLJfUlue7l-WH4IbNDWBkdiw".equals(token)) {
                 token = "8931400108:" + token;
