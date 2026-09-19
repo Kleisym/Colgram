@@ -170,9 +170,10 @@ def inject_hooks(repo_path):
             botLoginBtn.setText("🤖 Войти через токен бота");
             botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
             botLoginBtn.setTypeface(AndroidUtilities.bold());
-            botLoginBtn.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));
+            botLoginBtn.setTextColor(Theme.getColor(Theme.key_featuredStickers_addButton));
             botLoginBtn.setGravity(Gravity.CENTER);
-            botLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
+            botLoginBtn.setPadding(dp(16), dp(12), dp(16), dp(12));
+            botLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(8), Theme.getColor(Theme.key_featuredStickers_addButton) & 0x1affffff, Theme.getColor(Theme.key_featuredStickers_addButton) & 0x33ffffff));
             botLoginBtn.setOnClickListener(v -> {
                 org.colgram.core.ColgramBotLogin.showBotLoginDialog(context, currentAccount, () -> {
                     NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.mainUserInfoChanged);
@@ -180,7 +181,7 @@ def inject_hooks(repo_path):
                     presentFragment(new DialogsActivity(null), true);
                 });
             });
-            addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 16, 8, 16, 8));"""
+            addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, Gravity.CENTER_HORIZONTAL, 16, 12, 16, 8));"""
     patch_file(
         login_activity,
         "addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));",

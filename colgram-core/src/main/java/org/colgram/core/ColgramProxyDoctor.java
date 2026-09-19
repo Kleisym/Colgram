@@ -88,9 +88,12 @@ public class ColgramProxyDoctor {
         appContext = context.getApplicationContext();
 
         // Seed with high-availability verified defaults
-        verifiedPool.add(new VerifiedProxy("t.meow-meow-fast.site", 443, "eeaea279c83d92a4c4fa8a780775d0458b73332e616d617a6f6e6177732e636f6d", 1, 150));
-        verifiedPool.add(new VerifiedProxy("yostavpn.casacam.net", 443, "eec17adfc3591215500ff524021295b2fa636c6f7564666c6172652e636f6d", 1, 180));
-        verifiedPool.add(new VerifiedProxy("sioms.co.uk", 25565, "ee104462821249bd7ac519130220c25d0963646e2e79656b74616e65742e636f6d", 1, 210));
+        verifiedPool.add(new VerifiedProxy("media.experthost.shop", 443, "ee92ccb7af38638802ad9afb21d587fa9f7777772e6d6963726f736f66742e636f6d", 1, 12));
+        verifiedPool.add(new VerifiedProxy("194.59.221.90", 8443, "eef4b79908a669cfe8f29394142828b8e07777772e676f6f676c652e636f6d", 1, 15));
+        verifiedPool.add(new VerifiedProxy("yostavpn.casacam.net", 443, "eec17adfc3591215500ff524021295b2fa636c6f7564666c6172652e636f6d", 1, 169));
+        verifiedPool.add(new VerifiedProxy("sioms.co.uk", 25565, "ee104462821249bd7ac519130220c25d0963646e2e79656b74616e65742e636f6d", 1, 150));
+        verifiedPool.add(new VerifiedProxy("t.meow-meow-fast.site", 443, "eeaea279c83d92a4c4fa8a780775d0458b73332e616d617a6f6e6177732e636f6d", 1, 200));
+        verifiedPool.add(new VerifiedProxy("ma.hastim.co.uk", 443, "ee1603010200010001fc030386e24c3add7777772e676f6f676c652e636f6d", 1, 194));
 
         // Initial scrape and verification immediately
         workerPool.execute(ColgramProxyDoctor::runDoctorAuditCycle);
