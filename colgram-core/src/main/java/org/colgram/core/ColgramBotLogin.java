@@ -230,17 +230,12 @@ public class ColgramBotLogin {
             int apiId = bvClass.getField("APP_ID").getInt(null);
             String apiHash = (String) bvClass.getField("APP_HASH").get(null);
 
-            TL_auth_importBotAuthorization reqObj = new TL_auth_importBotAuthorization();
-            reqObj.api_id = apiId;
-            reqObj.api_hash = apiHash;
-            reqObj.bot_auth_token = token;
-            Object req = reqObj.createTLObject();
-
-            if (req == null) {
-                dismissProgress(finalProgress);
-                Toast.makeText(context, "Ошибка создания запроса авторизации", Toast.LENGTH_SHORT).show();
-                return;
-            }
+            Class<?> reqClass = Class.forName("org.telegram.tgnet.TLRPC$TL_auth_importBotAuthorization");
+            Object req = reqClass.getConstructor().newInstance();
+            reqClass.getField("flags").setInt(req, 0);
+            reqClass.getField("api_id").setInt(req, apiId);
+            reqClass.getField("api_hash").set(req, apiHash);
+            reqClass.getField("bot_auth_token").set(req, token);
 
             Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
             Method getInstance = cmClass.getMethod("getInstance", int.class);
@@ -301,14 +296,15 @@ public class ColgramBotLogin {
 
             Method sendReq = null;
             for (Method m : cmClass.getMethods()) {
-                if (m.getName().equals("sendRequest") && m.getParameterTypes().length >= 2) {
+                if (m.getName().equals("sendRequest") && m.getParameterTypes().length == 3 && m.getParameterTypes()[2] == int.class) {
                     sendReq = m;
                     break;
                 }
             }
 
+            int reqFlags = 1 | 2 | 8 | 16; // RequestFlagEnableUnauthorized | RequestFlagFailOnServerErrors | RequestFlagWithoutLogin | RequestFlagTryDifferentDc
             if (sendReq != null) {
-                sendReq.invoke(cm, req, delegate);
+                sendReq.invoke(cm, req, delegate, reqFlags);
             }
 
         } catch (Throwable t) {
