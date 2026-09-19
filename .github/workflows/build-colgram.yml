@@ -65,10 +65,16 @@ jobs:
           echo "Using apksigner at: $APKSIGNER"
           
           # Find unsigned APK
-          UNSIGNED_APK=$(find Telegram-Src -name "*.apk" | head -n 1)
+          UNSIGNED_APK=$(find Telegram-Src -name "*afat*release*.apk" | head -n 1)
+          if [ -z "$UNSIGNED_APK" ]; then
+            UNSIGNED_APK=$(find Telegram-Src/TMessagesProj_AppStandalone/build/outputs/apk -name "*.apk" | head -n 1)
+          fi
+          if [ -z "$UNSIGNED_APK" ]; then
+            UNSIGNED_APK=$(find Telegram-Src -name "*.apk" | head -n 1)
+          fi
           echo "Target APK: $UNSIGNED_APK"
           
-          if [ -f "$UNSIGNED_APK" ]; then
+          if [ -n "$UNSIGNED_APK" ] && [ -f "$UNSIGNED_APK" ]; then
             $APKSIGNER sign --ks colgram.keystore --ks-pass pass:colgrampass --key-pass pass:colgrampass --out colgram-signed-release.apk "$UNSIGNED_APK"
             echo "Successfully signed: colgram-signed-release.apk"
           else

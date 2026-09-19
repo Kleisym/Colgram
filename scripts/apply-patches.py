@@ -162,6 +162,9 @@ def download_official_binaries(repo_path):
         with zipfile.ZipFile(temp_apk, 'r') as zip_ref:
             for file_info in zip_ref.infolist():
                 if file_info.filename.startswith("lib/"):
+                    # Exclude third-party libs like liblanguage_id_l2c_jni.so that come from AAR dependencies
+                    if "liblanguage_id" in file_info.filename or not file_info.filename.endswith(".so"):
+                        continue
                     rel_path = file_info.filename[len("lib/"):]
                     target_file = os.path.join(jni_libs_dir, rel_path)
                     os.makedirs(os.path.dirname(target_file), exist_ok=True)
@@ -203,6 +206,25 @@ def download_official_binaries(repo_path):
             with open(tmessages_gradle, "w", encoding="utf-8") as f:
                 f.write(gradle_content)
             print(" [+] Cleanly configured Gradle jniLibs and removed externalNativeBuild")
+
+        # Configure packagingOptions in all app and library modules to pickFirst on .so files
+        for module in ["TMessagesProj", "TMessagesProj_AppStandalone"]:
+            gradle_path = os.path.join(repo_path, module, "build.gradle")
+            if os.path.exists(gradle_path):
+                with open(gradle_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                packaging_code = """
+    packagingOptions {
+        jniLibs {
+            pickFirsts += ['**/*.so']
+        }
+    }
+"""
+                if "pickFirsts += ['**/*.so']" not in content:
+                    content = content.replace("android {", "android {" + packaging_code, 1)
+                    with open(gradle_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    print(f" [+] Added packagingOptions to {module}/build.gradle")
 
     except Exception as e:
         print(f" [!] Warning: Prebuilt binary extraction encountered error: {e}")
