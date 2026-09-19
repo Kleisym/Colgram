@@ -370,7 +370,42 @@ public class ColgramBotLoginBottomSheet {
         });
         inputCard.addView(pasteBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
 
-        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 52, 0, 0, 0, 18));
+        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 52, 0, 0, 0, 10));
+
+        // API ID & API Hash inputs (to bypass API_ID_PUBLISHED_FLOOD)
+        LinearLayout apiCard = new LinearLayout(context);
+        apiCard.setOrientation(LinearLayout.HORIZONTAL);
+        apiCard.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
+                AndroidUtilities.dp(10),
+                cardBg,
+                cardBg
+        ));
+        apiCard.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(4), AndroidUtilities.dp(12), AndroidUtilities.dp(4));
+
+        EditText apiIdInput = new EditText(context);
+        apiIdInput.setHint(isRu ? "API ID (my.telegram.org)" : "API ID (my.telegram.org)");
+        apiIdInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+        apiIdInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        apiIdInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        apiIdInput.setBackground(null);
+        apiIdInput.setSingleLine(true);
+        apiIdInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        apiCard.addView(apiIdInput, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 0.45f, Gravity.CENTER_VERTICAL));
+
+        View divider = new View(context);
+        divider.setBackgroundColor(Theme.getColor(Theme.key_divider));
+        apiCard.addView(divider, LayoutHelper.createLinear(1, 24, Gravity.CENTER_VERTICAL, 8, 0, 8, 0));
+
+        EditText apiHashInput = new EditText(context);
+        apiHashInput.setHint(isRu ? "API Hash" : "API Hash");
+        apiHashInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+        apiHashInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        apiHashInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        apiHashInput.setBackground(null);
+        apiHashInput.setSingleLine(true);
+        apiCard.addView(apiHashInput, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 0.55f, Gravity.CENTER_VERTICAL));
+
+        container.addView(apiCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 46, 0, 0, 0, 16));
 
         // Primary Action Button
         FrameLayout buttonLayout = new FrameLayout(context);
@@ -411,16 +446,32 @@ public class ColgramBotLoginBottomSheet {
                 return;
             }
 
+            int targetApiId = BuildVars.APP_ID;
+            String targetApiHash = BuildVars.APP_HASH;
+
+            String customIdStr = apiIdInput.getText().toString().trim();
+            String customHashStr = apiHashInput.getText().toString().trim();
+            if (!customIdStr.isEmpty()) {
+                try {
+                    targetApiId = Integer.parseInt(customIdStr);
+                } catch (Throwable ignored) {}
+            }
+            if (!customHashStr.isEmpty()) {
+                targetApiHash = customHashStr;
+            }
+
             buttonText.setVisibility(View.INVISIBLE);
             progressView.setVisibility(View.VISIBLE);
             buttonLayout.setEnabled(false);
             input.setEnabled(false);
             pasteBtn.setEnabled(false);
+            apiIdInput.setEnabled(false);
+            apiHashInput.setEnabled(false);
 
             TLRPC.TL_auth_importBotAuthorization req = new TLRPC.TL_auth_importBotAuthorization();
             req.flags = 0;
-            req.api_id = BuildVars.APP_ID;
-            req.api_hash = BuildVars.APP_HASH;
+            req.api_id = targetApiId;
+            req.api_hash = targetApiHash;
             req.bot_auth_token = token;
 
             int flags = ConnectionsManager.RequestFlagEnableUnauthorized
@@ -446,10 +497,16 @@ public class ColgramBotLoginBottomSheet {
                     buttonLayout.setEnabled(true);
                     input.setEnabled(true);
                     pasteBtn.setEnabled(true);
+                    apiIdInput.setEnabled(true);
+                    apiHashInput.setEnabled(true);
 
                     String errorMsg = (error != null && error.text != null) ? error.text : "UNKNOWN_ERROR";
                     if ("BOT_TOKEN_INVALID".equals(errorMsg)) {
                         errorMsg = isRu ? "Неверный токен бота (BOT_TOKEN_INVALID). Проверьте токен в @BotFather." : "Invalid bot token (BOT_TOKEN_INVALID).";
+                    } else if ("API_ID_PUBLISHED_FLOOD".equals(errorMsg)) {
+                        errorMsg = isRu
+                                ? "Telegram запрещает стандартный API ID для ботов (API_ID_PUBLISHED_FLOOD). Укажите свой API ID и Hash с my.telegram.org."
+                                : "Official API ID is blocked for bots (API_ID_PUBLISHED_FLOOD). Enter custom API ID & Hash from my.telegram.org.";
                     }
                     Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show();
                 }
