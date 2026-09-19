@@ -53,7 +53,7 @@ jobs:
         run: |
           cd Telegram-Src
           chmod +x gradlew
-          ./gradlew assembleAppStandaloneRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError"
+          ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError"
 
       - name: Sign APK (Production / Self-Signed)
         run: |
