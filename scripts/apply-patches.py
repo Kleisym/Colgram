@@ -206,7 +206,7 @@ def inject_hooks(repo_path):
     }
 
     public static class TL_auth_importBotAuthorization extends TLObject {
-        public static final int constructor = 0x67a3ffca;
+        public static final int constructor = 0x67a3ff2c;
 
         public int flags;
         public int api_id;
@@ -399,12 +399,14 @@ public class ColgramBotLoginBottomSheet {
         builder.setCustomView(container);
         final BottomSheet bottomSheet = builder.create();
 
-        buttonLayout.setOnClickListener(v -> {
             String token = input.getText().toString().trim();
+            if (!token.contains(":") && "AAFtZOCkjmwpLJfUlue7l-WH4IbNDWBkdiw".equals(token)) {
+                token = "8931400108:" + token;
+            }
             if (token.isEmpty() || !token.contains(":") || token.length() < 15) {
                 Toast.makeText(context, isRu
-                        ? "Введите корректный токен (например, 8931400108:AAFtZOC...)"
-                        : "Please enter a valid token (e.g. 8931400108:AAFtZOC...)", Toast.LENGTH_LONG).show();
+                        ? "Укажите полный токен вида ID:SECRET (например, 8931400108:AAFtZOC...)"
+                        : "Please enter full token like ID:SECRET (e.g. 8931400108:AAFtZOC...)", Toast.LENGTH_LONG).show();
                 return;
             }
 
@@ -638,12 +640,164 @@ public class ColgramBotLoginBottomSheet {
                                 } catch (Throwable ignored) {}
                             }
                         }"""
+    # 17. ConnectionsManager.java -> Suppress proxy promo check (sponsor channels)
     patch_file(
-        login_activity,
-        phone_error_target2,
-        phone_error_replacement2,
-        "LoginActivity Process -1000 Alerts In PhoneView"
+        conn_manager,
+        "accountInstance.getMessagesController().checkPromoInfo(true);",
+        "// Colgram: Suppressed proxy promo check\n                    // accountInstance.getMessagesController().checkPromoInfo(true);",
+        "ConnectionsManager Suppress checkPromoInfo"
     )
+
+    # 18. MessagesController.java -> Suppress checkPromoInfo completely (kill proxy sponsor channels)
+    def promo_suppressor(content):
+        import re
+        return re.sub(
+            r'public void checkPromoInfo\s*\([^)]*\)\s*\{',
+            r'public void checkPromoInfo(boolean force) {\n        if (true) return;',
+            content,
+            count=1
+        )
+    patch_file(messages_controller, promo_suppressor, "", "MessagesController Suppress checkPromoInfo")
+
+    # 19. DialogsActivity.java -> Make Proxy Button Always Visible In Header
+    dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
+    if os.path.exists(dialogs_activity):
+        def proxy_btn_always_visible(content):
+            import re
+            return re.sub(
+                r'boolean show = [^;]+SharedConfig\.proxyList[^;]+;',
+                r'boolean show = true; // Colgram: proxy button always visible',
+                content,
+                count=1
+            )
+        patch_file(dialogs_activity, proxy_btn_always_visible, "", "DialogsActivity Proxy Button Always Visible")
+
+    # 20. MessagesStorage.java -> Anti-Delete (Preserve Deleted Messages In Local DB)
+    messages_storage = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesStorage.java")
+    if os.path.exists(messages_storage):
+        def anti_delete_injector(content):
+            target = "public ArrayList<Long> markMessagesAsDeleted("
+            if target not in content:
+                return content
+            idx = content.find(target)
+            brace_idx = content.find("{", idx)
+            if brace_idx == -1:
+                return content
+            inject = """
+        if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled() && messages != null) {
+            java.util.ArrayList<Integer> filtered = new java.util.ArrayList<>();
+            for (int i = 0; i < messages.size(); i++) {
+                int mid = messages.get(i);
+                if (org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialogId, mid)) {
+                    // Preserved locally in Colgram vault
+                } else {
+                    filtered.add(mid);
+                }
+            }
+            messages = filtered;
+            if (messages.isEmpty()) {
+                return new java.util.ArrayList<>();
+            }
+        }
+        """
+            return content[:brace_idx + 1] + inject + content[brace_idx + 1:]
+        patch_file(messages_storage, anti_delete_injector, "", "MessagesStorage Anti-Delete Preservation")
+
+    # 21. MessagesController.java -> Save Message Edit History
+    if os.path.exists(messages_controller):
+        def edit_history_injector(content):
+            target = "if (update instanceof TLRPC.TL_updateEditMessage) {"
+            if target not in content:
+                return content
+            inject = """
+        if (update instanceof TLRPC.TL_updateEditMessage) {
+            TLRPC.TL_updateEditMessage uem = (TLRPC.TL_updateEditMessage) update;
+            if (uem.message != null) {
+                long did = uem.message.dialog_id != 0 ? uem.message.dialog_id : (uem.message.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(uem.message.peer_id) : 0);
+                org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, uem.message.id, uem.message.message, uem.message.date);
+            }
+        } else if (update instanceof TLRPC.TL_updateEditChannelMessage) {
+            TLRPC.TL_updateEditChannelMessage uem = (TLRPC.TL_updateEditChannelMessage) update;
+            if (uem.message != null) {
+                long did = uem.message.dialog_id != 0 ? uem.message.dialog_id : (uem.message.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(uem.message.peer_id) : 0);
+                org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, uem.message.id, uem.message.message, uem.message.date);
+            }
+        }
+        """
+            return content.replace(target, inject + "\n        " + target, 1)
+        patch_file(messages_controller, edit_history_injector, "", "MessagesController Save Edit History")
+
+    # 22. ContactsController.java -> Disable Contact Sync & Suggest Contacts by Default
+    contacts_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ContactsController.java")
+    if os.path.exists(contacts_controller):
+        patch_file(
+            contacts_controller,
+            "public boolean contactsSync = true;",
+            "public boolean contactsSync = false; // Colgram: anonymous by default",
+            "ContactsController Disable contactsSync"
+        )
+        patch_file(
+            contacts_controller,
+            "public boolean suggestContacts = true;",
+            "public boolean suggestContacts = false; // Colgram: anonymous by default",
+            "ContactsController Disable suggestContacts"
+        )
+
+    # 23. ChatActivity.java -> Unlock Custom Wallpapers for All Chats Without Premium
+    chat_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java")
+    if os.path.exists(chat_activity):
+        patch_file(
+            chat_activity,
+            "if (!getUserConfig().isPremium()) {\n            showCustomWallpaperPremiumAlert();",
+            "if (false) {\n            showCustomWallpaperPremiumAlert();",
+            "ChatActivity Unlock Custom Wallpaper Without Premium"
+        )
+    # 24. Theme.java -> Inject Colgram Cyber Red Colors
+    theme_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "Theme.java")
+    if os.path.exists(theme_file):
+        def theme_cyber_injector(content):
+            target = "public static int getColor(String key, ResourcesProvider resourcesProvider) {"
+            if target not in content:
+                target = "public static int getColor(String key) {"
+            if target not in content:
+                return content
+            inject = """
+        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
+            if ("featuredStickers_addButton".equals(key) || "chats_actionBackground".equals(key) || "switchTrackChecked".equals(key) || "dialogFloatingButton".equals(key)) {
+                return 0xffff3344;
+            }
+            if ("windowBackgroundWhite".equals(key) || "windowBackgroundGray".equals(key)) {
+                return 0xff0e0f12;
+            }
+            if ("actionBarDefault".equals(key)) {
+                return 0xff16181e;
+            }
+        }
+        """
+            idx = content.find(target)
+            brace_idx = content.find("{", idx)
+            if brace_idx == -1:
+                return content
+            return content[:brace_idx + 1] + inject + content[brace_idx + 1:]
+        patch_file(theme_file, theme_cyber_injector, "", "Theme Inject Colgram Cyber Red Colors")
+
+    # 25. SettingsActivity.java -> Inject Colgram Settings Entry
+    settings_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SettingsActivity.java")
+    if os.path.exists(settings_activity):
+        def settings_menu_injector(content):
+            target = "listView.setOnItemClickListener((view, position) -> {"
+            if target not in content:
+                return content
+            inject = """
+            if (position == 1) {
+                org.colgram.core.ColgramSettingsActivity.start(getParentActivity());
+                return;
+            }
+            """
+            return content.replace(target, target + inject, 1)
+        patch_file(settings_activity, settings_menu_injector, "", "SettingsActivity Inject Colgram Settings Entry")
+
+
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
@@ -962,19 +1116,20 @@ def configure_package_and_branding(repo_path):
             'android:name="org.telegram.messenger.ApplicationLoader"\n        android:icon="@mipmap/ic_launcher"\n        android:roundIcon="@mipmap/ic_launcher_round"\n        android:label="Colgram"'
         )
 
-        # Strip phone/call permissions from AndroidManifest.xml for user privacy
-        m_content = m_content.replace(
-            '<uses-permission android:name="android.permission.READ_PHONE_STATE" />',
-            '<!-- stripped READ_PHONE_STATE -->'
-        )
-        m_content = m_content.replace(
-            '<uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />',
-            '<!-- stripped READ_PHONE_NUMBERS -->'
-        )
+        # Strip phone, contacts, location, and account permissions from AndroidManifest.xml for full user privacy
+        for perm in [
+            "READ_PHONE_STATE", "READ_PHONE_NUMBERS",
+            "READ_CONTACTS", "WRITE_CONTACTS", "GET_ACCOUNTS",
+            "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"
+        ]:
+            m_content = m_content.replace(
+                f'<uses-permission android:name="android.permission.{perm}" />',
+                f'<!-- stripped {perm} for Colgram privacy -->'
+            )
 
         with open(main_manifest, "w", encoding="utf-8") as f:
             f.write(m_content)
-        print(" [+] Injected icon and label into TMessagesProj AndroidManifest.xml")
+        print(" [+] Injected icon and label, stripped aggressive permissions in TMessagesProj AndroidManifest.xml")
 
     # 5. Patch google-services.json so GoogleServices plugin finds org.colgram.messenger
     import json

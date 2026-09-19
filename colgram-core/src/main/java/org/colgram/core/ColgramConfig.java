@@ -36,6 +36,9 @@ public class ColgramConfig {
     private static final String KEY_DOH_ENABLED = "doh_resolver_enabled";
     private static final String KEY_UPDATE_REPO = "github_update_repo";
 
+    // Theme
+    private static final String KEY_CYBER_THEME_ENABLED = "cyber_theme_enabled";
+
     // Defaults
     public static final String DEFAULT_MODEL = "Google Pixel 8 Pro";
     public static final String DEFAULT_SYSTEM_VERSION = "SDK 34 (Android 14)";
@@ -174,5 +177,13 @@ public class ColgramConfig {
 
     public static String getUpdateRepo() {
         return prefs != null ? prefs.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO) : DEFAULT_UPDATE_REPO;
+    }
+
+    public static boolean isCyberThemeEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_CYBER_THEME_ENABLED, true);
+    }
+
+    public static void setCyberThemeEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_CYBER_THEME_ENABLED, enabled).apply();
     }
 }

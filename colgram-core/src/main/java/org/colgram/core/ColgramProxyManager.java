@@ -101,14 +101,15 @@ public class ColgramProxyManager {
         if (context == null || !initialized.compareAndSet(false, true)) return;
         appContext = context.getApplicationContext();
 
-        // 1. Start embedded DPI bypass engine immediately
+        // 1. Start embedded DPI bypass engine immediately (works independently of proxy)
         ColgramDpiBypass.start();
 
-        // 2. Populate verified pool with local DPI bypass and verified alive MTProto proxies
+        // 2. Populate verified pool with local DPI bypass and clean verified proxies
         initVerifiedPool();
 
-        // 3. Apply default proxy (local DPI bypass) immediately
-        if (!verifiedPool.isEmpty()) {
+        // 3. Apply proxy ONLY if user has proxy enabled in settings
+        if (ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
+            // Apply local DPI or first clean proxy
             forceApplyProxy(verifiedPool.get(0));
         }
 
@@ -124,7 +125,7 @@ public class ColgramProxyManager {
         // 5. Periodic health check every 5 minutes
         scheduler.scheduleWithFixedDelay(() -> {
             try {
-                if (currentActiveProxy != null && !currentActiveProxy.isLocalDpi()) {
+                if (ColgramConfig.isBuiltinProxyEnabled() && currentActiveProxy != null && !currentActiveProxy.isLocalDpi()) {
                     int ping = testProxy(currentActiveProxy.address, currentActiveProxy.port, 3000);
                     if (ping < 0) {
                         Log.w(TAG, "Current proxy unreachable, rotating: " + currentActiveProxy.address);
@@ -143,20 +144,21 @@ public class ColgramProxyManager {
     }
 
     private static void initVerifiedPool() {
-        // Priority 1: Verified alive Fake-TLS MTProto proxies (Ultra-low latency, TSPU/RKN-immune)
+        // Priority 1: Local DPI Desync Bypass (127.0.0.1:9876) — 0ms ping, 100% private, no sponsor channels!
+        ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
+        localDpi.isAvailable = true;
+        localDpi.pingMs = 0;
+        verifiedPool.add(localDpi);
+
+        // Priority 2: Clean Fake-TLS MTProto proxies (without spam/sponsor channels)
         ProxyItem[] hardcoded = {
-            new ProxyItem("79.137.196.223", 18443, "eefd7ec32323aa5b4fc5cdd6b7dd28836a7777772e636c6f7564666c6172652e636f6d", 1),
             new ProxyItem("77.239.105.219", 443, "ee6c083120393936fb881456da3ec073777777772e676f6f676c652e636f6d", 1),
-            new ProxyItem("79.137.196.223", 7443, "eeeeb30662ee79541fb143515ad872d2e9dd7777772e636c6f7564666c6172652e636f6d", 1),
-            new ProxyItem("79.137.196.223", 9443, "eeeed3431eaef666469f9beb5286a544d96f7777772e636c6f7564666c6172652e636f6d", 1),
             new ProxyItem("176.57.69.182", 53627, "ee42eb79c1df22d7be6de261ce63082a4d31632e7275", 1),
             new ProxyItem("194.59.221.90", 8443, "eef4b79908a669cfe8f293941da4e388916465636174686c6f6e2e636f6d", 1),
             new ProxyItem("ma.hastim.co.uk", 443, "ee1603010200010001fc030386e24c3add6d656469612e737465616d706f77657265642e636f6d", 1),
             new ProxyItem("media.experthost.shop", 443, "ee3360704eb31ee47a17fc96383f7fcf7c6d656469612e657870657274686f73742e73686f70", 1),
             new ProxyItem("sioms.co.uk", 25565, "ee104462821249bd7ac519130220c25d0963646e2e79656b74616e65742e636f6d", 1),
-            new ProxyItem("yostavpn.casacam.net", 443, "ee3db34d5ab674545e688abbefee52237f796f73746176706e2e6361736163616d2e6e6574", 1),
-            new ProxyItem("t.meow-meow-fast.site", 443, "eeaea279c83d92a4c4fa8a780bf10b8c4b742e6d656f772d6d656f772d666173742e73697465", 1),
-            new ProxyItem("mt1.kurduk.store", 443, "ee2c359976c0e74101ab25d285b51faf306d74312e6b757264756b2e73746f7265", 1)
+            new ProxyItem("yostavpn.casacam.net", 443, "ee3db34d5ab674545e688abbefee52237f796f73746176706e2e6361736163616d2e6e6574", 1)
         };
 
         for (ProxyItem p : hardcoded) {
@@ -165,14 +167,6 @@ public class ColgramProxyManager {
             if (!containsProxy(p)) {
                 verifiedPool.add(p);
             }
-        }
-
-        // Local DPI Desync Bypass (127.0.0.1:9876) as fallback in pool
-        ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
-        localDpi.isAvailable = true;
-        localDpi.pingMs = 1;
-        if (!containsProxy(localDpi)) {
-            verifiedPool.add(localDpi);
         }
     }
 

@@ -10,7 +10,7 @@ import java.lang.reflect.Method;
  * Uses pure reflection on org.telegram.tgnet classes so it compiles independently of Telegram's build classpath.
  */
 public class TL_auth_importBotAuthorization {
-    public static final int constructor = 0x67a3ffca;
+    public static final int constructor = 0x67a3ff2c;
 
     public int flags = 0;
     public int api_id;

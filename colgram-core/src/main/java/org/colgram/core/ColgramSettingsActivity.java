@@ -76,6 +76,32 @@ public class ColgramSettingsActivity extends AppCompatActivity {
             ColgramConfig.setBypassFlagSecureEnabled(isChecked);
         });
 
+        // Section: Theme
+        addSectionHeader(root, "Оформление (Theme)");
+        addSwitch(root, "Красно-чёрный стиль Colgram Cyber", ColgramConfig.isCyberThemeEnabled(), (btn, isChecked) -> {
+            ColgramConfig.setCyberThemeEnabled(isChecked);
+            Toast.makeText(this, "Тема обновлена. Перезапустите экран для применения", Toast.LENGTH_SHORT).show();
+        });
+
+        // Section: Plugins & Python Engine
+        addSectionHeader(root, "Плагины и скрипты Python");
+        final TextView pluginCountTv = new TextView(this);
+        int pluginCount = ColgramPluginManager.getLoadedPlugins() != null ? ColgramPluginManager.getLoadedPlugins().size() : 0;
+        pluginCountTv.setText("Активных плагинов: " + pluginCount + " (папка /sdcard/Documents/Colgram/plugins)");
+        pluginCountTv.setTextColor(0xFFAAAAAA);
+        pluginCountTv.setPadding(0, 8, 0, 16);
+        root.addView(pluginCountTv);
+
+        Button reloadPluginsBtn = new Button(this);
+        reloadPluginsBtn.setText("⚡ Перезагрузить плагины из хранилища");
+        reloadPluginsBtn.setOnClickListener(v -> {
+            ColgramPluginManager.init(getApplicationContext());
+            int count = ColgramPluginManager.getLoadedPlugins() != null ? ColgramPluginManager.getLoadedPlugins().size() : 0;
+            pluginCountTv.setText("Активных плагинов: " + count + " (папка /sdcard/Documents/Colgram/plugins)");
+            Toast.makeText(this, "Плагины перезагружены! Загружено: " + count, Toast.LENGTH_SHORT).show();
+        });
+        root.addView(reloadPluginsBtn);
+
         // Section: Storage Sandbox
         addSectionHeader(root, "Песочница файлов (Sandbox)");
         addSwitch(root, "Изолировать хранилище в Documents/Colgram", ColgramConfig.isSandboxStorageEnabled(), (btn, isChecked) -> {
