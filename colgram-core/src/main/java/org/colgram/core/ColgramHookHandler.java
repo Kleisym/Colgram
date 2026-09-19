@@ -17,12 +17,31 @@ public class ColgramHookHandler {
 
     public static void init(Context context) {
         appContext = context.getApplicationContext();
+        ColgramOptimizer.optimizeStartup(appContext);
         ColgramConfig.init(appContext);
         ColgramStorageSandbox.init(appContext);
         ColgramDatabase.getInstance(appContext);
+        ColgramPythonEngine.init(appContext);
+        ColgramPluginManager.init(appContext);
 
-        // Start embedded DPI bypass engine and connection doctor immediately
+        // Start embedded DPI bypass engine and background connection doctor immediately
         ColgramProxyManager.activateBuiltinProxy(appContext);
+        ColgramProxyDoctor.start(appContext);
+    }
+
+    /**
+     * HOOK: Called from SendMessagesHelper before dispatching an outgoing message.
+     * @return true if the message was handled as a plugin command and should NOT be sent.
+     */
+    public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text) {
+        return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text);
+    }
+
+    /**
+     * HOOK: Called from MessagesController when a new message is received or created.
+     */
+    public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
+        ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
     }
 
     /**

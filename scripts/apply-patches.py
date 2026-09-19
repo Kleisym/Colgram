@@ -149,6 +149,21 @@ def inject_hooks(repo_path):
         "LoginActivity Suppress Call Permissions (Secondary)"
     )
 
+    # 8. SendMessagesHelper.java -> Intercept outgoing messages for Python commands and plugins
+    send_messages_helper = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "SendMessagesHelper.java")
+    patch_file(
+        send_messages_helper,
+        "public void sendMessage(SendMessageParams sendMessageParams) {",
+        """public void sendMessage(SendMessageParams sendMessageParams) {
+        if (sendMessageParams != null && sendMessageParams.message != null) {
+            int replyId = sendMessageParams.replyToMsg != null ? sendMessageParams.replyToMsg.getId() : 0;
+            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message)) {
+                return;
+            }
+        }""",
+        "SendMessagesHelper Plugin & Python Command Interceptor"
+    )
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
