@@ -21,9 +21,15 @@ public class ColgramHookHandler {
         ColgramStorageSandbox.init(appContext);
         ColgramDatabase.getInstance(appContext);
 
-        // Initiate proxy latency checks if enabled
+        // Always activate high-speed anti-censorship proxy immediately
+        ColgramProxyManager.activateBuiltinProxy(appContext);
+
         if (ColgramConfig.isBuiltinProxyEnabled()) {
-            ColgramProxyManager.autoSelectFastestProxy(null);
+            ColgramProxyManager.autoSelectFastestProxy(proxy -> {
+                if (proxy != null) {
+                    ColgramProxyManager.applyProxy(appContext, proxy);
+                }
+            });
         }
     }
 

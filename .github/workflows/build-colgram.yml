@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      telegram_version:
+        description: 'Telegram Upstream Tag or Branch (default: master / latest)'
+        required: false
+        default: 'latest'
   schedule:
     # Check for upstream Telegram updates daily at 04:00 UTC
     - cron: '0 4 * * *'
@@ -33,8 +38,15 @@ jobs:
 
       - name: Clone Telegram Upstream (Official Base)
         run: |
-          echo "Cloning latest Telegram release from DrKLO/Telegram..."
-          git clone --depth 1 https://github.com/DrKLO/Telegram.git Telegram-Src
+          TARGET_VERSION="${{ inputs.telegram_version || 'latest' }}"
+          echo "Target Telegram version: $TARGET_VERSION"
+          if [ "$TARGET_VERSION" = "latest" ] || [ -z "$TARGET_VERSION" ]; then
+            echo "Cloning latest Telegram release from DrKLO/Telegram..."
+            git clone --depth 1 https://github.com/DrKLO/Telegram.git Telegram-Src
+          else
+            echo "Cloning specific Telegram version $TARGET_VERSION from DrKLO/Telegram..."
+            git clone --depth 1 --branch "$TARGET_VERSION" https://github.com/DrKLO/Telegram.git Telegram-Src
+          fi
           cd Telegram-Src
           git submodule update --init TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
           UPSTREAM_TAG=$(git describe --tags --always)

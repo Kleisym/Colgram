@@ -134,7 +134,20 @@ def inject_hooks(repo_path):
         "MessagesController Ghost Typing Suppression (String)"
     )
 
-    pass
+    # 7. LoginActivity.java -> Suppress phone call permission requests
+    login_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LoginActivity.java")
+    patch_file(
+        login_activity,
+        "if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && simcardAvailable) {",
+        "simcardAvailable = false; checkPermissions = false;\n            if (false) {",
+        "LoginActivity Suppress Call Permissions (Primary)"
+    )
+    patch_file(
+        login_activity,
+        "if (checkShowPermissions && (!allowCall || !allowReadPhoneNumbers)) {",
+        "checkShowPermissions = false;\n                        if (false) {",
+        "LoginActivity Suppress Call Permissions (Secondary)"
+    )
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
@@ -357,6 +370,17 @@ def configure_package_and_branding(repo_path):
             'android:name="org.telegram.messenger.ApplicationLoader"',
             'android:name="org.telegram.messenger.ApplicationLoader"\n        android:icon="@mipmap/ic_launcher"\n        android:roundIcon="@mipmap/ic_launcher_round"\n        android:label="Colgram"'
         )
+
+        # Strip phone/call permissions from AndroidManifest.xml for user privacy
+        m_content = m_content.replace(
+            '<uses-permission android:name="android.permission.READ_PHONE_STATE" />',
+            '<!-- stripped READ_PHONE_STATE -->'
+        )
+        m_content = m_content.replace(
+            '<uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />',
+            '<!-- stripped READ_PHONE_NUMBERS -->'
+        )
+
         with open(main_manifest, "w", encoding="utf-8") as f:
             f.write(m_content)
         print(" [+] Injected icon and label into TMessagesProj AndroidManifest.xml")
@@ -384,9 +408,54 @@ def configure_package_and_branding(repo_path):
                 except Exception as e:
                     print(f" [!] Error patching {path}: {e}")
 
+def apply_custom_app_icon(repo_path, source_icon_path):
+    if not os.path.exists(source_icon_path):
+        print(f" [!] Source icon not found at: {source_icon_path}")
+        return
+
+    try:
+        from PIL import Image
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "pillow", "--quiet"], check=True)
+        from PIL import Image
+
+    print("[*] Generating custom Colgram avatar across all mipmap densities...")
+    base_img = Image.open(source_icon_path).convert("RGBA")
+    
+    sizes = {
+        "mdpi": (48, 108),
+        "hdpi": (72, 162),
+        "xhdpi": (96, 216),
+        "xxhdpi": (144, 324),
+        "xxxhdpi": (192, 432),
+    }
+
+    target_dirs = [
+        os.path.join(repo_path, "TMessagesProj", "src", "main", "res"),
+        os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "res")
+    ]
+
+    for res_dir in target_dirs:
+        if not os.path.exists(res_dir):
+            continue
+        for density, (icon_size, fg_size) in sizes.items():
+            mipmap_dir = os.path.join(res_dir, f"mipmap-{density}")
+            os.makedirs(mipmap_dir, exist_ok=True)
+            
+            icon_img = base_img.resize((icon_size, icon_size), Image.LANCZOS)
+            for name in ["ic_launcher.png", "ic_launcher_round.png", "ic_launcher_sa.png", "icon_2_launcher.png", "icon_2_launcher_round.png"]:
+                icon_img.save(os.path.join(mipmap_dir, name), "PNG")
+
+            fg_img = base_img.resize((fg_size, fg_size), Image.LANCZOS)
+            for name in ["icon_foreground.png", "icon_foreground_sa.png", "icon_foreground_round.png"]:
+                fg_img.save(os.path.join(mipmap_dir, name), "PNG")
+
+    print(" [+] Custom Colgram avatar successfully generated across all mipmap densities!")
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
+    custom_icon = os.path.join(root_dir, "assets", "app_icon.png")
 
     target_repo = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root_dir, "Telegram")
 
@@ -396,6 +465,7 @@ def main():
 
     clone_required_submodules(target_repo)
     configure_package_and_branding(target_repo)
+    apply_custom_app_icon(target_repo, custom_icon)
     inject_core(target_repo, core_dir)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)
