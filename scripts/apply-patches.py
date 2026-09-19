@@ -517,7 +517,7 @@ def inject_hooks(repo_path):
         io.add(R.drawable.msg_settings, "⚙️ Настройки Colgram", () -> {
             presentFragment(new ColgramSettingsActivity());
         });
-        io.add(R.drawable.msg_mail, "✉️ Временная почта (Temp Mail)", () -> {
+        io.add(R.drawable.msg_send, "✉️ Временная почта (Temp Mail)", () -> {
             presentFragment(new ColgramTempMailActivity());
         });
         io.add(R.drawable.msg_download, "📥 Версии Telegram", () -> {
@@ -631,7 +631,7 @@ def inject_hooks(repo_path):
         items.add(UItem.asHeader("Colgram"));
         items.add(SettingCell.Factory.of(101, 0xFFFF3344, 0xFFCC1122, R.drawable.msg_settings, "Настройки Colgram", "Анонимность, защита от удаления, обход блокировок"));
         items.add(SettingCell.Factory.of(102, 0xFF9C27B0, 0xFF673AB7, R.drawable.msg_customize, "Плагины и Маркетплейс", "Каталог расширений exteraGram, Python скрипты"));
-        items.add(SettingCell.Factory.of(103, 0xFF00BCD4, 0xFF009688, R.drawable.msg_mail, "Временная почта (Temp Mail)", "Быстрая анонимная регистрация без спама"));
+        items.add(SettingCell.Factory.of(103, 0xFF00BCD4, 0xFF009688, R.drawable.msg_send, "Временная почта (Temp Mail)", "Быстрая анонимная регистрация без спама"));
         items.add(SettingCell.Factory.of(104, 0xFF4CAF50, 0xFF2E7D32, R.drawable.msg_download, "Версии Telegram и обновления", "Переключение каналов и загрузка APK"));
         items.add(UItem.asShadow(null));"""
             return content.replace(target, inject, 1)
