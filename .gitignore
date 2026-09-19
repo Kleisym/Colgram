@@ -2,3 +2,4 @@ scripts/error_log.txt
 scripts/monitor_build.py
 __pycache__/
 *.pyc
+Telegram-Src/

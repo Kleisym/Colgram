@@ -329,8 +329,8 @@ public class ColgramProxyManager {
         if (ctx == null) return;
 
         try {
-            // 1. Persist proxy settings in SharedPreferences for all accounts (0..5)
-            for (int a = 0; a < 6; a++) {
+            // 1. Persist proxy settings in SharedPreferences for all accounts (0..31)
+            for (int a = 0; a < 32; a++) {
                 String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
                 preferences.edit()
@@ -350,7 +350,7 @@ public class ColgramProxyManager {
                 Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
                         int.class, String.class, int.class, String.class, String.class, String.class);
                 nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < 6; i++) {
+                for (int i = 0; i < 32; i++) {
                     nativeSetProxy.invoke(null, i, proxy.address, proxy.port, "", "", proxy.secret);
                 }
             } catch (Throwable t) {
@@ -391,6 +391,94 @@ public class ColgramProxyManager {
 
         } catch (Exception e) {
             Log.e(TAG, "forceApplyProxy error", e);
+        }
+    }
+
+    public static boolean isProxyEnabled(Context context) {
+        Context ctx = context != null ? context.getApplicationContext() : appContext;
+        if (ctx == null) return false;
+        SharedPreferences preferences = ctx.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+        return preferences.getBoolean("proxy_enabled", false);
+    }
+
+    public static synchronized void toggleProxy(final Context context) {
+        Context ctx = context != null ? context.getApplicationContext() : appContext;
+        if (ctx == null) return;
+        boolean currentlyEnabled = isProxyEnabled(ctx);
+        if (currentlyEnabled) {
+            disableProxy(ctx);
+            mainHandler.post(() -> {
+                try {
+                    Toast.makeText(ctx, "Прокси: Отключен", Toast.LENGTH_SHORT).show();
+                } catch (Throwable ignored) {}
+            });
+        } else {
+            if (verifiedPool.isEmpty()) {
+                initVerifiedPool();
+            }
+            ProxyItem target = (currentActiveProxy != null && !currentActiveProxy.isLocalDpi()) ? currentActiveProxy : (verifiedPool.isEmpty() ? null : verifiedPool.get(0));
+            if (target != null) {
+                forceApplyProxy(target);
+                mainHandler.post(() -> {
+                    try {
+                        Toast.makeText(ctx, "Прокси: Включен (" + target.address + ")", Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {}
+                });
+            }
+        }
+    }
+
+    public static void disableProxy(Context context) {
+        Context ctx = context != null ? context.getApplicationContext() : appContext;
+        if (ctx == null) return;
+        try {
+            for (int a = 0; a < 32; a++) {
+                String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
+                SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
+                preferences.edit().putBoolean("proxy_enabled", false).apply();
+            }
+
+            try {
+                Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
+                        int.class, String.class, int.class, String.class, String.class, String.class);
+                nativeSetProxy.setAccessible(true);
+                for (int i = 0; i < 32; i++) {
+                    nativeSetProxy.invoke(null, i, "", 0, "", "", "");
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "disableProxy nativeSetProxy error", t);
+            }
+
+            try {
+                Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
+                try {
+                    Field currentProxyField = scClass.getDeclaredField("currentProxy");
+                    currentProxyField.setAccessible(true);
+                    currentProxyField.set(null, null);
+                } catch (Throwable ignored) {}
+
+                Method loadProxyListMethod = scClass.getDeclaredMethod("loadProxyList");
+                loadProxyListMethod.setAccessible(true);
+                loadProxyListMethod.invoke(null);
+            } catch (Throwable ignored) {}
+
+            try {
+                Class<?> ncClass = Class.forName("org.telegram.messenger.NotificationCenter");
+                Method getGlobalInstance = ncClass.getDeclaredMethod("getGlobalInstance");
+                getGlobalInstance.setAccessible(true);
+                Object globalNc = getGlobalInstance.invoke(null);
+
+                Field proxySettingsChangedField = ncClass.getDeclaredField("proxySettingsChanged");
+                proxySettingsChangedField.setAccessible(true);
+                int proxySettingsChanged = proxySettingsChangedField.getInt(null);
+
+                Method postNotificationName = ncClass.getDeclaredMethod("postNotificationName", int.class, Object[].class);
+                postNotificationName.setAccessible(true);
+                postNotificationName.invoke(globalNc, proxySettingsChanged, new Object[0]);
+            } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(TAG, "disableProxy error", t);
         }
     }
 

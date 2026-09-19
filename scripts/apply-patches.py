@@ -729,21 +729,40 @@ public class ColgramBotLoginBottomSheet {
             "final boolean proxyVisible = true; // Colgram: proxy menu item always visible\n            final boolean proxyVisibleOld = proxyEnabled && !TextUtils.isEmpty(proxyAddress)",
             "DialogsActivity Proxy Menu Item Always Visible"
         )
-        header_proxy_target = "downloadsItem.setVisibility(View.GONE);\n\n            updateProxyButton(false, false);"
-        header_proxy_replacement = """downloadsItem.setVisibility(View.GONE);
+        def header_proxy_updater(content):
+            target_replacement = """downloadsItem.setVisibility(View.GONE);
 
             org.telegram.ui.ActionBar.ActionBarMenuItem colgramProxyItem = menu.addItem(2, proxyDrawable);
             if (colgramProxyItem != null) {
                 colgramProxyItem.setContentDescription(getString(R.string.ProxySettings));
-                colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));
+                colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity()));
+                colgramProxyItem.setOnLongClickListener(v -> {
+                    presentFragment(new ProxyListActivity());
+                    return true;
+                });
             }
 
             updateProxyButton(false, false);"""
+            if "colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy" in content:
+                return content
+            if "colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));" in content:
+                return content.replace(
+                    "colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));",
+                    """colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity()));
+                colgramProxyItem.setOnLongClickListener(v -> {
+                    presentFragment(new ProxyListActivity());
+                    return true;
+                });"""
+                )
+            target = "downloadsItem.setVisibility(View.GONE);\\n\\n            updateProxyButton(false, false);"
+            if target in content:
+                return content.replace(target, target_replacement, 1)
+            return content
         patch_file(
             dialogs_activity,
-            header_proxy_target,
-            header_proxy_replacement,
-            "DialogsActivity Header Proxy Button Always Visible"
+            header_proxy_updater,
+            "",
+            "DialogsActivity Header Proxy Button 1-Tap Toggle"
         )
 
     # 20. MessagesStorage.java -> Anti-Delete (Preserve Deleted Messages In Local DB)
@@ -801,31 +820,7 @@ public class ColgramBotLoginBottomSheet {
             return content.replace(target, inject + "\n        " + target, 1)
         patch_file(messages_controller, edit_history_injector, "", "MessagesController Save Edit History")
 
-    # 22. ContactsController.java -> Disable Contact Sync & Suggest Contacts by Default
-    contacts_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ContactsController.java")
-    if os.path.exists(contacts_controller):
-        patch_file(
-            contacts_controller,
-            "public boolean contactsSync = true;",
-            "public boolean contactsSync = false; // Colgram: anonymous by default",
-            "ContactsController Disable contactsSync"
-        )
-        patch_file(
-            contacts_controller,
-            "public boolean suggestContacts = true;",
-            "public boolean suggestContacts = false; // Colgram: anonymous by default",
-            "ContactsController Disable suggestContacts"
-        )
 
-    # 23. ChatActivity.java -> Unlock Custom Wallpapers for All Chats Without Premium
-    chat_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java")
-    if os.path.exists(chat_activity):
-        patch_file(
-            chat_activity,
-            "if (!getUserConfig().isPremium()) {\n            showCustomWallpaperPremiumAlert();",
-            "if (false) {\n            showCustomWallpaperPremiumAlert();",
-            "ChatActivity Unlock Custom Wallpaper Without Premium"
-        )
     # 24. Theme.java -> Inject Colgram Cyber Red Colors
     theme_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "Theme.java")
     if os.path.exists(theme_file):
@@ -870,6 +865,279 @@ public class ColgramBotLoginBottomSheet {
             """
             return content.replace(target, target + inject, 1)
         patch_file(settings_activity, settings_menu_injector, "", "SettingsActivity Inject Colgram Settings Entry")
+
+    # 26. DialogsActivity.java & ContactsActivity.java -> Complete Permission Suppression
+    if os.path.exists(dialogs_activity):
+        patch_file(
+            dialogs_activity,
+            "if (hasNotNotificationsPermission || hasNotContactsPermission || hasNotStoragePermission)",
+            "if (false && (hasNotNotificationsPermission || hasNotContactsPermission || hasNotStoragePermission))",
+            "DialogsActivity Suppress Startup Permission Dialogs"
+        )
+        patch_file(
+            dialogs_activity,
+            "private void askForPermissons(boolean alert) {",
+            "private void askForPermissons(boolean alert) {\\n        if (true) return;",
+            "DialogsActivity Suppress askForPermissons"
+        )
+
+    contacts_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ContactsActivity.java")
+    if os.path.exists(contacts_activity):
+        patch_file(
+            contacts_activity,
+            "private void askForPermissons(boolean alert) {",
+            "private void askForPermissons(boolean alert) {\\n        if (true) return;",
+            "ContactsActivity Suppress askForPermissons"
+        )
+
+    # 27. MessagesController.java -> Fix Bot Account Loading Dialogs (Handle BOT_METHOD_INVALID)
+    if os.path.exists(messages_controller):
+        bot_dialogs_target = "public void loadDialogs(final int folderId, int offset, int count, boolean fromCache, Runnable onEmptyCallback) {"
+        bot_dialogs_inject = """public void loadDialogs(final int folderId, int offset, int count, boolean fromCache, Runnable onEmptyCallback) {
+        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+            loadingDialogs.put(folderId, false);
+            dialogsEndReached.put(folderId, true);
+            serverDialogsEndReached.put(folderId, true);
+            if (fromCache) {
+                getMessagesStorage().getDialogs(folderId, offset == 0 ? 0 : nextDialogsCacheOffset.get(folderId, 0), count, folderId == 0 && offset == 0);
+            }
+            getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);
+            return;
+        }"""
+        patch_file(
+            messages_controller,
+            bot_dialogs_target,
+            bot_dialogs_inject,
+            "MessagesController Bot Dialogs Cache Load"
+        )
+
+        bot_error_target = """                    if (onEmptyCallback != null && dialogsRes.dialogs.isEmpty()) {
+                        AndroidUtilities.runOnUIThread(onEmptyCallback);
+                    }
+                }
+            });"""
+        bot_error_replacement = """                    if (onEmptyCallback != null && dialogsRes.dialogs.isEmpty()) {
+                        AndroidUtilities.runOnUIThread(onEmptyCallback);
+                    }
+                } else {
+                    AndroidUtilities.runOnUIThread(() -> {
+                        loadingDialogs.put(folderId, false);
+                        dialogsEndReached.put(folderId, true);
+                        getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);
+                    });
+                }
+            });"""
+        patch_file(
+            messages_controller,
+            bot_error_target,
+            bot_error_replacement,
+            "MessagesController Handle Dialogs Load Error"
+        )
+
+    # 28. ChatActivity.java -> Fallback User on Opening Bot Chat / Missing User Cache
+    chat_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java")
+    if os.path.exists(chat_activity):
+        user_fallback_target = """                if (currentUser != null) {
+                    getMessagesController().putUser(currentUser, true);
+                } else {
+                    return false;
+                }"""
+        user_fallback_replacement = """                if (currentUser != null) {
+                    getMessagesController().putUser(currentUser, true);
+                } else {
+                    TLRPC.TL_user fallbackUser = new TLRPC.TL_user();
+                    fallbackUser.id = userId;
+                    fallbackUser.first_name = "User " + userId;
+                    fallbackUser.phone = "";
+                    currentUser = fallbackUser;
+                    getMessagesController().putUser(currentUser, true);
+                }"""
+        patch_file(
+            chat_activity,
+            user_fallback_target,
+            user_fallback_replacement,
+            "ChatActivity Fallback User Object On Open"
+        )
+
+    # 29. ChatActivity.java -> Retain Deleted Messages in UI (Anti-Delete AyuGram Style)
+    if os.path.exists(chat_activity):
+        anti_delete_ui_target = "processDeletedMessages(markAsDeletedMessages, channelId, sent, !movedToScheduled);"
+        anti_delete_ui_replacement = """if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled()) {
+                for (int msg_id : markAsDeletedMessages) {
+                    MessageObject msg = messagesDict[0].get(msg_id);
+                    if (msg != null) {
+                        msg.deleted = true;
+                        org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialog_id, msg_id);
+                    }
+                }
+                if (chatAdapter != null) {
+                    chatAdapter.notifyDataSetChanged(false);
+                }
+                return;
+            }
+            processDeletedMessages(markAsDeletedMessages, channelId, sent, !movedToScheduled);"""
+        patch_file(
+            chat_activity,
+            anti_delete_ui_target,
+            anti_delete_ui_replacement,
+            "ChatActivity Anti-Delete Message Retention"
+        )
+
+    # 30. ChatMessageCell.java -> Prepend 🗑 to time string for deleted messages
+    if os.path.exists(chat_cell):
+        cell_time_target = """        } else {
+            currentTimeString = timeString;
+        }"""
+        cell_time_replacement = """        } else {
+            currentTimeString = timeString;
+        }
+        if (currentMessageObject != null && (currentMessageObject.deleted || org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(currentMessageObject.getDialogId(), currentMessageObject.getId()))) {
+            currentTimeString = TextUtils.concat("🗑 ", currentTimeString);
+        }"""
+        patch_file(
+            chat_cell,
+            cell_time_target,
+            cell_time_replacement,
+            "ChatMessageCell Prepend Deleted Icon"
+        )
+
+    # 31. ChatActivity.java -> Edit History Context Menu Option & Action
+    if os.path.exists(chat_activity):
+        menu_edit_target = """fillMessageMenu(
+        MessageObject primaryMessage,
+
+        ArrayList<Integer> icons,
+        ArrayList<CharSequence> items,
+        ArrayList<Integer> options
+    ) {"""
+        menu_edit_replacement = """fillMessageMenu(
+        MessageObject primaryMessage,
+
+        ArrayList<Integer> icons,
+        ArrayList<CharSequence> items,
+        ArrayList<Integer> options
+    ) {
+        if (selectedObject != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
+            boolean isRuLang = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            items.add(isRuLang ? "История изменений" : "Edit History");
+            options.add(9988);
+            icons.add(R.drawable.msg_edit);
+        }"""
+        patch_file(
+            chat_activity,
+            menu_edit_target,
+            menu_edit_replacement,
+            "ChatActivity Edit History Menu Option"
+        )
+
+        process_option_target = """private void processSelectedOption(int option) {
+        if (selectedObject == null || getParentActivity() == null) {
+            return;
+        }"""
+        process_option_replacement = """private void processSelectedOption(int option) {
+        if (selectedObject == null || getParentActivity() == null) {
+            return;
+        }
+        if (option == 9988) {
+            org.colgram.core.ColgramHookHandler.showEditHistory(getParentActivity(), selectedObject.getDialogId(), selectedObject.getId());
+            return;
+        }"""
+        patch_file(
+            chat_activity,
+            process_option_target,
+            process_option_replacement,
+            "ChatActivity Handle Edit History Option"
+        )
+
+    # 32. SessionCell.java & SessionBottomSheet.java -> Spoof Active Session Device Display & ConnectionsManager
+    session_cell = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "SessionCell.java")
+    if os.path.exists(session_cell):
+        patch_file(
+            session_cell,
+            "final TLRPC.TL_authorization session = (TLRPC.TL_authorization) object;",
+            """final TLRPC.TL_authorization session = (TLRPC.TL_authorization) object;
+            if ((session.flags & 1) != 0 && org.colgram.core.ColgramConfig.isCloakEnabled()) {
+                session.device_model = org.colgram.core.ColgramConfig.getSpoofDeviceModel();
+                session.system_version = org.colgram.core.ColgramConfig.getSpoofSystemVersion();
+            }""",
+            "SessionCell Spoof Active Device Display"
+        )
+
+    session_sheet = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SessionBottomSheet.java")
+    if os.path.exists(session_sheet):
+        patch_file(
+            session_sheet,
+            "timeView.setText(timeText);",
+            """timeView.setText(timeText);
+        if ((session.flags & 1) != 0 && org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            session.device_model = org.colgram.core.ColgramConfig.getSpoofDeviceModel();
+            session.system_version = org.colgram.core.ColgramConfig.getSpoofSystemVersion();
+        }""",
+            "SessionBottomSheet Spoof Active Device Display"
+        )
+
+    if os.path.exists(conn_manager):
+        patch_file(
+            conn_manager,
+            "deviceModel = Build.MANUFACTURER + Build.MODEL;",
+            "deviceModel = org.colgram.core.ColgramConfig.getSpoofDeviceModel();",
+            "ConnectionsManager Spoof deviceModel Directly"
+        )
+        patch_file(
+            conn_manager,
+            'systemVersion = "SDK " + Build.VERSION.SDK_INT;',
+            "systemVersion = org.colgram.core.ColgramConfig.getSpoofSystemVersion();",
+            "ConnectionsManager Spoof systemVersion Directly"
+        )
+
+    # 33. UserConfig.java -> 32 Max Accounts & Safe Phone Defaults
+    if os.path.exists(user_config):
+        user_max_target = """    public final static int MAX_ACCOUNT_DEFAULT_COUNT = 3;
+    public final static int MAX_ACCOUNT_COUNT = 4;"""
+        user_max_replacement = """    public final static int MAX_ACCOUNT_DEFAULT_COUNT = 32;
+    public final static int MAX_ACCOUNT_COUNT = 32;"""
+        patch_file(
+            user_config,
+            user_max_target,
+            user_max_replacement,
+            "UserConfig Set MAX_ACCOUNT_COUNT to 32"
+        )
+        patch_file(
+            user_config,
+            "public boolean syncContacts = true;",
+            "public boolean syncContacts = false; // Colgram: anonymous by default",
+            "UserConfig Default syncContacts to false"
+        )
+        patch_file(
+            user_config,
+            "public boolean suggestContacts = true;",
+            "public boolean suggestContacts = false; // Colgram: anonymous by default",
+            "UserConfig Default suggestContacts to false"
+        )
+        patch_file(
+            user_config,
+            'syncContacts = preferences.getBoolean("syncContacts", true);',
+            'syncContacts = preferences.getBoolean("syncContacts", false);',
+            "UserConfig Load syncContacts default false"
+        )
+        patch_file(
+            user_config,
+            'suggestContacts = preferences.getBoolean("suggestContacts", true);',
+            'suggestContacts = preferences.getBoolean("suggestContacts", false);',
+            "UserConfig Load suggestContacts default false"
+        )
+        patch_file(
+            user_config,
+            'return currentUser != null && currentUser.phone != null ? currentUser.phone : "";',
+            'if (currentUser != null && currentUser.phone == null) currentUser.phone = "";\n            return currentUser != null && currentUser.phone != null ? currentUser.phone : "";',
+            "UserConfig Safe ClientPhone"
+        )
+        patch_file(
+            user_config,
+            "public boolean isPremium() {",
+            "public boolean isPremium() {\n        if (true) return true;",
+            "UserConfig Unlock Client-Side Premium"
+        )
 
 
 
@@ -931,6 +1199,11 @@ def download_official_binaries(repo_path):
                 print(f" [+] Added packagingOptions to {module}/build.gradle")
 
     # 3. Download official APK with retries
+    has_so_files = os.path.exists(jni_libs_dir) and any(f.endswith('.so') for _, _, files in os.walk(jni_libs_dir) for f in files)
+    if has_so_files:
+        print(" [+] Precompiled native .so libraries already present in jniLibs, skipping download.")
+        return
+
     success = False
     for attempt in range(4):
         try:
@@ -1190,14 +1463,20 @@ def configure_package_and_branding(repo_path):
             'android:name="org.telegram.messenger.ApplicationLoader"\n        android:icon="@mipmap/ic_launcher"\n        android:roundIcon="@mipmap/ic_launcher_round"\n        android:label="Colgram"'
         )
 
-        # Strip phone, contacts, location, and account permissions from AndroidManifest.xml for full user privacy
+        # Strip phone, contacts, location, notifications, and account permissions from AndroidManifest.xml for full user privacy
         for perm in [
             "READ_PHONE_STATE", "READ_PHONE_NUMBERS",
             "READ_CONTACTS", "WRITE_CONTACTS", "GET_ACCOUNTS",
-            "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"
+            "MANAGE_ACCOUNTS", "READ_PROFILE", "MANAGE_OWN_CALLS",
+            "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+            "POST_NOTIFICATIONS"
         ]:
             m_content = m_content.replace(
                 f'<uses-permission android:name="android.permission.{perm}" />',
+                f'<!-- stripped {perm} for Colgram privacy -->'
+            )
+            m_content = m_content.replace(
+                f'<uses-permission android:name="android.permission.{perm}"/>',
                 f'<!-- stripped {perm} for Colgram privacy -->'
             )
 
