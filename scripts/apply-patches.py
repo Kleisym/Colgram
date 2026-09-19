@@ -134,18 +134,7 @@ def inject_hooks(repo_path):
         "MessagesController Ghost Typing Suppression (String)"
     )
 
-    # 7. Strip trackers from TMessagesProj/build.gradle
-    tmessages_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
-    if os.path.exists(tmessages_gradle):
-        with open(tmessages_gradle, "r", encoding="utf-8") as f:
-            gradle_text = f.read()
-        
-        gradle_text = re.sub(r"implementation\s+['\"]com\.google\.firebase:firebase-messaging:[^'\"]+['\"]", "// stripped firebase-messaging", gradle_text)
-        gradle_text = re.sub(r"implementation\s+['\"]com\.google\.android\.gms:play-services-base:[^'\"]+['\"]", "// stripped play-services", gradle_text)
-        
-        with open(tmessages_gradle, "w", encoding="utf-8") as f:
-            f.write(gradle_text)
-        print(" [+] Stripped trackers from TMessagesProj/build.gradle")
+    pass
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
