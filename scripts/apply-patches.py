@@ -409,6 +409,31 @@ def configure_package_and_branding(repo_path):
                     print(f" [!] Error patching {path}: {e}")
 
 def apply_custom_app_icon(repo_path, source_icon_path):
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prebuilt_icons_dir = os.path.join(root_dir, "assets", "icons")
+
+    target_dirs = [
+        os.path.join(repo_path, "TMessagesProj", "src", "main", "res"),
+        os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "res")
+    ]
+
+    # If prebuilt icons exist, copy them directly (no external dependencies needed)
+    if os.path.exists(prebuilt_icons_dir):
+        print("[*] Copying pre-generated custom Colgram avatar icons...")
+        for density_name in os.listdir(prebuilt_icons_dir):
+            src_density = os.path.join(prebuilt_icons_dir, density_name)
+            if not os.path.isdir(src_density):
+                continue
+            for res_dir in target_dirs:
+                if not os.path.exists(res_dir):
+                    continue
+                dest_density = os.path.join(res_dir, density_name)
+                os.makedirs(dest_density, exist_ok=True)
+                for file_name in os.listdir(src_density):
+                    shutil.copy2(os.path.join(src_density, file_name), os.path.join(dest_density, file_name))
+        print(" [+] Custom Colgram avatar successfully applied across all mipmap densities!")
+        return
+
     if not os.path.exists(source_icon_path):
         print(f" [!] Source icon not found at: {source_icon_path}")
         return
@@ -416,8 +441,8 @@ def apply_custom_app_icon(repo_path, source_icon_path):
     try:
         from PIL import Image
     except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "pillow", "--quiet"], check=True)
-        from PIL import Image
+        print(" [!] Pillow not available and no prebuilt icons found, skipping icon resizing.")
+        return
 
     print("[*] Generating custom Colgram avatar across all mipmap densities...")
     base_img = Image.open(source_icon_path).convert("RGBA")
@@ -429,11 +454,6 @@ def apply_custom_app_icon(repo_path, source_icon_path):
         "xxhdpi": (144, 324),
         "xxxhdpi": (192, 432),
     }
-
-    target_dirs = [
-        os.path.join(repo_path, "TMessagesProj", "src", "main", "res"),
-        os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "res")
-    ]
 
     for res_dir in target_dirs:
         if not os.path.exists(res_dir):
