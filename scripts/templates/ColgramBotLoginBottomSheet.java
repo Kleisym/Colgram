@@ -187,13 +187,20 @@ public class ColgramBotLoginBottomSheet {
 
         buttonLayout.setOnClickListener(v -> {
             String token = input.getText().toString().trim();
-            if (!token.contains(":") && "AAFtZOCkjmwpLJfUlue7l-WH4IbNDWBkdiw".equals(token)) {
-                token = "8931400108:" + token;
+            if (!token.contains(":")) {
+                if ("AAFtZOCkjmwpLJFUlue7l-WH4IbNDWBkdiw".equalsIgnoreCase(token)) {
+                    token = "8931400108:" + token;
+                } else {
+                    Toast.makeText(context, isRu
+                            ? "Токен неполный! В начале должны быть цифры и двоеточие из @BotFather (например, 1234567890:AAFtZOC...)"
+                            : "Incomplete token! Please include bot ID and colon (e.g. 1234567890:AAFtZOC...)", Toast.LENGTH_LONG).show();
+                    return;
+                }
             }
-            if (token.isEmpty() || !token.contains(":") || token.length() < 15) {
+            if (token.isEmpty() || token.length() < 15) {
                 Toast.makeText(context, isRu
-                        ? "Укажите полный токен вида ID:SECRET (например, 8931400108:AAFtZOC...)"
-                        : "Please enter full token like ID:SECRET (e.g. 8931400108:AAFtZOC...)", Toast.LENGTH_LONG).show();
+                        ? "Укажите полный токен бота из @BotFather"
+                        : "Please enter full bot token from @BotFather", Toast.LENGTH_LONG).show();
                 return;
             }
 
@@ -221,7 +228,7 @@ public class ColgramBotLoginBottomSheet {
             buttonLayout.setEnabled(true);
             input.setEnabled(true);
             pasteBtn.setEnabled(true);
-            Toast.makeText(context, isRu ? "Не удалось войти (все API ID отклонены сервером Telegram)." : "Failed to log in (all API IDs rejected).", Toast.LENGTH_LONG).show();
+            Toast.makeText(context, isRu ? "Не удалось войти: неверный токен бота. Проверьте его в @BotFather." : "Failed to log in: invalid bot token. Check @BotFather.", Toast.LENGTH_LONG).show();
             return;
         }
 

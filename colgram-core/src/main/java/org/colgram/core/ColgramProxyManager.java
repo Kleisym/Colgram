@@ -108,9 +108,13 @@ public class ColgramProxyManager {
         initVerifiedPool();
         populateSharedConfigProxies();
 
-        // 3. Apply proxy ONLY if user has proxy enabled in settings (never force if disabled)
+        // 3. Apply proxy: on fresh install, default to enabled so connection to Telegram isn't blocked by TSPU
         SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
-        boolean isProxyEnabled = mainPrefs.getBoolean("proxy_enabled", false);
+        boolean hasSetProxy = mainPrefs.contains("proxy_enabled");
+        boolean isProxyEnabled = hasSetProxy ? mainPrefs.getBoolean("proxy_enabled", false) : true;
+        if (!hasSetProxy) {
+            mainPrefs.edit().putBoolean("proxy_enabled", true).apply();
+        }
         if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
             forceApplyProxy(verifiedPool.get(0));
         }

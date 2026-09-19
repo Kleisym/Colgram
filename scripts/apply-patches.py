@@ -940,15 +940,16 @@ def inject_hooks(repo_path):
 
 
 
-    # 34. BuildVars.java -> Use Telegram Android X APP_ID and APP_HASH (Bypasses API_ID_PUBLISHED_FLOOD)
+    # 34. BuildVars.java -> Official Telegram Android credentials & disable SafetyNet check
     build_vars_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "BuildVars.java")
     if os.path.exists(build_vars_file):
-        patch_file(
-            build_vars_file,
-            "public static int APP_ID = 4;\n    public static String APP_HASH = \"014b35b6184100b085b0d0572f9b5103\";",
-            "public static int APP_ID = 21724; // Telegram Android X\n    public static String APP_HASH = \"3e0cb5ab2c70d5d304694f752b726003\";",
-            "BuildVars Set APP_ID & APP_HASH to Telegram Android X"
-        )
+        def build_vars_injector(content):
+            import re
+            content = re.sub(r'public static int APP_ID = \d+;[^\n]*', 'public static int APP_ID = 6; // Official Telegram for Android', content)
+            content = re.sub(r'public static String APP_HASH = "[^"]+";', 'public static String APP_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e";', content)
+            content = re.sub(r'public static String SAFETYNET_KEY = "[^"]*";', 'public static String SAFETYNET_KEY = "";', content)
+            return content
+        patch_file(build_vars_file, build_vars_injector, "APP_ID = 6", "BuildVars Set APP_ID & APP_HASH to Official Android & Clear SafetyNet")
 
 
     # 35. ProxyListActivity.java -> Silent 1-Tap Proxy Toggle (Never ask for input on empty list)
@@ -980,6 +981,25 @@ def inject_hooks(repo_path):
             if (allowCustom && !(uri != null && MessagesController.getInstance(currentAccount).isWebBrowserOpenInApp(uri.toString()) || isInstantViewOpen())"""
             return c.replace(target, inject, 1)
         patch_file(browser_file, browser_proxy_injector, "org.colgram.core.ColgramConfig.isProxyBrowserEnabled()", "Browser Force In-App Browser for Privacy")
+
+    # 37. LoginActivity.java -> Always visible Proxy Button
+    login_activity_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LoginActivity.java")
+    if os.path.exists(login_activity_file):
+        patch_file(
+            login_activity_file,
+            "showProxyButton(false, animated);",
+            "showProxyButton(true, animated);",
+            "LoginActivity Keep Proxy Button Always Visible"
+        )
+        patch_file(
+            login_activity_file,
+            "proxyButtonView.setOnClickListener(v -> presentFragment(new ProxyListActivity()));",
+            """proxyButtonView.setOnClickListener(v -> {
+            org.colgram.core.ColgramProxyManager.populateSharedConfigProxies();
+            presentFragment(new ProxyListActivity());
+        });""",
+            "LoginActivity Auto-Populate Proxy on Click"
+        )
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
