@@ -163,8 +163,8 @@ public class ColgramPythonEngine {
         return "Executed: " + trimmed;
     }
 
-    private static String evaluateArithmetic(String expr) {
-        expr = expr.replaceAll("\\s+", "");
+    private static String evaluateArithmetic(String rawExpr) {
+        final String expr = rawExpr.replaceAll("\\s+", "");
         // Basic arithmetic parser
         try {
             double result = new Object() {
