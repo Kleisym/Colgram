@@ -1001,6 +1001,74 @@ def inject_hooks(repo_path):
             "LoginActivity Auto-Populate Proxy on Click"
         )
 
+    # 38. IntroActivity.java -> Colgram Dark Black Intro Screen with Red Airplane Logo
+    intro_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "IntroActivity.java")
+    if os.path.exists(intro_file):
+        patch_file(
+            intro_file,
+            'ssb.setSpan(new ImageSpan(logoDrawable), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n        titles[0] = ssb;',
+            'titles[0] = "Colgram";',
+            "IntroActivity Set Title to Colgram"
+        )
+        patch_file(
+            intro_file,
+            'LocaleController.getString(R.string.Page1Message),',
+            '"Быстрый, приватный и свободный мессенджер",',
+            "IntroActivity Set Subtitle to Colgram"
+        )
+        patch_file(
+            intro_file,
+            'frameLayout2 = new FrameLayout(context);\n        frameContainerView.addView(frameLayout2, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.LEFT | Gravity.TOP, 0, 78, 0, 0));\n\n        TextureView textureView = new TextureView(context);',
+            '''frameLayout2 = new FrameLayout(context);
+        frameContainerView.addView(frameLayout2, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.LEFT | Gravity.TOP, 0, 78, 0, 0));
+
+        android.widget.ImageView colgramLogo = new android.widget.ImageView(context);
+        colgramLogo.setImageResource(R.drawable.colgram_plane_splash);
+        colgramLogo.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+        frameLayout2.addView(colgramLogo, LayoutHelper.createFrame(160, 160, Gravity.CENTER));
+
+        TextureView textureView = new TextureView(context);
+        textureView.setVisibility(View.GONE);''',
+            "IntroActivity Show Colgram Red Airplane"
+        )
+        patch_file(
+            intro_file,
+            'frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));',
+            '''themeFrameLayout.setVisibility(View.GONE);
+        frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));''',
+            "IntroActivity Hide DayNight Switcher"
+        )
+        patch_file(
+            intro_file,
+            'headerTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));',
+            'headerTextView.setTextColor(0xFFFFFFFF);',
+            "IntroActivity White Header Text"
+        )
+        patch_file(
+            intro_file,
+            'messageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));',
+            'messageTextView.setTextColor(0xFFCCCCCC);',
+            "IntroActivity Light Grey Message Text"
+        )
+        patch_file(
+            intro_file,
+            'startMessagingButtonBackground.setColors(new int[]{getThemedColor(Theme.key_featuredStickers_addButton), getThemedColor(Theme.key_featuredStickers_addButton2)});',
+            'startMessagingButtonBackground.setColors(new int[]{0xFFD32F2F, 0xFF8B0000});',
+            "IntroActivity Red Gradient Button"
+        )
+        patch_file(
+            intro_file,
+            'fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));',
+            'fragmentView.setBackgroundColor(0xFF000000);',
+            "IntroActivity Pure Black Background"
+        )
+        patch_file(
+            intro_file,
+            'switchLanguageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));',
+            'switchLanguageTextView.setTextColor(0xFFEF5350);',
+            "IntroActivity Red Switch Language Text"
+        )
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
@@ -1376,7 +1444,7 @@ def apply_custom_app_icon(repo_path, source_icon_path):
         os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "res")
     ]
 
-    # If prebuilt icons exist, copy them directly (no external dependencies needed)
+    # 1. Copy pre-generated custom Colgram avatar icons across all mipmap densities
     if os.path.exists(prebuilt_icons_dir):
         print("[*] Copying pre-generated custom Colgram avatar icons...")
         for density_name in os.listdir(prebuilt_icons_dir):
@@ -1391,45 +1459,91 @@ def apply_custom_app_icon(repo_path, source_icon_path):
                 for file_name in os.listdir(src_density):
                     shutil.copy2(os.path.join(src_density, file_name), os.path.join(dest_density, file_name))
         print(" [+] Custom Colgram avatar successfully applied across all mipmap densities!")
-        return
 
-    if not os.path.exists(source_icon_path):
-        print(f" [!] Source icon not found at: {source_icon_path}")
-        return
-
-    try:
-        from PIL import Image
-    except ImportError:
-        print(" [!] Pillow not available and no prebuilt icons found, skipping icon resizing.")
-        return
-
-    print("[*] Generating custom Colgram avatar across all mipmap densities...")
-    base_img = Image.open(source_icon_path).convert("RGBA")
-    
-    sizes = {
-        "mdpi": (48, 108),
-        "hdpi": (72, 162),
-        "xhdpi": (96, 216),
-        "xxhdpi": (144, 324),
-        "xxxhdpi": (192, 432),
-    }
-
+    # 2. Adaptive icon background -> solid pure black #000000
     for res_dir in target_dirs:
-        if not os.path.exists(res_dir):
-            continue
-        for density, (icon_size, fg_size) in sizes.items():
-            mipmap_dir = os.path.join(res_dir, f"mipmap-{density}")
-            os.makedirs(mipmap_dir, exist_ok=True)
-            
-            icon_img = base_img.resize((icon_size, icon_size), Image.LANCZOS)
-            for name in ["ic_launcher.png", "ic_launcher_round.png", "ic_launcher_sa.png", "icon_2_launcher.png", "icon_2_launcher_round.png"]:
-                icon_img.save(os.path.join(mipmap_dir, name), "PNG")
+        bg_sa_xml = os.path.join(res_dir, "drawable", "icon_background_sa.xml")
+        if os.path.exists(bg_sa_xml):
+            with open(bg_sa_xml, "w", encoding="utf-8") as f:
+                f.write('<?xml version="1.0" encoding="utf-8"?>\n<shape xmlns:android="http://schemas.android.com/apk/res/android">\n    <solid android:color="#000000" />\n</shape>\n')
+        bg_xml = os.path.join(res_dir, "drawable", "icon_background.xml")
+        if os.path.exists(bg_xml):
+            with open(bg_xml, "w", encoding="utf-8") as f:
+                f.write('<?xml version="1.0" encoding="utf-8"?>\n<shape xmlns:android="http://schemas.android.com/apk/res/android">\n    <solid android:color="#000000" />\n</shape>\n')
 
-            fg_img = base_img.resize((fg_size, fg_size), Image.LANCZOS)
-            for name in ["icon_foreground.png", "icon_foreground_sa.png", "icon_foreground_round.png"]:
-                fg_img.save(os.path.join(mipmap_dir, name), "PNG")
+    # 3. Splash plane & black launch screen background
+    splash_src = os.path.join(root_dir, "assets", "colgram_plane_splash.png")
+    if os.path.exists(splash_src):
+        for res_dir in target_dirs:
+            if not os.path.exists(res_dir):
+                continue
+            drawable_dir = os.path.join(res_dir, "drawable")
+            os.makedirs(drawable_dir, exist_ok=True)
+            shutil.copy2(splash_src, os.path.join(drawable_dir, "colgram_plane_splash.png"))
 
-    print(" [+] Custom Colgram avatar successfully generated across all mipmap densities!")
+            splash_bg_xml = os.path.join(drawable_dir, "colgram_splash_bg.xml")
+            with open(splash_bg_xml, "w", encoding="utf-8") as f:
+                f.write('''<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/black" />
+    <item
+        android:gravity="center"
+        android:width="160dp"
+        android:height="160dp"
+        android:drawable="@drawable/colgram_plane_splash" />
+</layer-list>
+''')
+
+            tg_splash = os.path.join(drawable_dir, "tg_splash_320.xml")
+            with open(tg_splash, "w", encoding="utf-8") as f:
+                f.write('''<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/black" />
+    <item
+        android:gravity="center"
+        android:width="160dp"
+        android:height="160dp"
+        android:drawable="@drawable/colgram_plane_splash" />
+</layer-list>
+''')
+
+    # 4. Patch styles.xml (Theme.TMessages.Start & Android 12+ Splash to pitch black + red plane)
+    res_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "res")
+    values_styles = os.path.join(res_dir, "values", "styles.xml")
+    if os.path.exists(values_styles):
+        with open(values_styles, "r", encoding="utf-8") as f:
+            v_content = f.read()
+        v_content = v_content.replace(
+            '<item name="android:colorBackground">@android:color/white</item>\n        <item name="android:windowBackground">@android:color/white</item>',
+            '<item name="android:colorBackground">@android:color/black</item>\n        <item name="android:windowBackground">@drawable/colgram_splash_bg</item>'
+        )
+        with open(values_styles, "w", encoding="utf-8") as f:
+            f.write(v_content)
+
+    v31_styles = os.path.join(res_dir, "values-v31", "styles.xml")
+    if os.path.exists(v31_styles):
+        with open(v31_styles, "r", encoding="utf-8") as f:
+            v31_content = f.read()
+        v31_content = v31_content.replace(
+            '<item name="android:colorBackground">@android:color/white</item>\n        <item name="android:windowBackground">@android:color/white</item>',
+            '<item name="android:colorBackground">@android:color/black</item>\n        <item name="android:windowBackground">@drawable/colgram_splash_bg</item>'
+        ).replace(
+            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">?android:windowBackground</item>',
+            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
+        )
+        with open(v31_styles, "w", encoding="utf-8") as f:
+            f.write(v31_content)
+
+    night_styles = os.path.join(res_dir, "values-night", "styles.xml")
+    if os.path.exists(night_styles):
+        with open(night_styles, "r", encoding="utf-8") as f:
+            n_content = f.read()
+        n_content = n_content.replace(
+            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">#1f2732</item>',
+            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
+        )
+        with open(night_styles, "w", encoding="utf-8") as f:
+            f.write(n_content)
 
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
