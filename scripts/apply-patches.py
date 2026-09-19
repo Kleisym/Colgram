@@ -93,23 +93,6 @@ def inject_hooks(repo_path):
             }"""
         if target1 in content:
             content = content.replace(target1, inject1, 1)
-
-        target2 = "KeepAliveJob.finishJob();"
-        inject2 = """KeepAliveJob.finishJob();
-                try {
-                    if (message instanceof TLRPC.TL_updateShort && ((TLRPC.TL_updateShort) message).update instanceof org.telegram.tgnet.tl.TL_update.TL_updateLoginToken) {
-                        org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
-                    } else if (message instanceof TLRPC.TL_updates && ((TLRPC.TL_updates) message).updates != null) {
-                        for (TLRPC.Update u : ((TLRPC.TL_updates) message).updates) {
-                            if (u instanceof org.telegram.tgnet.tl.TL_update.TL_updateLoginToken) {
-                                org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
-                                break;
-                            }
-                        }
-                    }
-                } catch (Throwable ignored) {}"""
-        if target2 in content:
-            content = content.replace(target2, inject2, 1)
         return content
 
     patch_file(conn_manager, conn_qr_replacer, "org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);", "ConnectionsManager QR Login Token Hook")

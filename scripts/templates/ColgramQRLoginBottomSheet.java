@@ -24,8 +24,12 @@ import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.TelegramQRCodeWriter;
+import org.telegram.messenger.Utilities;
+import android.os.Bundle;
 import org.telegram.tgnet.ConnectionsManager;
+import org.telegram.tgnet.SerializedData;
 import org.telegram.tgnet.TLRPC;
+import org.telegram.tgnet.tl.TL_account;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.LayoutHelper;
@@ -398,12 +402,15 @@ public class ColgramQRLoginBottomSheet {
         Toast.makeText(activity.getParentActivity(), isRu ? "Требуется пароль двухэтапной аутентификации" : "2FA password required", Toast.LENGTH_LONG).show();
 
         try {
-            activity.needShowProgress(0);
-            TLRPC.TL_account_getPassword req = new TLRPC.TL_account_getPassword();
+            TL_account.getPassword req = new TL_account.getPassword();
             ConnectionsManager.getInstance(currentAccount).sendRequest(req, (resp, err) -> AndroidUtilities.runOnUIThread(() -> {
-                activity.needHideProgress(false);
-                if (resp instanceof TLRPC.TL_account_password) {
-                    activity.openPasswordView((TLRPC.TL_account_password) resp);
+                if (err == null && resp instanceof TL_account.Password) {
+                    TL_account.Password password = (TL_account.Password) resp;
+                    Bundle bundle = new Bundle();
+                    SerializedData data = new SerializedData(password.getObjectSize());
+                    password.serializeToStream(data);
+                    bundle.putString("password", Utilities.bytesToHex(data.toByteArray()));
+                    activity.setPage(6, true, bundle, false);
                 }
             }), ConnectionsManager.RequestFlagFailOnServerErrors | ConnectionsManager.RequestFlagWithoutLogin);
         } catch (Throwable t) {
