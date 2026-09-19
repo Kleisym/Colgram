@@ -220,20 +220,24 @@ def inject_core(repo_path, core_source_dir):
             print(" [+] Added colgram-core dependency to TMessagesProj/build.gradle")
 
 def clone_required_submodules(repo_path):
-    print("[*] Cloning required submodules for Gradle (media & jlatexmath)...")
+    print("[*] Checking out required submodules for Gradle (media & jlatexmath)...")
     media_dir = os.path.join(repo_path, "TMessagesProj_Modules", "media")
-    if not os.path.exists(os.path.join(media_dir, "core_settings.gradle")):
+    core_settings = os.path.join(media_dir, "core_settings.gradle")
+    
+    if not os.path.exists(core_settings):
         shutil.rmtree(media_dir, ignore_errors=True)
-        print(" -> Cloning media submodule...")
-        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/Arseny271/media.git", media_dir], check=True)
-        print(" [+] Cloned media submodule")
+        print(" -> Cloning media submodule at pinned commit c822f1f33d30591fdbbf3919662be258f7cfbfc6...")
+        subprocess.run(["git", "clone", "https://github.com/Arseny271/media.git", media_dir], check=True)
+        subprocess.run(["git", "checkout", "c822f1f33d30591fdbbf3919662be258f7cfbfc6"], cwd=media_dir, check=True)
+        print(" [+] Successfully checked out media submodule with core_settings.gradle")
 
     jlatex_dir = os.path.join(repo_path, "TMessagesProj", "lib", "jlatexmath")
     if not os.path.exists(os.path.join(jlatex_dir, "jlatexmath")):
         shutil.rmtree(jlatex_dir, ignore_errors=True)
-        print(" -> Cloning jlatexmath submodule...")
-        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/dkaraush/jlatexmath-android.git", jlatex_dir], check=True)
-        print(" [+] Cloned jlatexmath submodule")
+        print(" -> Cloning jlatexmath submodule at pinned commit 919e50b2f6f64b04b712cdb13d558ff9ecf9c8ed...")
+        subprocess.run(["git", "clone", "https://github.com/dkaraush/jlatexmath-android.git", jlatex_dir], check=True)
+        subprocess.run(["git", "checkout", "919e50b2f6f64b04b712cdb13d558ff9ecf9c8ed"], cwd=jlatex_dir, check=True)
+        print(" [+] Successfully checked out jlatexmath submodule")
 
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

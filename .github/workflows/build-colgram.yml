@@ -36,6 +36,7 @@ jobs:
           echo "Cloning latest Telegram release from DrKLO/Telegram..."
           git clone --depth 1 https://github.com/DrKLO/Telegram.git Telegram-Src
           cd Telegram-Src
+          git submodule update --init TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
           UPSTREAM_TAG=$(git describe --tags --always)
           echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
           echo "Base Telegram Tag: $UPSTREAM_TAG"
