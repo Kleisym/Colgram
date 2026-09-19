@@ -329,8 +329,8 @@ public class ColgramProxyManager {
         if (ctx == null) return;
 
         try {
-            // 1. Persist proxy settings in SharedPreferences for all accounts (0..31)
-            for (int a = 0; a < 32; a++) {
+            // 1. Persist proxy settings in SharedPreferences for all accounts (0..3)
+            for (int a = 0; a < 4; a++) {
                 String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
                 preferences.edit()
@@ -350,7 +350,7 @@ public class ColgramProxyManager {
                 Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
                         int.class, String.class, int.class, String.class, String.class, String.class);
                 nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < 32; i++) {
+                for (int i = 0; i < 4; i++) {
                     nativeSetProxy.invoke(null, i, proxy.address, proxy.port, "", "", proxy.secret);
                 }
             } catch (Throwable t) {
@@ -432,7 +432,7 @@ public class ColgramProxyManager {
         Context ctx = context != null ? context.getApplicationContext() : appContext;
         if (ctx == null) return;
         try {
-            for (int a = 0; a < 32; a++) {
+            for (int a = 0; a < 4; a++) {
                 String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
                 preferences.edit().putBoolean("proxy_enabled", false).apply();
@@ -443,7 +443,7 @@ public class ColgramProxyManager {
                 Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
                         int.class, String.class, int.class, String.class, String.class, String.class);
                 nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < 32; i++) {
+                for (int i = 0; i < 4; i++) {
                     nativeSetProxy.invoke(null, i, "", 0, "", "", "");
                 }
             } catch (Throwable t) {

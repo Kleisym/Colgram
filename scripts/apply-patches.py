@@ -21,7 +21,7 @@ def patch_file(filepath, search_pattern, replacement, description):
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
-    if replacement.strip() in content:
+    if replacement and replacement.strip() in content:
         print(f" [=] Already patched: {description}")
         return True
 
@@ -772,8 +772,41 @@ public class ColgramBotLoginBottomSheet {
         patch_file(
             dialogs_activity,
             header_proxy_updater,
-            "",
+            "org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity())",
             "DialogsActivity Header Proxy Button 1-Tap Toggle"
+        )
+
+        def options_menu_injector(content):
+            target = """        io.add(R.drawable.outline_saved_24, getString(R.string.SavedMessages), () -> {
+            Bundle args = new Bundle();
+            args.putLong("user_id", UserConfig.getInstance(currentAccount).getClientUserId());
+            presentFragment(new ChatActivity(args));
+        });"""
+            if "org.colgram.core.ColgramPluginsActivity.start(getParentActivity())" in content:
+                return content
+            inject = """
+        io.addGap();
+        io.add(R.drawable.msg_customize, "🧩 Плагины и Маркетплейс", () -> {
+            org.colgram.core.ColgramPluginsActivity.start(getParentActivity());
+        });
+        io.add(R.drawable.msg_settings, "⚙️ Настройки Colgram", () -> {
+            org.colgram.core.ColgramSettingsActivity.start(getParentActivity());
+        });
+        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+            io.add(R.drawable.msg_retry, "🔄 Синхронизировать чаты бота", () -> {
+                org.colgram.core.ColgramBotSync.syncBotDialogs(getParentActivity(), currentAccount);
+            });
+            io.add(R.drawable.msg_edit, "✉️ Написать от имени бота", () -> {
+                org.colgram.core.ColgramBotSync.showStartChatDialog(getParentActivity(), currentAccount);
+            });
+        }"""
+            return content.replace(target, target + inject, 1)
+
+        patch_file(
+            dialogs_activity,
+            options_menu_injector,
+            "org.colgram.core.ColgramPluginsActivity.start(getParentActivity())",
+            "DialogsActivity Options Menu Plugins and Bot Sync Entries"
         )
 
     # 20. MessagesStorage.java -> Anti-Delete (Preserve Deleted Messages In Local DB)
@@ -805,77 +838,69 @@ public class ColgramBotLoginBottomSheet {
         }
         """
             return content[:brace_idx + 1] + inject + content[brace_idx + 1:]
-        patch_file(messages_storage, anti_delete_injector, "", "MessagesStorage Anti-Delete Preservation")
+        patch_file(messages_storage, anti_delete_injector, "org.colgram.core.ColgramConfig.isAntiDeleteEnabled()", "MessagesStorage Anti-Delete Preservation")
 
     # 21. MessagesController.java -> Save Message Edit History
     if os.path.exists(messages_controller):
         def edit_history_injector(content):
-            target = "if (update instanceof TLRPC.TL_updateEditMessage) {"
+            target = "} else if (baseUpdate instanceof TL_update.TL_updateEditChannelMessage || baseUpdate instanceof TL_update.TL_updateEditMessage) {"
             if target not in content:
                 return content
             inject = """
-        if (update instanceof TLRPC.TL_updateEditMessage) {
-            TLRPC.TL_updateEditMessage uem = (TLRPC.TL_updateEditMessage) update;
-            if (uem.message != null) {
-                long did = uem.message.dialog_id != 0 ? uem.message.dialog_id : (uem.message.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(uem.message.peer_id) : 0);
-                org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, uem.message.id, uem.message.message, uem.message.date);
-            }
-        } else if (update instanceof TLRPC.TL_updateEditChannelMessage) {
-            TLRPC.TL_updateEditChannelMessage uem = (TLRPC.TL_updateEditChannelMessage) update;
-            if (uem.message != null) {
-                long did = uem.message.dialog_id != 0 ? uem.message.dialog_id : (uem.message.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(uem.message.peer_id) : 0);
-                org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, uem.message.id, uem.message.message, uem.message.date);
-            }
-        }
-        """
-            return content.replace(target, inject + "\n        " + target, 1)
-        patch_file(messages_controller, edit_history_injector, "", "MessagesController Save Edit History")
+                try {
+                    TLRPC.Message colgramEditMsg = (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) ? ((TL_update.TL_updateEditChannelMessage) baseUpdate).message : ((TL_update.TL_updateEditMessage) baseUpdate).message;
+                    if (colgramEditMsg != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
+                        long did = colgramEditMsg.dialog_id != 0 ? colgramEditMsg.dialog_id : (colgramEditMsg.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(colgramEditMsg.peer_id) : 0);
+                        org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, colgramEditMsg.id, colgramEditMsg.message, colgramEditMsg.date);
+                    }
+                } catch (Throwable ignore) {}"""
+            return content.replace(target, target + inject, 1)
+        patch_file(messages_controller, edit_history_injector, "org.colgram.core.ColgramConfig.isEditHistoryEnabled()", "MessagesController Save Edit History")
 
 
     # 24. Theme.java -> Inject Colgram Cyber Red Colors
     theme_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "Theme.java")
     if os.path.exists(theme_file):
         def theme_cyber_injector(content):
-            target = "public static int getColor(String key, ResourcesProvider resourcesProvider) {"
-            if target not in content:
-                target = "public static int getColor(String key) {"
+            target = "public static int getColor(int key, ResourcesProvider provider) {"
             if target not in content:
                 return content
             inject = """
         if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
-            if ("featuredStickers_addButton".equals(key) || "chats_actionBackground".equals(key) || "switchTrackChecked".equals(key) || "dialogFloatingButton".equals(key)) {
+            if (key == key_chats_actionBackground || key == key_dialogFloatingButton || key == key_switchTrackChecked) {
                 return 0xffff3344;
             }
-            if ("windowBackgroundWhite".equals(key) || "windowBackgroundGray".equals(key)) {
+            if (key == key_windowBackgroundWhite || key == key_windowBackgroundGray) {
                 return 0xff0e0f12;
             }
-            if ("actionBarDefault".equals(key)) {
+            if (key == key_actionBarDefault) {
                 return 0xff16181e;
             }
-        }
-        """
-            idx = content.find(target)
-            brace_idx = content.find("{", idx)
-            if brace_idx == -1:
-                return content
-            return content[:brace_idx + 1] + inject + content[brace_idx + 1:]
-        patch_file(theme_file, theme_cyber_injector, "", "Theme Inject Colgram Cyber Red Colors")
+        }"""
+            return content.replace(target, target + inject, 1)
+        patch_file(theme_file, theme_cyber_injector, "org.colgram.core.ColgramConfig.isCyberThemeEnabled()", "Theme Inject Colgram Cyber Red Colors")
 
-    # 25. SettingsActivity.java -> Inject Colgram Settings Entry
+    # 25. SettingsActivity.java -> Inject Colgram Plugins & Settings Header Items
     settings_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SettingsActivity.java")
     if os.path.exists(settings_activity):
         def settings_menu_injector(content):
-            target = "listView.setOnItemClickListener((view, position) -> {"
+            target = "searchItem = menu.addItem(0, R.drawable.outline_header_search, resourceProvider)"
             if target not in content:
                 return content
             inject = """
-            if (position == 1) {
-                org.colgram.core.ColgramSettingsActivity.start(getParentActivity());
-                return;
-            }
-            """
-            return content.replace(target, target + inject, 1)
-        patch_file(settings_activity, settings_menu_injector, "", "SettingsActivity Inject Colgram Settings Entry")
+        ActionBarMenuItem pluginsItem = menu.addItem(8899, R.drawable.msg_customize);
+        if (pluginsItem != null) {
+            pluginsItem.setContentDescription("Плагины Colgram");
+            pluginsItem.setOnClickListener(v -> org.colgram.core.ColgramPluginsActivity.start(getParentActivity()));
+        }
+        ActionBarMenuItem colgramSettingsItem = menu.addItem(8898, R.drawable.msg_settings);
+        if (colgramSettingsItem != null) {
+            colgramSettingsItem.setContentDescription("Настройки Colgram");
+            colgramSettingsItem.setOnClickListener(v -> org.colgram.core.ColgramSettingsActivity.start(getParentActivity()));
+        }
+        """
+            return content.replace(target, inject + target, 1)
+        patch_file(settings_activity, settings_menu_injector, "ActionBarMenuItem pluginsItem = menu.addItem(8899", "SettingsActivity Inject Colgram Plugins & Settings Header Items")
 
     # 26. DialogsActivity.java & ContactsActivity.java -> Complete Permission Suppression
     if os.path.exists(dialogs_activity):
@@ -914,6 +939,7 @@ public class ColgramBotLoginBottomSheet {
             if (fromCache) {
                 getMessagesStorage().getDialogs(folderId, offset == 0 ? 0 : nextDialogsCacheOffset.get(folderId, 0), count, folderId == 0 && offset == 0);
             }
+            org.colgram.core.ColgramBotSync.syncBotDialogs(ApplicationLoader.applicationContext, currentAccount);
             getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);
             return;
         }"""
@@ -1103,17 +1129,15 @@ public class ColgramBotLoginBottomSheet {
             "ConnectionsManager Spoof systemVersion Directly"
         )
 
-    # 33. UserConfig.java -> 32 Max Accounts & Safe Phone Defaults
+    # 33. UserConfig.java -> Safe Account Bounds & Safe Defaults
     if os.path.exists(user_config):
-        user_max_target = """    public final static int MAX_ACCOUNT_DEFAULT_COUNT = 3;
-    public final static int MAX_ACCOUNT_COUNT = 4;"""
-        user_max_replacement = """    public final static int MAX_ACCOUNT_DEFAULT_COUNT = 32;
-    public final static int MAX_ACCOUNT_COUNT = 32;"""
+        user_max_target = "public final static int MAX_ACCOUNT_DEFAULT_COUNT = 3;"
+        user_max_replacement = "public final static int MAX_ACCOUNT_DEFAULT_COUNT = 4;"
         patch_file(
             user_config,
             user_max_target,
             user_max_replacement,
-            "UserConfig Set MAX_ACCOUNT_COUNT to 32"
+            "UserConfig Set MAX_ACCOUNT_DEFAULT_COUNT to 4"
         )
         patch_file(
             user_config,

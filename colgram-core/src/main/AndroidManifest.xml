@@ -8,6 +8,11 @@
             android:label="Colgram Settings"
             android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar"
             android:exported="false" />
+        <activity
+            android:name=".ColgramPluginsActivity"
+            android:label="Colgram Plugins"
+            android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+            android:exported="false" />
     </application>
 
 </manifest>

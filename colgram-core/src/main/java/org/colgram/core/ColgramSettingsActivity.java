@@ -84,23 +84,20 @@ public class ColgramSettingsActivity extends AppCompatActivity {
         });
 
         // Section: Plugins & Python Engine
-        addSectionHeader(root, "Плагины и скрипты Python");
+        addSectionHeader(root, "Плагины и Маркетплейс (как в exteraGram)");
+        Button openPluginsBtn = new Button(this);
+        openPluginsBtn.setText("🧩 Открыть Маркетплейс и Плагины");
+        openPluginsBtn.setTextColor(0xFFFFFFFF);
+        openPluginsBtn.setBackgroundColor(0xFFFF3344);
+        openPluginsBtn.setOnClickListener(v -> ColgramPluginsActivity.start(this));
+        root.addView(openPluginsBtn);
+
         final TextView pluginCountTv = new TextView(this);
         int pluginCount = ColgramPluginManager.getLoadedPlugins() != null ? ColgramPluginManager.getLoadedPlugins().size() : 0;
-        pluginCountTv.setText("Активных плагинов: " + pluginCount + " (папка /sdcard/Documents/Colgram/plugins)");
+        pluginCountTv.setText("Установлено плагинов: " + pluginCount + " • Встроенный CPython 3.11");
         pluginCountTv.setTextColor(0xFFAAAAAA);
-        pluginCountTv.setPadding(0, 8, 0, 16);
+        pluginCountTv.setPadding(0, 12, 0, 16);
         root.addView(pluginCountTv);
-
-        Button reloadPluginsBtn = new Button(this);
-        reloadPluginsBtn.setText("⚡ Перезагрузить плагины из хранилища");
-        reloadPluginsBtn.setOnClickListener(v -> {
-            ColgramPluginManager.init(getApplicationContext());
-            int count = ColgramPluginManager.getLoadedPlugins() != null ? ColgramPluginManager.getLoadedPlugins().size() : 0;
-            pluginCountTv.setText("Активных плагинов: " + count + " (папка /sdcard/Documents/Colgram/plugins)");
-            Toast.makeText(this, "Плагины перезагружены! Загружено: " + count, Toast.LENGTH_SHORT).show();
-        });
-        root.addView(reloadPluginsBtn);
 
         // Section: Storage Sandbox
         addSectionHeader(root, "Песочница файлов (Sandbox)");

@@ -271,11 +271,13 @@ public class ColgramBotLogin {
                                 msClass.getMethod("putUsersAndChats", ArrayList.class, ArrayList.class, boolean.class, boolean.class)
                                         .invoke(ms, users, null, true, true);
 
+                                ColgramBotSync.saveBotToken(context, currentAccount, token);
                                 Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
                                 Method runOnUI = auClass.getMethod("runOnUIThread", Runnable.class);
                                 runOnUI.invoke(null, (Runnable) () -> {
                                     dismissProgress(finalProgress);
                                     Toast.makeText(context, "Успешный вход в аккаунт бота!", Toast.LENGTH_SHORT).show();
+                                    ColgramBotSync.syncBotDialogs(context, currentAccount);
                                     if (onLoggedIn != null) {
                                         onLoggedIn.run();
                                     }

@@ -16,18 +16,23 @@ public class ColgramHookHandler {
     private static Context appContext;
 
     public static void init(Context context) {
-        appContext = context.getApplicationContext();
-        ColgramOptimizer.optimizeStartup(appContext);
-        ColgramConfig.init(appContext);
-        ColgramStorageSandbox.init(appContext);
-        ColgramDatabase.getInstance(appContext);
-        ColgramPythonEngine.init(appContext);
-        ColgramPluginManager.init(appContext);
+        if (context == null) return;
+        try {
+            appContext = context.getApplicationContext();
+            ColgramOptimizer.optimizeStartup(appContext);
+            ColgramConfig.init(appContext);
+            ColgramStorageSandbox.init(appContext);
+            ColgramDatabase.getInstance(appContext);
+            ColgramPythonEngine.init(appContext);
+            ColgramPluginManager.init(appContext);
 
-        // Start embedded DPI bypass engine and background connection doctor immediately
-        ColgramDpiBypass.start();
-        ColgramProxyManager.activateBuiltinProxy(appContext);
-        ColgramProxyDoctor.init(appContext);
+            // Start embedded DPI bypass engine and background connection doctor immediately
+            ColgramDpiBypass.start();
+            ColgramProxyManager.activateBuiltinProxy(appContext);
+            ColgramProxyDoctor.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.e("ColgramHookHandler", "Error during Colgram initialization", t);
+        }
     }
 
     /**
