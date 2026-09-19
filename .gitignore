@@ -29,3 +29,6 @@ Telegram-Src/
 
 # --- Tooling scratch ---
 .workbuddy-ai/tmp/
+
+# Local agent state: memory logs, caches, session scratch. Not project source.
+.workbuddy-ai/

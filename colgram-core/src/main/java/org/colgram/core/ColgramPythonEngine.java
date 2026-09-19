@@ -113,14 +113,61 @@ public class ColgramPythonEngine {
                 "        sys.stdout = old_stdout\n" +
                 "        sys.stderr = old_stderr\n" +
                 "\n" +
-                "builtins._execute_code = _execute_code\n";
+                "builtins._execute_code = _execute_code\n" +
+                "\n" +
+                "# Install the exteraGram compatibility shim as `exteraPlugins` before any\n" +
+                "# plugin is imported, so a plugin doing `import exteraPlugins` resolves to\n" +
+                "# Colgram's partial implementation instead of failing at import time.\n" +
+                "# The shim raises a clear UnsupportedFeature for APIs it cannot provide,\n" +
+                "# rather than silently no-op'ing.\n" +
+                "#\n" +
+                "# The location comes from `_colgram_plugins_dir`, injected below as a\n" +
+                "# Python global — os.environ cannot see a Java system property.\n" +
+                "try:\n" +
+                "    import types as _types, os as _os\n" +
+                "    _shim_path = _os.path.join(_colgram_plugins_dir, 'extera_compat.py') if _colgram_plugins_dir else ''\n" +
+                "    if _shim_path and _os.path.isfile(_shim_path):\n" +
+                "        with open(_shim_path, 'r', encoding='utf-8') as _fh:\n" +
+                "            _shim_src = _fh.read()\n" +
+                "        _ext = _types.ModuleType('exteraPlugins')\n" +
+                "        exec(compile(_shim_src, _shim_path, 'exec'), _ext.__dict__)\n" +
+                "        sys.modules['exteraPlugins'] = _ext\n" +
+                "except Exception as _e:\n" +
+                "    pass\n";
+
+            // Inject the plugins directory as a Python global before the bootstrap runs,
+            // so the shim loader above can find extera_compat.py.
+            String pluginsDir = System.getProperty("COLGRAM_PLUGINS_DIR", "");
+            String prelude = "_colgram_plugins_dir = " + pyStr(pluginsDir) + "\n";
 
             Object builtinsMod = getModuleMethod.invoke(pythonInstance, "builtins");
+            // Run the prelude first so `_colgram_plugins_dir` exists as a global, then the
+            // bootstrap that consumes it.
+            callAttrMethod.invoke(builtinsMod, "exec", new Object[]{ prelude });
             callAttrMethod.invoke(builtinsMod, "exec", new Object[]{ bootstrap });
 
         } catch (Throwable t) {
             Log.e(TAG, "Failed to bootstrap Python runner", t);
         }
+    }
+
+    /** Render a Java string as a safe single-quoted Python literal. */
+    private static String pyStr(String s) {
+        if (s == null) return "''";
+        StringBuilder sb = new StringBuilder("'");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' || c == '\'') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.append('\'').toString();
     }
 
     /**
@@ -133,6 +180,84 @@ public class ColgramPythonEngine {
             Object pathObj = callAttrMethod.invoke(sysMod, "get", new Object[]{ "path" });
             callAttrMethod.invoke(pathObj, "append", new Object[]{ path });
         } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Is `cmd` registered by a plugin through the exteraGram compatibility shim?
+     *
+     * exteraGram plugins register commands with exteraPlugins.add_command() instead of
+     * Colgram's header-comment convention, so they never appear in the Java-side command
+     * map. This asks the shim directly.
+     */
+    public static boolean isShimCommandRegistered(String cmd) {
+        if (!pythonInitialized || pythonInstance == null || cmd == null) return false;
+        try {
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            if (mod == null) return false;
+            Object commands = callAttrMethod.invoke(mod, "list_commands", new Object[]{});
+            if (commands == null) return false;
+            // PyObject list -> String and compare, case-insensitively like the dispatcher.
+            String rendered = commands.toString();
+            return rendered != null && rendered.toLowerCase().contains(cmd.toLowerCase());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Status of the exteraGram compatibility shim: "active", "loaded" or "missing".
+     *
+     * Used by the plugins screen so the user can tell whether the shim that lets
+     * exteraGram plugins run is actually installed in this build.
+     */
+    public static String getShimStatus() {
+        if (!pythonInitialized || pythonInstance == null) return "missing";
+        try {
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            return mod == null ? "missing" : "active";
+        } catch (Throwable t) {
+            return "missing";
+        }
+    }
+
+    /**
+     * Number of dot-commands registered through the exteraGram shim.
+     * Returns -1 when the shim is not present.
+     */
+    public static int getShimCommandCount() {
+        if (!pythonInitialized || pythonInstance == null) return -1;
+        try {
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            if (mod == null) return -1;
+            Object commands = callAttrMethod.invoke(mod, "list_commands", new Object[]{});
+            if (commands == null) return 0;
+            Object len = callAttrMethod.invoke(commands, "__len__", new Object[]{});
+            return len == null ? 0 : Integer.parseInt(len.toString());
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * Invoke a command registered through the exteraGram shim.
+     * Returns the handler's string result, or null if the command is unknown.
+     */
+    public static String runShimCommand(long dialogId, String cmd, String args) {
+        if (!pythonInitialized || pythonInstance == null || cmd == null) return null;
+        try {
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            // Wire the real bridge actions and the dialog context, so a plugin calling
+            // exteraPlugins.send_message() reaches an actual chat instead of raising
+            // UnsupportedFeature.
+            callAttrMethod.invoke(mod, "set_bridge",
+                    new Object[]{ makeCallback("send"), makeCallback("edit"), makeCallback("delete") });
+            Object out = callAttrMethod.invoke(mod, "run_command",
+                    new Object[]{ cmd, args == null ? "" : args, dialogId });
+            return out == null ? null : out.toString();
+        } catch (Throwable t) {
+            Log.w(TAG, "shim command ." + cmd + " failed: " + t.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -342,6 +467,145 @@ public class ColgramPythonEngine {
             return String.valueOf(result);
         } catch (Exception e) {
             return "SyntaxError: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Edits an existing message via SendMessagesHelper reflection.
+     *
+     * SendMessagesHelper.editMessage() requires a BaseFragment, so this uses
+     * ColgramUiBridge.reflectionRootFragment() (the activity currently on screen) and
+     * bails out silently when there is none — an edit from a background plugin has no
+     * UI anchor and would otherwise NPE inside Telegram.
+     */
+    public static void editMessage(long dialogId, int messageId, String newText) {
+        try {
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
+
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
+            Object msg = mcClass.getMethod("getMessage", int.class, long.class, int.class, boolean.class)
+                    .invoke(mc, currentAccount, dialogId, messageId, false);
+            if (msg == null) return;
+
+            Class<?> msgObjClass = Class.forName("org.telegram.messenger.MessageObject");
+            Object messageObject = msgObjClass.getConstructor(int.class, Object.class, Object.class, boolean.class)
+                    .newInstance(currentAccount, msg, null, false);
+
+            Object fragment = reflectionRootFragment();
+            if (fragment == null) return;
+
+            Class<?> smhClass = Class.forName("org.telegram.messenger.SendMessagesHelper");
+            Object smh = smhClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
+
+            Class<?> baseFragmentClass = Class.forName("org.telegram.ui.ActionBar.BaseFragment");
+            smhClass.getMethod("editMessage", msgObjClass, String.class, boolean.class,
+                            baseFragmentClass, java.util.ArrayList.class, int.class, int.class)
+                    .invoke(smh, messageObject, newText, false, fragment, null, 0, 0);
+        } catch (Throwable t) {
+            Log.w(TAG, "editMessage via reflection failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Deletes a single message via MessagesController.deleteMessages() reflection.
+     */
+    public static void deleteMessage(long dialogId, int messageId) {
+        try {
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
+
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
+
+            java.util.ArrayList<Integer> ids = new java.util.ArrayList<>();
+            ids.add(messageId);
+
+            Class<?> encryptedChatClass = Class.forName("org.telegram.tgnet.TLRPC$EncryptedChat");
+            // Public overload: (ArrayList, ArrayList, EncryptedChat, long, int, boolean, int)
+            // mode 0 == MODE_DEFAULT, forAll=false so it behaves like a normal local delete.
+            mcClass.getMethod("deleteMessages", java.util.ArrayList.class, java.util.ArrayList.class,
+                            encryptedChatClass, long.class, int.class, boolean.class, int.class)
+                    .invoke(mc, ids, null, null, dialogId, 0, false, 0);
+        } catch (Throwable t) {
+            Log.w(TAG, "deleteMessage via reflection failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * The BaseFragment Telegram currently has on screen, or null when nothing is open.
+     *
+     * Needed because SendMessagesHelper.editMessage() demands a fragment — it dereferences
+     * fragment.getParentActivity() immediately. The activity tracked by ColgramUiBridge is
+     * not a BaseFragment, so this checks whether it is fragment-shaped before handing it
+     * back, and returns null rather than a wrong-typed object.
+     */
+    private static Object reflectionRootFragment() {
+        try {
+            Class<?> bridge = Class.forName("org.colgram.core.ColgramUiBridge");
+            Object activity = bridge.getMethod("currentActivity").invoke(null);
+            if (activity == null) return null;
+            // Only return it if Telegram would accept it as a BaseFragment. Any activity
+            // that also implements this shape is the LaunchActivity's fragment host.
+            Class<?> baseFragmentClass;
+            try {
+                baseFragmentClass = Class.forName("org.telegram.ui.ActionBar.BaseFragment");
+            } catch (Throwable t) {
+                return null;
+            }
+            return baseFragmentClass.isInstance(activity) ? activity : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Build a Python-callable that forwards to the matching Java action.
+     *
+     * Chaquopy wraps a Java object and exposes its public methods to Python by name, so an
+     * object exposing {@code __call__(Object...)} becomes callable as {@code fn(a, b)}.
+     * This is why the bridge does not need {@code org.python.core} — which colgram-core
+     * cannot compile against, since Chaquopy is only on the app module.
+     *
+     * The returned proxy accepts either two or three positional arguments (Python passes
+     * only what the caller supplied), so argument handling is tolerant of both shapes.
+     */
+    private static Object makeCallback(final String kind) {
+        return java.lang.reflect.Proxy.newProxyInstance(
+                ColgramPythonEngine.class.getClassLoader(),
+                new Class<?>[]{ PyCallable.class },
+                (proxy, method, rawArgs) -> {
+                    if ("__call__".equals(method.getName())) {
+                        Object[] a = (Object[]) rawArgs[0];
+                        if ("send".equals(kind) && a.length >= 2) {
+                            sendMessage(asLong(a[0]), String.valueOf(a[1]));
+                        } else if ("edit".equals(kind) && a.length >= 3) {
+                            editMessage(asLong(a[0]), (int) asLong(a[1]), String.valueOf(a[2]));
+                        } else if ("delete".equals(kind) && a.length >= 2) {
+                            deleteMessage(asLong(a[0]), (int) asLong(a[1]));
+                        }
+                        return null;
+                    }
+                    if ("toString".equals(method.getName())) return "ColgramPyBridge(" + kind + ")";
+                    if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
+                    if ("equals".equals(method.getName())) return proxy == rawArgs[0];
+                    return null;
+                });
+    }
+
+    /** Marker interface so the proxy has a stable, Chaquopy-visible method set. */
+    public interface PyCallable {
+        Object __call__(Object... args);
+    }
+
+    /** Best-effort numeric coercion: Chaquopy may hand back Integer, Long or a String. */
+    private static long asLong(Object o) {
+        if (o instanceof Number) return ((Number) o).longValue();
+        try {
+            return Long.parseLong(String.valueOf(o));
+        } catch (Throwable t) {
+            return 0L;
         }
     }
 

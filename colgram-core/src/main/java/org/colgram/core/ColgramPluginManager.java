@@ -79,6 +79,12 @@ public class ColgramPluginManager {
             // 3. Create default built-in plugins if none exist
             createDefaultPluginsIfEmpty(internalPluginsDir);
 
+            // 3b. Always refresh the exteraGram compatibility shim. It is infrastructure,
+            //     not a user plugin, so it is overwritten on every start — that way a
+            //     Colgram update that changes the shim takes effect without the user
+            //     having to clear app data.
+            installExteraCompatShim(internalPluginsDir);
+
             // 4. Reload
             reloadPlugins();
 
@@ -195,7 +201,36 @@ public class ColgramPluginManager {
                 return true;
             }
         }
-        return false;
+        // Fall through to any command registered through the exteraGram compat shim.
+        // exteraGram plugins register via `exteraPlugins.add_command(...)` rather than
+        // Colgram's header comment, so they never appear in activeCommands and would
+        // otherwise never fire.
+        return dispatchExteraShimCommand(dialogId, cmd, args);
+    }
+
+    /**
+     * Run a command registered through the exteraPlugins compatibility shim.
+     *
+     * The shim lives inside the Python interpreter; we reach it through ColgramPythonEngine
+     * rather than importing Python here, since this module must stay free of Telegram and
+     * interpreter references at compile time.
+     *
+     * Returns true if the shim handled the command.
+     */
+    private static boolean dispatchExteraShimCommand(long dialogId, String cmd, String args) {
+        try {
+            if (!ColgramPythonEngine.isShimCommandRegistered(cmd)) {
+                return false;
+            }
+            String result = ColgramPythonEngine.runShimCommand(dialogId, cmd, args);
+            if (result != null && !result.isEmpty()) {
+                ColgramPythonEngine.sendMessage(dialogId, result);
+            }
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "extera shim dispatch failed for ." + cmd + ": " + t.getMessage());
+            return false;
+        }
     }
 
     public static String getLoadedPluginsSummary() {
@@ -346,8 +381,41 @@ public class ColgramPluginManager {
         return new ArrayList<>(loadedPlugins);
     }
 
-    private static void createDefaultPluginsIfEmpty(File dir) {
-        if (dir == null) return;
+    /**
+     * Write the bundled exteraGram compatibility shim into the plugins directory.
+     *
+     * The shim is read from assets/plugins/extera_compat.py and written as
+     * extera_compat.py. It is refreshed on every start (unlike user plugins, which are
+     * only created when the directory is empty) because it is infrastructure that must
+     * track the Colgram version.
+     *
+     * Also exports COLGRAM_PLUGINS_DIR so the Python bootstrap can locate it.
+     */
+    private static void installExteraCompatShim(File dir) {
+        if (dir == null || appContext == null) return;
+        try {
+            // Export the plugins dir for the Python bootstrap.
+            System.setProperty("COLGRAM_PLUGINS_DIR", dir.getAbsolutePath());
+
+            java.io.InputStream in = appContext.getAssets().open("plugins/extera_compat.py");
+            File out = new File(dir, "extera_compat.py");
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(out, false);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                fos.write(buf, 0, n);
+            }
+            fos.flush();
+            fos.close();
+            in.close();
+            Log.i(TAG, "exteraGram compat shim installed at " + out.getAbsolutePath());
+        } catch (Throwable t) {
+            // Missing asset is not fatal: plugins simply will not have the shim.
+            Log.w(TAG, "Could not install exteraGram compat shim: " + t.getMessage());
+        }
+    }
+
+    private static void createDefaultPluginsIfEmpty(File dir) {        if (dir == null) return;
         File[] existing = dir.listFiles((d, n) -> n.endsWith(".py"));
         if (existing != null && existing.length > 0) return;
 

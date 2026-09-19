@@ -59,6 +59,16 @@ def inject_hooks(repo_path):
         "applicationContext = getApplicationContext();\n            org.colgram.core.ColgramHookHandler.init(applicationContext);",
         "ApplicationLoader.onCreate initialization"
     )
+    # 1b. Let Colgram track which screen is on top. Several Telegram APIs that plugin
+    #     features need (notably SendMessagesHelper.editMessage) require a live fragment
+    #     and fail silently without one. colgram-core cannot reference Activity or
+    #     BaseFragment at compile time, so it registers lifecycle callbacks here instead.
+    patch_file(
+        app_loader,
+        "org.colgram.core.ColgramHookHandler.init(applicationContext);",
+        "org.colgram.core.ColgramHookHandler.init(applicationContext);\n            org.colgram.core.ColgramUiBridge.install(this);",
+        "ApplicationLoader.onCreate UI bridge registration"
+    )
 
     # 2. ConnectionsManager.java -> Hardware & OS Cloaking
     conn_manager = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")

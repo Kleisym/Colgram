@@ -142,6 +142,47 @@ public class ColgramPluginsActivity extends Activity {
                     "1.3",
                     ".purge",
                     "# name: Быстрая зачистка\n# author: AyuGram\n# version: 1.3\n# command: purge\n\ndef on_command(cmd, args):\n    return '⚡ Выполняю зачистку сообщений...'\n"
+            ),
+            // --- exteraGram-compatible plugins -------------------------------------------
+            // These are written against the exteraPlugins shim, so they exercise the same
+            // import path a real exteraGram plugin uses. They are deliberately simple:
+            // anything needing exteraGram's raw MTProto or custom UI cannot work here, and
+            // would fail loudly rather than silently.
+            new StorePlugin(
+                    "Uptime (extera-стиль)",
+                    "uptime_extra.py",
+                    "Показывает, сколько времени работает Colgram. Написан через exteraPlugins API — проверка совместимости.",
+                    "exteraGram community",
+                    "1.0",
+                    ".uptime",
+                    "import exteraPlugins, time\n\n_start = time.time()\n\n@exteraPlugins.on_command('uptime')\ndef uptime(args):\n    secs = int(time.time() - _start)\n    h, rem = divmod(secs, 3600)\n    m, s = divmod(rem, 60)\n    return '⏱ Сессия: %dч %dм %dс' % (h, m, s)\n"
+            ),
+            new StorePlugin(
+                    "Заметки (extera-стиль)",
+                    "notes_extra.py",
+                    "Личные заметки с сохранением в хранилище плагина. Команды: .note add/del/list.",
+                    "exteraGram community",
+                    "1.1",
+                    ".note",
+                    "import exteraPlugins\n\n@exteraPlugins.on_command('note')\ndef note(args):\n    parts = (args or '').split(None, 1)\n    if not parts:\n        return 'Использование: .note add <текст> | .note del <n> | .note list'\n    action = parts[0].lower()\n    value = parts[1].strip() if len(parts) > 1 else ''\n    items = exteraPlugins.store.get('notes', [])\n    if action == 'add':\n        if not value:\n            return 'Что записать?'\n        items.append(value)\n        exteraPlugins.store.put('notes', items)\n        return 'Записано. Всего заметок: %d' % len(items)\n    if action == 'del':\n        try:\n            idx = int(value) - 1\n            removed = items.pop(idx)\n        except (ValueError, IndexError):\n            return 'Неверный номер'\n        exteraPlugins.store.put('notes', items)\n        return 'Удалено: ' + removed\n    if action == 'list':\n        if not items:\n            return 'Заметок нет'\n        return '\\n'.join('%d. %s' % (i + 1, t) for i, t in enumerate(items))\n    return 'Неизвестное действие: ' + action\n"
+            ),
+            new StorePlugin(
+                    "Калькулятор (extera-стиль)",
+                    "calc_extra.py",
+                    "Безопасный арифметический калькулятор без eval. Команда: .calc <выражение>.",
+                    "exteraGram community",
+                    "1.0",
+                    ".calc",
+                    "import exteraPlugins, ast, operator\n\n_OPS = {ast.Add: operator.add, ast.Sub: operator.sub,\n        ast.Mult: operator.mul, ast.Div: operator.truediv,\n        ast.Pow: operator.pow, ast.Mod: operator.mod,\n        ast.USub: operator.neg}\n\ndef _ev(node):\n    if isinstance(node, ast.Constant):\n        return node.value\n    if isinstance(node, ast.BinOp):\n        return _OPS[type(node.op)](_ev(node.left), _ev(node.right))\n    if isinstance(node, ast.UnaryOp):\n        return _OPS[type(node.op)](_ev(node.operand))\n    raise ValueError('unsupported')\n\n@exteraPlugins.on_command('calc')\ndef calc(args):\n    if not args:\n        return 'Использование: .calc 2+2*2'\n    try:\n        tree = ast.parse(args, mode='eval')\n        return '= %s' % _ev(tree.body)\n    except Exception:\n        return 'Не могу посчитать: %s' % args\n"
+            ),
+            new StorePlugin(
+                    "Счётчик символов (extera-стиль)",
+                    "counter_extra.py",
+                    "Считает символы и слова в тексте. Команда: .count <текст>.",
+                    "exteraGram community",
+                    "1.0",
+                    ".count",
+                    "import exteraPlugins\n\n@exteraPlugins.on_command('count')\ndef count(args):\n    if not args:\n        return 'Использование: .count <текст>'\n    chars = len(args)\n    chars_ns = len(args.replace(' ', ''))\n    words = len(args.split())\n    return 'Символов: %d (без пробелов: %d)\\nСлов: %d' % (chars, chars_ns, words)\n"
             )
     };
 
@@ -257,7 +298,20 @@ public class ColgramPluginsActivity extends Activity {
         List<ColgramPluginManager.PluginInfo> plugins = ColgramPluginManager.getLoadedPlugins();
 
         TextView headerTv = new TextView(this);
-        headerTv.setText("Загружено плагинов: " + plugins.size());
+        String shimStatus = ColgramPythonEngine.getShimStatus();
+        int shimCommands = ColgramPythonEngine.getShimCommandCount();
+        StringBuilder header = new StringBuilder("Загружено плагинов: " + plugins.size());
+        if ("active".equals(shimStatus)) {
+            header.append("\nСовместимость с exteraGram: активна");
+            if (shimCommands > 0) {
+                header.append(" • команд через неё: ").append(shimCommands);
+            }
+        } else {
+            // The shim is what lets exteraGram plugins run at all. Saying so plainly beats
+            // letting the user install a plugin that silently cannot register anything.
+            header.append("\nСовместимость с exteraGram: недоступна в этой сборке");
+        }
+        headerTv.setText(header.toString());
         headerTv.setTextColor(COLOR_SUBTEXT);
         headerTv.setTextSize(14);
         headerTv.setPadding(0, 0, 0, 16);

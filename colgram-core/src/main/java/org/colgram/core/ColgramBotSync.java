@@ -128,6 +128,178 @@ public class ColgramBotSync {
     }
 
     /**
+     * Convert a Bot API chat id to the id Telegram's client uses for a channel peer.
+     *
+     * Bot API:  -1001234567890
+     * Client:    1234567890   (strip the -100 prefix)
+     */
+    private static long channelIdFromBotApi(long botApiChatId) {
+        return Math.abs(botApiChatId) - 1000000000000L;
+    }
+
+    /**
+     * A Bot API chat id is a supergroup/channel when it carries the -100 prefix.
+     * Legacy groups are negative without it; private chats are positive.
+     */
+    private static boolean isSupergroupOrChannel(long botApiChatId) {
+        return botApiChatId < 0 && String.valueOf(Math.abs(botApiChatId)).startsWith("100");
+    }
+
+    /**
+     * Mirror of MessageObject.getPeerId() for a TL_message, without referencing Telegram
+     * classes at compile time.
+     *
+     * Telegram's rule (MessageObject.getPeerId):
+     *     TL_peerChat    -> -chat_id
+     *     TL_peerChannel -> -channel_id
+     *     TL_peerUser    ->  user_id
+     * Returning 0 when the message has no peer keeps the caller's match check safe.
+     */
+    private static long peerIdOf(Class<?> messageClass, Class<?> peerChannelClass, Class<?> peerChatClass,
+                                 Class<?> peerUserClass, Object message) {
+        try {
+            Object peer = messageClass.getField("peer_id").get(message);
+            if (peer == null) return 0;
+            if (peerChannelClass.isInstance(peer)) {
+                return -peerChannelClass.getField("channel_id").getLong(peer);
+            }
+            if (peerChatClass.isInstance(peer)) {
+                return -peerChatClass.getField("chat_id").getLong(peer);
+            }
+            if (peerUserClass.isInstance(peer)) {
+                return peerUserClass.getField("user_id").getLong(peer);
+            }
+            return 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /**
+     * Build a TLRPC chat object for a group or channel seen through the Bot API.
+     *
+     * DialogsActivity cannot render a dialog row for a chat it has no object for: it needs
+     * the title and the group/channel flags to pick the row type, the participant count for
+     * the subtitle, and the id to look the peer up. The Bot API supplies only a subset, so
+     * this constructs the closest honest equivalent:
+     *
+     *   - supergroup/channel -> TLRPC.TL_channel, megagroup=true (broadcast=false)
+     *   - legacy group       -> TLRPC.TL_chat
+     *
+     * Field names differ between the two classes (title/participants_count exist on both,
+     * but only TL_channel has megagroup/broadcast), so the optional ones are set defensively.
+     *
+     * @param source    the raw Bot API chat object, used for title/username when available
+     * @param isChannel true for a supergroup/channel, false for a legacy group
+     * @return a TLRPC chat instance, or null if reflection could not build one
+     */
+    private static Object buildBotApiChat(Class<?> chatClass, Class<?> channelClass, JSONObject source,
+                                          long id, String title, int date, boolean isChannel) {
+        try {
+            Object chat = isChannel ? channelClass.getConstructor().newInstance() : chatClass.getConstructor().newInstance();
+
+            chatClass.getField("id").setLong(chat, id);
+            chatClass.getField("title").set(chat, title == null || title.isEmpty() ? "Chat " + id : title);
+            chatClass.getField("date").setInt(chat, date);
+            try {
+                chatClass.getField("participants_count").setInt(chat, 0);
+            } catch (Throwable ignored) {}
+
+            if (source != null) {
+                String username = source.optString("username", "");
+                if (!username.isEmpty()) {
+                    try { chatClass.getField("username").set(chat, username); } catch (Throwable ignored) {}
+                }
+            }
+
+            if (isChannel) {
+                // megagroup=true keeps the chat openable in ChatActivity; a channel with
+                // broadcast=true and megagroup=false opens read-only and would look wrong
+                // for a bot's own group.
+                try { channelClass.getField("megagroup").setBoolean(chat, true); } catch (Throwable ignored) {}
+                try { channelClass.getField("broadcast").setBoolean(chat, false); } catch (Throwable ignored) {}
+                try { channelClass.getField("left").setBoolean(chat, false); } catch (Throwable ignored) {}
+                try { channelClass.getField("creator").setBoolean(chat, true); } catch (Throwable ignored) {}
+            }
+            return chat;
+        } catch (Throwable t) {
+            Log.w(TAG, "could not build chat object for bot api id " + id + ": " + t.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Fetch the bot's own profile via getMe and register it as the account's current user.
+     *
+     * Why this matters: on a bot account the client otherwise has no idea who "it" is.
+     * MessagesController needs a current user to resolve the account's own id, to decide
+     * which side of a dialog is "outgoing", and to render the avatar in the chat list.
+     * Without it, dialogs can be inserted into storage and still never render.
+     *
+     * Returns the bot's user id, or 0 on failure.
+     */
+    public static long fetchAndRegisterBotSelf(Context context, int account, String token) {
+        if (token == null || token.isEmpty()) return 0;
+        try {
+            HttpURLConnection conn = openConnection(
+                    "https://api.telegram.org/bot" + token + "/getMe", 12000);
+            conn.setRequestMethod("GET");
+            if (conn.getResponseCode() != 200) return 0;
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+
+            JSONObject root = new JSONObject(sb.toString());
+            if (!root.optBoolean("ok", false)) return 0;
+            JSONObject me = root.optJSONObject("result");
+            if (me == null) return 0;
+
+            long botId = me.optLong("id", 0);
+            if (botId == 0) return 0;
+
+            Class<?> userClass = Class.forName("org.telegram.tgnet.TLRPC$TL_user");
+            Class<?> userStatusClass = Class.forName("org.telegram.tgnet.TLRPC$TL_userStatusRecently");
+
+            Object user = userClass.getConstructor().newInstance();
+            userClass.getField("id").setLong(user, botId);
+            userClass.getField("first_name").set(user, me.optString("first_name", "Bot"));
+            userClass.getField("last_name").set(user, me.optString("last_name", ""));
+            userClass.getField("username").set(user, me.optString("username", ""));
+            userClass.getField("phone").set(user, "");
+            userClass.getField("bot").setBoolean(user, true);
+            userClass.getField("status").set(user, userStatusClass.getConstructor().newInstance());
+
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+            mcClass.getMethod("putUser", Class.forName("org.telegram.tgnet.TLRPC$User"), boolean.class)
+                    .invoke(mc, user, true);
+
+            SharedPreferences prefs = context.getSharedPreferences(
+                    "colgram_bot_account_" + account, Context.MODE_PRIVATE);
+            prefs.edit()
+                    .putLong("bot_self_id", botId)
+                    .putString("bot_self_username", me.optString("username", ""))
+                    .apply();
+
+            Log.i(TAG, "getMe ok: id=" + botId + " @" + me.optString("username", ""));
+            return botId;
+        } catch (Throwable t) {
+            Log.w(TAG, "getMe failed: " + t.getMessage());
+            return 0;
+        }
+    }
+
+    /** Cached bot user id for this account, or 0 if getMe has not succeeded yet. */
+    public static long getBotSelfId(Context context, int account) {
+        if (context == null) return 0;
+        return context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE)
+                .getLong("bot_self_id", 0);
+    }
+
+    /**
      * Starts continuous background polling for incoming messages on bot accounts.
      */
     public static synchronized void startBotUpdatesPoller(final Context context, final int account) {
@@ -144,6 +316,10 @@ public class ColgramBotSync {
             String token = getBotToken(appContext, account);
             if (!token.isEmpty()) {
                 deleteWebhook(token);
+                // Make sure we know who the bot is before polling updates.
+                if (getBotSelfId(appContext, account) == 0) {
+                    fetchAndRegisterBotSelf(appContext, account, token);
+                }
             }
 
             SharedPreferences prefs = appContext.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE);
@@ -177,8 +353,19 @@ public class ColgramBotSync {
                     int currentOffset = lastUpdateIds.getOrDefault(account, 0);
                     String urlStr;
                     if (currentOffset == 0) {
-                        // First run: fetch last 50 updates immediately
-                        urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=50&offset=-50&timeout=0";
+                        // First run.
+                        //
+                        // DO NOT use offset=-50 here. In the Bot API, `offset` means
+                        // "return updates starting from this id" and Telegram treats every
+                        // update BELOW that id as confirmed/delivered. A negative offset is
+                        // read as "give me the last N", so this very first call marked the
+                        // bot's entire pending backlog as read — and the next getUpdates
+                        // came back empty. That is why the chat list was empty and never
+                        // recovered until the local offset was cleared.
+                        //
+                        // Omitting offset entirely returns the pending queue without
+                        // acknowledging anything we have not actually processed.
+                        urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22channel_post%22%2C%22callback_query%22%5D";
                     } else {
                         // Long-poll: wait up to 20 seconds on server
                         urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=" + currentOffset + "&timeout=20";
@@ -253,7 +440,9 @@ public class ColgramBotSync {
         if (activity == null) return;
         AlertDialog.Builder builder = new AlertDialog.Builder(activity);
         builder.setTitle("🔑 Токен бота (@BotFather)");
-        builder.setMessage("Введите токен бота из @BotFather для загрузки диалогов и синхронизации сообщений:");
+        builder.setMessage("Введите токен бота из @BotFather для загрузки диалогов и синхронизации сообщений:\n\n"
+                + "Важно: бот видит только те чаты, которые ему писали (или где он добавлен). "
+                + "Если список пуст — напишите боту любое сообщение и нажмите «Синхронизировать» снова.");
 
         final EditText input = new EditText(activity);
         input.setHint("123456789:ABCdef...");
@@ -263,10 +452,14 @@ public class ColgramBotSync {
 
         builder.setPositiveButton("Синхронизировать", (dialog, which) -> {
             String token = input.getText().toString().trim();
-            if (!token.isEmpty()) {
-                saveBotToken(activity, account, token);
-                syncBotDialogs(activity, account, true);
+            if (token.isEmpty()) {
+                Toast.makeText(activity, "Токен пустой", Toast.LENGTH_SHORT).show();
+                return;
             }
+            saveBotToken(activity, account, token);
+            // Verify the token before the heavier dialog sync, so a typo is reported as a
+            // token problem instead of surfacing as the misleading "no chats found".
+            syncBotDialogs(activity, account, true);
         });
         builder.setNegativeButton("Отмена", null);
         builder.show();
@@ -298,7 +491,14 @@ public class ColgramBotSync {
 
         executor.execute(() -> {
             try {
-                String urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=-50";
+                // Resolve the bot's own identity FIRST. Without a current user the client
+                // cannot resolve its own id, so dialogs get inserted but never render —
+                // they look like "no chats" even when storage has them.
+                if (getBotSelfId(context, account) == 0) {
+                    fetchAndRegisterBotSelf(context, account, token);
+                }
+
+                String urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0";
                 HttpURLConnection conn = openConnection(urlStr, 12000);
                 conn.setRequestMethod("GET");
 
@@ -376,7 +576,10 @@ public class ColgramBotSync {
             Class<?> messageClass = Class.forName("org.telegram.tgnet.TLRPC$TL_message");
             Class<?> peerUserClass = Class.forName("org.telegram.tgnet.TLRPC$TL_peerUser");
             Class<?> peerChatClass = Class.forName("org.telegram.tgnet.TLRPC$TL_peerChat");
+            Class<?> peerChannelClass = Class.forName("org.telegram.tgnet.TLRPC$TL_peerChannel");
             Class<?> dialogClass = Class.forName("org.telegram.tgnet.TLRPC$TL_dialog");
+            Class<?> chatClass = Class.forName("org.telegram.tgnet.TLRPC$TL_chat");
+            Class<?> channelClass = Class.forName("org.telegram.tgnet.TLRPC$TL_channel");
             Class<?> messagesDialogsClass = Class.forName("org.telegram.tgnet.TLRPC$TL_messages_dialogs");
             Class<?> messagesDialogsBaseClass = Class.forName("org.telegram.tgnet.TLRPC$messages_Dialogs");
 
@@ -391,6 +594,11 @@ public class ColgramBotSync {
             Set<Long> processedUserIds = new HashSet<>();
             java.util.LinkedHashMap<Long, Integer> topMessageMap = new java.util.LinkedHashMap<>();
             java.util.LinkedHashMap<Long, Integer> lastDateMap = new java.util.LinkedHashMap<>();
+            // Which updates belong to a group/channel, and what to call it. Needed later when
+            // building the chat object the dialog row is rendered from — the chat fields are
+            // not all present on every update, so the last non-empty value wins.
+            java.util.LinkedHashMap<Long, JSONObject> chatObjCache = new java.util.LinkedHashMap<>();
+            java.util.LinkedHashMap<Long, String> titleCache = new java.util.LinkedHashMap<>();
 
             for (int i = 0; i < updates.length(); i++) {
                 JSONObject upd = updates.getJSONObject(i);
@@ -426,6 +634,15 @@ public class ColgramBotSync {
 
                 topMessageMap.put(chatId, msgId);
                 lastDateMap.put(chatId, date);
+                if (chatObj != null && chatId < 0) {
+                    chatObjCache.put(chatId, chatObj);
+                    String t = chatObj.optString("title", "");
+                    if (t.isEmpty()) {
+                        // Fall back to @username so the row is not labelled "Chat".
+                        t = chatObj.optString("username", "");
+                    }
+                    if (!t.isEmpty()) titleCache.put(chatId, t);
+                }
 
                 // Create TLRPC.TL_user
                 if (fromId != 0 && !processedUserIds.contains(fromId)) {
@@ -454,7 +671,26 @@ public class ColgramBotSync {
                     messageClass.getField("out").setBoolean(message, false);
                 } catch (Throwable ignored) {}
 
-                if (chatId < 0) {
+                // Resolve the correct peer type and id.
+                //
+                // Telegram has THREE peer shapes and the Bot API returns them all as
+                // negative chat ids, so you cannot pick the class by sign alone:
+                //
+                //   -100XXXXXXXXXX  supergroup or channel  -> TLRPC.TL_peerChannel,
+                //                                             id = -chatId - 1000000000000
+                //   -XXXXXXXXXX     legacy group           -> TLRPC.TL_peerChat,
+                //                                             id = -chatId
+                //   > 0             private chat           -> TLRPC.TL_peerUser
+                //
+                // The previous code sent EVERY negative id to TL_peerChat as -chatId, so a
+                // supergroup became channel_id 1001234567890 — an id that does not exist.
+                // The dialog was stored under a bogus peer and never rendered, which is why
+                // group chats were missing entirely.
+                if (isSupergroupOrChannel(chatId)) {
+                    Object peer = peerChannelClass.getConstructor().newInstance();
+                    peerChannelClass.getField("channel_id").setLong(peer, channelIdFromBotApi(chatId));
+                    messageClass.getField("peer_id").set(message, peer);
+                } else if (chatId < 0) {
                     Object peer = peerChatClass.getConstructor().newInstance();
                     peerChatClass.getField("chat_id").setLong(peer, -chatId);
                     messageClass.getField("peer_id").set(message, peer);
@@ -483,28 +719,78 @@ public class ColgramBotSync {
                         .invoke(ms, messagesList, true, true, false, 0, 0, 0L);
             }
 
-            // Create and persist TLRPC.TL_dialog for each unique chat
+            // Create and persist TLRPC.TL_dialog for each unique chat.
+            //
+            // The dialog id MUST equal MessageObject.getPeerId(peer), which Telegram defines
+            // as:
+            //     TL_peerChat    -> -chat_id
+            //     TL_peerChannel -> -channel_id
+            //     TL_peerUser    ->  user_id
+            //
+            // The Bot API hands back a supergroup as -1001234567890. That is NOT a Telegram
+            // dialog id: the real channel_id is 1234567890 and the dialog id is
+            // -1234567890. Writing the raw -100-prefixed value produced a dialog whose id
+            // matched no peer, so the chat never appeared in the list even though the
+            // message and user rows were stored correctly. This mirrors the peer-type fix
+            // applied to messages above.
             ArrayList dialogsList = new ArrayList();
+            ArrayList chatsList = new ArrayList();
             for (java.util.Map.Entry<Long, Integer> entry : topMessageMap.entrySet()) {
-                long did = entry.getKey();
+                long botApiChatId = entry.getKey();
                 int topMid = entry.getValue();
-                int lastDate = lastDateMap.containsKey(did) ? lastDateMap.get(did) : (int) (System.currentTimeMillis() / 1000);
+                int lastDate = lastDateMap.containsKey(botApiChatId) ? lastDateMap.get(botApiChatId)
+                        : (int) (System.currentTimeMillis() / 1000);
+
+                long dialogId;
+                Object peer;
+                if (isSupergroupOrChannel(botApiChatId)) {
+                    long channelId = channelIdFromBotApi(botApiChatId);
+                    dialogId = -channelId;
+                    peer = peerChannelClass.getConstructor().newInstance();
+                    peerChannelClass.getField("channel_id").setLong(peer, channelId);
+                    // DialogsActivity resolves the title and row type from a registered chat
+                    // object; without it the dialog row cannot be built at all.
+                    Object chat = buildBotApiChat(chatClass, channelClass, chatObjCache.get(botApiChatId),
+                            channelId, titleCache.get(botApiChatId), lastDate, true);
+                    if (chat != null) chatsList.add(chat);
+                } else if (botApiChatId < 0) {
+                    long chatId = -botApiChatId;
+                    dialogId = -chatId;
+                    peer = peerChatClass.getConstructor().newInstance();
+                    peerChatClass.getField("chat_id").setLong(peer, chatId);
+                    Object chat = buildBotApiChat(chatClass, channelClass, chatObjCache.get(botApiChatId),
+                            chatId, titleCache.get(botApiChatId), lastDate, false);
+                    if (chat != null) chatsList.add(chat);
+                } else {
+                    dialogId = botApiChatId;
+                    peer = peerUserClass.getConstructor().newInstance();
+                    peerUserClass.getField("user_id").setLong(peer, dialogId);
+                }
 
                 Object dialog = dialogClass.getConstructor().newInstance();
-                dialogClass.getField("id").setLong(dialog, did);
+                dialogClass.getField("id").setLong(dialog, dialogId);
+                dialogClass.getField("peer").set(dialog, peer);
                 dialogClass.getField("top_message").setInt(dialog, topMid);
                 dialogClass.getField("last_message_date").setInt(dialog, lastDate);
-
-                if (did < 0) {
-                    Object peer = peerChatClass.getConstructor().newInstance();
-                    peerChatClass.getField("chat_id").setLong(peer, -did);
-                    dialogClass.getField("peer").set(dialog, peer);
-                } else {
-                    Object peer = peerUserClass.getConstructor().newInstance();
-                    peerUserClass.getField("user_id").setLong(peer, did);
-                    dialogClass.getField("peer").set(dialog, peer);
-                }
+                dialogClass.getField("unread_count").setInt(dialog, 0);
                 dialogsList.add(dialog);
+            }
+
+            if (!chatsList.isEmpty()) {
+                try {
+                    msClass.getMethod("putUsersAndChats", ArrayList.class, ArrayList.class, boolean.class, boolean.class)
+                            .invoke(ms, null, chatsList, true, true);
+                    // Also publish to the live chat cache so the dialog list can build rows
+                    // immediately, without waiting for a full getDialogs round-trip.
+                    for (Object c : chatsList) {
+                        try {
+                            mcClass.getMethod("putChat", Class.forName("org.telegram.tgnet.TLRPC$Chat"), boolean.class)
+                                    .invoke(mc, c, false);
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "putUsersAndChats(chats) reflection warning", t);
+                }
             }
 
             if (!dialogsList.isEmpty()) {
@@ -513,12 +799,94 @@ public class ColgramBotSync {
                     messagesDialogsClass.getField("dialogs").set(dialogsRes, dialogsList);
                     messagesDialogsClass.getField("messages").set(dialogsRes, messagesList);
                     messagesDialogsClass.getField("users").set(dialogsRes, usersList);
-                    messagesDialogsClass.getField("chats").set(dialogsRes, new ArrayList());
+                    messagesDialogsClass.getField("chats").set(dialogsRes, chatsList);
 
                     msClass.getMethod("putDialogs", messagesDialogsBaseClass, int.class).invoke(ms, dialogsRes, 1);
                 } catch (Throwable t) {
                     Log.w(TAG, "putDialogs reflection warning", t);
                 }
+            }
+
+            // Seed the IN-MEMORY dialog cache, not just SQLite.
+            //
+            // putDialogs() above only writes rows to the database. The chat list is rendered
+            // from MessagesController.dialogs_dict / dialogMessage, and those are populated by
+            // loadDialogs() from a server getDialogs response. A bot account's getDialogs
+            // returns almost nothing, so the cache stayed empty and the list rendered blank
+            // even though every dialog was correctly persisted. Nothing downstream reloads
+            // storage on its own, so the cache has to be filled here.
+            //
+            // The same seed is also posted to the UI thread, because DialogsActivity reads
+            // these structures directly while building rows.
+            final ArrayList finalDialogsList = dialogsList;
+            final ArrayList finalMessagesList = messagesList;
+            final ArrayList finalUsersList = usersList;
+            final ArrayList finalChatsList = chatsList;
+            Runnable seedCache = () -> {
+                try {
+                    Class<?> dialogBaseClass = Class.forName("org.telegram.tgnet.TLRPC$Dialog");
+                    Class<?> msgObjCls = Class.forName("org.telegram.messenger.MessageObject");
+                    Class<?> sparseArrayClass = Class.forName("android.util.LongSparseArray");
+                    Class<?> arrayListClass = java.util.ArrayList.class;
+                    Class<?> chatBaseClass = Class.forName("org.telegram.tgnet.TLRPC$Chat");
+                    Class<?> userBaseClass = Class.forName("org.telegram.tgnet.TLRPC$User");
+
+                    java.lang.reflect.Field dictField = mcClass.getField("dialogs_dict");
+                    java.lang.reflect.Field msgField = mcClass.getField("dialogMessage");
+
+                    Object dict = dictField.get(mc);
+                    Object msgs = msgField.get(mc);
+                    if (dict == null || msgs == null) return;
+
+                    // LongSparseArray.put(long, Object)
+                    Method putSparse = sparseArrayClass.getMethod("put", long.class, Object.class);
+                    Method getSparse = sparseArrayClass.getMethod("get", long.class);
+
+                    // Register users/chats in the live caches so titles and avatars resolve.
+                    if (finalUsersList != null && !finalUsersList.isEmpty()) {
+                        Method putUser = mcClass.getMethod("putUser", userBaseClass, boolean.class);
+                        for (Object u : finalUsersList) putUser.invoke(mc, u, false);
+                    }
+                    if (finalChatsList != null && !finalChatsList.isEmpty()) {
+                        Method putChat = mcClass.getMethod("putChat", chatBaseClass, boolean.class);
+                        for (Object c : finalChatsList) putChat.invoke(mc, c, false);
+                    }
+
+                    for (Object d : finalDialogsList) {
+                        long did = dialogClass.getField("id").getLong(d);
+                        putSparse.invoke(dict, did, d);
+
+                        // Attach the newest message as a MessageObject so the row shows a
+                        // preview line instead of an empty subtitle.
+                        Object best = null;
+                        int bestId = -1;
+                        for (Object m : finalMessagesList) {
+                            try {
+                                long peerId = peerIdOf(messageClass, peerChannelClass, peerChatClass,
+                                        peerUserClass, m);
+                                int mid = messageClass.getField("id").getInt(m);
+                                if (peerId == did && mid > bestId) {
+                                    bestId = mid;
+                                    best = m;
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        if (best != null) {
+                            Object mo = msgObjCls.getConstructor(int.class, messageClass, messageClass, boolean.class)
+                                    .newInstance(account, best, null, false);
+                            java.util.ArrayList<Object> list = new java.util.ArrayList<>();
+                            list.add(mo);
+                            putSparse.invoke(msgs, did, list);
+                        }
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "could not seed in-memory dialog cache: " + t.getMessage());
+                }
+            };
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                seedCache.run();
+            } else {
+                mainHandler.post(seedCache);
             }
 
             // Reload UI dialogs & messages
