@@ -64,6 +64,8 @@ def inject_hooks(repo_path):
     conn_manager = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")
     
     def cloak_replacer(content):
+        if "org.colgram.core.ColgramHookHandler.hookInitConnection" in content:
+            return content
         target = "init(SharedConfig.buildVersion()"
         if target not in content:
             return content
@@ -78,7 +80,39 @@ def inject_hooks(repo_path):
         """
         return content.replace(target, inject_code + "\n        " + target, 1)
 
-    patch_file(conn_manager, cloak_replacer, "", "ConnectionsManager MTProto Cloaking")
+    patch_file(conn_manager, cloak_replacer, "org.colgram.core.ColgramHookHandler.hookInitConnection", "ConnectionsManager MTProto Cloaking")
+
+    # 2b. ConnectionsManager.java -> QR Login Token Updates Hook
+    def conn_qr_replacer(content):
+        if "ColgramQRLoginBottomSheet.onLoginTokenUpdate" in content:
+            return content
+        target1 = "FileLog.dumpUnparsedMessage(message, messageId, currentAccount);"
+        inject1 = """FileLog.dumpUnparsedMessage(message, messageId, currentAccount);
+            if (constructor == 0x564fe691 || message instanceof org.telegram.tgnet.tl.TL_update.TL_updateLoginToken) {
+                org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
+            }"""
+        if target1 in content:
+            content = content.replace(target1, inject1, 1)
+
+        target2 = "KeepAliveJob.finishJob();"
+        inject2 = """KeepAliveJob.finishJob();
+                try {
+                    if (message instanceof TLRPC.TL_updateShort && ((TLRPC.TL_updateShort) message).update instanceof org.telegram.tgnet.tl.TL_update.TL_updateLoginToken) {
+                        org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
+                    } else if (message instanceof TLRPC.TL_updates && ((TLRPC.TL_updates) message).updates != null) {
+                        for (TLRPC.Update u : ((TLRPC.TL_updates) message).updates) {
+                            if (u instanceof org.telegram.tgnet.tl.TL_update.TL_updateLoginToken) {
+                                org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
+                                break;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}"""
+        if target2 in content:
+            content = content.replace(target2, inject2, 1)
+        return content
+
+    patch_file(conn_manager, conn_qr_replacer, "org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);", "ConnectionsManager QR Login Token Hook")
 
     # 3. FileLoader.java -> Storage Sandbox & Media Lock
     file_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java")
@@ -265,76 +299,59 @@ def inject_hooks(repo_path):
         "LoginActivity Make onAuthSuccess Public"
     )
 
-    # 12. LoginActivity.java -> Inject QR Login & Bot Token Login buttons in PhoneView (with 76dp margin to avoid FAB collision)
-    alt_login_btn = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
-            LinearLayout altLoginButtonsLayout = new LinearLayout(context);
-            altLoginButtonsLayout.setOrientation(LinearLayout.VERTICAL);
+    # 12. LoginActivity.java -> Inject QR Login & Bot Token Login buttons between subtitleView and countryButton
+    alt_login_btn = """addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 8, 32, 0));
+
+            LinearLayout altButtonsRow = new LinearLayout(context);
+            altButtonsRow.setOrientation(LinearLayout.HORIZONTAL);
+            altButtonsRow.setGravity(Gravity.CENTER);
             boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
             int accentBtnColor = Theme.getColor(Theme.key_featuredStickers_addButton);
             if (accentBtnColor == 0) accentBtnColor = 0xFF2AABEE;
 
-            // 1. QR Login Button
             TextView qrLoginBtn = new TextView(context);
-            qrLoginBtn.setText(isRuLang ? "Быстрый вход по QR-коду" : "Quick log in using QR code");
-            qrLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+            qrLoginBtn.setText(isRuLang ? "📷 Вход по QR" : "📷 QR Log in");
+            qrLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
             qrLoginBtn.setTypeface(AndroidUtilities.bold());
             qrLoginBtn.setTextColor(accentBtnColor);
             qrLoginBtn.setGravity(Gravity.CENTER);
-            try {
-                android.graphics.drawable.Drawable qrIcon = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.msg_qrcode).mutate();
-                qrIcon.setColorFilter(new android.graphics.PorterDuffColorFilter(accentBtnColor, android.graphics.PorterDuff.Mode.SRC_IN));
-                qrLoginBtn.setCompoundDrawablesWithIntrinsicBounds(qrIcon, null, null, null);
-                qrLoginBtn.setCompoundDrawablePadding(dp(8));
-            } catch (Throwable ignored) {}
-            qrLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
-            qrLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(8), accentBtnColor & 0x14ffffff, accentBtnColor & 0x33ffffff));
+            qrLoginBtn.setPadding(dp(8), dp(4), dp(8), dp(4));
+            qrLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(18), accentBtnColor & 0x18ffffff, accentBtnColor & 0x33ffffff));
             qrLoginBtn.setOnClickListener(v -> {
                 org.telegram.ui.ColgramQRLoginBottomSheet.show(LoginActivity.this, currentAccount);
             });
-            altLoginButtonsLayout.addView(qrLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44, Gravity.CENTER_HORIZONTAL, 0, 4, 0, 8));
+            altButtonsRow.addView(qrLoginBtn, LayoutHelper.createLinear(0, 36, 1.0f, Gravity.CENTER, 0, 0, 6, 0));
 
-            // 2. Bot Token Login Button
             TextView botLoginBtn = new TextView(context);
-            botLoginBtn.setText(isRuLang ? "Войти через токен бота" : "Log in via Bot Token");
-            botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+            botLoginBtn.setText(isRuLang ? "🤖 Токен бота" : "🤖 Bot Token");
+            botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
             botLoginBtn.setTypeface(AndroidUtilities.bold());
             botLoginBtn.setTextColor(accentBtnColor);
             botLoginBtn.setGravity(Gravity.CENTER);
-            try {
-                android.graphics.drawable.Drawable botIcon = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.msg_bot).mutate();
-                botIcon.setColorFilter(new android.graphics.PorterDuffColorFilter(accentBtnColor, android.graphics.PorterDuff.Mode.SRC_IN));
-                botLoginBtn.setCompoundDrawablesWithIntrinsicBounds(botIcon, null, null, null);
-                botLoginBtn.setCompoundDrawablePadding(dp(8));
-            } catch (Throwable ignored) {}
-            botLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
-            botLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(8), accentBtnColor & 0x14ffffff, accentBtnColor & 0x33ffffff));
+            botLoginBtn.setPadding(dp(8), dp(4), dp(8), dp(4));
+            botLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(18), accentBtnColor & 0x18ffffff, accentBtnColor & 0x33ffffff));
             botLoginBtn.setOnClickListener(v -> {
                 org.telegram.ui.ColgramBotLoginBottomSheet.show(LoginActivity.this, currentAccount);
             });
-            altLoginButtonsLayout.addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 4));
+            altButtonsRow.addView(botLoginBtn, LayoutHelper.createLinear(0, 36, 1.0f, Gravity.CENTER, 6, 0, 0, 0));
 
-            addView(altLoginButtonsLayout, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 16, 2, 76, 4));"""
+            addView(altButtonsRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 14, 32, 6));"""
 
     def login_btn_replacer(content):
-        if "ColgramQRLoginBottomSheet.show" in content:
+        # Remove legacy vertical button layout if present
+        legacy_pattern = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
+            LinearLayout altLoginButtonsLayout = new LinearLayout(context);"""
+        if legacy_pattern in content:
+            import re
+            content = re.sub(
+                r'LinearLayout altLoginButtonsLayout = new LinearLayout\(context\);.*?addView\(altLoginButtonsLayout, LayoutHelper\.createLinear\(LayoutHelper\.MATCH_PARENT, LayoutHelper\.WRAP_CONTENT, Gravity\.CENTER_HORIZONTAL, 16, 2, 76, 4\)\);',
+                '',
+                content,
+                flags=re.DOTALL
+            )
+        if "altButtonsRow" in content:
             return content
-        old_pattern = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
-            TextView botLoginBtn = new TextView(context);
-            boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
-            botLoginBtn.setText(isRuLang ? "🤖  Войти через токен бота" : "🤖  Log in via Bot Token");
-            botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-            botLoginBtn.setTypeface(AndroidUtilities.bold());
-            botLoginBtn.setTextColor(Theme.getColor(Theme.key_featuredStickers_addButton));
-            botLoginBtn.setGravity(Gravity.CENTER);
-            botLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
-            botLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(8), Theme.getColor(Theme.key_featuredStickers_addButton) & 0x14ffffff, Theme.getColor(Theme.key_featuredStickers_addButton) & 0x33ffffff));
-            botLoginBtn.setOnClickListener(v -> {
-                org.telegram.ui.ColgramBotLoginBottomSheet.show(LoginActivity.this, currentAccount);
-            });
-            addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44, Gravity.CENTER_HORIZONTAL, 16, 12, 76, 8));"""
-        if old_pattern in content:
-            return content.replace(old_pattern, alt_login_btn, 1)
-        target = "addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));"
+        target = "addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 8, 32, 0));"
         if target in content:
             return content.replace(target, alt_login_btn, 1)
         return content
@@ -404,11 +421,21 @@ def inject_hooks(repo_path):
         "UserInfoActivity Unlock Add Account"
     )
 
-    # 15. IntroActivity.java -> Fix back button (do not remove IntroActivity from backstack) and language switching
+    # 15. IntroActivity.java -> Full Instant Language Switching & Top-Right Language Badge
     intro_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "IntroActivity.java")
     if os.path.exists(intro_activity):
-        # Keep IntroActivity in backstack when opening LoginActivity (removeLast = false)
-        intro_t1 = """        startMessagingButton.setOnClickListener(view -> {
+        def intro_lang_replacer(content):
+            if "langBadge.setText" in content:
+                return content
+            
+            # 1. Start messaging button text & click listener with language persistence
+            old_btn_pattern = """        startMessagingButton.setText(LocaleController.getString(R.string.StartMessaging));
+        startMessagingButton.setGravity(Gravity.CENTER);
+        startMessagingButton.setTypeface(AndroidUtilities.bold());
+        startMessagingButton.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+        startMessagingButton.setPadding(dp(34), 0, dp(34), 0);
+        frameContainerView.addView(startMessagingButton, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM, 16, 0, 16, 76));
+        startMessagingButton.setOnClickListener(view -> {
             if (startPressed) {
                 return;
             }
@@ -417,46 +444,156 @@ def inject_hooks(repo_path):
             presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), true);
             destroyed = true;
         });"""
-        intro_r1 = """        startMessagingButton.setOnClickListener(view -> {
+            new_btn_code = """        boolean isRuStart = LocaleController.getInstance().getCurrentLocaleInfo() != null
+                && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+
+        startMessagingButton.setText(isRuStart ? "Начать общение" : "Start Messaging");
+        startMessagingButton.setGravity(Gravity.CENTER);
+        startMessagingButton.setTypeface(AndroidUtilities.bold());
+        startMessagingButton.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+        startMessagingButton.setPadding(dp(34), 0, dp(34), 0);
+        frameContainerView.addView(startMessagingButton, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM, 16, 0, 16, 76));
+        startMessagingButton.setOnClickListener(view -> {
             if (startPressed) {
                 return;
             }
             startPressed = true;
 
+            LocaleController.LocaleInfo cur = LocaleController.getInstance().getCurrentLocaleInfo();
+            if (cur != null) {
+                LocaleController.getInstance().applyLanguage(cur, true, false, currentAccount);
+                MessagesController.getGlobalMainSettings().edit().putString("language", cur.getKey()).apply();
+            }
+
             presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);
             destroyed = false;
         });"""
-        patch_file(intro_activity, intro_t1, intro_r1, "IntroActivity Retain In Backstack On Start Messaging")
+            if old_btn_pattern in content:
+                content = content.replace(old_btn_pattern, new_btn_code, 1)
 
-        intro_t2 = """                        AndroidUtilities.runOnUIThread(()->{
+            # 2. Switch language text view & top-right language badge
+            old_switch_pattern = """        switchLanguageTextView = new TextView(context);
+        switchLanguageTextView.setGravity(Gravity.CENTER);
+        switchLanguageTextView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+        frameContainerView.addView(switchLanguageTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 30, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0, 0, 20));
+        switchLanguageTextView.setOnClickListener(v -> {
+            if (startPressed || localeInfo == null) {
+                return;
+            }
+            startPressed = true;
+
+            AlertDialog loaderDialog = new AlertDialog(v.getContext(), AlertDialog.ALERT_TYPE_SPINNER);
+            loaderDialog.setCanCancel(false);
+            loaderDialog.showDelayed(1000);
+
+            NotificationCenter.getGlobalInstance().addObserver(new NotificationCenter.NotificationCenterDelegate() {
+                @Override
+                public void didReceivedNotification(int id, int account, Object... args) {
+                    if (id == NotificationCenter.reloadInterface) {
+                        loaderDialog.dismiss();
+
+                        NotificationCenter.getGlobalInstance().removeObserver(this, id);
+                        AndroidUtilities.runOnUIThread(()->{
                             presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), true);
                             destroyed = true;
-                        }, 100);"""
-        intro_r2 = """                        AndroidUtilities.runOnUIThread(()->{
-                            presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);
-                            destroyed = false;
-                        }, 100);"""
-        patch_file(intro_activity, intro_t2, intro_r2, "IntroActivity Retain In Backstack On Language Switch")
+                        }, 100);
+                    }
+                }
+            }, NotificationCenter.reloadInterface);
+            LocaleController.getInstance().applyLanguage(localeInfo, true, false, currentAccount);
+        });"""
+            new_switch_code = """        switchLanguageTextView = new TextView(context);
+        switchLanguageTextView.setGravity(Gravity.CENTER);
+        switchLanguageTextView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+        switchLanguageTextView.setText(isRuStart ? "Continue in English" : "Продолжить на русском");
+        frameContainerView.addView(switchLanguageTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 30, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0, 0, 20));
+        switchLanguageTextView.setOnClickListener(v -> {
+            if (startPressed) {
+                return;
+            }
+            startPressed = true;
 
-        # Reset startPressed and destroyed on resume so buttons work when user navigates back
-        patch_file(
-            intro_activity,
-            "public void onResume() {\n        super.onResume();",
-            "public void onResume() {\n        super.onResume();\n        startPressed = false;\n        destroyed = false;",
-            "IntroActivity Reset startPressed On Resume"
-        )
-        # Update activity resources configuration when language is switched
-        patch_file(
-            intro_activity,
-            "LocaleController.getInstance().applyLanguage(localeInfo, true, false, currentAccount);",
-            """try {
-                android.content.res.Configuration cfg = new android.content.res.Configuration();
-                cfg.locale = new java.util.Locale(localeInfo.shortName);
-                v.getContext().getResources().updateConfiguration(cfg, v.getContext().getResources().getDisplayMetrics());
-            } catch (Throwable ignored) {}
-            LocaleController.getInstance().applyLanguage(localeInfo, true, false, currentAccount);""",
-            "IntroActivity Apply Language Configuration"
-        )
+            boolean currentlyRu = LocaleController.getInstance().getCurrentLocaleInfo() != null
+                    && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            String targetCode = currentlyRu ? "en" : "ru";
+            LocaleController.LocaleInfo targetInfo = null;
+            for (LocaleController.LocaleInfo info : LocaleController.getInstance().languages) {
+                if (info != null && targetCode.equalsIgnoreCase(info.shortName)) {
+                    targetInfo = info;
+                    break;
+                }
+            }
+            if (targetInfo != null) {
+                LocaleController.getInstance().applyLanguage(targetInfo, true, false, currentAccount);
+                MessagesController.getGlobalMainSettings().edit().putString("language", targetInfo.getKey()).apply();
+                try {
+                    android.content.res.Configuration cfg = new android.content.res.Configuration();
+                    cfg.locale = new java.util.Locale(targetInfo.shortName);
+                    v.getContext().getResources().updateConfiguration(cfg, v.getContext().getResources().getDisplayMetrics());
+                } catch (Throwable ignored) {}
+            }
+            presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);
+            destroyed = false;
+        });
+
+        // Top-right language badge
+        TextView langBadge = new TextView(context);
+        langBadge.setText(isRuStart ? "🇷🇺 RU" : "🇬🇧 EN");
+        langBadge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        langBadge.setTypeface(AndroidUtilities.bold());
+        langBadge.setTextColor(0xFFFFFFFF);
+        langBadge.setGravity(Gravity.CENTER);
+        langBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
+        langBadge.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(16), 0x22FFFFFF, 0x44FFFFFF));
+        frameContainerView.addView(langBadge, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, 16, 16, 0));
+        langBadge.setOnClickListener(v -> {
+            boolean nowRu = LocaleController.getInstance().getCurrentLocaleInfo() != null
+                    && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            String target = nowRu ? "en" : "ru";
+            LocaleController.LocaleInfo targetInfo = null;
+            for (LocaleController.LocaleInfo info : LocaleController.getInstance().languages) {
+                if (info != null && target.equalsIgnoreCase(info.shortName)) {
+                    targetInfo = info;
+                    break;
+                }
+            }
+            if (targetInfo != null) {
+                LocaleController.getInstance().applyLanguage(targetInfo, true, false, currentAccount);
+                MessagesController.getGlobalMainSettings().edit().putString("language", targetInfo.getKey()).apply();
+                langBadge.setText(target.equals("ru") ? "🇷🇺 RU" : "🇬🇧 EN");
+                startMessagingButton.setText(target.equals("ru") ? "Начать общение" : "Start Messaging");
+                switchLanguageTextView.setText(target.equals("ru") ? "Continue in English" : "Продолжить на русском");
+            }
+        });"""
+            if old_switch_pattern in content:
+                content = content.replace(old_switch_pattern, new_switch_code, 1)
+
+            # 3. Fast checkContinueText without network request
+            import re
+            content = re.sub(
+                r'private void checkContinueText\(\) \{.*?^\s*\}\s*$',
+                '''private void checkContinueText() {
+        boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null
+                && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+        if (startMessagingButton != null) {
+            startMessagingButton.setText(isRu ? "Начать общение" : "Start Messaging");
+        }
+        if (switchLanguageTextView != null) {
+            switchLanguageTextView.setText(isRu ? "Continue in English" : "Продолжить на русском");
+        }
+    }''',
+                content,
+                flags=re.DOTALL | re.MULTILINE
+            )
+
+            # 4. onResume resets startPressed & destroyed
+            target_resume = "public void onResume() {\\n        super.onResume();"
+            if target_resume in content and "startPressed = false;" not in content:
+                content = content.replace(target_resume, target_resume + "\\n        startPressed = false;\\n        destroyed = false;", 1)
+
+            return content
+
+        patch_file(intro_activity, intro_lang_replacer, "langBadge.setText", "IntroActivity Instant Language Switcher & Badge")
 
     # 16. LoginActivity.java -> Visual Alert and Auto-Rotation on -1000 Connection Error in PhoneView
     phone_error_target = """fillNextCodeParams(params, (TLRPC.auth_SentCode) response);
@@ -798,6 +935,22 @@ def inject_hooks(repo_path):
             bot_error_replacement,
             "MessagesController Handle Dialogs Load Error"
         )
+
+        def mc_qr_replacer(content):
+            if "ColgramQRLoginBottomSheet.onLoginTokenUpdate" in content:
+                return content
+            target = 'FileLog.d("process update " + baseUpdate.getClass().getSimpleName());\\n            }'
+            inject = """FileLog.d("process update " + baseUpdate.getClass().getSimpleName());
+            }
+            if (baseUpdate instanceof TL_update.TL_updateLoginToken) {
+                org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
+                continue;
+            }"""
+            if target in content:
+                return content.replace(target, inject, 1)
+            return content
+
+        patch_file(messages_controller, mc_qr_replacer, "ColgramQRLoginBottomSheet.onLoginTokenUpdate", "MessagesController QR Login Token Hook")
 
     # 28. ChatActivity.java -> Fallback User on Opening Bot Chat / Missing User Cache
     chat_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java")
@@ -1226,6 +1379,78 @@ def inject_hooks(repo_path):
             'if (error == null || error.code == 406 || error.text == null || error.text.contains("BOT_METHOD_INVALID")) {',
             "AlertsCreator Suppress BOT_METHOD_INVALID in processError"
         )
+
+    # 45. DialogsActivity.java -> Start Bot Updates Poller in onResume
+    if os.path.exists(dialogs_activity):
+        bot_resume_target = "public void onResume() {\n        super.onResume();"
+        bot_resume_inject = """public void onResume() {\n        super.onResume();
+        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+            org.colgram.core.ColgramBotSync.startBotUpdatesPoller(getParentActivity(), currentAccount);
+        }"""
+        patch_file(
+            dialogs_activity,
+            bot_resume_target,
+            bot_resume_inject,
+            "DialogsActivity Start Bot Updates Poller in onResume"
+        )
+
+    # 46. ChangeNameActivity.java -> Bot Profile Name Update Hook
+    change_name = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChangeNameActivity.java")
+    if os.path.exists(change_name):
+        cname_target = """        if (currentUser.first_name != null && currentUser.first_name.equals(newFirst) && currentUser.last_name != null && currentUser.last_name.equals(newLast)) {
+            return;
+        }"""
+        cname_inject = """        if (currentUser.first_name != null && currentUser.first_name.equals(newFirst) && currentUser.last_name != null && currentUser.last_name.equals(newLast)) {
+            return;
+        }
+        if (currentUser.bot) {
+            org.colgram.core.ColgramBotSync.updateBotName(getParentActivity(), currentAccount, newFirst);
+            finishFragment();
+            return;
+        }"""
+        patch_file(change_name, cname_target, cname_inject, "ChangeNameActivity Bot Name Update Hook")
+
+    # 47. ChangeBioActivity.java -> Bot Profile Bio/Description Update Hook
+    change_bio = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChangeBioActivity.java")
+    if os.path.exists(change_bio):
+        cbio_target = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
+        if (currentName.equals(newName)) {
+            finishFragment();
+            return;
+        }"""
+        cbio_inject = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
+        if (currentName.equals(newName)) {
+            finishFragment();
+            return;
+        }
+        final TLRPC.User currentUser = UserConfig.getInstance(currentAccount).getCurrentUser();
+        if (currentUser != null && currentUser.bot) {
+            org.colgram.core.ColgramBotSync.updateBotDescription(getParentActivity(), currentAccount, newName, () -> {
+                userFull.about = newName;
+                NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, currentUser.id, userFull);
+                finishFragment();
+            });
+            return;
+        }"""
+        patch_file(change_bio, cbio_target, cbio_inject, "ChangeBioActivity Bot Description Update Hook")
+
+    # 48. ChangeUsernameActivity.java -> Bot Username Notice Hook
+    change_user = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChangeUsernameActivity.java")
+    if os.path.exists(change_user):
+        cuser_target = "final TL_account.updateUsername req = new TL_account.updateUsername();"
+        cuser_inject = """TLRPC.User currentUser = UserConfig.getInstance(currentAccount).getCurrentUser();
+        if (currentUser != null && currentUser.bot) {
+            boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            android.widget.Toast.makeText(getParentActivity(), isRu ? "Юзернейм бота можно изменить только через @BotFather" : "Bot username can only be changed via @BotFather", android.widget.Toast.LENGTH_LONG).show();
+            return;
+        }
+        final TL_account.updateUsername req = new TL_account.updateUsername();"""
+        patch_file(change_user, cuser_target, cuser_inject, "ChangeUsernameActivity Bot Username Notice Hook")
+
+    # 49. qr_logo.svg -> Black Color for Colgram Airplane in QR Code
+    qr_svg = os.path.join(repo_path, "TMessagesProj", "src", "main", "res", "raw", "qr_logo.svg")
+    if os.path.exists(qr_svg):
+        patch_file(qr_svg, 'fill="#50A7EA"', 'fill="#000000"', "QR Code Black Logo SVG")
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
