@@ -436,17 +436,44 @@ def inject_hooks(repo_path):
             }
             startPressed = true;
 
+            // Do NOT call applyLanguage() here.
+            //
+            // applyLanguage() is a full locale reload: it re-parses resources, resets the
+            // connection's lang code, and can trigger a remote language fetch. Running that
+            // synchronously on the UI thread immediately before a fragment transition
+            // stalls the transition — which is the "second press does nothing until
+            // restart" bug.
+            //
+            // It is also redundant: the language was already applied when the user picked
+            // it in the intro (see the switch-language handler below). We only need to make
+            // sure the chosen language is persisted so it survives the restart.
             LocaleController.LocaleInfo cur = LocaleController.getInstance().getCurrentLocaleInfo();
             if (cur != null) {
-                LocaleController.getInstance().applyLanguage(cur, true, false, currentAccount);
                 MessagesController.getGlobalMainSettings().edit().putString("language", cur.getKey()).apply();
             }
 
             presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);
-            destroyed = false;
+            destroyed = true;
         });"""
             if old_btn_pattern in content:
                 content = content.replace(old_btn_pattern, new_btn_code, 1)
+
+            # Colgram re-entry fix.
+            #
+            # `destroyed` is IntroActivity's guard for its EGL/render callbacks — see the
+            # comment at the frame callback: "If display or surface already destroyed".
+            # Upstream sets it true when we navigate away. An earlier Colgram revision
+            # changed it to false, so the intro activity kept its render thread alive after
+            # being left. Pressing "Начать общение" a second time then ran a fresh instance
+            # alongside the stale thread, and the fragment transition deadlocked — the login
+            # form never appeared until the process was restarted.
+            #
+            # Restore true, and guard any stray false that survived from an earlier run.
+            if "destroyed = true;" in content and content.count("destroyed = false;") > 0:
+                content = content.replace(
+                    "presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);\n            destroyed = false;",
+                    "presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);\n            destroyed = true;"
+                )
 
             # 2. Switch language text view & top-right language badge
             old_switch_pattern = """        switchLanguageTextView = new TextView(context);
@@ -503,14 +530,9 @@ def inject_hooks(repo_path):
             if (targetInfo != null) {
                 LocaleController.getInstance().applyLanguage(targetInfo, true, false, currentAccount);
                 MessagesController.getGlobalMainSettings().edit().putString("language", targetInfo.getKey()).apply();
-                try {
-                    android.content.res.Configuration cfg = new android.content.res.Configuration();
-                    cfg.locale = new java.util.Locale(targetInfo.shortName);
-                    v.getContext().getResources().updateConfiguration(cfg, v.getContext().getResources().getDisplayMetrics());
-                } catch (Throwable ignored) {}
             }
             presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);
-            destroyed = false;
+            destroyed = true;
         });
 
         // Top-right language badge
@@ -1282,18 +1304,21 @@ def inject_hooks(repo_path):
         frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));''',
             "IntroActivity Hide DayNight Switcher"
         )
-        patch_file(
-            intro_file,
-            'headerTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));',
-            'headerTextView.setTextColor(0xFFFFFFFF);',
-            "IntroActivity White Header Text"
-        )
-        patch_file(
-            intro_file,
-            'messageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));',
-            'messageTextView.setTextColor(0xFFCCCCCC);',
-            "IntroActivity Light Grey Message Text"
-        )
+        # Colgram branding on the intro screen.
+        #
+        # HISTORY — this block used to force fragmentView to 0xFF000000 (pure black) while
+        # also hardcoding header/message text to white/grey. That works on the intro screen
+        # alone, but LoginActivity REUSES this same container via setIntroView(), and the
+        # phone-input form draws its title, subtitle and phone field with
+        # Theme.key_windowBackgroundWhiteBlackText — a colour that assumes a LIGHT
+        # background. Worse, IntroActivity.updateColors() rewrites the pager text back to
+        # the theme colour on every theme event, so even the hardcoded white got stomped.
+        # Net result: near-black text on a pure-black background — an unreadable login
+        # screen, and the phone field invisible.
+        #
+        # The fix is to stop fighting the theme. We brand in Colgram red (accents) and let
+        # the background and all body text follow the active theme, so every form on this
+        # container stays legible in both light and dark mode.
         patch_file(
             intro_file,
             'startMessagingButtonBackground.setColors(new int[]{getThemedColor(Theme.key_featuredStickers_addButton), getThemedColor(Theme.key_featuredStickers_addButton2)});',
@@ -1302,16 +1327,66 @@ def inject_hooks(repo_path):
         )
         patch_file(
             intro_file,
-            'fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));',
-            'fragmentView.setBackgroundColor(0xFF000000);',
-            "IntroActivity Pure Black Background"
-        )
-        patch_file(
-            intro_file,
             'switchLanguageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));',
             'switchLanguageTextView.setTextColor(0xFFEF5350);',
             "IntroActivity Red Switch Language Text"
         )
+        # Keep the themed background. The old patch replaced this line with 0xFF000000;
+        # that is the root cause of the black-on-black login form, so we explicitly assert
+        # the themed form is what is present and do NOT mutate it.
+        intro_bg_ok = False
+        if os.path.exists(intro_file):
+            with open(intro_file, "r", encoding="utf-8", errors="ignore") as f:
+                _intro = f.read()
+            intro_bg_ok = "fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));" in _intro
+        if intro_bg_ok:
+            print(" [=] IntroActivity background stays theme-driven - login form stays legible")
+        else:
+            print(" [!] IntroActivity background was force-darkened; login text will be "
+                  "unreadable. Re-run with a clean upstream checkout.")
+
+        # updateColors() is the second half of the black-on-black bug: it re-asserts the
+        # background and text colours on every theme event, so any one-shot fix to the
+        # constructor gets overwritten the moment the theme changes. Neutralise the
+        # hardcoded black here and let the themed values flow through.
+        patch_file(
+            intro_file,
+            '''        fragmentView.setBackgroundColor(0xFF000000);
+        switchLanguageTextView.setTextColor(0xFFEF5350);
+        startMessagingButton.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText));''',
+            '''        fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+        switchLanguageTextView.setTextColor(0xFFEF5350);
+        startMessagingButton.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText));''',
+            "IntroActivity updateColors Keeps Themed Background"
+        )
+
+        # Reset startPressed when the intro comes back to the foreground.
+        #
+        # THE "second press of Начать общение does nothing" BUG.
+        #
+        # `startPressed` is a plain instance field, set true on the first press and never
+        # cleared anywhere. The IntroActivity instance stays alive in the fragment stack
+        # after navigating to the login form, so on returning to it the field is still true
+        # and the click handler hits its own guard: `if (startPressed) return;`. The button
+        # silently does nothing until the whole process is restarted and a fresh instance
+        # is built with startPressed = false.
+        #
+        # Clearing it in onResume is the right place: the intro is only ever re-shown when
+        # the user comes back to it, which is exactly when the button must work again.
+        patch_file(
+            intro_file,
+            '''    public void onResume() {
+        super.onResume();
+        if (justCreated) {''',
+            '''    public void onResume() {
+        super.onResume();
+        // Colgram: re-arm the Start Messaging button. Without this, returning to the intro
+        // leaves startPressed true and the button no-ops until the app is restarted.
+        startPressed = false;
+        if (justCreated) {''',
+            "IntroActivity Re-arm Start Button on Resume"
+        )
+
 
     # 41. DialogsActivity.java -> Bot Account Chat Initiator on Floating Button
     dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
