@@ -45,41 +45,101 @@ public class ColgramBotSync {
 
     public static void saveBotToken(Context context, int account, String token) {
         if (context == null || token == null) return;
+        token = token.trim();
         SharedPreferences prefs = context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE);
-        prefs.edit().putString("bot_token", token.trim()).apply();
+        prefs.edit().putString("bot_token", token).apply();
+
+        SharedPreferences globalPrefs = context.getSharedPreferences("colgram_bot_tokens_global", Context.MODE_PRIVATE);
+        globalPrefs.edit()
+                .putString("token_account_" + account, token)
+                .putString("last_bot_token", token)
+                .apply();
     }
 
     public static String getBotToken(Context context, int account) {
         if (context == null) return "";
         SharedPreferences prefs = context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE);
-        return prefs.getString("bot_token", "");
+        String token = prefs.getString("bot_token", "");
+        if (token.isEmpty()) {
+            SharedPreferences globalPrefs = context.getSharedPreferences("colgram_bot_tokens_global", Context.MODE_PRIVATE);
+            token = globalPrefs.getString("token_account_" + account, "");
+            if (token.isEmpty()) {
+                token = globalPrefs.getString("last_bot_token", "");
+            }
+        }
+        return token;
+    }
+
+    public static void promptBotTokenAndSync(final Activity activity, final int account) {
+        if (activity == null) return;
+        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+        builder.setTitle("🔑 Токен бота (@BotFather)");
+        builder.setMessage("Введите токен бота из @BotFather для загрузки диалогов и синхронизации сообщений:");
+
+        final EditText input = new EditText(activity);
+        input.setHint("123456789:ABCdef...");
+        String existing = getBotToken(activity, account);
+        if (!existing.isEmpty()) input.setText(existing);
+        builder.setView(input);
+
+        builder.setPositiveButton("Синхронизировать", (dialog, which) -> {
+            String token = input.getText().toString().trim();
+            if (!token.isEmpty()) {
+                saveBotToken(activity, account, token);
+                syncBotDialogs(activity, account, true);
+            }
+        });
+        builder.setNegativeButton("Отмена", null);
+        builder.show();
+    }
+
+    public static void syncBotDialogs(final Context context, final int account) {
+        syncBotDialogs(context, account, false);
     }
 
     /**
      * Initiates asynchronous sync of all chats for the bot account.
      */
-    public static void syncBotDialogs(final Context context, final int account) {
+    public static void syncBotDialogs(final Context context, final int account, final boolean userInitiated) {
         if (context == null) return;
         final String token = getBotToken(context, account);
         if (token.isEmpty()) {
-            Toast.makeText(context, "Токен бота не найден. Выполните вход по токену.", Toast.LENGTH_SHORT).show();
+            if (userInitiated && context instanceof Activity) {
+                promptBotTokenAndSync((Activity) context, account);
+            }
             return;
         }
 
-        Toast.makeText(context, "🔄 Синхронизация чатов бота...", Toast.LENGTH_SHORT).show();
+        if (userInitiated) {
+            Toast.makeText(context, "🔄 Синхронизация чатов бота...", Toast.LENGTH_SHORT).show();
+        }
 
         executor.execute(() -> {
             try {
                 String urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=0";
-                URL url = new URL(urlStr);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(15000);
+                HttpURLConnection conn;
+                try {
+                    conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(8000);
+                    if (conn.getResponseCode() != 200 && ColgramDpiBypass.isRunning()) {
+                        throw new Exception("HTTP not 200");
+                    }
+                } catch (Throwable t) {
+                    java.net.Proxy proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                            new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.LOCAL_PORT));
+                    conn = (HttpURLConnection) new URL(urlStr).openConnection(proxy);
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(12000);
+                    conn.setReadTimeout(12000);
+                }
 
                 int responseCode = conn.getResponseCode();
                 if (responseCode != 200) {
-                    mainHandler.post(() -> Toast.makeText(context, "Ошибка Telegram Bot API: HTTP " + responseCode, Toast.LENGTH_SHORT).show());
+                    if (userInitiated) {
+                        mainHandler.post(() -> Toast.makeText(context, "Ошибка Telegram Bot API: HTTP " + responseCode, Toast.LENGTH_SHORT).show());
+                    }
                     return;
                 }
 
@@ -93,13 +153,17 @@ public class ColgramBotSync {
 
                 JSONObject root = new JSONObject(sb.toString());
                 if (!root.optBoolean("ok", false)) {
-                    mainHandler.post(() -> Toast.makeText(context, "Bot API вернул ошибку: " + root.optString("description"), Toast.LENGTH_SHORT).show());
+                    if (userInitiated) {
+                        mainHandler.post(() -> Toast.makeText(context, "Bot API вернул ошибку: " + root.optString("description"), Toast.LENGTH_SHORT).show());
+                    }
                     return;
                 }
 
                 JSONArray updates = root.optJSONArray("result");
                 if (updates == null || updates.length() == 0) {
-                    mainHandler.post(() -> Toast.makeText(context, "У бота пока нет входящих сообщений", Toast.LENGTH_SHORT).show());
+                    if (userInitiated) {
+                        mainHandler.post(() -> Toast.makeText(context, "У бота пока нет входящих сообщений", Toast.LENGTH_SHORT).show());
+                    }
                     return;
                 }
 
@@ -109,6 +173,9 @@ public class ColgramBotSync {
                 Class<?> messageClass = Class.forName("org.telegram.tgnet.TLRPC$TL_message");
                 Class<?> peerUserClass = Class.forName("org.telegram.tgnet.TLRPC$TL_peerUser");
                 Class<?> peerChatClass = Class.forName("org.telegram.tgnet.TLRPC$TL_peerChat");
+                Class<?> dialogClass = Class.forName("org.telegram.tgnet.TLRPC$TL_dialog");
+                Class<?> messagesDialogsClass = Class.forName("org.telegram.tgnet.TLRPC$TL_messages_dialogs");
+                Class<?> messagesDialogsBaseClass = Class.forName("org.telegram.tgnet.TLRPC$messages_Dialogs");
 
                 Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
                 Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
@@ -119,6 +186,8 @@ public class ColgramBotSync {
                 ArrayList usersList = new ArrayList();
                 ArrayList messagesList = new ArrayList();
                 Set<Long> processedUserIds = new HashSet<>();
+                java.util.LinkedHashMap<Long, Integer> topMessageMap = new java.util.LinkedHashMap<>();
+                java.util.LinkedHashMap<Long, Integer> lastDateMap = new java.util.LinkedHashMap<>();
 
                 for (int i = 0; i < updates.length(); i++) {
                     JSONObject upd = updates.getJSONObject(i);
@@ -140,6 +209,9 @@ public class ColgramBotSync {
                     String text = msgObj.optString("text", "[Медиа]");
                     int date = msgObj.optInt("date", (int) (System.currentTimeMillis() / 1000));
                     int msgId = msgObj.optInt("message_id", 1);
+
+                    topMessageMap.put(chatId, msgId);
+                    lastDateMap.put(chatId, date);
 
                     // Create TLRPC.TL_user
                     if (fromId != 0 && !processedUserIds.contains(fromId)) {
@@ -192,6 +264,44 @@ public class ColgramBotSync {
                             .invoke(ms, messagesList, true, true, false, 0, 0, 0L);
                 }
 
+                // Create and persist TLRPC.TL_dialog for each unique chat
+                ArrayList dialogsList = new ArrayList();
+                for (java.util.Map.Entry<Long, Integer> entry : topMessageMap.entrySet()) {
+                    long did = entry.getKey();
+                    int topMid = entry.getValue();
+                    int lastDate = lastDateMap.containsKey(did) ? lastDateMap.get(did) : (int) (System.currentTimeMillis() / 1000);
+
+                    Object dialog = dialogClass.getConstructor().newInstance();
+                    dialogClass.getField("id").setLong(dialog, did);
+                    dialogClass.getField("top_message").setInt(dialog, topMid);
+                    dialogClass.getField("last_message_date").setInt(dialog, lastDate);
+
+                    if (did < 0) {
+                        Object peer = peerChatClass.getConstructor().newInstance();
+                        peerChatClass.getField("chat_id").setLong(peer, -did);
+                        dialogClass.getField("peer").set(dialog, peer);
+                    } else {
+                        Object peer = peerUserClass.getConstructor().newInstance();
+                        peerUserClass.getField("user_id").setLong(peer, did);
+                        dialogClass.getField("peer").set(dialog, peer);
+                    }
+                    dialogsList.add(dialog);
+                }
+
+                if (!dialogsList.isEmpty()) {
+                    try {
+                        Object dialogsRes = messagesDialogsClass.getConstructor().newInstance();
+                        messagesDialogsClass.getField("dialogs").set(dialogsRes, dialogsList);
+                        messagesDialogsClass.getField("messages").set(dialogsRes, messagesList);
+                        messagesDialogsClass.getField("users").set(dialogsRes, usersList);
+                        messagesDialogsClass.getField("chats").set(dialogsRes, new ArrayList());
+
+                        msClass.getMethod("putDialogs", messagesDialogsBaseClass, int.class).invoke(ms, dialogsRes, 1);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "putDialogs reflection warning", t);
+                    }
+                }
+
                 // Reload dialogs in UI
                 mainHandler.post(() -> {
                     try {
@@ -205,7 +315,9 @@ public class ColgramBotSync {
                         Method postNotification = ncClass.getMethod("postNotificationName", int.class, Object[].class);
                         postNotification.invoke(nc, dialogsNeedReload, new Object[0]);
 
-                        Toast.makeText(context, "✅ Синхронизировано " + processedUserIds.size() + " чатов бота!", Toast.LENGTH_SHORT).show();
+                        if (userInitiated) {
+                            Toast.makeText(context, "✅ Синхронизировано " + dialogsList.size() + " чатов бота!", Toast.LENGTH_SHORT).show();
+                        }
                     } catch (Throwable t) {
                         Log.e(TAG, "Error notifying UI after bot sync", t);
                     }
@@ -213,7 +325,9 @@ public class ColgramBotSync {
 
             } catch (Throwable t) {
                 Log.e(TAG, "Error syncing bot updates", t);
-                mainHandler.post(() -> Toast.makeText(context, "Сбой синхронизации: " + t.getMessage(), Toast.LENGTH_LONG).show());
+                if (userInitiated) {
+                    mainHandler.post(() -> Toast.makeText(context, "Сбой синхронизации: " + t.getMessage(), Toast.LENGTH_LONG).show());
+                }
             }
         });
     }

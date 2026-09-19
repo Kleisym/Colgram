@@ -34,6 +34,7 @@ public class ColgramConfig {
     // Network & Proxies
     private static final String KEY_BUILTIN_PROXY_ENABLED = "builtin_proxy_enabled";
     private static final String KEY_DOH_ENABLED = "doh_resolver_enabled";
+    private static final String KEY_PROXY_BROWSER_ENABLED = "proxy_browser_enabled";
     private static final String KEY_UPDATE_REPO = "github_update_repo";
 
     // Theme
@@ -173,6 +174,14 @@ public class ColgramConfig {
 
     public static void setDohEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_DOH_ENABLED, enabled).apply();
+    }
+
+    public static boolean isProxyBrowserEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_PROXY_BROWSER_ENABLED, true);
+    }
+
+    public static void setProxyBrowserEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_PROXY_BROWSER_ENABLED, enabled).apply();
     }
 
     public static String getUpdateRepo() {

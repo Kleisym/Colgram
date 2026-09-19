@@ -106,6 +106,7 @@ public class ColgramProxyManager {
 
         // 2. Populate verified pool with clean verified proxies
         initVerifiedPool();
+        populateSharedConfigProxies();
 
         // 3. Apply proxy ONLY if user has proxy enabled in settings (never force if disabled)
         SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
@@ -479,6 +480,67 @@ public class ColgramProxyManager {
             } catch (Throwable ignored) {}
         } catch (Throwable t) {
             Log.e(TAG, "disableProxy error", t);
+        }
+    }
+
+    public static void populateSharedConfigProxies() {
+        try {
+            Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
+            Class<?> piClass = Class.forName("org.telegram.messenger.SharedConfig$ProxyInfo");
+            Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
+            Class<?> pstClass = Class.forName("org.telegram.proxy.ProxySettings$Type");
+
+            Field plField = scClass.getDeclaredField("proxyList");
+            plField.setAccessible(true);
+            List proxyList = (List) plField.get(null);
+
+            if (proxyList != null && proxyList.isEmpty()) {
+                if (verifiedPool.isEmpty()) {
+                    initVerifiedPool();
+                }
+                for (ProxyItem p : verifiedPool) {
+                    try {
+                        Object typeObj;
+                        if (p.type == 1) {
+                            typeObj = Enum.valueOf((Class<Enum>) pstClass, "MTPROTO");
+                        } else {
+                            typeObj = Enum.valueOf((Class<Enum>) pstClass, "SOCKS5");
+                        }
+
+                        Method builderMethod = psClass.getDeclaredMethod("builder");
+                        builderMethod.setAccessible(true);
+                        Object builder = builderMethod.invoke(null);
+
+                        Method setAddress = builder.getClass().getDeclaredMethod("setAddress", String.class);
+                        Method setPort = builder.getClass().getDeclaredMethod("setPort", int.class);
+                        Method setSecret = builder.getClass().getDeclaredMethod("setSecret", String.class);
+                        Method build = builder.getClass().getDeclaredMethod("build");
+
+                        setAddress.invoke(builder, p.address);
+                        setPort.invoke(builder, p.port);
+                        setSecret.invoke(builder, p.secret != null ? p.secret : "");
+                        Object settings = build.invoke(builder);
+
+                        java.lang.reflect.Constructor<?> piConstructor = piClass.getConstructor(psClass);
+                        piConstructor.setAccessible(true);
+                        Object proxyInfo = piConstructor.newInstance(settings);
+
+                        proxyList.add(proxyInfo);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "Failed to reflect ProxyInfo for " + p.address, t);
+                    }
+                }
+
+                if (!proxyList.isEmpty()) {
+                    Field cpField = scClass.getDeclaredField("currentProxy");
+                    cpField.setAccessible(true);
+                    if (cpField.get(null) == null) {
+                        cpField.set(null, proxyList.get(0));
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "populateSharedConfigProxies error", t);
         }
     }
 
