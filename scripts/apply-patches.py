@@ -176,7 +176,7 @@ def inject_hooks(repo_path):
             botLoginBtn.setOnClickListener(v -> {
                 org.colgram.core.ColgramBotLogin.showBotLoginDialog(context, currentAccount, () -> {
                     NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.mainUserInfoChanged);
-                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.reloadDialogs);
+                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.dialogsNeedReload);
                     presentFragment(new DialogsActivity(null), true);
                 });
             });
