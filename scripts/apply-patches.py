@@ -430,7 +430,13 @@ public class ColgramBotLoginBottomSheet {
                     try {
                         bottomSheet.dismiss();
                     } catch (Throwable ignored) {}
-                    activity.onAuthSuccess((TLRPC.TL_auth_authorization) response);
+                    try {
+                        java.lang.reflect.Method m = LoginActivity.class.getDeclaredMethod("onAuthSuccess", TLRPC.TL_auth_authorization.class);
+                        m.setAccessible(true);
+                        m.invoke(activity, (TLRPC.TL_auth_authorization) response);
+                    } catch (Throwable t) {
+                        org.telegram.messenger.FileLog.e(t);
+                    }
                 } else {
                     buttonText.setVisibility(View.VISIBLE);
                     progressView.setVisibility(View.GONE);
@@ -455,7 +461,15 @@ public class ColgramBotLoginBottomSheet {
         f.write(bot_sheet_source)
     print(" [+] Generated Telegram-Native ColgramBotLoginBottomSheet.java")
 
-    # 11. LoginActivity.java -> Inject Bot Token Login button in PhoneView (with 76dp margin to avoid FAB collision)
+    # 11. LoginActivity.java -> Make onAuthSuccess public
+    patch_file(
+        login_activity,
+        "private void onAuthSuccess(TLRPC.TL_auth_authorization res) {",
+        "public void onAuthSuccess(TLRPC.TL_auth_authorization res) {",
+        "LoginActivity Make onAuthSuccess Public"
+    )
+
+    # 12. LoginActivity.java -> Inject Bot Token Login button in PhoneView (with 76dp margin to avoid FAB collision)
     bot_login_btn = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
             TextView botLoginBtn = new TextView(context);
             boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
@@ -477,7 +491,7 @@ public class ColgramBotLoginBottomSheet {
         "LoginActivity Bot Token Login Button"
     )
 
-    # 12. LoginActivity.java -> Fix back button on VIEW_PHONE_INPUT (return to IntroActivity)
+    # 13. LoginActivity.java -> Fix back button on VIEW_PHONE_INPUT (return to IntroActivity)
     login_back_target = """        if (currentViewNum == VIEW_PHONE_INPUT || activityMode == MODE_CHANGE_LOGIN_EMAIL && currentViewNum == VIEW_ADD_EMAIL) {
             if (invoked) {
                 for (int a = 0; a < views.length; a++) {
@@ -498,7 +512,7 @@ public class ColgramBotLoginBottomSheet {
                 }
                 clearCurrentState();
             }
-            if (activityMode == MODE_LOGIN && (parentLayout == null || parentLayout.fragmentsStack.size() <= 1)) {
+            if (activityMode == MODE_LOGIN && (parentLayout == null || parentLayout.getFragmentStack().size() <= 1)) {
                 presentFragment(new IntroActivity(), true);
                 return false;
             }
@@ -511,7 +525,7 @@ public class ColgramBotLoginBottomSheet {
         "LoginActivity Return To IntroActivity On Back"
     )
 
-    # 13. UserConfig.java -> Unlock all account slots
+    # 14. UserConfig.java -> Unlock all account slots
     user_config = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "UserConfig.java")
     patch_file(
         user_config,
