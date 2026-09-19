@@ -351,7 +351,9 @@ def inject_core(repo_path, core_source_dir):
             print(" [+] Added colgram-core dependency to TMessagesProj/build.gradle")
 
 def configure_chaquopy_build(repo_path):
-    print("[*] Configuring Chaquopy CPython plugin in root and module build.gradle...")
+    print("[*] Configuring Chaquopy CPython plugin in root and application build.gradle...")
+
+    # 1. Add Chaquopy classpath to root build.gradle
     root_gradle = os.path.join(repo_path, "build.gradle")
     if os.path.exists(root_gradle):
         with open(root_gradle, "r", encoding="utf-8") as f:
@@ -385,9 +387,44 @@ def configure_chaquopy_build(repo_path):
 
             with open(root_gradle, "w", encoding="utf-8") as f:
                 f.write(content)
-            print(" [+] Configured Chaquopy plugin in root build.gradle")
+            print(" [+] Configured Chaquopy classpath in root build.gradle")
 
-    # Ensure minSdkVersion 24 in TMessagesProj and TMessagesProj_AppStandalone
+    # 2. Apply Chaquopy plugin to TMessagesProj_AppStandalone (the application module)
+    standalone_gradle = os.path.join(repo_path, "TMessagesProj_AppStandalone", "build.gradle")
+    if os.path.exists(standalone_gradle):
+        with open(standalone_gradle, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if "com.chaquo.python" not in content:
+            # Apply plugin after android application plugin
+            if "apply plugin: 'com.android.application'" in content:
+                content = content.replace(
+                    "apply plugin: 'com.android.application'",
+                    "apply plugin: 'com.android.application'\napply plugin: 'com.chaquo.python'"
+                )
+            elif "id 'com.android.application'" in content or "id(\"com.android.application\")" in content:
+                content = content.replace(
+                    "id 'com.android.application'",
+                    "id 'com.android.application'\n    id 'com.chaquo.python'"
+                )
+
+            # Add chaquopy config block before dependencies block
+            chaquopy_block = """
+chaquopy {
+    defaultConfig {
+        version = "3.11"
+    }
+}
+
+"""
+            if "dependencies {" in content:
+                content = content.replace("dependencies {", chaquopy_block + "dependencies {", 1)
+
+            with open(standalone_gradle, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(" [+] Applied Chaquopy plugin to TMessagesProj_AppStandalone/build.gradle")
+
+    # 3. Ensure minSdkVersion 24 in TMessagesProj and TMessagesProj_AppStandalone
     for mod in ["TMessagesProj", "TMessagesProj_AppStandalone"]:
         mod_gradle = os.path.join(repo_path, mod, "build.gradle")
         if os.path.exists(mod_gradle):
@@ -397,6 +434,16 @@ def configure_chaquopy_build(repo_path):
             with open(mod_gradle, "w", encoding="utf-8") as f:
                 f.write(m_content)
             print(f" [+] Ensured minSdkVersion 24 in {mod}/build.gradle")
+
+    # 4. Add gradle.properties flags to disable configuration cache (Chaquopy compat)
+    gradle_props = os.path.join(repo_path, "gradle.properties")
+    if os.path.exists(gradle_props):
+        with open(gradle_props, "r", encoding="utf-8") as f:
+            props = f.read()
+        if "org.gradle.configuration-cache" not in props:
+            with open(gradle_props, "a", encoding="utf-8") as f:
+                f.write("\norg.gradle.configuration-cache=false\n")
+            print(" [+] Disabled Gradle configuration cache for Chaquopy compatibility")
 
 def clone_required_submodules(repo_path):
     print("[*] Checking out required submodules for Gradle (media & jlatexmath)...")
