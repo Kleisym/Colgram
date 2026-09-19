@@ -811,32 +811,25 @@ public class ColgramBotLoginBottomSheet {
     messages_storage = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesStorage.java")
     if os.path.exists(messages_storage):
         def anti_delete_injector(content):
-            target = "public ArrayList<Long> markMessagesAsDeleted("
+            target = "public ArrayList<Long> markMessagesAsDeleted(long dialogId, ArrayList<Integer> messages, boolean useQueue, boolean deleteFiles, int mode, int topicId) {"
             if target not in content:
                 return content
-            idx = content.find(target)
-            brace_idx = content.find("{", idx)
-            if brace_idx == -1:
-                return content
-            inject = """
+            inject = """public ArrayList<Long> markMessagesAsDeleted(long dialogId, ArrayList<Integer> messages, boolean useQueue, boolean deleteFiles, int mode, int topicId) {
         if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled() && messages != null) {
-            java.util.ArrayList<Integer> filtered = new java.util.ArrayList<>();
+            java.util.ArrayList<Integer> toRemove = new java.util.ArrayList<>();
             for (int i = 0; i < messages.size(); i++) {
                 int mid = messages.get(i);
                 if (org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialogId, mid)) {
-                    // Preserved locally in Colgram vault
-                } else {
-                    filtered.add(mid);
+                    toRemove.add(mid);
                 }
             }
-            messages = filtered;
+            messages.removeAll(toRemove);
             if (messages.isEmpty()) {
                 return new java.util.ArrayList<>();
             }
-        }
-        """
-            return content[:brace_idx + 1] + inject + content[brace_idx + 1:]
-        patch_file(messages_storage, anti_delete_injector, "org.colgram.core.ColgramConfig.isAntiDeleteEnabled()", "MessagesStorage Anti-Delete Preservation")
+        }"""
+            return content.replace(target, inject, 1)
+        patch_file(messages_storage, anti_delete_injector, "messages.removeAll(toRemove);", "MessagesStorage Anti-Delete Preservation")
 
     # 21. MessagesController.java -> Save Message Edit History
     if os.path.exists(messages_controller):
