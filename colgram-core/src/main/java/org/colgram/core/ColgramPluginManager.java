@@ -430,16 +430,63 @@ public class ColgramPluginManager {
     }
 
     /**
+     * Catalog that ships inside the APK, used when the remote catalog is unreachable.
+     *
+     * This exists because the remote catalog is a hard dependency on a network fetch
+     * that can fail for reasons outside the user's control: the repo may be private
+     * (raw.githubusercontent.com is unauthenticated and returns 404 for private
+     * repos), the device may be offline, or GitHub may be rate-limiting. Without a
+     * bundled fallback the marketplace shows an empty list in every one of those
+     * cases, which reads to the user as "the feature is broken".
+     *
+     * Entries here are installed from bundled code, so `url` may be empty — the UI
+     * is expected to treat a blank url as "install from the copy already on device".
+     */
+    private static final String BUILTIN_CATALOG_JSON =
+            "[" +
+            "{\"name\":\"Message Logger\"," +
+            " \"author\":\"Colgram\"," +
+            " \"description\":\"Saves incoming and outgoing messages to a local JSONL file, including edits and deletions.\"," +
+            " \"version\":\"1.0\"," +
+            " \"url\":\"\"}," +
+            "{\"name\":\"Auto Reply\"," +
+            " \"author\":\"Colgram\"," +
+            " \"description\":\"Replies to private messages with a canned response while you are away.\"," +
+            " \"version\":\"1.0\"," +
+            " \"url\":\"\"}," +
+            "{\"name\":\"Chat Exporter\"," +
+            " \"author\":\"Colgram\"," +
+            " \"description\":\"Exports chat history to a portable HTML file.\"," +
+            " \"version\":\"1.0\"," +
+            " \"url\":\"\"}," +
+            "{\"name\":\"Keyword Alerts\"," +
+            " \"author\":\"Colgram\"," +
+            " \"description\":\"Watches chats for keywords and reports matches.\"," +
+            " \"version\":\"1.0\"," +
+            " \"url\":\"\"}" +
+            "]";
+
+    /**
      * Fetch and parse the remote catalog.
      *
      * Deliberately a tiny hand-rolled JSON reader: pulling in a JSON library for one
      * flat array of objects is not worth the dependency, and the schema is fixed.
-     * Never throws — returns an empty list so the UI can show "empty catalog" instead
-     * of crashing on a network error.
+     * Never throws — falls back to the bundled catalog so the marketplace is never
+     * empty, then to an empty list.
      */
     public static List<CatalogEntry> fetchCatalog() {
+        List<CatalogEntry> out = parseCatalog(httpGet(getCatalogUrl()));
+        if (out.isEmpty()) {
+            // Remote failed (private repo, offline, rate-limited). Show the bundled set
+            // rather than an empty screen.
+            out = parseCatalog(BUILTIN_CATALOG_JSON);
+        }
+        return out;
+    }
+
+    /** Parse a flat JSON array of catalog objects. Never throws. */
+    private static List<CatalogEntry> parseCatalog(String json) {
         List<CatalogEntry> out = new ArrayList<>();
-        String json = httpGet(getCatalogUrl());
         if (json == null || json.trim().isEmpty()) return out;
         try {
             int i = 0;
@@ -450,24 +497,24 @@ public class ColgramPluginManager {
                 if (objEnd < 0) break;
                 String obj = json.substring(objStart + 1, objEnd);
                 String name = jsonField(obj, "name");
-                String url = jsonField(obj, "url");
-                // An entry without a name or a download URL is unusable; skip it rather
-                // than adding a broken row to the list.
-                if (name != null && url != null && !name.isEmpty() && !url.isEmpty()) {
+                // A name is the minimum for a usable row. An empty url is allowed and
+                // means "this entry ships with the app" — see BUILTIN_CATALOG_JSON.
+                if (name != null && !name.isEmpty()) {
                     out.add(new CatalogEntry(
                             name,
                             orEmpty(jsonField(obj, "author")),
                             orEmpty(jsonField(obj, "description")),
                             orEmpty(jsonField(obj, "version")),
-                            url));
+                            orEmpty(jsonField(obj, "url"))));
                 }
                 i = objEnd + 1;
             }
         } catch (Throwable t) {
-            Log.e(TAG, "fetchCatalog parse error", t);
+            Log.e(TAG, "catalog parse error", t);
         }
         return out;
     }
+
 
     private static String orEmpty(String s) {
         return s == null ? "" : s;
