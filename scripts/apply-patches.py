@@ -344,6 +344,29 @@ def configure_package_and_branding(repo_path):
             f.write(m_content)
         print(" [+] Injected icon and label into TMessagesProj AndroidManifest.xml")
 
+    # 5. Patch google-services.json so GoogleServices plugin finds org.colgram.messenger
+    import json
+    import copy
+    for root, _, files in os.walk(repo_path):
+        for f in files:
+            if f == "google-services.json":
+                path = os.path.join(root, f)
+                try:
+                    with open(path, "r", encoding="utf-8") as jf:
+                        data = json.load(jf)
+                    clients = data.get("client", [])
+                    has_colgram = any(c.get("client_info", {}).get("android_client_info", {}).get("package_name") == "org.colgram.messenger" for c in clients)
+                    if not has_colgram and clients:
+                        new_client = copy.deepcopy(clients[0])
+                        new_client["client_info"]["android_client_info"]["package_name"] = "org.colgram.messenger"
+                        clients.append(new_client)
+                        data["client"] = clients
+                        with open(path, "w", encoding="utf-8") as jf:
+                            json.dump(data, jf, indent=2)
+                        print(f" [+] Added org.colgram.messenger to {path}")
+                except Exception as e:
+                    print(f" [!] Error patching {path}: {e}")
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
