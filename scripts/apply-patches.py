@@ -142,87 +142,104 @@ def download_official_binaries(repo_path):
     temp_apk = os.path.join(repo_path, "official_temp.apk")
     jni_libs_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "jniLibs")
 
-    try:
-        print(" -> Downloading official Telegram APK for native .so extraction...")
-        req = urllib.request.Request(apk_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as resp, open(temp_apk, 'wb') as out_file:
-            shutil.copyfileobj(resp, out_file)
+    # 1. Disable externalNativeBuild and configure jniLibs unconditionally in TMessagesProj/build.gradle
+    tmessages_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
+    if os.path.exists(tmessages_gradle):
+        with open(tmessages_gradle, "r", encoding="utf-8") as f:
+            content = f.read()
 
-        print(" -> Extracting native libraries from APK...")
-        # Clean destination to prevent duplicate resources
-        if os.path.exists(jni_libs_dir):
-            shutil.rmtree(jni_libs_dir)
-        os.makedirs(jni_libs_dir, exist_ok=True)
+        lines = content.split('\n')
+        out_lines = []
+        in_block = False
+        brace_count = 0
 
-        with zipfile.ZipFile(temp_apk, 'r') as zip_ref:
-            for file_info in zip_ref.infolist():
-                if file_info.filename.startswith("lib/"):
-                    # Exclude third-party libs like liblanguage_id_l2c_jni.so that come from AAR dependencies
-                    if "liblanguage_id" in file_info.filename or not file_info.filename.endswith(".so"):
-                        continue
-                    rel_path = file_info.filename[len("lib/"):]
-                    target_file = os.path.join(jni_libs_dir, rel_path)
-                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                    with zip_ref.open(file_info) as src, open(target_file, 'wb') as dst:
-                        shutil.copyfileobj(src, dst)
+        for line in lines:
+            if 'externalNativeBuild {' in line:
+                in_block = True
+                brace_count = line.count('{') - line.count('}')
+                continue
+            if in_block:
+                brace_count += line.count('{') - line.count('}')
+                if brace_count <= 0:
+                    in_block = False
+                continue
+            out_lines.append(line)
 
-        print(" [+] Successfully extracted prebuilt .so libraries to jniLibs!")
-        if os.path.exists(temp_apk):
-            os.remove(temp_apk)
+        gradle_content = '\n'.join(out_lines)
+        gradle_content = gradle_content.replace(
+            "sourceSets.main.jniLibs.srcDirs = ['./jni/']",
+            "sourceSets.main.jniLibs.srcDirs = ['src/main/jniLibs']"
+        )
+        with open(tmessages_gradle, "w", encoding="utf-8") as f:
+            f.write(gradle_content)
+        print(" [+] Cleanly configured Gradle jniLibs and removed externalNativeBuild")
 
-        # Disable externalNativeBuild in TMessagesProj/build.gradle using clean brace counter
-        tmessages_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
-        if os.path.exists(tmessages_gradle):
-            with open(tmessages_gradle, "r", encoding="utf-8") as f:
+    # 2. Configure packagingOptions in all app and library modules to pickFirst on .so files
+    for module in ["TMessagesProj", "TMessagesProj_AppStandalone"]:
+        gradle_path = os.path.join(repo_path, module, "build.gradle")
+        if os.path.exists(gradle_path):
+            with open(gradle_path, "r", encoding="utf-8") as f:
                 content = f.read()
-
-            lines = content.split('\n')
-            out_lines = []
-            in_block = False
-            brace_count = 0
-
-            for line in lines:
-                if 'externalNativeBuild {' in line:
-                    in_block = True
-                    brace_count = line.count('{') - line.count('}')
-                    continue
-                if in_block:
-                    brace_count += line.count('{') - line.count('}')
-                    if brace_count <= 0:
-                        in_block = False
-                    continue
-                out_lines.append(line)
-
-            gradle_content = '\n'.join(out_lines)
-            gradle_content = gradle_content.replace(
-                "sourceSets.main.jniLibs.srcDirs = ['./jni/']",
-                "sourceSets.main.jniLibs.srcDirs = ['src/main/jniLibs']"
-            )
-            with open(tmessages_gradle, "w", encoding="utf-8") as f:
-                f.write(gradle_content)
-            print(" [+] Cleanly configured Gradle jniLibs and removed externalNativeBuild")
-
-        # Configure packagingOptions in all app and library modules to pickFirst on .so files
-        for module in ["TMessagesProj", "TMessagesProj_AppStandalone"]:
-            gradle_path = os.path.join(repo_path, module, "build.gradle")
-            if os.path.exists(gradle_path):
-                with open(gradle_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                packaging_code = """
+            packaging_code = """
     packagingOptions {
         jniLibs {
             pickFirsts += ['**/*.so']
         }
     }
 """
-                if "pickFirsts += ['**/*.so']" not in content:
-                    content = content.replace("android {", "android {" + packaging_code, 1)
-                    with open(gradle_path, "w", encoding="utf-8") as f:
-                        f.write(content)
-                    print(f" [+] Added packagingOptions to {module}/build.gradle")
+            if "pickFirsts += ['**/*.so']" not in content:
+                content = content.replace("android {", "android {" + packaging_code, 1)
+                with open(gradle_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f" [+] Added packagingOptions to {module}/build.gradle")
 
-    except Exception as e:
-        print(f" [!] Warning: Prebuilt binary extraction encountered error: {e}")
+    # 3. Download official APK with retries
+    success = False
+    for attempt in range(4):
+        try:
+            print(f" -> Downloading official Telegram APK (attempt {attempt+1}/4)...")
+            if os.path.exists(temp_apk):
+                os.remove(temp_apk)
+
+            # Try curl first
+            curl_res = subprocess.run(
+                ["curl", "-L", "--retry", "3", "--retry-delay", "2", "-s", "-o", temp_apk, apk_url],
+                capture_output=True
+            )
+            if curl_res.returncode != 0 or not os.path.exists(temp_apk) or os.path.getsize(temp_apk) < 30 * 1024 * 1024:
+                req = urllib.request.Request(apk_url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=120) as resp, open(temp_apk, 'wb') as out_file:
+                    shutil.copyfileobj(resp, out_file)
+
+            if os.path.exists(temp_apk) and os.path.getsize(temp_apk) > 30 * 1024 * 1024:
+                with zipfile.ZipFile(temp_apk, 'r') as zip_ref:
+                    if os.path.exists(jni_libs_dir):
+                        shutil.rmtree(jni_libs_dir)
+                    os.makedirs(jni_libs_dir, exist_ok=True)
+
+                    for file_info in zip_ref.infolist():
+                        if file_info.filename.startswith("lib/"):
+                            if "liblanguage_id" in file_info.filename or not file_info.filename.endswith(".so"):
+                                continue
+                            rel_path = file_info.filename[len("lib/"):]
+                            target_file = os.path.join(jni_libs_dir, rel_path)
+                            os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                            with zip_ref.open(file_info) as src, open(target_file, 'wb') as dst:
+                                shutil.copyfileobj(src, dst)
+                    print(" [+] Successfully extracted prebuilt .so libraries to jniLibs!")
+                    success = True
+                    break
+            else:
+                print(f" [!] Attempt {attempt+1} produced small/invalid file.")
+        except Exception as e:
+            print(f" [!] Attempt {attempt+1} error: {e}")
+        finally:
+            if os.path.exists(temp_apk):
+                os.remove(temp_apk)
+
+    if not success:
+        print(" [!] FATAL: Failed to download official Telegram APK for native .so extraction.")
+        sys.exit(1)
 
 def inject_core(repo_path, core_source_dir):
     print("[*] Injecting colgram-core module into project...")
