@@ -167,7 +167,8 @@ def inject_hooks(repo_path):
     # 9. LoginActivity.java -> Inject Bot Token Login button in PhoneView
     bot_login_btn = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
             TextView botLoginBtn = new TextView(context);
-            botLoginBtn.setText("🤖 Войти через токен бота");
+            boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            botLoginBtn.setText(isRuLang ? "🤖 Войти через токен бота" : "🤖 Log in via Bot Token");
             botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
             botLoginBtn.setTypeface(AndroidUtilities.bold());
             botLoginBtn.setTextColor(Theme.getColor(Theme.key_featuredStickers_addButton));
@@ -212,6 +213,36 @@ def inject_hooks(repo_path):
         "// Colgram: all account slots unlocked without premium",
         "UserInfoActivity Unlock Add Account"
     )
+
+    # 12. IntroActivity.java -> Fix back button (do not remove IntroActivity from backstack) and language switching
+    intro_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "IntroActivity.java")
+    if os.path.exists(intro_activity):
+        # Keep IntroActivity in backstack when opening LoginActivity (removeLast = false)
+        patch_file(
+            intro_activity,
+            "presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), true);",
+            "presentFragment(new LoginActivity().setIntroView(frameContainerView, startMessagingButton), false);",
+            "IntroActivity Retain In Backstack On Login"
+        )
+        # Reset startPressed on resume so buttons work when user navigates back
+        patch_file(
+            intro_activity,
+            "public void onResume() {\n        super.onResume();",
+            "public void onResume() {\n        super.onResume();\n        startPressed = false;",
+            "IntroActivity Reset startPressed On Resume"
+        )
+        # Update activity resources configuration when language is switched
+        patch_file(
+            intro_activity,
+            "LocaleController.getInstance().applyLanguage(localeInfo, true, false, currentAccount);",
+            """try {
+                android.content.res.Configuration cfg = new android.content.res.Configuration();
+                cfg.locale = new java.util.Locale(localeInfo.shortName);
+                v.getContext().getResources().updateConfiguration(cfg, v.getContext().getResources().getDisplayMetrics());
+            } catch (Throwable ignored) {}
+            LocaleController.getInstance().applyLanguage(localeInfo, true, false, currentAccount);""",
+            "IntroActivity Apply Language Configuration"
+        )
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")

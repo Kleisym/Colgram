@@ -41,6 +41,23 @@ public class ColgramBotLogin {
         }
     }
 
+    private static boolean isRussian() {
+        try {
+            Class<?> lcClass = Class.forName("org.telegram.messenger.LocaleController");
+            Method getInstance = lcClass.getMethod("getInstance");
+            Object lc = getInstance.invoke(null);
+            Field currentLocaleInfoField = lcClass.getDeclaredField("currentLocaleInfo");
+            currentLocaleInfoField.setAccessible(true);
+            Object li = currentLocaleInfoField.get(lc);
+            if (li != null) {
+                Field shortNameField = li.getClass().getField("shortName");
+                String sn = (String) shortNameField.get(li);
+                return "ru".equalsIgnoreCase(sn);
+            }
+        } catch (Throwable ignored) {}
+        return "ru".equalsIgnoreCase(java.util.Locale.getDefault().getLanguage());
+    }
+
     public static void showBotLoginDialog(final Context context, final int currentAccount, final Runnable onLoggedIn) {
         try {
             Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
@@ -60,6 +77,8 @@ public class ColgramBotLogin {
             int blueColor = getThemeColor(themeClass, "key_dialogTextBlue2", Color.parseColor("#2AABEE"));
             int fieldBgColor = getThemeColor(themeClass, "key_dialogInputField", Color.parseColor("#0F000000"));
 
+            boolean isRu = isRussian();
+
             // Main container
             LinearLayout container = new LinearLayout(context);
             container.setOrientation(LinearLayout.VERTICAL);
@@ -75,7 +94,9 @@ public class ColgramBotLogin {
 
             // Subtitle Description
             TextView subtitleView = new TextView(context);
-            subtitleView.setText("Войдите в Telegram от имени бота. Создайте или скопируйте токен в @BotFather и вставьте его ниже.");
+            subtitleView.setText(isRu 
+                ? "Войдите в Telegram от имени бота. Создайте или скопируйте токен в @BotFather и вставьте его ниже."
+                : "Log in to Telegram as a bot. Create or copy a token from @BotFather and paste it below.");
             subtitleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
             subtitleView.setTextColor(grayColor);
             subtitleView.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -110,7 +131,7 @@ public class ColgramBotLogin {
 
             // Quick Paste button
             TextView pasteBtn = new TextView(context);
-            pasteBtn.setText("Вставить");
+            pasteBtn.setText(isRu ? "Вставить" : "Paste");
             pasteBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
             pasteBtn.setTextColor(blueColor);
             try {
@@ -136,21 +157,21 @@ public class ColgramBotLogin {
 
             // Telegram AlertDialog.Builder
             Object builder = alertBuilderClass.getConstructor(Context.class).newInstance(context);
-            alertBuilderClass.getMethod("setTitle", CharSequence.class).invoke(builder, "Вход по токену бота");
+            alertBuilderClass.getMethod("setTitle", CharSequence.class).invoke(builder, isRu ? "Вход по токену бота" : "Log in via Bot Token");
             alertBuilderClass.getMethod("setView", View.class).invoke(builder, container);
 
             alertBuilderClass.getMethod("setPositiveButton", CharSequence.class, DialogInterface.OnClickListener.class)
-                    .invoke(builder, "Войти", (DialogInterface.OnClickListener) (dialog, which) -> {
+                    .invoke(builder, isRu ? "Войти" : "Log In", (DialogInterface.OnClickListener) (dialog, which) -> {
                         String token = input.getText().toString().trim();
                         if (token.isEmpty() || !token.contains(":")) {
-                            Toast.makeText(context, "Введите корректный токен (например, 123456:ABC-DEF)", Toast.LENGTH_LONG).show();
+                            Toast.makeText(context, isRu ? "Введите корректный токен (например, 123456:ABC-DEF)" : "Please enter a valid token (e.g. 123456:ABC-DEF)", Toast.LENGTH_LONG).show();
                             return;
                         }
                         loginWithBotToken(context, currentAccount, token, onLoggedIn);
                     });
 
             alertBuilderClass.getMethod("setNegativeButton", CharSequence.class, DialogInterface.OnClickListener.class)
-                    .invoke(builder, "Отмена", null);
+                    .invoke(builder, isRu ? "Отмена" : "Cancel", null);
 
             alertBuilderClass.getMethod("show").invoke(builder);
 
