@@ -7,8 +7,13 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -379,5 +384,182 @@ public class ColgramPluginManager {
         try (FileWriter w = new FileWriter(file)) {
             w.write(content);
         } catch (Throwable ignored) {}
+    }
+
+    // ==================================================================================
+    // Marketplace
+    // ==================================================================================
+
+    /** A plugin listed in the remote catalog. */
+    public static class CatalogEntry {
+        public final String name;
+        public final String author;
+        public final String description;
+        public final String version;
+        public final String downloadUrl;
+
+        public CatalogEntry(String name, String author, String description,
+                            String version, String downloadUrl) {
+            this.name = name;
+            this.author = author;
+            this.description = description;
+            this.version = version;
+            this.downloadUrl = downloadUrl;
+        }
+    }
+
+    /**
+     * Default catalog. A plain JSON array hosted in the repo, so publishing a plugin is
+     * just a PR — no server to run. Shape:
+     *   [{"name":"...","author":"...","description":"...","version":"1.0","url":"https://..."}]
+     */
+    public static final String DEFAULT_CATALOG_URL =
+            "https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/catalog.json";
+
+    public static String getCatalogUrl() {
+        if (appContext == null) return DEFAULT_CATALOG_URL;
+        return appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString("catalog_url", DEFAULT_CATALOG_URL);
+    }
+
+    public static void setCatalogUrl(String url) {
+        if (appContext != null) {
+            appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putString("catalog_url", url).apply();
+        }
+    }
+
+    /**
+     * Fetch and parse the remote catalog.
+     *
+     * Deliberately a tiny hand-rolled JSON reader: pulling in a JSON library for one
+     * flat array of objects is not worth the dependency, and the schema is fixed.
+     * Never throws — returns an empty list so the UI can show "empty catalog" instead
+     * of crashing on a network error.
+     */
+    public static List<CatalogEntry> fetchCatalog() {
+        List<CatalogEntry> out = new ArrayList<>();
+        String json = httpGet(getCatalogUrl());
+        if (json == null || json.trim().isEmpty()) return out;
+        try {
+            int i = 0;
+            while (true) {
+                int objStart = json.indexOf('{', i);
+                if (objStart < 0) break;
+                int objEnd = json.indexOf('}', objStart);
+                if (objEnd < 0) break;
+                String obj = json.substring(objStart + 1, objEnd);
+                String name = jsonField(obj, "name");
+                String url = jsonField(obj, "url");
+                // An entry without a name or a download URL is unusable; skip it rather
+                // than adding a broken row to the list.
+                if (name != null && url != null && !name.isEmpty() && !url.isEmpty()) {
+                    out.add(new CatalogEntry(
+                            name,
+                            orEmpty(jsonField(obj, "author")),
+                            orEmpty(jsonField(obj, "description")),
+                            orEmpty(jsonField(obj, "version")),
+                            url));
+                }
+                i = objEnd + 1;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "fetchCatalog parse error", t);
+        }
+        return out;
+    }
+
+    private static String orEmpty(String s) {
+        return s == null ? "" : s;
+    }
+
+    /** Extract a flat string field from a JSON object body. */
+    private static String jsonField(String obj, String key) {
+        String needle = "\"" + key + "\"";
+        int k = obj.indexOf(needle);
+        if (k < 0) return null;
+        int colon = obj.indexOf(':', k + needle.length());
+        if (colon < 0) return null;
+        int q1 = obj.indexOf('"', colon + 1);
+        if (q1 < 0) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int p = q1 + 1; p < obj.length(); p++) {
+            char c = obj.charAt(p);
+            if (c == '\\' && p + 1 < obj.length()) {
+                sb.append(obj.charAt(++p));
+            } else if (c == '"') {
+                break;
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Install a plugin straight from a URL — this is what makes the catalog work, and
+     * also what backs "install from link" in the UI.
+     */
+    public static boolean installPluginFromUrl(String url) {
+        if (url == null || url.trim().isEmpty()) return false;
+        String code = httpGet(url);
+        if (code == null || code.trim().isEmpty()) return false;
+        String fileName = fileNameFromUrl(url);
+        if (fileName == null) return false;
+        return installPlugin(fileName, code);
+    }
+
+    /** Derive a safe on-disk filename from a plugin URL. */
+    private static String fileNameFromUrl(String url) {
+        try {
+            String path = url;
+            int q = path.indexOf('?');
+            if (q >= 0) path = path.substring(0, q);
+            int slash = path.lastIndexOf('/');
+            String base = slash >= 0 ? path.substring(slash + 1) : path;
+            if (base.isEmpty()) return null;
+            // Only permit a bare filename — never let a crafted URL escape the plugin dir.
+            if (base.contains("..") || base.contains("/") || base.contains("\\")) return null;
+            if (!base.endsWith(".py") && !base.endsWith(".json") && !base.endsWith(".txt")) {
+                base = base + ".py";
+            }
+            return base;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Minimal HTTP GET returning the body as text, or null on any failure. */
+    private static String httpGet(String urlStr) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(urlStr);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(15000);
+            conn.setRequestMethod("GET");
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("User-Agent", "Colgram");
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                Log.e(TAG, "httpGet HTTP " + code + " for " + urlStr);
+                return null;
+            }
+            InputStream in = conn.getInputStream();
+            if (in == null) return null;
+            BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+            r.close();
+            return sb.toString();
+        } catch (Throwable t) {
+            Log.e(TAG, "httpGet failed for " + urlStr, t);
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
 }

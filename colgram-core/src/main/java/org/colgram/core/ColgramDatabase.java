@@ -110,12 +110,31 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     /**
      * Stores a prior version of a message before it was edited.
+     * Skips duplicates so repeated update packets do not inflate the history.
      */
     public void saveMessageEdit(long dialogId, int messageId, String previousText, long editTimestamp) {
         if (previousText == null || previousText.trim().isEmpty()) return;
 
         try {
             SQLiteDatabase db = getWritableDatabase();
+
+            // Deduplicate: skip if this exact revision is already the last one stored.
+            Cursor last = db.query(TABLE_EDITS,
+                    new String[]{COL_EDIT_PREV_TEXT},
+                    COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?",
+                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
+                    null, null, COL_EDIT_TIMESTAMP + " DESC", "1");
+            if (last != null) {
+                if (last.moveToFirst()) {
+                    String existing = last.getString(0);
+                    if (previousText.equals(existing)) {
+                        last.close();
+                        return;
+                    }
+                }
+                last.close();
+            }
+
             ContentValues values = new ContentValues();
             values.put(COL_EDIT_DIALOG_ID, dialogId);
             values.put(COL_EDIT_MSG_ID, messageId);

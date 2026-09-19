@@ -163,12 +163,15 @@ public class ColgramQRLoginBottomSheet {
                 activity, currentAccount, bottomSheet, qrImageView, progressView, statusText, isRu);
         activeInstance = instance;
 
+        // Refresh button is now a manual fallback only — the real confirmation is automatic.
+        checkBtn.setText(isRu ? "Проверить сейчас" : "Check now");
         checkBtn.setOnClickListener(v -> instance.onTokenScanned());
         cancelBtn.setOnClickListener(v -> bottomSheet.dismiss());
 
         bottomSheet.setOnDismissListener(dialog -> {
             instance.isDismissed = true;
             instance.cancelRefresh();
+            instance.stopAutoConfirm();
             if (activeInstance == instance) {
                 activeInstance = null;
             }
@@ -178,6 +181,40 @@ public class ColgramQRLoginBottomSheet {
 
         // Start MTProto QR Export Flow (single call, no rapid polling)
         instance.startQrExport();
+
+        // Automatic confirmation: poll the token status in the background so the user
+        // never has to tap anything after scanning. The server push (updateLoginToken)
+        // is the primary trigger; this poller is the safety net when push is delayed
+        // or filtered by the proxy.
+        instance.startAutoConfirm();
+    }
+
+    private Runnable autoConfirmRunnable = null;
+    private int autoConfirmAttempts = 0;
+
+    private void startAutoConfirm() {
+        stopAutoConfirm();
+        autoConfirmAttempts = 0;
+        autoConfirmRunnable = () -> {
+            if (isDismissed || activity == null || activity.getParentActivity() == null || activity.getParentActivity().isFinishing()) {
+                return;
+            }
+            autoConfirmAttempts++;
+            // Give up after ~2 minutes of polling to avoid battery drain.
+            if (autoConfirmAttempts > 24) {
+                return;
+            }
+            onTokenScanned();
+            handler.postDelayed(autoConfirmRunnable, 5000L);
+        };
+        handler.postDelayed(autoConfirmRunnable, 5000L);
+    }
+
+    private void stopAutoConfirm() {
+        if (autoConfirmRunnable != null) {
+            handler.removeCallbacks(autoConfirmRunnable);
+            autoConfirmRunnable = null;
+        }
     }
 
     /**
@@ -376,6 +413,7 @@ public class ColgramQRLoginBottomSheet {
         isDismissed = true;
         activeInstance = null;
         cancelRefresh();
+        stopAutoConfirm();
 
         try {
             bottomSheet.dismiss();

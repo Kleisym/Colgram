@@ -19,6 +19,7 @@ public class ColgramConfig {
     // Message Vault
     private static final String KEY_ANTI_DELETE_ENABLED = "anti_delete_enabled";
     private static final String KEY_EDIT_HISTORY_ENABLED = "edit_history_enabled";
+    private static final String KEY_CHAT_WALLPAPER_ENABLED = "chat_wallpaper_enabled";
     private static final String KEY_PRESERVE_MEDIA = "preserve_deleted_media";
 
     // Ghost Mode
@@ -39,6 +40,12 @@ public class ColgramConfig {
 
     // Theme
     private static final String KEY_CYBER_THEME_ENABLED = "cyber_theme_enabled";
+
+    // Version switching
+    private static final String KEY_PENDING_UPSTREAM_TAG = "pending_upstream_tag";
+
+    // Mini-app floating windows
+    private static final String KEY_MINIAPP_PIP_ENABLED = "miniapp_pip_enabled";
 
     // Defaults
     public static final String DEFAULT_MODEL = "Google Pixel 8 Pro";
@@ -103,6 +110,14 @@ public class ColgramConfig {
 
     public static void setEditHistoryEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_EDIT_HISTORY_ENABLED, enabled).apply();
+    }
+
+    public static boolean isChatWallpaperEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_CHAT_WALLPAPER_ENABLED, true);
+    }
+
+    public static void setChatWallpaperEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_CHAT_WALLPAPER_ENABLED, enabled).apply();
     }
 
     public static boolean isPreserveMediaEnabled() {
@@ -194,5 +209,41 @@ public class ColgramConfig {
 
     public static void setCyberThemeEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_CYBER_THEME_ENABLED, enabled).apply();
+    }
+
+    // --- Version switching ---
+
+    /**
+     * The upstream DrKLO/Telegram tag the user picked in the version switcher.
+     *
+     * Switching Telegram versions cannot happen on-device — it requires re-cloning the
+     * tag, re-applying every patch and rebuilding. We persist the choice so the CI
+     * pipeline (or a local build) can consume it, and the UI sends the user to the run
+     * that performs the rebuild.
+     */
+    public static String getPendingUpstreamTag() {
+        return prefs != null ? prefs.getString(KEY_PENDING_UPSTREAM_TAG, null) : null;
+    }
+
+    public static void setPendingUpstreamTag(String tag) {
+        if (prefs != null) prefs.edit().putString(KEY_PENDING_UPSTREAM_TAG, tag).apply();
+    }
+
+    public static void clearPendingUpstreamTag() {
+        if (prefs != null) prefs.edit().remove(KEY_PENDING_UPSTREAM_TAG).apply();
+    }
+
+    // --- Mini-app floating windows ---
+
+    /**
+     * Whether a mini-app can be pinned into an Android picture-in-picture floating
+     * window. Enabled by default; the UI reads this before offering the action.
+     */
+    public static boolean isMiniAppPipEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_MINIAPP_PIP_ENABLED, true);
+    }
+
+    public static void setMiniAppPipEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_MINIAPP_PIP_ENABLED, enabled).apply();
     }
 }

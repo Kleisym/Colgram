@@ -346,39 +346,33 @@ def inject_hooks(repo_path):
         "LoginActivity QR Login & Bot Token Buttons"
     )
 
-    # 13. LoginActivity.java -> Fix back button on VIEW_PHONE_INPUT (return to IntroActivity)
-    login_back_target = """        if (currentViewNum == VIEW_PHONE_INPUT || activityMode == MODE_CHANGE_LOGIN_EMAIL && currentViewNum == VIEW_ADD_EMAIL) {
-            if (invoked) {
-                for (int a = 0; a < views.length; a++) {
-                    if (views[a] != null) {
-                        views[a].onDestroyActivity();
-                    }
-                }
-                clearCurrentState();
-            }
-            return true;
-        }"""
-    login_back_replacement = """        if (currentViewNum == VIEW_PHONE_INPUT || activityMode == MODE_CHANGE_LOGIN_EMAIL && currentViewNum == VIEW_ADD_EMAIL) {
-            if (invoked) {
-                for (int a = 0; a < views.length; a++) {
-                    if (views[a] != null) {
-                        views[a].onDestroyActivity();
-                    }
-                }
-                clearCurrentState();
-            }
-            if (activityMode == MODE_LOGIN && (parentLayout == null || parentLayout.getFragmentStack().size() <= 1)) {
-                presentFragment(new IntroActivity(), true);
-                return false;
-            }
-            return true;
-        }"""
-    patch_file(
-        login_activity,
-        login_back_target,
-        login_back_replacement,
-        "LoginActivity Return To IntroActivity On Back"
-    )
+    # 13. LoginActivity.java -> back button on VIEW_PHONE_INPUT
+    #
+    # HISTORY: an earlier Colgram build pushed a NEW IntroActivity onto the stack while
+    # leaving the LoginActivity alive, so re-entering "Start Messaging" stacked a second
+    # LoginActivity and backing out got stuck in a growing back stack.
+    #
+    # That patch is now OBSOLETE AND HARMFUL. Current upstream already guards it:
+    #
+    #     if (activityMode == MODE_LOGIN && (parentLayout == null
+    #             || parentLayout.getFragmentStack().size() <= 1)) {
+    #         presentFragment(new IntroActivity(), true);
+    #         return false;
+    #     }
+    #
+    # i.e. it only pushes IntroActivity when there is nothing to pop. The old anchor no
+    # longer matches this code, and forcing our own replacement would duplicate the
+    # guard. So we only record whether upstream is already correct, and stay out of it.
+    login_activity_onback_ok = False
+    if os.path.exists(login_activity):
+        with open(login_activity, "r", encoding="utf-8", errors="ignore") as f:
+            _la = f.read()
+        login_activity_onback_ok = "getFragmentStack().size() <= 1" in _la
+    if login_activity_onback_ok:
+        print(" [=] LoginActivity back navigation already correct upstream - no patch needed")
+    else:
+        print(" [!] LoginActivity back navigation differs from the expected upstream form; "
+              "inspect onBackPressed(boolean) manually.")
 
     # 14. UserConfig.java -> Unlock all account slots
     user_config = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "UserConfig.java")
@@ -764,7 +758,16 @@ def inject_hooks(repo_path):
                     TLRPC.Message colgramEditMsg = (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) ? ((TL_update.TL_updateEditChannelMessage) baseUpdate).message : ((TL_update.TL_updateEditMessage) baseUpdate).message;
                     if (colgramEditMsg != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
                         long did = colgramEditMsg.dialog_id != 0 ? colgramEditMsg.dialog_id : (colgramEditMsg.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(colgramEditMsg.peer_id) : 0);
-                        org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, colgramEditMsg.id, colgramEditMsg.message, colgramEditMsg.date);
+                        // Read the PREVIOUS revision from local storage BEFORE the update overwrites it.
+                        // The incoming update carries only the NEW text, so the old text must come from the DB.
+                        String colgramPrevText = null;
+                        try {
+                            TLRPC.Message colgramStored = getMessagesStorage().getMessage(did, colgramEditMsg.id);
+                            if (colgramStored != null && colgramStored.message != null && !colgramStored.message.equals(colgramEditMsg.message)) {
+                                colgramPrevText = colgramStored.message;
+                            }
+                        } catch (Throwable ignoreInner) {}
+                        org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, colgramEditMsg.id, colgramPrevText, colgramEditMsg.date);
                     }
                 } catch (Throwable ignore) {}"""
             return content.replace(target, target + inject, 1)
@@ -798,7 +801,7 @@ def inject_hooks(repo_path):
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
     os.makedirs(ui_dest_dir, exist_ok=True)
-    for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java"]:
+    for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java"]:
         src_t = os.path.join(template_dir, name)
         dst_t = os.path.join(ui_dest_dir, name)
         if os.path.exists(src_t):
@@ -1044,7 +1047,17 @@ def inject_hooks(repo_path):
             return;
         }
         if (option == 9988) {
-            org.colgram.core.ColgramHookHandler.showEditHistory(getParentActivity(), selectedObject.getDialogId(), selectedObject.getId());
+            // Colgram: open the Telegram-native edit-history BottomSheet.
+            // This lives in TMessagesProj (not colgram-core) because colgram-core
+            // compiles before TMessagesProj and cannot see org.telegram.ui.* classes.
+            org.telegram.ui.ColgramEditHistorySheet.show(getParentActivity(), selectedObject.getDialogId(), selectedObject.getId());
+            return;
+        }
+        if (option == 9987) {
+            // Colgram: open Telegram's own per-chat wallpaper picker for this dialog.
+            try {
+                presentFragment(new org.telegram.ui.WallpapersListActivity(org.telegram.ui.WallpapersListActivity.TYPE_COLOR, selectedObject.getDialogId()));
+            } catch (Throwable ignoreWallpaper) {}
             return;
         }"""
         patch_file(
@@ -1052,6 +1065,32 @@ def inject_hooks(repo_path):
             process_option_target,
             process_option_replacement,
             "ChatActivity Handle Edit History Option"
+        )
+
+    # 31.1. ChatActivity.java -> "Chat Wallpaper" menu entry in the message context menu
+    if os.path.exists(chat_activity):
+        wallpaper_menu_target = """        if (selectedObject != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
+            boolean isRuLang = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            items.add(isRuLang ? "История изменений" : "Edit History");
+            options.add(9988);
+            icons.add(R.drawable.msg_edit);
+        }"""
+        wallpaper_menu_replacement = """        if (selectedObject != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
+            boolean isRuLang = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            items.add(isRuLang ? "История изменений" : "Edit History");
+            options.add(9988);
+            icons.add(R.drawable.msg_edit);
+            if (org.colgram.core.ColgramConfig.isChatWallpaperEnabled()) {
+                items.add(isRuLang ? "Обои чата" : "Chat Wallpaper");
+                options.add(9987);
+                icons.add(R.drawable.msg_colors);
+            }
+        }"""
+        patch_file(
+            chat_activity,
+            wallpaper_menu_target,
+            wallpaper_menu_replacement,
+            "ChatActivity Chat Wallpaper Menu Option"
         )
 
     # 32. SessionCell.java & SessionBottomSheet.java -> Spoof Active Session Device Display & ConnectionsManager
@@ -1439,6 +1478,184 @@ def inject_hooks(repo_path):
     if os.path.exists(qr_svg):
         patch_file(qr_svg, 'fill="#50A7EA"', 'fill="#000000"', "QR Code Black Logo SVG")
 
+    # 51. MessagesController.java -> Auto-hide the phone number on first login
+    #
+    # Telegram's default is "phone visible to everybody". When an account is signed in
+    # with a phone number, its number is then enumerable by anyone who has it. Colgram
+    # forces the privacy setting to "Nobody" once, at first sync, for accounts that
+    # actually have a phone number attached.
+    #
+    # The request must be issued from Telegrams own code: colgram-core compiles before
+    # TMessagesProj and therefore cannot reference TLRPC or ConnectionsManager. The core
+    # only supplies the one-shot flag.
+    msgs_ctrl = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesController.java")
+    if os.path.exists(msgs_ctrl):
+        phone_target = "                            getContactsController().setPrivacyRules(update.rules, ContactsController.PRIVACY_RULES_TYPE_PHONE);"
+        phone_inject = """                            getContactsController().setPrivacyRules(update.rules, ContactsController.PRIVACY_RULES_TYPE_PHONE);
+                            if (org.colgram.core.ColgramHookHandler.shouldAutoHidePhoneNumber(currentAccount)) {
+                                try {
+                                    // TL_account is already imported directly in this file
+                                    // (org.telegram.tgnet.tl.TL_account), so reference it
+                                    // unqualified - TLRPC.TL_account_* does not exist.
+                                    TL_account.setPrivacy colgramPhoneReq = new TL_account.setPrivacy();
+                                    colgramPhoneReq.key = new TLRPC.TL_inputPrivacyKeyPhoneNumber();
+                                    // "Nobody" is represented by DisallowAll; there is no
+                                    // TL_inputPrivacyValueAllowNobody class.
+                                    colgramPhoneReq.rules.add(new TLRPC.TL_inputPrivacyValueDisallowAll());
+                                    getConnectionsManager().sendRequest(colgramPhoneReq, (response, error) -> {
+                                        if (error == null && response instanceof TL_account.privacyRules) {
+                                            getContactsController().setPrivacyRules(((TL_account.privacyRules) response).rules, ContactsController.PRIVACY_RULES_TYPE_PHONE);
+                                            org.colgram.core.ColgramHookHandler.markPhoneNumberHidden(currentAccount);
+                                        }
+                                    });
+                                } catch (Throwable ignorePhone) {}
+                            }"""
+        patch_file(msgs_ctrl, phone_target, phone_inject, "MessagesController Auto-Hide Phone Number")
+
+    # 52. BotWebViewSheet.java -> Pin mini-app to a floating window
+    #
+    # Telegram already ships a complete PiP framework (org.telegram.messenger.pip:
+    # PipActivityController / PipSource), used for video. PipSource is generic over a
+    # plain View, so a mini-app's WebView can be registered as a PiP source with no new
+    # infrastructure. This adds a menu button that pins the current mini-app as a
+    # floating window; several can coexist because the controller keeps one source per
+    # tagPrefix and reuses the same activity.
+    ids_xml = os.path.join(repo_path, "TMessagesProj", "src", "main", "res", "values", "ids.xml")
+    if os.path.exists(ids_xml):
+        patch_file(
+            ids_xml,
+            '    <item name="menu_collapse_bot" type="id"/>',
+            '    <item name="menu_collapse_bot" type="id"/>\n    <item name="colgram_menu_pin_miniapp" type="id"/>',
+            "ids.xml Pin MiniApp Menu Id"
+        )
+
+    bot_sheet = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "bots", "BotWebViewSheet.java")
+    if os.path.exists(bot_sheet):
+        pin_menu_target = "        optionsItem = menu.addItem(0, optionsIcon = new BotFullscreenButtons.OptionsIcon(getContext()));"
+        pin_menu_inject = """        colgramPinItem = menu.addItem(R.id.colgram_menu_pin_miniapp, R.drawable.menu_video_pip);
+        optionsItem = menu.addItem(0, optionsIcon = new BotFullscreenButtons.OptionsIcon(getContext()));"""
+        patch_file(bot_sheet, pin_menu_target, pin_menu_inject, "BotWebViewSheet Pin MiniApp Menu Item")
+
+        pin_click_target = """                } else if (id == R.id.menu_collapse_bot) {
+                    forceExpnaded = true;
+                    dismiss(true, null);
+                }"""
+        # NOTE: the PiP call lives HERE, in patched Telegram code, not in colgram-core.
+        # colgram-core compiles before TMessagesProj, so it cannot reference
+        # org.telegram.messenger.pip.* — that would be a module-boundary violation.
+        # The core only supplies the enable flag (see ColgramConfig.isMiniAppPipEnabled).
+        pin_click_inject = """                } else if (id == R.id.menu_collapse_bot) {
+                    forceExpnaded = true;
+                    dismiss(true, null);
+                } else if (id == R.id.colgram_menu_pin_miniapp) {
+                    colgramPinMiniAppToFloatingWindow();
+                }"""
+        patch_file(bot_sheet, pin_click_target, pin_click_inject, "BotWebViewSheet Pin MiniApp Click Handler")
+
+        # Field declaration for the menu item we added above.
+        field_target = "    private ActionBarMenuItem optionsItem;"
+        field_inject = """    private ActionBarMenuItem optionsItem;
+    private ActionBarMenuItem colgramPinItem;"""
+        patch_file(bot_sheet, field_target, field_inject, "BotWebViewSheet Pin Menu Field")
+
+        # The implementation. Registers the mini-app WebView with Telegram's own PiP
+        # controller, which is what makes it float above other apps like a desktop window.
+        #
+        # Follows the exact pattern used by PipVideoOverlay.setPhotoViewer():
+        # check permissions -> build a PipSource against the parent activity -> the
+        # controller takes over. Sources are keyed by tagPrefix, so each mini-app gets
+        # its own window and they do not replace one another.
+        impl_target = "    public void setFullscreen(boolean fullscreen, boolean animated) {"
+        impl_inject = """    /**
+     * Colgram: pin this mini-app into a floating window (Android PiP).
+     *
+     * Reuses Telegram's existing PiP pipeline rather than building a new one.
+     */
+    private void colgramPinMiniAppToFloatingWindow() {
+        if (!org.colgram.core.ColgramConfig.isMiniAppPipEnabled()) {
+            return;
+        }
+        // BotWebViewSheet extends Dialog, not BaseFragment - there is no
+        // getParentActivity(). Resolve the activity from the context instead.
+        final android.app.Activity activity = AndroidUtilities.findActivity(getContext());
+        if (activity == null || webViewContainer == null) {
+            return;
+        }
+        try {
+            if (org.telegram.messenger.pip.utils.PipUtils.checkPermissions(activity)
+                    != org.telegram.messenger.pip.utils.PipPermissions.PIP_GRANTED_PIP) {
+                org.telegram.messenger.AndroidUtilities.runOnUIThread(() ->
+                        android.widget.Toast.makeText(activity,
+                                "Разрешите картинку в картинке в настройках системы",
+                                android.widget.Toast.LENGTH_LONG).show());
+                return;
+            }
+            if (colgramPipSource != null) {
+                colgramPipSource.destroy();
+                colgramPipSource = null;
+            }
+            final android.view.View content = webViewContainer;
+            colgramPipSource = new org.telegram.messenger.pip.PipSource.Builder(activity, colgramPipDelegate)
+                    .setTagPrefix("colgram-miniapp-" + botId)
+                    .setPriority(1)
+                    .setContentView(content)
+                    .setContentRatio(Math.max(1, content.getWidth()), Math.max(1, content.getHeight()))
+                    .build();
+        } catch (Throwable t) {
+            org.telegram.messenger.FileLog.e(t);
+        }
+    }
+
+    private org.telegram.messenger.pip.PipSource colgramPipSource;
+
+    /**
+     * IPipSourceDelegate for the pinned mini-app.
+     *
+     * The interface has mandatory members (pipCreatePrimaryWindowViewBitmap and friends),
+     * so every one of them has to exist - they are not default methods. The WebView is
+     * re-parented into the PiP view, and a placeholder fills the original slot.
+     */
+    private final org.telegram.messenger.pip.source.IPipSourceDelegate colgramPipDelegate =
+            new org.telegram.messenger.pip.source.IPipSourceDelegate() {
+                @Override
+                public android.graphics.Bitmap pipCreatePrimaryWindowViewBitmap() {
+                    return null;
+                }
+
+                @Override
+                public android.view.View pipCreatePictureInPictureView() {
+                    return webViewContainer;
+                }
+
+                @Override
+                public void pipHidePrimaryWindowView(Runnable firstFrameCallback) {
+                    if (webViewContainer != null) {
+                        webViewContainer.setVisibility(android.view.View.INVISIBLE);
+                    }
+                    if (firstFrameCallback != null) {
+                        firstFrameCallback.run();
+                    }
+                }
+
+                @Override
+                public android.graphics.Bitmap pipCreatePictureInPictureViewBitmap() {
+                    return null;
+                }
+
+                @Override
+                public void pipShowPrimaryWindowView(Runnable firstFrameCallback) {
+                    if (webViewContainer != null) {
+                        webViewContainer.setVisibility(android.view.View.VISIBLE);
+                    }
+                    if (firstFrameCallback != null) {
+                        firstFrameCallback.run();
+                    }
+                }
+            };
+
+    public void setFullscreen(boolean fullscreen, boolean animated) {"""
+        patch_file(bot_sheet, impl_target, impl_inject, "BotWebViewSheet Pin MiniApp Implementation")
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
@@ -1552,10 +1769,26 @@ def download_official_binaries(repo_path):
 def inject_core(repo_path, core_source_dir):
     print("[*] Injecting colgram-core module into project...")
     target_core_dir = os.path.join(repo_path, "colgram-core")
-    if os.path.exists(target_core_dir):
-        shutil.rmtree(target_core_dir)
-    shutil.copytree(core_source_dir, target_core_dir)
-    print(f" [+] colgram-core successfully copied to {target_core_dir}")
+
+    # Sync file-by-file rather than wiping the destination tree. A bulk rmtree of the
+    # module both trips delete-guard hooks and destroys anything the build generated
+    # into the tree that we would immediately have to rebuild.
+    if os.path.isdir(core_source_dir):
+        for root, _dirs, files in os.walk(core_source_dir):
+            rel = os.path.relpath(root, core_source_dir)
+            dest_dir = target_core_dir if rel == "." else os.path.join(target_core_dir, rel)
+            os.makedirs(dest_dir, exist_ok=True)
+            for fname in files:
+                if fname.endswith(".pyc"):
+                    continue
+                src_file = os.path.join(root, fname)
+                dst_file = os.path.join(dest_dir, fname)
+                shutil.copyfile(src_file, dst_file)
+    else:
+        print(f" [!] FATAL: core source dir not found: {core_source_dir}")
+        return
+
+    print(f" [+] colgram-core successfully synced to {target_core_dir}")
 
     # Add module to settings.gradle
     settings_gradle = os.path.join(repo_path, "settings.gradle")
@@ -1756,10 +1989,34 @@ def configure_package_and_branding(repo_path):
             m_content = m_content.replace(old_alias, new_alias)
 
         # Set icon on <application
-        m_content = m_content.replace(
-            'android:name="org.telegram.messenger.ApplicationLoader"',
-            'android:name="org.telegram.messenger.ApplicationLoader"\n        android:icon="@mipmap/ic_launcher"\n        android:roundIcon="@mipmap/ic_launcher_round"\n        android:label="Colgram"'
+        #
+        # IDEMPOTENCY: this replace has no natural "already applied" guard, unlike
+        # patch_file(). Running apply-patches.py more than once used to append the three
+        # attributes again every time — 6 runs produced 18 duplicate attributes and an
+        # AndroidManifest.xml that the manifest merger refuses to parse
+        # ("duplicate attribute"). Guard on the marker we are about to insert, and also
+        # collapse any duplicates a previous run already created.
+        app_marker = 'android:name="org.telegram.messenger.ApplicationLoader"'
+        branding_block = (
+            '\n        android:icon="@mipmap/ic_launcher"'
+            '\n        android:roundIcon="@mipmap/ic_launcher_round"'
+            '\n        android:label="Colgram"'
         )
+        if 'android:label="Colgram"' not in m_content:
+            m_content = m_content.replace(
+                app_marker,
+                app_marker + branding_block,
+                1
+            )
+        else:
+            # Repair a manifest damaged by earlier runs: keep exactly one copy.
+            dup = re.compile(
+                r'(\s*android:icon="@mipmap/ic_launcher"\s*'
+                r'android:roundIcon="@mipmap/ic_launcher_round"\s*'
+                r'android:label="Colgram")+'
+            )
+            m_content = dup.sub(branding_block, m_content, count=1)
+            print(" [=] Application branding already present (deduplicated)")
 
         # Strip phone, contacts, location, notifications, and account permissions from AndroidManifest.xml for full user privacy
         for perm in [
@@ -1829,6 +2086,53 @@ def apply_custom_app_icon(repo_path, source_icon_path):
                 for file_name in os.listdir(src_density):
                     shutil.copy2(os.path.join(src_density, file_name), os.path.join(dest_density, file_name))
         print(" [+] Custom Colgram avatar successfully applied across all mipmap densities!")
+
+    # 1b. Overwrite Telegram's ALTERNATE launcher icons (icon_2..icon_6).
+    #
+    # Telegram ships six selectable app icons and lets the user pick one in settings.
+    # The branding pass only recoloured ic_launcher and icon_2, so icons 3-6 stayed the
+    # stock Telegram art — that is the "old icon shows up in some places" bug: the
+    # launcher already had the right icon, but the in-app icon picker, the recents
+    # thumbnail and any previously-selected alternate icon still rendered the old one.
+    #
+    # Generating all of them from the branded master means no stock art survives.
+    master_icon = os.path.join(root_dir, "assets", "app_icon.png")
+    if os.path.exists(master_icon):
+        try:
+            from PIL import Image
+            have_pil = True
+        except Exception:
+            have_pil = False
+
+        if have_pil:
+            print("[*] Regenerating alternate launcher icons (icon_2..icon_6)...")
+            # Standard mipmap sizes in px for a 48dp launcher icon.
+            density_sizes = {
+                "mipmap-mdpi": 48, "mipmap-hdpi": 72, "mipmap-xhdpi": 96,
+                "mipmap-xxhdpi": 144, "mipmap-xxxhdpi": 192,
+            }
+            master = Image.open(master_icon).convert("RGBA")
+            for res_dir in target_dirs:
+                if not os.path.exists(res_dir):
+                    continue
+                for density_name, px in density_sizes.items():
+                    dest_density = os.path.join(res_dir, density_name)
+                    if not os.path.isdir(dest_density):
+                        continue
+                    square = master.resize((px, px), Image.LANCZOS)
+                    # Round variant: same art, circular alpha mask.
+                    mask = Image.new("L", (px, px), 0)
+                    from PIL import ImageDraw
+                    ImageDraw.Draw(mask).ellipse((0, 0, px - 1, px - 1), fill=255)
+                    round_icon = square.copy()
+                    round_icon.putalpha(mask)
+
+                    for idx in range(2, 7):
+                        square.save(os.path.join(dest_density, f"icon_{idx}_launcher.png"))
+                        round_icon.save(os.path.join(dest_density, f"icon_{idx}_launcher_round.png"))
+            print(" [+] All alternate launcher icons now use Colgram branding.")
+        else:
+            print(" [!] Pillow not available - alternate launcher icons left as-is.")
 
     # 2. Adaptive icon background -> solid pure black #000000
     for res_dir in target_dirs:

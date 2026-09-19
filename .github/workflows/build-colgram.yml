@@ -9,6 +9,10 @@ on:
         description: 'Telegram Upstream Tag or Branch (default: master / latest)'
         required: false
         default: 'latest'
+      release_label:
+        description: 'Optional label appended to the release name (e.g. "12.10.3-fixview")'
+        required: false
+        default: ''
   schedule:
     # Check for upstream Telegram updates daily at 04:00 UTC
     - cron: '0 4 * * *'
@@ -52,9 +56,16 @@ jobs:
           fi
           cd Telegram-Src
           git submodule update --init --depth 1 TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
-          UPSTREAM_TAG=$(git describe --tags --always)
+          # Record which base actually got built. On a specific tag this is the tag;
+          # on 'latest' fall back to the commit we landed on so the release is still
+          # traceable to an exact upstream revision.
+          UPSTREAM_TAG=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
           echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
           echo "Base Telegram Tag: $UPSTREAM_TAG"
+
+          # Keep the requested tag separately from the resolved one, so the release
+          # notes can show both what was asked for and what was actually checked out.
+          echo "REQUESTED_TAG=$TARGET_VERSION" >> $GITHUB_ENV
 
       - name: Apply Colgram Core & Surgical Patches
         run: |
@@ -109,15 +120,21 @@ jobs:
         with:
           files: colgram-signed-release.apk
           tag_name: colgram-${{ env.UPSTREAM_TAG }}-${{ github.run_number }}
-          name: Colgram v${{ env.UPSTREAM_TAG }} (Build ${{ github.run_number }})
+          name: Colgram v${{ env.UPSTREAM_TAG }} (Build ${{ github.run_number }})${{ inputs.release_label && format(' {0}', inputs.release_label) || '' }}
           body: |
             ## Colgram Automated Release
             - **Telegram Base**: `${{ env.UPSTREAM_TAG }}` (Official `DrKLO/Telegram`)
+            - **Requested version**: `${{ env.REQUESTED_TAG }}`
             - **Hardware Cloaking**: Enabled (Spoofed device & OS info)
             - **Anti-Delete Vault**: Active (Preserves deleted messages & edit logs)
             - **Ghost Mode**: Silent read, stealth typing, offline status, FLAG_SECURE bypass
             - **Storage Sandbox**: Scoped to isolated folder
             - **Built-in MTProto**: Fake-TLS anti-censorship pool active
             - **Telemetry**: 100% Stripped (No Firebase / Play Services / HMS)
+
+            ### Install
+            Download `colgram-signed-release.apk` below and install it. The build is
+            self-signed with the shared Colgram keystore, so it upgrades in place over
+            any earlier Colgram build without uninstalling.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,37 @@
+// dump-classpath.gradle — writes the standalone compile classpath to a file so the
+// fast-feedback javac loop can be used without paying for a full Gradle build.
+//
+// Usage:
+//   java -cp gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain \
+//     -I ../scripts/dump-classpath.gradle :TMessagesProj:dumpStandaloneClasspath
+//
+// Output: build/colgram-classpath.txt  (path-separator delimited)
+
+gradle.projectsEvaluated {
+    def proj = rootProject.findProject(':TMessagesProj')
+    if (proj == null) {
+        println "[-] :TMessagesProj not found"
+        return
+    }
+
+    proj.tasks.register('dumpStandaloneClasspath') {
+        doLast {
+            def cfg = proj.configurations.findByName('standaloneCompileClasspath')
+            if (cfg == null) {
+                println "[-] configuration 'standaloneCompileClasspath' not found"
+                return
+            }
+            // Resolve as a set of files with lenient variant matching to avoid the
+            // "variant ambiguity" failure that a bare .files call can trigger.
+            def files = cfg.incoming.artifactView {
+                attributes { }
+                lenient(true)
+            }.files.files
+
+            def out = new File(proj.buildDir, 'colgram-classpath.txt')
+            out.parentFile.mkdirs()
+            out.text = files.collect { it.absolutePath }.join(File.pathSeparator)
+            println "[+] Wrote ${files.size()} classpath entries to ${out}"
+        }
+    }
+}

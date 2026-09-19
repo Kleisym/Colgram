@@ -35,7 +35,10 @@ import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RecyclerListView;
 
 import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
@@ -52,16 +55,23 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private String currentEmail = "";
     private String currentLogin = "";
-    private String currentDomain = "1secmail.com";
+    private String currentDomain = "mail.tm";
+    private String mailTmToken = "";
 
     public static class TempMessage {
         public final int id;
+        public final String tmId;
         public final String from;
         public final String subject;
         public final String date;
 
         public TempMessage(int id, String from, String subject, String date) {
+            this(id, "", from, subject, date);
+        }
+
+        public TempMessage(int id, String tmId, String from, String subject, String date) {
             this.id = id;
+            this.tmId = tmId;
             this.from = from;
             this.subject = subject;
             this.date = date;
@@ -110,118 +120,173 @@ public class ColgramTempMailActivity extends BaseFragment {
     private void generateNewMailbox() {
         executor.execute(() -> {
             try {
-                URL url = new URL("https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setConnectTimeout(6000);
-                conn.setReadTimeout(6000);
-                if (conn.getResponseCode() == 200) {
-                    BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                    String res = r.readLine();
-                    r.close();
-                    JSONArray arr = new JSONArray(res);
-                    if (arr.length() > 0) {
-                        String email = arr.getString(0);
-                        String[] parts = email.split("@");
-                        mainHandler.post(() -> {
-                            currentEmail = email;
-                            currentLogin = parts[0];
-                            currentDomain = parts.length > 1 ? parts[1] : "1secmail.com";
-                            messages.clear();
-                            if (listAdapter != null) listAdapter.notifyDataSetChanged();
-                            fetchMessages(true);
-                        });
+                // mail.tm — create a disposable mailbox.
+                // Step 1: fetch an available domain.
+                String resolvedDomain = "mail.tm";
+                try {
+                    JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
+                    JSONArray members = domRes.optJSONArray("hydra:member");
+                    if (members != null && members.length() > 0) {
+                        resolvedDomain = members.getJSONObject(0).optString("domain", "mail.tm");
                     }
+                } catch (Throwable ignored) {}
+                final String domain = resolvedDomain;
+
+                final String login = "colgram" + System.currentTimeMillis() % 1000000 + (int) (Math.random() * 9000 + 1000);
+                final String address = login + "@" + domain;
+                final String password = "Colgram_" + (int) (Math.random() * 900000 + 100000);
+
+                JSONObject create = new JSONObject();
+                create.put("address", address);
+                create.put("password", password);
+
+                JSONObject created = httpPostJson("https://api.mail.tm/accounts", create.toString());
+                String accountId = created.optString("id", "");
+                if (accountId.isEmpty()) {
+                    throw new IOException("mail.tm rejected mailbox creation");
                 }
-                conn.disconnect();
+
+                // Step 2: authenticate to get the bearer token.
+                JSONObject authReq = new JSONObject();
+                authReq.put("address", address);
+                authReq.put("password", password);
+                JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
+                final String token = authRes.optString("token", "");
+
+                mainHandler.post(() -> {
+                    currentEmail = address;
+                    currentLogin = login;
+                    currentDomain = domain;
+                    mailTmToken = token;
+                    messages.clear();
+                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                    fetchMessages(true);
+                });
             } catch (Throwable t) {
                 mainHandler.post(() -> {
-                    String rnd = "colgram_" + (int)(Math.random() * 90000 + 10000);
-                    currentLogin = rnd;
-                    currentDomain = "1secmail.com";
-                    currentEmail = rnd + "@" + currentDomain;
-                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                    if (getParentActivity() != null) {
+                        Toast.makeText(getParentActivity(), "Не удалось создать ящик: " + t.getMessage(), Toast.LENGTH_LONG).show();
+                    }
                 });
             }
         });
     }
 
+    private JSONObject httpGetJson(String urlStr) throws Exception {
+        return httpGetJsonWithAuth(urlStr, null);
+    }
+
+    private JSONObject httpGetJsonWithAuth(String urlStr, String bearer) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+        conn.setConnectTimeout(8000);
+        conn.setReadTimeout(8000);
+        conn.setRequestProperty("Accept", "application/json");
+        if (bearer != null) conn.setRequestProperty("Authorization", "Bearer " + bearer);
+        try {
+            BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            r.close();
+            return new JSONObject(sb.toString());
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    private JSONObject httpPostJson(String urlStr, String jsonBody) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+        conn.setConnectTimeout(8000);
+        conn.setReadTimeout(8000);
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Accept", "application/json");
+        try {
+            OutputStream os = conn.getOutputStream();
+            os.write(jsonBody.getBytes("UTF-8"));
+            os.flush();
+            os.close();
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            if (is == null) throw new IOException("HTTP " + code);
+            BufferedReader r = new BufferedReader(new InputStreamReader(is));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            r.close();
+            return new JSONObject(sb.toString());
+        } finally {
+            conn.disconnect();
+        }
+    }
+
     private void fetchMessages(boolean notifyUser) {
-        if (currentLogin.isEmpty()) return;
+        if (mailTmToken == null || mailTmToken.isEmpty()) return;
         executor.execute(() -> {
             try {
-                URL url = new URL("https://www.1secmail.com/api/v1/?action=getMessages&login=" + currentLogin + "&domain=" + currentDomain);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setConnectTimeout(6000);
-                conn.setReadTimeout(6000);
-                if (conn.getResponseCode() == 200) {
-                    BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = r.readLine()) != null) sb.append(line);
-                    r.close();
-
-                    JSONArray arr = new JSONArray(sb.toString());
-                    final List<TempMessage> list = new ArrayList<>();
+                JSONObject res = httpGetJsonWithAuth("https://api.mail.tm/messages?page=1", mailTmToken);
+                JSONArray arr = res.optJSONArray("hydra:member");
+                final List<TempMessage> list = new ArrayList<>();
+                if (arr != null) {
                     for (int i = 0; i < arr.length(); i++) {
                         JSONObject obj = arr.getJSONObject(i);
+                        String from = "";
+                        JSONObject fromObj = obj.optJSONObject("from");
+                        if (fromObj != null) from = fromObj.optString("address", "");
                         list.add(new TempMessage(
-                            obj.optInt("id", 0),
-                            obj.optString("from", ""),
+                            obj.optString("id", "").hashCode(),
+                            from,
                             obj.optString("subject", ""),
-                            obj.optString("date", "")
+                            obj.optString("createdAt", "")
                         ));
                     }
-                    mainHandler.post(() -> {
-                        messages.clear();
-                        messages.addAll(list);
-                        if (listAdapter != null) listAdapter.notifyDataSetChanged();
-                        if (notifyUser && getParentActivity() != null) {
-                            Toast.makeText(getParentActivity(), "Входящие обновлены (" + list.size() + " писем)", Toast.LENGTH_SHORT).show();
-                        }
-                    });
                 }
-                conn.disconnect();
+                mainHandler.post(() -> {
+                    messages.clear();
+                    messages.addAll(list);
+                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                    if (notifyUser && getParentActivity() != null) {
+                        Toast.makeText(getParentActivity(), "Входящие обновлены (" + list.size() + " писем)", Toast.LENGTH_SHORT).show();
+                    }
+                });
             } catch (Throwable ignored) {}
         });
     }
 
     private void readMessageContent(int messageId) {
-        if (getParentActivity() == null) return;
+        if (getParentActivity() == null || mailTmToken == null) return;
         Toast.makeText(getParentActivity(), "Загрузка письма...", Toast.LENGTH_SHORT).show();
         executor.execute(() -> {
             try {
-                URL url = new URL("https://www.1secmail.com/api/v1/?action=readMessage&login=" + currentLogin + "&domain=" + currentDomain + "&id=" + messageId);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setConnectTimeout(6000);
-                conn.setReadTimeout(6000);
-                if (conn.getResponseCode() == 200) {
-                    BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = r.readLine()) != null) sb.append(line);
-                    r.close();
-
-                    JSONObject obj = new JSONObject(sb.toString());
-                    String from = obj.optString("from", "");
-                    String subject = obj.optString("subject", "");
-                    String textBody = obj.optString("textBody", "");
-                    if (textBody.isEmpty()) textBody = obj.optString("body", "");
-
-                    String detectedOtp = "";
-                    Pattern pattern = Pattern.compile("\\b(\\d{4,8})\\b");
-                    Matcher matcher = pattern.matcher(subject + " " + textBody);
-                    if (matcher.find()) {
-                        detectedOtp = matcher.group(1);
-                    }
-
-                    final String fFrom = from;
-                    final String fSubject = subject;
-                    final String fBody = textBody;
-                    final String fOtp = detectedOtp;
-
-                    mainHandler.post(() -> showMessageDialog(fFrom, fSubject, fBody, fOtp));
+                // Find the mail.tm message id from the cached list by hash code match
+                String targetId = null;
+                for (TempMessage m : messages) {
+                    if (m.id == messageId) { targetId = m.tmId; break; }
                 }
-                conn.disconnect();
+                if (targetId == null) return;
+
+                JSONObject obj = httpGetJsonWithAuth("https://api.mail.tm/messages/" + targetId, mailTmToken);
+                String from = "";
+                JSONObject fromObj = obj.optJSONObject("from");
+                if (fromObj != null) from = fromObj.optString("address", "");
+                String subject = obj.optString("subject", "");
+                String textBody = obj.optString("text", "");
+                if (textBody.isEmpty()) textBody = obj.optString("intro", "");
+
+                String detectedOtp = "";
+                Pattern pattern = Pattern.compile("\\b(\\d{4,8})\\b");
+                Matcher matcher = pattern.matcher(subject + " " + textBody);
+                if (matcher.find()) {
+                    detectedOtp = matcher.group(1);
+                }
+
+                final String fFrom = from;
+                final String fSubject = subject;
+                final String fBody = textBody;
+                final String fOtp = detectedOtp;
+
+                mainHandler.post(() -> showMessageDialog(fFrom, fSubject, fBody, fOtp));
             } catch (Throwable t) {
                 mainHandler.post(() -> {
                     if (getParentActivity() != null) Toast.makeText(getParentActivity(), "Ошибка чтения: " + t.getMessage(), Toast.LENGTH_SHORT).show();

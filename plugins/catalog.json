@@ -1,0 +1,30 @@
+[
+  {
+    "name": "Message Logger",
+    "author": "Colgram",
+    "description": "Saves every incoming and outgoing message to a local JSONL file in the Colgram sandbox, including edits and deletions.",
+    "version": "1.0",
+    "url": "https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/message_logger.py"
+  },
+  {
+    "name": "Auto Reply",
+    "author": "Colgram",
+    "description": "Replies to incoming private messages with a configurable canned response while you are marked offline.",
+    "version": "1.0",
+    "url": "https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/auto_reply.py"
+  },
+  {
+    "name": "Chat Exporter",
+    "author": "Colgram",
+    "description": "Exports the current chat history to HTML with media links intact, ready to open in any browser.",
+    "version": "1.0",
+    "url": "https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/chat_exporter.py"
+  },
+  {
+    "name": "Keyword Alerts",
+    "author": "Colgram",
+    "description": "Watches every chat for a list of keywords and raises a local notification when one appears.",
+    "version": "1.0",
+    "url": "https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/keyword_alerts.py"
+  }
+]

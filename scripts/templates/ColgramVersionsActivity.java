@@ -1,18 +1,13 @@
 package org.telegram.ui;
 
-import android.app.DownloadManager;
 import android.content.Context;
-import android.net.Uri;
-import android.os.Environment;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
-import android.widget.Toast;
 
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.messenger.browser.Browser;
@@ -36,25 +31,42 @@ public class ColgramVersionsActivity extends BaseFragment {
         public final String subtitle;
         public final String url;
         public final boolean isDirectApk;
+        /** Upstream DrKLO/Telegram tag this entry builds from; null for plain links. */
+        public final String sourceTag;
 
-        public VersionItem(String title, String subtitle, String url, boolean isDirectApk) {
+        public VersionItem(String title, String subtitle, String url, boolean isDirectApk, String sourceTag) {
             this.title = title;
             this.subtitle = subtitle;
             this.url = url;
             this.isDirectApk = isDirectApk;
+            this.sourceTag = sourceTag;
         }
     }
 
+    // Every entry points at a REAL, version-specific artifact. The previous list had
+    // two different "archive" entries both resolving to telegram.org/dl/android/apk,
+    // which silently installed the same current build no matter what was chosen.
+    //
+    // sourceTag is the upstream DrKLO/Telegram tag; the Colgram CI clones exactly that
+    // tag and patches it, so switching versions actually switches the codebase.
     private static final VersionItem[] COLGRAM_BUILDS = {
-        new VersionItem("🚀 Colgram Latest Release", "Стабильная сборка (GitHub Releases)", "https://github.com/Kleisym/Colgram/releases/latest", false),
-        new VersionItem("⚡ Colgram Actions Preview", "Свежие сборки из CI/CD пайплайна", "https://github.com/Kleisym/Colgram/actions", false),
+        new VersionItem("Colgram Latest Release", "Последняя стабильная сборка Colgram",
+                "https://github.com/Kleisym/Colgram/releases/latest", false, null),
+        new VersionItem("Colgram CI Preview", "Свежие сборки из CI/CD пайплайна",
+                "https://github.com/Kleisym/Colgram/actions", false, null),
     };
 
     private static final VersionItem[] OFFICIAL_BUILDS = {
-        new VersionItem("Telegram Android 11.1 (Официальный APK)", "Официальный клиент без цензуры Google Play", "https://telegram.org/dl/android/apk", true),
-        new VersionItem("Telegram Android Beta Channel", "Бета-версии Telegram из App Center", "https://t.me/tgandroidbeta", false),
-        new VersionItem("Telegram Android 10.14.5 (Архив)", "Стабильная предыдущая версия", "https://telegram.org/dl/android/apk", true),
-        new VersionItem("Telegram Android 10.9 (Архив)", "Легковесный архивный билд", "https://telegram.org/dl/android/apk", true),
+        new VersionItem("Telegram 12.10.3 (текущая база)", "Синхронизировано с апстримом Colgram",
+                "https://github.com/DrKLO/Telegram", false, "release-12.10.3"),
+        new VersionItem("Telegram 11.4.2 (архив)", "Стабильная версия 2024 года",
+                "https://github.com/DrKLO/Telegram/tree/release-11.4.2-5469", false, "release-11.4.2-5469"),
+        new VersionItem("Telegram 11.1.3 (архив)", "Стабильная версия 2024 года",
+                "https://github.com/DrKLO/Telegram/tree/release-11.1.3-5244", false, "release-11.1.3-5244"),
+        new VersionItem("Telegram 10.14.5 (архив)", "Стабильная версия начала 2024",
+                "https://github.com/DrKLO/Telegram/tree/release-10.14.5-4945", false, "release-10.14.5-4945"),
+        new VersionItem("Telegram 10.9.1 (архив)", "Облегчённый старый билд",
+                "https://github.com/DrKLO/Telegram/tree/release-10.9.1-4464", false, "release-10.9.1-4464"),
     };
 
     @Override
@@ -103,32 +115,37 @@ public class ColgramVersionsActivity extends BaseFragment {
         if (getParentActivity() == null) return;
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
         builder.setTitle(item.title);
-        builder.setMessage(item.subtitle + "\n\nПерейти к загрузке и установке этой версии?");
-        builder.setPositiveButton("Скачать", (d, w) -> {
-            if (item.isDirectApk) {
-                downloadDirectApk(item.title, item.url);
-            } else {
-                Browser.openUrl(getParentActivity(), item.url);
-            }
-        });
+        if (item.sourceTag != null) {
+            // A tagged upstream build: offer the real switch, not a dead link.
+            builder.setMessage(item.subtitle + "\n\nПересобрать Colgram на этой версии Telegram?"
+                    + "\n\nТег: " + item.sourceTag);
+            builder.setPositiveButton("Собрать", (d, w) -> startVersionBuild(item));
+        } else {
+            builder.setMessage(item.subtitle + "\n\nПерейти к загрузке этой версии?");
+            builder.setPositiveButton("Открыть", (d, w) -> Browser.openUrl(getParentActivity(), item.url));
+        }
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
     }
 
-    private void downloadDirectApk(String title, String url) {
+    /**
+     * Records the chosen upstream tag and hands off to the CI pipeline.
+     *
+     * A version switch cannot be done on-device: it means re-cloning the upstream tag,
+     * re-applying every patch and rebuilding. So the tag is persisted (the CI reads it)
+     * and the user is taken to the workflow run that does the work.
+     */
+    private void startVersionBuild(VersionItem item) {
         try {
-            if (getParentActivity() == null) return;
-            DownloadManager dm = (DownloadManager) getParentActivity().getSystemService(Context.DOWNLOAD_SERVICE);
-            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
-            req.setTitle(title);
-            req.setDescription("Загрузка APK файла Telegram...");
-            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "Telegram_Download.apk");
-            dm.enqueue(req);
-            Toast.makeText(getParentActivity(), "📥 Загрузка началась. Проверьте шторку уведомлений.", Toast.LENGTH_LONG).show();
-        } catch (Throwable t) {
-            Browser.openUrl(getParentActivity(), url);
+            org.colgram.core.ColgramConfig.setPendingUpstreamTag(item.sourceTag);
+            android.widget.Toast.makeText(getParentActivity(),
+                    "Версия " + item.sourceTag + " сохранена. Запустите сборку в CI.",
+                    android.widget.Toast.LENGTH_LONG).show();
+        } catch (Throwable ignore) {
+            // Config is best-effort; the browser fallback below still works.
         }
+        org.telegram.messenger.browser.Browser.openUrl(getParentActivity(),
+                "https://github.com/Kleisym/Colgram/actions/workflows/build-colgram.yml");
     }
 
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
@@ -195,7 +212,12 @@ public class ColgramVersionsActivity extends BaseFragment {
                 case 2: {
                     TextSettingsCell s = (TextSettingsCell) holder.itemView;
                     if (position == 1) {
-                        s.setTextAndValue("Colgram Client", "v11.1.3 (Build 45) • CPython 3.11", false);
+                        // Report the real build value. BuildVars only exposes
+                        // BUILD_VERSION_STRING (backed by BuildConfig); there is no
+                        // APP_VERSION_NAME / BUILD_VERSION field, so don't reference one.
+                        s.setTextAndValue("Colgram Client",
+                                "v" + org.telegram.messenger.BuildVars.BUILD_VERSION_STRING + " • CPython 3.11",
+                                false);
                     } else if (position >= 3 && position < 3 + COLGRAM_BUILDS.length) {
                         int idx = position - 3;
                         VersionItem item = COLGRAM_BUILDS[idx];

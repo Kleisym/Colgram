@@ -1,6 +1,7 @@
 package org.colgram.core;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import java.io.File;
 import java.util.List;
 import java.util.Map;
@@ -13,6 +14,7 @@ import java.util.Map;
  */
 public class ColgramHookHandler {
 
+    private static final String PREFS_NAME = "colgram_prefs";
     private static Context appContext;
 
     public static void init(Context context) {
@@ -83,13 +85,23 @@ public class ColgramHookHandler {
 
     /**
      * HOOK: Called from MessagesController when UpdateEditMessage arrives,
-     * before replacing the existing message in storage.
+     * BEFORE the new revision overwrites the stored message.
+     *
+     * The incoming update carries only the NEW text. The caller is expected to
+     * have read the PREVIOUS revision out of local storage and pass it here as
+     * oldText. A null or blank oldText means "nothing recoverable" and is skipped
+     * so we never pollute the history with empty or duplicate rows.
+     *
+     * @param oldText previous revision text, or null if unavailable
+     * @param editDate timestamp of the edit
      */
     public static void hookOnMessageEdited(long dialogId, int messageId, String oldText, long editDate) {
         if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) {
             return;
         }
-
+        if (dialogId == 0 || messageId == 0 || oldText == null || oldText.trim().isEmpty()) {
+            return;
+        }
         ColgramDatabase.getInstance(appContext).saveMessageEdit(dialogId, messageId, oldText, editDate);
     }
 
@@ -105,9 +117,26 @@ public class ColgramHookHandler {
 
     /**
      * HOOK: Called when user clicks "История правок" in context menu.
+     *
+     * NOTE ON MODULE BOUNDARIES: colgram-core compiles BEFORE TMessagesProj, so it
+     * cannot reference org.telegram.ui.* classes. The Telegram-native BottomSheet
+     * (ColgramEditHistorySheet) is therefore invoked directly by the patched
+     * ChatActivity, which lives inside TMessagesProj. This method exists only as a
+     * context/data accessor and a fallback dialog host.
      */
     public static void showEditHistory(Context context, long dialogId, int messageId) {
+        // Fallback path only — the primary UI is the Telegram-native sheet invoked
+        // from the patched ChatActivity.
         ColgramEditHistoryDialog.show(context, dialogId, messageId);
+    }
+
+    /**
+     * Returns the edit history entries for a message, for use by the Telegram-native
+     * history sheet that lives inside TMessagesProj.
+     */
+    public static java.util.List<ColgramDatabase.MessageEditEntry> getEditHistory(long dialogId, int messageId) {
+        if (appContext == null) return new java.util.ArrayList<>();
+        return ColgramDatabase.getInstance(appContext).getEditHistory(dialogId, messageId);
     }
 
     /**
@@ -165,5 +194,33 @@ public class ColgramHookHandler {
      */
     public static void openSettings(Context context) {
         ColgramSettingsActivity.start(context);
+    }
+
+    // --- Phone number auto-hide -------------------------------------------------
+
+    /**
+     * HOOK: called from MessagesController after privacy rules are first synced.
+     *
+     * Returns true exactly once per account, so the caller issues a single
+     * account.setPrivacy(phone -> nobody) request instead of repeating it on every
+     * rules update. Once marked, this returns false forever for that account.
+     */
+    public static boolean shouldAutoHidePhoneNumber(int account) {
+        if (appContext == null) return false;
+        try {
+            SharedPreferences p = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            return !p.getBoolean("phone_hidden_" + account, false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** HOOK: records that the phone-number privacy request has been accepted. */
+    public static void markPhoneNumberHidden(int account) {
+        if (appContext == null) return;
+        try {
+            appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putBoolean("phone_hidden_" + account, true).apply();
+        } catch (Throwable ignored) {}
     }
 }

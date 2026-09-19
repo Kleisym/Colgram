@@ -1,6 +1,31 @@
-scripts/error_log.txt
-scripts/monitor_build.py
-scripts/poll_build.py
+# --- Secrets: never commit these ---
+*.txt.token
+gfpat.txt
+.env
+.env.*
+secrets/
+*.keystore
+*.jks
+local.properties
+
+# --- Build output ---
 __pycache__/
 *.pyc
+scripts/error_log.txt
+scripts/build_*.log
+scripts/*.log
+
+# --- Built / signed artifacts (too large to version; use Releases) ---
+dist/
+*.apk
+*.apk.idsig
+*.aab
+
+# --- Cloned upstream / heavy trees ---
 Telegram-Src/
+
+# --- Android SDK provisioned locally (not part of the repo) ---
+.android-sdk/
+
+# --- Tooling scratch ---
+.workbuddy-ai/tmp/
