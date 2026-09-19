@@ -145,6 +145,7 @@ def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
     temp_apk = os.path.join(repo_path, "official_temp.apk")
+    jni_dir = os.path.join(repo_path, "TMessagesProj", "jni")
     jni_libs_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "jniLibs")
 
     try:
@@ -154,35 +155,53 @@ def download_official_binaries(repo_path):
             shutil.copyfileobj(resp, out_file)
 
         print(" -> Extracting native libraries from APK...")
+        os.makedirs(jni_dir, exist_ok=True)
         os.makedirs(jni_libs_dir, exist_ok=True)
         with zipfile.ZipFile(temp_apk, 'r') as zip_ref:
             for file_info in zip_ref.infolist():
                 if file_info.filename.startswith("lib/"):
                     rel_path = file_info.filename[len("lib/"):]
-                    target_file = os.path.join(jni_libs_dir, rel_path)
-                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                    with zip_ref.open(file_info) as src, open(target_file, 'wb') as dst:
-                        shutil.copyfileobj(src, dst)
+                    for target_root in [jni_dir, jni_libs_dir]:
+                        target_file = os.path.join(target_root, rel_path)
+                        os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                        with zip_ref.open(file_info) as src, open(target_file, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
 
-        print(" [+] Successfully extracted prebuilt .so libraries to jniLibs!")
+        print(" [+] Successfully extracted prebuilt .so libraries to jni and jniLibs!")
         if os.path.exists(temp_apk):
             os.remove(temp_apk)
 
-        # Disable externalNativeBuild in TMessagesProj/build.gradle
+        # Disable externalNativeBuild in TMessagesProj/build.gradle using clean brace counter
         tmessages_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
         if os.path.exists(tmessages_gradle):
             with open(tmessages_gradle, "r", encoding="utf-8") as f:
-                gradle_content = f.read()
-            gradle_content = re.sub(r'(externalNativeBuild\s*\{)', r'/* \1', gradle_content)
-            gradle_content = re.sub(r'(\}\s*//\s*externalNativeBuild)', r'\1 */', gradle_content)
-            if "sourceSets.main.jniLibs.srcDirs" not in gradle_content:
-                gradle_content = gradle_content.replace(
-                    "android {",
-                    "android {\n    sourceSets.main.jniLibs.srcDirs = ['src/main/jniLibs']"
-                )
+                content = f.read()
+
+            lines = content.split('\n')
+            out_lines = []
+            in_block = False
+            brace_count = 0
+
+            for line in lines:
+                if 'externalNativeBuild {' in line:
+                    in_block = True
+                    brace_count = line.count('{') - line.count('}')
+                    continue
+                if in_block:
+                    brace_count += line.count('{') - line.count('}')
+                    if brace_count <= 0:
+                        in_block = False
+                    continue
+                out_lines.append(line)
+
+            gradle_content = '\n'.join(out_lines)
+            gradle_content = gradle_content.replace(
+                "sourceSets.main.jniLibs.srcDirs = ['./jni/']",
+                "sourceSets.main.jniLibs.srcDirs = ['./jni/', 'src/main/jniLibs']"
+            )
             with open(tmessages_gradle, "w", encoding="utf-8") as f:
                 f.write(gradle_content)
-            print(" [+] Configured Gradle to use prebuilt native libraries (fast build)")
+            print(" [+] Cleanly removed externalNativeBuild from TMessagesProj/build.gradle")
 
     except Exception as e:
         print(f" [!] Warning: Prebuilt binary extraction encountered error: {e}")
