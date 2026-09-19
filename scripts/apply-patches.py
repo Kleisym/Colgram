@@ -164,6 +164,54 @@ def inject_hooks(repo_path):
         "SendMessagesHelper Plugin & Python Command Interceptor"
     )
 
+    # 9. LoginActivity.java -> Inject Bot Token Login button in PhoneView
+    bot_login_btn = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
+            TextView botLoginBtn = new TextView(context);
+            botLoginBtn.setText("🤖 Войти через токен бота");
+            botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+            botLoginBtn.setTypeface(AndroidUtilities.bold());
+            botLoginBtn.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));
+            botLoginBtn.setGravity(Gravity.CENTER);
+            botLoginBtn.setPadding(dp(16), dp(10), dp(16), dp(10));
+            botLoginBtn.setOnClickListener(v -> {
+                org.colgram.core.ColgramBotLogin.showBotLoginDialog(context, currentAccount, () -> {
+                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.mainUserInfoChanged);
+                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.reloadDialogs);
+                    presentFragment(new DialogsActivity(null), true);
+                });
+            });
+            addView(botLoginBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 16, 8, 16, 8));"""
+    patch_file(
+        login_activity,
+        "addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));",
+        bot_login_btn,
+        "LoginActivity Bot Token Login Button"
+    )
+
+    # 10. UserConfig.java -> Unlock all account slots
+    user_config = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "UserConfig.java")
+    patch_file(
+        user_config,
+        "public static int getMaxAccountCount() {\n        return hasPremiumOnAccounts() ? 5 : 3;\n    }",
+        "public static int getMaxAccountCount() {\n        return UserConfig.MAX_ACCOUNT_COUNT;\n    }",
+        "UserConfig Unlock Max Account Count"
+    )
+    patch_file(
+        user_config,
+        "public static boolean hasPremiumOnAccounts() {",
+        "public static boolean hasPremiumOnAccounts() {\n        if (true) return true;",
+        "UserConfig Has Premium on Accounts"
+    )
+
+    # 11. UserInfoActivity.java -> Bypass account limit check on Add Account
+    user_info_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "UserInfoActivity.java")
+    patch_file(
+        user_info_activity,
+        "if (!UserConfig.hasPremiumOnAccounts()) {\n                freeAccounts -= (UserConfig.MAX_ACCOUNT_COUNT - UserConfig.MAX_ACCOUNT_DEFAULT_COUNT);\n            }",
+        "// Colgram: all account slots unlocked without premium",
+        "UserInfoActivity Unlock Add Account"
+    )
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
