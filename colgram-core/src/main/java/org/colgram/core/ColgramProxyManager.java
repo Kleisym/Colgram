@@ -101,7 +101,38 @@ public class ColgramProxyManager {
         if (context == null || !initialized.compareAndSet(false, true)) return;
         appContext = context.getApplicationContext();
 
-        // 1. Start embedded DPI bypass engine immediately (runs local service on 127.0.0.1:9876)
+        // Everything below touches sockets: binding the local DPI listener,
+        // probing proxies over TCP, and flipping Telegram's proxy settings (which
+        // makes MTProto tear down and rebuild its connections). Running that
+        // during application startup races Telegram's native ConnectionSocket for
+        // process-wide file descriptors and trips bionic's fdsan guard, aborting
+        // the process inside libtmessages.49.so. Defer the whole block until the
+        // network stack has settled.
+        STARTUP_DEFERRED.execute(() -> {
+            try {
+                Thread.sleep(PROXY_START_DELAY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            try {
+                activateBuiltinProxyNow();
+            } catch (Throwable t) {
+                Log.e(TAG, "Deferred proxy activation failed", t);
+            }
+        });
+    }
+
+    private static final ExecutorService STARTUP_DEFERRED = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "colgram-proxy-deferred");
+        t.setDaemon(true);
+        return t;
+    });
+    /** Delay before any proxy-side socket work begins. */
+    private static final long PROXY_START_DELAY_MS = 10000L;
+
+    private static void activateBuiltinProxyNow() {
+        // 1. Start embedded DPI bypass engine (runs local service on 127.0.0.1:9876)
         ColgramDpiBypass.start();
 
         // 2. Populate verified pool with clean verified proxies

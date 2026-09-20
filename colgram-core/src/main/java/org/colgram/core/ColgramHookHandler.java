@@ -25,11 +25,19 @@ public class ColgramHookHandler {
             ColgramConfig.init(appContext);
             ColgramStorageSandbox.init(appContext);
             ColgramDatabase.getInstance(appContext);
+            // Registers the context only. The CPython runtime itself is started
+            // lazily by ColgramPythonEngine.ensureInitialized() on first real use:
+            // booting an interpreter (with its own libssl/libsqlite3 sockets) inside
+            // the application-startup window makes it race Telegram's native MTProto
+            // ConnectionSocket over the process descriptor table, which fdsan turns
+            // into a SIGABRT in libtmessages.49.so.
             ColgramPythonEngine.init(appContext);
             ColgramPluginManager.init(appContext);
 
-            // Start embedded DPI bypass engine and background connection doctor immediately
-            ColgramDpiBypass.start();
+            // Proxy / DPI-bypass work is socket-heavy (local listener + TCP probes
+            // + Telegram proxy reconfiguration). ColgramProxyManager defers it
+            // internally; starting the bypass engine again here would defeat that,
+            // so this method no longer calls ColgramDpiBypass.start() directly.
             ColgramProxyManager.activateBuiltinProxy(appContext);
             ColgramProxyDoctor.init(appContext);
         } catch (Throwable t) {

@@ -2598,15 +2598,100 @@ chaquopy {
                 f.write(m_content)
             print(f" [+] Ensured minSdkVersion 24 in {mod}/build.gradle")
 
-    # 4. Add gradle.properties flags to disable configuration cache (Chaquopy compat)
+    configure_build_performance(repo_path)
+
+def configure_build_performance(repo_path):
+    """
+    Cut cold-build time.
+
+    The stock upstream gradle.properties is tuned for correctness on a generic
+    CI machine, not for wall-clock. Four settings dominate a clean compile here:
+
+      1. android.enableJetifier=true  -> rewrites the bytecode of EVERY resolved
+         dependency on every build. Telegram's dependency graph is fully AndroidX
+         (verified: no com.android.support:* entries anywhere in the build files),
+         so Jetifier is pure overhead. The only android.support.* symbols in the
+         tree are android.support.v4.media.*, which AndroidX still ships under
+         that legacy package name on purpose and never needed rewriting.
+
+      2. org.gradle.configuration-cache -> left OFF. This one was measured, not
+         guessed: enabling it fails the application module outright, because
+         Chaquopy's com.chaquo.python.OutputDirTask (generate<Flavor>PythonJniLibs)
+         captures non-serializable Gradle internals (Project, DependencyHandler,
+         SourceSetContainer, ClassLoader, Configuration) and Gradle discards the
+         entry with "Configuration cache entry discarded with 442 problems". It IS
+         clean for pure-Java modules such as :colgram-core, but the app module is
+         the one that dominates build time, so a global switch buys nothing. The
+         patcher therefore keeps it off and relies on the build cache plus
+         incremental compilation instead.
+
+      3. org.gradle.caching -> ON. Reuses task outputs across builds.
+
+      4. android.enableR8.fullMode / optimizedResourceShrinking stay ON: they
+         cost time but change the shipped artifact, so they are left alone.
+
+    Only additive/idempotent edits are made; an existing user override wins.
+    """
+    print("[*] Applying Gradle build-performance settings...")
     gradle_props = os.path.join(repo_path, "gradle.properties")
-    if os.path.exists(gradle_props):
-        with open(gradle_props, "r", encoding="utf-8") as f:
-            props = f.read()
-        if "org.gradle.configuration-cache" not in props:
-            with open(gradle_props, "a", encoding="utf-8") as f:
-                f.write("\norg.gradle.configuration-cache=false\n")
-            print(" [+] Disabled Gradle configuration cache for Chaquopy compatibility")
+    if not os.path.exists(gradle_props):
+        return
+
+    with open(gradle_props, "r", encoding="utf-8") as f:
+        props = f.read()
+
+    # key -> desired value. Comments are added once with the block below.
+    desired = {
+        # Jetifier: no legacy support libraries in this dependency graph.
+        "android.enableJetifier": "false",
+        # Reuse task outputs across builds instead of redoing them.
+        "org.gradle.caching": "true",
+        # Parallel task execution (already true upstream, enforced here).
+        "org.gradle.parallel": "true",
+        # Keep a warm daemon so the JVM + configuration survive between builds.
+        "org.gradle.daemon": "true",
+        # Configuration cache stays OFF: Chaquopy's OutputDirTask on the
+        # application module is not serializable and makes Gradle discard the
+        # entry (442 problems -> build failure). Measured, not assumed.
+        "org.gradle.configuration-cache": "false",
+        # Property caching. This is a file-locking log, not incremental state, so
+        # disabling it trades a little I/O for less contention on Windows.
+        "org.gradle.vfs.watch": "true",
+    }
+
+    lines = props.splitlines()
+    out = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            out.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in desired:
+            out.append(f"{key}={desired[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+
+    missing = [k for k in desired if k not in seen]
+    if missing:
+        out.append("")
+        out.append("# --- Colgram build performance (see scripts/apply-patches.py) ---")
+        for k in missing:
+            out.append(f"{k}={desired[k]}")
+
+    new_props = "\n".join(out) + "\n"
+    # Keep compile-incremental alongside the rest, idempotently.
+    if "org.gradle.java.compile-incremental" not in new_props:
+        new_props += "org.gradle.java.compile-incremental=true\n"
+
+    if new_props != props:
+        with open(gradle_props, "w", encoding="utf-8") as f:
+            f.write(new_props)
+        print(" [+] Gradle: Jetifier off, build cache + incremental javac on")
+    else:
+        print(" [=] Gradle build-performance settings already present")
 
 def clone_required_submodules(repo_path):
     print("[*] Checking out required submodules for Gradle (media & jlatexmath)...")

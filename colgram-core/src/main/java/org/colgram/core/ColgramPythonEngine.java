@@ -28,6 +28,14 @@ public class ColgramPythonEngine {
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
     private static Context appContext = null;
     private static volatile boolean pythonInitialized = false;
+    /** Guards against two concurrent ensureInitialized() calls both starting the runtime. */
+    private static volatile boolean pythonStarting = false;
+    /**
+     * Delay applied before the interpreter actually boots. Long enough for the
+     * native MTProto connection pool to finish its own socket setup, so the two
+     * descriptor tables never overlap.
+     */
+    private static final long STARTUP_SETTLE_MS = 5000L;
 
     // Reflection handles for Chaquopy
     private static Class<?> pythonClass = null;
@@ -38,15 +46,53 @@ public class ColgramPythonEngine {
     // Active environment fallback variables
     private static final Map<String, Object> fallbackScope = new HashMap<>();
 
+    /**
+     * Registers the application context only. The CPython runtime is deliberately
+     * NOT started here.
+     *
+     * Why: Chaquopy's CPython links its own libssl/libcrypto/libsqlite3 and its
+     * _socket module opens file descriptors outside Android's fdsan bookkeeping.
+     * Starting it while Telegram's native MTProto stack (libtmessages.so,
+     * tgnet::ConnectionSocket) is still establishing its own sockets makes both
+     * stacks race over the same fd numbers. bionic's fdsan then aborts the
+     * process with:
+     *
+     *     fdsan: attempted to close file descriptor N,
+     *     expected to be unowned, actually owned by SocketImpl 0x...
+     *
+     * which surfaces as a SIGABRT inside libtmessages.49.so about two seconds
+     * after launch. The runtime is therefore started lazily, via
+     * ensureInitialized(), from the points that actually need Python.
+     */
     public static synchronized void init(Context context) {
         if (context == null) return;
         appContext = context.getApplicationContext();
-
         fallbackScope.put("version", "3.11-colgram-cpython");
         fallbackScope.put("client", "Colgram");
+    }
+
+    /**
+     * Starts the embedded CPython runtime if it is not already running.
+     * Safe to call from any thread; the first caller wins and later callers
+     * simply observe pythonInitialized == true.
+     *
+     * Callers must be genuine Python entry points (plugin execution, the
+     * antispam screen, script console). Never call this from app startup.
+     */
+    public static synchronized void ensureInitialized() {
+        if (pythonInitialized || pythonStarting) return;
+        if (appContext == null) return;
+        pythonStarting = true;
 
         pyExecutor.execute(() -> {
             try {
+                // Settle delay: keep the interpreter out of the window in which
+                // the MTProto socket layer is still bringing its connections up.
+                try {
+                    Thread.sleep(STARTUP_SETTLE_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
                 // Initialize Chaquopy AndroidPlatform & Python
                 Class<?> platformClass = Class.forName("com.chaquo.python.android.AndroidPlatform");
                 pythonClass = Class.forName("com.chaquo.python.Python");
@@ -70,14 +116,28 @@ public class ColgramPythonEngine {
                 // Setup Python runner and Telegram bridge
                 setupPythonEnvironment();
 
+                // Apply sys.path entries that were registered while the runtime
+                // was still dormant (plugin directories from ColgramPluginManager.init).
+                applyPendingPaths();
+
                 pythonInitialized = true;
                 Log.d(TAG, "Full Mobile CPython 3.11 (Chaquopy) initialized successfully!");
 
             } catch (Throwable t) {
                 Log.w(TAG, "Chaquopy CPython initialization deferred or falling back: " + t.getMessage());
                 pythonInitialized = false;
+            } finally {
+                // Always release the in-flight latch: on success the interpreter is
+                // live and later calls short-circuit on pythonInitialized; on failure
+                // we allow a future entry point to retry.
+                pythonStarting = false;
             }
         });
+    }
+
+    /** True once the embedded interpreter is live and usable. */
+    public static boolean isPythonReady() {
+        return pythonInitialized;
     }
 
     private static void setupPythonEnvironment() {
@@ -174,12 +234,40 @@ public class ColgramPythonEngine {
      * Appends a filesystem path to Python's sys.path (e.g. for plugins directory).
      */
     public static void addPythonPath(String path) {
-        if (!pythonInitialized || pythonInstance == null || path == null) return;
+        if (path == null) return;
+        // The interpreter may not be up yet (startup registration happens before
+        // the lazy runtime boots). Remember the path and apply it on start.
+        if (!pythonInitialized || pythonInstance == null) {
+            synchronized (pendingPaths) {
+                if (!pendingPaths.contains(path)) pendingPaths.add(path);
+            }
+            return;
+        }
         try {
             Object sysMod = getModuleMethod.invoke(pythonInstance, "sys");
             Object pathObj = callAttrMethod.invoke(sysMod, "get", new Object[]{ "path" });
             callAttrMethod.invoke(pathObj, "append", new Object[]{ path });
         } catch (Throwable ignored) {}
+    }
+
+    /** sys.path entries registered before the interpreter finished booting. */
+    private static final java.util.List<String> pendingPaths = new java.util.ArrayList<>();
+
+    /** Flush deferred sys.path registrations once the interpreter is live. */
+    private static void applyPendingPaths() {
+        java.util.List<String> copy;
+        synchronized (pendingPaths) {
+            if (pendingPaths.isEmpty()) return;
+            copy = new java.util.ArrayList<>(pendingPaths);
+            pendingPaths.clear();
+        }
+        for (String p : copy) {
+            try {
+                Object sysMod = getModuleMethod.invoke(pythonInstance, "sys");
+                Object pathObj = callAttrMethod.invoke(sysMod, "get", new Object[]{ "path" });
+                callAttrMethod.invoke(pathObj, "append", new Object[]{ p });
+            } catch (Throwable ignored) {}
+        }
     }
 
     /**
@@ -243,7 +331,10 @@ public class ColgramPythonEngine {
      * Returns the handler's string result, or null if the command is unknown.
      */
     public static String runShimCommand(long dialogId, String cmd, String args) {
-        if (!pythonInitialized || pythonInstance == null || cmd == null) return null;
+        if (cmd == null) return null;
+        // Real execution path: bring the interpreter up on demand.
+        ensureInitialized();
+        if (!pythonInitialized || pythonInstance == null) return null;
         try {
             Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
             // Wire the real bridge actions and the dialog context, so a plugin calling
@@ -358,6 +449,11 @@ public class ColgramPythonEngine {
 
     public static String runPythonCode(String code) {
         if (code == null || code.trim().isEmpty()) return "None";
+
+        // Lazily bring the interpreter up on first real use. This is the single
+        // choke point for executeCode()/executeScript()/console input, so the
+        // runtime only costs anything once the user actually runs Python.
+        ensureInitialized();
 
         // 1. Try real CPython runtime
         if (pythonInitialized && pythonInstance != null) {

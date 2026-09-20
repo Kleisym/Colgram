@@ -27,9 +27,40 @@ public class ColgramDpiBypass {
     public static final int LOCAL_PORT = 9876;
     private static ServerSocket serverSocket;
     private static volatile boolean isRunning = false;
+    private static volatile boolean startScheduled = false;
+    private static Thread deferredStart;
+    /** Keep the proxy listener out of the fragile application-startup window. */
+    private static final long START_DELAY_MS = 8000L;
     private static final ExecutorService workerPool = Executors.newCachedThreadPool();
 
     public static synchronized void start() {
+        if (isRunning || startScheduled) return;
+        startScheduled = true;
+
+        // Defer binding the local proxy socket out of the application-startup
+        // window. Telegram's native MTProto stack (libtmessages.so ->
+        // tgnet::ConnectionSocket) is still opening and closing its own sockets
+        // during the first seconds of the process; adding a ServerSocket plus a
+        // cached pool of worker sockets in that same window makes the two stacks
+        // race over the process-wide descriptor table. bionic's fdsan then kills
+        // the process with SIGABRT ("attempted to close file descriptor N ...
+        // owned by SocketImpl") inside libtmessages.49.so.
+        deferredStart = new Thread(() -> {
+            try {
+                Thread.sleep(START_DELAY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            startScheduled = false;
+            startNow();
+        }, "colgram-dpi-deferred");
+        deferredStart.setDaemon(true);
+        deferredStart.start();
+    }
+
+    /** Binds the proxy listener immediately. Prefer start(), which defers safely. */
+    private static synchronized void startNow() {
         if (isRunning) return;
         isRunning = true;
 
@@ -56,6 +87,11 @@ public class ColgramDpiBypass {
 
     public static synchronized void stop() {
         isRunning = false;
+        startScheduled = false;
+        if (deferredStart != null) {
+            deferredStart.interrupt();
+            deferredStart = null;
+        }
         if (serverSocket != null) {
             try {
                 serverSocket.close();
