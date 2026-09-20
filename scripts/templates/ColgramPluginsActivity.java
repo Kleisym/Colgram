@@ -1,7 +1,14 @@
 package org.telegram.ui;
 
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Typeface;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.util.Log;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
@@ -17,11 +24,11 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
+import org.telegram.ui.ActionBar.ActionBarMenuItem;
 import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.HeaderCell;
-import org.telegram.ui.Cells.ShadowSectionCell;
 import org.telegram.ui.Cells.TextCheckCell;
 import org.telegram.ui.Cells.TextSettingsCell;
 import org.telegram.ui.Components.LayoutHelper;
@@ -29,48 +36,42 @@ import org.telegram.ui.Components.RecyclerListView;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
+/**
+ * ColgramPluginsActivity — plugin manager and marketplace.
+ *
+ * All three install paths a user actually asks for:
+ *   - write code   (editor dialog, via the "+" menu item)
+ *   - from a URL   (raw .py fetched over HTTPS, via the link menu item)
+ *   - from a file  (system document picker, via the file menu item)
+ *
+ * The marketplace list is loaded live from ColgramPluginManager.fetchCatalog(), which
+ * reads the remote catalog and falls back to a bundled set. The previous version rendered
+ * a hardcoded array and never displayed the remote catalog at all, so the marketplace
+ * could never show anything beyond the built-in stubs.
+ *
+ * Colours come from Telegram Theme tokens throughout. This screen used to hardcode a dark
+ * palette (0xFF0E0F12 background with white text), which made it unreadable in the light
+ * theme — the same bug class as the black-on-black login form.
+ */
 public class ColgramPluginsActivity extends BaseFragment {
+
+    private static final String TAG = "ColgramPlugins";
+    /** Request code for the SAF .py picker. */
+    private static final int REQ_PICK_PY = 4801;
 
     private RecyclerListView listView;
     private ListAdapter listAdapter;
 
-            private static String b64(String s) {
-        try {
-            return new String(android.util.Base64.decode(s, android.util.Base64.DEFAULT), "UTF-8");
-        } catch (Throwable t) {
-            return "";
-        }
-    }
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private boolean destroyed = false;
 
-    private static class CatalogPlugin {
-        public final String name;
-        public final String fileName;
-        public final String description;
-        public final String command;
-        public final String code;
-
-        public CatalogPlugin(String name, String fileName, String description, String command, String code) {
-            this.name = name;
-            this.fileName = fileName;
-            this.description = description;
-            this.command = command;
-            this.code = code;
-        }
-    }
-
-    private static final CatalogPlugin[] CATALOG = {
-        new CatalogPlugin("Анти-исчезновение (Save-TTL)", "anti_ttl.py", "Автосохранение самоуничтожающихся фото и видео", ".ttl", b64("IyBuYW1lOiBTYXZlLVRUTAojIGF1dGhvcjogZXh0ZXJhR3JhbQojIHZlcnNpb246IDIuMAojIGNvbW1hbmQ6IHR0bAoKZGVmIG9uX2NvbW1hbmQoY21kLCBhcmdzKToKICAgIHJldHVybiAn8J+boSDQkNC90YLQuC3QuNGB0YfQtdC30L3QvtCy0LXQvdC40LUg0LDQutGC0LjQstC90L46INC80LXQtNC40LAg0YHQvtGF0YDQsNC90Y/RjtGC0YHRjyDQsiBEb2N1bWVudHMvQ29sZ3JhbScK")),
-        new CatalogPlugin("Спамер сообщений", "spammer.py", "Массовая отправка с задержкой: .spam <кол-во> <текст>", ".spam", b64("IyBuYW1lOiDQodC/0LDQvNC10YAKIyBhdXRob3I6IENvbGdyYW0KIyB2ZXJzaW9uOiAxLjIKIyBjb21tYW5kOiBzcGFtCgpkZWYgb25fY29tbWFuZChjbWQsIGFyZ3MpOgogICAgcmV0dXJuICfQmNGB0L/QvtC70YzQt9GD0LnRgtC1OiAuc3BhbSA1INCf0YDQuNCy0LXRgicK")),
-        new CatalogPlugin("Инспектор чата (.info)", "chat_info.py", "Выводит ID чата, собеседника, ДЦ и дату создания", ".info", b64("IyBuYW1lOiDQmNC90YHQv9C10LrRgtC+0YAKIyBhdXRob3I6IENvbW11bml0eQojIHZlcnNpb246IDEuMAojIGNvbW1hbmQ6IGluZm8KCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ+KEue+4jyDQmNC90YTQvtGA0LzQsNGG0LjRjyDRh9Cw0YLQsCDQv9C+0LvRg9GH0LXQvdCwJwo=")),
-        new CatalogPlugin("Реверс текста (.rev)", "reverse.py", "Переворачивает текст задом наперед: .rev привет -> тевирп", ".rev", b64("IyBuYW1lOiDQoNC10LLQtdGA0YEKIyBhdXRob3I6IGV4dGVyYUdyYW0KIyB2ZXJzaW9uOiAxLjAKIyBjb21tYW5kOiByZXYKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJyAnLmpvaW4od29yZFs6Oi0xXSBmb3Igd29yZCBpbiBhcmdzLnNwbGl0KCkpIGlmIGFyZ3MgZWxzZSAn0J/Rg9GB0YLQvtC5INGC0LXQutGB0YInCg==")),
-        new CatalogPlugin("Калькулятор (.calc)", "calc.py", "Быстрый математический калькулятор: .calc 2+2*2", ".calc", b64("IyBuYW1lOiDQmtCw0LvRjNC60YPQu9GP0YLQvtGACiMgYXV0aG9yOiBDb2xncmFtCiMgdmVyc2lvbjogMS4wCiMgY29tbWFuZDogY2FsYwoKZGVmIG9uX2NvbW1hbmQoY21kLCBhcmdzKToKICAgIHRyeToKICAgICAgICByZXR1cm4gZifwn6euINCg0LXQt9GD0LvRjNGC0LDRgjoge2V2YWwoYXJncywgeyJfX2J1aWx0aW5zX18iOiBOb25lfSl9JwogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJldHVybiBmJ9Ce0YjQuNCx0LrQsDoge2V9Jwo=")),
-        new CatalogPlugin("Транслит текста (.tr)", "translit.py", "Преобразование транслита в кириллицу и наоборот: .tr privet -> привет", ".tr", b64("IyBuYW1lOiDQotGA0LDQvdGB0LvQuNGCCiMgYXV0aG9yOiBleHRlcmFHcmFtCiMgdmVyc2lvbjogMS4xCiMgY29tbWFuZDogdHIKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ9Ci0YDQsNC90YHQu9C40YI6ICcgKyBhcmdzCg==")),
-        new CatalogPlugin("Автоответчик (.auto)", "auto_responder.py", "Шаблонный автоответ при упоминании или ЛС", ".auto", b64("IyBuYW1lOiDQkNCy0YLQvtC+0YLQstC10YLRh9C40LoKIyBhdXRob3I6IENvbW11bml0eQojIHZlcnNpb246IDEuMAojIGNvbW1hbmQ6IGF1dG8KCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ/CfpJYg0JDQstGC0L7QvtGC0LLQtdGC0YfQuNC6INC90LDRgdGC0YDQvtC10L0nCg==")),
-        new CatalogPlugin("Генератор паролей (.genpass)", "genpass.py", "Случайный безопасный пароль: .genpass 16", ".genpass", b64("IyBuYW1lOiDQk9C10L3Qv9Cw0YDQvtC70YwKIyBhdXRob3I6IENvbGdyYW0KIyB2ZXJzaW9uOiAxLjAKIyBjb21tYW5kOiBnZW5wYXNzCmltcG9ydCByYW5kb20sIHN0cmluZwoKZGVmIG9uX2NvbW1hbmQoY21kLCBhcmdzKToKICAgIGxlbmd0aCA9IGludChhcmdzKSBpZiBhcmdzLmlzZGlnaXQoKSBlbHNlIDE2CiAgICBjaGFycyA9IHN0cmluZy5hc2NpaV9sZXR0ZXJzICsgc3RyaW5nLmRpZ2l0cyArICchQCMkJV4mKigpJwogICAgcmV0dXJuICfwn5SRINCf0LDRgNC+0LvRjDogJyArICcnLmpvaW4ocmFuZG9tLmNob2ljZShjaGFycykgZm9yIF8gaW4gcmFuZ2UobGVuZ3RoKSkK")),
-        new CatalogPlugin("Очистка сообщений (.purge)", "purge.py", "Массовое удаление своих сообщений: .purge 20", ".purge", b64("IyBuYW1lOiDQntGH0LjRgdGC0LrQsAojIGF1dGhvcjogZXh0ZXJhR3JhbQojIHZlcnNpb246IDIuMAojIGNvbW1hbmQ6IHB1cmdlCgpkZWYgb25fY29tbWFuZChjbWQsIGFyZ3MpOgogICAgcmV0dXJuICfwn6e5INCe0YfQuNGB0YLQutCwINC30LDQv9GD0YnQtdC90LAuLi4nCg==")),
-        new CatalogPlugin("Быстрые заметки (.note)", "notes.py", "Локальные заметки и сниппеты прямо в Telegram", ".note", b64("IyBuYW1lOiDQl9Cw0LzQtdGC0LrQuAojIGF1dGhvcjogQ29sZ3JhbQojIHZlcnNpb246IDEuMAojIGNvbW1hbmQ6IG5vdGUKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ/Cfk50g0JfQsNC80LXRgtC60LAg0YHQvtGF0YDQsNC90LXQvdCwJwo="))
-    };
+    private final List<ColgramPluginManager.CatalogEntry> catalog = new ArrayList<>();
+    private boolean catalogLoading = true;
+    private boolean catalogIsRemote = false;
 
     @Override
     public boolean onFragmentCreate() {
@@ -79,19 +80,40 @@ public class ColgramPluginsActivity extends BaseFragment {
         return true;
     }
 
+    private static String b64(String s) {
+        try {
+            return new String(android.util.Base64.decode(s, android.util.Base64.DEFAULT), "UTF-8");
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     @Override
     public View createView(Context context) {
         actionBar.setBackButtonImage(R.drawable.ic_ab_back);
         actionBar.setAllowOverlayTitle(true);
-        actionBar.setTitle("Плагины и Маркетплейс");
+        actionBar.setTitle("Плагины");
         actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
             @Override
             public void onItemClick(int id) {
                 if (id == -1) {
                     finishFragment();
+                } else if (id == 100) {
+                    showPluginEditorDialog(null, null);
+                } else if (id == 101) {
+                    showInstallFromUrlDialog();
+                } else if (id == 102) {
+                    pickPluginFile();
+                } else if (id == 103) {
+                    loadCatalog(true);
                 }
             }
         });
+        actionBar.createMenu().addItem(100, R.drawable.msg_add).setContentDescription("Новый плагин");
+        actionBar.createMenu().addItem(101, R.drawable.msg_link).setContentDescription("Установить по ссылке");
+        actionBar.createMenu().addItem(102, R.drawable.msg_filehq).setContentDescription("Установить из файла");
+        ActionBarMenuItem refresh = actionBar.createMenu().addItem(103, R.drawable.msg_retry);
+        refresh.setContentDescription("Обновить каталог");
 
         fragmentView = new FrameLayout(context);
         FrameLayout frameLayout = (FrameLayout) fragmentView;
@@ -106,60 +128,341 @@ public class ColgramPluginsActivity extends BaseFragment {
         listView.setAdapter(listAdapter);
 
         listView.setOnItemClickListener((view, position) -> {
-            int installedCount = ColgramPluginManager.getLoadedPlugins().size();
-            if (position == 1) {
-                showPluginEditorDialog(null, null);
-            } else if (position >= 3 && position < 3 + installedCount) {
-                ColgramPluginManager.PluginInfo p = ColgramPluginManager.getLoadedPlugins().get(position - 3);
-                ColgramPluginManager.togglePlugin(p.fileName, !p.isEnabled);
-                listAdapter.notifyItemChanged(position);
-            } else {
-                int catalogStartIndex = 3 + installedCount + 2;
-                int catIndex = position - catalogStartIndex;
-                if (catIndex >= 0 && catIndex < CATALOG.length) {
-                    CatalogPlugin cp = CATALOG[catIndex];
-                    installCatalogPlugin(cp);
-                }
+            Row row = rowAt(position);
+            if (row == null) return;
+            switch (row.kind) {
+                case Row.KIND_NEW_PLUGIN:
+                    showPluginEditorDialog(null, null);
+                    break;
+                case Row.KIND_INSTALLED:
+                    if (row.plugin != null) {
+                        ColgramPluginManager.togglePlugin(row.plugin.fileName, !row.plugin.isEnabled);
+                        listAdapter.notifyDataSetChanged();
+                    }
+                    break;
+                case Row.KIND_CATALOG:
+                    if (row.entry != null) installCatalogEntry(row.entry);
+                    break;
+                default:
+                    break;
             }
         });
 
         listView.setOnItemLongClickListener((view, position) -> {
-            int installedCount = ColgramPluginManager.getLoadedPlugins().size();
-            if (position >= 3 && position < 3 + installedCount) {
-                ColgramPluginManager.PluginInfo p = ColgramPluginManager.getLoadedPlugins().get(position - 3);
-                showInstalledPluginActions(p);
+            Row row = rowAt(position);
+            if (row != null && row.kind == Row.KIND_INSTALLED && row.plugin != null) {
+                showInstalledPluginActions(row.plugin);
                 return true;
             }
             return false;
         });
 
+        loadCatalog(false);
+
         return fragmentView;
     }
 
-    private void installCatalogPlugin(CatalogPlugin cp) {
+    @Override
+    public void onFragmentDestroy() {
+        destroyed = true;
+        super.onFragmentDestroy();
+    }
+
+    // ------------------------------------------------------------ row model
+
+    private static class Row {
+        static final int KIND_HEADER = 0;
+        static final int KIND_NEW_PLUGIN = 1;
+        static final int KIND_INSTALLED = 2;
+        static final int KIND_CATALOG = 3;
+
+        final int kind;
+        final String header;
+        final ColgramPluginManager.PluginInfo plugin;
+        final ColgramPluginManager.CatalogEntry entry;
+
+        Row(int kind, String header, ColgramPluginManager.PluginInfo plugin,
+            ColgramPluginManager.CatalogEntry entry) {
+            this.kind = kind;
+            this.header = header;
+            this.plugin = plugin;
+            this.entry = entry;
+        }
+    }
+
+    private final List<Row> rows = new ArrayList<>();
+
+    private void rebuildRows() {
+        rows.clear();
+
+        rows.add(new Row(Row.KIND_HEADER, "Создать плагин", null, null));
+        rows.add(new Row(Row.KIND_NEW_PLUGIN, null, null, null));
+
+        List<ColgramPluginManager.PluginInfo> installed = ColgramPluginManager.getLoadedPlugins();
+        rows.add(new Row(Row.KIND_HEADER, "Установленные (" + installed.size() + ")", null, null));
+        for (ColgramPluginManager.PluginInfo p : installed) {
+            rows.add(new Row(Row.KIND_INSTALLED, null, p, null));
+        }
+
+        String catHeader;
+        if (catalogLoading) {
+            catHeader = "Маркетплейс — загрузка...";
+        } else if (catalog.isEmpty()) {
+            catHeader = "Маркетплейс пуст";
+        } else if (catalogIsRemote) {
+            catHeader = "Маркетплейс (" + catalog.size() + ")";
+        } else {
+            catHeader = "Маркетплейс (" + catalog.size() + ", офлайн-набор)";
+        }
+        rows.add(new Row(Row.KIND_HEADER, catHeader, null, null));
+        for (ColgramPluginManager.CatalogEntry e : catalog) {
+            rows.add(new Row(Row.KIND_CATALOG, null, null, e));
+        }
+
+        if (listAdapter != null) listAdapter.notifyDataSetChanged();
+    }
+
+    private Row rowAt(int position) {
+        if (position < 0 || position >= rows.size()) return null;
+        return rows.get(position);
+    }
+
+    // ------------------------------------------------------------ catalog
+
+    private void loadCatalog(boolean showToast) {
+        catalogLoading = true;
+        rebuildRows();
+        final boolean toast = showToast;
+        executor.execute(() -> {
+            List<ColgramPluginManager.CatalogEntry> fetched = null;
+            boolean remote = false;
+            try {
+                fetched = ColgramPluginManager.fetchCatalog();
+                remote = ColgramPluginManager.lastCatalogWasRemote();
+            } catch (Throwable t) {
+                Log.w(TAG, "catalog fetch failed: " + t.getMessage());
+            }
+            final List<ColgramPluginManager.CatalogEntry> result =
+                    fetched == null ? new ArrayList<>() : fetched;
+            final boolean isRemote = remote;
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                catalog.clear();
+                catalog.addAll(result);
+                catalogIsRemote = isRemote;
+                catalogLoading = false;
+                rebuildRows();
+                if (toast && getParentActivity() != null) {
+                    Toast.makeText(getParentActivity(),
+                            isRemote ? "Каталог обновлён: " + result.size()
+                                    : "Сеть недоступна — показан встроенный набор",
+                            Toast.LENGTH_SHORT).show();
+                }
+            });
+        });
+    }
+
+    private void installCatalogEntry(ColgramPluginManager.CatalogEntry e) {
         if (getParentActivity() == null) return;
+        final String fileName = ColgramPluginManager.fileNameFor(e);
+        boolean already = ColgramPluginManager.isPluginInstalled(fileName);
+
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
-        builder.setTitle(cp.name);
-        builder.setMessage(cp.description + "\n\nКоманда: " + cp.command + "\nФайл: " + cp.fileName + "\n\nУстановить этот плагин?");
-        builder.setPositiveButton("Установить", (d, w) -> {
-            ColgramPluginManager.installPlugin(cp.fileName, cp.code);
-            listAdapter.notifyDataSetChanged();
-            Toast.makeText(getParentActivity(), "✅ Плагин " + cp.name + " установлен!", Toast.LENGTH_SHORT).show();
+        builder.setTitle(e.name == null ? "Плагин" : e.name);
+        StringBuilder msg = new StringBuilder();
+        if (e.description != null && !e.description.isEmpty()) msg.append(e.description).append("\n\n");
+        if (e.author != null && !e.author.isEmpty()) msg.append("Автор: ").append(e.author).append("\n");
+        if (e.version != null && !e.version.isEmpty()) msg.append("Версия: ").append(e.version).append("\n");
+        msg.append("Файл: ").append(fileName).append("\n");
+        if (already) msg.append("\nУже установлен — будет перезаписан.");
+        builder.setMessage(msg.toString().trim());
+
+        builder.setPositiveButton(already ? "Переустановить" : "Установить", (d, w) -> {
+            executor.execute(() -> {
+                boolean ok = false;
+                String err = null;
+                try {
+                    if (e.downloadUrl != null && !e.downloadUrl.trim().isEmpty()) {
+                        ok = ColgramPluginManager.installPluginFromUrl(e.downloadUrl);
+                        if (!ok) err = "не удалось скачать " + e.downloadUrl;
+                    } else {
+                        // Bundled entries carry no URL: they are installed from the copy
+                        // already inside the APK, which is why the fallback catalog always
+                        // has a working install path.
+                        ok = ColgramPluginManager.installBundledPlugin(fileName);
+                        if (!ok) err = "встроенный плагин " + fileName + " не найден";
+                    }
+                } catch (Throwable t) {
+                    err = t.getMessage() == null ? t.toString() : t.getMessage();
+                }
+                final boolean success = ok;
+                final String failure = err;
+                mainHandler.post(() -> {
+                    rebuildRows();
+                    if (getParentActivity() == null) return;
+                    Toast.makeText(getParentActivity(),
+                            success ? "Установлено: " + e.name : "Ошибка: " + failure,
+                            success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+                });
+            });
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
     }
 
+    // ------------------------------------------------------------ install paths
+
+    /** Install from a raw .py URL typed by the user. */
+    private void showInstallFromUrlDialog() {
+        if (getParentActivity() == null) return;
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        builder.setTitle("Установить по ссылке");
+
+        LinearLayout layout = new LinearLayout(getParentActivity());
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12), AndroidUtilities.dp(20), AndroidUtilities.dp(4));
+
+        final EditText urlInput = new EditText(getParentActivity());
+        urlInput.setHint("https://example.com/my_plugin.py");
+        urlInput.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+        urlInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        urlInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+        layout.addView(urlInput);
+        builder.setView(layout);
+
+        builder.setPositiveButton("Установить", (d, w) -> {
+            String url = urlInput.getText().toString().trim();
+            if (url.isEmpty()) return;
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                Toast.makeText(getParentActivity(), "Ссылка должна начинаться с http:// или https://", Toast.LENGTH_LONG).show();
+                return;
+            }
+            executor.execute(() -> {
+                boolean ok = false;
+                String err = null;
+                try {
+                    ok = ColgramPluginManager.installPluginFromUrl(url);
+                    if (!ok) err = "не удалось загрузить или установить";
+                } catch (Throwable t) {
+                    err = t.getMessage() == null ? t.toString() : t.getMessage();
+                }
+                final boolean success = ok;
+                final String failure = err;
+                mainHandler.post(() -> {
+                    rebuildRows();
+                    if (getParentActivity() == null) return;
+                    Toast.makeText(getParentActivity(),
+                            success ? "Плагин установлен" : "Ошибка: " + failure,
+                            success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+                });
+            });
+        });
+        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
+        showDialog(builder.create());
+    }
+
+    /**
+     * Open the system document picker for a .py file.
+     *
+     * Uses ACTION_OPEN_DOCUMENT rather than a Colgram file browser: the plugin file lives
+     * outside the app sandbox, so only SAF can reach it, and the user gets the familiar
+     * system picker instead of a custom directory walk.
+     */
+    private void pickPluginFile() {
+        if (getParentActivity() == null) return;
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                    "text/x-python", "text/plain", "application/octet-stream"
+            });
+            startActivityForResult(intent, REQ_PICK_PY);
+        } catch (Throwable t) {
+            Toast.makeText(getParentActivity(),
+                    "Не удалось открыть файловый менеджер: " + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
+        if (requestCode != REQ_PICK_PY) {
+            super.onActivityResultFragment(requestCode, resultCode, data);
+            return;
+        }
+        if (data == null || data.getData() == null || getParentActivity() == null) return;
+        final Uri uri = data.getData();
+        final Context ctx = getParentActivity();
+        executor.execute(() -> {
+            boolean ok = false;
+            String err = null;
+            try {
+                String code = readTextFromUri(ctx, uri);
+                if (code == null || code.trim().isEmpty()) {
+                    err = "файл пустой или недоступен";
+                } else {
+                    String name = displayNameFromUri(uri);
+                    if (!name.endsWith(".py")) name = name + ".py";
+                    ok = ColgramPluginManager.installPlugin(name, code);
+                    if (!ok) err = "не удалось установить";
+                }
+            } catch (Throwable t) {
+                err = t.getMessage() == null ? t.toString() : t.getMessage();
+            }
+            final boolean success = ok;
+            final String failure = err;
+            mainHandler.post(() -> {
+                rebuildRows();
+                if (getParentActivity() == null) return;
+                Toast.makeText(getParentActivity(),
+                        success ? "Плагин установлен из файла" : "Ошибка: " + failure,
+                        success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+            });
+        });
+    }
+
+    private static String readTextFromUri(Context ctx, Uri uri) {
+        try {
+            java.io.InputStream in = ctx.getContentResolver().openInputStream(uri);
+            if (in == null) return null;
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+            in.close();
+            return new String(bos.toByteArray(), "UTF-8");
+        } catch (Throwable t) {
+            Log.w(TAG, "readTextFromUri failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    /** Best-effort display name for a content:// URI (the last path segment). */
+    private static String displayNameFromUri(Uri uri) {
+        try {
+            String last = uri.getLastPathSegment();
+            if (last == null) return "plugin.py";
+            int slash = last.lastIndexOf('/');
+            if (slash >= 0) last = last.substring(slash + 1);
+            return last.isEmpty() ? "plugin.py" : last;
+        } catch (Throwable t) {
+            return "plugin.py";
+        }
+    }
+
     private void showInstalledPluginActions(ColgramPluginManager.PluginInfo p) {
         if (getParentActivity() == null) return;
-        String[] options = {"Удалить плагин", "Отмена"};
+        String[] options = {"Редактировать код", "Удалить плагин", "Отмена"};
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
         builder.setTitle(p.name);
         builder.setItems(options, (d, w) -> {
             if (w == 0) {
+                String code = ColgramPluginManager.getPluginCode(p.fileName);
+                showPluginEditorDialog(p.fileName, code);
+            } else if (w == 1) {
                 ColgramPluginManager.deletePlugin(p.fileName);
-                listAdapter.notifyDataSetChanged();
-                Toast.makeText(getParentActivity(), "Плагин удален", Toast.LENGTH_SHORT).show();
+                rebuildRows();
+                Toast.makeText(getParentActivity(), "Плагин удалён", Toast.LENGTH_SHORT).show();
             }
         });
         showDialog(builder.create());
@@ -168,7 +471,7 @@ public class ColgramPluginsActivity extends BaseFragment {
     private void showPluginEditorDialog(String initialName, String initialCode) {
         if (getParentActivity() == null) return;
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
-        builder.setTitle("✏️ Новый Python плагин");
+        builder.setTitle("Python плагин");
 
         LinearLayout layout = new LinearLayout(getParentActivity());
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -176,29 +479,46 @@ public class ColgramPluginsActivity extends BaseFragment {
 
         final EditText nameInput = new EditText(getParentActivity());
         nameInput.setHint("my_plugin.py");
+        nameInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        nameInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
         if (initialName != null) nameInput.setText(initialName);
         layout.addView(nameInput);
 
         final EditText codeInput = new EditText(getParentActivity());
-        codeInput.setHint(b64("IyBuYW1lOiDQnNC+0Lkg0L/Qu9Cw0LPQuNC9CiMgY29tbWFuZDogbXljbWQKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ9Ce0YLQstC10YI6ICcgKyBhcmdzCg=="));
+        codeInput.setHint("def on_command(cmd, args): ...");
         codeInput.setTypeface(Typeface.MONOSPACE);
         codeInput.setTextSize(13);
-        if (initialCode != null) codeInput.setText(initialCode);
-        else codeInput.setText(b64("IyBuYW1lOiDQmtCw0YHRgtC+0LzQvdGL0Lkg0L/Qu9Cw0LPQuNC9CiMgY29tbWFuZDogdGVzdAoKZGVmIG9uX2NvbW1hbmQoY21kLCBhcmdzKToKICAgIHJldHVybiAn0J/RgNC40LLQtdGCINC40LcgUHl0aG9uISDQkNGA0LPRg9C80LXQvdGC0Ys6ICcgKyBhcmdzCg=="));
+        codeInput.setMinLines(6);
+        codeInput.setGravity(Gravity.TOP | Gravity.START);
+        codeInput.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        codeInput.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+        if (initialCode != null && !initialCode.isEmpty()) {
+            codeInput.setText(initialCode);
+        } else {
+            codeInput.setText(b64("IyBuYW1lOiDQnNC+0Lkg0L/Qu9Cw0LPQuNC9CiMgY29tbWFuZDogbXljbWQKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ9Ce0YLQstC10YI6ICcgKyBhcmdzCg=="));
+        }
         layout.addView(codeInput);
 
         builder.setView(layout);
         builder.setPositiveButton("Сохранить", (dialog, which) -> {
             String name = nameInput.getText().toString().trim();
+            if (name.isEmpty()) {
+                Toast.makeText(getParentActivity(), "Укажите имя файла", Toast.LENGTH_SHORT).show();
+                return;
+            }
             if (!name.endsWith(".py")) name += ".py";
             String code = codeInput.getText().toString();
-            ColgramPluginManager.installPlugin(name, code);
-            listAdapter.notifyDataSetChanged();
-            Toast.makeText(getParentActivity(), "Плагин сохранен!", Toast.LENGTH_SHORT).show();
+            boolean ok = ColgramPluginManager.installPlugin(name, code);
+            rebuildRows();
+            Toast.makeText(getParentActivity(),
+                    ok ? "Плагин сохранён" : "Не удалось сохранить плагин",
+                    ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
     }
+
+    // ------------------------------------------------------------ adapter
 
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
         private final Context mContext;
@@ -209,29 +529,21 @@ public class ColgramPluginsActivity extends BaseFragment {
 
         @Override
         public int getItemCount() {
-            int installed = ColgramPluginManager.getLoadedPlugins().size();
-            return 1 + 1 + 1 + installed + 1 + 1 + CATALOG.length;
+            return rows.size();
         }
 
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
-            int viewType = holder.getItemViewType();
-            return viewType == 1 || viewType == 2;
+            Row row = rowAt(holder.getAdapterPosition());
+            return row != null && row.kind != Row.KIND_HEADER;
         }
 
         @Override
         public int getItemViewType(int position) {
-            int installed = ColgramPluginManager.getLoadedPlugins().size();
-            if (position == 0 || position == 2 || position == 3 + installed + 1) {
-                return 0; // HeaderCell
-            } else if (position == 1) {
-                return 2; // TextSettingsCell
-            } else if (position >= 3 && position < 3 + installed) {
-                return 1; // TextCheckCell
-            } else if (position == 3 + installed) {
-                return 3; // ShadowSectionCell
-            }
-            return 2; // TextSettingsCell (Catalog)
+            Row row = rowAt(position);
+            if (row == null || row.kind == Row.KIND_HEADER) return 0;
+            if (row.kind == Row.KIND_INSTALLED) return 1;
+            return 2;
         }
 
         @Override
@@ -240,64 +552,55 @@ public class ColgramPluginsActivity extends BaseFragment {
             switch (viewType) {
                 case 0:
                     view = new HeaderCell(mContext);
-                    view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
                     break;
                 case 1:
                     view = new TextCheckCell(mContext);
-                    view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
                     break;
                 case 2:
-                    view = new TextSettingsCell(mContext);
-                    view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
-                    break;
-                case 3:
                 default:
-                    view = new ShadowSectionCell(mContext);
+                    view = new TextSettingsCell(mContext);
                     break;
             }
+            // Theme-driven background so this screen is legible in light and dark alike.
+            view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
             return new RecyclerListView.Holder(view);
         }
 
         @Override
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
-            int installed = ColgramPluginManager.getLoadedPlugins().size();
+            Row row = rowAt(position);
+            if (row == null) return;
             switch (holder.getItemViewType()) {
-                case 0: {
-                    HeaderCell h = (HeaderCell) holder.itemView;
-                    if (position == 0) h.setText("Управление");
-                    else if (position == 2) h.setText("Установленные плагины (" + installed + ")");
-                    else h.setText("Маркетплейс exteraGram (1-Click установка)");
+                case 0:
+                    ((HeaderCell) holder.itemView).setText(row.header);
                     break;
-                }
                 case 1: {
                     TextCheckCell c = (TextCheckCell) holder.itemView;
-                    int pIndex = position - 3;
-                    if (pIndex >= 0 && pIndex < installed) {
-                        ColgramPluginManager.PluginInfo pi = ColgramPluginManager.getLoadedPlugins().get(pIndex);
-                        c.setTextAndCheck(pi.name + " (." + pi.command + ")", pi.isEnabled, pIndex < installed - 1);
+                    if (row.plugin != null) {
+                        String cmd = row.plugin.command == null || row.plugin.command.isEmpty()
+                                ? row.plugin.fileName
+                                : "." + row.plugin.command;
+                        c.setTextAndCheck(row.plugin.name + "  (" + cmd + ")", row.plugin.isEnabled, true);
+                        c.setEnabled(true);
                     }
                     break;
                 }
                 case 2: {
                     TextSettingsCell s = (TextSettingsCell) holder.itemView;
-                    if (position == 1) {
-                        s.setText("✏️ Написать пользовательский Python скрипт", false);
-                    } else {
-                        int catIndex = position - (3 + installed + 2);
-                        if (catIndex >= 0 && catIndex < CATALOG.length) {
-                            CatalogPlugin cp = CATALOG[catIndex];
-                            boolean isInstalled = false;
-                            for (ColgramPluginManager.PluginInfo pi : ColgramPluginManager.getLoadedPlugins()) {
-                                if (cp.fileName.equals(pi.fileName)) {
-                                    isInstalled = true;
-                                    break;
-                                }
-                            }
-                            s.setTextAndValue(cp.name + " (" + cp.command + ")", isInstalled ? "Установлен ✅" : "Установить 📥", catIndex < CATALOG.length - 1);
-                        }
+                    if (row.kind == Row.KIND_NEW_PLUGIN) {
+                        s.setTextAndValue("Новый плагин", "написать код вручную", true);
+                    } else if (row.entry != null) {
+                        String fn = ColgramPluginManager.fileNameFor(row.entry);
+                        boolean already = ColgramPluginManager.isPluginInstalled(fn);
+                        String author = row.entry.author == null || row.entry.author.isEmpty()
+                                ? "" : " • " + row.entry.author;
+                        s.setTextAndValue(row.entry.name == null ? fn : row.entry.name,
+                                (already ? "Установлен" : "Установить") + author, false);
                     }
                     break;
                 }
+                default:
+                    break;
             }
         }
     }

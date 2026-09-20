@@ -189,12 +189,48 @@ public class ColgramHookHandler {
         return ColgramGhostMode.shouldBypassFlagSecure();
     }
 
+    // --- Per-user notification blocking -----------------------------------------
+
     /**
-     * Opens the Colgram settings activity.
+     * HOOK: Called when a message arrives, to decide whether this sender's message should
+     * be kept silent.
+     *
+     * Scope, deliberately: this suppresses NOTIFICATIONS only. The message is still stored,
+     * still appears in the chat, and I can still reply normally. The point is that a
+     * specific user pinging me inside a group does not produce a buzz, a badge or a
+     * notification row.
+     *
+     * @param senderUserId the author of the incoming message, 0 when unknown
      */
-    public static void openSettings(Context context) {
-        ColgramSettingsActivity.start(context);
+    public static boolean shouldSilenceNotificationsFrom(long senderUserId) {
+        if (senderUserId == 0 || appContext == null) return false;
+        // MessageObject.getFromChatId() resolves from_id, which for a channel post is the
+        // CHANNEL id, not a user. Restrict this to the user id space so a muted user can
+        // never accidentally collide with a channel.
+        if (senderUserId < 0) return false;
+        return ColgramDatabase.getInstance(appContext).isNotificationsBlockedFrom(senderUserId);
     }
+
+    public static void setNotificationsBlocked(long userId, boolean blocked) {
+        if (userId == 0 || appContext == null) return;
+        if (blocked) {
+            ColgramDatabase.getInstance(appContext).blockNotificationsFrom(userId);
+        } else {
+            ColgramDatabase.getInstance(appContext).unblockNotificationsFrom(userId);
+        }
+    }
+
+    public static boolean isNotificationsBlocked(long userId) {
+        if (userId == 0 || appContext == null) return false;
+        return ColgramDatabase.getInstance(appContext).isNotificationsBlockedFrom(userId);
+    }
+
+    // NOTE: the settings / plugins screens are the Telegram-native BaseFragment
+    // implementation deployed from scripts/templates/ into org.telegram.ui. The old
+    // Activity-based colgram-core versions were deleted because they hardcoded a dark
+    // palette (white-on-dark text that was unreadable in the light theme) and had
+    // drifted out of sync with the themed screens. Entry points live in the patcher,
+    // which calls presentFragment(new ColgramSettingsActivity()) etc.
 
     // --- Phone number auto-hide -------------------------------------------------
 
@@ -207,6 +243,8 @@ public class ColgramHookHandler {
      */
     public static boolean shouldAutoHidePhoneNumber(int account) {
         if (appContext == null) return false;
+        // Respect the user-level toggle: if the feature is off, never fire.
+        if (!ColgramConfig.isAutoHidePhoneEnabled()) return false;
         try {
             SharedPreferences p = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
             return !p.getBoolean("phone_hidden_" + account, false);

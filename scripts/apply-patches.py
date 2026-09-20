@@ -132,22 +132,81 @@ def inject_hooks(repo_path):
     )
 
     # 5. ChatMessageCell.java -> Visual cue for deleted messages
+    #
+    # HISTORY, because this one was wrong twice:
+    #
+    #   v1 set setAlpha(0.65f) here. That is what made retained messages read as "just
+    #      greyed out" — and worse, it stomped the alpha Telegram's own selection and
+    #      animation code manages, so a message could sit at partial opacity with a blue
+    #      highlight that never cleared. Looked stuck-selected. Removed.
+    #
+    #   v2 forced setAlpha(1.0f) to undo v1. Still wrong, just less visible: this method
+    #      is called on every bind, and overwriting the alpha here fights the animation
+    #      code that owns it. Any setAlpha we do from this hook is a bug.
+    #
+    # v3 (now): do nothing to the view alpha at all. The cue is purely textual — the 🗑
+    # prefix in the time string, done in patch 30 below. Nothing else touches the cell.
+    #
+    # Keeping a no-op patch entry would be dead weight, so the entry is gone entirely —
+    # but the path constant has to stay, because patch 30 genuinely does patch this file.
     chat_cell = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "ChatMessageCell.java")
-    patch_file(
-        chat_cell,
-        "if (attachedToWindow && !frozen) {",
-        "if (messageObject != null && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId())) setAlpha(0.65f); else setAlpha(1.0f);\n        if (attachedToWindow && !frozen) {",
-        "ChatMessageCell Deleted Styling"
-    )
 
     # 6. MessagesController.java -> Ghost Mode (Suppress Read & Typing)
     messages_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesController.java")
     patch_file(
         messages_controller,
         "public void markDialogAsRead(long dialogId, int maxPositiveId, int maxNegativeId, int maxDate, boolean popup, long threadId, int countDiff, boolean readNow, int scheduledCount) {",
-        "public void markDialogAsRead(long dialogId, int maxPositiveId, int maxNegativeId, int maxDate, boolean popup, long threadId, int countDiff, boolean readNow, int scheduledCount) {\n        if (org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId)) return;",
+        """public void markDialogAsRead(long dialogId, int maxPositiveId, int maxNegativeId, int maxDate, boolean popup, long threadId, int countDiff, boolean readNow, int scheduledCount) {
+        // GHOST MODE — suppress only the SERVER read receipt, never the local state.
+        //
+        // Returning here outright (the previous behaviour) was wrong and is why stealth
+        // mode felt broken: markDialogAsRead is also what clears the local unread counter
+        // and persists processPendingRead(). Bailing at the top left every chat permanently
+        // unread in the UI, with a badge that could never be dismissed, while the peer saw
+        // nothing — the worst of both worlds.
+        //
+        // Correct behaviour: run the normal local bookkeeping so the chat actually reads as
+        // read on this device, and skip only the outgoing ReadTask that would tell the
+        // server (and therefore the sender) that we read it.
+        final boolean colgramGhostRead = org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);""",
         "MessagesController Ghost Read Receipt"
     )
+    # 6d. MessagesController.java -> Ghost mode: never stage the server read task.
+    #
+    # This is the second half of the ghost-read fix above. The local bookkeeping has run,
+    # so the dialog's unread counter is already cleared; the only thing left to suppress is
+    # the ReadTask, which is what actually sends messages.readHistory to the server.
+    patch_file(
+        messages_controller,
+        """        if (createReadTask) {
+            Utilities.stageQueue.postRunnable(() -> {
+                ReadTask currentReadTask;
+                if (threadId != 0) {""",
+        """        if (colgramGhostRead) {
+            // Ghost mode: skip the outgoing receipt entirely. Local read state above has
+            // already been updated, so the chat reads correctly on this device.
+            return;
+        }
+
+        if (createReadTask) {
+            Utilities.stageQueue.postRunnable(() -> {
+                ReadTask currentReadTask;
+                if (threadId != 0) {""",
+        "MessagesController Ghost Read Task Suppression"
+    )
+
+    # 6e. MessagesController.java -> Keep the local unread counter honest in ghost mode.
+    #
+    # markDialogAsRead's early `return` above bypasses the notification/badge refresh
+    # further down. Push a dialogsNeedReload so the UI reflects the cleared counter rather
+    # than showing a stale badge until the next full reload.
+    patch_file(
+        messages_controller,
+        "org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);\n        boolean createReadTask;",
+        "org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);\n        getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);\n        boolean createReadTask;",
+        "MessagesController Ghost Read Refresh Dialogs"
+    )
+
     patch_file(
         messages_controller,
         "public boolean sendTyping(long dialogId, long threadMsgId, int action, int classGuid) {",
@@ -159,6 +218,115 @@ def inject_hooks(repo_path):
         "public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {",
         "public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {\n        if (org.colgram.core.ColgramHookHandler.shouldPreventTypingStatus(dialogId)) return false;",
         "MessagesController Ghost Typing Suppression (String)"
+    )
+
+    # 6f. MessagesController.java -> Ghost mode: actually keep the account offline.
+    #
+    # THIS PATCH WAS MISSING, and its absence is the whole reason "invisibility works
+    # badly". ColgramGhostMode.shouldStayOffline() has existed from the start but NOTHING
+    # called it — the hook was dead code. Read-receipt and typing suppression do not help
+    # at all if the account still broadcasts presence.
+    #
+    # Telegram's real online signal is the account.updateStatus RPC: `offline = false` is
+    # what flips you to "online" for every contact. It is sent on screen-on / app
+    # foreground and re-sent at most every 55 seconds, so a user who looks invisible in
+    # the UI is in fact broadcasting presence the entire time.
+    #
+    # There is no setOnline() helper, so the correct lever is the `ignoreSetOnline` flag
+    # that already guards this whole block (line 10527): it is exactly the "do not touch
+    # presence right now" switch Telegram uses itself. With ghost-online ON we set it
+    # before the check, so neither the `offline = false` nor the `offline = true` branch
+    # runs and the account keeps whatever state it last had — nobody sees us come online.
+    # When OFF, behaviour is verbatim upstream.
+    patch_file(
+        messages_controller,
+        """        if (getUserConfig().isClientActivated()) {
+            if (!ignoreSetOnline && getConnectionsManager().getPauseTime() == 0 && ApplicationLoader.isScreenOn && !ApplicationLoader.mainInterfacePausedStageQueue) {""",
+        """        if (getUserConfig().isClientActivated()) {
+            if (org.colgram.core.ColgramHookHandler.shouldStayOffline()) {
+                // Ghost mode: never announce presence. ignoreSetOnline is the same latch
+                // Telegram uses internally to suppress the updateStatus RPC entirely, so
+                // neither the online nor the offline branch below will run.
+                ignoreSetOnline = true;
+            }
+            if (!ignoreSetOnline && getConnectionsManager().getPauseTime() == 0 && ApplicationLoader.isScreenOn && !ApplicationLoader.mainInterfacePausedStageQueue) {""",
+        "MessagesController Ghost Online Suppression"
+    )
+
+    # 6b. MessagesController.java -> Anti-Delete at the REAL removal site.
+    #
+    # This is the single most important anti-delete patch. Upstream deleteMessages()
+    # is what actually destroys a message, and it does two harmful things at once:
+    #
+    #   1. obj.deleted = true on the live MessageObject. This is an internal lifecycle
+    #      flag, not styling. It makes ChatMessageCell bail out of the share button
+    #      (checkNeedDrawShareButton), suppress name/time/caption drawing, and skip
+    #      context-menu and selection paths — so the bubble greys out, stays visually
+    #      "selected", cannot be replied to, and any action needing the real id fails
+    #      with MESSAGE_ID_INVALID.
+    #   2. markMessagesAsDeleted() + updateDialogsWithDeletedMessages() wipe the row
+    #      from SQLite, so on the next reload the message is gone for real.
+    #
+    # The old anti-delete patch only touched ChatActivity.processDeletedMessages, which
+    # is the UI-side notification — by then the MessageObject had already been tombstoned
+    # and storage already scheduled for deletion. That is why retained messages were
+    # broken rather than preserved.
+    #
+    # Correct behaviour when anti-delete is ON: record the id for tombstone styling and
+    # leave the message completely untouched — fully replyable, deletable, forwardable.
+    # When it is OFF we fall through to upstream behaviour verbatim.
+    patch_file(
+        messages_controller,
+        """            } else {
+                if (channelId == 0) {
+                    for (int a = 0; a < messages.size(); a++) {
+                        Integer id = messages.get(a);
+                        MessageObject obj = dialogMessagesByIds.get(id);
+                        if (obj != null) {
+                            obj.deleted = true;
+                        }
+                    }
+                } else {
+                    markDialogMessageAsDeleted(dialogId, messages);
+                }
+                getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, forAll, 0, topicId);
+                getMessagesStorage().updateDialogsWithDeletedMessages(dialogId, channelId, messages, null);
+            }""",
+            """            } else {
+                final boolean colgramKeep = org.colgram.core.ColgramConfig.isAntiDeleteEnabled();
+                final boolean colgramWipe = org.colgram.core.ColgramConfig.isAntiDeleteWipeEnabled();
+                if (channelId == 0) {
+                    for (int a = 0; a < messages.size(); a++) {
+                        Integer id = messages.get(a);
+                        MessageObject obj = dialogMessagesByIds.get(id);
+                        if (obj != null && !colgramKeep) {
+                            obj.deleted = true;
+                        }
+                    }
+                } else {
+                    if (!colgramKeep) {
+                        markDialogMessageAsDeleted(dialogId, messages);
+                    }
+                }
+                if (colgramKeep) {
+                    // Record for tombstone styling only. The MessageObject keeps its
+                    // normal state so reply, forward, selection and delete all work.
+                    for (int a = 0; a < messages.size(); a++) {
+                        org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(
+                                channelId != 0 ? -channelId : dialogId, messages.get(a));
+                    }
+                    if (colgramWipe) {
+                        // Tombstone only — the row stays in SQLite so the message survives a
+                        // reload and still reads as a message, not a hole in the timeline.
+                        // This is the AyuGram behaviour.
+                        getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, false, 0, topicId);
+                    }
+                } else {
+                    getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, forAll, 0, topicId);
+                    getMessagesStorage().updateDialogsWithDeletedMessages(dialogId, channelId, messages, null);
+                }
+            }""",
+        "MessagesController Anti-Delete Preserve Message In Storage"
     )
 
     # 7. LoginActivity.java -> Suppress phone call permission requests completely
@@ -722,7 +890,7 @@ def inject_hooks(repo_path):
             args.putLong("user_id", UserConfig.getInstance(currentAccount).getClientUserId());
             presentFragment(new ChatActivity(args));
         });"""
-            if "org.colgram.core.ColgramPluginsActivity.start(getParentActivity())" in content:
+            if "🧩 Плагины и Маркетплейс" in content:
                 return content
             inject = """
         io.addGap();
@@ -738,6 +906,9 @@ def inject_hooks(repo_path):
         io.add(R.drawable.msg_download, "📥 Версии Telegram", () -> {
             presentFragment(new ColgramVersionsActivity());
         });
+        io.add(R.drawable.msg_policy, "🛡 Анти-спам (юзербот)", () -> {
+            presentFragment(new ColgramAntiSpamActivity());
+        });
         if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
             io.add(R.drawable.msg_retry, "🔄 Синхронизировать чаты бота", () -> {
                 org.colgram.core.ColgramBotSync.syncBotDialogs(getParentActivity(), currentAccount, true);
@@ -751,8 +922,225 @@ def inject_hooks(repo_path):
         patch_file(
             dialogs_activity,
             options_menu_injector,
-            "org.colgram.core.ColgramPluginsActivity.start(getParentActivity())",
-            "DialogsActivity Options Menu Plugins and Bot Sync Entries"
+            "🧩 Плагины и Маркетплейс",
+            "DialogsActivity Options Menu: Colgram Entries"
+        )
+
+    # 49. UserConfig.java -> Unlimited Accounts
+    #
+    # MAX_ACCOUNT_COUNT is a compile-time array size, not a soft limit: UserConfig holds
+    # static arrays of exactly this length, and every loop that iterates accounts is
+    # bounded by it. Raising the constant is therefore the correct and only change needed
+    # — no other site hardcodes 4 in a way that would desync. Telegram's own UI reads
+    # UserConfig.MAX_ACCOUNT_COUNT / getMaxAccountCount() rather than a literal.
+    user_config = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "UserConfig.java")
+    patch_file(
+        user_config,
+        "public final static int MAX_ACCOUNT_COUNT = 4;",
+        "public final static int MAX_ACCOUNT_COUNT = 64; // Colgram: unlimited multi-account",
+        "UserConfig Unlimited Account Count"
+    )
+
+    # 50. MessagesController.java -> Unlimited Pinned Dialogs
+    #
+    # The pin cap arrives from server config (pinned_dialogs_count_max) but that block is
+    # commented out upstream, so the fields keep whatever they were initialised with.
+    # Folder-scoped pins already default to 100; the main-dialog fields default to 5.
+    #
+    # IMPORTANT: the two assignment lines appear TWICE each in the initialiser (upstream
+    # has a duplicated pair at 1646/1647 and 1648/1649). patch_file's replace(..., 1)
+    # would only rewrite the first of each pair, leaving the second to overwrite it at
+    # runtime — so the cap would silently survive. Both pairs are rewritten by replacing
+    # the whole 4-line block in one shot.
+    #
+    # This only lifts the CLIENT-side guard. Telegram's server still enforces its own
+    # pinned-dialog limit, which a client cannot override.
+    patch_file(
+        messages_controller,
+        '''maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 5);
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 5);
+        maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 5);
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 5);''',
+        '''maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins
+        maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins''',
+        "MessagesController Unlimited Pins"
+    )
+    patch_file(
+        messages_controller,
+        '''maxFolderPinnedDialogsCountDefault = mainPreferences.getInt("maxFolderPinnedDialogsCountDefault", 100);
+        maxFolderPinnedDialogsCountPremium = mainPreferences.getInt("maxFolderPinnedDialogsCountPremium", 100);''',
+        '''maxFolderPinnedDialogsCountDefault = mainPreferences.getInt("maxFolderPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
+        maxFolderPinnedDialogsCountPremium = mainPreferences.getInt("maxFolderPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins''',
+        "MessagesController Unlimited Folder Pins"
+    )
+
+    # 51. DialogsActivity.java -> Remove the Pin Guard Entirely
+    #
+    # Belt and braces: the guard computes maxPinnedCount from the (now large) config
+    # values, but for a folder-scoped filter it computes 100 - alwaysShow.size(), which can
+    # still block. Replacing the condition with an unconditional allow removes the last
+    # client-side stop. Unpinning is never affected, and the server remains the authority.
+    if os.path.exists(dialogs_activity):
+        patch_file(
+            dialogs_activity,
+            "hasPinAction[0] = !(newPinnedSecretCount + pinnedSecretCount > maxPinnedCount || newPinnedCount + pinnedCount - alreadyAdded > maxPinnedCount);",
+            "hasPinAction[0] = true; // Colgram: no client-side pin cap",
+            "DialogsActivity Remove Pin Cap"
+        )
+
+    # 52. NotificationsController.java -> Per-User Notification Blocking
+    #
+    # Enforced at the single place that decides whether an incoming message becomes a
+    # notification. Placing the filter here (rather than in the notification builder or the
+    # UI) means a silenced sender produces no notification, no sound and no badge from ANY
+    # code path — push, in-app update, or edited message.
+    #
+    # Scope is intentionally notification-only: the message is still stored and rendered,
+    # and replying works normally. The user asked for exactly that ("не буду это видеть...
+    # без проблем отвечать").
+    #
+    # The anchor is the first guard in the per-message loop, which already exists to skip
+    # message kinds that should not notify, so this composes with Telegram's own logic
+    # instead of bypassing it.
+    notifications_controller = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "NotificationsController.java")
+    if os.path.exists(notifications_controller):
+        patch_file(
+            notifications_controller,
+            """                if (messageObject.messageOwner != null && (messageObject.isImportedForward() ||
+                        messageObject.messageOwner.action instanceof TLRPC.TL_messageActionSetMessagesTTL ||
+                        messageObject.messageOwner.silent && (messageObject.messageOwner.action instanceof TLRPC.TL_messageActionContactSignUp || messageObject.messageOwner.action instanceof TLRPC.TL_messageActionUserJoined)) ||
+                        MessageObject.isTopicActionMessage(messageObject)) {
+                    if (BuildVars.LOGS_ENABLED) {
+                        FileLog.d("skipped message because 1");
+                    }
+                    continue;
+                }""",
+            """                // Colgram: keep silent for senders the user has muted, even when they ping
+                // in a group or channel. Notification only - the message is still stored
+                // and shown when the chat is opened.
+                if (messageObject.messageOwner != null
+                        && org.colgram.core.ColgramHookHandler.shouldSilenceNotificationsFrom(messageObject.getFromChatId())) {
+                    if (BuildVars.LOGS_ENABLED) {
+                        FileLog.d("colgram: notification suppressed for sender " + messageObject.getFromChatId());
+                    }
+                    continue;
+                }
+                if (messageObject.messageOwner != null && (messageObject.isImportedForward() ||
+                        messageObject.messageOwner.action instanceof TLRPC.TL_messageActionSetMessagesTTL ||
+                        messageObject.messageOwner.silent && (messageObject.messageOwner.action instanceof TLRPC.TL_messageActionContactSignUp || messageObject.messageOwner.action instanceof TLRPC.TL_messageActionUserJoined)) ||
+                        MessageObject.isTopicActionMessage(messageObject)) {
+                    if (BuildVars.LOGS_ENABLED) {
+                        FileLog.d("skipped message because 1");
+                    }
+                    continue;
+                }""",
+            "NotificationsController Per-User Silent Senders"
+        )
+
+    # 53. ProfileActivity.java -> Per-User "Mute group pings" row
+    #
+    # Adds a Colgram-only row to another user's profile that silences their group/channel
+    # pings on this device. Three edits are needed and all three are required for the row
+    # to work: the field declaration, the row index assignment, and the bind + click
+    # handler.
+    #
+    # Kept as a NEW field rather than reusing an existing row index: reusing one would mean
+    # the row disappears whenever that other feature is conditionally hidden.
+    profile_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProfileActivity.java")
+    if os.path.exists(profile_activity):
+        # (a) field
+        patch_file(
+            profile_activity,
+            "    private int unblockRow;",
+            "    private int unblockRow;\n    /** Colgram: silences this user's pings in groups/channels. */\n    private int colgramMutePingsRow = -1;",
+            "ProfileActivity Colgram Mute Row Field"
+        )
+        # (b) reset alongside the other rows
+        patch_file(
+            profile_activity,
+            "        unblockRow = -1;",
+            "        unblockRow = -1;\n        colgramMutePingsRow = -1;",
+            "ProfileActivity Colgram Mute Row Reset"
+        )
+        # (c) assign the index in the other-user branch
+        patch_file(
+            profile_activity,
+            """                if (user != null && !isBot && currentEncryptedChat == null && user.id != getUserConfig().getClientUserId()) {
+                    if (userBlocked) {
+                        unblockRow = rowCount++;
+                        lastSectionRow = rowCount++;
+                    }
+                }""",
+            """                if (user != null && !isBot && currentEncryptedChat == null && user.id != getUserConfig().getClientUserId()) {
+                    if (userBlocked) {
+                        unblockRow = rowCount++;
+                        lastSectionRow = rowCount++;
+                    }
+                    // Colgram: always offer the mute-pings toggle for a real user, blocked
+                    // or not — muting their pings is independent of blocking them.
+                    colgramMutePingsRow = rowCount++;
+                }""",
+            "ProfileActivity Colgram Mute Row Index"
+        )
+        # (d) bind the cell text.
+        #
+        # There is exactly ONE `case VIEW_TYPE_TEXT:` handler in ProfileActivity (verified),
+        # and the other-user branch reuses it — that is why unblockRow / sendMessageRow /
+        # addToContactsRow all bind there even though they are only assigned for other users.
+        # So inserting near notificationRow/privacyRow works for the other-user case too.
+        #
+        # The anchor is the notificationRow/privacyRow *pair*, not a bare `position == unblockRow`:
+        # the latter appears twice (rows builder + bind) and patch_file replaces only the
+        # first occurrence. The pair is unique in the file.
+        patch_file(
+            profile_activity,
+            """                    } else if (position == notificationRow) {
+                        textCell.setTextAndIcon(LocaleController.getString(R.string.NotificationsAndSounds), R.drawable.msg2_notifications, true);
+                    } else if (position == privacyRow) {
+                        textCell.setTextAndIcon(LocaleController.getString(R.string.PrivacySettings), R.drawable.msg2_secret, true);""",
+            """                    } else if (position == colgramMutePingsRow) {
+                        boolean muted = org.colgram.core.ColgramHookHandler.isNotificationsBlocked(userId);
+                        textCell.setTextAndValue("Молчать о пингах в группах",
+                                muted ? "включено" : "выключено", true);
+                    } else if (position == notificationRow) {
+                        textCell.setTextAndIcon(LocaleController.getString(R.string.NotificationsAndSounds), R.drawable.msg2_notifications, true);
+                    } else if (position == privacyRow) {
+                        textCell.setTextAndIcon(LocaleController.getString(R.string.PrivacySettings), R.drawable.msg2_secret, true);""",
+            "ProfileActivity Colgram Mute Row Bind"
+        )
+        # (e) click handler, next to the other per-user actions.
+        #
+        # Anchored on the *second* half of the unblockRow handler (the bulletin block) rather
+        # than `} else if (position == unblockRow) {` alone, which would also match the bind
+        # site. This anchor is unique.
+        patch_file(
+            profile_activity,
+            """            } else if (position == unblockRow) {
+                getMessagesController().unblockPeer(userId);
+                if (BulletinFactory.canShowBulletin(ProfileActivity.this)) {
+                    BulletinFactory.createBanBulletin(ProfileActivity.this, false).show();
+                }
+            }""",
+            """            } else if (position == colgramMutePingsRow) {
+                final long colgramTarget = userId;
+                boolean colgramMuted = org.colgram.core.ColgramHookHandler.isNotificationsBlocked(colgramTarget);
+                org.colgram.core.ColgramHookHandler.setNotificationsBlocked(colgramTarget, !colgramMuted);
+                if (listAdapter != null) {
+                    listAdapter.notifyDataSetChanged();
+                }
+                Toast.makeText(getParentActivity(),
+                        !colgramMuted ? "Уведомления от этого человека заглушены"
+                                      : "Уведомления от этого человека снова включены",
+                        Toast.LENGTH_SHORT).show();
+            } else if (position == unblockRow) {
+                getMessagesController().unblockPeer(userId);
+                if (BulletinFactory.canShowBulletin(ProfileActivity.this)) {
+                    BulletinFactory.createBanBulletin(ProfileActivity.this, false).show();
+                }
+            }""",
+            "ProfileActivity Colgram Mute Row Click"
         )
 
     # 20. MessagesStorage.java -> Anti-Delete (Preserve Deleted Messages In Local DB)
@@ -763,6 +1151,21 @@ def inject_hooks(repo_path):
             if target not in content:
                 return content
             inject = """public ArrayList<Long> markMessagesAsDeleted(long dialogId, ArrayList<Integer> messages, boolean useQueue, boolean deleteFiles, int mode, int topicId) {
+        // Anti-delete: pull the retained ids back out of the list before storage touches
+        // them. An id that reaches this method's body is gone from SQLite for good, so
+        // filtering here — not at the call site — is the only thing that actually keeps
+        // the message alive across a reload.
+        //
+        // Two modes, and the difference matters:
+        //   isAntiDeleteEnabled()        — interception is on at all
+        //   isAntiDeleteWipeEnabled()    — ON  => row survives but its content is blanked
+        //                                        (AyuGram-style tombstone: the message stays
+        //                                        in place, unreadable, permanently)
+        //                                  OFF => row is left completely intact, full text
+        //                                        kept forever. Use this for a local archive.
+        //
+        // We honour the wipe flag by NOT filtering when the user wants a full archive, and
+        // by filtering (thereby preserving the row) when they want a tombstone.
         if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled() && messages != null) {
             java.util.ArrayList<Integer> toRemove = new java.util.ArrayList<>();
             for (int i = 0; i < messages.size(); i++) {
@@ -833,7 +1236,7 @@ def inject_hooks(repo_path):
     template_dir = os.path.join(os.path.dirname(__file__), "templates")
     ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
     os.makedirs(ui_dest_dir, exist_ok=True)
-    for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java"]:
+    for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java"]:
         src_t = os.path.join(template_dir, name)
         dst_t = os.path.join(ui_dest_dir, name)
         if os.path.exists(src_t):
@@ -1000,21 +1403,43 @@ def inject_hooks(repo_path):
         )
 
     # 29. ChatActivity.java -> Retain Deleted Messages in UI (Anti-Delete AyuGram Style)
+    #
+    # CRITICAL DESIGN NOTE — why we do NOT set MessageObject.deleted = true:
+    #
+    # MessageObject.deleted is Telegram's internal "this message no longer exists" state,
+    # not a display flag. Setting it makes the client treat the bubble as a tombstone:
+    #   - checkNeedDrawShareButton() bails early            (ChatMessageCell:18652)
+    #   - name/subtitle/time/caption drawing is suppressed  (21227, 21987, 23605, 23936)
+    #   - selection and context-menu paths skip the bubble
+    #   - getPeerId()-based round trips no longer agree with the server view, so any
+    #     action that needs the real message id (reply, edit, forward) fails with
+    #     MESSAGE_ID_INVALID and the bubble stays highlighted because the touch/selection
+    #     state is cleared by a code path we just returned out of.
+    #
+    # That is exactly the bug report: messages only greyed out/kept selected, reply
+    # silently failing, "message id invalid" on tap, and unable to delete them.
+    #
+    # The correct model for anti-delete is: the message stays a FULLY NORMAL message in
+    # every functional respect, and we only add a visual marker for it. The "was deleted"
+    # fact lives in Colgram's own DB and is consulted at draw time. So we record the
+    # deletion and let Telegram's normal removal path run.
+    #
+    # AyuGram does it this way too: it never mutates MessageObject.deleted for retained
+    # messages, it keeps a local store and marks the bubble in the cell.
     if os.path.exists(chat_activity):
         anti_delete_ui_target = "private void processDeletedMessages(ArrayList<Integer> markAsDeletedMessages, long channelId, boolean sent, boolean thanos) {"
         anti_delete_ui_replacement = """private void processDeletedMessages(ArrayList<Integer> markAsDeletedMessages, long channelId, boolean sent, boolean thanos) {
+        // ANTI-DELETE: record the ids so the cells can draw the tombstone styling, then
+        // FALL THROUGH to upstream's normal handling. We must not return early: the code
+        // below clears replyingMessageObject when the message being replied to is deleted
+        // and rebuilds the grouping, and collapsing the view without it leaves a dangling
+        // reply bar and stale group layout. The actual preservation happens earlier, in
+        // MessagesController.deleteMessages(), which no longer tombstones the object or
+        // wipes storage when anti-delete is on.
         if (org.colgram.core.ColgramConfig.isAntiDeleteEnabled() && markAsDeletedMessages != null) {
             for (int msg_id : markAsDeletedMessages) {
-                MessageObject msg = (messagesDict != null && messagesDict.length > 0 && messagesDict[0] != null) ? messagesDict[0].get(msg_id) : null;
-                if (msg != null) {
-                    msg.deleted = true;
-                    org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialog_id, msg_id);
-                }
+                org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(dialog_id, msg_id);
             }
-            if (chatAdapter != null) {
-                chatAdapter.notifyDataSetChanged(false);
-            }
-            return;
         }"""
         patch_file(
             chat_activity,
@@ -1024,6 +1449,17 @@ def inject_hooks(repo_path):
         )
 
     # 30. ChatMessageCell.java -> Prepend 🗑 to time string for deleted messages
+    #
+    # Anchored on the CURRENT upstream text. Two deliberate constraints:
+    #
+    #   * `currentMessageObject.deleted` is NOT part of the condition. With the corrected
+    #     anti-delete implementation a retained message never enters that state, and
+    #     including it would double-mark anything genuinely tombstoned by another path.
+    #   * The prefix is gated on isAntiDeleteHighlightEnabled(), so a user who wants the
+    #     interception to be completely invisible gets exactly that.
+    #
+    # TextUtils.concat on the time string is safe here because only `currentTimeString`
+    # is rewritten; nothing downstream depends on it being a plain String.
     if os.path.exists(chat_cell):
         cell_time_target = """        } else {
             currentTimeString = timeString;
@@ -1031,7 +1467,9 @@ def inject_hooks(repo_path):
         cell_time_replacement = """        } else {
             currentTimeString = timeString;
         }
-        if (currentMessageObject != null && (currentMessageObject.deleted || org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(currentMessageObject.getDialogId(), currentMessageObject.getId()))) {
+        if (currentMessageObject != null
+                && org.colgram.core.ColgramConfig.isAntiDeleteHighlightEnabled()
+                && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(currentMessageObject.getDialogId(), currentMessageObject.getId())) {
             currentTimeString = TextUtils.concat("🗑 ", currentTimeString);
         }"""
         patch_file(
@@ -1522,14 +1960,51 @@ def inject_hooks(repo_path):
         patch_file(change_name, cname_target, cname_inject, "ChangeNameActivity Bot Name Update Hook")
 
     # 47. ChangeBioActivity.java -> Bot Profile Bio/Description Update Hook
+    #
+    # TWO fixes here, both required:
+    #
+    # (a) The early guard. saveName() begins with
+    #         final TLRPC.UserFull userFull = ...getUserFull(getClientUserId());
+    #         if (getParentActivity() == null || userFull == null) return;
+    #     On a bot account the client never performs an MTProto users.getFullUser for
+    #     itself, so getUserFull() returns null and the method returns before reaching any
+    #     of our code. The save button therefore did nothing at all, silently — this is the
+    #     "I can't change the bot's description" report. Guarding the bot branch BEFORE the
+    #     null check is what makes the edit reachable.
+    #
+    # (b) userFull may legitimately be null for a bot, so the confirmation callback must
+    #     not dereference it unconditionally.
     change_bio = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChangeBioActivity.java")
     if os.path.exists(change_bio):
-        cbio_target = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
-        if (currentName.equals(newName)) {
-            finishFragment();
+        cbio_guard_target = """        if (getParentActivity() == null || userFull == null) {
             return;
         }"""
-        cbio_inject = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
+        cbio_guard_replacement = """        if (getParentActivity() == null) {
+            return;
+        }
+        final TLRPC.User colgramSelf = UserConfig.getInstance(currentAccount).getCurrentUser();
+        if (colgramSelf != null && colgramSelf.bot) {
+            // Bots have no MTProto UserFull on the client, so the normal path below would
+            // always bail out. Route straight to the Bot API.
+            final String botNewName = firstNameField.getText().toString().replace("\\n", "");
+            org.colgram.core.ColgramBotSync.updateBotDescription(getParentActivity(), currentAccount, botNewName, () -> {
+                if (userFull != null) {
+                    userFull.about = botNewName;
+                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, colgramSelf.id, userFull);
+                }
+                finishFragment();
+            });
+            return;
+        }
+        if (userFull == null) {
+            return;
+        }"""
+        patch_file(change_bio, cbio_guard_target, cbio_guard_replacement, "ChangeBioActivity Bot Guard Before UserFull Null Check")
+
+        # The original bot hook is now unreachable (the guard above returns first), but it
+        # also referenced a bot-only path that is already handled. Replace it so we do not
+        # leave a dead duplicate whose callback dereferences userFull.
+        cbio_target = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
         if (currentName.equals(newName)) {
             finishFragment();
             return;
@@ -1543,7 +2018,24 @@ def inject_hooks(repo_path):
             });
             return;
         }"""
-        patch_file(change_bio, cbio_target, cbio_inject, "ChangeBioActivity Bot Description Update Hook")
+        cbio_replacement = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
+        if (currentName.equals(newName)) {
+            finishFragment();
+            return;
+        }
+        final TLRPC.User currentUser = UserConfig.getInstance(currentAccount).getCurrentUser();
+        if (currentUser != null && currentUser.bot) {
+            // Unreachable in practice (handled above), kept as a defensive fallback.
+            org.colgram.core.ColgramBotSync.updateBotDescription(getParentActivity(), currentAccount, newName, () -> {
+                if (userFull != null) {
+                    userFull.about = newName;
+                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, currentUser.id, userFull);
+                }
+                finishFragment();
+            });
+            return;
+        }"""
+        patch_file(change_bio, cbio_target, cbio_replacement, "ChangeBioActivity Bot Description Null-Safe Callback")
 
     # 48. ChangeUsernameActivity.java -> Bot Username Notice Hook
     change_user = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChangeUsernameActivity.java")
@@ -1652,9 +2144,24 @@ def inject_hooks(repo_path):
         # its own window and they do not replace one another.
         impl_target = "    public void setFullscreen(boolean fullscreen, boolean animated) {"
         impl_inject = """    /**
-     * Colgram: pin this mini-app into a floating window (Android PiP).
+     * Colgram: pin this mini-app into a floating window.
      *
-     * Reuses Telegram's existing PiP pipeline rather than building a new one.
+     * Two-tier strategy, because the platform allows different things depending on
+     * permissions:
+     *
+     *   1. ColgramFloatWindowManager — a real draggable overlay window. This IS the
+     *      "several at once, like a desktop" path the feature is asked for. It needs the
+     *      draw-over-other-apps permission; each window is an independent
+     *      WindowManager.addView using TYPE_APPLICATION_OVERLAY, which Android does not
+     *      cap at one.
+     *
+     *   2. Telegram's PipSource / PipActivityController — used when the overlay permission
+     *      is missing. No permission needed, but the controller keeps a single
+     *      maxPrioritySource and calls onLoseMaxPriority() on every other source, and
+     *      Android itself allows only one system PiP window per task. One window only.
+     *
+     * The user is told which one they got, rather than the button silently doing less
+     * than it says.
      */
     private void colgramPinMiniAppToFloatingWindow() {
         if (!org.colgram.core.ColgramConfig.isMiniAppPipEnabled()) {
@@ -1666,13 +2173,32 @@ def inject_hooks(repo_path):
         if (activity == null || webViewContainer == null) {
             return;
         }
+
+        // --- Tier 1: real multi-window overlay ---
+        if (org.telegram.ui.ColgramFloatWindowManager.isSupported(activity)) {
+            final org.telegram.ui.ColgramFloatWindowManager.FloatWindow floatWindow =
+                    org.telegram.ui.ColgramFloatWindowManager.open(
+                            activity, webViewContainer, "Mini App");
+            if (floatWindow != null) {
+                // The sheet must let go of the view: the window owns it now.
+                dismiss(true, null);
+                android.widget.Toast.makeText(activity,
+                        "Мини-приложение закреплено как плавающее окно ("
+                                + org.telegram.ui.ColgramFloatWindowManager.getWindowCount()
+                                + " открыто)",
+                        android.widget.Toast.LENGTH_SHORT).show();
+                return;
+            }
+        }
+
+        // --- Tier 2: system PiP, single window ---
         try {
-            if (org.telegram.messenger.pip.utils.PipUtils.checkPermissions(activity)
-                    != org.telegram.messenger.pip.utils.PipPermissions.PIP_GRANTED_PIP) {
-                org.telegram.messenger.AndroidUtilities.runOnUIThread(() ->
-                        android.widget.Toast.makeText(activity,
-                                "Разрешите картинку в картинке в настройках системы",
-                                android.widget.Toast.LENGTH_LONG).show());
+            final int permission = org.telegram.messenger.pip.utils.PipUtils.checkPermissions(activity);
+            if (permission != org.telegram.messenger.pip.utils.PipPermissions.PIP_GRANTED_PIP
+                    && permission != org.telegram.messenger.pip.utils.PipPermissions.PIP_GRANTED_OVERLAY) {
+                AndroidUtilities.runOnUIThread(() -> android.widget.Toast.makeText(activity,
+                        "Разрешите «Поверх других окон» или «Картинку в картинке» в настройках системы",
+                        android.widget.Toast.LENGTH_LONG).show());
                 return;
             }
             if (colgramPipSource != null) {
@@ -1681,11 +2207,16 @@ def inject_hooks(repo_path):
             }
             final android.view.View content = webViewContainer;
             colgramPipSource = new org.telegram.messenger.pip.PipSource.Builder(activity, colgramPipDelegate)
-                    .setTagPrefix("colgram-miniapp-" + botId)
+                    // Keyed per view instance: two windows for the SAME bot would otherwise
+                    // share a tag and replace each other in the controller's source map.
+                    .setTagPrefix("colgram-miniapp-" + botId + "-" + System.identityHashCode(content))
                     .setPriority(1)
                     .setContentView(content)
                     .setContentRatio(Math.max(1, content.getWidth()), Math.max(1, content.getHeight()))
                     .build();
+            android.widget.Toast.makeText(activity,
+                    "Открыто в системном окне (одно за раз). Дайте доступ «Поверх других окон» для нескольких",
+                    android.widget.Toast.LENGTH_LONG).show();
         } catch (Throwable t) {
             org.telegram.messenger.FileLog.e(t);
         }
@@ -1858,22 +2389,105 @@ def inject_core(repo_path, core_source_dir):
     # Sync file-by-file rather than wiping the destination tree. A bulk rmtree of the
     # module both trips delete-guard hooks and destroys anything the build generated
     # into the tree that we would immediately have to rebuild.
-    if os.path.isdir(core_source_dir):
-        for root, _dirs, files in os.walk(core_source_dir):
-            rel = os.path.relpath(root, core_source_dir)
-            dest_dir = target_core_dir if rel == "." else os.path.join(target_core_dir, rel)
-            os.makedirs(dest_dir, exist_ok=True)
-            for fname in files:
-                if fname.endswith(".pyc"):
-                    continue
-                src_file = os.path.join(root, fname)
-                dst_file = os.path.join(dest_dir, fname)
-                shutil.copyfile(src_file, dst_file)
-    else:
+    #
+    # The copy is deliberately MIRRORED, not merely additive: a plain additive copy can
+    # never propagate a *deletion*. If a file is removed from colgram-core/ in the repo
+    # (e.g. a test artifact that had leaked into assets/), its stale twin in
+    # Telegram-Src/colgram-core/ survives forever and keeps getting packaged into the
+    # APK - "clean" does not help, because the build tree is the source of truth for
+    # Gradle and the file genuinely is still on disk. So: after copying, walk the
+    # destination and delete anything under a source-managed directory that the source
+    # no longer has.
+    #
+    # Scope note: pruning is confined to directories this module owns. The root of
+    # target_core_dir is skipped outright (see below), so Gradle's build/, .gradle/ and
+    # any other root-level output can never be touched. Deeper inside the tree we are
+    # definitionally walking a source-managed directory, so removing an entry there is
+    # safe - and removing a stale *directory* (not just stale files) matters, because a
+    # runtime folder such as assets/antispam/storage/ otherwise survives a file-only
+    # sweep and keeps shipping its contents (bot.db) into the APK.
+    if not os.path.isdir(core_source_dir):
         print(f" [!] FATAL: core source dir not found: {core_source_dir}")
         return
 
-    print(f" [+] colgram-core successfully synced to {target_core_dir}")
+    # ---- Pass 1: enumerate exactly what the source owns ----------------------------
+    # Build the authoritative set of relative paths present in the source. Doing this
+    # BEFORE touching the destination is what makes the prune correct: we can then ask
+    # "is this destination path part of the source tree?" as a set lookup instead of
+    # re-deriving ownership directory-by-directory during the walk (which gets it wrong
+    # when a shallow directory is visited before its deeper siblings are known).
+    src_files = set()
+    src_dirs = set()
+    for root, dirs, files in os.walk(core_source_dir):
+        rel_root = os.path.relpath(root, core_source_dir)
+        if rel_root == ".":
+            rel_root = ""
+        for d in dirs:
+            src_dirs.add(os.path.join(rel_root, d) if rel_root else d)
+        for f in files:
+            if f.endswith(".pyc"):
+                continue
+            src_files.add(os.path.join(rel_root, f) if rel_root else f)
+
+    # ---- Pass 2: copy the source in -------------------------------------------------
+    copied = 0
+    for rel in sorted(src_files):
+        src_file = os.path.join(core_source_dir, rel)
+        dst_file = os.path.join(target_core_dir, rel)
+        os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+        shutil.copyfile(src_file, dst_file)
+        copied += 1
+
+    # ---- Pass 3: prune destination entries the source does not own ------------------
+    # Depth-limited to paths that mirror a source directory. Gradle's own output lives
+    # at the module root (build/, .gradle/, local.properties) and is never descended
+    # into, because the scan starts only inside directories that exist in src_dirs.
+    #
+    # A stale *directory* (not just a stale file) must be removable: a runtime folder
+    # such as assets/antispam/storage/ would otherwise survive a file-only sweep and
+    # keep shipping its contents (bot.db) into the APK.
+    removed = []
+    protected_roots = {"build", ".gradle", ".idea", "__pycache__"}
+    scan_roots = {""} | src_dirs
+    for rel_dir in sorted(scan_roots, key=lambda p: p.count(os.sep)):
+        abs_dir = os.path.join(target_core_dir, rel_dir) if rel_dir else target_core_dir
+        if not os.path.isdir(abs_dir):
+            continue
+        for entry in os.listdir(abs_dir):
+            if entry.startswith(".") or entry in protected_roots:
+                continue
+            rel_entry = os.path.join(rel_dir, entry) if rel_dir else entry
+            abs_entry = os.path.join(abs_dir, entry)
+            if os.path.isdir(abs_entry):
+                if rel_entry in src_dirs:
+                    continue  # still owned by the source, keep
+                # Not owned by the source. Only prune it when it sits under a directory
+                # the source actually manages; a dir at the module root is off-limits
+                # because that is where Gradle and local tooling keep their state.
+                if rel_dir == "":
+                    continue
+                shutil.rmtree(abs_entry, ignore_errors=True)
+            elif os.path.isfile(abs_entry):
+                if rel_entry in src_files:
+                    continue
+                # Same rule for files: never delete anything at the module root that the
+                # source does not have. local.properties (sdk.dir) lives there and is
+                # local build configuration, not module source - removing it breaks the
+                # build outright. .pyc anywhere is also always preserved.
+                if rel_entry.endswith(".pyc"):
+                    continue
+                if rel_dir == "":
+                    continue
+                os.remove(abs_entry)
+            else:
+                continue
+            removed.append(rel_entry)
+
+    for rel in sorted(removed):
+        print(f" [-] pruned stale path: {rel}")
+    if removed:
+        print(f" [+] colgram-core: pruned {len(removed)} stale path(s) deleted from source")
+    print(f" [+] colgram-core synced to {target_core_dir} ({copied} files)")
 
     # Add module to settings.gradle
     settings_gradle = os.path.join(repo_path, "settings.gradle")

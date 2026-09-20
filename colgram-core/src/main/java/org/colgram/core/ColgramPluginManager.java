@@ -311,6 +311,34 @@ public class ColgramPluginManager {
         }
     }
 
+    /**
+     * Install a plugin that ships inside the APK, by file name.
+     *
+     * The bundled catalog entries deliberately carry no download URL, so the offline
+     * fallback needs a way to install from the APK's own assets. Without this the
+     * marketplace would list entries that cannot be installed whenever the network is
+     * unavailable — which is exactly when the fallback catalog is shown.
+     *
+     * Looks in assets/plugins/ for the given name.
+     */
+    public static boolean installBundledPlugin(String fileName) {
+        if (appContext == null || internalPluginsDir == null) return false;
+        try {
+            InputStream in = appContext.getAssets().open("plugins/" + fileName);
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+            in.close();
+            String code = new String(bos.toByteArray(), "UTF-8");
+            if (code.trim().isEmpty()) return false;
+            return installPlugin(fileName, code);
+        } catch (Throwable t) {
+            Log.w(TAG, "installBundledPlugin(" + fileName + ") failed: " + t.getMessage());
+            return false;
+        }
+    }
+
     public static boolean deletePlugin(String fileName) {
         try {
             boolean deleted = false;
@@ -516,22 +544,22 @@ public class ColgramPluginManager {
             " \"author\":\"Colgram\"," +
             " \"description\":\"Saves incoming and outgoing messages to a local JSONL file, including edits and deletions.\"," +
             " \"version\":\"1.0\"," +
-            " \"url\":\"\"}," +
+            " \"url\":\"https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/message_logger.py\"}," +
             "{\"name\":\"Auto Reply\"," +
             " \"author\":\"Colgram\"," +
             " \"description\":\"Replies to private messages with a canned response while you are away.\"," +
             " \"version\":\"1.0\"," +
-            " \"url\":\"\"}," +
+            " \"url\":\"https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/auto_reply.py\"}," +
             "{\"name\":\"Chat Exporter\"," +
             " \"author\":\"Colgram\"," +
             " \"description\":\"Exports chat history to a portable HTML file.\"," +
             " \"version\":\"1.0\"," +
-            " \"url\":\"\"}," +
+            " \"url\":\"https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/chat_exporter.py\"}," +
             "{\"name\":\"Keyword Alerts\"," +
             " \"author\":\"Colgram\"," +
             " \"description\":\"Watches chats for keywords and reports matches.\"," +
             " \"version\":\"1.0\"," +
-            " \"url\":\"\"}" +
+            " \"url\":\"https://raw.githubusercontent.com/Kleisym/Colgram/main/plugins/keyword_alerts.py\"}" +
             "]";
 
     /**
@@ -545,11 +573,57 @@ public class ColgramPluginManager {
     public static List<CatalogEntry> fetchCatalog() {
         List<CatalogEntry> out = parseCatalog(httpGet(getCatalogUrl()));
         if (out.isEmpty()) {
-            // Remote failed (private repo, offline, rate-limited). Show the bundled set
-            // rather than an empty screen.
+            // Remote failed (offline, rate-limited, repo unreachable). Show the bundled
+            // set rather than an empty screen.
+            lastCatalogRemote = false;
             out = parseCatalog(BUILTIN_CATALOG_JSON);
+        } else {
+            lastCatalogRemote = true;
         }
         return out;
+    }
+
+    /**
+     * Whether the most recent fetchCatalog() call returned the live remote catalog.
+     *
+     * The marketplace UI needs this to be honest with the user: an offline fallback and a
+     * live catalog look identical in the list, and showing "12 plugins" without saying the
+     * network failed hides the fact that nothing new is available.
+     */
+    private static volatile boolean lastCatalogRemote = false;
+
+    public static boolean lastCatalogWasRemote() {
+        return lastCatalogRemote;
+    }
+
+    /**
+     * File name a catalog entry installs as.
+     *
+     * The catalog schema carries a download URL and no explicit name, so derive it from
+     * the URL's last path segment. Falls back to a slug of the display name when the URL
+     * has no usable segment, so a bundled entry (blank URL) still gets a stable file name.
+     */
+    public static String fileNameFor(CatalogEntry entry) {
+        if (entry == null) return "plugin.py";
+        String url = entry.downloadUrl;
+        if (url != null && !url.trim().isEmpty()) {
+            String last = url.substring(url.lastIndexOf('/') + 1);
+            int q = last.indexOf('?');
+            if (q >= 0) last = last.substring(0, q);
+            if (last.endsWith(".py")) return last;
+            if (!last.isEmpty()) return last + ".py";
+        }
+        StringBuilder slug = new StringBuilder();
+        String name = entry.name == null ? "plugin" : entry.name.toLowerCase(java.util.Locale.US);
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) slug.append(c);
+            else if (slug.length() > 0 && slug.charAt(slug.length() - 1) != '_') slug.append('_');
+        }
+        String s = slug.toString();
+        while (s.endsWith("_")) s = s.substring(0, s.length() - 1);
+        if (s.isEmpty()) s = "plugin";
+        return s + ".py";
     }
 
     /** Parse a flat JSON array of catalog objects. Never throws. */

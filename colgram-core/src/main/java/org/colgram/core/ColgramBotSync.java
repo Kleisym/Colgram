@@ -112,8 +112,60 @@ public class ColgramBotSync {
 
     public static void deleteWebhook(String token) {
         if (token == null || token.isEmpty()) return;
+        deleteWebhook(token, false);
+    }
+
+    /**
+     * Inspect the bot's current update-delivery configuration without changing it.
+     *
+     * A bot token is a single pipe: a webhook and getUpdates cannot coexist. Telegram
+     * answers getUpdates with 409 while a webhook is set. If the same token is already
+     * driving a bot process elsewhere (which is the normal case for Colgram users — the
+     * bot is running on a server), Colgram must NOT call deleteWebhook or long-poll,
+     * because doing so silently redirects that bot's traffic into the phone and starves
+     * the real deployment.
+     *
+     * @return true when a webhook is currently configured
+     */
+    public static boolean hasActiveWebhook(String token) {
+        if (token == null || token.isEmpty()) return false;
+        try {
+            HttpURLConnection conn = openConnection(
+                    "https://api.telegram.org/bot" + token + "/getWebhookInfo", 10000);
+            conn.setRequestMethod("GET");
+            if (conn.getResponseCode() != 200) return false;
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+            JSONObject root = new JSONObject(sb.toString());
+            if (!root.optBoolean("ok", false)) return false;
+            JSONObject result = root.optJSONObject("result");
+            if (result == null) return false;
+            String url = result.optString("url", "");
+            int pending = result.optInt("pending_update_count", 0);
+            Log.i(TAG, "getWebhookInfo: url=" + (url.isEmpty() ? "(none)" : url) + " pending=" + pending);
+            return !url.isEmpty();
+        } catch (Throwable t) {
+            Log.w(TAG, "getWebhookInfo failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * @param force when false, nothing is changed when the bot is serving a webhook —
+     *              the caller is expected to fall back to passive mode instead.
+     */
+    public static void deleteWebhook(String token, boolean force) {
+        if (token == null || token.isEmpty()) return;
+        final boolean doForce = force;
         executor.execute(() -> {
             try {
+                if (!doForce && hasActiveWebhook(token)) {
+                    Log.i(TAG, "webhook is set and passive mode is on - leaving it alone");
+                    return;
+                }
                 String urlStr = "https://api.telegram.org/bot" + token + "/deleteWebhook?drop_pending_updates=false";
                 HttpURLConnection conn = openConnection(urlStr, 10000);
                 conn.setRequestMethod("POST");
@@ -125,6 +177,25 @@ public class ColgramBotSync {
                 Log.w(TAG, "deleteWebhook error: " + t.getMessage());
             }
         });
+    }
+
+    /**
+     * True when Colgram should stay out of the update queue entirely.
+     *
+     * Controlled by the "passive bot mode" preference, which defaults to ON. The safe
+     * default matters: a user who has a bot deployed somewhere must not have its update
+     * stream hijacked merely by adding the token in Colgram to browse its dialogs.
+     */
+    public static boolean isPassiveBotMode(Context context, int account) {
+        if (context == null) return true;
+        return context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE)
+                .getBoolean("passive_mode", true);
+    }
+
+    public static void setPassiveBotMode(Context context, int account, boolean passive) {
+        if (context == null) return;
+        context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE)
+                .edit().putBoolean("passive_mode", passive).apply();
     }
 
     /**
@@ -315,11 +386,24 @@ public class ColgramBotSync {
 
             String token = getBotToken(appContext, account);
             if (!token.isEmpty()) {
-                deleteWebhook(token);
-                // Make sure we know who the bot is before polling updates.
+                // Make sure we know who the bot is before polling updates. getMe is
+                // read-only and safe to call in either mode.
                 if (getBotSelfId(appContext, account) == 0) {
                     fetchAndRegisterBotSelf(appContext, account, token);
                 }
+
+                // Passive mode: never take the update stream away from an existing
+                // deployment. deleteWebhook() is skipped and the long-poll loop below is
+                // not entered, so dialogs are still synced via syncBotDialogs() but
+                // Colgram consumes nothing from getUpdates.
+                if (isPassiveBotMode(appContext, account)) {
+                    Log.i(TAG, "passive bot mode: leaving webhook/updates untouched");
+                    return;
+                }
+
+                deleteWebhook(token, true);
+            } else {
+                return;
             }
 
             SharedPreferences prefs = appContext.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE);
@@ -376,10 +460,14 @@ public class ColgramBotSync {
 
                     int responseCode = conn.getResponseCode();
                     if (responseCode == 409) {
-                        // Webhook was active, delete it and retry
-                        deleteWebhook(token);
-                        Thread.sleep(2000);
-                        continue;
+                        // 409 means a webhook is active on this token. Something else is
+                        // serving this bot. Do NOT delete the webhook — that would silently
+                        // steal the bot's traffic from its real deployment. Stop polling and
+                        // leave the stream alone; the user can opt in explicitly from the
+                        // bot settings if they really want Colgram to take over.
+                        Log.w(TAG, "getUpdates conflict (409): another consumer owns this token. "
+                                + "Stopping poller and leaving the webhook untouched.");
+                        break;
                     }
 
                     if (responseCode != 200) {
@@ -504,7 +592,17 @@ public class ColgramBotSync {
 
                 int responseCode = conn.getResponseCode();
                 if (responseCode == 409) {
-                    deleteWebhook(token);
+                    // A webhook is registered on this token. Do not touch it — see
+                    // deleteWebhook() for why. Report it so the empty chat list is not
+                    // mistaken for "the bot has no chats".
+                    if (userInitiated) {
+                        mainHandler.post(() -> Toast.makeText(context,
+                                "У бота установлен webhook. Colgram не трогает очередь обновлений, "
+                                        + "чтобы не мешать вашему боту. Чаты подтянутся только те, "
+                                        + "что уже есть в Bot API.",
+                                Toast.LENGTH_LONG).show());
+                    }
+                    Log.w(TAG, "syncBotDialogs: 409, webhook owned by another consumer");
                 }
                 if (responseCode != 200) {
                     if (userInitiated) {
@@ -922,35 +1020,93 @@ public class ColgramBotSync {
     }
 
     /**
+     * Generic Bot API POST helper that actually surfaces Telegram's error text.
+     *
+     * Two traps this avoids:
+     *   1. Reading getResponseCode() without draining the stream leaves the connection
+     *      in a state where the error body is never readable, so a rejected request just
+     *      looks like "HTTP 400" with no reason. The Bot API always explains itself in the
+     *      body ("description" field) and that message is what the user needs to see.
+     *   2. openConnection() must be given the POST stream before the code is read.
+     *
+     * @return the parsed JSON response, or null if the request could not be performed
+     */
+    private static JSONObject botApiPost(String token, String method, JSONObject payload) {
+        try {
+            HttpURLConnection conn = openConnection(
+                    "https://api.telegram.org/bot" + token + "/" + method, 15000);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            byte[] body = payload.toString().getBytes("UTF-8");
+            OutputStream os = conn.getOutputStream();
+            os.write(body);
+            os.close();
+
+            int code = conn.getResponseCode();
+            java.io.InputStream stream = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            StringBuilder sb = new StringBuilder();
+            if (stream != null) {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
+                String line;
+                while ((line = reader.readLine()) != null) sb.append(line);
+                reader.close();
+            }
+            JSONObject result = sb.length() > 0 ? new JSONObject(sb.toString()) : new JSONObject();
+            if (code < 200 || code >= 300) {
+                Log.w(TAG, method + " HTTP " + code + ": " + sb);
+            }
+            return result;
+        } catch (Throwable t) {
+            Log.w(TAG, method + " failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    /** Human-readable reason from a Bot API error response, or null when it succeeded. */
+    private static String botApiError(JSONObject resp) {
+        if (resp == null) return "no response";
+        if (resp.optBoolean("ok", false)) return null;
+        String desc = resp.optString("description", "");
+        return desc.isEmpty() ? "unknown error" : desc;
+    }
+
+    /**
      * Updates bot name via Telegram Bot API setMyName (bypassing MTProto BOT_METHOD_INVALID).
      */
     public static void updateBotName(final Context context, final int account, final String newName) {
         final String token = getBotToken(context, account);
-        if (token.isEmpty()) return;
+        if (token.isEmpty()) {
+            mainHandler.post(() -> Toast.makeText(context, "Токен бота не найден", Toast.LENGTH_SHORT).show());
+            return;
+        }
 
         executor.execute(() -> {
             try {
-                String urlStr = "https://api.telegram.org/bot" + token + "/setMyName";
                 JSONObject json = new JSONObject();
                 json.put("name", newName);
+                JSONObject resp = botApiPost(token, "setMyName", json);
+                final String err = botApiError(resp);
 
-                HttpURLConnection conn = openConnection(urlStr, 12000);
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                OutputStream os = conn.getOutputStream();
-                os.write(json.toString().getBytes("UTF-8"));
-                os.close();
-
-                int code = conn.getResponseCode();
-                if (code == 200) {
+                if (err == null) {
                     mainHandler.post(() -> {
                         try {
                             Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
                             Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
                             Object currentUser = ucClass.getMethod("getCurrentUser").invoke(uc);
                             if (currentUser != null) {
-                                currentUser.getClass().getField("first_name").set(currentUser, newName);
+                                // Split the display name the way Telegram does, so the
+                                // profile header and the dialog row agree with the server.
+                                String first = newName;
+                                String last = "";
+                                int sp = newName.indexOf(' ');
+                                if (sp > 0) {
+                                    first = newName.substring(0, sp);
+                                    last = newName.substring(sp + 1).trim();
+                                }
+                                currentUser.getClass().getField("first_name").set(currentUser, first);
+                                currentUser.getClass().getField("last_name").set(currentUser, last);
                                 ucClass.getMethod("saveConfig", boolean.class).invoke(uc, true);
                             }
 
@@ -959,13 +1115,14 @@ public class ColgramBotSync {
                             int mainUserInfoChanged = ncClass.getField("mainUserInfoChanged").getInt(null);
                             ncClass.getMethod("postNotificationName", int.class, Object[].class).invoke(nc, mainUserInfoChanged, new Object[0]);
 
-                            Toast.makeText(context, "Имя бота успешно обновлено!", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(context, "Имя бота обновлено", Toast.LENGTH_SHORT).show();
                         } catch (Throwable t) {
                             Log.e(TAG, "Error updating local user name", t);
                         }
                     });
                 } else {
-                    mainHandler.post(() -> Toast.makeText(context, "Ошибка изменения имени бота: HTTP " + code, Toast.LENGTH_SHORT).show());
+                    mainHandler.post(() -> Toast.makeText(context,
+                            "Не удалось изменить имя: " + err, Toast.LENGTH_LONG).show());
                 }
             } catch (Throwable t) {
                 Log.e(TAG, "Error setMyName", t);
@@ -974,55 +1131,71 @@ public class ColgramBotSync {
     }
 
     /**
-     * Updates bot description (bio) via Telegram Bot API setMyDescription & setMyShortDescription.
+     * Updates bot description via Bot API setMyDescription (shown on the bot profile page)
+     * and setMyShortDescription (shown in the chat header / share sheet).
+     *
+     * Both are attempted independently: Telegram rejects a too-long description on one
+     * field while accepting the other, so a single shared error path would report a
+     * failure for an edit that partly succeeded. The first real error is surfaced.
      */
     public static void updateBotDescription(final Context context, final int account, final String newBio, final Runnable onDone) {
         final String token = getBotToken(context, account);
-        if (token.isEmpty()) return;
+        if (token.isEmpty()) {
+            mainHandler.post(() -> Toast.makeText(context, "Токен бота не найден", Toast.LENGTH_SHORT).show());
+            return;
+        }
 
         executor.execute(() -> {
+            String firstError = null;
             try {
-                // 1. setMyDescription (displayed on bot profile)
-                String urlStr = "https://api.telegram.org/bot" + token + "/setMyDescription";
-                JSONObject json = new JSONObject();
-                json.put("description", newBio);
+                JSONObject full = new JSONObject();
+                full.put("description", newBio);
+                String e1 = botApiError(botApiPost(token, "setMyDescription", full));
+                if (e1 != null) firstError = e1;
 
-                HttpURLConnection conn = openConnection(urlStr, 12000);
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                OutputStream os = conn.getOutputStream();
-                os.write(json.toString().getBytes("UTF-8"));
-                os.close();
-                int code = conn.getResponseCode();
-
-                // 2. setMyShortDescription
-                try {
-                    String urlShort = "https://api.telegram.org/bot" + token + "/setMyShortDescription";
-                    JSONObject jsonShort = new JSONObject();
-                    jsonShort.put("short_description", newBio);
-                    HttpURLConnection connShort = openConnection(urlShort, 10000);
-                    connShort.setRequestMethod("POST");
-                    connShort.setDoOutput(true);
-                    connShort.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                    OutputStream osShort = connShort.getOutputStream();
-                    osShort.write(jsonShort.toString().getBytes("UTF-8"));
-                    osShort.close();
-                    connShort.getResponseCode();
-                } catch (Throwable ignored) {}
-
-                if (code == 200) {
-                    mainHandler.post(() -> {
-                        Toast.makeText(context, "Описание бота успешно обновлено!", Toast.LENGTH_SHORT).show();
-                        if (onDone != null) onDone.run();
-                    });
-                } else {
-                    mainHandler.post(() -> Toast.makeText(context, "Ошибка изменения описания: HTTP " + code, Toast.LENGTH_SHORT).show());
-                }
+                JSONObject shortDesc = new JSONObject();
+                shortDesc.put("short_description", newBio);
+                String e2 = botApiError(botApiPost(token, "setMyShortDescription", shortDesc));
+                if (e2 != null && firstError == null) firstError = e2;
             } catch (Throwable t) {
                 Log.e(TAG, "Error setMyDescription", t);
+                if (firstError == null) firstError = t.getMessage();
             }
+
+            final String finalError = firstError;
+            mainHandler.post(() -> {
+                if (finalError == null) {
+                    Toast.makeText(context, "Описание бота обновлено", Toast.LENGTH_SHORT).show();
+                    if (onDone != null) onDone.run();
+                } else {
+                    Toast.makeText(context, "Не удалось изменить описание: " + finalError, Toast.LENGTH_LONG).show();
+                }
+            });
         });
+    }
+
+    /**
+     * Read the bot's current profile from the API so the edit screens open pre-filled.
+     * Returns null when the token is missing or the call fails.
+     */
+    public static JSONObject fetchBotProfile(Context context, int account) {
+        String token = getBotToken(context, account);
+        if (token.isEmpty()) return null;
+        try {
+            HttpURLConnection conn = openConnection("https://api.telegram.org/bot" + token + "/getMe", 12000);
+            conn.setRequestMethod("GET");
+            if (conn.getResponseCode() != 200) return null;
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+            JSONObject root = new JSONObject(sb.toString());
+            return root.optBoolean("ok", false) ? root.optJSONObject("result") : null;
+        } catch (Throwable t) {
+            Log.w(TAG, "fetchBotProfile failed: " + t.getMessage());
+            return null;
+        }
     }
 
     private static int getThemeColor(Class<?> themeClass, String keyName, int defaultColor) {

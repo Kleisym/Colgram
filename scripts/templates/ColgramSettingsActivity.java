@@ -39,8 +39,11 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private int vaultHeaderRow;
     private int antiDeleteRow;
+    private int antiDeleteHighlightRow;
+    private int antiDeleteWipeRow;
     private int preserveMediaRow;
     private int editHistoryRow;
+    private int autoHidePhoneRow;
     private int vaultSectionRow;
 
     private int ghostHeaderRow;
@@ -56,6 +59,7 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private int networkHeaderRow;
     private int dpiBypassRow;
+    private int dohRow;
     private int builtinProxyRow;
     private int proxyBrowserRow;
     private int currentProxyRow;
@@ -84,6 +88,9 @@ public class ColgramSettingsActivity extends BaseFragment {
         antiDeleteRow = rowCount++;
         preserveMediaRow = rowCount++;
         editHistoryRow = rowCount++;
+        antiDeleteHighlightRow = rowCount++;
+        antiDeleteWipeRow = rowCount++;
+        autoHidePhoneRow = rowCount++;
         vaultSectionRow = rowCount++;
 
         ghostHeaderRow = rowCount++;
@@ -99,6 +106,7 @@ public class ColgramSettingsActivity extends BaseFragment {
 
         networkHeaderRow = rowCount++;
         dpiBypassRow = rowCount++;
+        dohRow = rowCount++;
         builtinProxyRow = rowCount++;
         proxyBrowserRow = rowCount++;
         currentProxyRow = rowCount++;
@@ -166,6 +174,24 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
+            } else if (position == antiDeleteHighlightRow) {
+                boolean val = !ColgramConfig.isAntiDeleteHighlightEnabled();
+                ColgramConfig.setAntiDeleteHighlightEnabled(val);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(val);
+                }
+            } else if (position == antiDeleteWipeRow) {
+                boolean val = !ColgramConfig.isAntiDeleteWipeEnabled();
+                ColgramConfig.setAntiDeleteWipeEnabled(val);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(val);
+                }
+            } else if (position == autoHidePhoneRow) {
+                boolean val = !ColgramConfig.isAutoHidePhoneEnabled();
+                ColgramConfig.setAutoHidePhoneEnabled(val);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(val);
+                }
             } else if (position == ghostReadRow) {
                 boolean val = !ColgramConfig.isGhostReadEnabled();
                 ColgramConfig.setGhostReadEnabled(val);
@@ -207,6 +233,12 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(ColgramDpiBypass.isRunning());
+                }
+            } else if (position == dohRow) {
+                boolean val = !ColgramConfig.isDohEnabled();
+                ColgramConfig.setDohEnabled(val);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(val);
                 }
             } else if (position == builtinProxyRow) {
                 boolean val = !ColgramConfig.isBuiltinProxyEnabled();
@@ -272,9 +304,9 @@ public class ColgramSettingsActivity extends BaseFragment {
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
             int position = holder.getAdapterPosition();
             return position == cloakEnabledRow || position == cloakModelRow ||
-                   position == antiDeleteRow || position == preserveMediaRow || position == editHistoryRow ||
+                   position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
-                   position == cyberThemeRow || position == dpiBypassRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
+                   position == cyberThemeRow || position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
                    position == sandboxStorageRow;
         }
 
@@ -345,7 +377,13 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == preserveMediaRow) {
                         checkCell.setTextAndCheck("Защита медиафайлов от удаления", ColgramConfig.isPreserveMediaEnabled(), true);
                     } else if (position == editHistoryRow) {
-                        checkCell.setTextAndCheck("Сохранять историю редакций текста", ColgramConfig.isEditHistoryEnabled(), false);
+                        checkCell.setTextAndCheck("Сохранять историю редакций текста", ColgramConfig.isEditHistoryEnabled(), true);
+                    } else if (position == antiDeleteHighlightRow) {
+                        checkCell.setTextAndCheck("Помечать удалённые значком 🗑", ColgramConfig.isAntiDeleteHighlightEnabled(), true);
+                    } else if (position == antiDeleteWipeRow) {
+                        checkCell.setTextAndCheck("Стирать текст удалённых (иначе — архив)", ColgramConfig.isAntiDeleteWipeEnabled(), true);
+                    } else if (position == autoHidePhoneRow) {
+                        checkCell.setTextAndCheck("Скрывать номер телефона при входе", ColgramConfig.isAutoHidePhoneEnabled(), false);
                     } else if (position == ghostReadRow) {
                         checkCell.setTextAndCheck("Не отправлять отчет о прочтении", ColgramConfig.isGhostReadEnabled(), true);
                     } else if (position == ghostTypingRow) {
@@ -358,6 +396,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                         checkCell.setTextAndCheck("Красно-чёрная тема Colgram Cyber", ColgramConfig.isCyberThemeEnabled(), false);
                     } else if (position == dpiBypassRow) {
                         checkCell.setTextAndCheck("Обходчик ТСПУ (TCP Desync / 127.0.0.1)", ColgramDpiBypass.isRunning(), true);
+                    } else if (position == dohRow) {
+                        checkCell.setTextAndCheck("DNS-over-HTTPS (шифрованный DNS)", ColgramConfig.isDohEnabled(), true);
                     } else if (position == builtinProxyRow) {
                         checkCell.setTextAndCheck("Встроенный пул Fake-TLS MTProto", ColgramConfig.isBuiltinProxyEnabled(), true);
                     } else if (position == proxyBrowserRow) {

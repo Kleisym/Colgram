@@ -15,7 +15,7 @@ import java.util.List;
  */
 public class ColgramDatabase extends SQLiteOpenHelper {
     private static final String DATABASE_NAME = "colgram_vault.db";
-    private static final int DATABASE_VERSION = 1;
+    private static final int DATABASE_VERSION = 2;
 
     // Table: Deleted Messages
     public static final String TABLE_DELETED = "deleted_messages";
@@ -30,6 +30,11 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     public static final String COL_EDIT_MSG_ID = "message_id";
     public static final String COL_EDIT_TIMESTAMP = "edit_timestamp";
     public static final String COL_EDIT_PREV_TEXT = "previous_text";
+
+    // Table: Per-user notification blocks
+    public static final String TABLE_BLOCKED_USERS = "blocked_notify_users";
+    public static final String COL_BLOCK_USER_ID = "user_id";
+    public static final String COL_BLOCK_ADDED_AT = "added_at";
 
     private static ColgramDatabase instance;
 
@@ -66,11 +71,84 @@ public class ColgramDatabase extends SQLiteOpenHelper {
         // Index for fast lookup by dialog and message id
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_edits_lookup ON " + TABLE_EDITS
                 + " (" + COL_EDIT_DIALOG_ID + ", " + COL_EDIT_MSG_ID + ");");
+
+        // Users whose group pings should not reach this device at all.
+        db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_BLOCKED_USERS + " ("
+                + COL_BLOCK_USER_ID + " INTEGER PRIMARY KEY, "
+                + COL_BLOCK_ADDED_AT + " INTEGER"
+                + ");");
     }
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        // Migration logic for future schema updates
+        // v1 -> v2: per-user notification blocks
+        if (oldVersion < 2) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_BLOCKED_USERS + " ("
+                    + COL_BLOCK_USER_ID + " INTEGER PRIMARY KEY, "
+                    + COL_BLOCK_ADDED_AT + " INTEGER"
+                    + ");");
+        }
+    }
+
+    /**
+     * Suppress notifications originating from this user id.
+     *
+     * Applies to pings in groups and channels: the message is still delivered and readable
+     * on opening the chat, it is only kept quiet — no notification, no badge, no sound.
+     */
+    public void blockNotificationsFrom(long userId) {
+        if (userId == 0) return;
+        try {
+            SQLiteDatabase db = getWritableDatabase();
+            ContentValues values = new ContentValues();
+            values.put(COL_BLOCK_USER_ID, userId);
+            values.put(COL_BLOCK_ADDED_AT, System.currentTimeMillis());
+            db.insertWithOnConflict(TABLE_BLOCKED_USERS, null, values, SQLiteDatabase.CONFLICT_REPLACE);
+        } catch (Exception e) {
+            // Never let this throw into the message pipeline.
+        }
+    }
+
+    public void unblockNotificationsFrom(long userId) {
+        if (userId == 0) return;
+        try {
+            getWritableDatabase().delete(TABLE_BLOCKED_USERS,
+                    COL_BLOCK_USER_ID + "=?", new String[]{String.valueOf(userId)});
+        } catch (Exception e) {
+            // Silently handle
+        }
+    }
+
+    public boolean isNotificationsBlockedFrom(long userId) {
+        if (userId == 0) return false;
+        try {
+            Cursor cursor = getReadableDatabase().query(TABLE_BLOCKED_USERS,
+                    new String[]{COL_BLOCK_USER_ID},
+                    COL_BLOCK_USER_ID + "=?",
+                    new String[]{String.valueOf(userId)},
+                    null, null, null);
+            boolean exists = cursor != null && cursor.getCount() > 0;
+            if (cursor != null) cursor.close();
+            return exists;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public List<Long> getBlockedNotifyUsers() {
+        List<Long> out = new ArrayList<>();
+        try {
+            Cursor cursor = getReadableDatabase().query(TABLE_BLOCKED_USERS,
+                    new String[]{COL_BLOCK_USER_ID},
+                    null, null, null, null, COL_BLOCK_ADDED_AT + " ASC");
+            if (cursor != null) {
+                while (cursor.moveToNext()) out.add(cursor.getLong(0));
+                cursor.close();
+            }
+        } catch (Exception e) {
+            // Silently handle
+        }
+        return out;
     }
 
     /**

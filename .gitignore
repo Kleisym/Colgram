@@ -32,3 +32,13 @@ Telegram-Src/
 
 # Local agent state: memory logs, caches, session scratch. Not project source.
 .workbuddy-ai/
+
+# Anti-spam userbot runtime state. The vendored .py modules under
+# colgram-core/src/main/assets/antispam/ are source and ARE tracked; anything the userbot
+# generates at runtime (session files, SQLite DB, generated config) must never ship, and a
+# test run that points init_app_storage() at the assets dir will create them there.
+colgram-core/src/main/assets/antispam/storage/
+colgram-core/src/main/assets/antispam/config.txt
+colgram-core/src/main/assets/antispam/*.session
+colgram-core/src/main/assets/antispam/*.session-journal
+colgram-core/src/main/assets/antispam/__pycache__/

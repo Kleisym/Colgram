@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
@@ -49,6 +50,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class ColgramTempMailActivity extends BaseFragment {
+
+    private static final String TAG = "ColgramTempMail";
 
     private RecyclerListView listView;
     private ListAdapter listAdapter;
@@ -95,9 +98,47 @@ public class ColgramTempMailActivity extends BaseFragment {
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
-        generateNewMailbox();
+        // Restore a previously created mailbox before generating a new one. The JWT is
+        // short-lived but the account is permanent, so reusing the saved address keeps the
+        // inbox the user was watching instead of silently replacing it on every open.
+        if (!restoreSavedMailbox()) {
+            generateNewMailbox();
+        }
         startAutoRefresh();
         return true;
+    }
+
+    /**
+     * Re-load the last mailbox from preferences and refresh its token.
+     *
+     * @return true when a usable mailbox was restored
+     */
+    private boolean restoreSavedMailbox() {
+        try {
+            Context ctx = getParentActivity();
+            if (ctx == null) return false;
+            android.content.SharedPreferences prefs =
+                    ctx.getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE);
+            String address = prefs.getString("address", "");
+            String password = prefs.getString("password", "");
+            if (address.isEmpty() || password.isEmpty()) return false;
+
+            currentEmail = address;
+            currentLogin = prefs.getString("login", "");
+            currentDomain = prefs.getString("domain", "");
+            mailTmToken = prefs.getString("token", "");
+
+            // The stored token is probably stale; refresh it up front so the first poll
+            // does not have to fail before recovering.
+            String fresh = refreshMailToken();
+            if (fresh == null) return false;
+
+            fetchMessages(false);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "restoreSavedMailbox failed: " + t.getMessage());
+            return false;
+        }
     }
 
     @Override
@@ -122,14 +163,32 @@ public class ColgramTempMailActivity extends BaseFragment {
             try {
                 // mail.tm — create a disposable mailbox.
                 // Step 1: fetch an available domain.
-                String resolvedDomain = "mail.tm";
-                try {
-                    JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
-                    JSONArray members = domRes.optJSONArray("hydra:member");
-                    if (members != null && members.length() > 0) {
-                        resolvedDomain = members.getJSONObject(0).optString("domain", "mail.tm");
+                //
+                // The literal "mail.tm" is NOT a valid mail.tm domain — the service hands
+                // out addresses on domains it actually operates (uberip.com and friends).
+                // Falling back to the literal meant account creation was rejected with 422
+                // and the whole feature looked dead. If the domain list cannot be read we
+                // must fail loudly instead of inventing an address.
+                String resolvedDomain = null;
+                JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
+                JSONArray members = domRes.optJSONArray("hydra:member");
+                if (members != null) {
+                    for (int i = 0; i < members.length(); i++) {
+                        JSONObject d = members.optJSONObject(i);
+                        if (d == null) continue;
+                        // Only use a domain the server reports as active; an inactive
+                        // domain accepts the account and then rejects the token.
+                        if (!d.optBoolean("isActive", true)) continue;
+                        String dn = d.optString("domain", "");
+                        if (!dn.isEmpty()) {
+                            resolvedDomain = dn;
+                            break;
+                        }
                     }
-                } catch (Throwable ignored) {}
+                }
+                if (resolvedDomain == null) {
+                    throw new IOException("Не удалось получить доступный домен mail.tm. Проверьте интернет.");
+                }
                 final String domain = resolvedDomain;
 
                 final String login = "colgram" + System.currentTimeMillis() % 1000000 + (int) (Math.random() * 9000 + 1000);
@@ -152,8 +211,24 @@ public class ColgramTempMailActivity extends BaseFragment {
                 authReq.put("password", password);
                 JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
                 final String token = authRes.optString("token", "");
+                if (token.isEmpty()) {
+                    throw new IOException("mail.tm не выдал токен для нового ящика");
+                }
 
                 mainHandler.post(() -> {
+                    // Persist the mailbox credentials: the JWT is short-lived and the
+                    // account is the only way to get a new one, so it must survive a
+                    // restart or the user loses the inbox they were watching.
+                    if (getParentActivity() != null) {
+                        getParentActivity().getSharedPreferences("colgram_tempmail", android.content.Context.MODE_PRIVATE)
+                                .edit()
+                                .putString("address", address)
+                                .putString("password", password)
+                                .putString("login", login)
+                                .putString("domain", domain)
+                                .putString("token", token)
+                                .apply();
+                    }
                     currentEmail = address;
                     currentLogin = login;
                     currentDomain = domain;
@@ -163,13 +238,49 @@ public class ColgramTempMailActivity extends BaseFragment {
                     fetchMessages(true);
                 });
             } catch (Throwable t) {
+                // Include the address we tried so a rejected domain is diagnosable.
+                final String msg = t.getMessage() == null ? t.toString() : t.getMessage();
                 mainHandler.post(() -> {
                     if (getParentActivity() != null) {
-                        Toast.makeText(getParentActivity(), "Не удалось создать ящик: " + t.getMessage(), Toast.LENGTH_LONG).show();
+                        Toast.makeText(getParentActivity(), "Не удалось создать ящик: " + msg, Toast.LENGTH_LONG).show();
                     }
                 });
             }
         });
+    }
+
+    /**
+     * Obtain a fresh JWT for the current mailbox.
+     *
+     * mail.tm bearer tokens expire (roughly an hour). The polling loop runs every 5s
+     * forever, so without a refresh the inbox silently stops updating partway through a
+     * session with no error shown — which reads as "temp mail does not work".
+     *
+     * @return the new token, or null when it could not be refreshed
+     */
+    private String refreshMailToken() {
+        try {
+            if (currentEmail == null || currentEmail.isEmpty()) return null;
+            android.content.SharedPreferences prefs =
+                    getParentActivity() != null ? getParentActivity().getSharedPreferences("colgram_tempmail", android.content.Context.MODE_PRIVATE) : null;
+            String password = prefs != null ? prefs.getString("password", "") : "";
+            if (password.isEmpty()) return null;
+
+            JSONObject authReq = new JSONObject();
+            authReq.put("address", currentEmail);
+            authReq.put("password", password);
+            JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
+            String newToken = authRes.optString("token", "");
+            if (newToken.isEmpty()) return null;
+
+            mailTmToken = newToken;
+            if (prefs != null) prefs.edit().putString("token", newToken).apply();
+            Log.i(TAG, "temp mail token refreshed");
+            return newToken;
+        } catch (Throwable t) {
+            Log.w(TAG, "token refresh failed: " + t.getMessage());
+            return null;
+        }
     }
 
     private JSONObject httpGetJson(String urlStr) throws Exception {
@@ -178,17 +289,27 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private JSONObject httpGetJsonWithAuth(String urlStr, String bearer) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-        conn.setConnectTimeout(8000);
-        conn.setReadTimeout(8000);
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(10000);
         conn.setRequestProperty("Accept", "application/json");
         if (bearer != null) conn.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
-            BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+            int code = conn.getResponseCode();
+            // Read the error stream for non-2xx. Calling getInputStream() on a 4xx throws
+            // FileNotFoundException and the server's explanation is lost, which is why a
+            // rejected/expired request used to look like an unexplained failure.
+            InputStream stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            if (stream == null) throw new IOException("HTTP " + code);
+            BufferedReader r = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = r.readLine()) != null) sb.append(line);
             r.close();
-            return new JSONObject(sb.toString());
+            JSONObject json = new JSONObject(sb.toString());
+            if (code < 200 || code >= 300) {
+                throw new IOException(describeApiError(code, json));
+            }
+            return json;
         } finally {
             conn.disconnect();
         }
@@ -196,8 +317,8 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private JSONObject httpPostJson(String urlStr, String jsonBody) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-        conn.setConnectTimeout(8000);
-        conn.setReadTimeout(8000);
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(10000);
         conn.setRequestMethod("POST");
         conn.setDoOutput(true);
         conn.setRequestProperty("Content-Type", "application/json");
@@ -210,48 +331,116 @@ public class ColgramTempMailActivity extends BaseFragment {
             int code = conn.getResponseCode();
             InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
             if (is == null) throw new IOException("HTTP " + code);
-            BufferedReader r = new BufferedReader(new InputStreamReader(is));
+            BufferedReader r = new BufferedReader(new InputStreamReader(is, "UTF-8"));
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = r.readLine()) != null) sb.append(line);
             r.close();
-            return new JSONObject(sb.toString());
+            JSONObject json = new JSONObject(sb.toString());
+            if (code < 200 || code >= 300) {
+                throw new IOException(describeApiError(code, json));
+            }
+            return json;
         } finally {
             conn.disconnect();
         }
+    }
+
+    /**
+     * Turn a mail.tm error payload into something a human can act on.
+     *
+     * The API follows the API Platform convention: a machine code plus a prose
+     * description, sometimes a list of per-field violations. Surface all of it —
+     * "422 Unprocessable Entity" alone tells the user nothing, whereas
+     * "address: This value is already used" is immediately actionable.
+     */
+    private String describeApiError(int code, JSONObject json) {
+        StringBuilder sb = new StringBuilder("HTTP ").append(code);
+        String desc = json.optString("detail", "");
+        if (desc.isEmpty()) desc = json.optString("hydra:description", "");
+        if (desc.isEmpty()) desc = json.optString("message", "");
+        if (!desc.isEmpty()) sb.append(": ").append(desc);
+
+        JSONArray violations = json.optJSONArray("violations");
+        if (violations != null) {
+            for (int i = 0; i < violations.length(); i++) {
+                JSONObject v = violations.optJSONObject(i);
+                if (v == null) continue;
+                String prop = v.optString("propertyPath", "");
+                String msg = v.optString("message", "");
+                if (!msg.isEmpty()) sb.append(" [").append(prop).append(": ").append(msg).append("]");
+            }
+        }
+        return sb.toString();
     }
 
     private void fetchMessages(boolean notifyUser) {
         if (mailTmToken == null || mailTmToken.isEmpty()) return;
         executor.execute(() -> {
             try {
-                JSONObject res = httpGetJsonWithAuth("https://api.mail.tm/messages?page=1", mailTmToken);
-                JSONArray arr = res.optJSONArray("hydra:member");
-                final List<TempMessage> list = new ArrayList<>();
-                if (arr != null) {
-                    for (int i = 0; i < arr.length(); i++) {
-                        JSONObject obj = arr.getJSONObject(i);
-                        String from = "";
-                        JSONObject fromObj = obj.optJSONObject("from");
-                        if (fromObj != null) from = fromObj.optString("address", "");
-                        list.add(new TempMessage(
-                            obj.optString("id", "").hashCode(),
-                            from,
-                            obj.optString("subject", ""),
-                            obj.optString("createdAt", "")
-                        ));
-                    }
+                List<TempMessage> list;
+                try {
+                    list = loadInbox();
+                } catch (Throwable first) {
+                    // A 401 here almost always means the JWT aged out. Refresh once and
+                    // retry before giving up, otherwise the poller dies silently and the
+                    // inbox just stops updating with no message — the exact symptom the
+                    // user reports as "temp mail is dead".
+                    String refreshed = refreshMailToken();
+                    if (refreshed == null) throw first;
+                    list = loadInbox();
                 }
+
+                final List<TempMessage> finalList = list;
                 mainHandler.post(() -> {
                     messages.clear();
-                    messages.addAll(list);
+                    messages.addAll(finalList);
                     if (listAdapter != null) listAdapter.notifyDataSetChanged();
                     if (notifyUser && getParentActivity() != null) {
-                        Toast.makeText(getParentActivity(), "Входящие обновлены (" + list.size() + " писем)", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getParentActivity(), "Входящие обновлены (" + finalList.size() + " писем)", Toast.LENGTH_SHORT).show();
                     }
                 });
-            } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                // Report the failure instead of swallowing it. The previous version used
+                // `catch (Throwable ignored) {}`, which is why a broken mailbox looked
+                // identical to an empty one.
+                final String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+                Log.w(TAG, "fetchMessages failed: " + msg);
+                if (notifyUser) {
+                    mainHandler.post(() -> {
+                        if (getParentActivity() != null) {
+                            Toast.makeText(getParentActivity(), "Ошибка почты: " + msg, Toast.LENGTH_LONG).show();
+                        }
+                    });
+                }
+            }
         });
+    }
+
+    private List<TempMessage> loadInbox() throws Exception {
+        JSONObject res = httpGetJsonWithAuth("https://api.mail.tm/messages?page=1", mailTmToken);
+        JSONArray arr = res.optJSONArray("hydra:member");
+        final List<TempMessage> list = new ArrayList<>();
+        if (arr != null) {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                String from = "";
+                JSONObject fromObj = obj.optJSONObject("from");
+                if (fromObj != null) from = fromObj.optString("address", "");
+                String tmId = obj.optString("id", "");
+                // Row identity is the real mail.tm id, not String.hashCode(). The old hash
+                // was only 32 bits (collisions are plausible inside a mailbox) and can be
+                // negative, which broke the id lookup in readMessageContent().
+                list.add(new TempMessage(
+                    tmId.hashCode() & 0x7fffffff,
+                    tmId,
+                    from,
+                    obj.optString("subject", ""),
+                    obj.optString("createdAt", "")
+                ));
+            }
+        }
+        return list;
     }
 
     private void readMessageContent(int messageId) {
