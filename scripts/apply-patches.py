@@ -51,23 +51,55 @@ def patch_file(filepath, search_pattern, replacement, description):
 def inject_hooks(repo_path):
     print("[*] Performing semantic code injection into Telegram source...")
 
-    # 1. ApplicationLoader.java -> Initialize Colgram core
+    # 1. ApplicationLoader.java -> Initialize Colgram core, LAST.
+    #
+    # ⚠️ ORDERING IS LOAD-BEARING. This used to be injected right after
+    # `applicationContext = getApplicationContext();`, which sits BEFORE all of:
+    #
+    #   * super.onCreate()                      - Application base class init
+    #   * AndroidUtilities.getHelloWorld()      - class-loads AndroidUtilities, whose
+    #                                             static block reads
+    #                                             ApplicationLoader.applicationContext
+    #                                             and calls checkDisplaySize()
+    #   * NativeLoader.initNativeLibs()         - this is what actually loads
+    #                                             libtmessages.49.so
+    #   * ConnectionsManager.native_setJava()   - installs the Java<->native bridge
+    #
+    # So Colgram was doing storage/database/plugin setup (it writes files and spawns
+    # threads) in a window where the native library did not exist yet and the
+    # framework had not finished bootstrapping. Upstream's own comment marks
+    # AndroidUtilities as must-be-initialized-first for exactly this reason.
+    #
+    # ColgramHookHandler.init() only records state and hands off to subsystems that
+    # already defer their own socket/disk work by 5-10s, so nothing needs it early.
+    # Running it at the very end of onCreate is both correct and safe.
+    #
+    # ColgramUiBridge.install(this) rides along here: it registers an
+    # Application.ActivityLifecycleCallbacks, and it needs `this` to be a fully
+    # constructed Application. Several plugin-facing Telegram APIs (notably
+    # SendMessagesHelper.editMessage) require a live BaseFragment and fail silently
+    # without one; colgram-core cannot reference Activity/BaseFragment at compile
+    # time, so it tracks the top activity through these callbacks instead.
     app_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java")
     patch_file(
         app_loader,
-        "applicationContext = getApplicationContext();",
-        "applicationContext = getApplicationContext();\n            org.colgram.core.ColgramHookHandler.init(applicationContext);",
-        "ApplicationLoader.onCreate initialization"
-    )
-    # 1b. Let Colgram track which screen is on top. Several Telegram APIs that plugin
-    #     features need (notably SendMessagesHelper.editMessage) require a live fragment
-    #     and fail silently without one. colgram-core cannot reference Activity or
-    #     BaseFragment at compile time, so it registers lifecycle callbacks here instead.
-    patch_file(
-        app_loader,
-        "org.colgram.core.ColgramHookHandler.init(applicationContext);",
-        "org.colgram.core.ColgramHookHandler.init(applicationContext);\n            org.colgram.core.ColgramUiBridge.install(this);",
-        "ApplicationLoader.onCreate UI bridge registration"
+        "        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
+        "        ProxyRotationController.init();\n"
+        "    }",
+        "        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
+        "        ProxyRotationController.init();\n"
+        "\n"
+        "        // Colgram: initialise LAST, once AndroidUtilities, the native library and\n"
+        "        // the Java<->native bridge all exist. See the note in apply-patches.py -\n"
+        "        // this used to run before super.onCreate() and that was a real bug.\n"
+        "        try {\n"
+        "            org.colgram.core.ColgramHookHandler.init(applicationContext);\n"
+        "            org.colgram.core.ColgramUiBridge.install(this);\n"
+        "        } catch (Throwable ignore) {\n"
+        "\n"
+        "        }\n"
+        "    }",
+        "ApplicationLoader.onCreate Colgram initialization (after native load)"
     )
 
     # 2. ConnectionsManager.java -> Hardware & OS Cloaking
@@ -926,19 +958,48 @@ def inject_hooks(repo_path):
             "DialogsActivity Options Menu: Colgram Entries"
         )
 
-    # 49. UserConfig.java -> Unlimited Accounts
+    # 49. UserConfig.java -> more accounts. HARD CAP 5, imposed by the native library.
     #
-    # MAX_ACCOUNT_COUNT is a compile-time array size, not a soft limit: UserConfig holds
-    # static arrays of exactly this length, and every loop that iterates accounts is
-    # bounded by it. Raising the constant is therefore the correct and only change needed
-    # — no other site hardcodes 4 in a way that would desync. Telegram's own UI reads
-    # UserConfig.MAX_ACCOUNT_COUNT / getMaxAccountCount() rather than a literal.
+    # ⚠️ The Java value must NEVER exceed the value the native tgnet library was
+    # compiled with, or the process corrupts its own memory. The native library is NOT
+    # built from this tree: download_official_binaries() pulls libtmessages.49.so
+    # straight out of telegram.org/dl/android/apk and disables externalNativeBuild, so
+    # the shipped .so is byte-identical to the official one, compiled with:
+    #
+    #     jni/tgnet/Defines.h:  #define MAX_ACCOUNT_COUNT 5
+    #
+    # which sizes a GLOBAL array in jni/tgnet/ConnectionsManager.cpp:
+    #
+    #     JNIEnv *jniEnv[MAX_ACCOUNT_COUNT];                                  // 5 slots
+    #     ...
+    #     javaVm->AttachCurrentThread(&jniEnv[networkManager->instanceNum], nullptr);
+    #
+    # Every account's network thread stores its JNIEnv* at jniEnv[instanceNum]. With
+    # Java raised to 10, accounts 5..9 write FIVE POINTERS PAST THE END of that array,
+    # straight into whatever globals sit next to it. Native then dereferences the
+    # clobbered slots from its own callbacks
+    # (TgNetWrapper.cpp: jniEnv[instanceNum]->CallStaticVoidMethod(..., onUpdate, ...))
+    # and the process dies with SIGSEGV inside libtmessages.49.so about 3s after launch.
+    #
+    # This is the long-standing "app dies right after the icon" crash. It is memory
+    # corruption, which is why the signature MOVED between runs - one tombstone shows a
+    # null deref (fault addr 0x32) on a native tgnet pthread, the next shows ArtMethod
+    # corruption during ART's GC stack walk (FindOatMethodFor, fault addr 0x76). Both
+    # were blamed on the wrong thing for a long time: first an fdsan socket race, then
+    # IntroActivity.setVisibility(GONE), then "the native storage layer cannot hold that
+    # many SQLite handles". None of those were it. The array bound is.
+    #
+    # Stock is Java 4 / native 5 - upstream keeps one slot spare, which is why official
+    # Telegram is fine. 5 is therefore the highest value that cannot overflow, and it
+    # still gives one more account than stock. Going beyond 5 REQUIRES rebuilding
+    # libtmessages from jni/ with a larger constant; raising only the Java side is
+    # guaranteed memory corruption.
     user_config = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "UserConfig.java")
     patch_file(
         user_config,
         "public final static int MAX_ACCOUNT_COUNT = 4;",
-        "public final static int MAX_ACCOUNT_COUNT = 64; // Colgram: unlimited multi-account",
-        "UserConfig Unlimited Account Count"
+        "public final static int MAX_ACCOUNT_COUNT = 5; // Colgram: HARD CAP - native tgnet jniEnv[] is 5 (see apply-patches.py note 49)",
+        "UserConfig Raise Account Count"
     )
 
     # 50. MessagesController.java -> Unlimited Pinned Dialogs
@@ -1736,22 +1797,32 @@ def inject_hooks(repo_path):
             '''frameLayout2 = new FrameLayout(context);
         frameContainerView.addView(frameLayout2, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.LEFT | Gravity.TOP, 0, 78, 0, 0));
 
+        // The stock Telegram intro logo is drawn by the native Intro renderer into this
+        // TextureView's SurfaceTexture. Never hide or remove this view: the native side
+        // (org.telegram.messenger.Intro, JNI) keeps a reference to the SurfaceTexture and
+        // frees/draws into it on every frame. Making the view GONE while the renderer is
+        // still attached leaves the native code holding an invalid surface, which
+        // corrupts the heap and aborts the process:
+        //   Abort message: 'Scudo ERROR: invalid chunk state when deallocating address ...'
+        // (also seen as SIGSEGV / SEGV_MAPERR / fdsan in the same slot).
+        //
+        // So the Colgram logo is added as an OVERLAY that sits on top of the live native
+        // view rather than replacing it. The TextureView keeps rendering underneath and
+        // nothing native is invalidated.
         android.widget.ImageView colgramLogo = new android.widget.ImageView(context);
         colgramLogo.setImageResource(R.drawable.colgram_plane_splash);
         colgramLogo.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
         frameLayout2.addView(colgramLogo, LayoutHelper.createFrame(160, 160, Gravity.CENTER));
 
-        TextureView textureView = new TextureView(context);
-        textureView.setVisibility(View.GONE);''',
+        TextureView textureView = new TextureView(context);''',
             "IntroActivity Show Colgram Red Airplane"
         )
-        patch_file(
-            intro_file,
-            'frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));',
-            '''themeFrameLayout.setVisibility(View.GONE);
-        frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));''',
-            "IntroActivity Hide DayNight Switcher"
-        )
+        # NOTE: the day/night switcher used to be hidden here with
+        # themeFrameLayout.setVisibility(View.GONE). That is deliberately NOT done any more.
+        # The stock paragraph around this frame also carries the native intro surface; a
+        # GONE child of it is the same invalid-surface hazard described above, and it was a
+        # second contributing cause of the startup abort. Leaving the switcher visible is
+        # harmless (it is a themed 64x64 control) and keeps the native view tree intact.
         # Colgram branding on the intro screen.
         #
         # HISTORY — this block used to force fragmentView to 0xFF000000 (pure black) while
@@ -2602,10 +2673,23 @@ chaquopy {
 
 def configure_build_performance(repo_path):
     """
-    Cut cold-build time.
+    Make the build both faster AND survivable on a 16 GB developer machine.
 
-    The stock upstream gradle.properties is tuned for correctness on a generic
-    CI machine, not for wall-clock. Four settings dominate a clean compile here:
+    ⚠️ FIRST, THE MEMORY BUDGET — this is what actually causes "the build hangs".
+
+    A Gradle daemon that dies from OOM produces NO error output: the JVM process
+    is killed by the OS, the daemon log just stops mid-sentence, and the CLI
+    client waits forever on a dead socket. It looks like a hang and is routinely
+    misdiagnosed as "CI is stuck". On this machine (16 GB physical RAM, plus an
+    Android emulator holding ~5 GB) the upstream `-Xmx8g -XX:MaxMetaspaceSize=1g`
+    plus parallel workers overcommits badly. So:
+        org.gradle.jvmargs = -Xmx4g -XX:MaxMetaspaceSize=768m
+        org.gradle.parallel = false
+        org.gradle.workers.max = 2
+    Serial is not a regression here — it is faster than being OOM-killed and
+    having to restart from cold.
+
+    Then the actual wall-clock wins, in order of impact:
 
       1. android.enableJetifier=true  -> rewrites the bytecode of EVERY resolved
          dependency on every build. Telegram's dependency graph is fully AndroidX
@@ -2627,7 +2711,42 @@ def configure_build_performance(repo_path):
 
       3. org.gradle.caching -> ON. Reuses task outputs across builds.
 
-      4. android.enableR8.fullMode / optimizedResourceShrinking stay ON: they
+      4. Do NOT use --rerun-tasks when measuring. It forces every task to execute
+         and defeats both caches; the old "32 minutes" figure was measured that
+         way and is not representative of normal iteration.
+
+    🔴 THE OTHER "HANG" — Gradle's transform-output cleanup on Windows.
+
+    This one is NOT memory and NOT Chaquopy. Confirmed by live jstack on a frozen
+    daemon (cpu counter identical across 10s samples):
+
+        "included builds" ... RUNNABLE
+          at sun.nio.fs.WindowsNativeDispatcher.DeleteFile0(Native Method)
+          at ...DefaultDeleter.deleteRecursively(DefaultDeleter.java:134)   <- x7
+          at ...RemovePreviousOutputsStep.cleanupExclusivelyOwnedOutputs(...)
+          at ...AbstractTransformExecution.visitOutputs(...)
+
+    Mechanism: with `org.gradle.caching=true`, every artifact transform goes
+    through BuildCacheStep -> RemovePreviousOutputsStep, which calls
+    `ensureEmptyDirectory()` on the transform's previous output. Android's
+    `bundleLibRuntimeToDirRelease` transform emits ONE .dex PER CLASS —
+    measured 6,342 files / 49 MB in `TMessagesProj/build/.transforms/<hash>/`.
+    Gradle deletes those with a single-threaded native recursion, and on Windows
+    (NTFS + Defender filters) that call can block for tens of minutes or never
+    return. The daemon sits at 0% CPU with a live pid and empty log tail, which
+    reads exactly like "the build is stuck".
+
+    Fixes applied below:
+      - the deletion-speed settings below are what we can control from here;
+      - when it DOES wedge, clear `.transforms/` while NO daemon is running.
+
+    ⚠️ When clearing `.transforms/` manually, do NOT use `rm -rf` — it timed out
+    after 2 minutes on the 6,342-file dir. Use Python's shutil.rmtree, which did
+    the same job in 6.6 seconds:
+
+        python -c "import shutil;shutil.rmtree(r'...\\build\\.transforms\\<hash>')"
+
+      5. android.enableR8.fullMode / optimizedResourceShrinking stay ON: they
          cost time but change the shipped artifact, so they are left alone.
 
     Only additive/idempotent edits are made; an existing user override wins.
@@ -2646,8 +2765,15 @@ def configure_build_performance(repo_path):
         "android.enableJetifier": "false",
         # Reuse task outputs across builds instead of redoing them.
         "org.gradle.caching": "true",
-        # Parallel task execution (already true upstream, enforced here).
-        "org.gradle.parallel": "true",
+        # ⚠️ PARALLEL MUST STAY OFF on a 16 GB machine.
+        # It was briefly set to "true" here as a speed-up. That made the daemon
+        # get OOM-killed mid-build (no exception, no "BUILD FAILED" — the process
+        # simply vanishes and the CLI client hangs forever on a dead socket,
+        # which is exactly the "build hangs" symptom users report). Measured:
+        # 16 GB physical RAM, `org.gradle.jvmargs=-Xmx8g` + 1g metaspace, plus an
+        # Android emulator eating ~5 GB. Serial execution is both faster and
+        # survivable here. Do not turn this back on without measuring RSS.
+        "org.gradle.parallel": "false",
         # Keep a warm daemon so the JVM + configuration survive between builds.
         "org.gradle.daemon": "true",
         # Configuration cache stays OFF: Chaquopy's OutputDirTask on the
@@ -2657,6 +2783,26 @@ def configure_build_performance(repo_path):
         # Property caching. This is a file-locking log, not incremental state, so
         # disabling it trades a little I/O for less contention on Windows.
         "org.gradle.vfs.watch": "true",
+        # 🔴 THE BIG ONE for build time on Windows (see the transform note above).
+        # By default AGP dexes library classes PER CLASS FILE and writes one .dex
+        # per class into `build/.transforms/<hash>/transformed/bundleLibRuntimeToDirRelease/`.
+        # For :TMessagesProj that measured **8,852 files / 136 directories / 91 MB**,
+        # produced through `DexFilePerClassFileConsumer.DirectoryConsumer` ->
+        # `Files.createDirectories` -> a native `CreateDirectory0` syscall each.
+        # A live jstack caught the worker wedged there with cpu=98796ms.
+        #
+        # `android.useFullClasspathForDexingTransform=true` switches D8 to dex the
+        # full classpath in one pass and emit a single dex archive, instead of tens
+        # of thousands of tiny files. This is the documented remedy for slow dexing
+        # transforms; it is the difference between a build that crawls for 20+
+        # minutes writing per-class files and one that just dexes.
+        "android.useFullClasspathForDexingTransform": "true",
+        # Cap the heap so the daemon is not the thing that kills the machine.
+        # Upstream's -Xmx8g is more than this box can back on top of an emulator.
+        "org.gradle.jvmargs": "-Xmx4g -XX:MaxMetaspaceSize=768m",
+        # Keep the parallelism inside the daemon capped too.
+        "org.gradle.workers.max": "2",
+        "org.gradle.tooling.parallel": "false",
     }
 
     lines = props.splitlines()
@@ -2682,9 +2828,22 @@ def configure_build_performance(repo_path):
             out.append(f"{k}={desired[k]}")
 
     new_props = "\n".join(out) + "\n"
-    # Keep compile-incremental alongside the rest, idempotently.
-    if "org.gradle.java.compile-incremental" not in new_props:
-        new_props += "org.gradle.java.compile-incremental=true\n"
+
+    # Remove the bogus `org.gradle.java.compile-incremental` property if an older
+    # revision of this patcher left it behind. It does NOT exist in Gradle 8.13 —
+    # verified by scanning every jar in the distribution for the byte string
+    # (0 hits), while a real property like `vfs.watch` shows up in 3 classes.
+    # Java incremental compilation is enabled by default and has no user-facing
+    # property; setting a fake one is silently ignored, which makes it dangerous
+    # to leave around: it looks like a speed-up in `gradle.properties` while
+    # doing exactly nothing.
+    cleaned = []
+    for line in new_props.splitlines():
+        if line.strip().startswith("org.gradle.java.compile-incremental"):
+            print(" [-] Removed non-existent property org.gradle.java.compile-incremental")
+            continue
+        cleaned.append(line)
+    new_props = "\n".join(cleaned) + "\n"
 
     if new_props != props:
         with open(gradle_props, "w", encoding="utf-8") as f:

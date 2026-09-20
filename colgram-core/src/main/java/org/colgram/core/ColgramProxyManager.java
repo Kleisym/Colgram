@@ -39,6 +39,19 @@ import java.util.regex.Pattern;
  */
 public class ColgramProxyManager {
 
+    /**
+     * Number of account slots to configure proxy settings for.
+     *
+     * MUST stay in sync with UserConfig.MAX_ACCOUNT_COUNT (apply-patches.py patch 49)
+     * and MUST NOT exceed 5.
+     *
+     * 5 is not a taste decision - it is the size of the native tgnet global
+     * `JNIEnv *jniEnv[MAX_ACCOUNT_COUNT]` array (jni/tgnet/Defines.h), which the
+     * prebuilt official libtmessages.49.so was compiled with. Iterating past it
+     * writes off the end of that array and corrupts the process.
+     */
+    private static final int colgramAccountSlots = 5;
+
     private static final String TAG = "ColgramProxyManager";
 
     public static class ProxyItem {
@@ -365,8 +378,8 @@ public class ColgramProxyManager {
         if (ctx == null) return;
 
         try {
-            // 1. Persist proxy settings in SharedPreferences for all accounts (0..3)
-            for (int a = 0; a < 4; a++) {
+            // 1. Persist proxy settings in SharedPreferences for every account slot.
+            for (int a = 0; a < colgramAccountSlots; a++) {
                 String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
                 preferences.edit()
@@ -386,7 +399,7 @@ public class ColgramProxyManager {
                 Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
                         int.class, String.class, int.class, String.class, String.class, String.class);
                 nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < 4; i++) {
+                for (int i = 0; i < colgramAccountSlots; i++) {
                     nativeSetProxy.invoke(null, i, proxy.address, proxy.port, "", "", proxy.secret);
                 }
             } catch (Throwable t) {
@@ -468,7 +481,7 @@ public class ColgramProxyManager {
         Context ctx = context != null ? context.getApplicationContext() : appContext;
         if (ctx == null) return;
         try {
-            for (int a = 0; a < 4; a++) {
+            for (int a = 0; a < colgramAccountSlots; a++) {
                 String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
                 preferences.edit().putBoolean("proxy_enabled", false).apply();
@@ -479,7 +492,7 @@ public class ColgramProxyManager {
                 Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
                         int.class, String.class, int.class, String.class, String.class, String.class);
                 nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < 4; i++) {
+                for (int i = 0; i < colgramAccountSlots; i++) {
                     nativeSetProxy.invoke(null, i, "", 0, "", "", "");
                 }
             } catch (Throwable t) {
