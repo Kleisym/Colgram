@@ -14,6 +14,15 @@ __pycache__/
 scripts/error_log.txt
 scripts/build_*.log
 scripts/*.log
+# Root-level Gradle logs from the local build loop (build-ipv4fix2.log, build-mediahist.log, ...).
+# `scripts/*.log` above does not reach these, which is why ~100 of them had accumulated untracked.
+/build*.log
+/build*.txt
+# javac scratch + daemon dumps produced while diagnosing build stalls.
+javac.*.args
+daemon-stack*.txt
+crash-run.log
+ci-artifact/
 
 # --- Built / signed artifacts (too large to version; use Releases) ---
 dist/
@@ -32,6 +41,11 @@ Telegram-Src/
 
 # Local agent state: memory logs, caches, session scratch. Not project source.
 .workbuddy-ai/
+
+# --- Local agent tooling state (not project source) ---
+.agents/
+.openclaw/
+.opencode/
 
 # Anti-spam userbot runtime state. The vendored .py modules under
 # colgram-core/src/main/assets/antispam/ are source and ARE tracked; anything the userbot
