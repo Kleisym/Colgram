@@ -83,25 +83,22 @@ def inject_hooks(repo_path):
     app_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java")
 
     def app_loader_replacer(content):
-        # A callable, not a plain anchor string, because this patch has to be able to land a
-        # SECOND time. `patch_file` short-circuits with "[=] Already patched" whenever the
-        # replacement text is already present, so an anchor-string form can add the Colgram
-        # init block once and then never append anything to it again - the boot-time IPv4
-        # policy below silently never shipped for exactly that reason. Doing the insertion by
-        # hand makes the function re-entrant: each piece is guarded on its own marker.
-        anchor = ("        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
-                  "        ProxyRotationController.init();\n"
-                  "    }")
-        # NOTE: this early return used to be `if anchor not in content: return content`,
-        # which silently disabled the whole re-entrancy design below. The anchor includes
-        # the closing brace that immediately follows ProxyRotationController.init(), so once
-        # piece 1 has been inserted that brace is no longer adjacent, the anchor stops
-        # matching, and the function bailed before the piece-2 branch could run - the same
-        # "already patched, never extend" trap that patch_file has. The anchor test must
-        # therefore apply ONLY to the fresh-file path.
-        anchor_present = anchor in content
+        # A callable, not a plain anchor string, because this patch has to be able to land
+        # SEVERAL times: `patch_file` short-circuits with "[=] Already patched" whenever the
+        # replacement text is already present, so an anchor-string form could add the Colgram
+        # init block once and then never append anything to it again.
+        #
+        # 🔴 Every piece below carries its OWN marker and is inserted INDEPENDENTLY.
+        #
+        # The previous shape returned early as soon as the IPv4 piece was present, which made
+        # any later piece unreachable on an existing checkout - the patch reported success
+        # while the new code was simply never written. That is the same trap as the theme
+        # wrapper: a guard that tests for an earlier piece can never admit a later one.
+        # One ordered list, one insert point, one marker each.
+        anchor = "        LauncherIconController.tryFixLauncherIconIfNeeded();"
 
-        block = ("        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
+        piece_init = (
+                 "        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
                  "        ProxyRotationController.init();\n"
                  "\n"
                  "        // Colgram: initialise LAST, once AndroidUtilities, the native library and\n"
@@ -114,83 +111,92 @@ def inject_hooks(repo_path):
                  "\n"
                  "        }\n")
 
-        # Piece 2, appended independently so its marker can be added on a later run.
-        ipv4 = ("\n"
+        piece_ipv4 = ("\n"
                 "        // Colgram: pin outbound HTTP dials to IPv4 where the device has no usable\n"
-                "        // IPv6 route, from the earliest point in the process.\n"
-                "        //\n"
-                "        // This used to rest on System.setProperty(\"java.net.preferIPv4Stack\", ...)\n"
-                "        // and Os.setenv(\"JAVA_TOOL_OPTIONS\", ...). BOTH ARE INERT on Android, and\n"
-                "        // both were measured as such, not assumed:\n"
-                "        //   * JAVA_TOOL_OPTIONS is read by a JVM *launcher*; an ART process is already\n"
-                "        //     running by the time app code executes.\n"
-                "        //   * InetAddress reads preferIPv4Stack once, during its own class init, which\n"
-                "        //     happens before any app code runs. Logged ENFORCED at 16:56:03, yet\n"
-                "        //     connects to 2001:67c:4e8:f004::9 started at 16:56:51 - 48s later, with\n"
-                "        //     the property set the whole time.\n"
-                "        //   * setSSLSocketFactory is inert too, and this is the subtle one: on\n"
-                "        //     Android HttpURLConnection IS OkHttp. OkHttp dials its OWN raw TCP\n"
-                "        //     socket in RealConnection.connect -> Platform.connectSocket and does its\n"
-                "        //     own DNS, consulting the SSLSocketFactory only for the TLS layer on a\n"
-                "        //     socket it already opened. Measured: 2434 connects to the AAAA address,\n"
-                "        //     zero successful Bot API calls.\n"
-                "        //\n"
-                "        // What DOES work is constraining the Socket's own connect() - see\n"
-                "        // ColgramIpv4Socket / colgramEnsureIpv4ConnectionFactory in ColgramBotSync.\n"
-                "        // The call below installs that factory; it is idempotent and safe to reach\n"
-                "        // from several entry points, which matters because this method\n"
-                "        // (postInitApplication) has a once-only guard and is NOT guaranteed to run.\n"
-                "        // Skipped at the factory level when a genuinely routable IPv6 path exists, so\n"
-                "        // a real dual-stack device keeps its faster v6 route.\n"
+                "        // IPv6 route. See ColgramBotSync.colgramIpv4ProxyPort for why neither a\n"
+                "        // global property nor a custom SocketFactory can do this on Android.\n"
                 "        try {\n"
                 "            org.colgram.core.ColgramBotSync.applyIpv4Policy();\n"
                 "        } catch (Throwable ignore) {\n"
                 "\n"
                 "        }\n")
 
-        if "ColgramUiBridge.install(this)" in content:
-            # Piece 1 present. Append piece 2 only if it is missing.
-            if "applyIpv4Policy" in content:
-                return content
-            # Find where the Colgram init try/catch ENDS and insert after it.
-            #
-            # Naive brace-matching from the `try {` lands on the closing brace of the
-            # TRY BLOCK, which is mid-statement - between `try { ... }` and `catch (...) {`.
-            # Inserting there produced
-            #     try { ... }
-            #     <new try/catch>
-            #     } catch (Throwable ignore) {
-            # i.e. a stray second catch. Scan for the end of the whole try/catch instead:
-            # from `try`, find `try`, its block, then consume `catch (...) { ... }`.
-            try_at = content.index("org.colgram.core.ColgramUiBridge.install(this)")
+        piece_service = ("\n"
+                "        // Colgram: keep the process resident so bot chats keep syncing.\n"
+                "        //\n"
+                "        // Without push (FCM is blocked for this package) the process dies as soon as\n"
+                "        // the user leaves the app, and everything downstream follows: chats render\n"
+                "        // empty until a restart, re-entry is a cold start, and a rebooted phone\n"
+                "        // syncs nothing. A foreground service is the supported way to stay alive;\n"
+                "        // ColgramBootReceiver brings it back after a reboot.\n"
+                "        try {\n"
+                "            org.colgram.core.ColgramForegroundService.start(this);\n"
+                "        } catch (Throwable ignore) {\n"
+                "\n"
+                "        }\n")
 
-            def _match_block(s, brace_pos):
-                depth = 0
-                i = brace_pos
-                while i < len(s):
-                    if s[i] == "{":
-                        depth += 1
-                    elif s[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
+        pieces = [
+            ("ColgramUiBridge.install(this)", piece_init),
+            ("ColgramBotSync.applyIpv4Policy()", piece_ipv4),
+            ("ColgramForegroundService.start(this)", piece_service),
+        ]
+
+        def _match_block(s, brace_pos):
+            depth = 0
+            i = brace_pos
+            while i < len(s):
+                if s[i] == "{":
+                    depth += 1
+                elif s[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+                i += 1
+            return -1
+
+        def _after_trycatch(s, marker):
+            """Index just past the try/catch that contains `marker`."""
+            at = s.index(marker)
+            try_kw = s.rindex("try", 0, at)
+            end = _match_block(s, s.index("{", try_kw))
+            if end == -1:
                 return -1
-
-            try_kw = content.rindex("try", 0, try_at)
-            try_block_end = _match_block(content, content.index("{", try_kw))
-            insert_at = try_block_end + 1
-            # The NEXT statement may be `catch (...) { ... }` - if so, skip past it too.
-            tail = content[insert_at:]
+            # Naive brace-matching from `try {` lands on the closing brace of the TRY BLOCK,
+            # i.e. mid-statement, between `try { ... }` and `catch (...) {`. Inserting there
+            # produced a stray second catch. Consume the catch block too.
+            tail = s[end + 1:]
             lead = len(tail) - len(tail.lstrip())
             if tail.lstrip().startswith("catch"):
-                catch_kw_rel = insert_at + lead
-                catch_block_end = _match_block(content, content.index("{", catch_kw_rel))
-                if catch_block_end != -1:
-                    insert_at = catch_block_end + 1
-            return content[:insert_at] + ipv4[:-6] + content[insert_at:]
+                ck = end + 1 + lead
+                ce = _match_block(s, s.index("{", ck))
+                if ce != -1:
+                    end = ce
+            return end + 1
 
-        return content.replace(anchor, block + ipv4, 1) if anchor_present else content
+        if "ColgramUiBridge.install(this)" not in content:
+            # Fresh file: all three pieces at once.
+            if anchor not in content:
+                print(" [!] ApplicationLoader anchor not found - Colgram init NOT injected")
+                return content
+            return content.replace(anchor, piece_init + piece_ipv4 + piece_service, 1)
+
+        # Already initialised. Add whichever pieces are missing, after the LAST Colgram
+        # try/catch so the ordering stays init -> ipv4 -> service.
+        for marker, piece in pieces[1:]:
+            if marker in content:
+                continue
+            insert_at = -1
+            for prev_marker, _ in reversed(pieces):
+                if prev_marker in content:
+                    insert_at = _after_trycatch(content, prev_marker)
+                    if insert_at != -1:
+                        break
+            if insert_at == -1:
+                print(" [!] could not locate an insertion point for " + marker)
+                continue
+            content = content[:insert_at] + piece + content[insert_at:]
+
+        return content
 
     patch_file(
         app_loader,
@@ -746,6 +752,76 @@ def inject_hooks(repo_path):
     intro_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "IntroActivity.java")
     if os.path.exists(intro_activity):
         def intro_lang_replacer(content):
+            # ---------------------------------------------------------------------------
+            # REPAIR: badge alignment, applied even when the badge already exists.
+            #
+            # Must run BEFORE the early return below, otherwise a tree that already has the
+            # badge can never receive a correction - the guard keys on the very marker the
+            # badge introduces.
+            # ---------------------------------------------------------------------------
+            # Regex rather than a literal: the literal form was brittle to whitespace and
+            # silently failed to match once already.
+            badge_re = re.compile(
+                r'frameContainerView\.addView\(langBadge,\s*LayoutHelper\.createFrame\('
+                r'\s*LayoutHelper\.WRAP_CONTENT,\s*32,\s*Gravity\.TOP \| Gravity\.RIGHT,'
+                r'\s*0,\s*\d+,\s*themeMargin \+ 64 \+ 8,\s*0\)\);')
+            good_badge = (
+                '        // Vertically centred against the theme switcher beside it.\n'
+                '        //\n'
+                '        // The switcher is positioned as `dp(themeMargin) + statusBarHeight`, so a\n'
+                '        // hard-coded top margin here put the badge at a different height and it\n'
+                '        // rode up under the status bar / notch. Both margins are DP;\n'
+                '        // statusBarHeight is in PIXELS, hence the density division.\n'
+                '        float colgramBadgeTop = themeMargin + 16;\n'
+                '        if (!AndroidUtilities.isTablet()) {\n'
+                '            colgramBadgeTop += AndroidUtilities.statusBarHeight / AndroidUtilities.density;\n'
+                '        }\n'
+                '        frameContainerView.addView(langBadge, LayoutHelper.createFrame('
+                'LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, colgramBadgeTop, '
+                'themeMargin + 64 + 8, 0));')
+            if 'colgramBadgeTop' not in content:
+                content = badge_re.sub(good_badge, content, count=1)
+
+            # Give the switch-language line an explicit, theme-aware colour.
+            #
+            # It had none, so it inherited the platform default and could end up low-contrast
+            # on the intro's dark background - observed as a hard-to-read red line above the
+            # main button. key_windowBackgroundWhiteBlueText is a link colour (semantically
+            # right for "switch language") and is covered by the dark-surface contrast guard.
+            # ---------------------------------------------------------------------------
+            # updateColors(): remove the two hardcoded reds.
+            #
+            #   startMessagingButtonBackground.setColors({0xFFD32F2F, 0xFF8B0000})
+            #   switchLanguageTextView.setTextColor(0xFFEF5350)
+            #
+            # Neither follows the theme, so the intro ignored light/dark and clashed with the
+            # cyber palette - the switch-language line rendered as a raw red regardless of
+            # what the user had selected. Both now derive from the active accent, which is
+            # also what the cyber palette overrides, so the screen finally matches the theme.
+            # ---------------------------------------------------------------------------
+            if 'colgramAccent' not in content:
+                old_col = (
+                    '        startMessagingButtonBackground.setColors(new int[]{0xFFD32F2F, 0xFF8B0000});\n')
+                new_col = (
+                    '        // Derived from the active accent instead of a hardcoded red, so the\n'
+                    '        // intro follows the theme (including the cyber palette).\n'
+                    '        int colgramAccent = Theme.getColor(Theme.key_chats_actionBackground);\n'
+                    '        int colgramAccentDark = (colgramAccent & 0xFF000000)\n'
+                    '                | ((int) (((colgramAccent >> 16) & 0xFF) * 0.7f) << 16)\n'
+                    '                | ((int) (((colgramAccent >> 8) & 0xFF) * 0.7f) << 8)\n'
+                    '                | (int) ((colgramAccent & 0xFF) * 0.7f);\n'
+                    '        startMessagingButtonBackground.setColors(new int[]{colgramAccent, colgramAccentDark});\n')
+                if old_col in content:
+                    content = content.replace(old_col, new_col, 1)
+
+                old_lang = '        switchLanguageTextView.setTextColor(0xFFEF5350);\n'
+                new_lang = (
+                    '        // Was 0xFFEF5350 - a raw red that ignored the theme entirely.\n'
+                    '        switchLanguageTextView.setTextColor(\n'
+                    '                Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));\n')
+                if old_lang in content:
+                    content = content.replace(old_lang, new_lang, 1)
+
             if "langBadge.setText" in content:
                 return content
             
@@ -940,7 +1016,10 @@ def inject_hooks(repo_path):
 
             return content
 
-        patch_file(intro_activity, intro_lang_replacer, "langBadge.setText", "IntroActivity Instant Language Switcher & Badge")
+        # The marker MUST name a symbol only the current version emits. With
+        # "langBadge.setText" the guard was satisfied by every build that had the badge at
+        # all, so the callable below - and every repair inside it - was dead code.
+        patch_file(intro_activity, intro_lang_replacer, "colgramBadgeTop", "IntroActivity Instant Language Switcher & Badge")
 
     # 16. LoginActivity.java -> Visual Alert and Auto-Rotation on -1000 Connection Error in PhoneView
     phone_error_target = """fillNextCodeParams(params, (TLRPC.auth_SentCode) response);
@@ -1567,32 +1646,29 @@ def inject_hooks(repo_path):
         COLGRAM_GETCOLOR_WRAPPER = (
         "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {\n"
         "        int colgramResolved = colgramGetColorInternal(key, isDefault, ignoreAnimation);\n"
-        "        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n"
-        "            if (key == key_chats_actionBackground || key == key_dialogFloatingButton || key == key_switchTrackChecked) {\n"
-        "                return 0xffff3344;\n"
-        "            }\n"
-        "            if (key == key_windowBackgroundWhite || key == key_windowBackgroundGray) {\n"
-        "                return 0xff0e0f12;\n"
-        "            }\n"
-        "            if (key == key_actionBarDefault) {\n"
-        "                return 0xff16181e;\n"
-        "            }\n"
-        "            if (key == key_windowBackgroundWhiteInputField) {\n"
-        "                return 0xff3a3f4a;\n"
-        "            }\n"
-        "            if (key == key_windowBackgroundWhiteInputFieldActivated) {\n"
-        "                return 0xffff3344;\n"
-        "            }\n"
-        "            if (key == key_actionBarDefaultIcon || key == key_actionBarDefaultTitle) {\n"
-        "                return 0xffffffff;\n"
-        "            }\n"
-        "            if (key == key_actionBarDefaultSubtitle) {\n"
-        "                return 0xff8a8f98;\n"
-        "            }\n"
-        "            if (key == key_switchTrack || key == key_radioBackground) {\n"
-        "                return 0xff3a3f4a;\n"
+        "        final boolean colgramCyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();\n"
+        # ---------------------------------------------------------------------------
+        # The cyber palette, applied as a COMPLETE set.
+        #
+        # It used to override only the backgrounds (windowBackgroundWhite, actionBarDefault,
+        # the input field) and none of the text keys. So on a light base theme the app drew
+        # the cyber dark background and then resolved black text from the light palette on
+        # top of it - black on near-black, i.e. "chats, profile, settings are invisible".
+        #
+        # A palette is only coherent if foreground and background are decided together, so
+        # every text/icon key is overridden here too. Anything not listed falls through to
+        # the contrast guard below, which now knows the cyber background is dark.
+        # ---------------------------------------------------------------------------
+        "        if (colgramCyber) {\n"
+        "            int colgramCyberColor = colgramCyberOverride(key);\n"
+        "            if (colgramCyberColor != 0) {\n"
+        "                return colgramCyberColor;\n"
         "            }\n"
         "        }\n"
+        "        final int colgramSurface = colgramCyber\n"
+        "                ? COLGRAM_CYBER_BG\n"
+        "                : colgramGetColorInternal(key_windowBackgroundWhite, null, true);\n"
+        "        final boolean colgramDarkSurface = colgramCyber || isCurrentThemeDark();\n"
         # A palette hole (resolved 0) is filled from the complete night palette shipped in
         # assets. This block used to live ONLY in the checked-out Theme.java and was absent
         # from this patcher, so every fresh clone and every CI build was quietly missing it -
@@ -1604,19 +1680,94 @@ def inject_hooks(repo_path):
         "        // A zero colour for a readable key is a broken/partial theme palette.\n"
         "        // Leaving it renders black text on a dark background - the invisible login form.\n"
         "        if (colgramResolved == 0 && colgramIsReadableKey(key)) {\n"
-        "            return isCurrentThemeDark() ? 0xffffffff : 0xff000000;\n"
+        "            return colgramDarkSurface ? 0xffffffff : 0xff000000;\n"
         "        }\n"
-        "        if (isCurrentThemeDark() && colgramIsForegroundKey(key)) {\n"
-        "            int surface = colgramGetColorInternal(key_windowBackgroundWhite, null, true);\n"
-        "            if (colgramContrast(colgramResolved, surface) < COLGRAM_MIN_CONTRAST) {\n"
+        "        if (colgramDarkSurface && colgramIsForegroundKey(key)) {\n"
+        "            if (colgramContrast(colgramResolved, colgramSurface) < COLGRAM_MIN_CONTRAST) {\n"
         "                int base = colgramGetColorInternal(key_windowBackgroundWhiteBlackText, null, true);\n"
-        "                if (colgramContrast(base, surface) < COLGRAM_MIN_CONTRAST) {\n"
+        "                if (colgramContrast(base, colgramSurface) < COLGRAM_MIN_CONTRAST) {\n"
         "                    base = 0xffffffff;\n"
         "                }\n"
         "                return base;\n"
         "            }\n"
         "        }\n"
         "        return colgramResolved;\n"
+        "    }\n"
+        "\n"
+        "    // Cyber palette. One place, so the whole scheme can be re-tuned without hunting\n"
+        "    // for stray literals. Backgrounds and foregrounds are chosen TOGETHER - a palette\n"
+        "    // that overrides only the background is how the UI ended up invisible.\n"
+        "    private static final int COLGRAM_CYBER_BG        = 0xff0e0f12;\n"
+        "    private static final int COLGRAM_CYBER_SURFACE   = 0xff16181e;\n"
+        "    private static final int COLGRAM_CYBER_FIELD     = 0xff22252d;\n"
+        "    private static final int COLGRAM_CYBER_ACCENT    = 0xffff3344;\n"
+        "    private static final int COLGRAM_CYBER_TEXT      = 0xffe8eaed;\n"
+        "    private static final int COLGRAM_CYBER_TEXT_DIM  = 0xff9aa0a6;\n"
+        "    private static final int COLGRAM_CYBER_HINT      = 0xff6b7280;\n"
+        "    private static final int COLGRAM_CYBER_DIVIDER   = 0xff2a2e37;\n"
+        "    /**\n"
+        "     * The cyber palette, applied as a COMPLETE set: foreground and background are\n"
+        "     * decided together.\n"
+        "     *\n"
+        "     * Returns 0 when the key is not part of the scheme, which is the sentinel the\n"
+        "     * callers test against - 0 is never a valid colour here.\n"
+        "     *\n"
+        "     * Why one method and not two inlined copies: the scheme must be applied on BOTH\n"
+        "     * colour paths. getColor(key) reaches the wrapper, but\n"
+        "     * getColor(key, ResourcesProvider) returns provider.getColor(key) directly when a\n"
+        "     * provider is present, so a provider-scoped screen (a themed chat, a sheet) would\n"
+        "     * otherwise get the cyber background and NOT the cyber text - black on near-black.\n"
+        "     * Two copies of a palette drift; one cannot.\n"
+        "     */\n"
+        "    private static int colgramCyberOverride(int key) {\n"
+        "        // Backgrounds\n"
+        "        if (key == key_windowBackgroundWhite || key == key_windowBackgroundGray\n"
+        "                || key == key_windowBackgroundGrayShadow) {\n"
+        "            return COLGRAM_CYBER_BG;\n"
+        "        }\n"
+        "        if (key == key_actionBarDefault || key == key_actionBarDefaultSelector\n"
+        "                || key == key_actionBarWhiteSelector) {\n"
+        "            return COLGRAM_CYBER_SURFACE;\n"
+        "        }\n"
+        "        if (key == key_windowBackgroundWhiteInputField) {\n"
+        "            return COLGRAM_CYBER_FIELD;\n"
+        "        }\n"
+        "        // Accents\n"
+        "        if (key == key_windowBackgroundWhiteInputFieldActivated\n"
+        "                || key == key_chats_actionBackground\n"
+        "                || key == key_chats_actionPressedBackground\n"
+        "                || key == key_dialogFloatingButton\n"
+        "                || key == key_switchTrackChecked\n"
+        "                || key == key_checkboxCheck) {\n"
+        "            return COLGRAM_CYBER_ACCENT;\n"
+        "        }\n"
+        "        // Primary text and icons - the keys whose absence made the UI invisible.\n"
+        "        if (key == key_windowBackgroundWhiteBlackText\n"
+        "                || key == key_actionBarDefaultTitle\n"
+        "                || key == key_actionBarDefaultIcon) {\n"
+        "            return COLGRAM_CYBER_TEXT;\n"
+        "        }\n"
+        "        // Secondary text\n"
+        "        if (key == key_windowBackgroundWhiteGrayText\n"
+        "                || key == key_windowBackgroundWhiteGrayText2\n"
+        "                || key == key_windowBackgroundWhiteGrayText3\n"
+        "                || key == key_windowBackgroundWhiteGrayText4\n"
+        "                || key == key_windowBackgroundWhiteGrayText5\n"
+        "                || key == key_windowBackgroundWhiteGrayText6\n"
+        "                || key == key_windowBackgroundWhiteGrayText7\n"
+        "                || key == key_windowBackgroundWhiteGrayText8\n"
+        "                || key == key_actionBarDefaultSubtitle) {\n"
+        "            return COLGRAM_CYBER_TEXT_DIM;\n"
+        "        }\n"
+        "        if (key == key_windowBackgroundWhiteHintText) {\n"
+        "            return COLGRAM_CYBER_HINT;\n"
+        "        }\n"
+        "        // Separators and inactive controls: invisible on the dark panel otherwise.\n"
+        "        if (key == key_divider || key == key_graySection\n"
+        "                || key == key_switchTrack || key == key_radioBackground) {\n"
+        "            return COLGRAM_CYBER_DIVIDER;\n"
+        "        }\n"
+        "        return 0;\n"
         "    }\n"
         "\n"
         "    private static boolean colgramIsReadableKey(int key) {\n"
@@ -1767,38 +1918,76 @@ def inject_hooks(repo_path):
             target = "public static int getColor(int key, ResourcesProvider provider) {"
             if target not in content:
                 return content
+
+            # --- Injection 1: the ResourcesProvider overload -------------------
+            # This overload returns provider.getColor(key) directly when a provider is
+            # present, so it never reaches the wrapper below. It must therefore apply
+            # the same palette, and delegate to the shared method so the two paths
+            # cannot drift apart.
             inject = """
         if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
-            if (key == key_chats_actionBackground || key == key_dialogFloatingButton || key == key_switchTrackChecked) {
-                return 0xffff3344;
-            }
-            if (key == key_windowBackgroundWhite || key == key_windowBackgroundGray) {
-                return 0xff0e0f12;
-            }
-            if (key == key_actionBarDefault) {
-                return 0xff16181e;
+            // Delegate to the shared palette so this path and the
+            // getColor(key, isDefault, ignoreAnimation) wrapper cannot disagree.
+            // This overload returns provider.getColor(key) directly when a provider is
+            // present, so without the delegation a provider-scoped screen received the
+            // cyber background but NOT the cyber text colour - black on near-black.
+            int colgramCyberColor = colgramCyberOverride(key);
+            if (colgramCyberColor != 0) {
+                return colgramCyberColor;
             }
         }"""
-            content = content.replace(target, target + inject, 1)
+
+            if "colgramCyberOverride(key)" not in content:
+                # Not present at all -> inject. But strip any OLDER inline block first,
+                # otherwise the old if-chain stays above the new delegation and wins.
+                content = re.sub(
+                    r"\n        if \(org\.colgram\.core\.ColgramConfig\.isCyberThemeEnabled\(\)\) \{"
+                    r".*?\n        \}\n(?=        if \(provider != null\) \{)",
+                    "\n",
+                    content, count=1, flags=re.S)
+                content = content.replace(target, target + inject, 1)
+            else:
+                # Already delegating. Repair a doubled block if an earlier run stacked one.
+                doubled = inject + inject
+                while doubled in content:
+                    content = content.replace(doubled, inject, 1)
+
+            # --- Injection 2: the boolean[] overload (the wrapper) --------------
+            #
+            # Two cases, and conflating them is what made this patch unreachable on a
+            # fresh clone:
+            #
+            #   FRESH  - upstream's own method body is still in place, and
+            #            colgramGetColorInternal does NOT exist yet (it is introduced BY
+            #            the wrapper). A regex that spans "getColor(...) { ... }
+            #            private static int colgramGetColorInternal(...) {" therefore
+            #            cannot match - there is no second marker to stop at. The wrapper
+            #            constant is designed for exactly this: it ENDS with the renamed
+            #            signature, so a plain replace of the public signature line leaves
+            #            the upstream body sitting immediately after it, now owned by
+            #            colgramGetColorInternal.
+            #
+            #   PATCHED - both signatures are present, so the regex can span and swap the
+            #            old wrapper without touching the body.
             anchor = "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {"
-            if anchor in content:
-                # Replace the wrapper whenever it is missing OR stale. The old guard was
-                # `"colgramGetColorInternal" not in content`, which meant once an early
-                # version of the wrapper had been applied, every later improvement to it
-                # was skipped forever - the patch reported success while the file kept the
-                # original, weaker logic. Compare against a marker that only the current
-                # wrapper contains and refuse to accept a downgrade.
-                needs_rewrite = ("colgramGetColorInternal" not in content
-                                 or "colgramIsForegroundKey" not in content)
-                if needs_rewrite:
-                    # Drop any previous wrapper so we do not stack a second copy.
+            if anchor in content and "COLGRAM_CYBER_BG" not in content:
+                if "private static int colgramGetColorInternal(int key, boolean[] isDefault, boolean ignoreAnimation) {" in content:
+                    # PATCHED: swap the stale wrapper out.
                     content = re.sub(
                         r"public static int getColor\(int key, boolean\[\] isDefault, boolean ignoreAnimation\) \{.*?"
                         r"private static int colgramGetColorInternal\(int key, boolean\[\] isDefault, boolean ignoreAnimation\) \{",
                         COLGRAM_GETCOLOR_WRAPPER,
                         content, count=1, flags=re.S)
+                else:
+                    # FRESH: rename upstream's method by prefixing the wrapper.
+                    content = content.replace(anchor, COLGRAM_GETCOLOR_WRAPPER, 1)
+                if "COLGRAM_CYBER_BG" not in content:
+                    print(" [!] FATAL: Theme wrapper did not land - cyber palette NOT applied")
             return content
-        patch_file(theme_file, theme_cyber_injector, "org.colgram.core.ColgramConfig.isCyberThemeEnabled()", "Theme Inject Colgram Cyber Red Colors")
+        # The marker MUST name something only the current version emits. With
+        # "isCyberThemeEnabled()" as the marker the guard was satisfied by every older
+        # build, so the injector never ran again and its internal repair was dead code.
+        patch_file(theme_file, theme_cyber_injector, "COLGRAM_CYBER_BG", "Theme Inject Colgram Cyber Red Colors")
 
         # 24b. The cyber overrides above ALSO get applied at the real choke point, and a
         # zero-valued readable colour is repaired there. See COLGRAM_GETCOLOR_WRAPPER.
@@ -3847,6 +4036,75 @@ def configure_package_and_branding(repo_path):
                 f'<uses-permission android:name="android.permission.{perm}"/>',
                 f'<!-- stripped {perm} for Colgram privacy -->'
             )
+
+        # ---------------------------------------------------------------------------
+        # Background sync: foreground service + boot receiver.
+        #
+        # The fork has no working push (FCM is blocked for this package), so without a foreground
+        # service the process dies the moment the user leaves the app and bot chats stop syncing.
+        # That is the root of three separate reports: chats empty until a restart, a full reload on
+        # re-entry, and no sync at all after a phone reboot.
+        #
+        # Guarded on our own service class name, and duplicates collapsed, because this file is
+        # written with a plain open()/write() rather than patch_file() and therefore has no generic
+        # idempotency guard of its own - the same trap that once produced 18 duplicate attributes
+        # on <application>.
+        # ---------------------------------------------------------------------------
+        COLGRAM_FG_PERMISSIONS = [
+            # A foreground service needs both the base permission and, from API 34, a typed one.
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+            # To come back after a reboot.
+            "android.permission.RECEIVE_BOOT_COMPLETED",
+            # Best-effort: asks to be exempt from Doze so the heartbeat is not deferred.
+            "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        ]
+        for perm in COLGRAM_FG_PERMISSIONS:
+            if perm not in m_content:
+                m_content = m_content.replace(
+                    '    <uses-permission android:name="android.permission.INTERNET" />',
+                    '    <uses-permission android:name="android.permission.INTERNET" />\n'
+                    '    <uses-permission android:name="%s" />' % perm,
+                    1)
+
+        # Collapse duplicates from any earlier run before adding ours.
+        for perm in COLGRAM_FG_PERMISSIONS:
+            decl = '    <uses-permission android:name="%s" />\n' % perm
+            while m_content.count(decl) > 1:
+                m_content = m_content.replace(decl + decl, decl, 1)
+
+        if "org.colgram.core.ColgramForegroundService" not in m_content:
+            bg_block = (
+                '\n'
+                '        <!-- Colgram: keeps the process alive so bot chats keep syncing without push.\n'
+                '             dataSync is the declared type; API 34+ requires it and the matching\n'
+                '             FOREGROUND_SERVICE_DATA_SYNC permission is added above. -->\n'
+                '        <service\n'
+                '            android:name="org.colgram.core.ColgramForegroundService"\n'
+                '            android:enabled="true"\n'
+                '            android:exported="false"\n'
+                '            android:foregroundServiceType="dataSync"\n'
+                '            android:stopWithTask="false" />\n'
+                '\n'
+                '        <!-- Colgram: bring the sync back after a reboot or an in-place update. -->\n'
+                '        <receiver\n'
+                '            android:name="org.colgram.core.ColgramBootReceiver"\n'
+                '            android:enabled="true"\n'
+                '            android:exported="true"\n'
+                '            android:directBootAware="false">\n'
+                '            <intent-filter android:priority="1000">\n'
+                '                <action android:name="android.intent.action.BOOT_COMPLETED" />\n'
+                '                <action android:name="android.intent.action.QUICKBOOT_POWERON" />\n'
+                '                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />\n'
+                '                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />\n'
+                '            </intent-filter>\n'
+                '        </receiver>\n'
+            )
+            if '    </application>' in m_content:
+                m_content = m_content.replace('    </application>', bg_block + '    </application>', 1)
+                print(" [+] Injected Colgram foreground service + boot receiver into AndroidManifest.xml")
+            else:
+                print(" [!] FATAL: </application> not found - background sync NOT registered")
 
         with open(main_manifest, "w", encoding="utf-8") as f:
             f.write(m_content)

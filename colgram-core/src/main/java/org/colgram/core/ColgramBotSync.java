@@ -218,7 +218,9 @@ public class ColgramBotSync {
         synchronized (ColgramBotSync.class) {
             if (colgramIpv4ProxyPort > 0) return colgramIpv4ProxyPort;
             try {
-                java.net.ServerSocket ss = new java.net.ServerSocket(0, 8,
+                // Backlog 64: a burst of concurrent Bot API calls would overflow 8 and
+                // connections would be refused before the accept loop could drain them.
+                java.net.ServerSocket ss = new java.net.ServerSocket(0, 64,
                         java.net.InetAddress.getByName("127.0.0.1"));
                 final int port = ss.getLocalPort();
                 Thread t = new Thread(() -> colgramIpv4ProxyLoop(ss), "colgram-ipv4-proxy");
@@ -245,105 +247,122 @@ public class ColgramBotSync {
      */
     private static void colgramIpv4ProxyLoop(java.net.ServerSocket server) {
         while (true) {
-            java.net.Socket client = null;
             try {
-                client = server.accept();
-                client.setSoTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
-                java.io.InputStream cin = client.getInputStream();
-                java.io.OutputStream cout = client.getOutputStream();
+                final java.net.Socket client = server.accept();
+                // 🔴 ONE THREAD PER CLIENT. Handling the client inline meant the blocking
+                // header read (up to COLGRAM_CONNECT_TIMEOUT_MS) held the accept loop, so a
+                // single slow or silent connection stalled every other request. Measured as
+                // the proxy itself timing out:
+                //   SocketTimeoutException: failed to connect to /127.0.0.1 (port 36719)
+                //   from /127.0.0.1 (port 41600) after 8000ms
+                Thread t = new Thread(() -> colgramHandleProxyClient(client),
+                        "colgram-ipv4-proxy-conn");
+                t.setDaemon(true);
+                t.start();
+            } catch (Throwable t) {
+                // Never let one accept failure kill the listener.
+                Log.w(TAG, "proxy accept: " + t.getClass().getSimpleName() + " " + t.getMessage());
+            }
+        }
+    }
 
-                // Read the request line first - that is where the target lives.
-                java.io.ByteArrayOutputStream head = new java.io.ByteArrayOutputStream();
-                int b, guard = 0;
-                while ((b = cin.read()) != -1 && guard++ < 8192) {
-                    head.write(b);
-                    if (b == '\n') break;
-                }
-                String requestLine = new String(head.toByteArray(), "US-ASCII").trim();
-                String[] parts = requestLine.split("\\s+");
-                if (parts.length < 2) {
-                    cout.write("HTTP/1.1 400 Bad Request\r\n\r\n".getBytes("US-ASCII"));
-                    cout.flush();
-                    client.close();
-                    continue;
-                }
-                boolean isConnect = "CONNECT".equalsIgnoreCase(parts[0]);
-                String target = parts[1];
-                String host;
-                int upstreamPort;
-                if (isConnect) {
-                    // CONNECT host:port
-                    int idx = target.lastIndexOf(':');
-                    if (idx < 0) { host = target; upstreamPort = 443; }
-                    else { host = target.substring(0, idx); upstreamPort = Integer.parseInt(target.substring(idx + 1)); }
-                } else {
-                    // Absolute-form GET http://host/path
-                    java.net.URL tu = new java.net.URL(target);
-                    host = tu.getHost();
-                    upstreamPort = tu.getPort() != -1 ? tu.getPort() : 80;
-                }
+    /** Serve one client: read its request, dial IPv4 upstream, relay. */
+    private static void colgramHandleProxyClient(java.net.Socket client) {
+        try {
+            client.setSoTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
+            java.io.InputStream cin = client.getInputStream();
+            java.io.OutputStream cout = client.getOutputStream();
 
-                java.net.InetAddress v4 = colgramResolveIpv4(host);
-                if (v4 == null) {
-                    Log.w(TAG, "proxy: no A record for " + host + ", refusing");
-                    cout.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes("US-ASCII"));
-                    cout.flush();
-                    client.close();
-                    continue;
-                }
+            // Read the request line first - that is where the target lives.
+            java.io.ByteArrayOutputStream head = new java.io.ByteArrayOutputStream();
+            int b, guard = 0;
+            while ((b = cin.read()) != -1 && guard++ < 8192) {
+                head.write(b);
+                if (b == '\n') break;
+            }
+            String requestLine = new String(head.toByteArray(), "US-ASCII").trim();
+            String[] parts = requestLine.split("\\s+");
+            if (parts.length < 2) {
+                cout.write("HTTP/1.1 400 Bad Request\r\n\r\n".getBytes("US-ASCII"));
+                cout.flush();
+                client.close();
+                return;
+            }
+            boolean isConnect = "CONNECT".equalsIgnoreCase(parts[0]);
+            String target = parts[1];
+            String host;
+            int upstreamPort;
+            if (isConnect) {
+                int idx = target.lastIndexOf(':');
+                if (idx < 0) { host = target; upstreamPort = 443; }
+                else { host = target.substring(0, idx); upstreamPort = Integer.parseInt(target.substring(idx + 1)); }
+            } else {
+                java.net.URL tu = new java.net.URL(target);
+                host = tu.getHost();
+                upstreamPort = tu.getPort() != -1 ? tu.getPort() : 80;
+            }
 
-                // 🔴 DRAIN THE REST OF THE HEADER BLOCK BEFORE REPLYING.
-                //
-                // Only the request line has been consumed so far. For CONNECT the client sends
-                // 'CONNECT host:port HTTP/1.1', then headers, then a BLANK LINE, and only THEN
-                // begins the TLS ClientHello. If those leftover header bytes are not consumed
-                // here they are still sitting in the socket, and the relay below forwards them
-                // upstream as if they were TLS - measured as:
-                //     javax.net.ssl.SSLException: Unable to parse TLS packet header
-                //       at ConscryptEngine.unwrap -> RealConnection.connectTls(RealConnection.java:196)
-                // because the server received the header terminator ahead of the ClientHello and
-                // its handshake parser rejected it.
-                //
-                // For plain http the whole header block must be preserved and forwarded, so it is
-                // accumulated here instead of discarded.
-                java.io.ByteArrayOutputStream rest = new java.io.ByteArrayOutputStream();
-                {
-                    // Consume up to and including the terminating blank line. Bounded so a
-                    // malformed or hostile stream cannot make this loop unbounded.
-                    int c, hdrGuard = 0, run = 0;
-                    while ((c = cin.read()) != -1 && hdrGuard++ < 16384) {
-                        if (!isConnect) rest.write(c);
-                        if (c == '\n') {
-                            if (++run >= 2) break;   // blank line reached
-                        } else if (c != '\r') {
-                            run = 0;
-                        }
+            java.net.InetAddress v4 = colgramResolveIpv4(host);
+            if (v4 == null) {
+                Log.w(TAG, "proxy: no A record for " + host + ", refusing");
+                cout.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes("US-ASCII"));
+                cout.flush();
+                client.close();
+                return;
+            }
+
+            // 🔴 DRAIN THE REST OF THE HEADER BLOCK BEFORE REPLYING.
+            //
+            // Only the request line has been consumed so far. For CONNECT the client sends
+            // 'CONNECT host:port HTTP/1.1', then headers, then a BLANK LINE, and only THEN
+            // begins the TLS ClientHello. If those leftover header bytes are not consumed
+            // here they are still sitting in the socket, and the relay below forwards them
+            // upstream as if they were TLS - measured as:
+            //     javax.net.ssl.SSLException: Unable to parse TLS packet header
+            //       at ConscryptEngine.unwrap -> RealConnection.connectTls(RealConnection.java:196)
+            // because the server received the header terminator ahead of the ClientHello and
+            // its handshake parser rejected it.
+            //
+            // For plain http the whole header block must be preserved and forwarded, so it is
+            // accumulated here instead of discarded.
+            java.io.ByteArrayOutputStream rest = new java.io.ByteArrayOutputStream();
+            {
+                // Consume up to and including the terminating blank line. Bounded so a
+                // malformed or hostile stream cannot make this loop unbounded.
+                int c, hdrGuard = 0, run = 0;
+                while ((c = cin.read()) != -1 && hdrGuard++ < 16384) {
+                    if (!isConnect) rest.write(c);
+                    if (c == '\n') {
+                        if (++run >= 2) break;   // blank line reached
+                    } else if (c != '\r') {
+                        run = 0;
                     }
                 }
-                // The upstream leg: IPv4 literal only. This is the whole point of the proxy.
-                java.net.Socket upstream = new ColgramIpv4Socket(v4, upstreamPort);
-                upstream.connect(new java.net.InetSocketAddress(v4, upstreamPort),
-                        COLGRAM_CONNECT_TIMEOUT_MS);
-
-                if (isConnect) {
-                    cout.write("HTTP/1.1 200 Connection established\r\n\r\n".getBytes("US-ASCII"));
-                    cout.flush();
-                } else {
-                    // Replay the request line plus the preserved header block, exactly once.
-                    java.io.OutputStream uos = upstream.getOutputStream();
-                    uos.write(head.toByteArray());
-                    uos.write(rest.toByteArray());
-                    uos.flush();
-                }
-                Log.i(TAG, "proxy: " + (isConnect ? "CONNECT " : "GET ") + host
-                        + " -> " + v4.getHostAddress() + ":" + upstreamPort);
-
-                colgramPump(client, upstream);
-            } catch (Throwable t) {
-                // One bad client must never take the listener down.
-                Log.w(TAG, "proxy: " + t.getClass().getSimpleName() + " " + t.getMessage());
-                try { if (client != null) client.close(); } catch (Throwable ignored) {}
             }
+
+            // The upstream leg: IPv4 literal only. This is the whole point of the proxy.
+            java.net.Socket upstream = new ColgramIpv4Socket(v4, upstreamPort);
+            upstream.connect(new java.net.InetSocketAddress(v4, upstreamPort),
+                    COLGRAM_CONNECT_TIMEOUT_MS);
+
+            if (isConnect) {
+                cout.write("HTTP/1.1 200 Connection established\r\n\r\n".getBytes("US-ASCII"));
+                cout.flush();
+            } else {
+                // Replay the request line plus the preserved header block, exactly once.
+                java.io.OutputStream uos = upstream.getOutputStream();
+                uos.write(head.toByteArray());
+                uos.write(rest.toByteArray());
+                uos.flush();
+            }
+            Log.i(TAG, "proxy: " + (isConnect ? "CONNECT " : "GET ") + host
+                    + " -> " + v4.getHostAddress() + ":" + upstreamPort);
+
+            colgramPump(client, upstream);
+        } catch (Throwable t) {
+            // One bad client must never take the listener down.
+            Log.w(TAG, "proxy: " + t.getClass().getSimpleName() + " " + t.getMessage());
+            try { client.close(); } catch (Throwable ignored) {}
         }
     }
 
@@ -1338,6 +1357,27 @@ public class ColgramBotSync {
     /**
      * One-shot dialog sync trigger, also kicks off the real-time poller.
      */
+    /**
+     * Minimum gap between AUTOMATIC dialog syncs.
+     *
+     * 🔴 Without this, syncBotDialogs and MessagesController.loadDialogs form an infinite cycle:
+     * loadDialogs() is patched to call syncBotDialogs(), and syncBotDialogs() calls loadDialogs()
+     * at the end to refresh the UI. Each iteration issues a blocking Bot API request.
+     *
+     * Measured before this guard: ~3300 connection attempts in 90 seconds, dozens of concurrent
+     * threads inside lambda$syncBotDialogs$13, and the IPv4 proxy eventually refusing connections
+     * outright (1377 x `failed to connect to /127.0.0.1`). That is the user-visible
+     * "бесконечная прогрузка чатов".
+     *
+     * 3 s is short enough that a genuinely new message still appears promptly, and long enough
+     * that a dialog-refresh storm cannot drive it. Only AUTOMATIC calls are throttled; a
+     * user-initiated sync always proceeds, so the button is never a no-op.
+     */
+    private static final long COLGRAM_SYNC_MIN_INTERVAL_MS = 3000L;
+
+    /** Timestamp of the last ACCEPTED automatic sync. Guarded by ColgramBotSync.class. */
+    private static volatile long colgramLastAutoSyncAt = 0L;
+
     public static void syncBotDialogs(final Context context, final int account, final boolean userInitiated) {
         if (context == null) return;
         final String token = getBotToken(context, account);
@@ -1346,6 +1386,19 @@ public class ColgramBotSync {
                 promptBotTokenAndSync((Activity) context, account);
             }
             return;
+        }
+
+        // 🔴 THE CYCLE BREAK. Automatic calls only; a user-initiated sync always proceeds.
+        if (!userInitiated) {
+            synchronized (ColgramBotSync.class) {
+                long now = System.currentTimeMillis();
+                if (now - colgramLastAutoSyncAt < COLGRAM_SYNC_MIN_INTERVAL_MS) {
+                    // Too soon after the last accepted automatic sync. This is the branch that
+                    // stops loadDialogs() -> syncBotDialogs() -> loadDialogs() from recursing.
+                    return;
+                }
+                colgramLastAutoSyncAt = now;
+            }
         }
 
         // Always ensure background poller is running

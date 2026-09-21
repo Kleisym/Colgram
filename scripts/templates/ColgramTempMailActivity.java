@@ -91,6 +91,40 @@ public class ColgramTempMailActivity extends BaseFragment {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private boolean isDestroyed = false;
 
+    // --- Action bar ids -------------------------------------------------------------
+    private static final int MENU_REFRESH = 1;
+    private static final int MENU_DOMAIN = 2;
+    private static final int MENU_NEW = 3;
+    private static final int MENU_TOGGLE = 4;
+
+    /**
+     * Domains the service currently offers, for the picker.
+     *
+     * Fetched ON DEMAND only. It is never loaded when the screen opens - that was part of
+     * what made every visit cost a round trip.
+     */
+    private final ArrayList<String> availableDomains = new ArrayList<>();
+
+    /**
+     * Domain the user chose for the NEXT mailbox. null means "let the service decide".
+     *
+     * Note on what is actually possible here: a disposable-mail API can only hand out
+     * addresses on domains IT operates (mail.tm serves things like uberip.com). No API can
+     * mint a @gmail.com address - Google does not permit it. So the picker offers the real
+     * list from the server, which is the honest version of "выбрать окончание".
+     */
+    private String pendingDomain = null;
+
+    /**
+     * Polling is OPT-IN and defaults to off.
+     *
+     * It used to run unconditionally every 5s from the moment the fragment was created,
+     * which is exactly the "обновляются постоянно" behaviour. A user who wants live updates
+     * can turn it on from the action bar; the setting persists.
+     */
+    private boolean autoRefreshEnabled = false;
+    private boolean autoRefreshRunning = false;
+
     private static final String[][] WEB_TEMP_SERVICES = {
         {"smailpro.com", "https://smailpro.com/", "Временная почта Gmail / Outlook"},
         {"22.do", "https://22.do/en/", "Быстрый генератор disposable почты"},
@@ -103,14 +137,176 @@ public class ColgramTempMailActivity extends BaseFragment {
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
-        // Restore a previously created mailbox before generating a new one. The JWT is
-        // short-lived but the account is permanent, so reusing the saved address keeps the
-        // inbox the user was watching instead of silently replacing it on every open.
-        if (!restoreSavedMailbox()) {
-            generateNewMailbox();
+        // 🔴 LOCAL ONLY. No network, no automatic mailbox creation, no polling.
+        //
+        // This method used to call restoreSavedMailbox() - which refreshed the token AND
+        // fetched the inbox - and, when that returned false, fell through to
+        // generateNewMailbox(). Two consequences, both reported:
+        //   * every single visit to this screen cost a round trip ("обновляются постоянно
+        //     при переходе в меню"), and
+        //   * a transient network failure silently REPLACED the user's address with a new
+        //     one, so the inbox they were watching disappeared.
+        //
+        // Now the saved mailbox is read from preferences, whatever was cached is shown, and
+        // the user drives: Refresh, or pick a domain and create a new mailbox. Polling is a
+        // separate opt-in toggle.
+        restoreSavedMailboxLocal();
+
+        try {
+            Context ctx = getParentActivity();
+            if (ctx != null) {
+                autoRefreshEnabled = ctx
+                        .getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE)
+                        .getBoolean("auto_refresh", false);
+            }
+        } catch (Throwable ignored) {
         }
-        startAutoRefresh();
+        if (autoRefreshEnabled) {
+            startAutoRefresh();
+        }
         return true;
+    }
+
+    /**
+     * Read the saved mailbox from preferences. Touches no network.
+     *
+     * Split out of restoreSavedMailbox() so that opening the screen is free: the token
+     * refresh and the fetch only happen when the user asks for them.
+     */
+    private boolean restoreSavedMailboxLocal() {
+        try {
+            Context ctx = getParentActivity();
+            if (ctx == null) return false;
+            android.content.SharedPreferences prefs =
+                    ctx.getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE);
+            String address = prefs.getString("address", "");
+            String password = prefs.getString("password", "");
+            if (address.isEmpty() || password.isEmpty()) return false;
+
+            currentEmail = address;
+            currentLogin = prefs.getString("login", "");
+            currentDomain = prefs.getString("domain", "");
+            mailTmToken = prefs.getString("token", "");
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "restoreSavedMailboxLocal failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** Explicit refresh, driven by the user. */
+    private void manualRefresh() {
+        final Context ctx = getParentActivity();
+        if (ctx == null) return;
+        if (currentEmail == null || currentEmail.isEmpty()) {
+            Toast.makeText(ctx, "Сначала создайте ящик", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Toast.makeText(ctx, "Обновление...", Toast.LENGTH_SHORT).show();
+        executor.execute(() -> {
+            final String fresh = refreshMailToken();
+            if (fresh != null) {
+                fetchMessages(true);
+            } else {
+                mainHandler.post(() -> {
+                    Context c = getParentActivity();
+                    if (c != null) {
+                        Toast.makeText(c, "Не удалось обновить — токен недействителен",
+                                Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+        });
+    }
+
+    /** Load the service's domain list, then let the user pick one. */
+    private void showDomainPicker() {
+        final Context ctx = getParentActivity();
+        if (ctx == null) return;
+        if (!availableDomains.isEmpty()) {
+            presentDomainDialog();
+            return;
+        }
+        Toast.makeText(ctx, "Загрузка списка доменов...", Toast.LENGTH_SHORT).show();
+        executor.execute(() -> {
+            final ArrayList<String> got = fetchDomainList();
+            mainHandler.post(() -> {
+                Context c = getParentActivity();
+                if (c == null) return;
+                availableDomains.clear();
+                availableDomains.addAll(got);
+                if (availableDomains.isEmpty()) {
+                    Toast.makeText(c, "Сервис не вернул список доменов", Toast.LENGTH_LONG).show();
+                } else {
+                    presentDomainDialog();
+                }
+            });
+        });
+    }
+
+    private void presentDomainDialog() {
+        final Context ctx = getParentActivity();
+        if (ctx == null) return;
+        final ArrayList<String> opts = new ArrayList<>();
+        opts.add("По умолчанию (выберет сервис)");
+        opts.addAll(availableDomains);
+        new AlertDialog.Builder(ctx)
+                .setTitle("Домен для нового ящика")
+                .setItems(opts.toArray(new String[0]), (d, which) -> {
+                    pendingDomain = (which == 0) ? null : opts.get(which);
+                    Toast.makeText(ctx, pendingDomain == null
+                                    ? "Домен: по умолчанию"
+                                    : "Домен: @" + pendingDomain,
+                            Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
+    /** The service's active domains. Never called from onFragmentCreate. */
+    private ArrayList<String> fetchDomainList() {
+        ArrayList<String> out = new ArrayList<>();
+        try {
+            JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
+            JSONArray members = domRes.optJSONArray("hydra:member");
+            if (members != null) {
+                for (int i = 0; i < members.length(); i++) {
+                    JSONObject d = members.optJSONObject(i);
+                    if (d == null) continue;
+                    // An inactive domain accepts the account and then rejects the token.
+                    if (!d.optBoolean("isActive", true)) continue;
+                    String dn = d.optString("domain", "");
+                    if (!dn.isEmpty()) out.add(dn);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "fetchDomainList failed: " + t.getMessage());
+        }
+        return out;
+    }
+
+    private void toggleAutoRefresh() {
+        autoRefreshEnabled = !autoRefreshEnabled;
+        try {
+            Context ctx = getParentActivity();
+            if (ctx != null) {
+                ctx.getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE)
+                        .edit().putBoolean("auto_refresh", autoRefreshEnabled).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+        if (autoRefreshEnabled) {
+            startAutoRefresh();
+        } else {
+            autoRefreshRunning = false;
+        }
+        Context ctx = getParentActivity();
+        if (ctx != null) {
+            Toast.makeText(ctx, autoRefreshEnabled
+                            ? "Автообновление включено (каждые 5 секунд)"
+                            : "Автообновление выключено",
+                    Toast.LENGTH_SHORT).show();
+        }
     }
 
     /**
@@ -153,12 +349,18 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void startAutoRefresh() {
+        if (autoRefreshRunning) return;
+        autoRefreshRunning = true;
         mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (isDestroyed) return;
+                // `autoRefreshRunning` is the stop flag: without it, turning the toggle off
+                // left the previous runnable chain alive and it kept polling anyway.
+                if (isDestroyed || !autoRefreshRunning) return;
                 fetchMessages(false);
-                mainHandler.postDelayed(this, 5000);
+                if (autoRefreshRunning) {
+                    mainHandler.postDelayed(this, 5000);
+                }
             }
         }, 5000);
     }
@@ -221,7 +423,12 @@ public class ColgramTempMailActivity extends BaseFragment {
                 // and the whole feature looked dead. If the domain list cannot be read we
                 // must fail loudly instead of inventing an address.
                 final String domain = withRetry("resolve domain", () -> {
-                    String resolved = null;
+                    // The user's pick wins. Only fall back to "first active domain" when
+                    // they have not chosen one.
+                    String resolved = pendingDomain;
+                    if (resolved != null && !resolved.isEmpty()) {
+                        return resolved;
+                    }
                     JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
                     JSONArray members = domRes.optJSONArray("hydra:member");
                     if (members != null) {
@@ -703,9 +910,28 @@ public class ColgramTempMailActivity extends BaseFragment {
             public void onItemClick(int id) {
                 if (id == -1) {
                     finishFragment();
+                } else if (id == MENU_REFRESH) {
+                    manualRefresh();
+                } else if (id == MENU_DOMAIN) {
+                    showDomainPicker();
+                } else if (id == MENU_NEW) {
+                    generateNewMailbox();
+                } else if (id == MENU_TOGGLE) {
+                    toggleAutoRefresh();
                 }
             }
         });
+        // Actions, in the order a user reaches for them: refresh what you have, choose the
+        // address, or start over. All three are real drawables verified to exist in res/
+        // (msg_refresh / msg_reload / ic_refresh do NOT exist in this tree - only msg_retry,
+        // msg_settings and msg_add do).
+        actionBar.createMenu().addItem(MENU_REFRESH, R.drawable.msg_retry);
+        actionBar.createMenu().addItem(MENU_DOMAIN, R.drawable.msg_settings);
+        actionBar.createMenu().addItem(MENU_NEW, R.drawable.msg_add);
+        // Polling is opt-in, so it needs a visible way in. A text item rather than an icon
+        // because there is no "sync" drawable in this tree, and because the current state
+        // matters here - the toast on toggle reports it.
+        actionBar.createMenu().addItem(MENU_TOGGLE, "Авто");
 
         fragmentView = new FrameLayout(context);
         FrameLayout frameLayout = (FrameLayout) fragmentView;
