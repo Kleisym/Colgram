@@ -77,6 +77,10 @@ public class ColgramDnsResolver {
             // Silently fallback to system resolver
         } finally {
             if (conn != null) {
+                // Always disconnect, even for non-200 responses: returning the socket to
+                // the keep-alive pool is the only way the next DoH query reuses it. This
+                // runs on the name-resolution path, so leaked connections surface as slow
+                // connects rather than as an obvious error.
                 conn.disconnect();
             }
         }

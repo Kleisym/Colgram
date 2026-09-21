@@ -147,6 +147,101 @@ public class ColgramHookHandler {
         return ColgramDatabase.getInstance(appContext).getEditHistory(dialogId, messageId);
     }
 
+    // --- Media revision history -------------------------------------------------
+    //
+    // Telegram does not version attachments. When a message's photo/video/document is
+    // replaced by an edit, the old file reference is destroyed and only the caption
+    // change would be recorded by hookOnMessageEdited. These three methods let the
+    // patched MessagesController capture the outgoing attachment before it is lost,
+    // and let the UI list / open the old revision afterwards.
+    //
+    // Module-boundary note: TMessagesProj resolves the actual local path (it owns
+    // FileLoader / MessageObject) and passes it in as a plain String. colgram-core
+    // never touches TLRPC or FileLoader.
+
+    /**
+     * Records an attachment that is about to be replaced by an edit.
+     *
+     * @param localPath path to a SANDBOX COPY of the old file, or null if the caller
+     *                  could not produce one. A null path still records the revision
+     *                  (name/size/type) so the history shows what used to be there;
+     *                  {@link ColgramDatabase.MediaRevision#isRetrievable()} then
+     *                  reports false and the UI offers no "open" action.
+     */
+    public static void hookOnMediaReplaced(long dialogId, int messageId, int mediaType,
+                                           String localPath, String fileName, long fileSize,
+                                           String mimeType, long remoteId, long editDate) {
+        if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) return;
+        if (dialogId == 0 || messageId == 0) return;
+        ColgramDatabase.getInstance(appContext).saveMediaRevision(
+                dialogId, messageId, mediaType, localPath, fileName, fileSize,
+                mimeType, remoteId, editDate);
+    }
+
+    /** All stored media revisions of a message, oldest first. */
+    public static java.util.List<ColgramDatabase.MediaRevision> getMediaRevisions(long dialogId, int messageId) {
+        if (appContext == null) return new java.util.ArrayList<>();
+        return ColgramDatabase.getInstance(appContext).getMediaRevisions(dialogId, messageId);
+    }
+
+    /**
+     * Copies a file into the Colgram sandbox so a revision survives Telegram's own
+     * cache eviction. Returns the destination path, or null on any failure.
+     *
+     * Deliberately tolerant: a revision whose copy failed is still worth recording,
+     * so the caller must handle null rather than treat it as an error.
+     */
+    public static String colgramCopyRevisionFile(String sourcePath, String suggestedName) {
+        if (appContext == null || sourcePath == null || sourcePath.isEmpty()) return null;
+        try {
+            File src = new File(sourcePath);
+            if (!src.exists() || !src.isFile() || src.length() == 0) return null;
+
+            File dir = new File(appContext.getFilesDir(), "media_history");
+            if (!dir.exists() && !dir.mkdirs()) return null;
+
+            String name = (suggestedName == null || suggestedName.trim().isEmpty())
+                    ? src.getName() : suggestedName.trim();
+            // Strip anything path-like so a crafted name cannot escape the sandbox.
+            name = name.replace('/', '_').replace('\\', '_').replace("..", "_");
+            if (name.length() > 120) {
+                String ext = "";
+                int dot = name.lastIndexOf('.');
+                if (dot > 0) ext = name.substring(dot);
+                name = name.substring(0, Math.max(1, 120 - ext.length())) + ext;
+            }
+
+            File dst = new File(dir, System.currentTimeMillis() + "_" + name);
+            // Guard against a collision if two edits land in the same millisecond.
+            if (dst.exists()) dst = new File(dir, System.currentTimeMillis() + "_" + Math.abs(name.hashCode()) + "_" + name);
+
+            java.io.InputStream in = null;
+            java.io.OutputStream out = null;
+            try {
+                in = new java.io.FileInputStream(src);
+                out = new java.io.FileOutputStream(dst);
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+            } finally {
+                if (in != null) try { in.close(); } catch (Throwable ignore) {}
+                if (out != null) try { out.close(); } catch (Throwable ignore) {}
+            }
+            return dst.exists() && dst.length() > 0 ? dst.getAbsolutePath() : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Existence probe used to gate the "Media History" menu entry. */
+    public static boolean hasMediaRevisions(long dialogId, int messageId) {
+        if (appContext == null) return false;
+        return ColgramDatabase.getInstance(appContext).hasMediaRevisions(dialogId, messageId);
+    }
+
     /**
      * HOOK: Called from FileLoader and AndroidUtilities when resolving storage paths.
      */

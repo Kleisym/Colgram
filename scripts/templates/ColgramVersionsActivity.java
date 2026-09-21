@@ -84,6 +84,19 @@ public class ColgramVersionsActivity extends BaseFragment {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private boolean destroyed = false;
 
+    /**
+     * How many times to re-attempt a failed GitHub fetch before showing the failure row.
+     *
+     * These calls are fired once from onCreateFragment and never repeated, so a single
+     * transient failure used to latch "Не удалось загрузить релизы" on screen until the app
+     * was restarted - the user saw a permanently broken page for a momentary network blip.
+     * A GitHub API call from a phone can fail for a dozen transient reasons (DNS not settled
+     * right after boot, a captive-portal probe, a carrier dropping the first tunnel), and
+     * every one of them is worth retrying.
+     */
+    private static final int FETCH_ATTEMPTS = 3;
+    private static final long FETCH_RETRY_BASE_MS = 1200L;
+
     private static class Row {
         // 0 = header, 1 = current build info, 2 = colgram apk, 3 = upstream tag, 4 = info link
         final int type;
@@ -246,56 +259,53 @@ public class ColgramVersionsActivity extends BaseFragment {
     private void fetchReleases() {
         executor.execute(() -> {
             List<ReleaseInfo> found = new ArrayList<>();
-            boolean ok = false;
-            try {
+            final boolean ok = withRetry("fetchReleases", () -> {
+                found.clear();
                 JSONArray arr = getJsonArray("https://api.github.com/repos/" + COLGRAM_REPO + "/releases?per_page=20");
-                if (arr != null) {
-                    ok = true;
-                    for (int i = 0; i < arr.length(); i++) {
-                        JSONObject rel = arr.optJSONObject(i);
-                        if (rel == null) continue;
-                        String tag = rel.optString("tag_name", "");
-                        String name = rel.optString("name", "");
-                        if (name.isEmpty()) name = tag;
-                        boolean prerelease = rel.optBoolean("prerelease", false);
-                        String published = rel.optString("published_at", "");
-                        if (published.length() >= 10) published = published.substring(0, 10);
+                if (arr == null) return false;
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject rel = arr.optJSONObject(i);
+                    if (rel == null) continue;
+                    String tag = rel.optString("tag_name", "");
+                    String name = rel.optString("name", "");
+                    if (name.isEmpty()) name = tag;
+                    boolean prerelease = rel.optBoolean("prerelease", false);
+                    String published = rel.optString("published_at", "");
+                    if (published.length() >= 10) published = published.substring(0, 10);
 
-                        // Pick the first real .apk asset. A release can attach several files
-                        // (idsig, mapping, sources), so this filters rather than assuming
-                        // the first asset is the APK.
-                        String apkUrl = null;
-                        long size = 0;
-                        JSONArray assets = rel.optJSONArray("assets");
-                        if (assets != null) {
-                            for (int a = 0; a < assets.length(); a++) {
-                                JSONObject asset = assets.optJSONObject(a);
-                                if (asset == null) continue;
-                                String an = asset.optString("name", "");
-                                if (an.endsWith(".apk")) {
-                                    apkUrl = asset.optString("browser_download_url", "");
-                                    size = asset.optLong("size", 0);
-                                    break;
-                                }
+                    // Pick the first real .apk asset. A release can attach several files
+                    // (idsig, mapping, sources), so this filters rather than assuming
+                    // the first asset is the APK.
+                    String apkUrl = null;
+                    long size = 0;
+                    JSONArray assets = rel.optJSONArray("assets");
+                    if (assets != null) {
+                        for (int a = 0; a < assets.length(); a++) {
+                            JSONObject asset = assets.optJSONObject(a);
+                            if (asset == null) continue;
+                            String an = asset.optString("name", "");
+                            if (an.endsWith(".apk")) {
+                                apkUrl = asset.optString("browser_download_url", "");
+                                size = asset.optLong("size", 0);
+                                break;
                             }
                         }
-                        if (apkUrl == null || apkUrl.isEmpty()) continue;
-
-                        StringBuilder sub = new StringBuilder();
-                        if (prerelease) sub.append("pre-release • ");
-                        if (size > 0) sub.append(formatSize(size)).append(" • ");
-                        sub.append(published.isEmpty() ? tag : published);
-
-                        found.add(new ReleaseInfo(
-                                name.isEmpty() ? tag : name,
-                                sub.toString(),
-                                apkUrl,
-                                rel.optString("html_url", "")));
                     }
+                    if (apkUrl == null || apkUrl.isEmpty()) continue;
+
+                    StringBuilder sub = new StringBuilder();
+                    if (prerelease) sub.append("pre-release • ");
+                    if (size > 0) sub.append(formatSize(size)).append(" • ");
+                    sub.append(published.isEmpty() ? tag : published);
+
+                    found.add(new ReleaseInfo(
+                            name.isEmpty() ? tag : name,
+                            sub.toString(),
+                            apkUrl,
+                            rel.optString("html_url", "")));
                 }
-            } catch (Throwable t) {
-                Log.w(TAG, "fetchReleases failed: " + t.getMessage());
-            }
+                return true;
+            });
             final List<ReleaseInfo> result = found;
             final boolean success = ok;
             mainHandler.post(() -> {
@@ -312,21 +322,18 @@ public class ColgramVersionsActivity extends BaseFragment {
     private void fetchUpstreamTags() {
         executor.execute(() -> {
             List<String> found = new ArrayList<>();
-            boolean ok = false;
-            try {
+            final boolean ok = withRetry("fetchUpstreamTags", () -> {
+                found.clear();
                 JSONArray arr = getJsonArray("https://api.github.com/repos/" + UPSTREAM_REPO + "/tags?per_page=40");
-                if (arr != null) {
-                    ok = true;
-                    for (int i = 0; i < arr.length(); i++) {
-                        JSONObject t = arr.optJSONObject(i);
-                        if (t == null) continue;
-                        String name = t.optString("name", "");
-                        if (!name.isEmpty()) found.add(name);
-                    }
+                if (arr == null) return false;
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject t = arr.optJSONObject(i);
+                    if (t == null) continue;
+                    String name = t.optString("name", "");
+                    if (!name.isEmpty()) found.add(name);
                 }
-            } catch (Throwable t) {
-                Log.w(TAG, "fetchUpstreamTags failed: " + t.getMessage());
-            }
+                return true;
+            });
             final List<String> result = found;
             final boolean success = ok;
             mainHandler.post(() -> {
@@ -340,7 +347,44 @@ public class ColgramVersionsActivity extends BaseFragment {
         });
     }
 
+    /**
+     * A non-2xx HTTP answer, carrying its status code as DATA.
+     *
+     * withRetry() needs to know whether a failure is worth repeating. Deriving that from
+     * the message text would drift the moment a message is reworded, and stashing the code
+     * in a field only held because this screen happens to use a single-thread executor —
+     * a constraint that silently breaks if the pool is ever widened. Throwing the code
+     * removes both hazards.
+     */
+    private static final class HttpStatusException extends java.io.IOException {
+        final int code;
+
+        HttpStatusException(int code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    /**
+     * Fetch and parse a JSON array from the GitHub API.
+     *
+     * Two things this must get right, both learned the hard way:
+     *
+     *  1. `User-Agent` is MANDATORY. GitHub's API answers **403** to any request without one
+     *     — verified directly: `curl -H "User-Agent:" .../tags` → 403, the same request with a
+     *     UA → 200. A UA that names the app is the documented requirement, and a 403 here is
+     *     indistinguishable from "repo unreachable" unless it is logged.
+     *
+     *  2. IPv4 is forced first. `api.telegram.org` publishes AAAA records and a device with no
+     *     routable IPv6 will hang on them for the whole timeout; routing every outbound call
+     *     through the same policy keeps this screen consistent with the Bot API path instead of
+     *     re-learning the same lesson per call site.
+     */
     private JSONArray getJsonArray(String urlStr) throws Exception {
+        try {
+            org.colgram.core.ColgramBotSync.applyIpv4Policy();
+        } catch (Throwable ignored) {}
+
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setConnectTimeout(12000);
         conn.setReadTimeout(12000);
@@ -349,14 +393,32 @@ public class ColgramVersionsActivity extends BaseFragment {
         try {
             int code = conn.getResponseCode();
             InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
-            if (is == null) return null;
+            if (is == null) {
+                Log.w(TAG, "getJsonArray: no body, HTTP " + code + " for " + urlStr);
+                return null;
+            }
             BufferedReader r = new BufferedReader(new InputStreamReader(is, "UTF-8"));
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = r.readLine()) != null) sb.append(line);
             r.close();
-            if (code < 200 || code >= 300) return null;
+            if (code < 200 || code >= 300) {
+                Log.w(TAG, "getJsonArray: HTTP " + code + " for " + urlStr + " body="
+                        + sb.toString().trim());
+                // Thrown rather than returned so withRetry() can read the status without a
+                // shared field. A 401/403 (rejected credentials or User-Agent) can never
+                // succeed on a retry, so retrying only delays the error row by the whole
+                // backoff schedule.
+                throw new HttpStatusException(code, "HTTP " + code + " for " + urlStr);
+            }
             String body = sb.toString().trim();
+            if (body.isEmpty()) {
+                // An empty 200 means a proxy or captive portal swallowed the body. Without
+                // this branch it would fall through to `new JSONArray("")` and throw
+                // "End of input at character 0 of", which reads as a parser bug.
+                Log.w(TAG, "getJsonArray: empty body, HTTP " + code + " for " + urlStr);
+                return null;
+            }
             if (body.startsWith("{")) {
                 JSONObject obj = new JSONObject(body);
                 if (obj.has("message")) {
@@ -369,6 +431,44 @@ public class ColgramVersionsActivity extends BaseFragment {
         } finally {
             conn.disconnect();
         }
+    }
+
+    /**
+     * Run a fetch body with bounded retries and exponential backoff.
+     *
+     * Returns true if any attempt reported success. Retries are what stop one transient
+     * network failure from latching a permanent error row on the screen.
+     *
+     * A hard client error short-circuits the loop: the server has already made a decision
+     * and cannot be argued with. 408 (timeout) and 429 (rate limited) are excluded because
+     * those ARE transient — retrying them is the whole point.
+     */
+    private boolean withRetry(String label, java.util.concurrent.Callable<Boolean> body) {
+        for (int attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+            try {
+                Boolean ok = body.call();
+                if (Boolean.TRUE.equals(ok)) return true;
+                Log.w(TAG, label + ": attempt " + attempt + "/" + FETCH_ATTEMPTS + " failed");
+            } catch (HttpStatusException hse) {
+                boolean permanent = hse.code >= 400 && hse.code < 500
+                        && hse.code != 408 && hse.code != 429;
+                Log.w(TAG, label + ": HTTP " + hse.code
+                        + (permanent ? " is not retryable, giving up" : ", will retry"));
+                if (permanent) return false;
+            } catch (Throwable t) {
+                Log.w(TAG, label + ": attempt " + attempt + "/" + FETCH_ATTEMPTS + " threw: "
+                        + t.getMessage());
+            }
+            if (attempt < FETCH_ATTEMPTS) {
+                try {
+                    Thread.sleep(FETCH_RETRY_BASE_MS * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+        return false;
     }
 
     private static String formatSize(long bytes) {

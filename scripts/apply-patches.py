@@ -81,24 +81,121 @@ def inject_hooks(repo_path):
     # without one; colgram-core cannot reference Activity/BaseFragment at compile
     # time, so it tracks the top activity through these callbacks instead.
     app_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java")
+
+    def app_loader_replacer(content):
+        # A callable, not a plain anchor string, because this patch has to be able to land a
+        # SECOND time. `patch_file` short-circuits with "[=] Already patched" whenever the
+        # replacement text is already present, so an anchor-string form can add the Colgram
+        # init block once and then never append anything to it again - the boot-time IPv4
+        # policy below silently never shipped for exactly that reason. Doing the insertion by
+        # hand makes the function re-entrant: each piece is guarded on its own marker.
+        anchor = ("        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
+                  "        ProxyRotationController.init();\n"
+                  "    }")
+        # NOTE: this early return used to be `if anchor not in content: return content`,
+        # which silently disabled the whole re-entrancy design below. The anchor includes
+        # the closing brace that immediately follows ProxyRotationController.init(), so once
+        # piece 1 has been inserted that brace is no longer adjacent, the anchor stops
+        # matching, and the function bailed before the piece-2 branch could run - the same
+        # "already patched, never extend" trap that patch_file has. The anchor test must
+        # therefore apply ONLY to the fresh-file path.
+        anchor_present = anchor in content
+
+        block = ("        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
+                 "        ProxyRotationController.init();\n"
+                 "\n"
+                 "        // Colgram: initialise LAST, once AndroidUtilities, the native library and\n"
+                 "        // the Java<->native bridge all exist. See the note in apply-patches.py -\n"
+                 "        // this used to run before super.onCreate() and that was a real bug.\n"
+                 "        try {\n"
+                 "            org.colgram.core.ColgramHookHandler.init(applicationContext);\n"
+                 "            org.colgram.core.ColgramUiBridge.install(this);\n"
+                 "        } catch (Throwable ignore) {\n"
+                 "\n"
+                 "        }\n")
+
+        # Piece 2, appended independently so its marker can be added on a later run.
+        ipv4 = ("\n"
+                "        // Colgram: pin outbound HTTP dials to IPv4 where the device has no usable\n"
+                "        // IPv6 route, from the earliest point in the process.\n"
+                "        //\n"
+                "        // This used to rest on System.setProperty(\"java.net.preferIPv4Stack\", ...)\n"
+                "        // and Os.setenv(\"JAVA_TOOL_OPTIONS\", ...). BOTH ARE INERT on Android, and\n"
+                "        // both were measured as such, not assumed:\n"
+                "        //   * JAVA_TOOL_OPTIONS is read by a JVM *launcher*; an ART process is already\n"
+                "        //     running by the time app code executes.\n"
+                "        //   * InetAddress reads preferIPv4Stack once, during its own class init, which\n"
+                "        //     happens before any app code runs. Logged ENFORCED at 16:56:03, yet\n"
+                "        //     connects to 2001:67c:4e8:f004::9 started at 16:56:51 - 48s later, with\n"
+                "        //     the property set the whole time.\n"
+                "        //   * setSSLSocketFactory is inert too, and this is the subtle one: on\n"
+                "        //     Android HttpURLConnection IS OkHttp. OkHttp dials its OWN raw TCP\n"
+                "        //     socket in RealConnection.connect -> Platform.connectSocket and does its\n"
+                "        //     own DNS, consulting the SSLSocketFactory only for the TLS layer on a\n"
+                "        //     socket it already opened. Measured: 2434 connects to the AAAA address,\n"
+                "        //     zero successful Bot API calls.\n"
+                "        //\n"
+                "        // What DOES work is constraining the Socket's own connect() - see\n"
+                "        // ColgramIpv4Socket / colgramEnsureIpv4ConnectionFactory in ColgramBotSync.\n"
+                "        // The call below installs that factory; it is idempotent and safe to reach\n"
+                "        // from several entry points, which matters because this method\n"
+                "        // (postInitApplication) has a once-only guard and is NOT guaranteed to run.\n"
+                "        // Skipped at the factory level when a genuinely routable IPv6 path exists, so\n"
+                "        // a real dual-stack device keeps its faster v6 route.\n"
+                "        try {\n"
+                "            org.colgram.core.ColgramBotSync.applyIpv4Policy();\n"
+                "        } catch (Throwable ignore) {\n"
+                "\n"
+                "        }\n")
+
+        if "ColgramUiBridge.install(this)" in content:
+            # Piece 1 present. Append piece 2 only if it is missing.
+            if "applyIpv4Policy" in content:
+                return content
+            # Find where the Colgram init try/catch ENDS and insert after it.
+            #
+            # Naive brace-matching from the `try {` lands on the closing brace of the
+            # TRY BLOCK, which is mid-statement - between `try { ... }` and `catch (...) {`.
+            # Inserting there produced
+            #     try { ... }
+            #     <new try/catch>
+            #     } catch (Throwable ignore) {
+            # i.e. a stray second catch. Scan for the end of the whole try/catch instead:
+            # from `try`, find `try`, its block, then consume `catch (...) { ... }`.
+            try_at = content.index("org.colgram.core.ColgramUiBridge.install(this)")
+
+            def _match_block(s, brace_pos):
+                depth = 0
+                i = brace_pos
+                while i < len(s):
+                    if s[i] == "{":
+                        depth += 1
+                    elif s[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return i
+                    i += 1
+                return -1
+
+            try_kw = content.rindex("try", 0, try_at)
+            try_block_end = _match_block(content, content.index("{", try_kw))
+            insert_at = try_block_end + 1
+            # The NEXT statement may be `catch (...) { ... }` - if so, skip past it too.
+            tail = content[insert_at:]
+            lead = len(tail) - len(tail.lstrip())
+            if tail.lstrip().startswith("catch"):
+                catch_kw_rel = insert_at + lead
+                catch_block_end = _match_block(content, content.index("{", catch_kw_rel))
+                if catch_block_end != -1:
+                    insert_at = catch_block_end + 1
+            return content[:insert_at] + ipv4[:-6] + content[insert_at:]
+
+        return content.replace(anchor, block + ipv4, 1) if anchor_present else content
+
     patch_file(
         app_loader,
-        "        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
-        "        ProxyRotationController.init();\n"
-        "    }",
-        "        LauncherIconController.tryFixLauncherIconIfNeeded();\n"
-        "        ProxyRotationController.init();\n"
-        "\n"
-        "        // Colgram: initialise LAST, once AndroidUtilities, the native library and\n"
-        "        // the Java<->native bridge all exist. See the note in apply-patches.py -\n"
-        "        // this used to run before super.onCreate() and that was a real bug.\n"
-        "        try {\n"
-        "            org.colgram.core.ColgramHookHandler.init(applicationContext);\n"
-        "            org.colgram.core.ColgramUiBridge.install(this);\n"
-        "        } catch (Throwable ignore) {\n"
-        "\n"
-        "        }\n"
-        "    }",
+        app_loader_replacer,
+        None,
         "ApplicationLoader.onCreate Colgram initialization (after native load)"
     )
 
@@ -147,10 +244,47 @@ def inject_hooks(repo_path):
         "public static File getDirectory(int type) {\n        File sandboxed = org.colgram.core.ColgramHookHandler.hookGetDirectory(type);\n        if (sandboxed != null) return sandboxed;",
         "FileLoader.getDirectory Sandbox Redirect"
     )
+    # FileLoader.deleteFiles -> media preservation guard.
+    #
+    # ⚠️ Anchoring on a bare "if (!file.delete()) {" is dangerous: that exact text
+    # appears TWICE in deleteFiles() — once for `file` and once for the `q_` thumbnail.
+    # A first-match replace therefore guards the main file but leaves the thumbnail
+    # deletable, which is why "media preservation" left q_*.jpg files vanishing.
+    # Anchor on the enclosing `else if (file.exists()) {` branch instead, which is
+    # unique, and carry the original branch body through the replacement.
+    #
+    # The guard must be `continue`, not `return`: it sits inside a `for` loop over the
+    # file list, and returning would abort preservation for every remaining file.
+    def media_lock_replacer(content):
+        old = """                } else if (file.exists()) {
+                    try {
+                        if (!file.delete()) {
+                            file.deleteOnExit();
+                        }"""
+        new = """                } else if (file.exists()) {
+                    if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) {
+                        continue;
+                    }
+                    try {
+                        if (!file.delete()) {
+                            file.deleteOnExit();
+                        }"""
+        if "shouldPreventMediaDeletion(file)) {\n                        continue;" in content:
+            return content                       # already in canonical form
+        if old in content:
+            return content.replace(old, new, 1)
+        # Fall back to the legacy single-line shape so an already-patched tree
+        # converges instead of silently keeping the broken indentation.
+        legacy = "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) continue;\n                if (!file.delete()) {"
+        if legacy in content:
+            return content.replace(legacy,
+                    "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) {\n                        continue;\n                    }\n                    if (!file.delete()) {", 1)
+        print(" [!] FileLoader.deleteFiles media-lock anchor not found")
+        return content
     patch_file(
         file_loader,
-        "if (!file.delete()) {",
-        "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) continue;\n                if (!file.delete()) {",
+        media_lock_replacer,
+        "if (org.colgram.core.ColgramHookHandler.shouldPreventMediaDeletion(file)) {",
         "FileLoader.deleteFiles Media Lock"
     )
 
@@ -1243,13 +1377,26 @@ def inject_hooks(repo_path):
             return content.replace(target, inject, 1)
         patch_file(messages_storage, anti_delete_injector, "messages.removeAll(toRemove);", "MessagesStorage Anti-Delete Preservation")
 
-    # 21. MessagesController.java -> Save Message Edit History
+    # 21. MessagesController.java -> Save Message Edit History (text + media)
+    #
+    # 🔴 SELF-GUARDED. Do NOT rely on patch_file's generic guard here: that guard keys
+    # on `replacement.strip() in content`, and this replacement is a 100-line block
+    # assembled inside the callable, so `.strip()` can never match. Worse, the removal
+    # of the previous text-only variant means a naive re-run APPENDS a second copy.
+    # Measured: two runs produced hookOnMediaReplaced x2 / hookOnMessageEdited x3.
+    # The guard below is therefore explicit and keyed on the media marker.
     if os.path.exists(messages_controller):
         def edit_history_injector(content):
             target = "} else if (baseUpdate instanceof TL_update.TL_updateEditChannelMessage || baseUpdate instanceof TL_update.TL_updateEditMessage) {"
             if target not in content:
                 return content
-            inject = """
+
+            # Already upgraded to the media-capturing revision? Nothing to do.
+            if "org.colgram.core.ColgramHookHandler.hookOnMediaReplaced(" in content:
+                return content
+
+            # Remove the older text-only variant so the two never stack.
+            old_text_only = """
                 try {
                     TLRPC.Message colgramEditMsg = (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) ? ((TL_update.TL_updateEditChannelMessage) baseUpdate).message : ((TL_update.TL_updateEditMessage) baseUpdate).message;
                     if (colgramEditMsg != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
@@ -1266,13 +1413,356 @@ def inject_hooks(repo_path):
                         org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, colgramEditMsg.id, colgramPrevText, colgramEditMsg.date);
                     }
                 } catch (Throwable ignore) {}"""
+            removed_old = old_text_only in content
+            if removed_old:
+                content = content.replace(old_text_only, "", 1)
+
+            inject = """
+                try {
+                    TLRPC.Message colgramEditMsg = (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) ? ((TL_update.TL_updateEditChannelMessage) baseUpdate).message : ((TL_update.TL_updateEditMessage) baseUpdate).message;
+                    if (colgramEditMsg != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
+                        long did = colgramEditMsg.dialog_id != 0 ? colgramEditMsg.dialog_id : (colgramEditMsg.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(colgramEditMsg.peer_id) : 0);
+
+                        // One storage read serves BOTH the text and the media capture.
+                        TLRPC.Message colgramStored = null;
+                        try {
+                            colgramStored = getMessagesStorage().getMessage(did, colgramEditMsg.id);
+                        } catch (Throwable ignoreInner) {}
+
+                        // ---- 1. text revision -------------------------------------------------
+                        // Read the PREVIOUS revision from local storage BEFORE the update
+                        // overwrites it. The update carries only the NEW text.
+                        //
+                        // \u26a0\ufe0f Record a text revision ONLY when storage returned a row.
+                        // MessagesStorage.getMessage() queries messages_v2 and returns null
+                        // for a message that was never persisted (or has been evicted).
+                        // Recording anyway would bank an empty revision that renders as a
+                        // blank "previous version" in the history sheet. No previous value,
+                        // no revision.
+                        String colgramPrevText = null;
+                        if (colgramStored != null && colgramStored.message != null
+                                && !colgramStored.message.equals(colgramEditMsg.message)) {
+                            colgramPrevText = colgramStored.message;
+                            org.colgram.core.ColgramHookHandler.hookOnMessageEdited(did, colgramEditMsg.id, colgramPrevText, colgramEditMsg.date);
+                        }
+
+                        // ---- 2. media revision ------------------------------------------------
+                        // Telegram has no attachment history: when an edit swaps the photo or
+                        // video, the old document reference is simply gone. Detect that the
+                        // stored message HAD media and the incoming one either has none or a
+                        // DIFFERENT one, then snapshot it before it is lost.
+                        //
+                        // API notes (all verified against this tree — do not "tidy" them):
+                        //   * FileLoader.getPathToMessage is an INSTANCE method; reach it via
+                        //     getFileLoader(). There is no FileLoader.getMediaId.
+                        //   * The media identity is Document.id / Photo.id directly. Both
+                        //     classes expose `public long id`, so read it off the TL object.
+                        try {
+                            boolean colgramHadMedia = colgramStored != null && colgramStored.media != null;
+                            if (colgramHadMedia) {
+                                // Identity: document id, else the largest photo size's id.
+                                long colgramOldId = 0;
+                                long colgramNewId = 0;
+                                if (colgramStored.media.document != null) {
+                                    colgramOldId = colgramStored.media.document.id;
+                                } else if (colgramStored.media.photo != null) {
+                                    colgramOldId = colgramStored.media.photo.id;
+                                }
+                                if (colgramEditMsg.media != null) {
+                                    if (colgramEditMsg.media.document != null) {
+                                        colgramNewId = colgramEditMsg.media.document.id;
+                                    } else if (colgramEditMsg.media.photo != null) {
+                                        colgramNewId = colgramEditMsg.media.photo.id;
+                                    }
+                                }
+                                if (colgramOldId == 0 || colgramOldId != colgramNewId) {
+                                    String colgramPath = null;
+                                    String colgramName = null;
+                                    long colgramSize = 0;
+                                    String colgramMime = null;
+                                    int colgramType = 3;
+                                    try {
+                                        // getPathToMessage() honours the message's stored attachPath,
+                                        // but the PUBLIC MessagesStorage.getMessage() does NOT run
+                                        // readAttachPath on the deserialized row (the private
+                                        // getMessageInternal() does). So attachPath is usually null
+                                        // here and this first attempt often resolves to nothing.
+                                        java.io.File colgramFile = getFileLoader().getPathToMessage(colgramStored);
+                                        if (colgramFile != null && colgramFile.exists() && colgramFile.length() > 0) {
+                                            colgramPath = colgramFile.getAbsolutePath();
+                                            colgramSize = colgramFile.length();
+                                        } else {
+                                            // Fallback: derive the canonical cache path straight from
+                                            // the media object. getPathToAttach() computes the path
+                                            // from the document/photo id, so it still resolves after
+                                            // an attachPath hint has been lost.
+                                            TLObject colgramAttach = null;
+                                            if (colgramStored.media.document != null) {
+                                                colgramAttach = colgramStored.media.document;
+                                            } else if (colgramStored.media.photo != null) {
+                                                colgramAttach = colgramStored.media.photo;
+                                            }
+                                            if (colgramAttach != null) {
+                                                java.io.File colgramAttachFile = getFileLoader().getPathToAttach(colgramAttach, true);
+                                                if (colgramAttachFile != null && colgramAttachFile.exists() && colgramAttachFile.length() > 0) {
+                                                    colgramPath = colgramAttachFile.getAbsolutePath();
+                                                }
+                                            }
+                                        }
+                                    } catch (Throwable ignorePath) {}
+                                    if (colgramStored.media instanceof TLRPC.TL_messageMediaPhoto) {
+                                        colgramType = 1;
+                                        colgramMime = "image/*";
+                                        colgramName = "photo_" + colgramOldId + ".jpg";
+                                    } else if (colgramStored.media instanceof TLRPC.TL_messageMediaDocument) {
+                                        TLRPC.Document colgramDoc = colgramStored.media.document;
+                                        if (colgramDoc != null) {
+                                            colgramMime = colgramDoc.mime_type;
+                                            colgramName = org.telegram.messenger.FileLoader.getDocumentFileName(colgramDoc);
+                                            if (colgramDoc.size > 0) colgramSize = colgramDoc.size;
+                                            if (org.telegram.messenger.MessageObject.isVideoDocument(colgramDoc)) {
+                                                colgramType = 2;
+                                            }
+                                        }
+                                        if (colgramName == null || colgramName.trim().isEmpty()) {
+                                            colgramName = "document_" + colgramOldId;
+                                        }
+                                    } else if (colgramStored.media instanceof TLRPC.TL_messageMediaGame) {
+                                        colgramType = 3;
+                                        colgramName = colgramStored.media.game != null
+                                                ? colgramStored.media.game.title : "game";
+                                    } else {
+                                        colgramType = 3;
+                                        colgramName = "attachment_" + colgramOldId;
+                                    }
+                                    // Copy into the sandbox so the revision outlives Telegram's
+                                    // own cache eviction. A null result is acceptable: the row is
+                                    // still recorded, just without an openable copy.
+                                    String colgramSandboxPath = null;
+                                    if (colgramPath != null) {
+                                        colgramSandboxPath = org.colgram.core.ColgramHookHandler
+                                                .colgramCopyRevisionFile(colgramPath, colgramName);
+                                        if (colgramSandboxPath == null) {
+                                            // Fall back to the live cache path: usable now, may
+                                            // vanish later. Better than nothing.
+                                            colgramSandboxPath = colgramPath;
+                                        }
+                                    }
+                                    org.colgram.core.ColgramHookHandler.hookOnMediaReplaced(
+                                            did, colgramEditMsg.id, colgramType,
+                                            colgramSandboxPath, colgramName, colgramSize,
+                                            colgramMime, colgramOldId, colgramEditMsg.date);
+                                }
+                            }
+                        } catch (Throwable ignoreMedia) {}
+                    }
+                } catch (Throwable ignore) {}"""
             return content.replace(target, target + inject, 1)
-        patch_file(messages_controller, edit_history_injector, "org.colgram.core.ColgramConfig.isEditHistoryEnabled()", "MessagesController Save Edit History")
+        patch_file(messages_controller, edit_history_injector, "colgramCopyRevisionFile", "MessagesController Save Edit History")
 
 
     # 24. Theme.java -> Inject Colgram Cyber Red Colors
     theme_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "Theme.java")
     if os.path.exists(theme_file):
+        COLGRAM_GETCOLOR_WRAPPER = (
+        "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {\n"
+        "        int colgramResolved = colgramGetColorInternal(key, isDefault, ignoreAnimation);\n"
+        "        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n"
+        "            if (key == key_chats_actionBackground || key == key_dialogFloatingButton || key == key_switchTrackChecked) {\n"
+        "                return 0xffff3344;\n"
+        "            }\n"
+        "            if (key == key_windowBackgroundWhite || key == key_windowBackgroundGray) {\n"
+        "                return 0xff0e0f12;\n"
+        "            }\n"
+        "            if (key == key_actionBarDefault) {\n"
+        "                return 0xff16181e;\n"
+        "            }\n"
+        "            if (key == key_windowBackgroundWhiteInputField) {\n"
+        "                return 0xff3a3f4a;\n"
+        "            }\n"
+        "            if (key == key_windowBackgroundWhiteInputFieldActivated) {\n"
+        "                return 0xffff3344;\n"
+        "            }\n"
+        "            if (key == key_actionBarDefaultIcon || key == key_actionBarDefaultTitle) {\n"
+        "                return 0xffffffff;\n"
+        "            }\n"
+        "            if (key == key_actionBarDefaultSubtitle) {\n"
+        "                return 0xff8a8f98;\n"
+        "            }\n"
+        "            if (key == key_switchTrack || key == key_radioBackground) {\n"
+        "                return 0xff3a3f4a;\n"
+        "            }\n"
+        "        }\n"
+        # A palette hole (resolved 0) is filled from the complete night palette shipped in
+        # assets. This block used to live ONLY in the checked-out Theme.java and was absent
+        # from this patcher, so every fresh clone and every CI build was quietly missing it -
+        # which is why the black-on-black kept coming back after a clean build. It is now
+        # part of the patch itself.
+        "        if (colgramResolved == 0 && colgramNightHasKey(key)) {\n"
+        "            return colgramNightColor(key);\n"
+        "        }\n"
+        "        // A zero colour for a readable key is a broken/partial theme palette.\n"
+        "        // Leaving it renders black text on a dark background - the invisible login form.\n"
+        "        if (colgramResolved == 0 && colgramIsReadableKey(key)) {\n"
+        "            return isCurrentThemeDark() ? 0xffffffff : 0xff000000;\n"
+        "        }\n"
+        "        if (isCurrentThemeDark() && colgramIsForegroundKey(key)) {\n"
+        "            int surface = colgramGetColorInternal(key_windowBackgroundWhite, null, true);\n"
+        "            if (colgramContrast(colgramResolved, surface) < COLGRAM_MIN_CONTRAST) {\n"
+        "                int base = colgramGetColorInternal(key_windowBackgroundWhiteBlackText, null, true);\n"
+        "                if (colgramContrast(base, surface) < COLGRAM_MIN_CONTRAST) {\n"
+        "                    base = 0xffffffff;\n"
+        "                }\n"
+        "                return base;\n"
+        "            }\n"
+        "        }\n"
+        "        return colgramResolved;\n"
+        "    }\n"
+        "\n"
+        "    private static boolean colgramIsReadableKey(int key) {\n"
+        "        return key == key_windowBackgroundWhiteBlackText\n"
+        "                || key == key_windowBackgroundWhiteGrayText\n"
+        "                || key == key_windowBackgroundWhiteGrayText2\n"
+        "                || key == key_windowBackgroundWhiteGrayText3\n"
+        "                || key == key_windowBackgroundWhiteGrayText4\n"
+        "                || key == key_windowBackgroundWhiteGrayText5\n"
+        "                || key == key_windowBackgroundWhiteGrayText6\n"
+        "                || key == key_windowBackgroundWhiteGrayText7\n"
+        "                || key == key_windowBackgroundWhiteGrayText8\n"
+        "                || key == key_windowBackgroundWhiteHintText\n"
+        "                || key == key_windowBackgroundWhiteValueText\n"
+        "                || key == key_windowBackgroundWhiteLinkText\n"
+        "                || key == key_windowBackgroundWhiteBlueText\n"
+        "                || key == key_windowBackgroundWhiteBlueText2\n"
+        "                || key == key_windowBackgroundWhiteBlueText3\n"
+        "                || key == key_windowBackgroundWhiteBlueText4\n"
+        "                || key == key_windowBackgroundWhiteBlueText5\n"
+        "                || key == key_windowBackgroundWhiteBlueText6\n"
+        "                || key == key_windowBackgroundWhiteBlueText7\n"
+        "                || key == key_windowBackgroundWhiteGrayIcon\n"
+        "                || key == key_windowBackgroundWhiteBlueIcon\n"
+        "                || key == key_windowBackgroundWhiteInputField\n"
+        "                || key == key_windowBackgroundWhiteInputFieldActivated;\n"
+        "    }\n"
+        "\n"
+        # Night palette: fills colour holes from the complete dark palette in assets.
+        # Without this a partial fetched theme resolves dozens of keys to 0 and the UI
+        # renders as one flat dark rectangle.
+        "    private static volatile int[] colgramNightColors;\n"
+        "    private static volatile boolean colgramNightLoading;\n"
+        "\n"
+        "    private static int[] colgramGetNightPalette() {\n"
+        "        if (colgramNightColors != null) {\n"
+        "            return colgramNightColors;\n"
+        "        }\n"
+        "        if (colgramNightLoading) {\n"
+        "            return null;\n"
+        "        }\n"
+        "        synchronized (Theme.class) {\n"
+        "            if (colgramNightColors != null || colgramNightLoading) {\n"
+        "                return colgramNightColors;\n"
+        "            }\n"
+        "            colgramNightLoading = true;\n"
+        "        }\n"
+        "        new Thread(() -> {\n"
+        "            try {\n"
+        "                android.content.Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;\n"
+        "                java.io.BufferedReader br = new java.io.BufferedReader(\n"
+        "                        new java.io.InputStreamReader(ctx.getAssets().open(\"night.attheme\")));\n"
+        "                java.util.HashMap<Integer, Integer> map = new java.util.HashMap<>();\n"
+        "                String line;\n"
+        "                while ((line = br.readLine()) != null) {\n"
+        "                    line = line.trim();\n"
+        "                    if (line.isEmpty() || line.startsWith(\"#\")) {\n"
+        "                        continue;\n"
+        "                    }\n"
+        "                    int eq = line.indexOf('=');\n"
+        "                    if (eq <= 0) {\n"
+        "                        continue;\n"
+        "                    }\n"
+        "                    int k2 = ThemeColors.stringKeyToInt(line.substring(0, eq));\n"
+        "                    if (k2 < 0) {\n"
+        "                        continue;\n"
+        "                    }\n"
+        "                    try {\n"
+        "                        map.put(k2, Integer.parseInt(line.substring(eq + 1).trim()));\n"
+        "                    } catch (Exception ignored) {}\n"
+        "                }\n"
+        "                br.close();\n"
+        "                int max = 0;\n"
+        "                for (int k3 : map.keySet()) {\n"
+        "                    max = Math.max(max, k3);\n"
+        "                }\n"
+        "                int[] arr = new int[max + 1];\n"
+        "                for (java.util.Map.Entry<Integer, Integer> e : map.entrySet()) {\n"
+        "                    arr[e.getKey()] = e.getValue();\n"
+        "                }\n"
+        "                colgramNightColors = arr;\n"
+        "                org.telegram.messenger.FileLog.d(\"ColgramTheme night palette loaded, \" + map.size() + \" keys\");\n"
+        "            } catch (Throwable t) {\n"
+        "                org.telegram.messenger.FileLog.e(t);\n"
+        "                colgramNightColors = new int[0];\n"
+        "            }\n"
+        "        }, \"colgram-night-palette\").start();\n"
+        "        return null;\n"
+        "    }\n"
+        "\n"
+        "    private static boolean colgramNightHasKey(int key) {\n"
+        "        int[] night = colgramGetNightPalette();\n"
+        "        return night != null && key >= 0 && key < night.length && night[key] != 0;\n"
+        "    }\n"
+        "\n"
+        "    private static int colgramNightColor(int key) {\n"
+        "        return colgramNightColors[key];\n"
+        "    }\n"
+        "\n"
+        # Contrast guard: the last line of defence against "everything merges". The two
+        # resolvers above only fire on a literal 0; a partial theme can instead resolve a
+        # foreground to a valid-but-invisible dark value. Surfaces take no part in this.
+        "    private static final int COLGRAM_MIN_CONTRAST = 48;\n"
+        "\n"
+        "    private static int colgramLuma(int color) {\n"
+        "        int r = (color >> 16) & 0xFF;\n"
+        "        int g = (color >> 8) & 0xFF;\n"
+        "        int b = color & 0xFF;\n"
+        "        return (r * 299 + g * 587 + b * 114) / 1000;\n"
+        "    }\n"
+        "\n"
+        "    private static int colgramContrast(int a, int b) {\n"
+        "        return Math.abs(colgramLuma(a) - colgramLuma(b));\n"
+        "    }\n"
+        "\n"
+        "    private static boolean colgramIsForegroundKey(int key) {\n"
+        "        return key == key_windowBackgroundWhiteBlackText\n"
+        "                || key == key_windowBackgroundWhiteGrayText\n"
+        "                || key == key_windowBackgroundWhiteGrayText2\n"
+        "                || key == key_windowBackgroundWhiteGrayText3\n"
+        "                || key == key_windowBackgroundWhiteGrayText4\n"
+        "                || key == key_windowBackgroundWhiteGrayText5\n"
+        "                || key == key_windowBackgroundWhiteGrayText6\n"
+        "                || key == key_windowBackgroundWhiteGrayText7\n"
+        "                || key == key_windowBackgroundWhiteGrayText8\n"
+        "                || key == key_windowBackgroundWhiteHintText\n"
+        "                || key == key_windowBackgroundWhiteValueText\n"
+        "                || key == key_windowBackgroundWhiteLinkText\n"
+        "                || key == key_windowBackgroundWhiteBlueText\n"
+        "                || key == key_windowBackgroundWhiteBlueText2\n"
+        "                || key == key_windowBackgroundWhiteBlueText3\n"
+        "                || key == key_windowBackgroundWhiteBlueText4\n"
+        "                || key == key_windowBackgroundWhiteBlueText5\n"
+        "                || key == key_windowBackgroundWhiteBlueText6\n"
+        "                || key == key_windowBackgroundWhiteBlueText7\n"
+        "                || key == key_windowBackgroundWhiteGrayIcon\n"
+        "                || key == key_windowBackgroundWhiteBlueIcon\n"
+        "                || key == key_actionBarDefaultIcon\n"
+        "                || key == key_actionBarDefaultTitle\n"
+        "                || key == key_actionBarDefaultSubtitle\n"
+        "                || key == key_actionBarDefaultSelector;\n"
+        "    }\n"
+        "\n"
+        "    private static int colgramGetColorInternal(int key, boolean[] isDefault, boolean ignoreAnimation) {"
+)
+
         def theme_cyber_injector(content):
             target = "public static int getColor(int key, ResourcesProvider provider) {"
             if target not in content:
@@ -1289,26 +1779,58 @@ def inject_hooks(repo_path):
                 return 0xff16181e;
             }
         }"""
-            return content.replace(target, target + inject, 1)
+            content = content.replace(target, target + inject, 1)
+            anchor = "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {"
+            if anchor in content:
+                # Replace the wrapper whenever it is missing OR stale. The old guard was
+                # `"colgramGetColorInternal" not in content`, which meant once an early
+                # version of the wrapper had been applied, every later improvement to it
+                # was skipped forever - the patch reported success while the file kept the
+                # original, weaker logic. Compare against a marker that only the current
+                # wrapper contains and refuse to accept a downgrade.
+                needs_rewrite = ("colgramGetColorInternal" not in content
+                                 or "colgramIsForegroundKey" not in content)
+                if needs_rewrite:
+                    # Drop any previous wrapper so we do not stack a second copy.
+                    content = re.sub(
+                        r"public static int getColor\(int key, boolean\[\] isDefault, boolean ignoreAnimation\) \{.*?"
+                        r"private static int colgramGetColorInternal\(int key, boolean\[\] isDefault, boolean ignoreAnimation\) \{",
+                        COLGRAM_GETCOLOR_WRAPPER,
+                        content, count=1, flags=re.S)
+            return content
         patch_file(theme_file, theme_cyber_injector, "org.colgram.core.ColgramConfig.isCyberThemeEnabled()", "Theme Inject Colgram Cyber Red Colors")
 
+        # 24b. The cyber overrides above ALSO get applied at the real choke point, and a
+        # zero-valued readable colour is repaired there. See COLGRAM_GETCOLOR_WRAPPER.
+        #
+        # Why: getColor(int key) delegates to getColor(int, boolean[], boolean), NOT to
+        # getColor(int, ResourcesProvider) - so ordinary UI never reached the 2-arg
+        # injection at all, which is why the cyber theme looked like it did nothing.
+        # And a theme that omits a text key resolves it to 0 = transparent black, which is
+        # invisible on any dark background. That was the black-on-black login screen.
+        # Probe evidence from the device:/n        #     name=Classic dark=true cyber=true wbw=0xff000000 wbwbt=0x0
 
-    # 24.1. Deploy Telegram-Native UI Screens from templates
-    template_dir = os.path.join(os.path.dirname(__file__), "templates")
-    ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
-    os.makedirs(ui_dest_dir, exist_ok=True)
-    for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java"]:
-        src_t = os.path.join(template_dir, name)
-        dst_t = os.path.join(ui_dest_dir, name)
-        if os.path.exists(src_t):
-            shutil.copyfile(src_t, dst_t)
-            print(f" [+] Deployed Telegram-Native {name}")
-        else:
-            print(f" [!] Warning: template {src_t} not found")
+        # 24.1. Deploy Telegram-Native UI Screens from templates
+        template_dir = os.path.join(os.path.dirname(__file__), "templates")
+        ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
+        os.makedirs(ui_dest_dir, exist_ok=True)
+        for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java"]:
+            src_t = os.path.join(template_dir, name)
+            dst_t = os.path.join(ui_dest_dir, name)
+            if os.path.exists(src_t):
+                shutil.copyfile(src_t, dst_t)
+                print(f" [+] Deployed Telegram-Native {name}")
+            else:
+                print(f" [!] Warning: template {src_t} not found")
 
-    # 25. SettingsActivity.java -> Deep Integration of Colgram Settings, Plugins, TempMail, Versions
-    settings_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SettingsActivity.java")
-    if os.path.exists(settings_activity):
+        # 25. SettingsActivity.java -> Deep Integration of Colgram Settings, Plugins, TempMail, Versions
+        settings_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SettingsActivity.java")
+        # The `if os.path.exists(settings_activity)` guard that used to wrap this `def` is
+        # gone on purpose: a `def` is a statement, not a block that can be conditionally
+        # declared at module level the way this was written, and the guard was redundant
+        # anyway - patch_file() already checks the file exists and reports a miss. Keeping
+        # the guard forced the whole function body one level deeper and is what produced
+        # the IndentationError that stopped this script from parsing at all.
         def settings_items_injector(content):
             target = "items.add(SettingCell.Factory.of(10, IconBackgroundColors.PURPLE.top, IconBackgroundColors.PURPLE.bottom, R.drawable.settings_language, getString(R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));"
             if target not in content:
@@ -1351,21 +1873,21 @@ def inject_hooks(repo_path):
 
         patch_file(settings_activity, settings_clicks_injector, "case 101:", "SettingsActivity Route Colgram Items Clicks")
 
-    # 26. DialogsActivity.java & ContactsActivity.java -> Complete Permission Suppression
-    if os.path.exists(dialogs_activity):
-        patch_file(
-            dialogs_activity,
-            "if (hasNotNotificationsPermission || hasNotContactsPermission || hasNotStoragePermission)",
-            "if (false && (hasNotNotificationsPermission || hasNotContactsPermission || hasNotStoragePermission))",
-            "DialogsActivity Suppress Startup Permission Dialogs"
-        )
-        patch_file(
-            dialogs_activity,
-            "private void askForPermissons(boolean alert) {",
-            """private void askForPermissons(boolean alert) {
+        # 26. DialogsActivity.java & ContactsActivity.java -> Complete Permission Suppression
+        if os.path.exists(dialogs_activity):
+            patch_file(
+                dialogs_activity,
+                "if (hasNotNotificationsPermission || hasNotContactsPermission || hasNotStoragePermission)",
+                "if (false && (hasNotNotificationsPermission || hasNotContactsPermission || hasNotStoragePermission))",
+                "DialogsActivity Suppress Startup Permission Dialogs"
+            )
+            patch_file(
+                dialogs_activity,
+                "private void askForPermissons(boolean alert) {",
+                """private void askForPermissons(boolean alert) {
         if (true) return;""",
-            "DialogsActivity Suppress askForPermissons"
-        )
+                "DialogsActivity Suppress askForPermissons"
+            )
 
     contacts_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ContactsActivity.java")
     if os.path.exists(contacts_activity):
@@ -1425,15 +1947,28 @@ def inject_hooks(repo_path):
         def mc_qr_replacer(content):
             if "ColgramQRLoginBottomSheet.onLoginTokenUpdate" in content:
                 return content
-            target = 'FileLog.d("process update " + baseUpdate.getClass().getSimpleName());\\n            }'
-            inject = """FileLog.d("process update " + baseUpdate.getClass().getSimpleName());
-            }
-            if (baseUpdate instanceof TL_update.TL_updateLoginToken) {
-                org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);
-                continue;
-            }"""
+            # 🔴 CRLF trap — the original target was written as
+            #     'FileLog.d(...);\n            }'
+            # with a BARE \n. Every Telegram source here is CRLF-only, so that literal
+            # could never match and this hook silently never applied (measured: 0
+            # occurrences of ColgramQRLoginBottomSheet in MessagesController, while
+            # ConnectionsManager had its half). Build the anchor from nl.join instead.
+            nl = "\r\n" if "\r\n" in content else "\n"
+            target = nl.join([
+                '                FileLog.d("process update " + baseUpdate.getClass().getSimpleName());',
+                '            }',
+            ])
+            inject = nl.join([
+                '                FileLog.d("process update " + baseUpdate.getClass().getSimpleName());',
+                '            }',
+                '            if (baseUpdate instanceof TL_update.TL_updateLoginToken) {',
+                '                org.telegram.ui.ColgramQRLoginBottomSheet.onLoginTokenUpdate(currentAccount);',
+                '                continue;',
+                '            }',
+            ])
             if target in content:
                 return content.replace(target, inject, 1)
+            print(" [!] MessagesController process-update anchor not found — QR login hook NOT injected")
             return content
 
         patch_file(messages_controller, mc_qr_replacer, "ColgramQRLoginBottomSheet.onLoginTokenUpdate", "MessagesController QR Login Token Hook")
@@ -1541,15 +2076,34 @@ def inject_hooks(repo_path):
         )
 
     # 31. ChatActivity.java -> Edit History Context Menu Option & Action
+    #
+    # 🔴 IDEMPOTENCY TRAP — read before touching this patch.
+    # This patch and patch 31.1 BOTH inject the edit-history arm. They are safe on a
+    # fresh clone (this one runs first, then 31.1 upgrades it to the canonical merged
+    # block) but NOT on a re-run: once 31.1 has merged the history arm with the
+    # wallpaper arm into a single `if`, patch_file's generic guard — which keys on
+    # `replacement.strip() in content` — can no longer find its own output, because
+    # the trailing `icons.add(R.drawable.msg_edit);\n        }` it used to end with is
+    # now followed by the wallpaper `if` instead of by the closing brace. The guard
+    # misses, the anchor still matches, and a SECOND history arm is appended.
+    # Measured: options.add(9988) went 1 -> 2 on the second run, which is exactly the
+    # duplicate context-menu row this patch was audited to remove.
+    #
+    # Fix: bail out when the canonical merged block is already present. Only 31.1 may
+    # create or repair that block; this patch's sole job is the fresh-clone first move.
     if os.path.exists(chat_activity):
-        menu_edit_target = """fillMessageMenu(
+        _ca_probe = open(chat_activity, "r", encoding="utf-8", errors="ignore").read()
+        if "org.colgram.core.ColgramConfig.isChatWallpaperEnabled()" in _ca_probe:
+            print(" [=] Already patched: ChatActivity Edit History Menu Option (superseded by merged block)")
+        else:
+            menu_edit_target = """fillMessageMenu(
         MessageObject primaryMessage,
 
         ArrayList<Integer> icons,
         ArrayList<CharSequence> items,
         ArrayList<Integer> options
     ) {"""
-        menu_edit_replacement = """fillMessageMenu(
+            menu_edit_replacement = """fillMessageMenu(
         MessageObject primaryMessage,
 
         ArrayList<Integer> icons,
@@ -1562,12 +2116,12 @@ def inject_hooks(repo_path):
             options.add(9988);
             icons.add(R.drawable.msg_edit);
         }"""
-        patch_file(
-            chat_activity,
-            menu_edit_target,
-            menu_edit_replacement,
-            "ChatActivity Edit History Menu Option"
-        )
+            patch_file(
+                chat_activity,
+                menu_edit_target,
+                menu_edit_replacement,
+                "ChatActivity Edit History Menu Option"
+            )
 
         process_option_target = """private void processSelectedOption(int option) {
         if (selectedObject == null || getParentActivity() == null) {
@@ -1598,29 +2152,134 @@ def inject_hooks(repo_path):
             "ChatActivity Handle Edit History Option"
         )
 
+    # 31.0. provider_paths.xml -> let FileProvider serve recovered media revisions
+    #
+    # The edit-history sheet hands a sandbox copy of a replaced photo/video to an
+    # external viewer via FileProvider.getUriForFile(). That throws
+    # IllegalArgumentException("Failed to find configured root that contains ...")
+    # unless a <files-path> entry covers the directory. Colgram stores revisions in
+    # files/media_history/, which upstream's provider_paths.xml does not cover — the
+    # stock entries are media / logs / cache / external_files only.
+    provider_paths = os.path.join(repo_path, "TMessagesProj", "src", "main", "res",
+                                  "xml", "provider_paths.xml")
+    if os.path.exists(provider_paths):
+        def provider_paths_replacer(content):
+            if "media_history" in content:
+                return content                      # already added
+            entry = '    <files-path name="media_history" path="/media_history/"/>\n'
+            # Insert just before </paths> so we never depend on the exact ordering of
+            # the upstream entries.
+            if "</paths>" in content:
+                return content.replace("</paths>", entry + "</paths>", 1)
+            # No closing tag (malformed or restructured upstream): bail loudly rather
+            # than emit a broken XML that fails the resource merge 20 minutes later.
+            print(" [!] provider_paths.xml has no </paths> — media-history URIs will fail")
+            return content
+        patch_file(provider_paths, provider_paths_replacer,
+                   "media_history", "FileProvider media-history path")
+
     # 31.1. ChatActivity.java -> "Chat Wallpaper" menu entry in the message context menu
+    #
+    # ⚠️ THIS PATCH MUST NOT USE A PLAIN STRING ANCHOR. See the block comment below for
+    # the duplicate-menu-entry bug that shipped because it did.
     if os.path.exists(chat_activity):
-        wallpaper_menu_target = """        if (selectedObject != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
-            boolean isRuLang = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
-            items.add(isRuLang ? "История изменений" : "Edit History");
-            options.add(9988);
-            icons.add(R.drawable.msg_edit);
-        }"""
-        wallpaper_menu_replacement = """        if (selectedObject != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
-            boolean isRuLang = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
-            items.add(isRuLang ? "История изменений" : "Edit History");
-            options.add(9988);
-            icons.add(R.drawable.msg_edit);
-            if (org.colgram.core.ColgramConfig.isChatWallpaperEnabled()) {
-                items.add(isRuLang ? "Обои чата" : "Chat Wallpaper");
-                options.add(9987);
-                icons.add(R.drawable.msg_colors);
-            }
-        }"""
+        def chat_wallpaper_menu_replacer(content):
+            # The canonical merged shape: edit history AND wallpaper inside ONE `if`.
+            #
+            # Why one `if` and not two: every item added here must push to the SAME
+            # index across all three parallel lists (items / options / icons). Two
+            # separate `if` blocks that both push would still be index-parallel, but a
+            # test that *removes* one of them can silently desynchronise the triples.
+            # One block, three matched pushes, is the only shape that is safe to patch
+            # incrementally.
+            #
+            # 🔴 LINE ENDINGS ARE LOAD-BEARING. This file and every Telegram source file
+            # in the tree are CRLF-only (verified: 3770 CRLF / 0 bare LF here, 47302 / 0
+            # in ChatActivity.java). A triple-quoted literal in a CRLF source file yields
+            # \r\n, but a hand-written trailing '...}\n' yields a bare \n — so the
+            # assembled block carries MIXED endings and can never match anything on
+            # disk. That is a silent no-match: patch_file reports success (or the
+            # callable just returns content unchanged) while nothing is injected.
+            # Build every line from a LIST and join with the real newline instead.
+            nl = "\r\n" if "\r\n" in content else "\n"
+
+            history_arm = nl.join([
+                '        if (selectedObject != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {',
+                '            boolean isRuLang = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);',
+                '            items.add(isRuLang ? "История изменений" : "Edit History");',
+                '            options.add(9988);',
+                '            icons.add(R.drawable.msg_edit);',
+                '',
+            ])
+            wallpaper_arm = nl.join([
+                '            if (org.colgram.core.ColgramConfig.isChatWallpaperEnabled()) {',
+                '                items.add(isRuLang ? "Обои чата" : "Chat Wallpaper");',
+                '                options.add(9987);',
+                '                icons.add(R.drawable.msg_colors);',
+                '            }',
+                '',
+            ])
+            closing = '        }' + nl
+            canonical = history_arm + wallpaper_arm + closing
+            history_only = history_arm + closing
+
+            # --- Repair pass: collapse any duplicated blocks already on disk ---------
+            # Two shapes can be present on an already-damaged tree:
+            #   (a) history_only + canonical      — an orphan arm followed by the merged
+            #                                        block. Produced by the old string-anchor
+            #                                        version of this patch.
+            #   (b) history_only + history_only + canonical
+            #                                     — an extra orphan from patch 31 re-firing
+            #                                        on a re-run (see the note on patch 31).
+            # Collapse repeatedly until neither shape remains, so the pass is convergent
+            # regardless of how many orphans accumulated.
+            dupe = history_only + canonical          # orphan, then the real one
+            orphan_stack = history_only + history_only + canonical
+            repaired = 0
+            while orphan_stack in content:
+                content = content.replace(orphan_stack, canonical, 1)
+                repaired += 1
+            while dupe in content:
+                content = content.replace(dupe, canonical, 1)
+                repaired += 1
+            if repaired:
+                print(f" [+] Repaired duplicated ChatActivity menu block ({repaired} orphan(s) collapsed)")
+
+            if canonical in content:
+                return content                        # already canonical
+
+            # --- Insert pass: upgrade a history-only block in place -------------------
+            # Anchor on the ARM, not on the whole `if` block. The old patch anchored on
+            # the complete `...}\n        }` block, which matched BOTH copies, so
+            # `replace(old, new, 1)` rewrote the FIRST occurrence and left the second —
+            # producing the duplicate. Anchoring on the arm makes the insertion
+            # idempotent and positional.
+            if history_only in content:
+                return content.replace(history_only, canonical, 1)
+
+            # --- Fresh-clone pass: the block does not exist yet ----------------------
+            # `fillMessageMenu` is the upstream method this menu is built in. Assert on
+            # the method signature so a renamed upstream method fails LOUDLY here
+            # instead of silently inserting nothing.
+            #
+            # Same CRLF trap: build the anchor and the insertion from the joined list.
+            method_anchor = nl.join([
+                '    ) {',
+                '        final MessageObject message = selectedObject;',
+            ])
+            if method_anchor in content:
+                method_fixed = nl.join([
+                    '    ) {',
+                ]) + canonical + '        final MessageObject message = selectedObject;'
+                return content.replace(method_anchor, method_fixed, 1)
+            print(" [!] ChatActivity fillMessageMenu anchor not found — menu entry NOT injected")
+            return content
+
+        chat_wallpaper_menu_replacer.__name__ = "chat_wallpaper_menu_replacer"
         patch_file(
             chat_activity,
-            wallpaper_menu_target,
-            wallpaper_menu_replacement,
+            chat_wallpaper_menu_replacer,
+            "org.colgram.core.ColgramConfig.isChatWallpaperEnabled()",
             "ChatActivity Chat Wallpaper Menu Option"
         )
 
@@ -1850,6 +2509,53 @@ def inject_hooks(repo_path):
             'switchLanguageTextView.setTextColor(0xFFEF5350);',
             "IntroActivity Red Switch Language Text"
         )
+
+        # The Colgram language badge sat UNDER the stock day/night switcher.
+        #
+        # Both are anchored Gravity.TOP | Gravity.RIGHT on the same container:
+        #   themeFrameLayout : createFrame(64, 64, TOP|RIGHT, 0, themeMargin, themeMargin, 0)
+        #   langBadge        : createFrame(WRAP_CONTENT, 32, TOP|RIGHT, 0, 16, 16, 0)
+        # themeMargin is 4, so the switcher occupies the rightmost 68dp. The badge, added
+        # at a 16dp right margin, lands inside it - and because the switcher is added to
+        # the container AFTER the badge, it draws on top. That is the "theme button is on
+        # top of the language button" bug.
+        #
+        # Fix: push the badge clear of the switcher. Right margin = themeMargin + 64 + 8.
+        patch_file(
+            intro_file,
+            'frameContainerView.addView(langBadge, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, 16, 16, 0));',
+            'frameContainerView.addView(langBadge, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, 16, themeMargin + 64 + 8, 0));',
+            "IntroActivity Language Badge Clear Of Theme Switcher"
+        )
+
+        # 38b. strings.xml -> the in-app name still said "Telegram".
+        #
+        # The manifest label was already rebranded (android:label="Colgram"), so the
+        # launcher and recents show Colgram. But the MAIN SCREEN's action bar title does
+        # not read the manifest - it is built from R.string.AppName
+        # (DialogsActivity: new SpannableStringBuilder(getString(R.string.AppName))),
+        # which is still "Telegram". Hence "why does it say Telegram, not Colgram".
+        strings_xml = os.path.join(repo_path, "TMessagesProj", "src", "main", "res", "values", "strings.xml")
+        patch_file(
+            strings_xml,
+            '<string name="AppName">Telegram</string>',
+            '<string name="AppName">Colgram</string>',
+            "strings.xml AppName -> Colgram"
+        )
+        patch_file(
+            strings_xml,
+            '<string name="AppNameBeta">Telegram Beta</string>',
+            '<string name="AppNameBeta">Colgram Beta</string>',
+            "strings.xml AppNameBeta -> Colgram Beta"
+        )
+
+        # BUG #2 (dark themes rendering black-on-black) is closed, so the temporary
+        # IntroActivity theme probe that used to live here has been removed. It served its
+        # purpose: it proved the palette really does resolve to 0 for a partial dark theme
+        # and that the cyber override was rewriting surfaces without covering foregrounds.
+        # Both of those are now handled permanently inside Theme.getColor (see
+        # COLGRAM_GETCOLOR_WRAPPER), which is where the fix belongs - not in a log line.
+        #
         # Keep the themed background. The old patch replaced this line with 0xFF000000;
         # that is the root cause of the black-on-black login form, so we explicitly assert
         # the themed form is what is present and do NOT mutate it.
@@ -2107,6 +2813,155 @@ def inject_hooks(repo_path):
             return;
         }"""
         patch_file(change_bio, cbio_target, cbio_replacement, "ChangeBioActivity Bot Description Null-Safe Callback")
+
+    # 47b. UserInfoActivity.java -> bot accounts can actually save their profile.
+    #
+    # ⚠️ THIS IS THE SCREEN THE USER ACTUALLY REACHES. The ChangeNameActivity /
+    # ChangeBioActivity hooks above sit on screens you cannot get to from a profile:
+    # ProfileActivity's own-profile Edit item opens UserInfoActivity -
+    #     } else if (id == edit_profile) { presentFragment(new UserInfoActivity()); }
+    # - while ChangeBioActivity is referenced ONLY from a commented-out upstream //TODO
+    # line (no entry point at all) and ChangeNameActivity appears solely in the settings
+    # SEARCH index. Hence "I go into the bot account to edit settings and I cannot".
+    #
+    # Reaching it would not have been enough either: this screen saves via MTProto
+    #     TL_account.updateProfile req1 = new TL_account.updateProfile();
+    # and a bot account answers BOT_METHOD_INVALID - the same error Colgram already
+    # suppresses in BulletinFactory.
+    #
+    # Fix: when the signed-in account is a bot, route name + description through the Bot
+    # API (setMyName / setMyDescription + setMyShortDescription) and skip the MTProto
+    # request, which cannot succeed.
+    user_info = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "UserInfoActivity.java")
+    patch_file(
+        user_info,
+        "            TL_account.updateProfile req1 = new TL_account.updateProfile();",
+        "            // Colgram: bot accounts cannot use MTProto account.updateProfile - it\n"
+        "            // answers BOT_METHOD_INVALID. Route the name and description through the\n"
+        "            // Bot API instead and skip the MTProto request, which cannot succeed.\n"
+        "            final TLRPC.User colgramSelfUser = getUserConfig().getCurrentUser();\n"
+        "            if (colgramSelfUser != null && colgramSelfUser.bot) {\n"
+        "                final String colgramNewFirst = firstNameEdit.getText().toString();\n"
+        "                final String colgramNewLast = lastNameEdit.getText().toString();\n"
+        "                final String colgramNewBio = bioEdit.getText().toString();\n"
+        "                org.colgram.core.ColgramBotSync.updateBotName(getParentActivity(), currentAccount,\n"
+        "                        (colgramNewFirst + \" \" + colgramNewLast).trim());\n"
+        "                org.colgram.core.ColgramBotSync.updateBotDescription(getParentActivity(), currentAccount,\n"
+        "                        colgramNewBio, null);\n"
+        "                user.first_name = colgramNewFirst;\n"
+        "                user.last_name = colgramNewLast;\n"
+        "                userFull.about = colgramNewBio;\n"
+        "                userFull.flags = TextUtils.isEmpty(colgramNewBio) ? (userFull.flags & ~2) : (userFull.flags | 2);\n"
+        "                getMessagesStorage().updateUserInfo(userFull, false);\n"
+        "                NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, user.id, userFull);\n"
+        "                finishFragment();\n"
+        "                return;\n"
+        "            }\n"
+        "            TL_account.updateProfile req1 = new TL_account.updateProfile();",
+        "UserInfoActivity Bot Profile Save Via Bot API"
+    )
+
+    # 47c. UserInfoActivity.java -> bot profile LOADS instead of hanging on "Loading...".
+    #
+    # The save path above is useless if the screen never populates. setValue() does:
+    #
+    #     TLRPC.UserFull userFull = getMessagesController().getUserFull(selfId);
+    #     if (userFull == null) {
+    #         getMessagesController().loadUserInfo(..., true, getClassGuid());
+    #         return;                       // <- fields stay unset
+    #     }
+    #
+    # and the UI renders R.string.Loading ("Загрузка...") until that resolves. A bot account
+    # has no usable MTProto UserFull, so loadUserInfo() never delivers: the profile shows a
+    # permanent "Загрузка..." and the description can never be read or changed.
+    #
+    # Fix: for a bot, seed the name from the local user, pull name + description from the
+    # Bot API (getMe) on a background thread, and stop waiting on MTProto entirely.
+    patch_file(
+        user_info,
+        "        final long selfId = getUserConfig().getClientUserId();\n"
+        "        TLRPC.UserFull userFull = getMessagesController().getUserFull(selfId);\n"
+        "        if (userFull == null) {\n"
+        "            getMessagesController().loadUserInfo(getUserConfig().getCurrentUser(), true, getClassGuid());\n"
+        "            return;\n"
+        "        }",
+        "        final long selfId = getUserConfig().getClientUserId();\n"
+        "        TLRPC.UserFull userFull = getMessagesController().getUserFull(selfId);\n"
+        "\n"
+        "        // Colgram: a bot account has no usable MTProto UserFull, so getUserFull()\n"
+        "        // stays null, loadUserInfo() never delivers, and the bio sits on\n"
+        "        // R.string.Loading forever. Seed from the local user, then fill name and\n"
+        "        // description from the Bot API instead of waiting on MTProto.\n"
+        "        final TLRPC.User colgramBotSelf = getUserConfig().getCurrentUser();\n"
+        "        if (colgramBotSelf != null && colgramBotSelf.bot && userFull == null) {\n"
+        "            valueSet = true;\n"
+        "            firstNameEdit.setText(currentFirstName = colgramBotSelf.first_name);\n"
+        "            lastNameEdit.setText(currentLastName = colgramBotSelf.last_name);\n"
+        "            checkDone(true);\n"
+        "            new Thread(() -> {\n"
+        "                final org.json.JSONObject colgramBot = org.colgram.core.ColgramBotSync.fetchBotProfile(\n"
+        "                        org.telegram.messenger.ApplicationLoader.applicationContext, currentAccount);\n"
+        "                if (colgramBot == null) return;\n"
+        "                final String colgramBotName = colgramBot.optString(\"first_name\", \"\");\n"
+        "                final String colgramBotDesc = colgramBot.optString(\"description\", \"\");\n"
+        "                org.telegram.messenger.AndroidUtilities.runOnUIThread(() -> {\n"
+        "                    if (!colgramBotName.isEmpty()) {\n"
+        "                        firstNameEdit.setText(currentFirstName = colgramBotName);\n"
+        "                    }\n"
+        "                    bioEdit.setText(currentBio = colgramBotDesc);\n"
+        "                    checkDone(true);\n"
+        "                });\n"
+        "            }, \"colgram-bot-profile\").start();\n"
+        "            return;\n"
+        "        }\n"
+        "\n"
+        "        if (userFull == null) {\n"
+        "            getMessagesController().loadUserInfo(getUserConfig().getCurrentUser(), true, getClassGuid());\n"
+        "            return;\n"
+        "        }",
+        "UserInfoActivity Bot Profile Load Via Bot API"
+    )
+
+    # 47d. ConnectionsManager.onProxyError() -> rotate the proxy IMMEDIATELY.
+    #
+    # This is THE reason Colgram "never cycled through the proxies".
+    #
+    # Telegram's native layer calls onProxyError() (TgNetWrapper.cpp:383) the moment a
+    # proxy connection fails. Upstream only shows an alert:
+    #
+    #     public static void onProxyError() {
+    #         AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance()
+    #                 .postNotificationName(NotificationCenter.needShowAlert, 3));
+    #     }
+    #
+    # and Colgram did not reference it AT ALL. The only rotation trigger was a 5-minute
+    # periodic health check in ColgramProxyManager, one step per check. The pool holds 8
+    # entries (7 hardcoded MTProto proxies + the in-process local DPI bypass at the END),
+    # so a user on a censored network whose remote proxies are all dead waited up to
+    # ~40 minutes to reach the one entry that actually works - which reads exactly as
+    # "it never tried the others".
+    #
+    # Wiring the native failure signal to the rotator turns that into a few seconds.
+    # ColgramProxyManager.switchToNextProxy() debounces (3s) so a flapping proxy cannot
+    # spin the whole pool, and falls back to the local DPI bypass once it wraps.
+    cm_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")
+    patch_file(
+        cm_file,
+        "    public static void onProxyError() {\n"
+        "        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3));\n"
+        "    }",
+        "    public static void onProxyError() {\n"
+        "        // Colgram: native reports a failed proxy connection here. Rotate immediately\n"
+        "        // instead of waiting for the 5-minute health check - see apply-patches.py 47d.\n"
+        "        try {\n"
+        "            org.colgram.core.ColgramProxyManager.switchToNextProxy();\n"
+        "        } catch (Throwable ignore) {\n"
+        "\n"
+        "        }\n"
+        "        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3));\n"
+        "    }",
+        "ConnectionsManager onProxyError Rotates Proxy"
+    )
 
     # 48. ChangeUsernameActivity.java -> Bot Username Notice Hook
     change_user = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChangeUsernameActivity.java")
@@ -2780,9 +3635,24 @@ def configure_build_performance(repo_path):
         # application module is not serializable and makes Gradle discard the
         # entry (442 problems -> build failure). Measured, not assumed.
         "org.gradle.configuration-cache": "false",
-        # Property caching. This is a file-locking log, not incremental state, so
-        # disabling it trades a little I/O for less contention on Windows.
-        "org.gradle.vfs.watch": "true",
+        # 🔴 MUST STAY false. This is NOT just a "file-locking log" - it is Gradle's
+        # file-system watch, i.e. a daemon-lifetime cache of the filesystem that Gradle
+        # consults for UP-TO-DATE checks. On this Windows/MSYS setup that cache goes
+        # stale, and the failure is silent and severe:
+        #
+        #   * Gradle reports `Task :colgram-core:compileReleaseJavaWithJavac UP-TO-DATE`
+        #     IMMEDIATELY AFTER a real source edit, so the fix never compiles.
+        #   * Worse, it reported UP-TO-DATE for that task while `colgram-core/build`
+        #     DID NOT EXIST AT ALL - it believed outputs existed that were not on disk.
+        #
+        # Observed cost: a one-line reflection fix in ColgramBotSync.java was edited,
+        # built, and shipped; the APK carried the old bytecode and the runtime error was
+        # unchanged. Nothing in the build log hinted at it.
+        #
+        # The skill used to blame CRLF normalisation for this. It is not CRLF - it is
+        # this property. Do not re-enable it to save I/O; a build that silently ships
+        # stale code is not fast, it is wrong.
+        "org.gradle.vfs.watch": "false",
         # 🔴 THE BIG ONE for build time on Windows (see the transform note above).
         # By default AGP dexes library classes PER CLASS FILE and writes one .dex
         # per class into `build/.transforms/<hash>/transformed/bundleLibRuntimeToDirRelease/`.
@@ -3124,27 +3994,37 @@ def apply_custom_app_icon(repo_path, source_icon_path):
 </layer-list>
 ''')
 
-    # 4. Patch styles.xml (Theme.TMessages.Start & Android 12+ Splash to pitch black + red plane)
+    # 4. Patch styles.xml — Colgram splash branding ONLY.
+    #
+    # ⚠️ android:windowBackground and android:colorBackground are deliberately NOT
+    # touched any more. An earlier revision forced both to
+    # `@drawable/colgram_splash_bg` / `@android:color/black` in every variant, and that
+    # drawable's first layer is pure black. This was the second half of the
+    # black-on-black bug:
+    #
+    #   * android:windowBackground is what you see wherever a screen's own content is
+    #     transparent, and Telegram leaves it transparent in places (the intro surface,
+    #     transition gaps, list spacing).
+    #   * In the LIGHT theme that was invisible, because the theme's own background is
+    #     white and the window was black - opaque content covered it and the two never
+    #     visibly disagreed. That is why this hid for so long.
+    #   * In a DARK theme it is not invisible: transparent areas showed pure black
+    #     instead of the theme colour, and IntroActivity feeds the same colour to the
+    #     NATIVE intro renderer (Intro.setBackgroundColor(Theme.getColor(
+    #     key_windowBackgroundWhite))), which then paints an opaque rectangle over the
+    #     intro's title/subtitle TextViews. Net result: black-on-black, unreadable
+    #     intro and login form.
+    #
+    # Same rule as the fragmentView bug fixed earlier, one level up: never hardcode a
+    # background behind theme-driven content. Brand the SPLASH instead - that is what
+    # windowSplashScreenBackground / windowSplashScreenAnimatedIcon are for.
     res_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "res")
-    values_styles = os.path.join(res_dir, "values", "styles.xml")
-    if os.path.exists(values_styles):
-        with open(values_styles, "r", encoding="utf-8") as f:
-            v_content = f.read()
-        v_content = v_content.replace(
-            '<item name="android:colorBackground">@android:color/white</item>\n        <item name="android:windowBackground">@android:color/white</item>',
-            '<item name="android:colorBackground">@android:color/black</item>\n        <item name="android:windowBackground">@drawable/colgram_splash_bg</item>'
-        )
-        with open(values_styles, "w", encoding="utf-8") as f:
-            f.write(v_content)
 
     v31_styles = os.path.join(res_dir, "values-v31", "styles.xml")
     if os.path.exists(v31_styles):
         with open(v31_styles, "r", encoding="utf-8") as f:
             v31_content = f.read()
         v31_content = v31_content.replace(
-            '<item name="android:colorBackground">@android:color/white</item>\n        <item name="android:windowBackground">@android:color/white</item>',
-            '<item name="android:colorBackground">@android:color/black</item>\n        <item name="android:windowBackground">@drawable/colgram_splash_bg</item>'
-        ).replace(
             '<item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">?android:windowBackground</item>',
             '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
         )

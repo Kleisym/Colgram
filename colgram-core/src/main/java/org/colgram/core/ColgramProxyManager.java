@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -146,9 +147,25 @@ public class ColgramProxyManager {
 
     private static void activateBuiltinProxyNow() {
         // 1. Start embedded DPI bypass engine (runs local service on 127.0.0.1:9876)
-        ColgramDpiBypass.start();
+        //
+        // startImmediately(), NOT start(): this method is already running inside the
+        // manager's own deferral, so asking the bypass to defer again stacked the delays
+        // serially (10s + 8s = ~18s) before the listener existed. That was the dominant
+        // cause of the slow post-login connect.
+        ColgramDpiBypass.startImmediately();
+        // The local listener is the pool's FIRST entry, so it must actually be accepting
+        // before we point Telegram at it. Without this wait the app would apply a proxy
+        // pointing at a closed port, Telegram would raise a proxy error, and the rotator
+        // would move off the local bypass entirely.
+        boolean localReady = ColgramDpiBypass.awaitReady(20000);
+        if (!localReady) {
+            // Do NOT apply a proxy that points at a closed port: Telegram shows it as
+            // "Недоступен", the toggle flips itself off, and the user loses the proxy UI
+            // entirely. Better to leave the setting alone and say so in the log.
+            Log.e(TAG, "local DPI listener never bound; skipping local proxy application");
+        }
 
-        // 2. Populate verified pool with clean verified proxies
+        // 2. Populate verified pool (local desync bypass first, public proxies after)
         initVerifiedPool();
         populateSharedConfigProxies();
 
@@ -160,7 +177,14 @@ public class ColgramProxyManager {
             mainPrefs.edit().putBoolean("proxy_enabled", true).apply();
         }
         if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
-            forceApplyProxy(verifiedPool.get(0));
+            // Only take the local entry when it actually bound. Otherwise fall through to a
+            // real proxy rather than pinning the app to a dead local port.
+            ProxyItem first = verifiedPool.get(0);
+            if (first.isLocalDpi() && !localReady) {
+                Log.w(TAG, "local bypass not ready; skipping it when applying the first proxy");
+            } else {
+                forceApplyProxy(first);
+            }
         }
 
         // 4. Background — fetch fresh proxies, test all, update pool
@@ -172,18 +196,46 @@ public class ColgramProxyManager {
             }
         });
 
-        // 5. Periodic health check every 5 minutes
+        // 5. Periodic health check every 30 seconds (was 5 minutes)
+        //
+        // The local DPI bypass used to be EXCLUDED here, on the assumption that it is
+        // in-process and therefore always alive. It is not: the listener binds on a deferred
+        // thread and can fail to bind at all, and once that happens nothing retries it —
+        // Telegram sits on a dead 127.0.0.1:9876 with the toggle showing "Недоступен" and
+        // the user has no way back except toggling the proxy off and on.
+        //
+        // 5 minutes was also far too slow to notice. 30s keeps the cost trivial (a single
+        // loopback connect) while making recovery actually feel automatic.
         scheduler.scheduleWithFixedDelay(() -> {
             try {
-                if (ColgramConfig.isBuiltinProxyEnabled() && currentActiveProxy != null && !currentActiveProxy.isLocalDpi()) {
-                    int ping = testProxy(currentActiveProxy.address, currentActiveProxy.port, 3000);
+                if (!ColgramConfig.isBuiltinProxyEnabled()) return;
+                ProxyItem active = currentActiveProxy;
+
+                if (active != null && active.isLocalDpi()) {
+                    // Probe the loopback listener for real. isBound() alone is not enough:
+                    // it is a flag set at bind time and never cleared if the socket later
+                    // dies (e.g. the accept loop throws and exits), so a stale `true` would
+                    // hide exactly the failure this check exists to catch.
+                    int ping = testProxy(active.address, active.port, 3000);
+                    if (ping < 0 || !ColgramDpiBypass.isBound()) {
+                        Log.w(TAG, "local DPI listener unhealthy (ping=" + ping
+                                + ", bound=" + ColgramDpiBypass.isBound() + "); attempting recovery");
+                        if (!ColgramDpiBypass.restartIfDeadAndWait(5000)) {
+                            Log.e(TAG, "local DPI listener still not bound after recovery");
+                        }
+                    }
+                    return;
+                }
+
+                if (active != null) {
+                    int ping = testProxy(active.address, active.port, 3000);
                     if (ping < 0) {
-                        Log.w(TAG, "Current proxy unreachable, rotating: " + currentActiveProxy.address);
+                        Log.w(TAG, "Current proxy unreachable, rotating: " + active.address);
                         switchToNextProxy();
                     }
                 }
             } catch (Throwable ignored) {}
-        }, 5, 5, TimeUnit.MINUTES);
+        }, 30, 30, TimeUnit.SECONDS);
 
         // 6. Full re-fetch every 30 minutes
         scheduler.scheduleWithFixedDelay(() -> {
@@ -194,7 +246,29 @@ public class ColgramProxyManager {
     }
 
     private static void initVerifiedPool() {
-        // Priority 1: Clean Fake-TLS MTProto proxies (without spam/sponsor channels)
+        // Priority 1: the LOCAL desync bypass, 127.0.0.1:9876.
+        //
+        // It goes FIRST, ahead of every public proxy, and that ordering is the whole
+        // point:
+        //   * It is the only option with no third party in the path. A public MTProto
+        //     proxy is a stranger's server and its operator sees your IP, timing and
+        //     volume by design - "anonymity checking" of someone else's proxy is not
+        //     possible from the client. The local listener has nobody to trust.
+        //   * It cannot be switched off by a host dying, which is the normal fate of
+        //     free public proxies.
+        //   * It costs one loopback hop.
+        // So the free, always-available, most-private path is the DEFAULT, and public
+        // proxies are the fallback rather than the other way round.
+        ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
+        localDpi.isAvailable = true;
+        localDpi.pingMs = 0;
+        if (!containsProxy(localDpi)) {
+            verifiedPool.add(localDpi);
+        }
+
+        // Priority 2: public FakeTLS MTProto proxies, as a fallback for networks where the
+        // desync gets through but the destination is still refused. Kept, but demoted -
+        // these are strangers' servers and they die often.
         ProxyItem[] hardcoded = {
             new ProxyItem("77.239.105.219", 443, "ee6c083120393936fb881456da3ec073777777772e676f6f676c652e636f6d", 1),
             new ProxyItem("176.57.69.182", 53627, "ee42eb79c1df22d7be6de261ce63082a4d31632e7275", 1),
@@ -212,21 +286,101 @@ public class ColgramProxyManager {
                 verifiedPool.add(p);
             }
         }
-
-        // Priority 2: Local DPI Desync Bypass (127.0.0.1:9876) — available in pool
-        ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
-        localDpi.isAvailable = true;
-        localDpi.pingMs = 0;
-        if (!containsProxy(localDpi)) {
-            verifiedPool.add(localDpi);
-        }
     }
 
     /**
      * Switch to the next available proxy in the pool and apply it.
      */
+    /**
+     * Timestamp of the last rotation. onProxyError() can fire on every failed connection
+     * attempt, so without this a flapping proxy would spin the entire pool in a second and
+     * land on a random entry rather than the next one.
+     */
+    private static volatile long lastRotationAt = 0L;
+    /**
+     * Rate limit between rotations. Deliberately long: onProxyError fires PER FAILED
+     * CONNECTION ATTEMPT, and Telegram retries aggressively on its own. A short debounce
+     * (this was 3 s) means the pool is walked over and over, and every step is a fresh
+     * outbound connection to a dead host. Through an emulator's NAT that becomes a
+     * connection storm that starves the HOST machine's networking - observed for real.
+     */
+    private static final long ROTATION_DEBOUNCE_MS = 30000L;
+
+    /** When the local DPI bypass was applied, so it can be given a fair chance. */
+    private static volatile long localDpiAppliedAt = 0L;
+    /**
+     * How long the local desync listener gets before we rotate away from it.
+     *
+     * Its adaptive strategy prober needs several connections to find a strategy that gets
+     * through. Rotating on the first failure both defeats the prober and drives the storm,
+     * so the two features have to be ordered: let the prober work first.
+     */
+    private static final long LOCAL_DPI_GRACE_MS = 45000L;
+
+    /** Hard cap on rotations per window - a pool must never be walked in a loop. */
+    private static final int MAX_ROTATIONS_PER_WINDOW = 4;
+    private static final long ROTATION_WINDOW_MS = 5 * 60 * 1000L;
+    private static int rotationBudget = MAX_ROTATIONS_PER_WINDOW;
+    private static volatile long budgetWindowStart = 0L;
+
+    /**
+     * Rotate to the next proxy in the pool.
+     *
+     * Called from two places now:
+     *   * ConnectionsManager.onProxyError() - Telegram's native layer reports a failed
+     *     proxy connection here. This is the trigger that was missing: rotation used to be
+     *     driven ONLY by the 5-minute periodic health check, so with 8 pool entries a user
+     *     whose proxies were all dead waited up to 40 minutes to reach a working one, and
+     *     it looked like Colgram simply never cycled them.
+     *   * the periodic health check, as a backstop.
+     */
     public static synchronized void switchToNextProxy() {
-        if (verifiedPool.isEmpty()) return;
+        if (verifiedPool.isEmpty()) {
+            // Pool genuinely empty: nothing to rotate to. Re-seed and re-fetch instead of
+            // returning silently, which is what made this look like a dead feature.
+            Log.w(TAG, "switchToNextProxy: pool empty, re-seeding and re-fetching");
+            initVerifiedPool();
+            executor.execute(() -> {
+                try {
+                    fetchAndVerifyAllSources();
+                } catch (Throwable t) {
+                    Log.w(TAG, "re-fetch after empty pool failed", t);
+                }
+            });
+            return;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+
+        // Give the local desync listener time to find a working strategy before abandoning
+        // it. Without this the prober never gets to finish and we rotate into dead public
+        // proxies on the very first failure.
+        if (currentActiveProxy != null && currentActiveProxy.isLocalDpi()
+                && !ColgramDpiBypass.hasWorkingStrategy()
+                && localDpiAppliedAt > 0
+                && now - localDpiAppliedAt < LOCAL_DPI_GRACE_MS) {
+            Log.d(TAG, "Holding the local DPI bypass: desync strategy search still running");
+            return;
+        }
+
+        if (now - lastRotationAt < ROTATION_DEBOUNCE_MS) {
+            return;
+        }
+
+        // Hard budget. Walking the pool repeatedly is what turns a dead proxy list into a
+        // connection storm; once the budget is spent we hold whatever we have and let the
+        // 5-minute health check resume later.
+        if (budgetWindowStart == 0L || now - budgetWindowStart > ROTATION_WINDOW_MS) {
+            budgetWindowStart = now;
+            rotationBudget = MAX_ROTATIONS_PER_WINDOW;
+        }
+        if (rotationBudget <= 0) {
+            Log.w(TAG, "Rotation budget spent for this window; holding current proxy");
+            return;
+        }
+        rotationBudget--;
+        lastRotationAt = now;
+
         int currentIndex = -1;
         for (int i = 0; i < verifiedPool.size(); i++) {
             if (verifiedPool.get(i).equals(currentActiveProxy)) {
@@ -238,14 +392,40 @@ public class ColgramProxyManager {
         ProxyItem next = verifiedPool.get(nextIndex);
         Log.d(TAG, "Rotating proxy to: " + next.address + ":" + next.port);
 
+        // Wrapped the whole pool without finding a live remote proxy: fall back to the local
+        // DPI bypass rather than looping through dead hosts, and refresh the list in the
+        // background so a later cycle has real candidates.
+        if (currentIndex >= 0 && nextIndex == 0) {
+            ProxyItem localDpi = findLocalDpiProxy();
+            if (localDpi != null && !localDpi.equals(currentActiveProxy)) {
+                Log.w(TAG, "Proxy pool exhausted; falling back to the local DPI bypass");
+                next = localDpi;
+                executor.execute(() -> {
+                    try {
+                        fetchAndVerifyAllSources();
+                    } catch (Throwable ignored) {
+                    }
+                });
+            }
+        }
+
+        final ProxyItem target = next;
         mainHandler.post(() -> {
-            forceApplyProxy(next);
+            forceApplyProxy(target);
             if (appContext != null) {
                 try {
-                    Toast.makeText(appContext, "Сеть: " + next.toString(), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(appContext, "Сеть: " + target.toString(), Toast.LENGTH_SHORT).show();
                 } catch (Throwable ignored) {}
             }
         });
+    }
+
+    /** The in-process 127.0.0.1 DPI-bypass entry, if the pool has one. */
+    private static ProxyItem findLocalDpiProxy() {
+        for (ProxyItem p : verifiedPool) {
+            if (p.isLocalDpi()) return p;
+        }
+        return null;
     }
 
     /**
@@ -277,9 +457,14 @@ public class ColgramProxyManager {
     }
 
     private static void fetchProxiesJson(String sourceUrl) {
+        // Declared outside the try so the finally can reach it. A reference declared inside
+        // the try block is not in scope in the finally, and the resulting compile error is
+        // how this was caught - `if (conn != null)` is only meaningful for a hoisted variable
+        // anyway, since a variable local to the try can never be null at that point.
+        HttpURLConnection conn = null;
         try {
             URL url = new URL(sourceUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0");
@@ -310,16 +495,21 @@ public class ColgramProxyManager {
                 }
                 Log.d(TAG, "Fetched " + added + " new proxies from " + sourceUrl);
             }
-            conn.disconnect();
         } catch (Throwable t) {
             Log.w(TAG, "Fetch error from " + sourceUrl, t);
+        } finally {
+            // disconnect() must be in a finally: it is the only thing that returns the
+            // socket to the pool. It used to sit on the success path, so every non-200
+            // response (and every parse error) leaked its connection.
+            if (conn != null) conn.disconnect();
         }
     }
 
     private static void fetchProxiesTxt(String sourceUrl) {
+        HttpURLConnection conn = null;
         try {
             URL url = new URL(sourceUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0");
@@ -349,9 +539,13 @@ public class ColgramProxyManager {
                 reader.close();
                 Log.d(TAG, "Fetched " + added + " new proxies from " + sourceUrl);
             }
-            conn.disconnect();
         } catch (Throwable t) {
             Log.w(TAG, "Fetch error from " + sourceUrl, t);
+        } finally {
+            // disconnect() must be in a finally: it is the only thing that returns the
+            // socket to the pool. It used to sit on the success path, so every non-200
+            // response (and every parse error) leaked its connection.
+            if (conn != null) conn.disconnect();
         }
     }
 
@@ -372,6 +566,12 @@ public class ColgramProxyManager {
     public static void forceApplyProxy(ProxyItem proxy) {
         if (proxy == null) return;
         currentActiveProxy = proxy;
+        if (proxy.isLocalDpi()) {
+            // Start the grace window: the desync strategy prober needs several connections
+            // to find a strategy that gets through, and rotating away before then defeats
+            // it (see switchToNextProxy).
+            localDpiAppliedAt = SystemClock.elapsedRealtime();
+        }
         Log.d(TAG, "Applying proxy: " + proxy.address + ":" + proxy.port + " (type=" + proxy.type + ")");
 
         Context ctx = appContext;

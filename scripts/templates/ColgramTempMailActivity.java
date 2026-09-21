@@ -53,6 +53,11 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private static final String TAG = "ColgramTempMail";
 
+    /** How many times a transient network step is retried before reporting failure. */
+    private static final int NET_ATTEMPTS = 3;
+    /** Base backoff between retries, multiplied by the attempt number. */
+    private static final long NET_RETRY_BASE_MS = 1000L;
+
     private RecyclerListView listView;
     private ListAdapter listAdapter;
 
@@ -158,6 +163,52 @@ public class ColgramTempMailActivity extends BaseFragment {
         }, 5000);
     }
 
+    /**
+     * Run a network step, retrying transient failures.
+     *
+     * mail.tm intermittently answers with an empty body, a 5xx, or closes the socket
+     * mid-request — especially right after app start while the radio is still settling.
+     * Without a retry a single blip produced a permanent, user-visible failure ("Не
+     * удалось создать ящик: ...") for a call that would have succeeded on the next try.
+     *
+     * A rejected request (4xx) is NOT retried: the server has made a decision and
+     * repeating it just burns time and can trip rate limiting.
+     */
+    private <T> T withRetry(String label, java.util.concurrent.Callable<T> body) throws Exception {
+        Exception last = null;
+        for (int attempt = 1; attempt <= NET_ATTEMPTS; attempt++) {
+            try {
+                return body.call();
+            } catch (Exception e) {
+                last = e;
+                if (isPermanent(e)) throw e;
+                if (attempt < NET_ATTEMPTS) {
+                    Log.w(TAG, label + " attempt " + attempt + " failed (" + e.getMessage()
+                            + "), retrying in " + (NET_RETRY_BASE_MS * attempt) + "ms");
+                    Thread.sleep(NET_RETRY_BASE_MS * attempt);
+                }
+            }
+        }
+        throw last != null ? last : new IOException(label + " failed");
+    }
+
+    /**
+     * True when retrying cannot help — the server answered with a client error.
+     *
+     * Reads the status off the exception rather than the message text. Matching on prose
+     * meant a reworded message would silently turn a non-retryable 4xx into three retries,
+     * which is how you earn a 429.
+     */
+    private boolean isPermanent(Exception e) {
+        if (e instanceof HttpException) {
+            int c = ((HttpException) e).code;
+            // 4xx = the server made a decision; repeating it is pointless and can trip
+            // rate limiting. 408/429 ARE worth retrying (transient by definition).
+            return c >= 400 && c < 500 && c != 408 && c != 429;
+        }
+        return false;
+    }
+
     private void generateNewMailbox() {
         executor.execute(() -> {
             try {
@@ -169,51 +220,63 @@ public class ColgramTempMailActivity extends BaseFragment {
                 // Falling back to the literal meant account creation was rejected with 422
                 // and the whole feature looked dead. If the domain list cannot be read we
                 // must fail loudly instead of inventing an address.
-                String resolvedDomain = null;
-                JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
-                JSONArray members = domRes.optJSONArray("hydra:member");
-                if (members != null) {
-                    for (int i = 0; i < members.length(); i++) {
-                        JSONObject d = members.optJSONObject(i);
-                        if (d == null) continue;
-                        // Only use a domain the server reports as active; an inactive
-                        // domain accepts the account and then rejects the token.
-                        if (!d.optBoolean("isActive", true)) continue;
-                        String dn = d.optString("domain", "");
-                        if (!dn.isEmpty()) {
-                            resolvedDomain = dn;
-                            break;
+                final String domain = withRetry("resolve domain", () -> {
+                    String resolved = null;
+                    JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
+                    JSONArray members = domRes.optJSONArray("hydra:member");
+                    if (members != null) {
+                        for (int i = 0; i < members.length(); i++) {
+                            JSONObject d = members.optJSONObject(i);
+                            if (d == null) continue;
+                            // Only use a domain the server reports as active; an inactive
+                            // domain accepts the account and then rejects the token.
+                            if (!d.optBoolean("isActive", true)) continue;
+                            String dn = d.optString("domain", "");
+                            if (!dn.isEmpty()) {
+                                resolved = dn;
+                                break;
+                            }
                         }
                     }
-                }
-                if (resolvedDomain == null) {
-                    throw new IOException("Не удалось получить доступный домен mail.tm. Проверьте интернет.");
-                }
-                final String domain = resolvedDomain;
+                    if (resolved == null) {
+                        // Empty/unreadable body — a retry is worthwhile here.
+                        throw new IOException("сервис не вернул список доменов");
+                    }
+                    return resolved;
+                });
 
                 final String login = "colgram" + System.currentTimeMillis() % 1000000 + (int) (Math.random() * 9000 + 1000);
                 final String address = login + "@" + domain;
                 final String password = "Colgram_" + (int) (Math.random() * 900000 + 100000);
 
-                JSONObject create = new JSONObject();
+                final JSONObject create = new JSONObject();
                 create.put("address", address);
                 create.put("password", password);
 
-                JSONObject created = httpPostJson("https://api.mail.tm/accounts", create.toString());
-                String accountId = created.optString("id", "");
-                if (accountId.isEmpty()) {
-                    throw new IOException("mail.tm rejected mailbox creation");
-                }
+                // Account creation is retried only for transient transport faults: a 422
+                // means the address was taken, and repeating that is pointless.
+                withRetry("create account", () -> {
+                    JSONObject created = httpPostJson("https://api.mail.tm/accounts", create.toString());
+                    String accountId = created.optString("id", "");
+                    if (accountId.isEmpty()) {
+                        // A 2xx with no id means the body was empty or unexpected.
+                        throw new IOException("сервис не подтвердил создание ящика");
+                    }
+                    return accountId;
+                });
 
                 // Step 2: authenticate to get the bearer token.
-                JSONObject authReq = new JSONObject();
+                final JSONObject authReq = new JSONObject();
                 authReq.put("address", address);
                 authReq.put("password", password);
-                JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
-                final String token = authRes.optString("token", "");
-                if (token.isEmpty()) {
-                    throw new IOException("mail.tm не выдал токен для нового ящика");
-                }
+                final String token = withRetry("authenticate", () -> {
+                    JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
+                    String t = authRes.optString("token", "");
+                    if (t.isEmpty()) {
+                        throw new IOException("сервис не выдал токен для ящика");
+                    }
+                    return t;
+                });
 
                 mainHandler.post(() -> {
                     // Persist the mailbox credentials: the JWT is short-lived and the
@@ -238,8 +301,8 @@ public class ColgramTempMailActivity extends BaseFragment {
                     fetchMessages(true);
                 });
             } catch (Throwable t) {
-                // Include the address we tried so a rejected domain is diagnosable.
-                final String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+                final String msg = humanizeError(t);
+                Log.w(TAG, "generateNewMailbox failed: " + t);
                 mainHandler.post(() -> {
                     if (getParentActivity() != null) {
                         Toast.makeText(getParentActivity(), "Не удалось создать ящик: " + msg, Toast.LENGTH_LONG).show();
@@ -247,6 +310,35 @@ public class ColgramTempMailActivity extends BaseFragment {
                 });
             }
         });
+    }
+
+    /**
+     * Translate a raw network/JSON exception into something a person can act on.
+     *
+     * The user used to be shown the raw org.json text
+     *     End of input at character 0 of
+     * which describes a parser internal, not a problem they can fix. Anything we do not
+     * have a specific phrase for falls through to the original message so no information
+     * is lost — it is only the well-known cases that get human wording.
+     */
+    private String humanizeError(Throwable t) {
+        String raw = t.getMessage() == null ? t.toString() : t.getMessage();
+        if (raw.contains("End of input at character 0")) {
+            return "сервис вернул пустой ответ (проверьте соединение)";
+        }
+        if (raw.contains("Unable to resolve host") || raw.contains("UnknownHostException")) {
+            return "нет соединения с mail.tm";
+        }
+        if (raw.contains("timed out") || raw.contains("timeout")) {
+            return "истекло время ожидания ответа mail.tm";
+        }
+        if (raw.contains("HTTP 429")) {
+            return "слишком много запросов, попробуйте позже";
+        }
+        if (raw.contains("HTTP 5")) {
+            return "сервис mail.tm временно недоступен";
+        }
+        return raw;
     }
 
     /**
@@ -283,39 +375,135 @@ public class ColgramTempMailActivity extends BaseFragment {
         }
     }
 
+    /**
+     * Parse a mail.tm response that may be either a Hydra-wrapped object
+     * ({"hydra:member":[...]}) or a BARE ARRAY ([{...}]).
+     *
+     * mail.tm now returns a bare array for /domains and /messages. The old code called
+     * `new JSONObject(body)` unconditionally, so an array threw
+     *     Value [{"id":"...","domain":"berip.com",...}] of type java.lang.String
+     *     cannot be converted to JSONObject
+     * which surfaced to the user as "Не удалось создать ящик: Value [{...}]" and made the
+     * whole feature look dead.
+     *
+     * Normalising a bare array to {"hydra:member":[...]} keeps every existing call site
+     * (optJSONArray("hydra:member")) working unchanged, and covers any future endpoint
+     * that switches shape the same way.
+     */
+    private JSONObject parseAsObject(String body) throws org.json.JSONException {
+        String trimmed = body == null ? "" : body.trim();
+        if (trimmed.startsWith("[")) {
+            JSONObject wrapper = new JSONObject();
+            wrapper.put("hydra:member", new JSONArray(trimmed));
+            return wrapper;
+        }
+        // An EMPTY body is not valid JSON, and org.json reports that as
+        //     End of input at character 0 of
+        // which is meaningless to a user. It reached them as
+        //     "Не удалось создать ящик: End of input at character 0 of"
+        // See readBody(): an empty response is now only ever returned for 2xx with a
+        // genuinely empty payload, so the right interpretation here is "no data".
+        if (trimmed.isEmpty()) {
+            return new JSONObject();
+        }
+        return new JSONObject(trimmed);
+    }
+
+    /**
+     * Read a response body, tolerating an empty one.
+     *
+     * Two real cases produce a zero-length body and both used to be fatal:
+     *
+     *  1. A legitimately empty 2xx (204 No Content, or a terse 200). There is simply
+     *     nothing to parse — treating that as an error made a SUCCESSFUL call look
+     *     broken.
+     *  2. A transport failure where the socket is closed before any bytes are written.
+     *     `getInputStream()` then returns an empty stream instead of throwing, so the
+     *     failure was never recognised as a failure.
+     *
+     * The returned map keeps the status code alongside the parsed JSON so callers can
+     * distinguish "empty but fine" from "empty and an error".
+     */
+    private static final class ApiResponse {
+        final int code;
+        final JSONObject json;
+
+        ApiResponse(int code, JSONObject json) {
+            this.code = code;
+            this.json = json;
+        }
+    }
+
+    /**
+     * An HTTP failure that carries its status code as DATA, not as prose.
+     *
+     * The status used to be recoverable only by string-matching the exception message
+     * ("HTTP 4xx"). That works until a message is reworded, and then a 4xx silently starts
+     * being retried — the exact class of bug that rate-limited the Bot API. Carrying the
+     * code on the exception makes the retry decision structural instead of textual.
+     */
+    private static final class HttpException extends IOException {
+        final int code;
+
+        HttpException(int code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    private ApiResponse readResponse(HttpURLConnection conn) throws Exception {
+        int code = conn.getResponseCode();
+        InputStream stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+        if (stream == null) {
+            // No error stream on a non-2xx means the server said nothing at all.
+            throw new HttpException(code, "HTTP " + code + " без ответа сервера");
+        }
+        BufferedReader r = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = r.readLine()) != null) sb.append(line);
+        r.close();
+
+        String body = sb.toString().trim();
+
+        // Order matters: report the HTTP status for a non-2xx even when the body is
+        // empty. Parsing first meant a 5xx with no body surfaced as a JSON syntax error.
+        if (code < 200 || code >= 300) {
+            String detail = body.isEmpty() ? "" : describeApiError(code, parseAsObject(body));
+            throw new HttpException(code, detail.isEmpty()
+                    ? ("HTTP " + code + " (пустой ответ сервера)")
+                    : detail);
+        }
+        if (body.isEmpty()) {
+            Log.i(TAG, "empty 2xx body (HTTP " + code + ") treated as no data");
+            return new ApiResponse(code, new JSONObject());
+        }
+        return new ApiResponse(code, parseAsObject(body));
+    }
+
     private JSONObject httpGetJson(String urlStr) throws Exception {
         return httpGetJsonWithAuth(urlStr, null);
     }
 
     private JSONObject httpGetJsonWithAuth(String urlStr, String bearer) throws Exception {
+        // Same address-family policy as the Bot API and GitHub paths. Without it this
+        // screen re-learns the IPv6 lesson per call site: a device with no routable IPv6
+        // hangs the whole timeout on an AAAA answer instead of falling back.
+        org.colgram.core.ColgramBotSync.applyIpv4Policy();
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setConnectTimeout(10000);
         conn.setReadTimeout(10000);
         conn.setRequestProperty("Accept", "application/json");
         if (bearer != null) conn.setRequestProperty("Authorization", "Bearer " + bearer);
         try {
-            int code = conn.getResponseCode();
-            // Read the error stream for non-2xx. Calling getInputStream() on a 4xx throws
-            // FileNotFoundException and the server's explanation is lost, which is why a
-            // rejected/expired request used to look like an unexplained failure.
-            InputStream stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
-            if (stream == null) throw new IOException("HTTP " + code);
-            BufferedReader r = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = r.readLine()) != null) sb.append(line);
-            r.close();
-            JSONObject json = new JSONObject(sb.toString());
-            if (code < 200 || code >= 300) {
-                throw new IOException(describeApiError(code, json));
-            }
-            return json;
+            return readResponse(conn).json;
         } finally {
             conn.disconnect();
         }
     }
 
     private JSONObject httpPostJson(String urlStr, String jsonBody) throws Exception {
+        org.colgram.core.ColgramBotSync.applyIpv4Policy();
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setConnectTimeout(10000);
         conn.setReadTimeout(10000);
@@ -328,19 +516,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             os.write(jsonBody.getBytes("UTF-8"));
             os.flush();
             os.close();
-            int code = conn.getResponseCode();
-            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
-            if (is == null) throw new IOException("HTTP " + code);
-            BufferedReader r = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = r.readLine()) != null) sb.append(line);
-            r.close();
-            JSONObject json = new JSONObject(sb.toString());
-            if (code < 200 || code >= 300) {
-                throw new IOException(describeApiError(code, json));
-            }
-            return json;
+            return readResponse(conn).json;
         } finally {
             conn.disconnect();
         }
@@ -404,7 +580,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                 // Report the failure instead of swallowing it. The previous version used
                 // `catch (Throwable ignored) {}`, which is why a broken mailbox looked
                 // identical to an empty one.
-                final String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+                final String msg = humanizeError(t);
                 Log.w(TAG, "fetchMessages failed: " + msg);
                 if (notifyUser) {
                     mainHandler.post(() -> {

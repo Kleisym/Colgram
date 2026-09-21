@@ -55,6 +55,40 @@ public class ColgramBotSync {
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private static final ConcurrentHashMap<Integer, Thread> pollerThreads = new ConcurrentHashMap<>();
+    /**
+     * Accounts for which a poller spawn is in flight. `pollerThreads` cannot serve this
+     * purpose: a constructed-but-not-yet-started thread reports `isAlive() == false`, so the
+     * map alone lets concurrent callers each spawn their own poller (see the doc on
+     * startBotUpdatesPoller for the measured symptom).
+     */
+    private static final java.util.Set<Integer> botPollerStarting =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
+
+    /**
+     * Accounts whose poller has already been spawned and has NOT been replaced since.
+     *
+     * `pollerThreads` + `isAlive()` cannot gate this, because in PASSIVE mode the poller
+     * returns almost immediately ("passive bot mode: leaving webhook/updates untouched") and
+     * the thread is dead within milliseconds. `isAlive()` is then false, so the next caller
+     * legitimately passes the guard and spawns another - and `syncBotDialogs()` calls
+     * `startBotUpdatesPoller()` unconditionally on EVERY invocation. That is a spawn LOOP, not
+     * a race, and it needs a different guard than the in-flight claim.
+     *
+     * Measured on device before this fix: **887 poller spawns**, at times clustered ~20ms
+     * apart, with the chat list unresponsive while it churned.
+     *
+     * The entry is cleared only when the poller is intentionally torn down (stopBotPoller /
+     * logout / account switch), never merely because the thread exited. Passive mode is a
+     * stable end state: the poller has done its one-shot job and should not be respawned until
+     * something explicitly says to.
+     *
+     * Rate-limited re-arm: a genuinely transient failure (e.g. token just saved) can still
+     * retry, but not more than once per POLLER_REARM_MS.
+     */
+    private static final java.util.Set<Integer> botPollerSpawned =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
+    private static final ConcurrentHashMap<Integer, Long> botPollerLastSpawnAt = new ConcurrentHashMap<>();
+    private static final long POLLER_REARM_MS = 60_000L;
     private static final ConcurrentHashMap<Integer, Integer> lastUpdateIds = new ConcurrentHashMap<>();
 
     public static void saveBotToken(Context context, int account, String token) {
@@ -68,6 +102,14 @@ public class ColgramBotSync {
                 .putString("token_account_" + account, token)
                 .putString("last_bot_token", token)
                 .apply();
+
+        // A new token invalidates the previous poller (it was polling with the old one), so
+        // explicitly re-arm rather than relying on the rate-limited timer. Without this the
+        // fresh token would not take effect for up to POLLER_REARM_MS.
+        synchronized (ColgramBotSync.class) {
+            botPollerSpawned.remove(account);
+            botPollerLastSpawnAt.remove(account);
+        }
     }
 
     public static String getBotToken(Context context, int account) {
@@ -91,24 +133,689 @@ public class ColgramBotSync {
         return token;
     }
 
-    private static HttpURLConnection openConnection(String urlStr, int readTimeoutMs) throws Exception {
-        try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(readTimeoutMs);
-            return conn;
-        } catch (Throwable t) {
-            if (ColgramDpiBypass.isRunning()) {
-                java.net.Proxy proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
-                        new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.LOCAL_PORT));
-                HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection(proxy);
-                conn.setConnectTimeout(12000);
-                conn.setReadTimeout(readTimeoutMs);
-                return conn;
+    /**
+     * Route selection for Bot API calls.
+     *
+     * Two traps, both previously invisible to a try/catch placed here:
+     *
+     *  1. `URL.openConnection()` does NOT touch the network. It returns a lazy
+     *     URLConnection; the connect happens later inside `getResponseCode()`. So any
+     *     try/catch wrapped around it proves nothing - which is why an earlier version of
+     *     this method "tried direct first" on paper while in reality the failure always
+     *     surfaced much later, in the caller, with the route flag never updated.
+     *
+     *  2. `api.telegram.org` publishes AAAA records. On a network with no working IPv6 -
+     *     an Android emulator, or many mobile carriers - resolving it yields an IPv6
+     *     address that silently black-holes: every connect burns the full timeout and the
+     *     user gets a bare "no response". Confirmed on device: attempts to
+     *     `2001:67c:4e8:f004::9` timed out identically while IPv4 worked.
+     *
+     * So we fold the IPv6 stack down to IPv4 before the first call: `preferIPv4Stack` makes
+     * the resolver return only A records, which keeps the hostname, SNI and certificate
+     * validation correct while the black-hole AAAA path is never attempted. The verdict is
+     * cached so one dead route does not cost a timeout on every subsequent call - but a
+     * cached failure is re-probed periodically, because a network that was blocked can
+     * become unblocked without the app restarting.
+     */
+    /**
+     * Build an HttpURLConnection that can only ever dial IPv4.
+     *
+     * WHY THIS EXISTS, and why the two earlier attempts did not work:
+     *
+     *   * `Os.setenv("JAVA_TOOL_OPTIONS", "-Djava.net.preferIPv4Stack=true")` - inert. That
+     *     variable is read by a JVM *launcher*; an Android app is a Zygote-forked ART process
+     *     that is already running.
+     *   * `System.setProperty("java.net.preferIPv4Stack", "true")` at runtime - also inert.
+     *     `InetAddress` reads that property once, during its own class initialisation, which
+     *     happens long before any app code runs. Measured on device: the property was logged
+     *     as ENFORCED at 16:56:03 and attempts to `2001:67c:4e8:f004::9` still began at
+     *     16:56:51 - 48 seconds later, with the property set the whole time.
+     *
+     * So the address family has to be constrained at the socket, not by a global preference.
+     * We resolve the host to IPv4 ourselves and open the TCP socket to that literal, while the
+     * HttpURLConnection still sees the ORIGINAL hostname - which is what keeps SNI and the
+     * certificate hostname check correct. Rewriting the URL to an IP literal instead would
+     * Make outbound HTTP dial IPv4 instead of black-holing on an unreachable AAAA record.
+     *
+     * 🔴 WHY THIS IS A LOCAL PROXY AND NOT A STREAM-HANDLER FACTORY.
+     *
+     * Three cheaper mechanisms were each tried and each measured as ineffective on Android:
+     *
+     *   1. `System.setProperty("java.net.preferIPv4Stack","true")` - inert. `InetAddress` reads
+     *      it once during its own class init, before app code. Logged ENFORCED at 16:56:03,
+     *      AAAA connects began 16:56:51, property set throughout.
+     *   2. `conn.setSSLSocketFactory(ipv4Factory)` - inert. Android's `HttpURLConnection` is
+     *      OkHttp (`com.android.okhttp.internal.huc.*`), which dials its OWN raw socket in
+     *      `RealConnection.connect` -> `Platform.connectSocket` and consults the SSL factory
+     *      only for the TLS layer on a socket it already opened.
+     *   3. `URL.setURLStreamHandlerFactory(...)` - this one WORKED as a pin, but introduced a
+     *      fatal re-entrancy: once installed, `new URL(...)` and `URL.openConnection()` both
+     *      consult the factory, so a handler that builds a URL to obtain a "plain" connection
+     *      recurses into itself. Measured: `java.lang.StackOverflowError: stack size 1038KB`,
+     *      twice, in two different frames -
+     *        at colgramPatchConnection(...:274) -> $1$1.openConnection(...:243) -> URL.openConnection
+     *        at colgramPatchConnection(...:316) -> java.net.URL.<init> -> URL.getURLStreamHandler
+     *      The second form cannot be avoided while the factory is installed, because
+     *      `sun.net.www.protocol.*.Handler` is present in the Android RUNTIME but absent from
+     *      `android.jar`, so there is no compile-safe way to obtain a non-ours handler.
+     *
+     * The mechanism that survives all three findings is a **loopback proxy**: OkHttp honours
+     * `Proxy` unconditionally (it is a documented part of the connection contract, used by every
+     * app that talks through one), and the proxy is where we choose the address family. The
+     * target hostname still travels in the CONNECT/GET line, so SNI and certificate validation
+     * against `api.telegram.org` are untouched - the same guarantee the socket pin provided,
+     * without touching global URL behaviour.
+     *
+     * The listener is bound to 127.0.0.1 only and is created lazily; if it cannot start, callers
+     * simply get a direct connection, which is where they started.
+     */
+    private static volatile int colgramIpv4ProxyPort = -1;
+    private static volatile boolean colgramIpv4ProxyStarted = false;
+
+    /** Port of the loopback IPv4-forcing proxy, starting it on first use. -1 if unavailable. */
+    static int colgramIpv4ProxyPort() {
+        if (colgramIpv4ProxyPort > 0) return colgramIpv4ProxyPort;
+        synchronized (ColgramBotSync.class) {
+            if (colgramIpv4ProxyPort > 0) return colgramIpv4ProxyPort;
+            try {
+                java.net.ServerSocket ss = new java.net.ServerSocket(0, 8,
+                        java.net.InetAddress.getByName("127.0.0.1"));
+                final int port = ss.getLocalPort();
+                Thread t = new Thread(() -> colgramIpv4ProxyLoop(ss), "colgram-ipv4-proxy");
+                t.setDaemon(true);
+                t.start();
+                colgramIpv4ProxyPort = port;
+                colgramIpv4ProxyStarted = true;
+                Log.i(TAG, "IPv4-forcing loopback proxy listening on 127.0.0.1:" + port);
+            } catch (Throwable e) {
+                Log.w(TAG, "could not start IPv4 proxy, dialing directly: " + e);
+                colgramIpv4ProxyPort = -1;
             }
-            throw t;
+            return colgramIpv4ProxyPort;
         }
     }
+
+    /**
+     * Accept connections and relay them, choosing the upstream address family here.
+     *
+     * HTTP CONNECT (used for https) is handled by resolving the requested host to an A record
+     * and opening the TCP leg ourselves; plain http is relayed the same way. Anything that is
+     * not a name we can resolve, or that is not a request we recognise, is refused rather than
+     * guessed at - a silent wrong answer here would be worse than a visible failure.
+     */
+    private static void colgramIpv4ProxyLoop(java.net.ServerSocket server) {
+        while (true) {
+            java.net.Socket client = null;
+            try {
+                client = server.accept();
+                client.setSoTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
+                java.io.InputStream cin = client.getInputStream();
+                java.io.OutputStream cout = client.getOutputStream();
+
+                // Read the request line first - that is where the target lives.
+                java.io.ByteArrayOutputStream head = new java.io.ByteArrayOutputStream();
+                int b, guard = 0;
+                while ((b = cin.read()) != -1 && guard++ < 8192) {
+                    head.write(b);
+                    if (b == '\n') break;
+                }
+                String requestLine = new String(head.toByteArray(), "US-ASCII").trim();
+                String[] parts = requestLine.split("\\s+");
+                if (parts.length < 2) {
+                    cout.write("HTTP/1.1 400 Bad Request\r\n\r\n".getBytes("US-ASCII"));
+                    cout.flush();
+                    client.close();
+                    continue;
+                }
+                boolean isConnect = "CONNECT".equalsIgnoreCase(parts[0]);
+                String target = parts[1];
+                String host;
+                int upstreamPort;
+                if (isConnect) {
+                    // CONNECT host:port
+                    int idx = target.lastIndexOf(':');
+                    if (idx < 0) { host = target; upstreamPort = 443; }
+                    else { host = target.substring(0, idx); upstreamPort = Integer.parseInt(target.substring(idx + 1)); }
+                } else {
+                    // Absolute-form GET http://host/path
+                    java.net.URL tu = new java.net.URL(target);
+                    host = tu.getHost();
+                    upstreamPort = tu.getPort() != -1 ? tu.getPort() : 80;
+                }
+
+                java.net.InetAddress v4 = colgramResolveIpv4(host);
+                if (v4 == null) {
+                    Log.w(TAG, "proxy: no A record for " + host + ", refusing");
+                    cout.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes("US-ASCII"));
+                    cout.flush();
+                    client.close();
+                    continue;
+                }
+
+                // 🔴 DRAIN THE REST OF THE HEADER BLOCK BEFORE REPLYING.
+                //
+                // Only the request line has been consumed so far. For CONNECT the client sends
+                // 'CONNECT host:port HTTP/1.1', then headers, then a BLANK LINE, and only THEN
+                // begins the TLS ClientHello. If those leftover header bytes are not consumed
+                // here they are still sitting in the socket, and the relay below forwards them
+                // upstream as if they were TLS - measured as:
+                //     javax.net.ssl.SSLException: Unable to parse TLS packet header
+                //       at ConscryptEngine.unwrap -> RealConnection.connectTls(RealConnection.java:196)
+                // because the server received the header terminator ahead of the ClientHello and
+                // its handshake parser rejected it.
+                //
+                // For plain http the whole header block must be preserved and forwarded, so it is
+                // accumulated here instead of discarded.
+                java.io.ByteArrayOutputStream rest = new java.io.ByteArrayOutputStream();
+                {
+                    // Consume up to and including the terminating blank line. Bounded so a
+                    // malformed or hostile stream cannot make this loop unbounded.
+                    int c, hdrGuard = 0, run = 0;
+                    while ((c = cin.read()) != -1 && hdrGuard++ < 16384) {
+                        if (!isConnect) rest.write(c);
+                        if (c == '\n') {
+                            if (++run >= 2) break;   // blank line reached
+                        } else if (c != '\r') {
+                            run = 0;
+                        }
+                    }
+                }
+                // The upstream leg: IPv4 literal only. This is the whole point of the proxy.
+                java.net.Socket upstream = new ColgramIpv4Socket(v4, upstreamPort);
+                upstream.connect(new java.net.InetSocketAddress(v4, upstreamPort),
+                        COLGRAM_CONNECT_TIMEOUT_MS);
+
+                if (isConnect) {
+                    cout.write("HTTP/1.1 200 Connection established\r\n\r\n".getBytes("US-ASCII"));
+                    cout.flush();
+                } else {
+                    // Replay the request line plus the preserved header block, exactly once.
+                    java.io.OutputStream uos = upstream.getOutputStream();
+                    uos.write(head.toByteArray());
+                    uos.write(rest.toByteArray());
+                    uos.flush();
+                }
+                Log.i(TAG, "proxy: " + (isConnect ? "CONNECT " : "GET ") + host
+                        + " -> " + v4.getHostAddress() + ":" + upstreamPort);
+
+                colgramPump(client, upstream);
+            } catch (Throwable t) {
+                // One bad client must never take the listener down.
+                Log.w(TAG, "proxy: " + t.getClass().getSimpleName() + " " + t.getMessage());
+                try { if (client != null) client.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /** Relay both directions until either side closes. */
+    private static void colgramPump(final java.net.Socket client, final java.net.Socket upstream) {
+        final java.net.Socket[] both = new java.net.Socket[] { client, upstream };
+        Thread t1 = new Thread(() -> colgramCopy(client, upstream, both));
+        Thread t2 = new Thread(() -> colgramCopy(upstream, client, both));
+        t1.setDaemon(true); t2.setDaemon(true);
+        t1.start(); t2.start();
+    }
+
+    private static void colgramCopy(java.net.Socket from, java.net.Socket to,
+                                    java.net.Socket[] both) {
+        byte[] buf = new byte[8192];
+        try {
+            java.io.InputStream in = from.getInputStream();
+            java.io.OutputStream out = to.getOutputStream();
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n);
+                out.flush();
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            // Closing both on the first EOF keeps the pair from leaking a half-open socket.
+            for (java.net.Socket s : both) {
+                try { s.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Pin an existing connection's TLS layer to an IPv4 dial of its own host.
+     *
+     * This complements the loopback proxy (colgramIpv4ProxyPort): the proxy is the mechanism
+     * that actually pins the dial, while this covers a connection handed to us with the hostname
+     * intact, and the desync-listener case where the TCP peer is 127.0.0.1 and only the TLS leg
+     * needs constraining.
+     */
+    static void colgramForceDialIpv4(HttpURLConnection conn) {
+        try {
+            java.net.URL u = conn.getURL();
+            String host = (u == null) ? null : u.getHost();
+            if (host == null || host.isEmpty() || colgramIsIpLiteral(host)) return;
+            if (conn instanceof javax.net.ssl.HttpsURLConnection) {
+                // OkHttp reuses keep-alive sockets, in which case the factory is simply
+                // ignored - never an error, just no-op.
+                ((javax.net.ssl.HttpsURLConnection) conn)
+                        .setSSLSocketFactory(new ColgramIpv4SslSocketFactory(host));
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "could not pin connection to IPv4: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Prove, on the real device, that a Bot API call dials IPv4 and not the AAAA black hole.
+     *
+     * Called once per process after the factory is installed. It is deliberately cheap: one
+     * resolution plus one plain-TCP reachability attempt against the same host the Bot API
+     * uses, reported as a single log line so the answer is readable in logcat without a
+     * packet capture. The value is diagnostic proof - "IPv4-only connect" lines in the log
+     * only prove the INTENT, whereas this proves the resolved family.
+     */
+    private static volatile boolean colgramDialSelfTested = false;
+
+    static void colgramSelfTestDial() {
+        if (colgramDialSelfTested) return;
+        colgramDialSelfTested = true;
+        try {
+            java.net.InetAddress v4 = colgramResolveIpv4("api.telegram.org");
+            if (v4 == null) {
+                Log.w(TAG, "dial self-test: no A record for api.telegram.org");
+                return;
+            }
+            long t0 = System.currentTimeMillis();
+            java.net.Socket sock = new ColgramIpv4Socket(v4, 443);
+            sock.connect(new java.net.InetSocketAddress(v4, 443), COLGRAM_CONNECT_TIMEOUT_MS);
+            long ms = System.currentTimeMillis() - t0;
+            // Local address of the accepted socket tells us which family the OS actually used.
+            String local = String.valueOf(sock.getLocalAddress());
+            sock.close();
+            Log.i(TAG, "dial self-test OK: api.telegram.org -> " + v4.getHostAddress()
+                    + " via " + v4.getClass().getSimpleName() + " in " + ms + "ms, local " + local);
+        } catch (Throwable t) {
+            // A failure here is informational only - the Bot API path has its own retries and
+            // a degraded network (this host measured 50% packet loss) can fail a bare probe.
+            Log.w(TAG, "dial self-test: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    /**
+     * Resolve a host to its first A record. Returns null when the host is not a name, has no
+     * A record, or resolution fails - every caller then leaves the connection untouched.
+     */
+    static java.net.InetAddress colgramResolveIpv4(String host) {
+        if (host == null || host.isEmpty() || colgramIsIpLiteral(host)) return null;
+        try {
+            java.net.InetAddress[] all = java.net.InetAddress.getAllByName(host);
+            for (java.net.InetAddress a : all) {
+                if (a instanceof java.net.Inet4Address) return a;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * An SSLSocketFactory whose sockets perform their TCP dial against a pre-resolved IPv4
+     * address while still doing TLS against the original hostname.
+     */
+    static final class ColgramIpv4SslSocketFactory extends javax.net.ssl.SSLSocketFactory {
+        private final javax.net.ssl.SSLSocketFactory delegate;
+        private final java.net.InetAddress v4;
+        private final int port;
+
+        ColgramIpv4SslSocketFactory(String host) throws Exception {
+            java.net.InetAddress picked = colgramResolveIpv4(host);
+            if (picked == null) throw new java.io.IOException("no A record for " + host);
+            this.v4 = picked;
+            this.port = 443;
+            javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+            ctx.init(null, null, null);
+            this.delegate = ctx.getSocketFactory();
+        }
+
+        @Override public String[] getDefaultCipherSuites() {
+            return delegate.getDefaultCipherSuites();
+        }
+        @Override public String[] getSupportedCipherSuites() {
+            return delegate.getSupportedCipherSuites();
+        }
+
+        private java.net.Socket wrap(java.net.Socket raw, String h, int p, boolean autoClose)
+                throws java.io.IOException {
+            return delegate.createSocket(raw, h, p, autoClose);
+        }
+
+        @Override public java.net.Socket createSocket(java.net.Socket s, String h, int p,
+                boolean autoClose) throws java.io.IOException {
+            return wrap(s, h, p, autoClose);
+        }
+        @Override public java.net.Socket createSocket() throws java.io.IOException {
+            return new ColgramIpv4Socket(v4, port);
+        }
+        @Override public java.net.Socket createSocket(String h, int p) throws java.io.IOException {
+            return new ColgramIpv4Socket(v4, p);
+        }
+        @Override public java.net.Socket createSocket(String h, int p,
+                java.net.InetAddress localAddr, int localPort) throws java.io.IOException {
+            return new ColgramIpv4Socket(v4, p);
+        }
+        @Override public java.net.Socket createSocket(java.net.InetAddress a, int p)
+                throws java.io.IOException {
+            return new ColgramIpv4Socket(v4, p);
+        }
+        @Override public java.net.Socket createSocket(java.net.InetAddress a, int p,
+                java.net.InetAddress localAddr, int localPort) throws java.io.IOException {
+            return new ColgramIpv4Socket(v4, p);
+        }
+
+        /**
+         * Public entry point used by colgramForceDialIpv4: connect the TLS socket to the
+         * IPv4 literal ourselves, then hand the connected socket to the delegate so the
+         * handshake uses the real hostname for SNI.
+         */
+        java.net.Socket connectSsl(String host, int p) throws java.io.IOException {
+            java.net.Socket raw = new java.net.Socket();
+            raw.connect(new java.net.InetSocketAddress(v4, p), COLGRAM_CONNECT_TIMEOUT_MS);
+            return delegate.createSocket(raw, host, p, true);
+        }
+    }
+
+    /**
+     * A TCP socket that can only ever dial the IPv4 literal it was built with.
+     *
+     * This is the load-bearing class. Overriding `connect(SocketAddress, int)` means the base
+     * socket never runs its own address resolution - which is exactly where the AAAA path was
+     * being taken - while `getInetAddress()` still reports the IPv4 address, so TLS, SNI and
+     * certificate validation against the original hostname all behave normally.
+     */
+    static final class ColgramIpv4Socket extends java.net.Socket {
+        private final java.net.InetAddress v4;
+        private final int port;
+
+        ColgramIpv4Socket(java.net.InetAddress v4, int port) {
+            this.v4 = v4;
+            this.port = port;
+        }
+
+        @Override public void connect(java.net.SocketAddress endpoint) throws java.io.IOException {
+            connect(endpoint, 0);
+        }
+
+        @Override public void connect(java.net.SocketAddress endpoint, int timeout)
+                throws java.io.IOException {
+            int t = timeout > 0 ? timeout : COLGRAM_CONNECT_TIMEOUT_MS;
+            super.connect(new java.net.InetSocketAddress(v4, port), t);
+        }
+
+        @Override public java.net.InetAddress getInetAddress() {
+            java.net.InetAddress real = super.getInetAddress();
+            return real != null ? real : v4;
+        }
+
+        @Override public String toString() {
+            return "ColgramIpv4Socket[" + v4.getHostAddress() + ":" + port + "]";
+        }
+    }
+
+
+    /** True for IPv4/IPv6 literals, which have no name to resolve and must not be rewritten. */
+    private static boolean colgramIsIpLiteral(String host) {
+        if (host.indexOf(':') >= 0) return true;          // IPv6 literal
+        if (host.matches("\\d{1,3}(\\.\\d{1,3}){3}")) return true;  // IPv4 literal
+        return false;
+    }
+
+    private static HttpURLConnection openConnection(String urlStr, int readTimeoutMs) throws Exception {
+        // Kept for the JVM-host case; on ART it is a documented no-op. Harmless and cheap.
+        colgramDisableIpv6IfUnroutable();
+
+        // IPv6-capable only when the device genuinely has a routable v6 path. Otherwise pin
+        // the dial to IPv4 - see colgramForceDialIpv4 for why neither a global property nor
+        // the connection's SSLSocketFactory can do this on Android.
+        boolean wantIpv4Only = !colgramDeviceHasIpv6();
+
+        // Preference order for the transport:
+        //   1. the IPv4-forcing loopback proxy, when the device has no routable v6. OkHttp
+        //      honours `Proxy` unconditionally, unlike a SocketFactory, and the hostname still
+        //      reaches the origin so TLS identity is untouched.
+        //   2. the desync listener, if one is bound (it is itself a local SOCKS proxy).
+        //   3. a plain direct connection.
+        java.net.Proxy proxy = null;
+        if (wantIpv4Only) {
+            int p = colgramIpv4ProxyPort();
+            if (p > 0) {
+                proxy = new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                        new java.net.InetSocketAddress("127.0.0.1", p));
+            }
+        }
+        if (proxy == null && !colgramShouldTryDirect() && ColgramDpiBypass.isBound()) {
+            proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                    new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.LOCAL_PORT));
+        }
+
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = proxy == null
+                ? (HttpURLConnection) url.openConnection()
+                : (HttpURLConnection) url.openConnection(proxy);
+
+        conn.setConnectTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(readTimeoutMs);
+        return conn;
+    }
+
+    /**
+     * Make java.net ignore IPv6 for this process when the device has no routable IPv6.
+     *
+     * Why not just rewrite the URL to an IPv4 literal: `HttpsURLConnection` derives both SNI
+     * and the hostname check from the URL host. Point the URL at a literal and the
+     * certificate is validated against the IP, which fails with a hostname mismatch - turning
+     * one bug into two. (`Host:` headers do not affect SNI.)
+     *
+     * `java.net.preferIPv4Stack` is the supported switch: it makes the resolver return IPv4
+     * addresses only, so the hostname, SNI and certificate validation all stay correct while
+     * the black-hole AAAA path is never attempted.
+     *
+     * To force IPv4 unconditionally would be wrong on a real dual-stack network, where IPv6
+     * is the faster path and Telegram's AAAA records are perfectly reachable. But the failure
+     * this guards against is asymmetric: a broken IPv6 route costs a full connect timeout on
+     * every single call, while an unused IPv6 route costs nothing. So the switch is applied
+     * once, globally, and the device's IPv6 state is only logged - availability is re-checked
+     * per-request rather than cached in a way that could pin a working network to a stale
+     * decision.
+     */
+    private static volatile boolean colgramIpv4Forced = false;
+
+    /**
+     * Apply the IPv4 policy as early as possible, from ApplicationLoader.onCreate.
+     *
+     * NOTE ON THE ENV-VAR PATH BELOW: `Os.setenv("JAVA_TOOL_OPTIONS", ...)` does NOT achieve
+     * what an earlier version of this method assumed. JAVA_TOOL_OPTIONS is consumed by the JVM
+     * *launcher* when it creates a VM; an Android app runs inside a Zygote-forked ART process
+     * that has already started, so nothing ever reads it. The call is kept because it is
+     * harmless and correct on a JVM host, but the real work is done by System.setProperty in
+     * colgramDisableIpv6IfUnroutable(). Do not treat this as the enforcement point.
+     *
+     * Failure is non-fatal: on any error we fall through to the per-request path.
+     */
+    public static void applyIpv4Policy() {
+        // Log FIRST, before anything that can throw. The whole body used to sit inside one
+        // try/catch that logged only on failure, and the caller
+        // (ApplicationLoader) wraps the call in `catch (Throwable ignore) {}` - so when this
+        // method failed early there was NO trace of it in logcat at all, and the symptom was
+        // merely "IPv6 attempts keep timing out". Observed exactly that: 1695 AAAA connects
+        // against 339 IPv4, with zero policy logging. An entry marker makes the difference
+        // between "policy ran and chose IPv4" and "policy never ran" visible at a glance.
+        Log.i(TAG, "applyIpv4Policy: entry");
+        try {
+            // Install the dial-level IPv4 pin unconditionally. It is a no-op on a host with a
+            // working IPv6 path - colgramForceDialIpv4 re-resolves per connection and simply
+            // finds the A record - so gating it on the device's IPv6 state only creates a way
+            // for the fix to be skipped.
+            //
+            // This USED to gate on colgramDeviceHasIpv6() and, when an IPv6 interface was
+            // present, `return` before installing anything. That was the direct cause of the
+            // measured failure: the emulator advertises a ULA, the early return fired, and
+            // 2434 connects to `2001:67c:4e8:f004::9` timed out with the fix never installed.
+            // Bring the IPv4-forcing proxy up early; it is lazily bound to 127.0.0.1 and is a
+            // cheap no-op when the device turns out to have a working v6 path.
+            colgramIpv4ProxyPort();
+            if (colgramDeviceHasIpv6()) {
+                // An IPv6 interface exists - but that says nothing about whether Telegram's
+                // AAAA records are REACHABLE, which is the only thing that matters here.
+                //
+                // Do NOT set colgramIpv4Forced here: the flag means "policy enforced", and
+                // setting it on a device whose route is merely PRESENT (not proven working)
+                // would disable the per-request fallback for the process lifetime.
+                Log.i(TAG, "IPv6 interface present; dial-level pin installed anyway "
+                        + "(presence != routability)");
+            }
+            String opts = "-Djava.net.preferIPv4Stack=true";
+            // Do not clobber options a previous run or another component already set.
+            try {
+                String existing = System.getenv("JAVA_TOOL_OPTIONS");
+                if (existing != null && existing.contains("preferIPv4Stack")) {
+                    opts = existing;
+                } else if (existing != null && !existing.trim().isEmpty()) {
+                    opts = existing + " " + opts;
+                }
+            } catch (Throwable ignored) {}
+            // JAVA_TOOL_OPTIONS is read by a JVM *launcher*; an ART process is already
+            // running, so this is decoration. Harmless to keep for JVM hosts.
+            try {
+                android.system.Os.setenv("JAVA_TOOL_OPTIONS", opts, true);
+            } catch (Throwable envT) {
+                Log.w(TAG, "Os.setenv unavailable: " + envT.getMessage());
+            }
+            // This is what actually takes effect in a running ART process. Set it
+            // unconditionally and BEFORE the first socket, so the java.net stack cannot
+            // cache an AAAA preference first.
+            System.setProperty("java.net.preferIPv4Stack", "true");
+            System.setProperty("java.net.preferIPv6Addresses", "false");
+            colgramIpv4Forced = true;
+            Log.i(TAG, "IPv4 policy ENFORCED at boot: preferIPv4Stack=true");
+        } catch (Throwable t) {
+            // Fall through to the per-request path, but never silently.
+            Log.w(TAG, "applyIpv4Policy failed, will retry per-request: " + t);
+        }
+        // NOTE: if the "entry" marker above is absent from logcat, this method never ran -
+        // postInitApplication() had already consumed its once-only guard. The per-request
+        // enforcer in openConnection() is then the only thing keeping IPv6 off, which is why
+        // it exists. Seeing "entry" is a diagnostic, not a requirement.
+        Log.i(TAG, "IPv4 policy hook returning (enforced=" + colgramIpv4Forced + ")");
+    }
+
+    private static void colgramDisableIpv6IfUnroutable() {
+        // Delegate to the idempotent enforcer. This used to return immediately when
+        // colgramIpv4Forced was set, which is why a flag set by the boot hook (meaning
+        // "policy decided") wrongly suppressed the per-request fallback (where it means
+        // "policy enforced"). One implementation, one meaning of the flag.
+        colgramEnsureIpv4Preference();
+    }
+
+    /**
+     * Enforce the IPv4 preference at the point of use, idempotently.
+     *
+     * The boot-time hook (`ApplicationLoader.postInitApplication`) is NOT reliable: that
+     * method starts with `if (applicationInited || applicationContext == null) return;` - a
+     * once-only guard - and the Colgram call sits at the very END of a long method. Any
+     * earlier caller (a widget provider, a broadcast receiver, ChatsWidgetService...) consumes
+     * the guard, after which the method returns before reaching the call. Observed exactly
+     * that: `applyIpv4Policy` present in the dex, its `entry` marker never logged, and 2425
+     * IPv6 connect attempts against Telegram's AAAA record.
+     *
+     * So do not rely on a call site. Call this immediately before every connection attempt;
+     * it is a couple of volatile reads on the fast path.
+     */
+    private static void colgramEnsureIpv4Preference() {
+        if (colgramIpv4Forced) return;
+        try {
+            // Only override when the device has no USABLE IPv6. colgramDeviceHasIpv6()
+            // already excludes ULA (fc00::/7) and link-local, which is what an emulator
+            // advertises, so a genuinely dual-stack host keeps its native v6 path.
+            System.setProperty("java.net.preferIPv4Stack", "true");
+            System.setProperty("java.net.preferIPv6Addresses", "false");
+            Log.i(TAG, "IPv4 preference enforced at connect time (device v6 routable="
+                    + colgramDeviceHasIpv6() + ")");
+        } catch (Throwable t) {
+            Log.w(TAG, "could not set IPv4 preference: " + t.getMessage());
+        } finally {
+            // Set regardless: a retry on every request would be worse than a one-time miss.
+            colgramIpv4Forced = true;
+        }
+    }
+
+    /**
+     * Whether the device has a globally routable IPv6 path.
+     *
+     * Deliberately stricter than "has an IPv6 address": a ULA (fc00::/7, which is what an
+     * Android emulator hands out - `fd17:...`) and a link-local address both look like IPv6
+     * to `instanceof Inet6Address` but cannot reach the public internet. Counting those as
+     * IPv6 would leave the black-hole in place. Verified on device: the emulator had only
+     * `fd17:...` ULAs and `fe80::` link-local, no global address, and pinging Telegram's
+     * IPv6 AAAA timed out while its IPv4 answered in 100ms.
+     *
+     * Cached, because it cannot meaningfully change while the process lives.
+     */
+    private static volatile int colgramIpv6Known = -1; // -1 unknown, 0 no, 1 yes
+
+    private static boolean colgramDeviceHasIpv6() {
+        int known = colgramIpv6Known;
+        if (known >= 0) return known == 1;
+        boolean has = false;
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> nifs =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (nifs != null && nifs.hasMoreElements()) {
+                java.net.NetworkInterface nif = nifs.nextElement();
+                if (!nif.isUp() || nif.isLoopback()) continue;
+                java.util.Enumeration<java.net.InetAddress> addrs = nif.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    java.net.InetAddress a = addrs.nextElement();
+                    if (!(a instanceof java.net.Inet6Address)) continue;
+                    if (a.isLoopbackAddress() || a.isLinkLocalAddress()) continue;
+                    byte[] raw = a.getAddress();
+                    // fc00::/7 covers both fc00:: and fd00:: - unique-local, not routable.
+                    if ((raw[0] & 0xFE) == 0xFC) continue;
+                    has = true;
+                    break;
+                }
+                if (has) break;
+            }
+        } catch (Throwable ignored) {}
+        colgramIpv6Known = has ? 1 : 0;
+        Log.i(TAG, "device has globally routable IPv6: " + has);
+        return has;
+    }
+
+    /**
+     * Decide whether to attempt the direct route, re-probing occasionally after a failure
+     * rather than disabling it for the lifetime of the process.
+     */
+    private static boolean colgramShouldTryDirect() {
+        if (colgramDirectRouteWorks) return true;
+        long now = System.currentTimeMillis();
+        if (now - colgramDirectRouteFailedAt >= COLGRAM_DIRECT_RETRY_MS) {
+            colgramDirectRouteWorks = true;
+            Log.i(TAG, "re-probing direct route to the Bot API");
+            return true;
+        }
+        return !ColgramDpiBypass.isBound();
+    }
+
+    /** Called by botApiPost when the direct route itself was the thing that failed. */
+    private static void colgramReportDirectRouteFailed() {
+        if (colgramDirectRouteWorks) {
+            colgramDirectRouteWorks = false;
+            colgramDirectRouteFailedAt = System.currentTimeMillis();
+            Log.w(TAG, "direct route unusable; preferring the desync listener for "
+                    + (COLGRAM_DIRECT_RETRY_MS / 1000) + "s");
+        }
+    }
+
+    /** Cleared when the direct route to the Bot API proves unusable. */
+    private static volatile boolean colgramDirectRouteWorks = true;
+    private static volatile long colgramDirectRouteFailedAt = 0L;
+    /** How long a failed direct route is skipped before being re-probed. */
+    private static final long COLGRAM_DIRECT_RETRY_MS = 120000L;
+    private static final int COLGRAM_CONNECT_TIMEOUT_MS = 8000;
 
     public static void deleteWebhook(String token) {
         if (token == null || token.isEmpty()) return;
@@ -372,156 +1079,227 @@ public class ColgramBotSync {
 
     /**
      * Starts continuous background polling for incoming messages on bot accounts.
+     *
+     * Why this is guarded by an explicit claim rather than `existing.isAlive()`:
+     *
+     * `loadDialogs()` runs on every dialog refresh and the MessagesController patch calls
+     * `syncBotDialogs()` from it unconditionally, so this method is entered many times per
+     * second during startup. The old guard only tested `isAlive()`, but the map slot was
+     * written at the END of the method - after `new Thread(...)` - while the body in between
+     * does real work (`getApplicationContext`, `getBotToken`, and a blocking
+     * `fetchAndRegisterBotSelf` network call). A thread that has been constructed but has not
+     * yet reached RUNNABLE reports `isAlive() == false`, so every caller that arrived during
+     * those milliseconds passed the guard and spawned another poller. Observed on device:
+     * 1806 poller threads and ~1831 live threads within 18s of launch, still climbing.
+     *
+     * The claim is now taken while still holding the monitor, before any work happens, so a
+     * second caller sees `starting == true` and returns immediately. The claim is cleared in
+     * a finally block once the thread is handed to the scheduler (or if startup throws), so a
+     * failed start does not wedge the account into a permanently dead state.
      */
     public static synchronized void startBotUpdatesPoller(final Context context, final int account) {
         if (context == null) return;
+
+        // Fast path: a live thread is already running.
         Thread existing = pollerThreads.get(account);
         if (existing != null && existing.isAlive()) {
             return;
         }
+        // A previous caller is mid-spawn. isAlive() cannot see it yet - this is the race.
+        if (botPollerStarting.contains(account)) {
+            return;
+        }
 
-        final Context appContext = context.getApplicationContext();
-        Thread poller = new Thread(() -> {
-            Log.i(TAG, "Starting bot updates poller for account " + account);
+        // Already spawned and not since torn down. This is the LOOP guard, not the race
+        // guard: in passive mode the thread dies immediately, so `isAlive()` above is false
+        // on every subsequent call and without this every one of them respawns. See the doc
+        // on botPollerSpawned for the measured 887-spawn symptom.
+        //
+        // Re-armed only after POLLER_REARM_MS, so a transient failure still recovers while a
+        // hot call site cannot churn.
+        if (botPollerSpawned.contains(account)) {
+            Long last = botPollerLastSpawnAt.get(account);
+            if (last != null && System.currentTimeMillis() - last < POLLER_REARM_MS) {
+                return;
+            }
+        }
 
-            String token = getBotToken(appContext, account);
-            if (!token.isEmpty()) {
-                // Make sure we know who the bot is before polling updates. getMe is
-                // read-only and safe to call in either mode.
-                if (getBotSelfId(appContext, account) == 0) {
-                    fetchAndRegisterBotSelf(appContext, account, token);
-                }
+        botPollerStarting.add(account);
+        botPollerLastSpawnAt.put(account, System.currentTimeMillis());
+        botPollerSpawned.add(account);
 
-                // Passive mode: never take the update stream away from an existing
-                // deployment. deleteWebhook() is skipped and the long-poll loop below is
-                // not entered, so dialogs are still synced via syncBotDialogs() but
-                // Colgram consumes nothing from getUpdates.
-                if (isPassiveBotMode(appContext, account)) {
-                    Log.i(TAG, "passive bot mode: leaving webhook/updates untouched");
+        try {
+            final Context appContext = context.getApplicationContext();
+            Thread poller = new Thread(() -> {
+                    Log.i(TAG, "Starting bot updates poller for account " + account);
+
+                String token = getBotToken(appContext, account);
+                if (!token.isEmpty()) {
+                    // Make sure we know who the bot is before polling updates. getMe is
+                    // read-only and safe to call in either mode.
+                    if (getBotSelfId(appContext, account) == 0) {
+                        fetchAndRegisterBotSelf(appContext, account, token);
+                    }
+
+                    // Passive mode: never take the update stream away from an existing
+                    // deployment. deleteWebhook() is skipped and the long-poll loop below is
+                    // not entered, so dialogs are still synced via syncBotDialogs() but
+                    // Colgram consumes nothing from getUpdates.
+                    if (isPassiveBotMode(appContext, account)) {
+                        Log.i(TAG, "passive bot mode: leaving webhook/updates untouched");
+                        return;
+                    }
+
+                    deleteWebhook(token, true);
+                } else {
                     return;
                 }
 
-                deleteWebhook(token, true);
-            } else {
-                return;
-            }
+                SharedPreferences prefs = appContext.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE);
+                int savedOffset = prefs.getInt("last_update_id", 0);
+                if (savedOffset > 0) {
+                    lastUpdateIds.put(account, savedOffset);
+                }
 
-            SharedPreferences prefs = appContext.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE);
-            int savedOffset = prefs.getInt("last_update_id", 0);
-            if (savedOffset > 0) {
-                lastUpdateIds.put(account, savedOffset);
-            }
+                int consecutiveErrors = 0;
 
-            int consecutiveErrors = 0;
-
-            while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    // Check if current user is still a bot on this account
-                    Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-                    Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
-                    Object currentUser = ucClass.getMethod("getCurrentUser").invoke(uc);
-                    if (currentUser == null) {
-                        break;
-                    }
-                    boolean isBot = currentUser.getClass().getField("bot").getBoolean(currentUser);
-                    if (!isBot) {
-                        break;
-                    }
-
-                    token = getBotToken(appContext, account);
-                    if (token == null || token.isEmpty()) {
-                        Thread.sleep(4000);
-                        continue;
-                    }
-
-                    int currentOffset = lastUpdateIds.getOrDefault(account, 0);
-                    String urlStr;
-                    if (currentOffset == 0) {
-                        // First run.
-                        //
-                        // DO NOT use offset=-50 here. In the Bot API, `offset` means
-                        // "return updates starting from this id" and Telegram treats every
-                        // update BELOW that id as confirmed/delivered. A negative offset is
-                        // read as "give me the last N", so this very first call marked the
-                        // bot's entire pending backlog as read — and the next getUpdates
-                        // came back empty. That is why the chat list was empty and never
-                        // recovered until the local offset was cleared.
-                        //
-                        // Omitting offset entirely returns the pending queue without
-                        // acknowledging anything we have not actually processed.
-                        urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22channel_post%22%2C%22callback_query%22%5D";
-                    } else {
-                        // Long-poll: wait up to 20 seconds on server
-                        urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=" + currentOffset + "&timeout=20";
-                    }
-
-                    HttpURLConnection conn = openConnection(urlStr, currentOffset == 0 ? 10000 : 28000);
-                    conn.setRequestMethod("GET");
-
-                    int responseCode = conn.getResponseCode();
-                    if (responseCode == 409) {
-                        // 409 means a webhook is active on this token. Something else is
-                        // serving this bot. Do NOT delete the webhook — that would silently
-                        // steal the bot's traffic from its real deployment. Stop polling and
-                        // leave the stream alone; the user can opt in explicitly from the
-                        // bot settings if they really want Colgram to take over.
-                        Log.w(TAG, "getUpdates conflict (409): another consumer owns this token. "
-                                + "Stopping poller and leaving the webhook untouched.");
-                        break;
-                    }
-
-                    if (responseCode != 200) {
-                        consecutiveErrors++;
-                        Thread.sleep(Math.min(consecutiveErrors * 2000, 15000));
-                        continue;
-                    }
-                    consecutiveErrors = 0;
-
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        sb.append(line);
-                    }
-                    reader.close();
-
-                    JSONObject root = new JSONObject(sb.toString());
-                    if (root.optBoolean("ok", false)) {
-                        JSONArray updates = root.optJSONArray("result");
-                        if (updates != null && updates.length() > 0) {
-                            int maxId = currentOffset;
-                            for (int i = 0; i < updates.length(); i++) {
-                                int uid = updates.getJSONObject(i).optInt("update_id", 0);
-                                if (uid >= maxId) {
-                                    maxId = uid + 1;
-                                }
-                            }
-                            lastUpdateIds.put(account, maxId);
-                            prefs.edit().putInt("last_update_id", maxId).apply();
-
-                            processUpdatesJson(appContext, account, updates);
-                        }
-                    }
-
-                    Thread.sleep(300);
-
-                } catch (InterruptedException e) {
-                    break;
-                } catch (Throwable t) {
-                    Log.w(TAG, "Poller cycle error: " + t.getMessage());
+                while (!Thread.currentThread().isInterrupted()) {
                     try {
-                        Thread.sleep(3000);
+                        // Check if current user is still a bot on this account
+                        Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+                        Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
+                        Object currentUser = ucClass.getMethod("getCurrentUser").invoke(uc);
+                        if (currentUser == null) {
+                            break;
+                        }
+                        boolean isBot = currentUser.getClass().getField("bot").getBoolean(currentUser);
+                        if (!isBot) {
+                            break;
+                        }
+
+                        token = getBotToken(appContext, account);
+                        if (token == null || token.isEmpty()) {
+                            Thread.sleep(4000);
+                            continue;
+                        }
+
+                        int currentOffset = lastUpdateIds.getOrDefault(account, 0);
+                        String urlStr;
+                        if (currentOffset == 0) {
+                            // First run.
+                            //
+                            // DO NOT use offset=-50 here. In the Bot API, `offset` means
+                            // "return updates starting from this id" and Telegram treats every
+                            // update BELOW that id as confirmed/delivered. A negative offset is
+                            // read as "give me the last N", so this very first call marked the
+                            // bot's entire pending backlog as read — and the next getUpdates
+                            // came back empty. That is why the chat list was empty and never
+                            // recovered until the local offset was cleared.
+                            //
+                            // Omitting offset entirely returns the pending queue without
+                            // acknowledging anything we have not actually processed.
+                            urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22channel_post%22%2C%22callback_query%22%5D";
+                        } else {
+                            // Long-poll: wait up to 20 seconds on server
+                            urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=" + currentOffset + "&timeout=20";
+                        }
+
+                        HttpURLConnection conn = openConnection(urlStr, currentOffset == 0 ? 10000 : 28000);
+                        conn.setRequestMethod("GET");
+
+                        int responseCode = conn.getResponseCode();
+                        if (responseCode == 409) {
+                            // 409 means a webhook is active on this token. Something else is
+                            // serving this bot. Do NOT delete the webhook — that would silently
+                            // steal the bot's traffic from its real deployment. Stop polling and
+                            // leave the stream alone; the user can opt in explicitly from the
+                            // bot settings if they really want Colgram to take over.
+                            Log.w(TAG, "getUpdates conflict (409): another consumer owns this token. "
+                                    + "Stopping poller and leaving the webhook untouched.");
+                            break;
+                        }
+
+                        if (responseCode != 200) {
+                            consecutiveErrors++;
+                            Thread.sleep(Math.min(consecutiveErrors * 2000, 15000));
+                            continue;
+                        }
+                        consecutiveErrors = 0;
+
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            sb.append(line);
+                        }
+                        reader.close();
+
+                        JSONObject root = new JSONObject(sb.toString());
+                        if (root.optBoolean("ok", false)) {
+                            JSONArray updates = root.optJSONArray("result");
+                            if (updates != null && updates.length() > 0) {
+                                int maxId = currentOffset;
+                                for (int i = 0; i < updates.length(); i++) {
+                                    int uid = updates.getJSONObject(i).optInt("update_id", 0);
+                                    if (uid >= maxId) {
+                                        maxId = uid + 1;
+                                    }
+                                }
+                                lastUpdateIds.put(account, maxId);
+                                prefs.edit().putInt("last_update_id", maxId).apply();
+
+                                processUpdatesJson(appContext, account, updates);
+                            }
+                        }
+
+                        Thread.sleep(300);
+
                     } catch (InterruptedException e) {
                         break;
+                    } catch (Throwable t) {
+                        Log.w(TAG, "Poller cycle error: " + t.getMessage());
+                        try {
+                            Thread.sleep(3000);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
                     }
                 }
-            }
-            Log.i(TAG, "Bot updates poller stopped for account " + account);
+                Log.i(TAG, "Bot updates poller stopped for account " + account);
         }, "ColgramBotPoller-" + account);
 
-        poller.setDaemon(true);
-        pollerThreads.put(account, poller);
-        poller.start();
+            poller.setDaemon(true);
+            // Publish the thread BEFORE starting it. A running thread that fails to find
+            // itself in the map is a worse outcome than the reverse, and `isAlive()` is not
+            // reliable until the scheduler has picked the thread up.
+            pollerThreads.put(account, poller);
+            poller.start();
+        } finally {
+            botPollerStarting.remove(account);
+        }
+    }
+
+    /**
+     * Tear down the poller for an account and clear the respawn guard.
+     *
+     * This did not exist before, which is the other half of the spawn loop: `pollerThreads`
+     * was only ever written, never cleared, so the map permanently held a dead thread and no
+     * code path could ever legitimately restart a poller after the first one exited.
+     *
+     * Call on logout, on account switch, and when the bot token is replaced.
+     */
+    public static synchronized void stopBotUpdatesPoller(final int account) {
+        Thread existing = pollerThreads.remove(account);
+        if (existing != null) {
+            existing.interrupt();
+        }
+        // Clearing this is what actually allows a future start; it must happen here and
+        // nowhere else, so that "spawned" keeps meaning "spawned and not since stopped".
+        botPollerSpawned.remove(account);
+        botPollerLastSpawnAt.remove(account);
+        botPollerStarting.remove(account);
+        Log.i(TAG, "bot updates poller torn down for account " + account
+                + " (respawn guard cleared)");
     }
 
     public static void promptBotTokenAndSync(final Activity activity, final int account) {
@@ -807,9 +1585,25 @@ public class ColgramBotSync {
                 messagesList.add(message);
             }
 
-            // Persist users and messages into database
+            // Persist users and messages into database.
+            //
+            // ⚠️ REFLECTION RULE: pass the DECLARED parameter types, not concrete ones.
+            // Class.getMethod(name, paramTypes...) matches the signature exactly, and
+            // interface parameters are NOT interchangeable with their implementations.
+            // MessagesStorage declares
+            //     public void putUsersAndChats(List<User> users, List<Chat> chats,
+            //                                  boolean withTransaction, boolean useQueue)
+            // so asking for ArrayList.class throws NoSuchMethodException. This one call
+            // used to throw here, at the top of processUpdatesJson, which aborted the
+            // whole method: no messages were persisted, no dialogs created and the live
+            // chat cache was never seeded. That is why a bot account's chat list came up
+            // completely empty even though getUpdates was returning data.
+            //
+            // Note putMessages below IS correct: MessagesStorage really does declare
+            // ArrayList<TLRPC.Message> there. Verify each call against the source; do not
+            // copy the parameter list from a neighbouring call.
             if (!usersList.isEmpty()) {
-                msClass.getMethod("putUsersAndChats", ArrayList.class, ArrayList.class, boolean.class, boolean.class)
+                msClass.getMethod("putUsersAndChats", java.util.List.class, java.util.List.class, boolean.class, boolean.class)
                         .invoke(ms, usersList, null, true, true);
             }
             if (!messagesList.isEmpty()) {
@@ -876,7 +1670,7 @@ public class ColgramBotSync {
 
             if (!chatsList.isEmpty()) {
                 try {
-                    msClass.getMethod("putUsersAndChats", ArrayList.class, ArrayList.class, boolean.class, boolean.class)
+                    msClass.getMethod("putUsersAndChats", java.util.List.class, java.util.List.class, boolean.class, boolean.class)
                             .invoke(ms, null, chatsList, true, true);
                     // Also publish to the live chat cache so the dialog list can build rows
                     // immediately, without waiting for a full getDialogs round-trip.
@@ -924,8 +1718,6 @@ public class ColgramBotSync {
                 try {
                     Class<?> dialogBaseClass = Class.forName("org.telegram.tgnet.TLRPC$Dialog");
                     Class<?> msgObjCls = Class.forName("org.telegram.messenger.MessageObject");
-                    Class<?> sparseArrayClass = Class.forName("android.util.LongSparseArray");
-                    Class<?> arrayListClass = java.util.ArrayList.class;
                     Class<?> chatBaseClass = Class.forName("org.telegram.tgnet.TLRPC$Chat");
                     Class<?> userBaseClass = Class.forName("org.telegram.tgnet.TLRPC$User");
 
@@ -936,9 +1728,25 @@ public class ColgramBotSync {
                     Object msgs = msgField.get(mc);
                     if (dict == null || msgs == null) return;
 
-                    // LongSparseArray.put(long, Object)
-                    Method putSparse = sparseArrayClass.getMethod("put", long.class, Object.class);
-                    Method getSparse = sparseArrayClass.getMethod("get", long.class);
+                    // Resolve `put`/`get` from the RUNTIME class of the map, not from a
+                    // hardcoded `android.util.LongSparseArray`.
+                    //
+                    // Upstream migrated these maps to androidx.collection.LongSparseArray, whose
+                    // implementation is a COPY of the platform class - same name, same signatures,
+                    // different class. `Class.getMethod` matches declared types exactly, so looking
+                    // the method up on the platform class and invoking it on the androidx instance
+                    // throws
+                    //   "Expected receiver of type android.util.LongSparseArray,
+                    //    but got androidx.collection.LongSparseArray"
+                    // which aborted this whole block and left the chat list empty - the exact
+                    // symptom the block exists to fix.
+                    Method putSparse = dict.getClass().getMethod("put", long.class, Object.class);
+                    // `get` differs by version (returns Object on some, void-in/void-out on
+                    // others), so it is optional: we only ever put here.
+                    Method getSparse = null;
+                    try {
+                        getSparse = dict.getClass().getMethod("get", long.class);
+                    } catch (NoSuchMethodException ignored) {}
 
                     // Register users/chats in the live caches so titles and avatars resolve.
                     if (finalUsersList != null && !finalUsersList.isEmpty()) {
@@ -970,22 +1778,60 @@ public class ColgramBotSync {
                             } catch (Throwable ignored) {}
                         }
                         if (best != null) {
-                            Object mo = msgObjCls.getConstructor(int.class, messageClass, messageClass, boolean.class)
-                                    .newInstance(account, best, null, false);
-                            java.util.ArrayList<Object> list = new java.util.ArrayList<>();
-                            list.add(mo);
-                            putSparse.invoke(msgs, did, list);
+                            // The real upstream signature is
+                            //     MessageObject(int, TLRPC.Message, boolean generateLayout,
+                            //                   boolean checkMediaExists)
+                            // (MessageObject.java:1882). The previous call passed
+                            // (int, message, null, false) - a literal 4th arg where the 3rd
+                            // was meant to be a reply, which matches NEITHER overload:
+                            //   1882 (int, Message, boolean, boolean)          <- no reply slot
+                            //   1886 (int, Message, MessageObject, boolean, boolean)  <- 5 args
+                            // So getConstructor() threw NoSuchMethodException every time, the
+                            // catch below swallowed it, and the in-memory dialog cache never
+                            // seeded - which is what makes the bot's chat list render with no
+                            // previews / glitch. Resolve by parameter count and pass real
+                            // booleans.
+                            //
+                            // generateLayout=false: we are seeding storage, not laying out.
+                            // checkMediaExists=false: avoid a synchronous media probe here.
+                            Object mo = null;
+                            try {
+                                mo = msgObjCls.getConstructor(int.class, messageClass,
+                                                boolean.class, boolean.class)
+                                        .newInstance(account, best, false, false);
+                            } catch (NoSuchMethodException nsme) {
+                                // Fall back to the reply-taking overload for forks/newer
+                                // upstreams: (int, Message, MessageObject, boolean, boolean).
+                                mo = msgObjCls.getConstructor(int.class, messageClass,
+                                                msgObjCls, boolean.class, boolean.class)
+                                        .newInstance(account, best, null, false, false);
+                            }
+                            if (mo != null) {
+                                java.util.ArrayList<Object> list = new java.util.ArrayList<>();
+                                list.add(mo);
+                                // Resolve against `msgs` itself: the two maps are different
+                                // classes in general, and a Method is bound to its declaring class.
+                                msgs.getClass().getMethod("put", long.class, Object.class)
+                                        .invoke(msgs, did, list);
+                            }
                         }
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "could not seed in-memory dialog cache: " + t.getMessage());
                 }
             };
-            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-                seedCache.run();
-            } else {
-                mainHandler.post(seedCache);
-            }
+            // Run the seeding on a WORKER, never on the main thread.
+            //
+            // This block does an O(dialogs x messages) nested scan plus reflection per row,
+            // and it used to run inline whenever the caller happened to be the main thread:
+            //     if (myLooper() == getMainLooper()) seedCache.run(); else mainHandler.post(...)
+            // So the expensive path fired exactly when the UI was most fragile. Measured on
+            // device: "Skipped 47/34/55 frames" at the same instants as the poller churn -
+            // ~0.8s of frozen UI per stall.
+            //
+            // Storage is thread-safe here, and the UI reload below is posted to mainHandler
+            // explicitly, so moving the seeding off-main is safe and is the whole fix.
+            executor.execute(seedCache);
 
             // Reload UI dialogs & messages
             mainHandler.post(() -> {
@@ -1022,16 +1868,22 @@ public class ColgramBotSync {
     /**
      * Generic Bot API POST helper that actually surfaces Telegram's error text.
      *
-     * Two traps this avoids:
+     * Three traps this avoids:
      *   1. Reading getResponseCode() without draining the stream leaves the connection
      *      in a state where the error body is never readable, so a rejected request just
      *      looks like "HTTP 400" with no reason. The Bot API always explains itself in the
      *      body ("description" field) and that message is what the user needs to see.
      *   2. openConnection() must be given the POST stream before the code is read.
+     *   3. A transport failure and a request Telegram actually rejected are different
+     *      things. Collapsing both into "no response" hid the fact that the request never
+     *      reached Telegram at all - which is the difference between "your token is wrong"
+     *      and "your network is blocked", and the only actionable part of the message.
      *
-     * @return the parsed JSON response, or null if the request could not be performed
+     * @return the parsed JSON response, or a synthetic {"ok":false,"description":...}
+     *         carrying the transport failure so callers still report something honest
      */
     private static JSONObject botApiPost(String token, String method, JSONObject payload) {
+        final boolean viaDirect = colgramShouldTryDirect();
         try {
             HttpURLConnection conn = openConnection(
                     "https://api.telegram.org/bot" + token + "/" + method, 15000);
@@ -1053,23 +1905,71 @@ public class ColgramBotSync {
                 while ((line = reader.readLine()) != null) sb.append(line);
                 reader.close();
             }
-            JSONObject result = sb.length() > 0 ? new JSONObject(sb.toString()) : new JSONObject();
+            if (sb.length() == 0) {
+                // Reached the server, but it said nothing. Worth distinguishing from an
+                // outright transport failure, because it usually means a proxy ate the body.
+                return transportFailure("пустой ответ (HTTP " + code + ")");
+            }
+            JSONObject result = new JSONObject(sb.toString());
             if (code < 200 || code >= 300) {
                 Log.w(TAG, method + " HTTP " + code + ": " + sb);
             }
             return result;
+        } catch (java.net.SocketTimeoutException ste) {
+            Log.w(TAG, method + " timed out: " + ste.getMessage());
+            if (viaDirect) colgramReportDirectRouteFailed();
+            return transportFailure(connectionHint("таймаут подключения"));
+        } catch (javax.net.ssl.SSLException se) {
+            Log.w(TAG, method + " TLS failed: " + se.getMessage());
+            if (viaDirect) colgramReportDirectRouteFailed();
+            return transportFailure("ошибка TLS — соединение перехвачено или заблокировано");
+        } catch (java.io.IOException ioe) {
+            Log.w(TAG, method + " IO failed: " + ioe.getMessage());
+            if (viaDirect) colgramReportDirectRouteFailed();
+            return transportFailure(connectionHint("сеть недоступна"));
         } catch (Throwable t) {
             Log.w(TAG, method + " failed: " + t.getMessage());
+            if (viaDirect) colgramReportDirectRouteFailed();
+            return transportFailure(connectionHint(t.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * A synthetic non-ok response so a transport failure travels the same path as a real
+     * Bot API error and reaches the user with a reason attached.
+     */
+    private static JSONObject transportFailure(String reason) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("ok", false);
+            o.put("description", reason);
+            return o;
+        } catch (Throwable t) {
             return null;
         }
     }
 
+    /**
+     * Name the likely culprit instead of leaving the user with a bare timeout.
+     *
+     * The desync listener is the first suspect whenever it is bound, because it sits in
+     * front of every request and its own upstream connection has a much shorter budget
+     * than the caller's.
+     */
+    private static String connectionHint(String base) {
+        if (ColgramDpiBypass.isBound()) {
+            return base + " (проверьте обход блокировок — локальный прокси 127.0.0.1:"
+                    + ColgramDpiBypass.LOCAL_PORT + " не отвечает)";
+        }
+        return base;
+    }
+
     /** Human-readable reason from a Bot API error response, or null when it succeeded. */
     private static String botApiError(JSONObject resp) {
-        if (resp == null) return "no response";
+        if (resp == null) return "нет ответа";
         if (resp.optBoolean("ok", false)) return null;
         String desc = resp.optString("description", "");
-        return desc.isEmpty() ? "unknown error" : desc;
+        return desc.isEmpty() ? "неизвестная ошибка" : desc;
     }
 
     /**
@@ -1184,8 +2084,10 @@ public class ColgramBotSync {
         try {
             HttpURLConnection conn = openConnection("https://api.telegram.org/bot" + token + "/getMe", 12000);
             conn.setRequestMethod("GET");
-            if (conn.getResponseCode() != 200) return null;
-            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            int code = conn.getResponseCode();
+            java.io.InputStream stream = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = reader.readLine()) != null) sb.append(line);

@@ -301,3 +301,324 @@ def on_command_info(dialog_id, args):
                 "registered a command yet.")
     return ("exteraGram compatibility shim active.\n"
             "Registered commands: " + ", ".join("." + c for c in reg))
+
+
+# =====================================================================================
+# exteraGram plugin modules: base_plugin, hook_utils, android_utils, client_utils
+# =====================================================================================
+#
+# A real exteraGram .plugin file is plain Python (no archive, no JS) that begins with:
+#
+#     from base_plugin   import BasePlugin, MethodHook
+#     from hook_utils    import find_class, get_private_field, set_private_field
+#     from android_utils import log, run_on_ui_thread
+#     from client_utils  import run_on_queue, get_last_fragment
+#     from java import jarray, jclass          <- Chaquopy, already works
+#
+# Without these four modules the import fails immediately and NO exteraGram plugin can
+# run at all. This section synthesises them into sys.modules, so `from base_plugin import
+# BasePlugin` resolves.
+#
+# What is real here, built on Chaquopy's Java bridge:
+#   find_class, get_private_field, set_private_field  -> genuine Java reflection
+#   log, run_on_ui_thread, run_on_queue, get_last_fragment -> genuine dispatch
+#   BasePlugin + the on_plugin_load / on_plugin_unload lifecycle
+#
+# What is NOT real: arbitrary METHOD INTERCEPTION.
+#
+#   hook_method / hook_all_methods in exteraGram are backed by a Java-side hooking layer
+#   compiled into that client. Colgram has no such layer - its hooks are injected at BUILD
+#   time by scripts/apply-patches.py into named methods. Intercepting an arbitrary Java
+#   method at runtime would need bytecode instrumentation (DexMaker/ASM), which is a
+#   project of its own, not a shim.
+#
+#   So hooking is wired to the hook points Colgram actually exposes, and raises a clear
+#   UnsupportedFeature for anything else. That is deliberate: a hook that silently never
+#   fires is far worse than one that says why.
+
+_COLGRAM_HOOK_POINTS = {
+    # exteraGram-ish name -> Colgram's real hook point
+    "send_message": "on_send_message",
+    "message_received": "on_message_received",
+    "message_edited": "on_message_edited",
+    "message_deleted": "on_message_deleted",
+    "menu_item_selected": "on_menu_item_selected",
+}
+
+_installed_hooks = []   # list of (target_name, callback)
+
+
+def _java():
+    """Import Chaquopy's java module lazily so the shim stays importable off-device."""
+    import java
+    return java
+
+
+def _is_android():
+    try:
+        _java()
+        return True
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------ hook_utils --------
+
+def find_class(name):
+    """Resolve a Java class by its fully-qualified name.
+
+    exteraGram returns a wrapper it can hook; Colgram returns the real java.lang.Class,
+    which is what plugins actually use it for (field access, instanceof, statics).
+    """
+    if not _is_android():
+        raise UnsupportedFeature("find_class(%r) needs the Android runtime" % name)
+    try:
+        return _java().jclass(name)
+    except Exception as e:
+        raise UnsupportedFeature("find_class(%r) failed: %s" % (name, e))
+
+
+def _find_field(obj, name):
+    """Walk the class hierarchy for a declared field.
+
+    getDeclaredField() only sees fields declared on THAT class, so a field inherited
+    from a superclass raises NoSuchFieldException unless we walk up. Every one of these
+    classes is deep in a hierarchy, so walking is required, not defensive.
+    """
+    cls = obj.getClass()
+    while cls is not None:
+        try:
+            f = cls.getDeclaredField(name)
+            f.setAccessible(True)
+            return f
+        except Exception:
+            cls = cls.getSuperclass()
+    return None
+
+
+def get_private_field(obj, name):
+    if obj is None:
+        raise UnsupportedFeature("get_private_field(None, %r)" % name)
+    f = _find_field(obj, name)
+    if f is None:
+        raise AttributeError("no field %r on %s" % (name, obj.getClass().getName()))
+    return f.get(obj)
+
+
+def set_private_field(obj, name, value):
+    if obj is None:
+        raise UnsupportedFeature("set_private_field(None, %r)" % name)
+    f = _find_field(obj, name)
+    if f is None:
+        raise AttributeError("no field %r on %s" % (name, obj.getClass().getName()))
+    f.set(obj, value)
+    return value
+
+
+def hook_method(method, hook, priority=0):
+    """Register a hook against a Colgram hook point.
+
+    `method` may be a hook-point name (see _COLGRAM_HOOK_POINTS) or an object with a
+    __name__. Anything else raises - see the module header for why.
+    """
+    name = None
+    if isinstance(method, str):
+        name = method
+    else:
+        name = getattr(method, "__name__", None)
+    key = _COLGRAM_HOOK_POINTS.get(name, name)
+    if key not in _COLGRAM_HOOK_POINTS.values():
+        raise UnsupportedFeature(
+            "hook_method(%r): Colgram cannot intercept arbitrary Java methods - its hooks "
+            "are injected at build time. Available hook points: %s"
+            % (name, ", ".join(sorted(_COLGRAM_HOOK_POINTS))))
+    _installed_hooks.append((key, hook))
+    log("Colgram: hook registered on %s" % key)
+    return hook
+
+
+def hook_all_methods(clazz, name, hook, priority=0):
+    """See hook_method(). Same limits, same explicit failure."""
+    return hook_method(name, hook, priority)
+
+
+def call_hook_point(name, *args, **kwargs):
+    """Called by Colgram when one of the real hook points fires."""
+    out = None
+    for target, cb in list(_installed_hooks):
+        if target != name:
+            continue
+        try:
+            out = cb(*args, **kwargs)
+        except Exception as e:
+            log("Colgram: hook %s raised %s: %s" % (name, type(e).__name__, e))
+    return out
+
+
+class MethodHook(object):
+    """Marker base class. exteraGram plugins subclass this for typed hooks; Colgram
+    accepts any callable, so subclassing is optional but must not explode."""
+
+    priority = 0
+
+    def before(self, *a, **kw):
+        return None
+
+    def after(self, *a, **kw):
+        return None
+
+
+# ---------------------------------------------------------------- android_utils -------
+
+def log(*parts):
+    """Log to logcat under a Colgram tag, and to stdout when running off-device."""
+    msg = " ".join(str(p) for p in parts)
+    try:
+        if _is_android():
+            _java().jclass("android.util.Log").i("ColgramPlugin", msg)
+    except Exception:
+        pass
+    try:
+        print("[ColgramPlugin]", msg)
+    except Exception:
+        pass
+    return msg
+
+
+def _runnable(fn):
+    """Wrap a Python callable as a java.lang.Runnable.
+
+    Chaquopy will not implicitly convert a Python function to a Java interface, so an
+    explicit dynamic proxy is required - passing the bare function raises a conversion
+    error at the call site.
+    """
+    from java import dynamic_proxy
+    from java.lang import Runnable
+
+    @dynamic_proxy(Runnable)
+    class _PyRunnable(object):
+        def __init__(self, f):
+            self._f = f
+
+        def run(self):
+            try:
+                self._f()
+            except Exception as e:
+                log("runnable raised %s: %s" % (type(e).__name__, e))
+
+    return _PyRunnable(fn)
+
+
+def run_on_ui_thread(fn):
+    if not _is_android():
+        fn()
+        return
+    try:
+        au = _java().jclass("org.telegram.messenger.AndroidUtilities")
+        au.runOnUIThread(_runnable(fn))
+    except Exception as e:
+        log("run_on_ui_thread failed (%s); running inline" % e)
+        fn()
+
+
+# ----------------------------------------------------------------- client_utils -------
+
+def run_on_queue(fn):
+    """Run off the UI thread. A plain daemon thread is correct here: these are short
+    tasks (file IO, JSON, media prep) and daemon=True means they never block process exit.
+    """
+    import threading
+    t = threading.Thread(target=fn, name="colgram-plugin-task")
+    t.daemon = True
+    t.start()
+    return t
+
+
+def get_last_fragment():
+    """The fragment currently on top, as exteraGram exposes it."""
+    if not _is_android():
+        return None
+    try:
+        return _java().jclass("org.telegram.ui.LaunchActivity").getSafeLastFragment()
+    except Exception as e:
+        log("get_last_fragment failed: %s" % e)
+        return None
+
+
+# ------------------------------------------------------------------ base_plugin -------
+
+class BasePlugin(object):
+    """Minimal exteraGram BasePlugin.
+
+    exteraGram calls on_plugin_load() once after construction and on_plugin_unload()
+    before teardown. Both are no-ops here so a subclass that overrides only one of them
+    still works, and __init__ is deliberately left alone - plugins commonly keep state in
+    class attributes precisely so the engine's constructor stays untouched.
+    """
+
+    def __init__(self):
+        pass
+
+    def on_plugin_load(self):
+        pass
+
+    def on_plugin_unload(self):
+        pass
+
+    def on_plugin_settings(self):
+        return None
+
+
+# ------------------------------------------------------- register the four modules ----
+
+def _make_module(name, **members):
+    mod = _types.ModuleType(name)
+    for k, v in members.items():
+        setattr(mod, k, v)
+    sys.modules[name] = mod
+    return mod
+
+
+def _install_extera_modules():
+    """Publish base_plugin / hook_utils / android_utils / client_utils.
+
+    These must land in sys.modules, not just be reachable as attributes of this module:
+    the plugin does `from base_plugin import BasePlugin`, and the import system only
+    consults sys.modules and the path finder.
+    """
+    try:
+        _make_module(
+            "base_plugin",
+            BasePlugin=BasePlugin,
+            MethodHook=MethodHook,
+        )
+        _make_module(
+            "hook_utils",
+            find_class=find_class,
+            get_private_field=get_private_field,
+            set_private_field=set_private_field,
+            hook_method=hook_method,
+            hook_all_methods=hook_all_methods,
+            MethodHook=MethodHook,
+        )
+        _make_module(
+            "android_utils",
+            log=log,
+            run_on_ui_thread=run_on_ui_thread,
+        )
+        _make_module(
+            "client_utils",
+            run_on_queue=run_on_queue,
+            get_last_fragment=get_last_fragment,
+        )
+        log("exteraGram modules ready: base_plugin, hook_utils, android_utils, client_utils")
+    except Exception as e:
+        # Never let shim installation break plugin loading as a whole.
+        try:
+            log("exteraGram module install failed: %s" % e)
+        except Exception:
+            pass
+
+
+_install_extera_modules()
+

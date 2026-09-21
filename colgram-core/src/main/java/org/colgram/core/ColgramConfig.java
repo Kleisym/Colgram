@@ -260,8 +260,22 @@ public class ColgramConfig {
         return prefs != null ? prefs.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO) : DEFAULT_UPDATE_REPO;
     }
 
+    /**
+     * Whether to force Colgram's red/near-black palette over the user's own theme.
+     *
+     * Defaults to FALSE. It used to default to true, and came up true whenever prefs had
+     * not finished initialising, which meant a stock dark install (Night / Dark Blue) had
+     * its backgrounds rewritten to 0xff0e0f12 and its action bar to 0xff16181e while the
+     * icon and text keys were NOT covered by the same override list. Those fell through to
+     * the user's palette, which for a partial dark theme resolves to 0 - so backgrounds,
+     * icons and labels all rendered as the same near-black rectangle. That was the
+     * "everything merges" report.
+     *
+     * A cosmetic override must be opted into, so an unreadable UI can never be the default
+     * state of a fresh install.
+     */
     public static boolean isCyberThemeEnabled() {
-        return prefs == null || prefs.getBoolean(KEY_CYBER_THEME_ENABLED, true);
+        return prefs != null && prefs.getBoolean(KEY_CYBER_THEME_ENABLED, false);
     }
 
     public static void setCyberThemeEnabled(boolean enabled) {

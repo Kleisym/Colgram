@@ -54,6 +54,14 @@ public class ColgramUpdater {
                 conn.setConnectTimeout(5000);
                 conn.setReadTimeout(5000);
 
+                // GitHub's REST API rejects requests without a User-Agent with 403.
+                //
+                // The AOSP default IS "Dalvik/<ver>", but only when the value is unset; the
+                // platform also strips it in some configurations, and a 403 here is
+                // indistinguishable from a deleted repo or a rate limit in the UI. Setting
+                // it explicitly costs nothing and removes the whole failure mode.
+                conn.setRequestProperty("User-Agent", "Colgram-Updater");
+
                 if (conn.getResponseCode() == 200) {
                     BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
                     StringBuilder sb = new StringBuilder();
@@ -88,7 +96,11 @@ public class ColgramUpdater {
                         mainHandler.post(callback::onUpToDate);
                     }
                 } else {
-                    mainHandler.post(() -> callback.onError("Server returned code " + 0));
+                    // Report the real status. This used to hardcode 0, so every upstream
+                    // failure - 403 rate limit, 404, 500 - surfaced as "Server returned code
+                    // 0", which is unactionable and sent debugging in the wrong direction.
+                    final int code = conn.getResponseCode();
+                    mainHandler.post(() -> callback.onError("Server returned code " + code));
                 }
             } catch (Exception e) {
                 mainHandler.post(() -> callback.onError(e.getMessage()));
