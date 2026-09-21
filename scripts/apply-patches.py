@@ -2012,6 +2012,88 @@ def inject_hooks(repo_path):
             else:
                 print(f" [!] Warning: template {src_t} not found")
 
+        # ---------------------------------------------------------------------------
+        # 24.2 Colgram file sandbox: stop requesting the media library.
+        #
+        # Telegram asks for READ_MEDIA_IMAGES + READ_MEDIA_VIDEO + READ_MEDIA_AUDIO +
+        # READ_EXTERNAL_STORAGE, i.e. every photo, video and audio file on the device. With
+        # ColgramStorageSandbox enabled we do not ask at all: the user picks specific files
+        # through the Storage Access Framework (which needs no permission), Colgram copies them
+        # into its own private inbox, and Telegram's normal attachment path gets local paths.
+        # ---------------------------------------------------------------------------
+        base_fragment = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org",
+                                     "telegram", "ui", "ActionBar", "BaseFragment.java")
+
+        def basefragment_import_result(content):
+            marker = "public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {"
+            if "ColgramFileImport.handleActivityResult" in content:
+                return content
+            if marker not in content:
+                print(" [!] BaseFragment.onActivityResultFragment anchor missing - "
+                      "Colgram file import results will NOT be delivered")
+                return content
+            inject = (marker + "\n"
+                      "        // Colgram: the SAF picker result. LaunchActivity routes EVERY\n"
+                      "        // fragment result through here (LaunchActivity:6663), so this one hook\n"
+                      "        // catches the picker regardless of which screen launched it.\n"
+                      "        if (org.colgram.core.ColgramFileImport.handleActivityResult(\n"
+                      "                org.telegram.messenger.ApplicationLoader.applicationContext,\n"
+                      "                requestCode, resultCode, data)) {\n"
+                      "            return;\n"
+                      "        }")
+            return content.replace(marker, inject, 1)
+
+        patch_file(base_fragment, basefragment_import_result,
+                   "ColgramFileImport.handleActivityResult",
+                   "BaseFragment forward Colgram SAF picker result")
+
+        attach_alert = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org",
+                                    "telegram", "ui", "Components", "ChatAttachAlert.java")
+
+        def attach_sandbox_routes(content):
+            if "ColgramFileImport.pickFiles" in content:
+                return content
+            changed = False
+            for num, mime, comment, guard in [
+                (3, "audio/*",
+                 "Colgram: no READ_MEDIA_AUDIO request. Pick through SAF instead.",
+                 "                    if (!musicEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"),
+                (4, "*/*",
+                 "Colgram: no READ_MEDIA_IMAGES / READ_MEDIA_VIDEO request. Pick through SAF.",
+                 "                    if (!documentsEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"),
+            ]:
+                head = "                } else if (num == %s) {\n" % num
+                idx = content.find(head)
+                if idx < 0:
+                    print(" [!] ChatAttachAlert branch num==%s not found" % num)
+                    continue
+                after = idx + len(head)
+                if not content[after:].startswith(guard):
+                    print(" [!] ChatAttachAlert branch num==%s has an unexpected body" % num)
+                    continue
+                end = after + len(guard)
+                inject = ('                    if (org.colgram.core.ColgramConfig.isSandboxStorageEnabled()) {\n'
+                          '                        // ' + comment + '\n'
+                          '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "' + mime + '", true, paths -> {\n'
+                          '                            if (paths == null || paths.isEmpty()) {\n'
+                          '                                return;\n'
+                          '                            }\n'
+                          '                            if (documentsDelegate != null) {\n'
+                          '                                documentsDelegate.didSelectFiles(paths, "", null, null, true, 0, 0, 0, false, 0);\n'
+                          '                            } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+                          '                                ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
+                          '                                        .didSelectFiles(paths, "", null, null, true, 0, 0, 0, false, 0);\n'
+                          '                            }\n'
+                          '                        });\n'
+                          '                        return;\n'
+                          '                    }\n')
+                content = content[:end] + inject + content[end:]
+                changed = True
+            return content
+
+        patch_file(attach_alert, attach_sandbox_routes, "ColgramFileImport.pickFiles",
+                   "ChatAttachAlert documents + music use Colgram SAF import")
+
         # 25. SettingsActivity.java -> Deep Integration of Colgram Settings, Plugins, TempMail, Versions
         settings_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SettingsActivity.java")
         # The `if os.path.exists(settings_activity)` guard that used to wrap this `def` is
