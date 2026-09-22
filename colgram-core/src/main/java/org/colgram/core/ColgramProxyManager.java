@@ -59,7 +59,7 @@ public class ColgramProxyManager {
         public final String address;
         public final int port;
         public final String secret;
-        public final int type; // 0 = SOCKS5, 1 = MTProto
+        public final int type; // 0 = SOCKS5, 1 = MTProto, 2 = WEB (wss:// bridge, no port)
         public int pingMs = -1;
         public boolean isAvailable = false;
 
@@ -387,6 +387,17 @@ public class ColgramProxyManager {
             return;
         }
 
+        // Never rotate away from a proxy the user chose themselves. A WEB (wss://) proxy is
+        // entered through Telegram's own proxy screen and has no reason to be in our pool, so
+        // without this the health check or a single onProxyError would replace a working
+        // user-supplied tunnel with one of our public nodes - and to the user that looks like
+        // "the proxy I set keeps turning itself off".
+        if (currentActiveProxy != null && !verifiedPool.contains(currentActiveProxy)) {
+            Log.i(TAG, "holding user-configured proxy " + currentActiveProxy.address
+                    + " (type=" + currentActiveProxy.type + "); it is not in the managed pool");
+            return;
+        }
+
         long now = SystemClock.elapsedRealtime();
 
         // Give the local desync listener time to find a working strategy before abandoning
@@ -630,17 +641,56 @@ public class ColgramProxyManager {
                         .apply();
             }
 
-            // 2. Set native ConnectionsManager proxy settings directly
+            // 2. Apply through Telegram's OWN entry point.
+            //
+            // This used to call native_setProxySettings directly by reflection for every
+            // account. That skipped the whole Java-side method, and the Java side is where
+            // two things live:
+            //
+            //   * ProxySettings.Type.WEB support. ConnectionsManager.setProxySettings starts
+            //     WebProxyTransport, a local WebSocket-to-TCP bridge, and hands tgnet the
+            //     loopback port it bound. A wss:// proxy is the one class of bypass that
+            //     survives an IP-level block without a VPN and without a server of your own,
+            //     because the traffic looks like ordinary HTTPS to a CDN. Bypassing the Java
+            //     method made WEB unreachable from Colgram no matter what the user typed.
+            //   * The per-account loop keyed off UserConfig.MAX_ACCOUNT_COUNT rather than our
+            //     own constant, so the two paths could not disagree about how many slots exist.
+            //
+            // ProxySettings is rebuilt from the preferences written in step 1 using upstream's
+            // own parser, so a proxy added through Telegram's stock screen and one added by
+            // Colgram go through exactly the same code.
+            boolean appliedThroughStockPath = false;
             try {
+                Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
                 Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
-                Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
-                        int.class, String.class, int.class, String.class, String.class, String.class);
-                nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < colgramAccountSlots; i++) {
-                    nativeSetProxy.invoke(null, i, proxy.address, proxy.port, "", "", proxy.secret);
-                }
+
+                SharedPreferences primary = ctx.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+                Object settings = psClass.getMethod("fromSharedPreferences", SharedPreferences.class)
+                        .invoke(null, primary);
+
+                Method stockSet = cmClass.getMethod("setProxySettings", boolean.class, psClass);
+                stockSet.invoke(null, true, settings);
+                appliedThroughStockPath = true;
+                Log.i(TAG, "proxy applied via ConnectionsManager.setProxySettings (type="
+                        + proxy.type + ", " + proxy.address + ")");
             } catch (Throwable t) {
-                Log.e(TAG, "ConnectionsManager native_setProxySettings error", t);
+                Log.e(TAG, "stock setProxySettings failed, falling back to native", t);
+            }
+
+            if (!appliedThroughStockPath) {
+                // Keep the previous behaviour as a last resort so a refactor upstream cannot
+                // leave users with no way to set a proxy at all.
+                try {
+                    Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                    Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
+                            int.class, String.class, int.class, String.class, String.class, String.class);
+                    nativeSetProxy.setAccessible(true);
+                    for (int i = 0; i < colgramAccountSlots; i++) {
+                        nativeSetProxy.invoke(null, i, proxy.address, proxy.port, "", "", proxy.secret);
+                    }
+                } catch (Throwable t) {
+                    Log.e(TAG, "ConnectionsManager native_setProxySettings error", t);
+                }
             }
 
             // 3. Reload SharedConfig proxy list cleanly
@@ -727,7 +777,11 @@ public class ColgramProxyManager {
             int port = mainPrefs.getInt("proxy_port", 0);
             int type = mainPrefs.getInt("proxy_type", -1);
             String secret = mainPrefs.getString("proxy_secret", "");
-            if (ip == null || ip.isEmpty() || port <= 0) return null;
+            if (ip == null || ip.isEmpty()) return null;
+            // A WEB proxy has no port at all - ProxySettings forces it to 0 and tgnet is given
+            // the loopback port that WebProxyTransport bound instead. Rejecting port <= 0 here
+            // would silently discard exactly the proxy type that beats an IP block.
+            if (type != 2 && port <= 0) return null;
             for (ProxyItem p : verifiedPool) {
                 if (p.address.equals(ip) && p.port == port && p.type == type) return p;
             }
