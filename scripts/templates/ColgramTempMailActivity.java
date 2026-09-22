@@ -1129,7 +1129,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                             // off was simply false.
                             s.setText(autoRefreshEnabled
                                     ? "Ожидание писем... обновляется каждые 5 сек"
-                                    : "Писем пока нет. Включи «Авто», чтобы обновлять само", false);
+                                    : "Писем пока нет. Включи «Авто» — будут приходить сами", false);
                         } else {
                             int mIdx = position - 2;
                             TempMessage m = messages.get(mIdx);

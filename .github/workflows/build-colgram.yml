@@ -81,6 +81,51 @@ jobs:
         run: |
           python3 scripts/verify-privacy.py Telegram-Src
 
+      - name: Audit the built APK for trackers
+        # The source audit above cannot catch what it does not look at. Firebase reached every
+        # release for the same reason: it is contributed by the google-services Gradle plugin
+        # during manifest merging, so no source file contains the string, and the script also
+        # runs in advisory mode (no --strict) so findings never failed a build.
+        #
+        # What is checked here is REGISTRATION, not class presence. The firebase-messaging
+        # dependency still ships its classes, and that is inert — Telegram's own code references
+        # FirebaseMessaging, so the jar cannot simply be dropped. What made it a beacon was
+        # FirebaseInitProvider being merged into the manifest plus an explicit
+        # FirebaseApp.initializeApp() call, both of which Colgram now removes. A dex grep for
+        # class names would therefore fail on every build while telling us nothing.
+        run: |
+          APK=$(find Telegram-Src -name "app.apk" -path "*afat/release*" | head -n 1)
+          if [ -z "$APK" ]; then echo "::error::No APK to audit"; exit 1; fi
+          BT=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n 1)
+          MANIFEST=$("$BT" dump xmltree --file AndroidManifest.xml "$APK")
+          status=0
+          # Components that must NOT be live. Each of these starts network traffic at process
+          # creation without any call site of ours.
+          for comp in com.google.firebase.provider.FirebaseInitProvider \
+                      com.google.android.gms.measurement.AppMeasurementReceiver \
+                      com.microsoft.appcenter \
+                      io.sentry \
+                      com.huawei.hms.push; do
+            if echo "$MANIFEST" | grep -qa "$comp"; then
+              echo "::error::$comp is registered in the shipped manifest"
+              status=1
+            else
+              echo "clean (not registered): $comp"
+            fi
+          done
+          # Analytics and Crashlytics were removed outright, so their classes SHOULD be absent.
+          mkdir -p /tmp/dexaudit && unzip -o -q "$APK" 'classes*.dex' -d /tmp/dexaudit
+          for pat in com/google/firebase/crashlytics com/google/android/gms/firebase com/appcenter/android sdk/io/sentry; do
+            if grep -qal -- "$pat" /tmp/dexaudit/classes*.dex 2>/dev/null; then
+              echo "::error::tracker classes present: $pat"
+              status=1
+            else
+              echo "clean (no classes): $pat"
+            fi
+          done
+          rm -rf /tmp/dexaudit
+          exit $status
+
       - name: Build Colgram APK
         run: |
           cd Telegram-Src
