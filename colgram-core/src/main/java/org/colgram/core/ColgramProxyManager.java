@@ -152,38 +152,75 @@ public class ColgramProxyManager {
         // manager's own deferral, so asking the bypass to defer again stacked the delays
         // serially (10s + 8s = ~18s) before the listener existed. That was the dominant
         // cause of the slow post-login connect.
-        ColgramDpiBypass.startImmediately();
-        // The local listener is the pool's FIRST entry, so it must actually be accepting
-        // before we point Telegram at it. Without this wait the app would apply a proxy
-        // pointing at a closed port, Telegram would raise a proxy error, and the rotator
-        // would move off the local bypass entirely.
-        boolean localReady = ColgramDpiBypass.awaitReady(20000);
-        if (!localReady) {
-            // Do NOT apply a proxy that points at a closed port: Telegram shows it as
-            // "Недоступен", the toggle flips itself off, and the user loses the proxy UI
-            // entirely. Better to leave the setting alone and say so in the log.
-            Log.e(TAG, "local DPI listener never bound; skipping local proxy application");
+        //
+        // Only when the user actually asked for it. The listener used to start on every
+        // launch regardless: a bound socket, its accept thread and the desync machinery all
+        // running for traffic that is no longer routed through them (the proxy is no longer
+        // force-applied by default), plus awaitReady() below blocking up to 20s on a cold
+        // start for a component that is switched off.
+        boolean localReady = false;
+        if (ColgramConfig.isDpiBypassEnabled()) {
+            ColgramDpiBypass.startImmediately();
+            // The local listener is the pool's FIRST entry, so it must actually be accepting
+            // before we point Telegram at it. Without this wait the app would apply a proxy
+            // pointing at a closed port, Telegram would raise a proxy error, and the rotator
+            // would move off the local bypass entirely.
+            localReady = ColgramDpiBypass.awaitReady(20000);
+            if (!localReady) {
+                // Do NOT apply a proxy that points at a closed port: Telegram shows it as
+                // "Недоступен", the toggle flips itself off, and the user loses the proxy UI
+                // entirely. Better to leave the setting alone and say so in the log.
+                Log.e(TAG, "local DPI listener never bound; skipping local proxy application");
+            }
+        } else {
+            Log.i(TAG, "DPI bypass disabled; not starting the local listener");
         }
 
         // 2. Populate verified pool (local desync bypass first, public proxies after)
         initVerifiedPool();
         populateSharedConfigProxies();
 
-        // 3. Apply proxy: on fresh install, default to enabled so connection to Telegram isn't blocked by TSPU
+        // 3. Apply proxy: DIRECT by default, proxy only when the user asks for one.
+        //
+        // This used to default to ENABLED on a fresh install and force-apply
+        // verifiedPool.get(0), which is the in-process desync listener. Two measurements killed
+        // that design:
+        //
+        //   * On a network where Telegram is blocked, the block is an IP-level silent drop -
+        //     TCP to 149.154.166.110:443 and 149.154.167.99:443 times out while general internet
+        //     is fine (1.1.1.1 answers in 62ms). Desync manipulates payload framing to defeat
+        //     INSPECTION; it cannot make a dropped route answer. So the thing we made the default
+        //     does not help against the block it was written for.
+        //   * On a network where Telegram is NOT blocked, the loopback hop is pure cost: an extra
+        //     proxy, an extra failure mode, and a port that can fail to bind and pin the app to
+        //     a dead 127.0.0.1.
+        //
+        // What does work against an IP block is an obfuscated proxy with a real endpoint - the
+        // user's own MTProto proxy, or a WebSocket bridge. That is now the documented path, and
+        // "Обходчик ТСПУ" stays available as an explicit opt-in for signature-based DPI.
         SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
         boolean hasSetProxy = mainPrefs.contains("proxy_enabled");
-        boolean isProxyEnabled = hasSetProxy ? mainPrefs.getBoolean("proxy_enabled", false) : true;
-        if (!hasSetProxy) {
-            mainPrefs.edit().putBoolean("proxy_enabled", true).apply();
-        }
+        boolean isProxyEnabled = hasSetProxy && mainPrefs.getBoolean("proxy_enabled", false);
         if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
-            // Only take the local entry when it actually bound. Otherwise fall through to a
-            // real proxy rather than pinning the app to a dead local port.
-            ProxyItem first = verifiedPool.get(0);
-            if (first.isLocalDpi() && !localReady) {
-                Log.w(TAG, "local bypass not ready; skipping it when applying the first proxy");
+            // Restore the proxy the user actually chose. This used to apply
+            // verifiedPool.get(0) unconditionally, which is the local desync node - so anyone
+            // who picked a public MTProto proxy was silently moved back onto the loopbar hop
+            // the next time the app started, and "my proxy does not stick" was the result.
+            ProxyItem saved = findSavedProxy(mainPrefs);
+            if (saved != null && !(saved.isLocalDpi() && !localReady)) {
+                forceApplyProxy(saved);
+                Log.i(TAG, "restored proxy " + saved.address + ":" + saved.port
+                        + " type=" + saved.type
+                        + " secret=" + (saved.secret == null || saved.secret.isEmpty() ? "none" : "set"));
             } else {
-                forceApplyProxy(first);
+                // No usable saved entry: fall back to the pool head, but never onto a local
+                // listener that failed to bind - that pins Telegram to a dead 127.0.0.1.
+                ProxyItem first = verifiedPool.get(0);
+                if (first.isLocalDpi() && !localReady) {
+                    Log.w(TAG, "local bypass not ready; skipping it when applying the first proxy");
+                } else {
+                    forceApplyProxy(first);
+                }
             }
         }
 
@@ -674,6 +711,66 @@ public class ColgramProxyManager {
                     } catch (Throwable ignored) {}
                 });
             }
+        }
+    }
+
+    /**
+     * The proxy the user last selected, as Telegram itself persists it.
+     *
+     * Keys are the stock ones written by forceApplyProxy below and read by ProxySettings, so
+     * a proxy added through Telegram's own proxy screen is honoured too, not just ours.
+     * Returns null when nothing is stored or the stored entry is not in the pool.
+     */
+    private static ProxyItem findSavedProxy(SharedPreferences mainPrefs) {
+        try {
+            String ip = mainPrefs.getString("proxy_ip", "");
+            int port = mainPrefs.getInt("proxy_port", 0);
+            int type = mainPrefs.getInt("proxy_type", -1);
+            String secret = mainPrefs.getString("proxy_secret", "");
+            if (ip == null || ip.isEmpty() || port <= 0) return null;
+            for (ProxyItem p : verifiedPool) {
+                if (p.address.equals(ip) && p.port == port && p.type == type) return p;
+            }
+            // Not in the pool (e.g. a user-entered private proxy, which has no reason to be
+            // there). Honour the choice anyway rather than quietly substituting something else.
+            ProxyItem custom = new ProxyItem(ip, port, secret, type);
+            custom.isAvailable = true;
+            custom.pingMs = 0;
+            Log.i(TAG, "saved proxy is not in the pool; applying it as a user-configured entry");
+            return custom;
+        } catch (Throwable t) {
+            Log.w(TAG, "findSavedProxy failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Single place that turns the desync bypass on or off, for real.
+     *
+     * The settings row used to only call ColgramDpiBypass.start()/stop(). That started or
+     * killed a listener nobody was necessarily routed through, persisted nothing so the
+     * choice reverted on the next launch, and left the UI showing one state while tgnet was
+     * pointed at another. Persisting, running the listener and routing traffic through it are
+     * three different things and all three have to agree.
+     */
+    public static void setDpiBypassEnabled(Context context, boolean enabled) {
+        ColgramConfig.setDpiBypassEnabled(enabled);
+        if (enabled) {
+            ColgramDpiBypass.start();
+            ProxyItem local = null;
+            for (ProxyItem p : verifiedPool) {
+                if (p.isLocalDpi()) { local = p; break; }
+            }
+            if (local != null) {
+                forceApplyProxy(local);
+                Log.i(TAG, "desync bypass enabled and applied");
+            } else {
+                Log.w(TAG, "desync bypass enabled but the local node is not in the pool");
+            }
+        } else {
+            disableProxy(context);
+            ColgramDpiBypass.stop();
+            Log.i(TAG, "desync bypass disabled, reverted to direct connection");
         }
     }
 

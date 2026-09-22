@@ -11,7 +11,6 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramBotSync;
 import org.colgram.core.ColgramConfig;
-import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramProxyManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
@@ -243,15 +242,13 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }
                 Toast.makeText(getParentActivity(), "Тема изменена. Перезайдите на экран для обновления.", Toast.LENGTH_SHORT).show();
             } else if (position == dpiBypassRow) {
-                if (ColgramDpiBypass.isRunning()) {
-                    ColgramDpiBypass.stop();
-                    Toast.makeText(getParentActivity(), "Обходчик ТСПУ остановлен", Toast.LENGTH_SHORT).show();
-                } else {
-                    ColgramDpiBypass.start();
-                    Toast.makeText(getParentActivity(), "Обходчик ТСПУ запущен (127.0.0.1:9876)", Toast.LENGTH_SHORT).show();
-                }
+                // Persist + route + run, in one call. This row used to only start or stop the
+                // listener, so the choice was lost on restart and the toggle could show
+                // "running" while tgnet was not routed through it at all.
+                ColgramProxyManager.setDpiBypassEnabled(getContext(),
+                        !ColgramConfig.isDpiBypassEnabled());
                 if (view instanceof TextCheckCell) {
-                    ((TextCheckCell) view).setChecked(ColgramDpiBypass.isRunning());
+                    ((TextCheckCell) view).setChecked(ColgramConfig.isDpiBypassEnabled());
                 }
             } else if (position == dohRow) {
                 boolean val = !ColgramConfig.isDohEnabled();
@@ -425,7 +422,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == cyberThemeRow) {
                         checkCell.setTextAndCheck("Красно-чёрная тема Colgram Cyber", ColgramConfig.isCyberThemeEnabled(), false);
                     } else if (position == dpiBypassRow) {
-                        checkCell.setTextAndCheck("Обходчик ТСПУ (TCP Desync / 127.0.0.1)", ColgramDpiBypass.isRunning(), true);
+                        // Read the persisted intent, not just whether a socket happens to be
+                        // bound: a listener that failed to bind is a fault, not a setting.
+                        checkCell.setTextAndCheck("Обходчик ТСПУ (TCP Desync / 127.0.0.1)",
+                                ColgramConfig.isDpiBypassEnabled(), true);
                     } else if (position == dohRow) {
                         checkCell.setTextAndCheck("DNS-over-HTTPS (шифрованный DNS)", ColgramConfig.isDohEnabled(), true);
                     } else if (position == builtinProxyRow) {

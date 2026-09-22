@@ -292,8 +292,62 @@ public class ColgramPluginManager {
         }).start();
     }
 
+    /**
+     * Broadcast an incoming message to every enabled plugin's on_message().
+     *
+     * This method used to contain only a comment, and nothing called it either — which is why
+     * auto_reply.py, keyword_alerts.py and message_logger.py were inert no matter what the
+     * plugin screen showed. The dispatch is deliberately defensive: a plugin that does not
+     * define on_message is skipped, and one that raises cannot stop the others.
+     *
+     * Only INCOMING messages reach here. A reply we send is itself a message, so filtering on
+     * isOut at the call site is what prevents auto-reply from answering itself forever.
+     */
     public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
-        // Broadcast incoming events to active plugins
+        if (isOut || text == null) return;
+        final String messageText = text;
+        new Thread(() -> {
+            // Snapshot the list: loadedPlugins is synchronised but iterating it while a reload
+            // swaps entries would throw.
+            List<PluginInfo> snapshot;
+            synchronized (loadedPlugins) {
+                snapshot = new ArrayList<>(loadedPlugins);
+            }
+            for (PluginInfo p : snapshot) {
+                if (!p.isEnabled || p.fileName == null) continue;
+                String module = p.fileName;
+                int dot = module.lastIndexOf('.');
+                if (dot > 0) module = module.substring(0, dot);
+                try {
+                    // The message text travels as base64 rather than as a quoted Python literal.
+                    // Escaping quotes correctly is necessary but not sufficient: the snippet is
+                    // compiled as SOURCE, so anything the host hands to Chaquopy's parser has to
+                    // survive its encoding too, and non-ASCII text plus astral characters (emoji)
+                    // are exactly where that gets murky. base64 keeps the generated source pure
+                    // ASCII and removes the quoting surface entirely.
+                    String b64 = android.util.Base64.encodeToString(
+                            messageText.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
+                    String snippet = "import base64, importlib\n"
+                            + "_m = importlib.import_module('" + module + "')\n"
+                            + "_f = getattr(_m, 'on_message', None)\n"
+                            + "if _f is not None:\n"
+                            + "    _t = base64.b64decode('" + b64 + "').decode('utf-8')\n"
+                            + "    _r = _f(" + dialogId + ", _t)\n"
+                            + "    if _r:\n"
+                            + "        print(_r)\n";
+                    String out = ColgramPythonEngine.executeCode(snippet);
+                    if (out == null) continue;
+                    String reply = out.trim();
+                    // executeCode prefixes successful-but-silent runs; anything else is the
+                    // plugin's own answer and should actually be delivered.
+                    if (reply.isEmpty() || reply.startsWith("Executed")) continue;
+                    ColgramPythonEngine.sendMessage(dialogId, reply);
+                    Log.i(TAG, "plugin " + p.fileName + " replied to message " + messageId);
+                } catch (Throwable t) {
+                    Log.w(TAG, "plugin " + p.fileName + " on_message failed: " + t.getMessage());
+                }
+            }
+        }, "colgram-plugin-inbound").start();
     }
 
     public static boolean installPlugin(String fileName, String code) {

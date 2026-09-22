@@ -1696,6 +1696,11 @@ public class ColgramBotSync {
             // Resolved once: which sender in this batch is "us".
             final long botSelfId = getBotSelfId(context, account);
 
+            // Incoming messages that plugins should see. Collected during the parse loop and
+            // dispatched only after the batch is actually in storage, so a plugin replying to
+            // message N cannot observe a dialog state that the same batch has not written yet.
+            final ArrayList<Object[]> pluginInbound = new ArrayList<>();
+
             for (int i = 0; i < updates.length(); i++) {
                 JSONObject upd = updates.getJSONObject(i);
                 JSONObject msgObj = upd.optJSONObject("message");
@@ -1806,6 +1811,13 @@ public class ColgramBotSync {
                 }
 
                 messagesList.add(message);
+
+                // Only anything NOT sent by this bot is "incoming". Feeding our own replies back
+                // into the plugin hook is how an auto-responder ends up answering itself.
+                boolean colgramIsIncoming = botSelfId == 0 || fromId != botSelfId;
+                if (colgramIsIncoming && !text.isEmpty()) {
+                    pluginInbound.add(new Object[]{chatId, Integer.valueOf(msgId), text});
+                }
             }
 
             // Persist users and messages into database.
@@ -2080,6 +2092,20 @@ public class ColgramBotSync {
                     Log.e(TAG, "Error notifying UI after bot sync", t);
                 }
             });
+
+            // Hand the batch's incoming messages to the plugin system now that they are stored
+            // and the UI has been told about them.
+            for (Object[] entry : pluginInbound) {
+                try {
+                    ColgramHookHandler.hookOnMessageReceived(
+                            ((Long) entry[0]).longValue(),
+                            ((Integer) entry[1]).intValue(),
+                            (String) entry[2],
+                            false);
+                } catch (Throwable t) {
+                    Log.w(TAG, "plugin inbound dispatch failed: " + t.getMessage());
+                }
+            }
 
             return dialogsList.size();
         } catch (Throwable t) {
