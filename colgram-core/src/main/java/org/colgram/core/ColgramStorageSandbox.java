@@ -18,14 +18,23 @@ public class ColgramStorageSandbox {
         if (context == null) return;
 
         if (ColgramConfig.isSandboxStorageEnabled()) {
-            // Target: scoped Documents/Colgram folder
+            // The folder is only a sandbox if the app can actually write to it. Public
+            // Documents/Colgram is the nicest place to live - a file manager shows it - but under
+            // scoped storage (targetSdk 36) a new directory there is usually denied, and a
+            // download path that silently cannot be written is worse than one in an out-of-the-way
+            // directory that can. So probe instead of guessing: public Documents, then the
+            // app-specific external directory (writable with no permission on every API level),
+            // then internal storage.
+            String name = ColgramConfig.getCustomStorageDir();
             File documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
-            if (documentsDir != null) {
-                sandboxRoot = new File(documentsDir, ColgramConfig.getCustomStorageDir());
-            } else {
-                // Fallback to app-internal sandboxed files directory
-                sandboxRoot = new File(context.getFilesDir(), ColgramConfig.getCustomStorageDir());
+            File candidate = documentsDir != null ? new File(documentsDir, name) : null;
+            if (!isWritable(candidate)) {
+                candidate = context.getExternalFilesDir(name);
             }
+            if (!isWritable(candidate)) {
+                candidate = new File(context.getFilesDir(), name);
+            }
+            sandboxRoot = candidate;
         } else {
             sandboxRoot = context.getExternalFilesDir(null);
         }
@@ -35,11 +44,41 @@ public class ColgramStorageSandbox {
         }
     }
 
+    /**
+     * Does this directory exist (or can it be created) and accept a write? Existence alone is
+     * not evidence: scoped storage happily reports a path that every open() on it rejects.
+     */
+    private static boolean isWritable(File dir) {
+        if (dir == null) return false;
+        try {
+            if (!dir.exists() && !dir.mkdirs()) return false;
+            if (!dir.isDirectory()) return false;
+            File probe = new File(dir, ".colgram-write-probe");
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(probe)) {
+                out.write(1);
+            } catch (Throwable t) {
+                return false;
+            } finally {
+                //noinspection ResultOfMethodCallIgnored
+                probe.delete();
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     public static File getSandboxRootDir(Context context) {
         if (sandboxRoot == null) {
             init(context);
         }
         return sandboxRoot;
+    }
+
+    /** Absolute path of the folder actually in effect, for display. */
+    public static String getRootPath(Context context) {
+        File root = getSandboxRootDir(context);
+        return root != null ? root.getAbsolutePath() : "";
     }
 
     /**

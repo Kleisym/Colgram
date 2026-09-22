@@ -13,6 +13,7 @@ import org.colgram.core.ColgramBotSync;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramProxyDoctor;
 import org.colgram.core.ColgramProxyManager;
+import org.colgram.core.ColgramStorageSandbox;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
@@ -70,10 +71,12 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private int sandboxHeaderRow;
     private int sandboxStorageRow;
+    private int sandboxFilesRow;
     private int sandboxSectionRow;
 
     private int botsHeaderRow;
     private int botRealtimeRow;
+    private int pluginsRow;
     private int botsSectionRow;
 
     @Override
@@ -123,10 +126,12 @@ public class ColgramSettingsActivity extends BaseFragment {
 
         sandboxHeaderRow = rowCount++;
         sandboxStorageRow = rowCount++;
+        sandboxFilesRow = rowCount++;
         sandboxSectionRow = rowCount++;
 
         botsHeaderRow = rowCount++;
         botRealtimeRow = rowCount++;
+        pluginsRow = rowCount++;
         botsSectionRow = rowCount++;
 
         if (listAdapter != null) {
@@ -306,6 +311,12 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
+            } else if (position == sandboxFilesRow) {
+                // The folder itself. Attaching a file should not require handing Telegram the
+                // whole media library, so this is where files live and where they get picked up.
+                presentFragment(new ColgramFilesActivity());
+            } else if (position == pluginsRow) {
+                presentFragment(new ColgramPluginsActivity());
             } else if (position == botRealtimeRow) {
                 // The cell shows "realtime", the preference stores "passive" — they are opposites.
                 boolean passive = !ColgramBotSync.isPassiveBotMode(getContext(), currentAccount);
@@ -360,7 +371,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
                    position == cyberThemeRow || position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
                    position == ownProxyRow || position == proxyStatusRow ||
-                   position == sandboxStorageRow || position == botRealtimeRow;
+                   position == sandboxStorageRow || position == sandboxFilesRow ||
+                   position == botRealtimeRow || position == pluginsRow;
         }
 
         @Override
@@ -370,7 +382,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                 position == botsHeaderRow) {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow
-                    || position == ownProxyRow || position == proxyStatusRow) {
+                    || position == ownProxyRow || position == proxyStatusRow
+                    || position == sandboxFilesRow || position == pluginsRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
                        position == themeSectionRow || position == networkSectionRow || position == sandboxSectionRow ||
@@ -464,7 +477,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == proxyBrowserRow) {
                         checkCell.setTextAndCheck("Открывать ссылки в защищенном браузере", ColgramConfig.isProxyBrowserEnabled(), true);
                     } else if (position == sandboxStorageRow) {
-                        checkCell.setTextAndCheck("Изолировать файлы в Documents/Colgram", ColgramConfig.isSandboxStorageEnabled(), false);
+                        checkCell.setTextAndCheck("Изолировать файлы в папке Colgram", ColgramConfig.isSandboxStorageEnabled(), false);
                     } else if (position == botRealtimeRow) {
                         checkCell.setTextAndCheck("Получать сообщения бота в реальном времени",
                                 !ColgramBotSync.isPassiveBotMode(getContext(), currentAccount), true);
@@ -486,6 +499,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                         settingsCell.setTextAndValue("Свой прокси: MTProto / WebSocket / SOCKS5",
                                 ColgramProxyManager.isProxyEnabled(getContext())
                                         ? "открыть экран Telegram" : "добавить и включить", false);
+                    } else if (position == sandboxFilesRow) {
+                        // Show the path that is actually in effect: scoped storage decides it, so
+                        // "Documents/Colgram" is only true when the system let us write there.
+                        settingsCell.setTextAndValue("Папка Colgram",
+                                ColgramStorageSandbox.getRootPath(getContext()), false);
+                    } else if (position == pluginsRow) {
+                        settingsCell.setTextAndValue("Плагины: автоответчик, алерты, лог",
+                                "открыть", false);
                     } else if (position == proxyStatusRow) {
                         settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
                                 ColgramProxyDoctor.getStatusSummary(), false);

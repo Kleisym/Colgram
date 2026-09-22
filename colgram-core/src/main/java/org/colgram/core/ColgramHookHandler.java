@@ -55,9 +55,37 @@ public class ColgramHookHandler {
 
     /**
      * HOOK: Called from MessagesController when a new message is received or created.
+     *
+     * Deduplicated on (dialog, message id) because more than one transport can report the same
+     * arrival: the bot synchroniser dispatches a batch it injected itself, and Telegram's own
+     * update path stores the same dialog through MessagesStorage. Without this a plugin - and an
+     * auto-reply is a plugin that answers - would fire twice for one message.
      */
     public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
+        if (!isOut && !colgramRememberDispatch(dialogId, messageId)) return;
         ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
+    }
+
+    /** Bounded LRU of recently dispatched inbound messages; false means "already handled". */
+    private static final java.util.LinkedHashMap<String, Long> colgramDispatchedInbound =
+            new java.util.LinkedHashMap<String, Long>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Long> eldest) {
+                    return size() > 512;
+                }
+            };
+
+    private static final long COLGRAM_DISPATCH_DEDUPE_MS = 5 * 60 * 1000L;
+
+    private static boolean colgramRememberDispatch(long dialogId, int messageId) {
+        String key = dialogId + ":" + messageId;
+        long now = System.currentTimeMillis();
+        synchronized (colgramDispatchedInbound) {
+            Long seen = colgramDispatchedInbound.get(key);
+            if (seen != null && now - seen < COLGRAM_DISPATCH_DEDUPE_MS) return false;
+            colgramDispatchedInbound.put(key, now);
+        }
+        return true;
     }
 
     /**

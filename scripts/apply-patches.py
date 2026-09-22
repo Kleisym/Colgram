@@ -23,6 +23,12 @@ import subprocess
 # as working had never actually reached a build.
 PATCH_MISSES = []
 
+# Version of the injected Theme.getColor wrapper and cyber palette. Bump it with EVERY edit to
+# the wrapper or the palette: it is both the constant the wrapper declares and the patch_file
+# marker, so the two can no longer disagree and an old build can no longer report "already
+# patched" over a newer body.
+COLGRAM_THEME_PATCH_VERSION = "5"
+
 # Misses that are known-benign, with the reason. Anything NOT listed here fails the run.
 # Keeping this explicit is the point: a new miss cannot be waved through by accident, and a
 # stale entry becomes visible the moment it stops firing.
@@ -71,6 +77,48 @@ def patch_file(filepath, search_pattern, replacement, description):
 
     print(f" [+] Successfully patched: {description}")
     return True
+
+# Body that replaces Theme.createDefaultWallpaper(int, int). Bump the number in the marker
+# comment with every edit, exactly like COLGRAM_THEME_PATCH_VERSION, or patch_file keeps
+# reporting "already patched" against an older body and the change never reaches a build.
+COLGRAM_WALLPAPER_MARKER = "// COLGRAM_WALLPAPER_PATCH = 1"
+
+COLGRAM_CREATE_DEFAULT_WALLPAPER = """    public static Drawable createDefaultWallpaper(int w, int h) {
+        // COLGRAM_WALLPAPER_PATCH = 1
+        // Colgram: our own geometry over a cold slate-to-crimson gradient instead of Telegram's
+        // doodle field over its stock greens. This method is the background for the chats list,
+        // the in-chat view, the login shell and the side menu, so it has to serve both the dark
+        // and the light theme from here.
+        boolean colgramWallpaperDark = org.colgram.core.ColgramConfig.isCyberThemeEnabled()
+                || isCurrentThemeDark();
+        int colgramGrad1;
+        int colgramGrad2;
+        int colgramGrad3;
+        int colgramGrad4;
+        if (colgramWallpaperDark) {
+            colgramGrad1 = 0xff10131a;
+            colgramGrad2 = 0xff151b26;
+            colgramGrad3 = 0xff0c0f15;
+            colgramGrad4 = 0xff1b0e13;
+        } else {
+            colgramGrad1 = 0xffe7ebf3;
+            colgramGrad2 = 0xffdce3ef;
+            colgramGrad3 = 0xffd4ddec;
+            colgramGrad4 = 0xffcbd7e8;
+        }
+        MotionBackgroundDrawable motionBackgroundDrawable = new MotionBackgroundDrawable(
+                colgramGrad1, colgramGrad2, colgramGrad3, colgramGrad4, w != 0);
+        if (w <= 0 || h <= 0) {
+            w = Math.min(AndroidUtilities.displaySize.x, AndroidUtilities.displaySize.y);
+            h = Math.max(AndroidUtilities.displaySize.x, AndroidUtilities.displaySize.y);
+        }
+        motionBackgroundDrawable.setPatternBitmap(34,
+                org.colgram.core.ColgramWallpaper.create(w, h));
+        // SRC_IN keeps only the geometry and alpha of the bitmap, so the tint lives here.
+        motionBackgroundDrawable.setPatternColorFilter(colgramWallpaperDark ? 0x66ff4d5e : 0x6637506e);
+        return motionBackgroundDrawable;
+    }
+"""
 
 def inject_hooks(repo_path):
     print("[*] Performing semantic code injection into Telegram source...")
@@ -1691,7 +1739,7 @@ def inject_hooks(repo_path):
         "    // an OLDER wrapper, patch_file reports 'already patched', the injector never\n"
         "    // re-runs, and edits to the palette silently never reach a build. That exact trap\n"
         "    // swallowed two separate theme fixes in this file before it was pinned down.\n"
-        "    private static final int COLGRAM_THEME_PATCH = 3;\n"
+        "    private static final int COLGRAM_THEME_PATCH = " + COLGRAM_THEME_PATCH_VERSION + ";\n"
         "\n"
         "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {\n"
         "        boolean[] colgramIsDefault = new boolean[1];\n"
@@ -1837,6 +1885,9 @@ def inject_hooks(repo_path):
         "    private static final int COLGRAM_CYBER_ACCENT    = 0xffff3344;\n"
         "    private static final int COLGRAM_CYBER_TEXT      = 0xffe8eaed;\n"
         "    private static final int COLGRAM_CYBER_TEXT_DIM  = 0xff9aa0a6;\n"
+        "    // 70% white: the glass keys ship as dark ink for a white pill, and the pill is now\n"
+        "    // dark. Translucent because upstream composes these over the blurred backdrop.\n"
+        "    private static final int COLGRAM_CYBER_GLASS_INK = 0xb3e9edf3;\n"
         "    private static final int COLGRAM_CYBER_HINT      = 0xff6b7280;\n"
         "    private static final int COLGRAM_CYBER_DIVIDER   = 0xff2a2e37;\n"
         "    /**\n"
@@ -1914,6 +1965,42 @@ def inject_hooks(repo_path):
         "        if (key == key_divider || key == key_graySection\n"
         "                || key == key_switchTrack || key == key_radioBackground) {\n"
         "            return COLGRAM_CYBER_DIVIDER;\n"
+        "        }\n"
+        "        // The glass material. This Telegram version paints the main tab bar, the top\n"
+        "        // panel and their icons from key_glass_*, and not one of them was in the\n"
+        "        // palette - so with Cyber on the chats list went black while the bottom\n"
+        "        // navigation stayed a WHITE pill with blue icons. That is the screenshot behind\n"
+        "        // 'cyber всё ещё выглядит баганно', and no amount of windowBackground* work\n"
+        "        // touches it because these keys are separate from the window palette.\n"
+        "        if (key == key_glass_targetMainTabs || key == key_glass_targetMainTopPanel) {\n"
+        "            return COLGRAM_CYBER_SURFACE;\n"
+        "        }\n"
+        "        if (key == key_glass_tabSelected || key == key_glass_tabSelectedText) {\n"
+        "            return COLGRAM_CYBER_ACCENT;\n"
+        "        }\n"
+        "        // Ink drawn ON the glass. Its stock values are dark strokes meant for a white\n"
+        "        // pill, so once the pill goes dark they would simply vanish - the labels have to\n"
+        "        // flip with the surface, not stay in the palette.\n"
+        "        if (key == key_glass_tabUnselected || key == key_glass_defaultIcon\n"
+        "                || key == key_glass_defaultText) {\n"
+        "            return COLGRAM_CYBER_GLASS_INK;\n"
+        "        }\n"
+        "        // The brand blue that survives everywhere else: the dialogs wordmark, which this\n"
+        "        // version uses as the action bar title whenever the main tabs are present\n"
+        "        // (DialogsActivity picks key_telegram_color_dialogsLogo over the title key), the\n"
+        "        // unread counters, and the timestamp of an unread dialog - DialogCell paints that\n"
+        "        // with Theme.dialogs_timePaintBoldAccent, a static TextPaint built once from\n"
+        "        // key_telegram_color_text, so there is no per-view colour key to reach and the\n"
+        "        // palette has to answer it here. Measured after the first cyber fix: the title,\n"
+        "        // badge and tab label were #ff3344, the date alone was still #298acf.\n"
+        "        if (key == key_telegram_color_dialogsLogo\n"
+        "                || key == key_telegram_color || key == key_telegram_color_text\n"
+        "                || key == key_chats_tabUnreadActiveBackground\n"
+        "                || key == key_chats_unreadCounter\n"
+        "                || key == key_topics_unreadCounter\n"
+        "                || key == key_featuredStickers_unread\n"
+        "                || key == key_picker_badge) {\n"
+        "            return COLGRAM_CYBER_ACCENT;\n"
         "        }\n"
         "        return 0;\n"
         "    }\n"
@@ -2138,7 +2225,7 @@ def inject_hooks(repo_path):
             #   PATCHED - both signatures are present, so the regex can span and swap the
             #            old wrapper without touching the body.
             anchor = "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {"
-            if anchor in content and "COLGRAM_THEME_PATCH = 3" not in content:
+            if anchor in content and ("COLGRAM_THEME_PATCH = " + COLGRAM_THEME_PATCH_VERSION) not in content:
                 # Drop any older version marker first: the wrapper is inserted at the
                 # marker's own line, and the PATCHED branch below replaces from
                 # `public static int getColor(` onward — so a stale constant sitting above
@@ -2156,7 +2243,7 @@ def inject_hooks(repo_path):
                 else:
                     # FRESH: rename upstream's method by prefixing the wrapper.
                     content = content.replace(anchor, COLGRAM_GETCOLOR_WRAPPER, 1)
-                if "COLGRAM_THEME_PATCH = 3" not in content:
+                if ("COLGRAM_THEME_PATCH = " + COLGRAM_THEME_PATCH_VERSION) not in content:
                     print(" [!] FATAL: Theme wrapper did not land - cyber palette NOT applied")
             return content
         # The marker MUST name something only the current version emits. It was
@@ -2166,7 +2253,7 @@ def inject_hooks(repo_path):
         # never reached a build. Same class of defect as the dead IntroActivity anchors.
         # It then became "colgramLooksLikeForeground", which did the same thing to the NEXT
         # edit — so the marker is now an explicit version constant that has to be bumped.
-        patch_file(theme_file, theme_cyber_injector, "COLGRAM_THEME_PATCH = 3", "Theme Inject Colgram Cyber Red Colors")
+        patch_file(theme_file, theme_cyber_injector, "COLGRAM_THEME_PATCH = " + COLGRAM_THEME_PATCH_VERSION, "Theme Inject Colgram Cyber Red Colors")
 
         # 24b. The cyber overrides above ALSO get applied at the real choke point, and a
         # zero-valued readable colour is repaired there. See COLGRAM_GETCOLOR_WRAPPER.
@@ -2182,7 +2269,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java"]:
+        for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -3769,6 +3856,155 @@ def inject_hooks(repo_path):
 
     public void setFullscreen(boolean fullscreen, boolean animated) {"""
         patch_file(bot_sheet, impl_target, impl_inject, "BotWebViewSheet Pin MiniApp Implementation")
+
+    # 54. Theme.java -> our own wallpaper instead of Telegram's doodle field.
+    #
+    # ONE method feeds the whole app. createDefaultWallpaper() produces Theme.wallpaper, and the
+    # chats list (SizeNotifierFrameLayout.getNewDrawable), the in-chat background
+    # (ChatActivity.getWallpaperDrawable), the login shell, the side menu and the wallpaper
+    # previews all read that single static field. Replacing it is therefore one insertion, not
+    # five, and it cannot drift per-screen.
+    #
+    # Upstream rasterises res/raw/default_pattern.svg - 500 KB, 745 paths, the dinosaur and the
+    # Christmas tree - over four hardcoded green gradient stops. Two things learned from the
+    # source before writing this:
+    #   * MotionBackgroundDrawable does NOT tile. For a positive intensity it scales the bitmap
+    #     to fill the view (only the negative-intensity branch builds a repeating BitmapShader),
+    #     so the pattern is generated AT SCREEN SIZE rather than as a small repeating tile.
+    #   * The pattern is recoloured by a PorterDuff SRC_IN filter, so the bitmap only supplies
+    #     geometry and alpha. The hue is chosen here through setPatternColorFilter.
+    theme_wallpaper_re = re.compile(
+        r"    public static Drawable createDefaultWallpaper\(int w, int h\) \{.*?\n    \}\n",
+        re.S)
+
+    def theme_wallpaper_injector(content):
+        if COLGRAM_WALLPAPER_MARKER in content:
+            return content
+        if "public static Drawable createDefaultWallpaper(int w, int h) {" not in content:
+            return content
+        new_content, count = theme_wallpaper_re.subn(
+            lambda m: COLGRAM_CREATE_DEFAULT_WALLPAPER, content, count=1)
+        return new_content if count else content
+
+    patch_file(theme_file, theme_wallpaper_injector, COLGRAM_WALLPAPER_MARKER,
+               "Theme Colgram Default Wallpaper Pattern")
+
+    # Custom themes with a gradient but no pattern file fall back to the same SVG through a
+    # different line, and bake it into a cache file. Covered so the doodles cannot reappear for
+    # anyone using an .attheme.
+    patch_file(
+        theme_file,
+        "patternBitmap = SvgHelper.getBitmap(R.raw.default_pattern, w, h, Color.WHITE, 1f, SvgHelper.ScaleMode.ByWidth);",
+        "patternBitmap = org.colgram.core.ColgramWallpaper.create(w, h); // COLGRAM_WALLPAPER_CACHED_PATCH = 1",
+        "Theme Colgram Wallpaper Baked For Custom Themes"
+    )
+
+    # The doodles are also drawn directly (not through createDefaultWallpaper) in the wallpaper
+    # picker thumbnail and in the two theme previews. Leaving them would mean the setting that
+    # says "this is the default background" still shows Telegram's dinosaur - a half-replacement
+    # is the kind of thing that reads as a bug the next day. QrActivity is deliberately NOT
+    # touched: there the SVG is decoration behind a QR code, not a claim about the wallpaper.
+    for _name, _old, _new in [
+        ("WallpaperCell.java",
+         "wallPaper.defaultCache = SvgHelper.getBitmap(R.raw.default_pattern, 100, 180, Color.BLACK);",
+         "wallPaper.defaultCache = org.colgram.core.ColgramWallpaper.create(100, 180, Color.BLACK);"),
+        ("ThemeSmallPreviewView.java",
+         "Bitmap bitmap = SvgHelper.getBitmap(R.raw.default_pattern, AndroidUtilities.dp(PATTERN_BITMAP_MAXWIDTH), AndroidUtilities.dp(PATTERN_BITMAP_MAXHEIGHT), Color.BLACK, AndroidUtilities.density);",
+         "Bitmap bitmap = org.colgram.core.ColgramWallpaper.create(AndroidUtilities.dp(PATTERN_BITMAP_MAXWIDTH), AndroidUtilities.dp(PATTERN_BITMAP_MAXHEIGHT), Color.BLACK);"),
+        ("ThemePreviewActivity.java",
+         "backgroundImage.setImageBitmap(SvgHelper.getBitmap(R.raw.default_pattern, w, h, patternColor));",
+         "backgroundImage.setImageBitmap(org.colgram.core.ColgramWallpaper.create(w, h, patternColor));"),
+    ]:
+        _path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui",
+                             "Cells" if _name == "WallpaperCell.java" else
+                             ("Components" if _name == "ThemeSmallPreviewView.java" else "."),
+                             _name)
+        patch_file(_path, _old, _new, "Colgram Wallpaper Pattern In " + _name)
+
+    # 55. MessagesStorage.java -> every incoming message reaches the plugin engine.
+    #
+    # hookOnMessageReceived had exactly one caller, in ColgramBotSync, so plugins - auto-reply,
+    # keyword alerts, the logger - only ever saw messages that arrived through the Bot API. A
+    # normal account receives updates through MessagesStorage.putMessages(ArrayList, ...) (see
+    # MessagesController:16848 and :17119 handing res.new_messages to it) and nothing dispatched
+    # those. The javadoc on the hook claimed it was called from MessagesController; it wasn't.
+    #
+    # This overload is the choke point every transport funnels through, which is why the hook
+    # goes here rather than into each caller. The recency filter is load-bearing, not cosmetic:
+    # the same method stores history pages, search results and reply chains, so without it
+    # scrolling back a month would trigger a month of auto-replies.
+    messages_storage = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesStorage.java")
+    colgram_storage_sig = ("    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, "
+                           "boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {")
+    # Bump with every edit to the body below: the marker is also what patch_file uses to
+    # decide the work is done, so a stale marker silently freezes an old body in place.
+
+    COLGRAM_PLUGIN_INBOUND_PATCH = "2"
+    COLGRAM_PLUGIN_INBOUND_MARKER = "// COLGRAM_PLUGIN_INBOUND_PATCH = " + COLGRAM_PLUGIN_INBOUND_PATCH
+    COLGRAM_PLUGIN_INBOUND_HELPER = """    // COLGRAM_PLUGIN_INBOUND_PATCH = 2
+    /**
+     * Hand genuinely-new incoming messages to the Colgram plugin system.
+     *
+     * Only messages dated within the last two minutes are dispatched, because this method also
+     * serves history loads; only incoming ones, because a reply we send is itself a message and
+     * answering it would loop. The cap keeps a large fresh batch from starting one thread per
+     * message downstream.
+     */
+    private void colgramDispatchPlugins(ArrayList<TLRPC.Message> messages) {
+        try {
+            if (messages == null || messages.isEmpty()) {
+                return;
+            }
+            long colgramNowSec = System.currentTimeMillis() / 1000L;
+            int colgramDispatched = 0;
+            for (int i = messages.size() - 1; i >= 0 && colgramDispatched < 10; i--) {
+                TLRPC.Message colgramMessage = messages.get(i);
+                if (colgramMessage == null || colgramMessage.out
+                        || colgramMessage.message == null || colgramMessage.message.isEmpty()) {
+                    continue;
+                }
+                if (colgramMessage.date < colgramNowSec - 120) {
+                    continue;
+                }
+                long colgramDialogId = MessageObject.getDialogId(colgramMessage);
+                if (colgramDialogId == 0) {
+                    continue;
+                }
+                org.colgram.core.ColgramHookHandler.hookOnMessageReceived(
+                        colgramDialogId, colgramMessage.id, colgramMessage.message, false);
+                colgramDispatched++;
+            }
+        } catch (Throwable ignore) {
+        }
+    }
+
+"""
+
+    # Matches any previously injected copy, which always sits immediately above the signature.
+    colgram_inbound_re = re.compile(
+        r"    // COLGRAM_PLUGIN_INBOUND_PATCH = \d+\n.*?\n    \}\n\n"
+        r"(?=    public void putMessages\(ArrayList<TLRPC\.Message> messages, boolean withTransaction)",
+        re.S)
+
+    def storage_inbound_injector(content):
+        if COLGRAM_PLUGIN_INBOUND_MARKER in content:
+            return content
+        if colgram_storage_sig not in content:
+            return content
+        # Strip an older copy first: the first revision of this helper called
+        # TLRPC.Message.getDialogId(), which does not exist in this version, and it had
+        # already been written into the tree. An injector that only ever ADDS cannot repair
+        # a line it shipped wrong.
+        content = colgram_inbound_re.sub("", content, count=1)
+        content = content.replace("\n        colgramDispatchPlugins(messages);", "")
+        return content.replace(
+            colgram_storage_sig,
+            COLGRAM_PLUGIN_INBOUND_HELPER + colgram_storage_sig
+            + "\n        colgramDispatchPlugins(messages);",
+            1)
+
+    patch_file(messages_storage, storage_inbound_injector, COLGRAM_PLUGIN_INBOUND_MARKER,
+               "MessagesStorage Dispatch Incoming Messages To Plugins")
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
