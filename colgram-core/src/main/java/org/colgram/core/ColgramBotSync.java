@@ -2244,6 +2244,30 @@ public class ColgramBotSync {
                 final String err = botApiError(resp);
 
                 if (err == null) {
+                    // "ok: true" is not proof the name changed. Verify it the way a user would -
+                    // ask the server what the name now is - because the failure he reported is
+                    // exactly this shape: the local profile shows the new name, and Telegram
+                    // somewhere else still shows the old one. Either the write never landed, or
+                    // another client is serving a cached user record, and those need saying out
+                    // loud rather than a green toast.
+                    String serverName = null;
+                    try {
+                        // botApiGet already unwraps ok/result and returns null on any failure.
+                        JSONObject nameRes = botApiGet(context, token, "getMyName");
+                        if (nameRes != null) {
+                            serverName = nameRes.optString("name", "");
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "getMyName verification failed: " + t.getMessage());
+                    }
+                    final String confirmed = serverName;
+                    if (confirmed != null && !confirmed.equals(newName)) {
+                        mainHandler.post(() -> Toast.makeText(context,
+                                "Сервер ответил, что имя бота осталось «" + confirmed
+                                        + "». В других клиентах оно обновится не сразу.",
+                                Toast.LENGTH_LONG).show());
+                        return;
+                    }
                     mainHandler.post(() -> {
                         try {
                             Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");

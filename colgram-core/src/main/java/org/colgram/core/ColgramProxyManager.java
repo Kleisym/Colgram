@@ -11,14 +11,10 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -72,12 +68,17 @@ public class ColgramProxyManager {
         public long lastCheckAt = 0L;
         /** Times Telegram's native layer failed a connection while this entry was applied. */
         int nativeFailures = 0;
+        /** Times the protocol probe said "dead". Enough of these and the entry leaves the pool. */
+        int failedVerdicts = 0;
+        /** Fake-TLS (an "ee" secret): the handshake is wrapped in a plausible TLS record. */
+        public final boolean fakeTls;
 
         public ProxyItem(String address, int port, String secret, int type) {
             this.address = address;
             this.port = port;
             this.secret = secret != null ? secret : "";
             this.type = type;
+            this.fakeTls = this.secret.toLowerCase().startsWith("ee");
         }
 
         public boolean isLocalDpi() {
@@ -113,11 +114,32 @@ public class ColgramProxyManager {
     private static volatile Context appContext = null;
     private static final AtomicBoolean initialized = new AtomicBoolean(false);
 
-    // Multiple GitHub sources for fresh proxies
-    private static final String[] PROXY_SOURCES = {
+    // Multiple GitHub sources for fresh proxies. Every URL here was fetched and parsed before it
+    // was added; the two that are commented out were tested and are dead or 404, and leaving dead
+    // sources in the list is how a fetch silently "succeeds" while returning nothing.
+    //
+    // Formats:
+    //   .json  -> [{server, port, secret}, ...]
+    //   .txt   -> t.me/proxy?server=..&port=..&secret=.. link lines
+    //   socks  -> plain host:port lines (no secret; type SOCKS5)
+    private static final String[] PROXY_SOURCES_MTPROTO_JSON = {
         "https://raw.githubusercontent.com/dubblebyte/free-mtproto-proxies/master/proxies.json",
+    };
+    private static final String[] PROXY_SOURCES_MTPROTO_LINKS = {
+        "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
         "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
     };
+    private static final String[] PROXY_SOURCES_SOCKS = {
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    };
+
+    /** Hard ceiling on the candidate list; the harvest replaces the oldest unverified entries. */
+    private static final int MAX_POOL_SIZE = 200;
+    /** How many entries the stock proxy list (and Telegram's own rotator) gets to see. */
+    private static final int MAX_PUBLISHED_TO_STOCK = 12;
+    /** Entries verified alive and kept across restarts. */
+    private static final int MAX_REMEMBERED_ALIVE = 24;
 
     /**
      * Main entry point — called from ColgramHookHandler.init() on app startup.
@@ -276,50 +298,20 @@ public class ColgramProxyManager {
                     return;
                 }
 
-                if (active != null) {
-                    // A TCP connect proves nothing about a proxy - it succeeds against any host
-                    // with the port open, including one that has never heard of MTProto, and it
-                    // always fails for a WEB proxy, which has no port at all (so a working
-                    // wss:// tunnel was rotated away every 30 seconds). Ask the native checker
-                    // instead and rotate only on an actual protocol verdict.
-                    if (active.type == 2) return;
-                    // Do not stack a second check on top of the sweep's own: the extra
-                    // handshake through the same proxy is what makes it answer "dead".
-                    if (sweepRunning.get()) return;
-                    // Same 2-minute freshness window as the sweep.
-                    if (active.lastCheckAt > 0
-                            && SystemClock.elapsedRealtime() - active.lastCheckAt < RECHECK_INTERVAL_MS) {
-                        return;
-                    }
-                    final ProxyItem checked = active;
-                    mainHandler.post(() -> {
-                        boolean started;
-                        try {
-                            started = checkOne(checked, alive -> {
-                                if (alive) return;
-                                Log.w(TAG, "Current proxy failed the protocol check: "
-                                        + checked.address);
-                                reportProxyFailure();
-                                switchToNextProxy();
-                            });
-                        } catch (Throwable t) {
-                            started = false;
-                        }
-                        if (!started) {
-                            Log.w(TAG, "no native checker for " + checked.address
-                                    + "; leaving the applied proxy alone");
-                        }
-                    });
-                }
+                // A REMOTE proxy is not checked here any more. The prober already re-verifies
+                // every entry - including the applied one - inside a two-minute window and
+                // rotates on its verdict, and running a second handshake against the same node
+                // from two timers is what made live proxies answer "dead".
             } catch (Throwable ignored) {}
         }, 30, 30, TimeUnit.SECONDS);
 
-        // 6. Full re-fetch and re-check every 30 minutes
+        // 6. Re-harvest every 20 minutes. Public MTProxy lists churn on that timescale - nodes
+        // disappear and new ones appear - and the prober keeps the verdicts fresh in between.
         scheduler.scheduleWithFixedDelay(() -> {
             try {
                 fetchAndVerifyAllSources();
             } catch (Throwable ignored) {}
-        }, 30, 30, TimeUnit.MINUTES);
+        }, 20, 20, TimeUnit.MINUTES);
     }
 
     private static void initVerifiedPool() {
@@ -358,12 +350,16 @@ public class ColgramProxyManager {
         // check of any kind. Everything downstream reads that flag - "Pool: N alive", the
         // rotation preference, the stock list's green/grey state - so the pool claimed seven
         // working proxies on a cold start and the rotator saw no reason to look further.
-        // Availability now comes from Telegram's own native proxy checker (checkPoolNow).
+        // Availability now comes from the protocol probe (see startProber).
         for (ProxyItem p : hardcoded) {
             if (!containsProxy(p)) {
                 verifiedPool.add(p);
             }
         }
+
+        // Nodes that were verified working on a previous run, with a deliberately stale verdict
+        // so the prober re-checks them first thing rather than trusting them blind.
+        loadRemembered();
     }
 
     /**
@@ -389,79 +385,202 @@ public class ColgramProxyManager {
      * became unreachable at TCP level within 25 minutes, while the app was probing them.
      */
     private static final long RECHECK_INTERVAL_MS = 120000L;
-    private static final AtomicBoolean sweepRunning = new AtomicBoolean(false);
+    /** Gap between two probes: ~20 handshakes a minute, one in flight at a time. */
+    private static final long PROBE_GAP_MS = 3000L;
+    /** Idle wait when every entry in the pool is still fresh. */
+    private static final long PROBE_IDLE_MS = 20000L;
+    /** Failed verdicts after which a node leaves the pool until the next harvest brings it back. */
+    private static final int MAX_FAILED_VERDICTS = 3;
 
-    /** Max candidates probed per sweep - the pool grows from fetched lists without bound. */
-    private static final int MAX_CHECKED_PER_SWEEP = 8;
+    private static final AtomicBoolean proberRunning = new AtomicBoolean(false);
+    private static int proberCursor = 0;
 
+    /**
+     * Continuous single-flight protocol probe.
+     *
+     * A capped sweep cannot cover a pool this size: with a few hundred candidates and eight
+     * checks per pass, most entries never get a verdict at all, which is exactly why the settings
+     * screen kept showing "10 proxies" worth of information. The prober instead keeps one
+     * handshake in flight at a steady pace, so a few hundred entries are re-verified every few
+     * minutes and a node that died is noticed without a burst of connections.
+     */
+    public static void startProber() {
+        if (appContext == null || !proberRunning.compareAndSet(false, true)) return;
+        mainHandler.post(proberTick);
+    }
+
+    /** Manual "check now": drop the freshness window so the prober walks everything again. */
     public static void checkPoolNow() {
-        checkPoolNow(false);
-    }
-
-    /** @param force re-probe even the nodes checked moments ago; used by the settings tap. */
-    public static void checkPoolNow(boolean force) {
-        if (appContext == null || !sweepRunning.compareAndSet(false, true)) return;
-        if (verifiedPool.isEmpty()) {
-            // Tapping "check" seconds after launch used to do nothing at all: the pool is only
-            // seeded after the startup deferral, so the sweep found no targets and the screen
-            // kept saying "не проверен" with no way to make it try again.
-            initVerifiedPool();
-        }
-        final long now = SystemClock.elapsedRealtime();
-        final List<ProxyItem> targets = new ArrayList<>();
         for (ProxyItem p : verifiedPool) {
-            // A WEB entry would need a WebView bridge per check and the pool never contains
-            // one; the user's own WEB proxy is checked where it is actually used.
-            if (p.type == 2) continue;
-            if (!force && p.lastCheckAt > 0 && now - p.lastCheckAt < RECHECK_INTERVAL_MS) continue;
-            targets.add(p);
-            if (targets.size() >= MAX_CHECKED_PER_SWEEP) break;
+            p.lastCheckAt = 0L;
         }
-        if (targets.isEmpty()) {
-            sweepRunning.set(false);
-            return;
-        }
-        mainHandler.post(() -> checkNext(targets, 0, () -> sweepRunning.set(false)));
+        startProber();
     }
 
-    private static void checkNext(final List<ProxyItem> targets, final int index, final Runnable onDone) {
-        if (index >= targets.size()) {
-            onDone.run();
-            return;
-        }
-        final ProxyItem item = targets.get(index);
-        final AtomicBoolean advanced = new AtomicBoolean(false);
-        final long startedAt = SystemClock.elapsedRealtime();
-        final Runnable advance = () -> {
-            if (advanced.compareAndSet(false, true)) {
-                // Reached only from the timeout: the native callback never fired, which means
-                // the host accepted TCP and then said nothing. That is a dead proxy, not an
-                // unknown one, and it must stop being preferred.
-                if (item.lastCheckAt < startedAt) {
-                    item.lastCheckAt = startedAt;
-                    item.isAvailable = false;
-                    item.pingMs = -2;
-                }
-                checkNext(targets, index + 1, onDone);
+    /** Kept for the settings row; a manual tap always means "walk the list again". */
+    public static void checkPoolNow(boolean force) {
+        checkPoolNow();
+    }
+
+    private static final Runnable proberTick = new Runnable() {
+        @Override
+        public void run() {
+            final ProxyItem target = nextProberTarget();
+            if (target == null) {
+                mainHandler.postDelayed(this, PROBE_IDLE_MS);
+                return;
             }
-        };
-        boolean started;
-        try {
-            started = checkOne(item, alive -> advance.run());
-        } catch (Throwable t) {
-            started = false;
+            final long startedAt = SystemClock.elapsedRealtime();
+            final AtomicBoolean done = new AtomicBoolean(false);
+            Runnable finish = () -> {
+                if (!done.compareAndSet(false, true)) return;
+                if (target.lastCheckAt < startedAt) {
+                    // The native callback never fired: TCP opened and nothing answered. That is a
+                    // dead proxy, not an unknown one.
+                    onVerdict(target, false);
+                }
+                mainHandler.postDelayed(this, PROBE_GAP_MS);
+            };
+            boolean started;
+            try {
+                started = checkOne(target, alive -> {
+                    onVerdict(target, alive);
+                    finish.run();
+                });
+            } catch (Throwable t) {
+                started = false;
+            }
+            if (!started) {
+                target.lastCheckAt = startedAt;
+                finish.run();
+                return;
+            }
+            mainHandler.postDelayed(finish, NATIVE_CHECK_TIMEOUT_MS);
         }
-        if (!started) {
-            advance.run();
-            return;
+    };
+
+    /** Next entry whose verdict is missing or stale; null when the whole pool is fresh. */
+    private static ProxyItem nextProberTarget() {
+        final long now = SystemClock.elapsedRealtime();
+        final int size = verifiedPool.size();
+        if (size == 0) return null;
+        for (int step = 0; step < size; step++) {
+            int idx = (proberCursor + step) % size;
+            ProxyItem p = verifiedPool.get(idx);
+            // A WEB entry needs a WebView bridge per check and the pool never holds one; the
+            // user's own WEB proxy is exercised where it is actually applied.
+            if (p.type == 2) continue;
+            if (p.lastCheckAt > 0 && now - p.lastCheckAt < RECHECK_INTERVAL_MS) continue;
+            proberCursor = (idx + 1) % size;
+            return p;
         }
-        mainHandler.postDelayed(advance, NATIVE_CHECK_TIMEOUT_MS);
+        proberCursor = 0;
+        return null;
     }
 
     /**
-     * Single native protocol check. Returns false when the check could not even be started
-     * (class or method moved), in which case {@code onResult} is NOT called.
+     * One verdict, applied everywhere it matters: the item's own state, the pool's size, and the
+     * rotation decision when the node that just failed is the one carrying traffic.
      */
+    private static void onVerdict(ProxyItem item, boolean alive) {
+        item.lastCheckAt = SystemClock.elapsedRealtime();
+        if (alive) {
+            item.isAvailable = true;
+            item.nativeFailures = 0;
+            item.failedVerdicts = 0;
+            rememberAlive();
+        } else {
+            item.failedVerdicts++;
+            if (item.failedVerdicts >= MAX_FAILED_VERDICTS) {
+                item.isAvailable = false;
+                item.pingMs = -2;
+            }
+        }
+        Log.d(TAG, "native check " + item.address + ":" + item.port + " -> "
+                + (alive ? item.pingMs + "ms" : "dead (" + item.failedVerdicts + ")"));
+        if (item == currentActiveProxy && !alive) {
+            reportProxyFailure();
+            switchToNextProxy();
+        }
+        prunePool();
+    }
+
+    /**
+     * Drop nodes that have failed enough times to stop being interesting. The user's own applied
+     * proxy is never dropped, and the harvest re-adds anything the lists still advertise.
+     */
+    private static void prunePool() {
+        for (int i = verifiedPool.size() - 1; i >= 0; i--) {
+            ProxyItem p = verifiedPool.get(i);
+            if (p == currentActiveProxy || p.isLocalDpi()) continue;
+            if (p.failedVerdicts >= MAX_FAILED_VERDICTS) {
+                verifiedPool.remove(i);
+                if (proberCursor > 0) proberCursor--;
+            }
+        }
+    }
+
+    /**
+     * Verified-alive nodes are remembered across restarts. Without this every launch starts
+     * blind: the pool is re-seeded from lists, nothing has a verdict yet, and the first thing the
+     * user does - turn the proxy on - lands on an unverified host.
+     */
+    private static final String PROXY_PREFS = "colgram_proxies";
+    private static final String KEY_ALIVE = "alive_nodes";
+
+    private static void rememberAlive() {
+        Context ctx = appContext;
+        if (ctx == null) return;
+        try {
+            StringBuilder sb = new StringBuilder();
+            int saved = 0;
+            for (ProxyItem p : verifiedPool) {
+                if (!p.isAvailable || p.isLocalDpi() || p.type == 2) continue;
+                if (saved++ > 0) sb.append('\n');
+                sb.append(p.type).append('|').append(p.address).append('|').append(p.port)
+                        .append('|').append(p.secret).append('|').append(p.pingMs);
+                if (saved >= MAX_REMEMBERED_ALIVE) break;
+            }
+            ctx.getSharedPreferences(PROXY_PREFS, Context.MODE_PRIVATE).edit()
+                    .putString(KEY_ALIVE, sb.toString()).apply();
+        } catch (Throwable ignored) {}
+    }
+
+    private static void loadRemembered() {
+        Context ctx = appContext;
+        if (ctx == null) return;
+        try {
+            String blob = ctx.getSharedPreferences(PROXY_PREFS, Context.MODE_PRIVATE)
+                    .getString(KEY_ALIVE, "");
+            if (blob == null || blob.isEmpty()) return;
+            long staleBefore = SystemClock.elapsedRealtime() - REMEMBERED_VALID_MS;
+            for (String line : blob.split("\n")) {
+                String[] parts = line.split("\\|", 5);
+                if (parts.length < 4) continue;
+                ProxyItem p;
+                try {
+                    p = new ProxyItem(parts[1], Integer.parseInt(parts[2]), parts[3],
+                            Integer.parseInt(parts[0]));
+                } catch (Throwable e) {
+                    continue;
+                }
+                if (parts.length == 5) {
+                    try {
+                        p.pingMs = Integer.parseInt(parts[4]);
+                    } catch (Throwable ignored) {}
+                }
+                // Still marked alive, but the verdict is treated as old so the prober re-checks
+                // it early rather than trusting a node that may have died overnight.
+                p.isAvailable = true;
+                p.lastCheckAt = staleBefore;
+                addCandidate(p);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** How long a remembered verdict is trusted before the prober re-checks it. */
+    private static final long REMEMBERED_VALID_MS = 60000L;
+
     private static boolean checkOne(final ProxyItem item, final AvailabilityHandler onResult) {
         try {
             Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
@@ -477,18 +596,11 @@ public class ColgramProxyManager {
                             final long time = (args == null || args.length == 0
                                     || !(args[0] instanceof Number)) ? -1L : ((Number) args[0]).longValue();
                             mainHandler.post(() -> {
-                                item.lastCheckAt = SystemClock.elapsedRealtime();
-                                if (time < 0) {
-                                    item.isAvailable = false;
-                                    item.pingMs = -2;
-                                } else {
-                                    item.isAvailable = true;
-                                    item.pingMs = (int) Math.max(1L, time);
-                                    item.nativeFailures = 0;
-                                }
-                                Log.d(TAG, "native check " + item.address + ":" + item.port
-                                        + " -> " + (item.isAvailable ? item.pingMs + "ms" : "dead"));
-                                onResult.onResult(item.isAvailable);
+                                // Only the measurement belongs here; onVerdict owns the state it
+                                // feeds, so a verdict cannot be recorded one way by the probe and
+                                // another way by the caller.
+                                item.pingMs = time < 0 ? -2 : (int) Math.max(1L, time);
+                                onResult.onResult(time >= 0);
                             });
                         }
                         return null;
@@ -748,20 +860,35 @@ public class ColgramProxyManager {
     }
 
     /**
-     * First pool entry worth applying: one the native checker confirmed working, else the local
-     * listener when it is actually up. Returns null when the pool has nothing better to offer
-     * than what is applied now.
+     * Best pool entry to apply right now: a verified-alive node, preferring fake-TLS and then
+     * the lowest measured latency, and only then something never probed. Returns null when the
+     * pool has nothing better to offer than what is applied already.
+     *
+     * It used to return the first alive entry in insertion order, which on a pool this size means
+     * "whichever host happened to be added first", not "the fastest one that works".
      */
     private static ProxyItem selectProxy(ProxyItem skip) {
+        ProxyItem best = null;
         ProxyItem unchecked = null;
         for (int i = 0; i < verifiedPool.size(); i++) {
             ProxyItem p = verifiedPool.get(i);
             if (p.equals(skip)) continue;
             if (p.isLocalDpi() && !localBypassUsable()) continue;
-            if (p.isAvailable) return p;
-            if (unchecked == null && p.pingMs == -1) unchecked = p;
+            if (p.isAvailable) {
+                if (best == null || betterCandidate(p, best)) best = p;
+            } else if (unchecked == null && p.pingMs == -1) {
+                unchecked = p;
+            }
         }
-        return unchecked;
+        return best != null ? best : unchecked;
+    }
+
+    /** Fake-TLS first, then lower latency. Both only ever compare two verified nodes. */
+    private static boolean betterCandidate(ProxyItem a, ProxyItem b) {
+        if (a.fakeTls != b.fakeTls) return a.fakeTls;
+        if (a.pingMs < 0) return false;
+        if (b.pingMs < 0) return true;
+        return a.pingMs < b.pingMs;
     }
 
     /** Next pool entry after {@code currentIndex}, skipping unusable entries. Last resort. */
@@ -777,121 +904,163 @@ public class ColgramProxyManager {
     }
 
     /**
-     * Fetch proxies from all configured sources and verify each one.
+     * Pull every configured source into the candidate list.
+     *
+     * "And verify each one" used to be in this name and did not happen: the method ran a TCP
+     * connect and stored the result as "available", which is how nodes that accept a socket and
+     * have never spoken MTProto ended up reported as working proxies. Verification is the
+     * prober's job now; this only grows the list, and the prober walks it continuously.
      */
     private static void fetchAndVerifyAllSources() {
-        for (String sourceUrl : PROXY_SOURCES) {
+        final int before = verifiedPool.size();
+        for (String url : PROXY_SOURCES_MTPROTO_JSON) {
             try {
-                if (sourceUrl.endsWith(".json")) {
-                    fetchProxiesJson(sourceUrl);
-                } else if (sourceUrl.endsWith(".txt")) {
-                    fetchProxiesTxt(sourceUrl);
-                }
+                fetchProxiesJson(url);
             } catch (Throwable t) {
-                Log.w(TAG, "Source fetch failed: " + sourceUrl, t);
+                Log.w(TAG, "source failed: " + url + " (" + t.getMessage() + ")");
             }
         }
-
-        // Verdict on every candidate comes from the native protocol checker, not from this
-        // method. It used to run a TCP connect here and store the result as "available", which
-        // is how seven hardcoded nodes with unknown fate ended up reported as working proxies.
+        for (String url : PROXY_SOURCES_MTPROTO_LINKS) {
+            try {
+                fetchProxiesLinkList(url, 150);
+            } catch (Throwable t) {
+                Log.w(TAG, "source failed: " + url + " (" + t.getMessage() + ")");
+            }
+        }
+        for (String url : PROXY_SOURCES_SOCKS) {
+            try {
+                fetchSocksList(url, 150);
+            } catch (Throwable t) {
+                Log.w(TAG, "source failed: " + url + " (" + t.getMessage() + ")");
+            }
+        }
+        Log.i(TAG, "harvest: " + before + " -> " + verifiedPool.size() + " candidates");
         mainHandler.post(() -> {
-            checkPoolNow();
+            startProber();
             publishPoolToStock();
         });
     }
 
-    private static void fetchProxiesJson(String sourceUrl) {
-        // Declared outside the try so the finally can reach it. A reference declared inside
-        // the try block is not in scope in the finally, and the resulting compile error is
-        // how this was caught - `if (conn != null)` is only meaningful for a hoisted variable
-        // anyway, since a variable local to the try can never be null at that point.
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(sourceUrl);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-
-            if (conn.getResponseCode() == 200) {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                StringBuilder sb = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) sb.append(line);
-                reader.close();
-
-                JSONArray arr = new JSONArray(sb.toString());
-                int added = 0;
-                for (int i = 0; i < arr.length(); i++) {
-                    JSONObject obj = arr.getJSONObject(i);
-                    String server = obj.optString("server", "");
-                    int port = obj.optInt("port", 0);
-                    String secret = obj.optString("secret", "");
-
-                    if (!server.isEmpty() && port > 0 && secret.startsWith("ee")) {
-                        ProxyItem item = new ProxyItem(server, port, secret, 1);
-                        if (!containsProxy(item)) {
-                            verifiedPool.add(item);
-                            added++;
-                        }
+    /**
+     * Insert one candidate, keeping the pool inside its ceiling.
+     *
+     * Eviction prefers a node that has already failed over one that has never been probed, so a
+     * long list of unverified hosts cannot push out the few that actually work.
+     */
+    private static boolean addCandidate(ProxyItem item) {
+        if (item == null || item.address == null || item.address.isEmpty()) return false;
+        if (item.type != 2 && item.port <= 0) return false;
+        synchronized (verifiedPool) {
+            if (containsProxy(item)) return false;
+            if (verifiedPool.size() >= MAX_POOL_SIZE) {
+                int victim = -1;
+                for (int i = verifiedPool.size() - 1; i >= 0; i--) {
+                    ProxyItem p = verifiedPool.get(i);
+                    if (p == currentActiveProxy || p.isLocalDpi()) continue;
+                    if (p.isAvailable) continue;
+                    if (victim < 0 || p.failedVerdicts > verifiedPool.get(victim).failedVerdicts) {
+                        victim = i;
                     }
-                    if (added >= 10) break; // Limit per source to keep pool lean
                 }
-                Log.d(TAG, "Fetched " + added + " new proxies from " + sourceUrl);
+                if (victim < 0) return false;
+                verifiedPool.remove(victim);
+                if (proberCursor > victim) proberCursor--;
             }
-        } catch (Throwable t) {
-            Log.w(TAG, "Fetch error from " + sourceUrl, t);
-        } finally {
-            // disconnect() must be in a finally: it is the only thing that returns the
-            // socket to the pool. It used to sit on the success path, so every non-200
-            // response (and every parse error) leaked its connection.
-            if (conn != null) conn.disconnect();
+            verifiedPool.add(item);
         }
+        return true;
     }
 
-    private static void fetchProxiesTxt(String sourceUrl) {
-        HttpURLConnection conn = null;
+    /** Plain HTTP GET as a string, with the connection always returned. */
+    private static String httpGet(String sourceUrl) throws Exception {
+        // ColgramHttp rather than a bare connection: on a network that drops the source's IP
+        // there is nothing to fetch directly, and a harvest that silently returns nothing is
+        // indistinguishable from an empty list. This one retries through the SOCKS5 relays
+        // already in the pool and names every attempt it made.
+        ColgramHttp.Response r = ColgramHttp.get(sourceUrl, null);
+        if (r.code < 200 || r.code >= 300) return "";
+        return r.body;
+    }
+
+    /** t.me/proxy?server=..&port=..&secret=.. link lists. */
+    private static void fetchProxiesLinkList(String sourceUrl, int limit) {
+        String body = null;
         try {
-            URL url = new URL(sourceUrl);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-
-            if (conn.getResponseCode() == 200) {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                Pattern pattern = Pattern.compile("server=([^&]+)&port=(\\d+)&secret=([^&\\s]+)");
-                String line;
-                int added = 0;
-                while ((line = reader.readLine()) != null) {
-                    Matcher m = pattern.matcher(line);
-                    if (m.find()) {
-                        String server = m.group(1).replaceAll("\\.$", "");
-                        int port = Integer.parseInt(m.group(2));
-                        String secret = m.group(3);
-
-                        if (secret.startsWith("ee") || secret.startsWith("dd")) {
-                            ProxyItem item = new ProxyItem(server, port, secret, 1);
-                            if (!containsProxy(item)) {
-                                verifiedPool.add(item);
-                                added++;
-                            }
-                        }
-                    }
-                    if (added >= 10) break;
-                }
-                reader.close();
-                Log.d(TAG, "Fetched " + added + " new proxies from " + sourceUrl);
+            body = httpGet(sourceUrl);
+        } catch (Throwable t) {
+            Log.w(TAG, "link list fetch failed: " + sourceUrl, t);
+            return;
+        }
+        Pattern pattern = Pattern.compile("server=([^&\\s]+)&port=(\\d+)&secret=([^&\\s]+)");
+        Matcher m = pattern.matcher(body);
+        int added = 0;
+        while (m.find() && added < limit) {
+            String server = m.group(1).replaceAll("\\.$", "");
+            int port;
+            try {
+                port = Integer.parseInt(m.group(2));
+            } catch (NumberFormatException e) {
+                continue;
             }
+            String secret = m.group(3);
+            String head = secret.length() >= 2 ? secret.substring(0, 2).toLowerCase() : "";
+            // "ee" is fake-TLS, "dd" is plain obfuscation. Anything else is not an MTProxy
+            // secret and would be applied as a broken one.
+            if (!head.equals("ee") && !head.equals("dd")) continue;
+            if (addCandidate(new ProxyItem(server, port, secret, 1))) added++;
+        }
+        Log.i(TAG, "link source " + sourceUrl + " added " + added);
+    }
+
+    /** Public SOCKS5 host:port lists. Telegram's DCs are reachable from the proxy's network, so
+     *  these relay fine even though our own route to them is blackholed. */
+    private static void fetchSocksList(String sourceUrl, int limit) {
+        String body;
+        try {
+            body = httpGet(sourceUrl);
+        } catch (Throwable t) {
+            Log.w(TAG, "socks list fetch failed: " + sourceUrl, t);
+            return;
+        }
+        Pattern pattern = Pattern.compile("(?m)^\\s*([0-9a-zA-Z.\\-]+):(\\d{2,5})\\s*$");
+        Matcher m = pattern.matcher(body);
+        int added = 0;
+        while (m.find() && added < limit) {
+            int port;
+            try {
+                port = Integer.parseInt(m.group(2));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (addCandidate(new ProxyItem(m.group(1), port, "", 0))) added++;
+        }
+        Log.i(TAG, "socks source " + sourceUrl + " added " + added);
+    }
+
+    private static void fetchProxiesJson(String sourceUrl) {
+        String body;
+        try {
+            body = httpGet(sourceUrl);
         } catch (Throwable t) {
             Log.w(TAG, "Fetch error from " + sourceUrl, t);
-        } finally {
-            // disconnect() must be in a finally: it is the only thing that returns the
-            // socket to the pool. It used to sit on the success path, so every non-200
-            // response (and every parse error) leaked its connection.
-            if (conn != null) conn.disconnect();
+            return;
         }
+        int added = 0;
+        try {
+            JSONArray arr = new JSONArray(body);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject obj = arr.getJSONObject(i);
+                String server = obj.optString("server", "");
+                int port = obj.optInt("port", 0);
+                String secret = obj.optString("secret", "");
+                if (server.isEmpty() || port <= 0 || !secret.toLowerCase().startsWith("ee")) continue;
+                if (addCandidate(new ProxyItem(server, port, secret, 1))) added++;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Parse error from " + sourceUrl, t);
+            return;
+        }
+        Log.i(TAG, "json source " + sourceUrl + " added " + added);
     }
 
     private static int testProxy(String host, int port, int timeoutMs) {
@@ -1267,7 +1436,6 @@ public class ColgramProxyManager {
      * Java. It is gated on SharedConfig.proxyRotationEnabled, which defaults to false and
      * nothing here ever set, so until now the real rotator never ran at all.
      */
-    private static final int MAX_PUBLISHED_TO_STOCK = 8;
 
     private static void publishPoolToStock() {
         Context ctx = appContext;
@@ -1366,5 +1534,16 @@ public class ColgramProxyManager {
         if (item.pingMs == -1) return "не проверен";
         if (item.pingMs == -2) return "не отвечает";
         return item.pingMs + " мс";
+    }
+
+    /** Entries that carry a fake-TLS secret, i.e. the handshake looks like ordinary HTTPS. */
+    public static int getFakeTlsCount() {
+        int c = 0;
+        for (ProxyItem p : verifiedPool) if (p.fakeTls) c++;
+        return c;
+    }
+
+    public static int getPoolSize() {
+        return verifiedPool.size();
     }
 }

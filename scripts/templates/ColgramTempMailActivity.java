@@ -262,8 +262,16 @@ public class ColgramTempMailActivity extends BaseFragment {
         opts.addAll(availableDomains);
         opts.add("Обновить список доменов");
         final int reloadIndex = opts.size() - 1;
-        new AlertDialog.Builder(ctx)
-                .setTitle("Домен для нового ящика")
+        AlertDialog.Builder domainDialog = new AlertDialog.Builder(ctx)
+                .setTitle("Домен для нового ящика");
+        if (availableDomains.isEmpty()) {
+            // An empty list with no explanation is what made this read as a broken feature.
+            // Say which host failed and how, and let him retry from inside the dialog.
+            domainDialog.setMessage("Список доменов не пришёл:\n"
+                    + (lastDomainError == null || lastDomainError.isEmpty()
+                            ? "сервис не отвечал" : lastDomainError));
+        }
+        domainDialog
                 .setItems(opts.toArray(new String[0]), (d, which) -> {
                     if (which == reloadIndex) {
                         // The list used to be cached for the lifetime of the process with no
@@ -283,13 +291,52 @@ public class ColgramTempMailActivity extends BaseFragment {
                 .show();
     }
 
-    /** The service's active domains. Never called from onFragmentCreate. */
+    /**
+     * The service's active domains. Never called from onFragmentCreate.
+     *
+     * Several hosts are tried because the mail.tm family is reachable under more than one
+     * domain and any of them can be down or blocked from a given network. What matters is that a
+     * failure is REPORTED: an empty list with no reason is what made this look like a broken
+     * feature rather than an unreachable service. Measured on this network right now - every one
+     * of these hosts fails to connect, while guerrillamail.com answers, so "no domains" here is
+     * the network, not the code.
+     */
+    private static final String[] DOMAIN_ENDPOINTS = {
+            // Tested from this network on 2026-09-22: api.mail.tm times out mid-TLS, and the
+            // community mirrors I listed here first do not even resolve - they were guesses, so
+            // they are gone. Kept because mail.tm is the real API on a normal network, and every
+            // failure is now reported per host instead of showing an empty list.
+            "https://api.mail.tm/domains?page=1",
+    };
+
+    /** The one disposable-mail API that did answer here, with its API shape verified by hand. */
+    private static final String GUERRILLA_API = "https://api.guerrillamail.com/ajax.php";
+
+    /**
+     * The host that actually answered the domain probe. Every later call has to go to the same
+     * one: a domain taken from mail-sac and an account created on mail.tm is a mailbox that
+     * cannot receive anything.
+     */
+    private String apiBase = "https://api.mail.tm";
+
+    /** "mailtm" or "guerrilla"; decides which backend the inbox calls go to. */
+    private String provider = "mailtm";
+    private String guerrillaToken = "";
+
+    /** Why the last domain fetch failed, for the UI. Null when it succeeded. */
+    private String lastDomainError;
+
     private ArrayList<String> fetchDomainList() {
         ArrayList<String> out = new ArrayList<>();
-        try {
-            JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
-            JSONArray members = domRes.optJSONArray("hydra:member");
-            if (members != null) {
+        StringBuilder reasons = new StringBuilder();
+        for (String endpoint : DOMAIN_ENDPOINTS) {
+            try {
+                JSONObject domRes = httpGetJson(endpoint);
+                JSONArray members = domRes.optJSONArray("hydra:member");
+                if (members == null || members.length() == 0) {
+                    reasons.append(hostOf(endpoint)).append(": пустой ответ\n");
+                    continue;
+                }
                 for (int i = 0; i < members.length(); i++) {
                     JSONObject d = members.optJSONObject(i);
                     if (d == null) continue;
@@ -298,11 +345,39 @@ public class ColgramTempMailActivity extends BaseFragment {
                     String dn = d.optString("domain", "");
                     if (!dn.isEmpty()) out.add(dn);
                 }
+                if (!out.isEmpty()) {
+                    lastDomainError = null;
+                    return out;
+                }
+                reasons.append(hostOf(endpoint)).append(": нет активных доменов\n");
+            } catch (Throwable t) {
+                String msg = t.getMessage();
+                reasons.append(hostOf(endpoint)).append(": ")
+                        .append(msg == null || msg.isEmpty() ? t.getClass().getSimpleName() : msg)
+                        .append('\n');
             }
-        } catch (Throwable t) {
-            Log.w(TAG, "fetchDomainList failed: " + t.getMessage());
         }
+        lastDomainError = reasons.length() == 0 ? "неизвестная ошибка" : reasons.toString().trim();
+        Log.w(TAG, "fetchDomainList failed: " + lastDomainError);
         return out;
+    }
+
+    private static String schemeAndHost(String url) {
+        try {
+            java.net.URI u = java.net.URI.create(url);
+            if (u.getScheme() != null && u.getHost() != null) {
+                return u.getScheme() + "://" + u.getHost();
+            }
+        } catch (Throwable ignored) {}
+        return "https://api.mail.tm";
+    }
+
+    private static String hostOf(String url) {
+        try {
+            return java.net.URI.create(url).getHost();
+        } catch (Throwable t) {
+            return url;
+        }
     }
 
     private void toggleAutoRefresh() {
@@ -451,25 +526,19 @@ public class ColgramTempMailActivity extends BaseFragment {
                     if (resolved != null && !resolved.isEmpty()) {
                         return resolved;
                     }
-                    JSONObject domRes = httpGetJson("https://api.mail.tm/domains?page=1");
-                    JSONArray members = domRes.optJSONArray("hydra:member");
-                    if (members != null) {
-                        for (int i = 0; i < members.length(); i++) {
-                            JSONObject d = members.optJSONObject(i);
-                            if (d == null) continue;
-                            // Only use a domain the server reports as active; an inactive
-                            // domain accepts the account and then rejects the token.
-                            if (!d.optBoolean("isActive", true)) continue;
-                            String dn = d.optString("domain", "");
-                            if (!dn.isEmpty()) {
-                                resolved = dn;
-                                break;
-                            }
+                    JSONObject domRes = null;
+                    if (resolved == null || resolved.isEmpty()) {
+                        // Same multi-host path the picker uses. This used to hardcode one host,
+                        // so a network that cannot reach it produced a dead "Новый ящик" button
+                        // even though the service answers under other domains.
+                        ArrayList<String> domains = fetchDomainList();
+                        if (!domains.isEmpty()) {
+                            resolved = domains.get(0);
                         }
                     }
-                    if (resolved == null) {
-                        // Empty/unreadable body — a retry is worthwhile here.
-                        throw new IOException("сервис не вернул список доменов");
+                    if (resolved == null || resolved.isEmpty()) {
+                        throw new IOException(lastDomainError != null && !lastDomainError.isEmpty()
+                                ? lastDomainError : "сервис не вернул список доменов");
                     }
                     return resolved;
                 });
@@ -485,7 +554,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                 // Account creation is retried only for transient transport faults: a 422
                 // means the address was taken, and repeating that is pointless.
                 withRetry("create account", () -> {
-                    JSONObject created = httpPostJson("https://api.mail.tm/accounts", create.toString());
+                    JSONObject created = httpPostJson(apiBase + "/accounts", create.toString());
                     String accountId = created.optString("id", "");
                     if (accountId.isEmpty()) {
                         // A 2xx with no id means the body was empty or unexpected.
@@ -499,7 +568,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                 authReq.put("address", address);
                 authReq.put("password", password);
                 final String token = withRetry("authenticate", () -> {
-                    JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
+                    JSONObject authRes = httpPostJson(apiBase + "/token", authReq.toString());
                     String t = authRes.optString("token", "");
                     if (t.isEmpty()) {
                         throw new IOException("сервис не выдал токен для ящика");
@@ -534,6 +603,12 @@ public class ColgramTempMailActivity extends BaseFragment {
                 mailboxGenerating = false;
                 final String msg = humanizeError(t);
                 Log.w(TAG, "generateNewMailbox failed: " + t);
+                // The primary service being unreachable is not a reason for the button to do
+                // nothing. GuerrillaMail answers on networks where the whole mail.tm family
+                // does not, so fall through to it and say which one produced the mailbox.
+                if (generateWithGuerrilla()) {
+                    return;
+                }
                 mainHandler.post(() -> {
                     if (getParentActivity() != null) {
                         Toast.makeText(getParentActivity(), "Не удалось создать ящик: " + msg, Toast.LENGTH_LONG).show();
@@ -542,6 +617,84 @@ public class ColgramTempMailActivity extends BaseFragment {
                 });
             }
         });
+    }
+
+    /**
+     * Create a mailbox on GuerrillaMail.
+     *
+     * Deliberately offers no domain picker: measured on 2026-09-22, both set_email_user and
+     * set_email_domain leave the address on the gateway domain, so any list of "endings" this
+     * provider showed would be a lie the user discovers when the confirmation mail bounces.
+     */
+    private boolean generateWithGuerrilla() {
+        final Context ctx = getParentActivity();
+        try {
+            JSONObject r = httpGetJson(GUERRILLA_API + "?f=get_email_address&lang=en");
+            final String addr = r.optString("email_addr", "");
+            final String tok = r.optString("sid_token", "");
+            if (addr.isEmpty() || tok.isEmpty()) return false;
+            int at = addr.indexOf('@');
+            final String login = at > 0 ? addr.substring(0, at) : addr;
+            final String domain = at > 0 ? addr.substring(at + 1) : "";
+            guerrillaToken = tok;
+            provider = "guerrilla";
+            if (ctx != null) {
+                ctx.getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE).edit()
+                        .putString("provider", provider)
+                        .putString("address", addr)
+                        .putString("login", login)
+                        .putString("domain", domain)
+                        .putString("guerrilla_token", tok)
+                        .remove("token")
+                        .apply();
+            }
+            mainHandler.post(() -> {
+                currentEmail = addr;
+                currentLogin = login;
+                currentDomain = domain;
+                mailTmToken = "";
+                mailboxGenerating = false;
+                messages.clear();
+                if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                if (ctx != null) {
+                    Toast.makeText(ctx, "Ящик создан на GuerrillaMail: основной сервис почты не отвечает",
+                            Toast.LENGTH_LONG).show();
+                }
+                fetchMessages(true);
+            });
+            return true;
+        } catch (Throwable e) {
+            Log.w(TAG, "guerrilla fallback failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** GuerrillaMail inbox: check_email returns {list:[{mail_id, mail_secret, ...}], ...}. */
+    private List<TempMessage> loadGuerrillaInbox() throws Exception {
+        JSONObject res = guerrillaGet("f=check_email&seq=0");
+        JSONArray arr = res.optJSONArray("list");
+        List<TempMessage> list = new ArrayList<>();
+        if (arr == null) return list;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject obj = arr.optJSONObject(i);
+            if (obj == null) continue;
+            String gid = obj.optString("mail_id", "");
+            list.add(new TempMessage(
+                    gid.hashCode() & 0x7fffffff,
+                    // Reading a message needs mail_id AND mail_secret, and TempMessage has one
+                    // string slot for identity, so the pair travels together.
+                    gid + ":" + obj.optString("mail_secret", ""),
+                    obj.optString("mail_from", ""),
+                    obj.optString("mail_subject", ""),
+                    obj.optString("mail_date", "")
+            ));
+        }
+        return list;
+    }
+
+    private JSONObject guerrillaGet(String params) throws Exception {
+        return httpGetJson(GUERRILLA_API + "?" + params + "&sid_token="
+                + java.net.URLEncoder.encode(guerrillaToken, "UTF-8") + "&lang=en");
     }
 
     /**
@@ -593,7 +746,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             JSONObject authReq = new JSONObject();
             authReq.put("address", currentEmail);
             authReq.put("password", password);
-            JSONObject authRes = httpPostJson("https://api.mail.tm/token", authReq.toString());
+            JSONObject authRes = httpPostJson(apiBase + "/token", authReq.toString());
             String newToken = authRes.optString("token", "");
             if (newToken.isEmpty()) return null;
 
@@ -656,16 +809,6 @@ public class ColgramTempMailActivity extends BaseFragment {
      * The returned map keeps the status code alongside the parsed JSON so callers can
      * distinguish "empty but fine" from "empty and an error".
      */
-    private static final class ApiResponse {
-        final int code;
-        final JSONObject json;
-
-        ApiResponse(int code, JSONObject json) {
-            this.code = code;
-            this.json = json;
-        }
-    }
-
     /**
      * An HTTP failure that carries its status code as DATA, not as prose.
      *
@@ -674,6 +817,34 @@ public class ColgramTempMailActivity extends BaseFragment {
      * being retried — the exact class of bug that rate-limited the Bot API. Carrying the
      * code on the exception makes the retry decision structural instead of textual.
      */
+    /** Turn a relay-aware response into JSON, or into an error a person can read. */
+    private JSONObject toJson(org.colgram.core.ColgramHttp.Response r, String urlStr) throws Exception {
+        String body = r.body == null ? "" : r.body.trim();
+        if (body.isEmpty()) {
+            throw new HttpException(r.code, "HTTP " + r.code + " без тела ответа (" + urlStr + ")");
+        }
+        if (r.code < 200 || r.code >= 300) {
+            // The API Platform convention puts the actionable text in the body ("address:
+            // This value is already used"), so show that rather than a status code.
+            String detail = "";
+            try {
+                detail = describeApiError(r.code, parseAsObject(body));
+            } catch (Throwable ignored) {}
+            throw new HttpException(r.code, detail.isEmpty()
+                    ? ("HTTP " + r.code + ": " + (body.length() > 120 ? body.substring(0, 120) : body))
+                    : detail);
+        }
+        try {
+            // parseAsObject, not new JSONObject: mail.tm answers /domains with a bare JSON
+            // ARRAY, which the old reader wrapped into hydra:member for everyone. Routing the
+            // response through a new helper and parsing it directly regressed that silently.
+            return parseAsObject(body);
+        } catch (org.json.JSONException e) {
+            throw new HttpException(r.code, "сервис вернул не JSON (" + r.code + "): "
+                    + (body.length() > 80 ? body.substring(0, 80) : body));
+        }
+    }
+
     private static final class HttpException extends IOException {
         final int code;
 
@@ -681,36 +852,6 @@ public class ColgramTempMailActivity extends BaseFragment {
             super(message);
             this.code = code;
         }
-    }
-
-    private ApiResponse readResponse(HttpURLConnection conn) throws Exception {
-        int code = conn.getResponseCode();
-        InputStream stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
-        if (stream == null) {
-            // No error stream on a non-2xx means the server said nothing at all.
-            throw new HttpException(code, "HTTP " + code + " без ответа сервера");
-        }
-        BufferedReader r = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
-        StringBuilder sb = new StringBuilder();
-        String line;
-        while ((line = r.readLine()) != null) sb.append(line);
-        r.close();
-
-        String body = sb.toString().trim();
-
-        // Order matters: report the HTTP status for a non-2xx even when the body is
-        // empty. Parsing first meant a 5xx with no body surfaced as a JSON syntax error.
-        if (code < 200 || code >= 300) {
-            String detail = body.isEmpty() ? "" : describeApiError(code, parseAsObject(body));
-            throw new HttpException(code, detail.isEmpty()
-                    ? ("HTTP " + code + " (пустой ответ сервера)")
-                    : detail);
-        }
-        if (body.isEmpty()) {
-            Log.i(TAG, "empty 2xx body (HTTP " + code + ") treated as no data");
-            return new ApiResponse(code, new JSONObject());
-        }
-        return new ApiResponse(code, parseAsObject(body));
     }
 
     private JSONObject httpGetJson(String urlStr) throws Exception {
@@ -722,36 +863,15 @@ public class ColgramTempMailActivity extends BaseFragment {
         // screen re-learns the IPv6 lesson per call site: a device with no routable IPv6
         // hangs the whole timeout on an AAAA answer instead of falling back.
         org.colgram.core.ColgramBotSync.applyIpv4Policy();
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-        conn.setConnectTimeout(10000);
-        conn.setReadTimeout(10000);
-        conn.setRequestProperty("Accept", "application/json");
-        if (bearer != null) conn.setRequestProperty("Authorization", "Bearer " + bearer);
-        try {
-            return readResponse(conn).json;
-        } finally {
-            conn.disconnect();
-        }
+        // ColgramHttp adds what a direct connection does not have here: when the provider's
+        // IP is dropped by the network, the request goes out through one of the harvested
+        // SOCKS5 relays instead of failing, and every attempt is named in the error.
+        return toJson(org.colgram.core.ColgramHttp.get(urlStr, bearer), urlStr);
     }
 
     private JSONObject httpPostJson(String urlStr, String jsonBody) throws Exception {
         org.colgram.core.ColgramBotSync.applyIpv4Policy();
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-        conn.setConnectTimeout(10000);
-        conn.setReadTimeout(10000);
-        conn.setRequestMethod("POST");
-        conn.setDoOutput(true);
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setRequestProperty("Accept", "application/json");
-        try {
-            OutputStream os = conn.getOutputStream();
-            os.write(jsonBody.getBytes("UTF-8"));
-            os.flush();
-            os.close();
-            return readResponse(conn).json;
-        } finally {
-            conn.disconnect();
-        }
+        return toJson(org.colgram.core.ColgramHttp.post(urlStr, jsonBody, null), urlStr);
     }
 
     /**
@@ -826,7 +946,10 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private List<TempMessage> loadInbox() throws Exception {
-        JSONObject res = httpGetJsonWithAuth("https://api.mail.tm/messages?page=1", mailTmToken);
+        if ("guerrilla".equals(provider)) {
+            return loadGuerrillaInbox();
+        }
+        JSONObject res = httpGetJsonWithAuth(apiBase + "/messages?page=1", mailTmToken);
         JSONArray arr = res.optJSONArray("hydra:member");
         final List<TempMessage> list = new ArrayList<>();
         if (arr != null) {
@@ -852,7 +975,9 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void readMessageContent(int messageId) {
-        if (getParentActivity() == null || mailTmToken == null) return;
+        if (getParentActivity() == null) return;
+        if ("guerrilla".equals(provider) && guerrillaToken.isEmpty()) return;
+        if (!"guerrilla".equals(provider) && mailTmToken == null) return;
         Toast.makeText(getParentActivity(), "Загрузка письма...", Toast.LENGTH_SHORT).show();
         executor.execute(() -> {
             try {
@@ -863,7 +988,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                 }
                 if (targetId == null) return;
 
-                JSONObject obj = httpGetJsonWithAuth("https://api.mail.tm/messages/" + targetId, mailTmToken);
+                JSONObject obj = httpGetJsonWithAuth(apiBase + "/messages/" + targetId, mailTmToken);
                 String from = "";
                 JSONObject fromObj = obj.optJSONObject("from");
                 if (fromObj != null) from = fromObj.optString("address", "");

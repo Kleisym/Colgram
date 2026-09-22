@@ -11,11 +11,21 @@
 # Usage:
 #   ./scripts/build-local.sh check       # 3s syntax gate on everything edited
 #   ./scripts/build-local.sh check-core  # 3s syntax gate on colgram-core
-#   ./scripts/build-local.sh compile     # Gradle: compile Java only (slow, full symbols)
+#   ./scripts/build-local.sh dev         # patcher + Gradle Java compile only  <- inner loop
+#   ./scripts/build-local.sh compile     # Gradle Java compile only
 #   ./scripts/build-local.sh apk         # full: assemble the release APK
+#   ./scripts/build-local.sh apkfast     # apk with more workers (only when RAM is free)
 #   ./scripts/build-local.sh clean       # clean build outputs
 #
-# Prefer `check` while editing; `compile`/`apk` are for shipping.
+# Timing measured on this machine (6 cores, 16 GB, 2026-09-22):
+#   check            ~3 s      no Gradle, no daemon
+#   dev / compile    13-35 s   one Java compile task, everything else up to date
+#   apk              2-7 min   dexing 9 dex files + packaging + aligning a 181 MB APK
+#
+# `apk` is slow for a reason that a Gradle flag cannot fix: the box runs at 92% memory
+# load with a game and the emulator open, so a 4 GB heap pages to disk. org.gradle.workers.max
+# is 2 and parallel is false in gradle.properties precisely because of that. `apkfast` raises
+# them for the case where nothing else is running; use it only then, or it gets slower.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -75,21 +85,36 @@ run_gradle() {
     "$JAVA_EXE" -cp "$WRAPPER_JAR" org.gradle.wrapper.GradleWrapperMain "$@"
 }
 
+apply_patches() {
+    echo "[*] Re-applying patches (mirrors colgram-core and copies the UI templates)"
+    (cd "$REPO_ROOT" && python scripts/apply-patches.py Telegram-Src | tail -3)
+}
+
 case "${1:-check}" in
+    dev)
+        apply_patches
+        echo "[*] Compiling Java only — this is the fast loop, use it before any apk build"
+        run_gradle :TMessagesProj:compileReleaseJavaWithJavac
+        ;;
     compile)
-        echo "[*] Compiling Java sources (flavour: standalone) — slower, full symbol check"
-        run_gradle :TMessagesProj:compileStandaloneJavaWithJavac
+        run_gradle :TMessagesProj:compileReleaseJavaWithJavac
         ;;
     apk)
+        apply_patches
         echo "[*] Assembling release APK (this takes a long time on a cold build)"
-        run_gradle :TMessagesProj_AppStandalone:assembleAfatRelease
+        COLGRAM_BUILD_STAMP="${COLGRAM_BUILD_STAMP:-local$(date +%H%M)}"             run_gradle :TMessagesProj_AppStandalone:assembleAfatRelease
+        ;;
+    apkfast)
+        apply_patches
+        echo "[*] Assembling with 4 workers and parallel tasks — only when RAM is free"
+        COLGRAM_BUILD_STAMP="${COLGRAM_BUILD_STAMP:-local$(date +%H%M)}"             run_gradle --max-workers=4 -Dorg.gradle.parallel=true             :TMessagesProj_AppStandalone:assembleAfatRelease
         ;;
     clean)
         run_gradle clean
         ;;
     *)
         echo "Unknown target: $1"
-        echo "Usage: $0 [check|check-core|check-full|compile|apk|clean]"
+        echo "Usage: $0 [check|check-core|check-full|dev|compile|apk|apkfast|clean]"
         exit 1
         ;;
 esac
