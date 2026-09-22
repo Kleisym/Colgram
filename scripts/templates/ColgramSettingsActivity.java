@@ -11,6 +11,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramBotSync;
 import org.colgram.core.ColgramConfig;
+import org.colgram.core.ColgramProxyDoctor;
 import org.colgram.core.ColgramProxyManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
@@ -63,6 +64,8 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int builtinProxyRow;
     private int proxyBrowserRow;
     private int currentProxyRow;
+    private int ownProxyRow;
+    private int proxyStatusRow;
     private int networkSectionRow;
 
     private int sandboxHeaderRow;
@@ -114,6 +117,8 @@ public class ColgramSettingsActivity extends BaseFragment {
         builtinProxyRow = rowCount++;
         proxyBrowserRow = rowCount++;
         currentProxyRow = rowCount++;
+        ownProxyRow = rowCount++;
+        proxyStatusRow = rowCount++;
         networkSectionRow = rowCount++;
 
         sandboxHeaderRow = rowCount++;
@@ -250,6 +255,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(ColgramConfig.isDpiBypassEnabled());
                 }
+                // The listener binds on a background thread and the rows below describe it, so
+                // refresh the whole list rather than leaving a stale "выключено" next to a
+                // toggle that was just switched on.
+                listAdapter.notifyDataSetChanged();
             } else if (position == dohRow) {
                 boolean val = !ColgramConfig.isDohEnabled();
                 ColgramConfig.setDohEnabled(val);
@@ -269,8 +278,28 @@ public class ColgramSettingsActivity extends BaseFragment {
                     ((TextCheckCell) view).setChecked(val);
                 }
             } else if (position == currentProxyRow) {
-                ColgramProxyManager.switchToNextProxy();
-                listAdapter.notifyItemChanged(currentProxyRow);
+                // force: the user asked for a different node, so the two-failure rule that
+                // protects against flapping proxies must not hold them on the current one.
+                ColgramProxyManager.switchToNextProxy(true);
+                listAdapter.notifyDataSetChanged();
+            } else if (position == ownProxyRow) {
+                // Telegram's own proxy screen, reached from Colgram. It is where a proxy gets
+                // entered properly - by t.me/proxy, t.me/webproxy or t.me/socks link, or by
+                // hand - including a WebSocket (wss) proxy, the one kind that gets through an
+                // IP-level block with no VPN and no server of your own. Colgram only ever
+                // offered its own list here, so that mechanism was unreachable from this app.
+                presentFragment(new ProxyListActivity());
+            } else if (position == proxyStatusRow) {
+                ColgramProxyManager.checkPoolNow(true);
+                Toast.makeText(getParentActivity(),
+                        "Проверяю прокси через нативный чекер Telegram…", Toast.LENGTH_SHORT).show();
+                // A sweep is up to 8 handshakes, and an unreachable host only reports after the
+                // checker's own timeout, so refreshing at 4 s used to show the old numbers.
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (listAdapter != null) {
+                        listAdapter.notifyDataSetChanged();
+                    }
+                }, 15000L);
             } else if (position == sandboxStorageRow) {
                 boolean val = !ColgramConfig.isSandboxStorageEnabled();
                 ColgramConfig.setSandboxStorageEnabled(val);
@@ -330,6 +359,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
                    position == cyberThemeRow || position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
+                   position == ownProxyRow || position == proxyStatusRow ||
                    position == sandboxStorageRow || position == botRealtimeRow;
         }
 
@@ -339,7 +369,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                 position == themeHeaderRow || position == networkHeaderRow || position == sandboxHeaderRow ||
                 position == botsHeaderRow) {
                 return 0; // HeaderCell
-            } else if (position == cloakModelRow || position == currentProxyRow) {
+            } else if (position == cloakModelRow || position == currentProxyRow
+                    || position == ownProxyRow || position == proxyStatusRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
                        position == themeSectionRow || position == networkSectionRow || position == sandboxSectionRow ||
@@ -445,9 +476,19 @@ public class ColgramSettingsActivity extends BaseFragment {
                     if (position == cloakModelRow) {
                         settingsCell.setTextAndValue("Модель устройства", ColgramConfig.getSpoofDeviceModel(), false);
                     } else if (position == currentProxyRow) {
-                        org.colgram.core.ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
-                        String proxyStr = active != null ? active.address : "Автовыбор (Нажмите для смены)";
-                        settingsCell.setTextAndValue("Сменить прокси / обходник", proxyStr, false);
+                        ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
+                        boolean proxyOn = ColgramProxyManager.isProxyEnabled(getContext());
+                        String proxyStr = !proxyOn
+                                ? "выключено — прямое соединение"
+                                : (active != null ? active.toString() : "включено, узел не определён");
+                        settingsCell.setTextAndValue("Сменить узел обходчика", proxyStr, false);
+                    } else if (position == ownProxyRow) {
+                        settingsCell.setTextAndValue("Свой прокси: MTProto / WebSocket / SOCKS5",
+                                ColgramProxyManager.isProxyEnabled(getContext())
+                                        ? "открыть экран Telegram" : "добавить и включить", false);
+                    } else if (position == proxyStatusRow) {
+                        settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
+                                ColgramProxyDoctor.getStatusSummary(), false);
                     }
                     break;
                 }

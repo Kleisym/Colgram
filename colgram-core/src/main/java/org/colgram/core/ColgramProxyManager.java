@@ -60,8 +60,18 @@ public class ColgramProxyManager {
         public final int port;
         public final String secret;
         public final int type; // 0 = SOCKS5, 1 = MTProto, 2 = WEB (wss:// bridge, no port)
+        /** -1 never checked, -2 checked and not working, otherwise RTT in ms. */
         public int pingMs = -1;
+        /**
+         * Only ever set by a real protocol check (Telegram's native checkProxy). It used to be
+         * assigned {@code true} to the whole hardcoded list without any check at all, which made
+         * "Pool: 8 alive" a fiction and let the rotator prefer nodes that had never answered.
+         */
         public boolean isAvailable = false;
+        /** SystemClock.elapsedRealtime() of the last protocol check; 0 = never checked. */
+        public long lastCheckAt = 0L;
+        /** Times Telegram's native layer failed a connection while this entry was applied. */
+        int nativeFailures = 0;
 
         public ProxyItem(String address, int port, String secret, int type) {
             this.address = address;
@@ -89,6 +99,7 @@ public class ColgramProxyManager {
         @Override
         public String toString() {
             if (isLocalDpi()) return "Локальный обходчик ТСПУ (127.0.0.1:9876)";
+            if (type == 2) return address + " (WebSocket)";
             return address + ":" + port + (type == 1 ? " (MTProto)" : " (SOCKS5)");
         }
     }
@@ -224,7 +235,8 @@ public class ColgramProxyManager {
             }
         }
 
-        // 4. Background — fetch fresh proxies, test all, update pool
+        // 4. Background — fetch fresh proxies. The fetch ends by asking the native checker for a
+        // verdict on every candidate and publishing the pool to Telegram's own proxy list.
         executor.execute(() -> {
             try {
                 fetchAndVerifyAllSources();
@@ -265,16 +277,44 @@ public class ColgramProxyManager {
                 }
 
                 if (active != null) {
-                    int ping = testProxy(active.address, active.port, 3000);
-                    if (ping < 0) {
-                        Log.w(TAG, "Current proxy unreachable, rotating: " + active.address);
-                        switchToNextProxy();
+                    // A TCP connect proves nothing about a proxy - it succeeds against any host
+                    // with the port open, including one that has never heard of MTProto, and it
+                    // always fails for a WEB proxy, which has no port at all (so a working
+                    // wss:// tunnel was rotated away every 30 seconds). Ask the native checker
+                    // instead and rotate only on an actual protocol verdict.
+                    if (active.type == 2) return;
+                    // Do not stack a second check on top of the sweep's own: the extra
+                    // handshake through the same proxy is what makes it answer "dead".
+                    if (sweepRunning.get()) return;
+                    // Same 2-minute freshness window as the sweep.
+                    if (active.lastCheckAt > 0
+                            && SystemClock.elapsedRealtime() - active.lastCheckAt < RECHECK_INTERVAL_MS) {
+                        return;
                     }
+                    final ProxyItem checked = active;
+                    mainHandler.post(() -> {
+                        boolean started;
+                        try {
+                            started = checkOne(checked, alive -> {
+                                if (alive) return;
+                                Log.w(TAG, "Current proxy failed the protocol check: "
+                                        + checked.address);
+                                reportProxyFailure();
+                                switchToNextProxy();
+                            });
+                        } catch (Throwable t) {
+                            started = false;
+                        }
+                        if (!started) {
+                            Log.w(TAG, "no native checker for " + checked.address
+                                    + "; leaving the applied proxy alone");
+                        }
+                    });
                 }
             } catch (Throwable ignored) {}
         }, 30, 30, TimeUnit.SECONDS);
 
-        // 6. Full re-fetch every 30 minutes
+        // 6. Full re-fetch and re-check every 30 minutes
         scheduler.scheduleWithFixedDelay(() -> {
             try {
                 fetchAndVerifyAllSources();
@@ -297,8 +337,6 @@ public class ColgramProxyManager {
         // So the free, always-available, most-private path is the DEFAULT, and public
         // proxies are the fallback rather than the other way round.
         ProxyItem localDpi = new ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0);
-        localDpi.isAvailable = true;
-        localDpi.pingMs = 0;
         if (!containsProxy(localDpi)) {
             verifiedPool.add(localDpi);
         }
@@ -316,12 +354,182 @@ public class ColgramProxyManager {
             new ProxyItem("yostavpn.casacam.net", 443, "ee3db34d5ab674545e688abbefee52237f796f73746176706e2e6361736163616d2e6e6574", 1)
         };
 
+        // These used to be inserted pre-marked {@code isAvailable = true; pingMs = 1}, with no
+        // check of any kind. Everything downstream reads that flag - "Pool: N alive", the
+        // rotation preference, the stock list's green/grey state - so the pool claimed seven
+        // working proxies on a cold start and the rotator saw no reason to look further.
+        // Availability now comes from Telegram's own native proxy checker (checkPoolNow).
         for (ProxyItem p : hardcoded) {
-            p.isAvailable = true;
-            p.pingMs = 1;
             if (!containsProxy(p)) {
                 verifiedPool.add(p);
             }
+        }
+    }
+
+    /**
+     * Ask Telegram's own native checker which of our candidates actually work.
+     *
+     * {@code ConnectionsManager.checkProxy(ProxySettings, RequestTimeDelegate)} performs a real
+     * MTProto handshake through the proxy (and, for a WEB proxy, runs it through
+     * WebProxyTransport first), so it distinguishes an MTProxy from an unrelated daemon that
+     * merely has the port open. A plain TCP connect cannot - and Colgram's pool is made of
+     * exactly the kind of host where that matters. Upstream uses this same call in
+     * ProxyRotationController and ProxyListActivity; reusing it means Colgram's numbers are the
+     * ones the stock UI shows too.
+     *
+     * Checks run one at a time on the main thread because that is how upstream calls them and
+     * because the native side serialises them anyway.
+     */
+    private static final long NATIVE_CHECK_TIMEOUT_MS = 12000L;
+    /**
+     * A node checked within this window is not probed again. Upstream uses the same 2-minute
+     * window in ProxyRotationController, and it matters here for a reason that only measurement
+     * showed: these are free public MTProxies, and repeated handshakes from one client get them
+     * rate-limited or dropped. Observed on this network - three nodes answering in 95-173 ms
+     * became unreachable at TCP level within 25 minutes, while the app was probing them.
+     */
+    private static final long RECHECK_INTERVAL_MS = 120000L;
+    private static final AtomicBoolean sweepRunning = new AtomicBoolean(false);
+
+    /** Max candidates probed per sweep - the pool grows from fetched lists without bound. */
+    private static final int MAX_CHECKED_PER_SWEEP = 8;
+
+    public static void checkPoolNow() {
+        checkPoolNow(false);
+    }
+
+    /** @param force re-probe even the nodes checked moments ago; used by the settings tap. */
+    public static void checkPoolNow(boolean force) {
+        if (appContext == null || !sweepRunning.compareAndSet(false, true)) return;
+        if (verifiedPool.isEmpty()) {
+            // Tapping "check" seconds after launch used to do nothing at all: the pool is only
+            // seeded after the startup deferral, so the sweep found no targets and the screen
+            // kept saying "не проверен" with no way to make it try again.
+            initVerifiedPool();
+        }
+        final long now = SystemClock.elapsedRealtime();
+        final List<ProxyItem> targets = new ArrayList<>();
+        for (ProxyItem p : verifiedPool) {
+            // A WEB entry would need a WebView bridge per check and the pool never contains
+            // one; the user's own WEB proxy is checked where it is actually used.
+            if (p.type == 2) continue;
+            if (!force && p.lastCheckAt > 0 && now - p.lastCheckAt < RECHECK_INTERVAL_MS) continue;
+            targets.add(p);
+            if (targets.size() >= MAX_CHECKED_PER_SWEEP) break;
+        }
+        if (targets.isEmpty()) {
+            sweepRunning.set(false);
+            return;
+        }
+        mainHandler.post(() -> checkNext(targets, 0, () -> sweepRunning.set(false)));
+    }
+
+    private static void checkNext(final List<ProxyItem> targets, final int index, final Runnable onDone) {
+        if (index >= targets.size()) {
+            onDone.run();
+            return;
+        }
+        final ProxyItem item = targets.get(index);
+        final AtomicBoolean advanced = new AtomicBoolean(false);
+        final long startedAt = SystemClock.elapsedRealtime();
+        final Runnable advance = () -> {
+            if (advanced.compareAndSet(false, true)) {
+                // Reached only from the timeout: the native callback never fired, which means
+                // the host accepted TCP and then said nothing. That is a dead proxy, not an
+                // unknown one, and it must stop being preferred.
+                if (item.lastCheckAt < startedAt) {
+                    item.lastCheckAt = startedAt;
+                    item.isAvailable = false;
+                    item.pingMs = -2;
+                }
+                checkNext(targets, index + 1, onDone);
+            }
+        };
+        boolean started;
+        try {
+            started = checkOne(item, alive -> advance.run());
+        } catch (Throwable t) {
+            started = false;
+        }
+        if (!started) {
+            advance.run();
+            return;
+        }
+        mainHandler.postDelayed(advance, NATIVE_CHECK_TIMEOUT_MS);
+    }
+
+    /**
+     * Single native protocol check. Returns false when the check could not even be started
+     * (class or method moved), in which case {@code onResult} is NOT called.
+     */
+    private static boolean checkOne(final ProxyItem item, final AvailabilityHandler onResult) {
+        try {
+            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Class<?> rtdClass = Class.forName("org.telegram.tgnet.RequestTimeDelegate");
+            final Object settings = buildProxySettings(item);
+            if (settings == null) return false;
+
+            final Object delegate = java.lang.reflect.Proxy.newProxyInstance(
+                    rtdClass.getClassLoader(),
+                    new Class<?>[]{rtdClass},
+                    (proxy, method, args) -> {
+                        if ("run".equals(method.getName())) {
+                            final long time = (args == null || args.length == 0
+                                    || !(args[0] instanceof Number)) ? -1L : ((Number) args[0]).longValue();
+                            mainHandler.post(() -> {
+                                item.lastCheckAt = SystemClock.elapsedRealtime();
+                                if (time < 0) {
+                                    item.isAvailable = false;
+                                    item.pingMs = -2;
+                                } else {
+                                    item.isAvailable = true;
+                                    item.pingMs = (int) Math.max(1L, time);
+                                    item.nativeFailures = 0;
+                                }
+                                Log.d(TAG, "native check " + item.address + ":" + item.port
+                                        + " -> " + (item.isAvailable ? item.pingMs + "ms" : "dead"));
+                                onResult.onResult(item.isAvailable);
+                            });
+                        }
+                        return null;
+                    });
+
+            Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, 0);
+            cmClass.getMethod("checkProxy", settings.getClass(), rtdClass).invoke(cm, settings, delegate);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "native proxy check unavailable: " + t.getMessage());
+            return false;
+        }
+    }
+
+    private interface AvailabilityHandler {
+        void onResult(boolean alive);
+    }
+
+    /**
+     * Build upstream's own ProxySettings value object for one of our items, through its public
+     * builder, so the native layer, the stock screen and Colgram all describe a proxy the same
+     * way. Returns null if the classes moved.
+     */
+    private static Object buildProxySettings(ProxyItem item) {
+        try {
+            Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
+            Class<?> pstClass = Class.forName("org.telegram.proxy.ProxySettings$Type");
+            String typeName = item.type == 2 ? "WEB" : (item.type == 1 ? "MTPROTO" : "SOCKS5");
+            Object typeObj = Enum.valueOf((Class<Enum>) pstClass, typeName);
+
+            Object builder = psClass.getDeclaredMethod("builder").invoke(null);
+            Class<?> bClass = builder.getClass();
+            bClass.getDeclaredMethod("setType", pstClass).invoke(builder, typeObj);
+            bClass.getDeclaredMethod("setAddress", String.class).invoke(builder, item.address);
+            bClass.getDeclaredMethod("setPort", int.class).invoke(builder, item.port);
+            bClass.getDeclaredMethod("setSecret", String.class)
+                    .invoke(builder, item.secret == null ? "" : item.secret);
+            return bClass.getDeclaredMethod("build").invoke(builder);
+        } catch (Throwable t) {
+            Log.w(TAG, "buildProxySettings failed for " + item.address, t);
+            return null;
         }
     }
 
@@ -371,7 +579,38 @@ public class ColgramProxyManager {
      *     it looked like Colgram simply never cycled them.
      *   * the periodic health check, as a backstop.
      */
-    public static synchronized void switchToNextProxy() {
+    /**
+     * Called from ConnectionsManager.onProxyError(): Telegram's native layer failed a connection
+     * while going through the currently applied proxy.
+     *
+     * This is the one failure signal that travelled the whole proxy path, so it now decides
+     * whether an entry counts as a candidate. Before it existed, availability came only from the
+     * startup sweep: a node that worked once and died an hour later stayed "alive" in Colgram's
+     * bookkeeping and the rotator kept offering it.
+     *
+     * Two failures, not one: a single drop is what a mobile network looks like, and demoting on
+     * the first one makes the pool shrink itself into nothing.
+     */
+    public static void reportProxyFailure() {
+        ProxyItem active = currentActiveProxy;
+        if (active == null || active.isLocalDpi()) return;
+        active.nativeFailures++;
+        if (active.nativeFailures < 2) return;
+        active.isAvailable = false;
+        active.pingMs = -2;
+        Log.w(TAG, "native proxy failures recorded for " + active.address + ":" + active.port
+                + "; dropping it from the preferred candidates");
+    }
+
+    public static void switchToNextProxy() {
+        switchToNextProxy(false);
+    }
+
+    /**
+     * @param force rotate even when the applied proxy has not accumulated two failures yet;
+     *              used when the user asks for a different node explicitly.
+     */
+    public static synchronized void switchToNextProxy(boolean force) {
         if (verifiedPool.isEmpty()) {
             // Pool genuinely empty: nothing to rotate to. Re-seed and re-fetch instead of
             // returning silently, which is what made this look like a dead feature.
@@ -395,6 +634,18 @@ public class ColgramProxyManager {
         if (currentActiveProxy != null && !verifiedPool.contains(currentActiveProxy)) {
             Log.i(TAG, "holding user-configured proxy " + currentActiveProxy.address
                     + " (type=" + currentActiveProxy.type + "); it is not in the managed pool");
+            return;
+        }
+
+        // One failed handshake is not a verdict. Observed on the emulator: three nodes that the
+        // startup sweep measured at 95-173 ms each reported a failure within a minute of being
+        // applied, and rotating on every one of those spent the whole 4-per-window budget in two
+        // minutes and left the app parked on a dead proxy. Free MTProxies throttle extra
+        // connections, so require two strikes before moving.
+        if (!force && currentActiveProxy != null && !currentActiveProxy.isLocalDpi()
+                && currentActiveProxy.nativeFailures > 0 && currentActiveProxy.nativeFailures < 2) {
+            Log.i(TAG, "holding " + currentActiveProxy.address
+                    + " after one failure; two are needed before rotating");
             return;
         }
 
@@ -436,25 +687,36 @@ public class ColgramProxyManager {
                 break;
             }
         }
-        int nextIndex = (currentIndex + 1) % verifiedPool.size();
-        ProxyItem next = verifiedPool.get(nextIndex);
-        Log.d(TAG, "Rotating proxy to: " + next.address + ":" + next.port);
+        // Pick the best candidate rather than simply the next slot. Walking onto nodes that the
+        // checker had already reported dead is what made rotation look like it "does nothing":
+        // the step is real, the destination is broken. Preference is verified-alive, then
+        // never-checked, and only then anything at all.
+        ProxyItem next = selectProxy(currentActiveProxy);
+        if (next == null) {
+            next = roundRobinNext(currentIndex);
+        }
+        if (next == null) {
+            Log.w(TAG, "no rotation candidate; holding the current proxy and re-fetching");
+            executor.execute(() -> {
+                try {
+                    fetchAndVerifyAllSources();
+                } catch (Throwable ignored) {}
+            });
+            return;
+        }
+        Log.d(TAG, "Rotating proxy to: " + next);
 
-        // Wrapped the whole pool without finding a live remote proxy: fall back to the local
-        // DPI bypass rather than looping through dead hosts, and refresh the list in the
-        // background so a later cycle has real candidates.
-        if (currentIndex >= 0 && nextIndex == 0) {
-            ProxyItem localDpi = findLocalDpiProxy();
-            if (localDpi != null && !localDpi.equals(currentActiveProxy)) {
-                Log.w(TAG, "Proxy pool exhausted; falling back to the local DPI bypass");
-                next = localDpi;
-                executor.execute(() -> {
-                    try {
-                        fetchAndVerifyAllSources();
-                    } catch (Throwable ignored) {
-                    }
-                });
-            }
+        // Nothing verified alive left in the list: refresh it in the background so a later
+        // cycle has real candidates. Falling back to the local desync listener here used to be
+        // unconditional, which pointed Telegram at 127.0.0.1:9876 while the bypass was switched
+        // off - a proxy that cannot answer, shown as unavailable, and rotated away from again.
+        if (!next.isAvailable && !next.isLocalDpi()) {
+            executor.execute(() -> {
+                try {
+                    fetchAndVerifyAllSources();
+                } catch (Throwable ignored) {
+                }
+            });
         }
 
         final ProxyItem target = next;
@@ -477,6 +739,44 @@ public class ColgramProxyManager {
     }
 
     /**
+     * Whether the in-process desync listener is a legitimate target right now. The user has to
+     * have switched it on AND the socket has to be accepting; otherwise applying it hands
+     * Telegram a proxy that cannot answer, which reads as "the proxy does not turn on".
+     */
+    private static boolean localBypassUsable() {
+        return ColgramConfig.isDpiBypassEnabled() && ColgramDpiBypass.isBound();
+    }
+
+    /**
+     * First pool entry worth applying: one the native checker confirmed working, else the local
+     * listener when it is actually up. Returns null when the pool has nothing better to offer
+     * than what is applied now.
+     */
+    private static ProxyItem selectProxy(ProxyItem skip) {
+        ProxyItem unchecked = null;
+        for (int i = 0; i < verifiedPool.size(); i++) {
+            ProxyItem p = verifiedPool.get(i);
+            if (p.equals(skip)) continue;
+            if (p.isLocalDpi() && !localBypassUsable()) continue;
+            if (p.isAvailable) return p;
+            if (unchecked == null && p.pingMs == -1) unchecked = p;
+        }
+        return unchecked;
+    }
+
+    /** Next pool entry after {@code currentIndex}, skipping unusable entries. Last resort. */
+    private static ProxyItem roundRobinNext(int currentIndex) {
+        int size = verifiedPool.size();
+        for (int step = 1; step <= size; step++) {
+            ProxyItem p = verifiedPool.get(((currentIndex + step) % size));
+            if (p.equals(currentActiveProxy)) continue;
+            if (p.isLocalDpi() && !localBypassUsable()) continue;
+            return p;
+        }
+        return null;
+    }
+
+    /**
      * Fetch proxies from all configured sources and verify each one.
      */
     private static void fetchAndVerifyAllSources() {
@@ -492,16 +792,13 @@ public class ColgramProxyManager {
             }
         }
 
-        // Test all proxies in pool
-        List<ProxyItem> snapshot = new ArrayList<>(verifiedPool);
-        for (ProxyItem p : snapshot) {
-            if (p.isLocalDpi()) continue;
-            executor.execute(() -> {
-                int ping = testProxy(p.address, p.port, 2500);
-                p.pingMs = ping;
-                p.isAvailable = ping >= 0;
-            });
-        }
+        // Verdict on every candidate comes from the native protocol checker, not from this
+        // method. It used to run a TCP connect here and store the result as "available", which
+        // is how seven hardcoded nodes with unknown fate ended up reported as working proxies.
+        mainHandler.post(() -> {
+            checkPoolNow();
+            publishPoolToStock();
+        });
     }
 
     private static void fetchProxiesJson(String sourceUrl) {
@@ -693,20 +990,40 @@ public class ColgramProxyManager {
                 }
             }
 
-            // 3. Reload SharedConfig proxy list cleanly
+            // 3. Make Telegram's own state agree with what was just applied.
+            //
+            // SharedConfig.isProxyEnabled() is "proxy_enabled && currentProxy != null", and the
+            // drawer, the settings rows and the stock proxy screen all read it. loadProxyList()
+            // only resolves a currentProxy when the applied node is already in the persisted
+            // list, so a proxy chosen by Colgram left currentProxy null: traffic really did go
+            // through the proxy while every stock surface said "Отключён". addProxy() is
+            // upstream's de-duplicating, persisting insert, so go through it and point
+            // currentProxy at the result.
             try {
                 Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
-                try {
-                    Field pllField = scClass.getDeclaredField("proxyListLoaded");
-                    pllField.setAccessible(true);
-                    pllField.setBoolean(null, false);
-                } catch (Throwable ignored) {}
+                Class<?> piClass = Class.forName("org.telegram.messenger.SharedConfig$ProxyInfo");
+                Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
 
-                Method loadProxyListMethod = scClass.getDeclaredMethod("loadProxyList");
-                loadProxyListMethod.setAccessible(true);
-                loadProxyListMethod.invoke(null);
+                Field pllField = scClass.getDeclaredField("proxyListLoaded");
+                pllField.setAccessible(true);
+                pllField.setBoolean(null, false);
+                scClass.getDeclaredMethod("loadProxyList").invoke(null);
+
+                Object settings = buildProxySettings(proxy);
+                if (settings != null) {
+                    java.lang.reflect.Constructor<?> piCtor = piClass.getConstructor(psClass);
+                    Method addProxy = scClass.getDeclaredMethod("addProxy", piClass);
+                    Object info = addProxy.invoke(null, piCtor.newInstance(settings));
+                    if (info != null) {
+                        Field cpField = scClass.getDeclaredField("currentProxy");
+                        cpField.setAccessible(true);
+                        cpField.set(null, info);
+                    }
+                }
+                scClass.getDeclaredMethod("saveProxyList").invoke(null);
+                enableStockRotation(appContext);
             } catch (Throwable t) {
-                Log.e(TAG, "SharedConfig loadProxyList error", t);
+                Log.e(TAG, "SharedConfig proxy state error", t);
             }
 
             // 4. Notify UI via NotificationCenter
@@ -743,25 +1060,44 @@ public class ColgramProxyManager {
         boolean currentlyEnabled = isProxyEnabled(ctx);
         if (currentlyEnabled) {
             disableProxy(ctx);
-            mainHandler.post(() -> {
-                try {
-                    Toast.makeText(ctx, "Прокси: Отключен", Toast.LENGTH_SHORT).show();
-                } catch (Throwable ignored) {}
-            });
-        } else {
-            if (verifiedPool.isEmpty()) {
-                initVerifiedPool();
-            }
-            ProxyItem target = (currentActiveProxy != null && !currentActiveProxy.isLocalDpi()) ? currentActiveProxy : (verifiedPool.isEmpty() ? null : verifiedPool.get(0));
-            if (target != null) {
-                forceApplyProxy(target);
-                mainHandler.post(() -> {
-                    try {
-                        Toast.makeText(ctx, "Прокси: Включен (" + target.address + ")", Toast.LENGTH_SHORT).show();
-                    } catch (Throwable ignored) {}
-                });
-            }
+            toast("Прокси: выключен");
+            return;
         }
+
+        if (verifiedPool.isEmpty()) {
+            initVerifiedPool();
+        }
+        SharedPreferences mainPrefs = ctx.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+        boolean localOk = localBypassUsable();
+
+        // What this used to do: apply verifiedPool.get(0). Entry zero is the in-process desync
+        // listener, so tapping the proxy button pointed Telegram at 127.0.0.1:9876 even when
+        // the bypass was switched off and nothing was listening. Telegram reported the proxy as
+        // unreachable, the rotator moved off it, and the whole feature read as "прокси без впн
+        // не подрубается". Pick something that can actually carry traffic instead.
+        ProxyItem target = findSavedProxy(mainPrefs);
+        if (target != null && target.isLocalDpi() && !localOk) {
+            target = null;
+        }
+        if (target == null && currentActiveProxy != null
+                && !(currentActiveProxy.isLocalDpi() && !localOk)) {
+            target = currentActiveProxy;
+        }
+        if (target == null) {
+            target = selectProxy(null);
+        }
+
+        if (target == null) {
+            // Refusing to invent a proxy is better than applying a dead one. The stock screen
+            // is where a proxy of his own - including a wss:// one, the only class that beats
+            // an IP-level block without a VPN - gets entered.
+            toast("Нет рабочих прокси. Добавьте свой: Настройки Colgram → Сеть → «Свой прокси»");
+            Log.w(TAG, "toggleProxy: nothing usable to enable");
+            return;
+        }
+
+        forceApplyProxy(target);
+        toast("Прокси: включён — " + target);
     }
 
     /**
@@ -788,8 +1124,8 @@ public class ColgramProxyManager {
             // Not in the pool (e.g. a user-entered private proxy, which has no reason to be
             // there). Honour the choice anyway rather than quietly substituting something else.
             ProxyItem custom = new ProxyItem(ip, port, secret, type);
-            custom.isAvailable = true;
-            custom.pingMs = 0;
+            custom.isAvailable = false;
+            custom.pingMs = -1;
             Log.i(TAG, "saved proxy is not in the pool; applying it as a user-configured entry");
             return custom;
         } catch (Throwable t) {
@@ -810,22 +1146,41 @@ public class ColgramProxyManager {
     public static void setDpiBypassEnabled(Context context, boolean enabled) {
         ColgramConfig.setDpiBypassEnabled(enabled);
         if (enabled) {
-            ColgramDpiBypass.start();
-            ProxyItem local = null;
-            for (ProxyItem p : verifiedPool) {
-                if (p.isLocalDpi()) { local = p; break; }
-            }
-            if (local != null) {
+            // Bind first, route second. The old order force-applied 127.0.0.1:9876 the moment
+            // start() was called, but start() defers the bind - so Telegram was pointed at a
+            // port that did not exist yet, reported the proxy as unavailable, and the rotator
+            // moved off it. That is the "я включаю обходчик и ничего не происходит" path.
+            ColgramDpiBypass.startImmediately();
+            executor.execute(() -> {
+                boolean ready = ColgramDpiBypass.awaitReady(20000);
+                ProxyItem local = findLocalDpiProxy();
+                if (!ready || local == null) {
+                    Log.e(TAG, "desync bypass enabled but the listener never bound; leaving traffic alone");
+                    mainHandler.post(() -> toast("Обходчик не смог поднять 127.0.0.1:"
+                            + ColgramDpiBypass.LOCAL_PORT));
+                    return;
+                }
                 forceApplyProxy(local);
-                Log.i(TAG, "desync bypass enabled and applied");
-            } else {
-                Log.w(TAG, "desync bypass enabled but the local node is not in the pool");
-            }
+                checkPoolNow();
+                toast("Обходчик ТСПУ включён: " + local);
+            });
         } else {
             disableProxy(context);
             ColgramDpiBypass.stop();
             Log.i(TAG, "desync bypass disabled, reverted to direct connection");
         }
+    }
+
+    private static void toast(final CharSequence text) {
+        // Toast needs a Looper; callers come from the pool checker's worker thread as well as
+        // from the UI, so the hop belongs here rather than at every call site.
+        mainHandler.post(() -> {
+            Context ctx = appContext;
+            if (ctx == null) return;
+            try {
+                Toast.makeText(ctx, text, Toast.LENGTH_LONG).show();
+            } catch (Throwable ignored) {}
+        });
     }
 
     public static void disableProxy(Context context) {
@@ -838,16 +1193,28 @@ public class ColgramProxyManager {
                 preferences.edit().putBoolean("proxy_enabled", false).apply();
             }
 
+            // Through Telegram's own entry point, not just the native call: a WEB proxy is
+            // served by WebProxyTransport, a WebView bridge holding a local port, and only
+            // ConnectionsManager.setProxySettings stops it. Disabling by the native call alone
+            // left that bridge running behind a proxy the user believes is off.
             try {
                 Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
-                Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
-                        int.class, String.class, int.class, String.class, String.class, String.class);
-                nativeSetProxy.setAccessible(true);
-                for (int i = 0; i < colgramAccountSlots; i++) {
-                    nativeSetProxy.invoke(null, i, "", 0, "", "", "");
-                }
+                Method stockSet = cmClass.getMethod("setProxySettings", boolean.class,
+                        Class.forName("org.telegram.proxy.ProxySettings"));
+                stockSet.invoke(null, false, null);
             } catch (Throwable t) {
-                Log.e(TAG, "disableProxy nativeSetProxy error", t);
+                Log.e(TAG, "disableProxy setProxySettings error", t);
+                try {
+                    Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                    Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
+                            int.class, String.class, int.class, String.class, String.class, String.class);
+                    nativeSetProxy.setAccessible(true);
+                    for (int i = 0; i < colgramAccountSlots; i++) {
+                        nativeSetProxy.invoke(null, i, "", 0, "", "", "");
+                    }
+                } catch (Throwable t2) {
+                    Log.e(TAG, "disableProxy nativeSetProxy error", t2);
+                }
             }
 
             try {
@@ -882,65 +1249,84 @@ public class ColgramProxyManager {
         }
     }
 
-    public static void populateSharedConfigProxies() {
+    /**
+     * Publish Colgram's candidate proxies into Telegram's OWN persisted list.
+     *
+     * This used to inject ProxyInfo objects into the in-memory SharedConfig.proxyList only.
+     * Two consequences made that useless: nothing was ever written to the "proxy_list"
+     * preference, so the entries disappeared on the next start; and forceApplyProxy() calls
+     * SharedConfig.loadProxyList(), which CLEARS proxyList and rebuilds it from that
+     * preference - so Colgram's entries were wiped the first time it ran, and the stock
+     * screen, the stock rotator and the drawer all saw an empty list. Going through
+     * SharedConfig.addProxy() means the entries persist, de-duplicate, and are visible to
+     * everything upstream.
+     *
+     * It also arms upstream's ProxyRotationController. That class checks every entry with the
+     * native protocol checker and switches to the lowest-ping working one the moment Telegram
+     * stalls in ConnectionStateConnectingToProxy - the failover Colgram reimplemented badly in
+     * Java. It is gated on SharedConfig.proxyRotationEnabled, which defaults to false and
+     * nothing here ever set, so until now the real rotator never ran at all.
+     */
+    private static final int MAX_PUBLISHED_TO_STOCK = 8;
+
+    private static void publishPoolToStock() {
+        Context ctx = appContext;
+        if (ctx == null) return;
         try {
             Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
             Class<?> piClass = Class.forName("org.telegram.messenger.SharedConfig$ProxyInfo");
             Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
-            Class<?> pstClass = Class.forName("org.telegram.proxy.ProxySettings$Type");
 
-            Field plField = scClass.getDeclaredField("proxyList");
-            plField.setAccessible(true);
-            List proxyList = (List) plField.get(null);
+            scClass.getDeclaredMethod("loadProxyList").invoke(null);
 
-            if (proxyList != null && proxyList.isEmpty()) {
-                if (verifiedPool.isEmpty()) {
-                    initVerifiedPool();
-                }
-                for (ProxyItem p : verifiedPool) {
-                    try {
-                        Object typeObj;
-                        if (p.type == 1) {
-                            typeObj = Enum.valueOf((Class<Enum>) pstClass, "MTPROTO");
-                        } else {
-                            typeObj = Enum.valueOf((Class<Enum>) pstClass, "SOCKS5");
-                        }
+            java.lang.reflect.Constructor<?> piCtor = piClass.getConstructor(psClass);
+            Method addProxy = scClass.getDeclaredMethod("addProxy", piClass);
 
-                        Method builderMethod = psClass.getDeclaredMethod("builder");
-                        builderMethod.setAccessible(true);
-                        Object builder = builderMethod.invoke(null);
-
-                        Method setAddress = builder.getClass().getDeclaredMethod("setAddress", String.class);
-                        Method setPort = builder.getClass().getDeclaredMethod("setPort", int.class);
-                        Method setSecret = builder.getClass().getDeclaredMethod("setSecret", String.class);
-                        Method build = builder.getClass().getDeclaredMethod("build");
-
-                        setAddress.invoke(builder, p.address);
-                        setPort.invoke(builder, p.port);
-                        setSecret.invoke(builder, p.secret != null ? p.secret : "");
-                        Object settings = build.invoke(builder);
-
-                        java.lang.reflect.Constructor<?> piConstructor = piClass.getConstructor(psClass);
-                        piConstructor.setAccessible(true);
-                        Object proxyInfo = piConstructor.newInstance(settings);
-
-                        proxyList.add(proxyInfo);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "Failed to reflect ProxyInfo for " + p.address, t);
-                    }
-                }
-
-                if (!proxyList.isEmpty()) {
-                    Field cpField = scClass.getDeclaredField("currentProxy");
-                    cpField.setAccessible(true);
-                    if (cpField.get(null) == null) {
-                        cpField.set(null, proxyList.get(0));
-                    }
-                }
+            if (verifiedPool.isEmpty()) {
+                initVerifiedPool();
             }
+            int published = 0;
+            for (ProxyItem p : verifiedPool) {
+                if (published >= MAX_PUBLISHED_TO_STOCK) break;
+                // Do not offer a listener the user switched off as if it were a proxy option.
+                if (p.isLocalDpi() && !ColgramConfig.isDpiBypassEnabled()) continue;
+                Object settings = buildProxySettings(p);
+                if (settings == null) continue;
+                addProxy.invoke(null, piCtor.newInstance(settings));
+                published++;
+            }
+
+            enableStockRotation(ctx);
         } catch (Throwable t) {
-            Log.e(TAG, "populateSharedConfigProxies error", t);
+            Log.e(TAG, "publishPoolToStock error", t);
         }
+    }
+
+    private static void enableStockRotation(Context ctx) {
+        try {
+            Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
+            Field enabled = scClass.getDeclaredField("proxyRotationEnabled");
+            enabled.setAccessible(true);
+            if (enabled.getBoolean(null)) return;
+            enabled.setBoolean(null, true);
+            // SharedConfig.loadConfig() reads this key from the "userconfing" file - that
+            // spelling is upstream's, not a typo of mine - not from mainconfig.
+            ctx.getSharedPreferences("userconfing", Context.MODE_PRIVATE).edit()
+                    .putBoolean("proxyRotationEnabled", true).apply();
+            Log.i(TAG, "Telegram's own proxy checker and rotator enabled");
+        } catch (Throwable t) {
+            Log.w(TAG, "could not enable stock proxy rotation: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Entry point kept for the patched call sites (login screen, proxy list screen).
+     */
+    public static void populateSharedConfigProxies() {
+        if (verifiedPool.isEmpty()) {
+            initVerifiedPool();
+        }
+        mainHandler.post(() -> publishPoolToStock());
     }
 
     private static boolean containsProxy(ProxyItem item) {
@@ -952,9 +1338,33 @@ public class ColgramProxyManager {
 
     public static ProxyItem getCurrentActiveProxy() { return currentActiveProxy; }
     public static List<ProxyItem> getVerifiedPool() { return new ArrayList<>(verifiedPool); }
+
+    /** Entries the native protocol checker actually confirmed working. */
     public static int getAliveCount() {
         int c = 0;
         for (ProxyItem p : verifiedPool) if (p.isAvailable) c++;
         return c;
+    }
+
+    /** Entries that have been checked and failed. */
+    public static int getDeadCount() {
+        int c = 0;
+        for (ProxyItem p : verifiedPool) if (p.pingMs == -2) c++;
+        return c;
+    }
+
+    /** Entries no verdict exists for yet. */
+    public static int getUncheckedCount() {
+        int c = 0;
+        for (ProxyItem p : verifiedPool) if (p.pingMs == -1) c++;
+        return c;
+    }
+
+    /** Human-readable state of one ping result. */
+    public static String describePing(ProxyItem item) {
+        if (item == null) return "нет";
+        if (item.pingMs == -1) return "не проверен";
+        if (item.pingMs == -2) return "не отвечает";
+        return item.pingMs + " мс";
     }
 }

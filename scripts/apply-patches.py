@@ -3475,13 +3475,20 @@ def inject_hooks(repo_path):
     #
     # Wiring the native failure signal to the rotator turns that into a few seconds.
     # ColgramProxyManager.switchToNextProxy() debounces (3s) so a flapping proxy cannot
-    # spin the whole pool, and falls back to the local DPI bypass once it wraps.
+    # spin the whole pool, and selectProxy() now refuses to prefer an entry that failed twice.
+    #
+    # The body has changed once already, so this injector matches every form it has ever had:
+    # pristine upstream, the previous Colgram body, and the current one. patch_file()'s
+    # already-applied marker cannot tell an older body from the newest one, and an anchor that
+    # only matches pristine source silently stops applying the day anyone upgrades in place -
+    # which is exactly how a fixed patch turns into a permanent miss.
     cm_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")
-    patch_file(
-        cm_file,
+    cm_proxy_stock = (
         "    public static void onProxyError() {\n"
         "        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3));\n"
-        "    }",
+        "    }"
+    )
+    cm_proxy_previous = (
         "    public static void onProxyError() {\n"
         "        // Colgram: native reports a failed proxy connection here. Rotate immediately\n"
         "        // instead of waiting for the 5-minute health check - see apply-patches.py 47d.\n"
@@ -3491,8 +3498,41 @@ def inject_hooks(repo_path):
         "\n"
         "        }\n"
         "        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3));\n"
-        "    }",
-        "ConnectionsManager onProxyError Rotates Proxy"
+        "    }"
+    )
+    cm_proxy_current = (
+        "    public static void onProxyError() {\n"
+        "        // Colgram: the native layer reports a proxy connection failure here, which is the\n"
+        "        // only signal that actually travelled the whole proxy path. Record it against the\n"
+        "        // applied entry, then rotate immediately instead of waiting for the health check.\n"
+        "        try {\n"
+        "            org.colgram.core.ColgramProxyManager.reportProxyFailure();\n"
+        "        } catch (Throwable ignore) {\n"
+        "\n"
+        "        }\n"
+        "        try {\n"
+        "            org.colgram.core.ColgramProxyManager.switchToNextProxy();\n"
+        "        } catch (Throwable ignore) {\n"
+        "\n"
+        "        }\n"
+        "        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3));\n"
+        "    }"
+    )
+
+    def proxy_error_hook(content):
+        if cm_proxy_current in content:
+            return content
+        if cm_proxy_previous in content:
+            return content.replace(cm_proxy_previous, cm_proxy_current, 1)
+        if cm_proxy_stock in content:
+            return content.replace(cm_proxy_stock, cm_proxy_current, 1)
+        return content
+
+    patch_file(
+        cm_file,
+        proxy_error_hook,
+        cm_proxy_current,
+        "ConnectionsManager onProxyError Records Failure and Rotates"
     )
 
     # 48. ChangeUsernameActivity.java -> Bot Username Notice Hook

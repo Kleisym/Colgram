@@ -1341,8 +1341,13 @@ public class ColgramBotSync {
                         break;
                     } catch (Throwable t) {
                         Log.w(TAG, "Poller cycle error: " + t.getMessage());
+                        // A transport failure (unreachable or blocked api.telegram.org) is not a
+                        // 3-seconds-and-retry-it condition. Observed on this network: the poller
+                        // logged and re-attempted 20 times a minute, forever, on a host that was
+                        // never going to answer. Escalate like the HTTP-error path and cap higher.
+                        consecutiveErrors++;
                         try {
-                            Thread.sleep(3000);
+                            Thread.sleep(Math.min(consecutiveErrors * 5000L, 60000L));
                         } catch (InterruptedException e) {
                             break;
                         }
