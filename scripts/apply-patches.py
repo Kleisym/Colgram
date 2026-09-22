@@ -4006,6 +4006,74 @@ def inject_hooks(repo_path):
     patch_file(messages_storage, storage_inbound_injector, COLGRAM_PLUGIN_INBOUND_MARKER,
                "MessagesStorage Dispatch Incoming Messages To Plugins")
 
+    # 56. ChatAttachAlert.java -> the Colgram folder, from the paperclip.
+    #
+    # This is the ask in its own words: files should come out of OUR folder, through the same
+    # menu where you attach anything, instead of the app asking for the whole media library.
+    # Four small edits, because the sheet is a horizontal RecyclerView driven by a slot counter,
+    # a bind chain and a tag switch:
+    #   field, slot (buttonsCount++), bind (icon + label + tag), tap branch.
+    # Tag 10 is free: 1/3/4/5/6/9/11/12/13 are taken and 7/8 are legacy photo-send ids that
+    # ChatActivity.didPressedButton still interprets. An unhandled tag would fall through to
+    # that switch, so the branch has to live here, before the fallback.
+    #
+    # The send itself is not reimplemented: the picked path goes to the same
+    # didSelectFiles(...) the existing SAF branch already calls, which queues an ordinary
+    # document through SendMessagesHelper.
+    chat_attach_alert = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org",
+                                     "telegram", "ui", "Components", "ChatAttachAlert.java")
+    COLGRAM_ATTACH_FOLDER_MARKER = "// COLGRAM_ATTACH_FOLDER_PATCH = 1"
+
+    def attach_folder_injector(content):
+        if COLGRAM_ATTACH_FOLDER_MARKER in content:
+            return content
+        field_anchor = "        private int documentButton;\n"
+        slot_anchor = "                documentButton = buttonsCount++;\n"
+        bind_anchor = ("                    } else if (position == documentButton) {\n"
+                       "                        attachButton.setTextAndIcon(4, getString(R.string.ChatDocument), GlassTabView.TabAnimation.FILES);\n"
+                       "                        attachButton.setTag(4);\n"
+                       "                        err = !checkPhotoAndDocumentsPermission(mContext);\n")
+        tap_anchor = "                } else if (num == 5) {\n"
+        if content.count(field_anchor) != 1 or content.count(slot_anchor) < 1 \
+                or content.count(bind_anchor) != 1 or content.count(tap_anchor) != 1:
+            print(" [!] ChatAttachAlert attach-menu anchors moved - folder entry NOT added")
+            return content
+        # The slot line legitimately appears once per layout branch (normal chat, channel, bot,
+        # ...), so it is replaced everywhere: the folder entry belongs next to "File" wherever
+        # "File" exists. The other three anchors are unique and asserted as such.
+
+        content = content.replace(field_anchor,
+                                  "        private int colgramFilesButton; " + COLGRAM_ATTACH_FOLDER_MARKER + "\n"
+                                  + field_anchor, 1)
+        content = content.replace(bind_anchor, bind_anchor
+                                  + "                    } else if (position == colgramFilesButton) {\n"
+                                    "                        attachButton.setTextAndIcon(10, \"Папка Colgram\", GlassTabView.TabAnimation.FILES);\n"
+                                    "                        attachButton.setTag(10);\n", 1)
+        content = content.replace(slot_anchor, slot_anchor
+                                  + "                colgramFilesButton = buttonsCount++;\n")
+        content = content.replace(tap_anchor,
+                                  "                } else if (num == 10) {\n"
+                                  "                    // Our folder, presented on top of the chat; the sheet dismisses itself because\n"
+                                  "                    // the picker is a full screen now. The listener is one-shot and static: this\n"
+                                  "                    // sheet does not survive the transition, so nothing could hold the callback.\n"
+                                  "                    org.telegram.ui.ColgramFilesActivity colgramPick = new org.telegram.ui.ColgramFilesActivity();\n"
+                                  "                    org.telegram.ui.ColgramFilesActivity.beginPick(colgramPaths -> {\n"
+                                  "                        if (documentsDelegate != null) {\n"
+                                  "                            documentsDelegate.didSelectFiles(colgramPaths, \"\", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n"
+                                  "                        } else if (baseFragment instanceof ChatActivity) {\n"
+                                  "                            ((ChatActivity) baseFragment).didSelectFiles(colgramPaths, \"\", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n"
+                                  "                        }\n"
+                                  "                    });\n"
+                                  "                    if (baseFragment != null) {\n"
+                                  "                        baseFragment.presentFragment(colgramPick);\n"
+                                  "                    }\n"
+                                  "                    dismiss();\n"
+                                  + tap_anchor, 1)
+        return content
+
+    patch_file(chat_attach_alert, attach_folder_injector, COLGRAM_ATTACH_FOLDER_MARKER,
+               "ChatAttachAlert Colgram Folder Entry")
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"

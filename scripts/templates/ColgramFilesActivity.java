@@ -47,6 +47,25 @@ public class ColgramFilesActivity extends BaseFragment {
 
     private static final int REQ_IMPORT = 10977;
 
+    /**
+     * One-shot handoff used by the attachment sheet: it registers a listener, presents this
+     * screen, and the chosen file comes back as a list of local paths that
+     * ChatActivity.didSelectFiles can send as an ordinary document. Static because the attach
+     * sheet dismisses itself when it presents us, so there is no surviving caller to hold a
+     * reference; it is cleared on pick and on destroy so it cannot outlive the flow.
+     */
+    public interface PickListener {
+        void onPicked(ArrayList<String> paths);
+    }
+
+    private static PickListener pendingPickListener;
+
+    public static void beginPick(PickListener listener) {
+        pendingPickListener = listener;
+    }
+
+    private boolean pickMode;
+
     private RecyclerListView listView;
     private ListAdapter listAdapter;
     private final List<File> entries = new ArrayList<>();
@@ -59,10 +78,20 @@ public class ColgramFilesActivity extends BaseFragment {
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
+        pickMode = pendingPickListener != null;
         sandboxRoot = ColgramStorageSandbox.getSandboxRootDir(getParentActivity());
         currentDir = sandboxRoot;
         reload();
         return true;
+    }
+
+    @Override
+    public void onFragmentDestroy() {
+        // A pick that was abandoned must not leave a listener pointing at a dismissed sheet.
+        if (pickMode) {
+            pendingPickListener = null;
+        }
+        super.onFragmentDestroy();
     }
 
     private void reload() {
@@ -97,7 +126,7 @@ public class ColgramFilesActivity extends BaseFragment {
     public View createView(Context context) {
         actionBar.setBackButtonImage(R.drawable.ic_ab_back);
         actionBar.setAllowOverlayTitle(true);
-        actionBar.setTitle("Папка Colgram");
+        actionBar.setTitle(pickMode ? "Выбрать файл из папки" : "Папка Colgram");
         actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
             @Override
             public void onItemClick(int id) {
@@ -163,22 +192,46 @@ public class ColgramFilesActivity extends BaseFragment {
 
     private void showFileActions(final File file) {
         if (getParentActivity() == null) return;
-        final String[] items = new String[]{
-                "Открыть",
-                "Удалить",
-                "Скопировать путь",
-        };
+        final String[] items;
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
         builder.setTitle(file.getName());
-        builder.setItems(items, (dialog, which) -> {
-            if (which == 0) {
-                openFile(file);
-            } else if (which == 1) {
-                deleteFile(file);
-            } else {
-                showPath(file.getAbsolutePath());
-            }
-        });
+        if (pickMode) {
+            final String path = file.getAbsolutePath();
+            items = new String[]{
+                    "Отправить в чат",
+                    "Скопировать путь",
+            };
+            builder.setItems(items, (dialog, which) -> {
+                if (which == 1) {
+                    showPath(path);
+                    return;
+                }
+                PickListener listener = pendingPickListener;
+                pendingPickListener = null;
+                pickMode = false;
+                ArrayList<String> paths = new ArrayList<>();
+                paths.add(path);
+                finishFragment();
+                if (listener != null) {
+                    listener.onPicked(paths);
+                }
+            });
+        } else {
+            items = new String[]{
+                    "Открыть",
+                    "Удалить",
+                    "Скопировать путь",
+            };
+            builder.setItems(items, (dialog, which) -> {
+                if (which == 0) {
+                    openFile(file);
+                } else if (which == 1) {
+                    deleteFile(file);
+                } else {
+                    showPath(file.getAbsolutePath());
+                }
+            });
+        }
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
     }
