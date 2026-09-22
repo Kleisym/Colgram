@@ -27,7 +27,7 @@ PATCH_MISSES = []
 # the wrapper or the palette: it is both the constant the wrapper declares and the patch_file
 # marker, so the two can no longer disagree and an old build can no longer report "already
 # patched" over a newer body.
-COLGRAM_THEME_PATCH_VERSION = "6"
+COLGRAM_THEME_PATCH_VERSION = "7"
 
 # Misses that are known-benign, with the reason. Anything NOT listed here fails the run.
 # Keeping this explicit is the point: a new miss cannot be waved through by accident, and a
@@ -1993,6 +1993,22 @@ def inject_hooks(repo_path):
         "        // key_telegram_color_text, so there is no per-view colour key to reach and the\n"
         "        // palette has to answer it here. Measured after the first cyber fix: the title,\n"
         "        // badge and tab label were #ff3344, the date alone was still #298acf.\n"
+        "        // Overflow and context menus. Their surface is a separate key from dialogs,\n"
+        "        // which is why the Colgram menu and the profile menu stayed white on a dark\n"
+        "        // theme: the guard lightened their TEXT against the cyber background and left\n"
+        "        // the surface stock white.\n"
+        "        if (key == key_actionBarDefaultSubmenuBackground) {\n"
+        "            return COLGRAM_CYBER_SURFACE;\n"
+        "        }\n"
+        "        if (key == key_actionBarDefaultSubmenuSeparator) {\n"
+        "            return COLGRAM_CYBER_DIVIDER;\n"
+        "        }\n"
+        "        if (key == key_actionBarDefaultSubmenuItem) {\n"
+        "            return COLGRAM_CYBER_TEXT;\n"
+        "        }\n"
+        "        if (key == key_actionBarDefaultSubmenuItemIcon) {\n"
+        "            return COLGRAM_CYBER_TEXT_DIM;\n"
+        "        }\n"
         "                // Dialogs. The readability guard lightens any foreground it thinks sits on the\n"
         "                // cyber background - including dialog text - but a dialog is its own surface, and\n"
         "                // that surface was not in the palette at all. Seen in a screenshot: a white\n"
@@ -2290,7 +2306,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java"]:
+        for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -4095,51 +4111,432 @@ def inject_hooks(repo_path):
     patch_file(chat_attach_alert, attach_folder_injector, COLGRAM_ATTACH_FOLDER_MARKER,
                "ChatAttachAlert Colgram Folder Entry")
 
-    # 57. SettingsActivity.java -> the Cyber theme where themes are actually chosen.
+    # 57. RETIRED. The Cyber row used to be injected into the stock Settings list here. He then
+    # asked the opposite: the theme belongs in the theme picker with the other themes, not as a
+    # button of its own ("какого хуя у нас тема cyber отдельно от всех"). Section 59 registers a
+    # real ThemeInfo and removes whatever this section left behind in already-patched trees.
+
+    # 58. Theme.java -> paints honour Cyber too.
     #
-    # He asked for the red/black theme to live "по стандарту", in the normal settings, instead of
-    # being reachable only through Настройки Colgram. The stock Settings list is the right place:
-    # it is the first screen people open when they want to change how Telegram looks, and this
-    # file already carries a Colgram section, so the row sits with its siblings rather than in a
-    # separate app.
+    # The third colour choke point, found the hard way: the floating chat header pill, the reply
+    # panel and the action backgrounds are drawn from CACHED Paint objects whose colours were
+    # baked when the theme loaded. A runtime override in getColor never reaches them, so with
+    # Cyber on the pill above a chat stayed white while everything around it went dark. Paint
+    # keys are strings and Theme knows which colour key each paint uses (getThemePaintColorKey),
+    # so the paint can be rebuilt through the same wrapped getColor as everything else.
     #
-    # Toggling recreates the activity. Cyber is consulted when a colour is READ, so every screen
-    # that already built its paints keeps its old colours otherwise - which is what made the
-    # switch look broken. The same trick is used by the row in ColgramSettingsActivity, and both
-    # read and write the one flag, so they cannot disagree.
-    def settings_cyber_item_injector(content):
-        target = ('items.add(SettingCell.Factory.of(104, 0xFF4CAF50, 0xFF2E7D32, R.drawable.msg_download, '
-                  '"Версии Telegram и обновления", "Переключение каналов и загрузка APK"));')
-        if target not in content:
+    # The result is cached because getThemePaint runs inside draw(); the cache is keyed on the
+    # flag so toggling Cyber cannot serve a stale paint.
+    def theme_paint_injector(content):
+        head = ("    public static Paint getThemePaint(String paintKey) {\n"
+                "        if (Objects.equals(paintKey, Theme.key_paint_divider)) {")
+        # v1 copied the cached base into a plain `new Paint(base)`, which silently dropped the
+        # TextPaint subclass. ChatActionCell casts the result to TextPaint and reads
+        # `paint.linkColor`, so a plain Paint crashed the chat list on measure. The marker is
+        # the type-preserving expression itself: only a fixed tree contains it.
+        marker = "colgramBase instanceof TextPaint"
+        if marker in content:
             return content
-        inject = target + ('\n        items.add(SettingCell.Factory.of(105, 0xFFFF3344, 0xFF7A0C14, '
-                           'R.drawable.msg_colors, "Красно-чёрная тема Colgram Cyber", '
-                           'org.colgram.core.ColgramConfig.isCyberThemeEnabled() ? "включена" : "выключена"));')
-        return content.replace(target, inject, 1)
-
-    patch_file(settings_activity, settings_cyber_item_injector,
-               'items.add(SettingCell.Factory.of(105, 0xFFFF3344',
-               "SettingsActivity Cyber Theme Row")
-
-    def settings_cyber_click_injector(content):
-        target = """            case 104:
-                presentSettingFragment(new ColgramVersionsActivity());
-                break;"""
-        if target not in content:
+        fixed = ("                Paint colgramPaint = colgramBase instanceof TextPaint\n"
+                 "                        ? new TextPaint(colgramBase)\n"
+                 "                        : new Paint(colgramBase);\n")
+        broken = "                Paint colgramPaint = new Paint(colgramBase);\n"
+        if broken in content:
+            return content.replace(broken, fixed, 1)
+        if head not in content:
             return content
-        inject = target + """
-            case 105:
-                org.colgram.core.ColgramConfig.init(getParentActivity());
-                org.colgram.core.ColgramConfig.setCyberThemeEnabled(
-                        !org.colgram.core.ColgramConfig.isCyberThemeEnabled());
-                if (getParentActivity() != null) {
-                    getParentActivity().recreate();
-                }
-                break;"""
-        return content.replace(target, inject, 1)
+        body = (
+            "    private static final java.util.HashMap<String, Paint> colgramPaintCache =\n"
+            "            new java.util.HashMap<>();\n"
+            "\n"
+            "    public static Paint getThemePaint(String paintKey) {\n"
+            "        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n"
+            "            Paint colgramCached = colgramPaintCache.get(paintKey);\n"
+            "            if (colgramCached != null) {\n"
+            "                return colgramCached;\n"
+            "            }\n"
+            "            Paint colgramBase = defaultChatPaints.get(paintKey);\n"
+            "            if (colgramBase != null) {\n"
+            + fixed +
+            "                colgramPaint.setColor(getColor(getThemePaintColorKey(paintKey)));\n"
+            "                colgramPaintCache.put(paintKey, colgramPaint);\n"
+            "                return colgramPaint;\n"
+            "            }\n"
+            "        }\n"
+            "        if (Objects.equals(paintKey, Theme.key_paint_divider)) {")
+        return content.replace(head, body, 1)
 
-    patch_file(settings_activity, settings_cyber_click_injector, "case 105:",
-               "SettingsActivity Cyber Theme Click")
+    patch_file(theme_file, theme_paint_injector, "colgramBase instanceof TextPaint",
+               "Theme Paints Honour Cyber")
+
+    # 59. Cyber becomes a normal theme in the stock theme picker, and the standalone
+    # Settings row goes away.
+    #
+    # The complaint was exact: "why is cyber separate from all the others, it should be in chat
+    # settings / colour theme / theme settings, not a separate button". A ThemeInfo added to
+    # Theme.themes appears in ThemeActivity's grid for free, because the grid is built from that
+    # list. Cyber is not a .attheme file - it is the runtime palette override - so its ThemeInfo
+    # borrows night.attheme as the base and the apply path flips the Colgram flag; selecting any
+    # other theme clears it, which is what makes the picker entry honest in both directions.
+    def cyber_themeinfo_injector(content):
+        marker = '// No sortAccents() here'
+        if marker in content:
+            return content
+        # Upgrade for trees patched by the first version of this block: sortAccents() sorts
+        # themeAccents, which is null until setAccentColorOptions() runs, so calling it on a
+        # theme with no accent set threw NullPointerException inside Theme.<clinit> and killed
+        # the process on startup (EmojiThemes.<clinit> was merely the first class to touch Theme).
+        broken = ('        themeInfo.sortIndex = 5;\n'
+                  '        sortAccents(themeInfo);\n'
+                  '        themes.add(themeInfo);\n'
+                  '        themesDict.put("Cyber", themeInfo);\n')
+        fixed = ('        themeInfo.sortIndex = 5;\n'
+                 '        // No sortAccents() here: it sorts themeAccents, which stays null until\n'
+                 '        // setAccentColorOptions() runs, and the built-ins only call it after filling\n'
+                 '        // those arrays. Cyber borrows night.attheme and has no accent set of its own.\n'
+                 '        themes.add(themeInfo);\n'
+                 '        themesDict.put("Cyber", themeInfo);\n')
+        if broken in content:
+            return content.replace(broken, fixed, 1)
+        anchor = ('        sortAccents(themeInfo);\n'
+                  '        themes.add(themeInfo);\n'
+                  '        themesDict.put("Night", themeInfo);\n')
+        if anchor not in content:
+            return content
+        block = anchor + (
+            '\n'
+            '        themeInfo = new ThemeInfo();\n'
+            '        themeInfo.name = "Cyber";\n'
+            '        themeInfo.assetName = "night.attheme";\n'
+            '        themeInfo.previewBackgroundColor = 0xff0e0f12;\n'
+            '        themeInfo.previewInColor = 0xffff3344;\n'
+            '        themeInfo.previewOutColor = 0xff9aa0a6;\n'
+            '        themeInfo.sortIndex = 5;\n'
+            '        // No sortAccents() here: it sorts themeAccents, which stays null until\n'
+            '        // setAccentColorOptions() runs, and the built-ins only call it after filling\n'
+            '        // those arrays. Cyber borrows night.attheme and has no accent set of its own.\n'
+            '        themes.add(themeInfo);\n'
+            '        themesDict.put("Cyber", themeInfo);\n')
+        return content.replace(anchor, block, 1)
+
+    patch_file(theme_file, cyber_themeinfo_injector, '// No sortAccents() here',
+               "Theme Cyber ThemeInfo In Stock Picker")
+
+    def cyber_isdark_injector(content):
+        marker = '|| "Cyber".equals(name)) {'
+        if marker in content:
+            return content
+        anchor = '            if ("Dark Blue".equals(name) || "Night".equals(name)) {\n'
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            '            if ("Dark Blue".equals(name) || "Night".equals(name)\n'
+            '                    || "Cyber".equals(name)) {\n', 1)
+
+    patch_file(theme_file, cyber_isdark_injector,
+               '|| "Cyber".equals(name)) {',
+               "Theme Cyber Counts As Dark")
+
+    def cyber_apply_hook_injector(content):
+        marker = "if (colgramPaintCache != null) {"
+        if marker in content:
+            return content
+        # Upgrade for trees patched by the first version: applyTheme runs from Theme.<clinit>,
+        # which is before the cache field further down the file is assigned, so an unguarded
+        # clear() threw NullPointerException during class init and killed every startup.
+        broken = ("            org.colgram.core.ColgramConfig.setCyberThemeEnabled(colgramCyberTheme);\n"
+                  "            colgramPaintCache.clear();\n")
+        fixed = ("            org.colgram.core.ColgramConfig.setCyberThemeEnabled(colgramCyberTheme);\n"
+                 "            // applyTheme also runs from Theme.<clinit>, before the cache field below is\n"
+                 "            // assigned, so the clear has to tolerate a null cache.\n"
+                 "            if (colgramPaintCache != null) {\n"
+                 "                colgramPaintCache.clear();\n"
+                 "            }\n")
+        if broken in content:
+            return content.replace(broken, fixed, 1)
+        anchor = ("    private static void applyTheme(ThemeInfo themeInfo, boolean save, "
+                  "boolean removeWallpaperOverride, final boolean nightTheme) {\n"
+                  "        if (themeInfo == null) {\n"
+                  "            return;\n"
+                  "        }\n")
+        if anchor not in content:
+            return content
+        hook = anchor + (
+            "        // The picker entry is the only way in or out of the cyber palette now, so\n"
+            "        // the flag follows the theme being applied. The paint cache is keyed on\n"
+            "        // paint name only, so it has to be dropped or the next frame serves the\n"
+            "        // previous theme's strokes.\n"
+            "        boolean colgramCyberTheme = \"Cyber\".equals(themeInfo.name);\n"
+            "        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled() != colgramCyberTheme) {\n"
+            "            org.colgram.core.ColgramConfig.setCyberThemeEnabled(colgramCyberTheme);\n"
+            "            // applyTheme also runs from Theme.<clinit>, before the cache field below is\n"
+            "            // assigned, so the clear has to tolerate a null cache.\n"
+            "            if (colgramPaintCache != null) {\n"
+            "                colgramPaintCache.clear();\n"
+            "            }\n"
+            "        }\n")
+        return content.replace(anchor, hook, 1)
+
+    patch_file(theme_file, cyber_apply_hook_injector, "if (colgramPaintCache != null) {",
+               "Theme Apply Syncs Cyber Flag")
+
+    def settings_cyber_row_removal_injector(content):
+        # The marker is the adjacency that only exists once the row line is gone: the Versions
+        # row becomes the last item before the section shadow.
+        marker = ('"Версии Telegram и обновления", "Переключение каналов и загрузка APK"));'
+                  + '\n        items.add(UItem.asShadow(null));')
+        if marker in content:
+            return content
+        row = ('        items.add(SettingCell.Factory.of(105, 0xFFFF3344, 0xFF7A0C14, '
+               'R.drawable.msg_colors, "Красно-чёрная тема Colgram Cyber", '
+               'org.colgram.core.ColgramConfig.isCyberThemeEnabled() ? "включена" : "выключена"));\n')
+        handler = ('            case 105:\n'
+                   '                org.colgram.core.ColgramConfig.init(getParentActivity());\n'
+                   '                org.colgram.core.ColgramConfig.setCyberThemeEnabled(\n'
+                   '                        !org.colgram.core.ColgramConfig.isCyberThemeEnabled());\n'
+                   '                if (getParentActivity() != null) {\n'
+                   '                    getParentActivity().recreate();\n'
+                   '                }\n'
+                   '                break;\n')
+        if row not in content or handler not in content:
+            return content
+        return content.replace(row, "", 1).replace(handler, "", 1)
+
+    patch_file(settings_activity, settings_cyber_row_removal_injector,
+               '"Версии Telegram и обновления", "Переключение каналов и загрузка APK"));'
+               + '\n        items.add(UItem.asShadow(null));',
+               "SettingsActivity Drops Standalone Cyber Row")
+
+    # 60. NotificationsSettingsActivity -> the auto-reply setting lives with the notifications.
+    #
+    # He asked for "настройка автоответчика в уведомлениях", i.e. the row belongs in the stock
+    # Notifications screen, not in a Colgram submenu. The row opens ColgramAutoReplyActivity,
+    # which configures the hook in ColgramHookHandler that actually sends the replies.
+    notifications_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                                      "org", "telegram", "ui", "NotificationsSettingsActivity.java")
+
+    def notifications_autoreply_injector(content):
+        marker = "colgramAutoReplyRow"
+        if marker in content:
+            return content
+
+        field_anchor = "    private int notificationsServiceRow;\n"
+        if field_anchor not in content:
+            return content
+        content = content.replace(
+            field_anchor,
+            field_anchor + "    private int colgramAutoReplyRow;\n", 1)
+
+        rows_anchor = ("        otherSectionRow = rowCount++;\n"
+                       "        notificationsServiceRow = rowCount++;\n")
+        if rows_anchor not in content:
+            return content
+        content = content.replace(
+            rows_anchor,
+            ("        otherSectionRow = rowCount++;\n"
+             "        colgramAutoReplyRow = rowCount++;\n"
+             "        notificationsServiceRow = rowCount++;\n"), 1)
+
+        click_anchor = "            } else if (position == notificationsServiceRow) {\n"
+        if click_anchor not in content:
+            return content
+        content = content.replace(
+            click_anchor,
+            ("            } else if (position == colgramAutoReplyRow) {\n"
+             "                presentFragment(new ColgramAutoReplyActivity());\n"
+             + click_anchor), 1)
+
+        bind_anchor = ("                case 5: {\n"
+                       "                    TextSettingsCell textCell = (TextSettingsCell) holder.itemView;\n"
+                       "                    SharedPreferences preferences = MessagesController.getNotificationsSettings(currentAccount);\n"
+                       "                    if (position == callsRingtoneRow) {\n")
+        if bind_anchor not in content:
+            return content
+        content = content.replace(
+            bind_anchor,
+            ("                case 5: {\n"
+             "                    TextSettingsCell textCell = (TextSettingsCell) holder.itemView;\n"
+             "                    SharedPreferences preferences = MessagesController.getNotificationsSettings(currentAccount);\n"
+             "                    if (position == colgramAutoReplyRow) {\n"
+             "                        textCell.setTextAndValue(\"Автоответчик\",\n"
+             "                                org.colgram.core.ColgramConfig.isAutoReplyEnabled()\n"
+             "                                        ? \"включён\" : \"выключен\", true);\n"
+             "                    } else if (position == callsRingtoneRow) {\n"), 1)
+        return content
+
+    patch_file(notifications_file, notifications_autoreply_injector, "colgramAutoReplyRow",
+               "Notifications Auto-Reply Row")
+
+    # 61. DataSettingsActivity -> the unlimited-memory story, told where storage is discussed.
+    #
+    # The row is honest about what it does: Telegram evicts cached media at 300 MB by default
+    # (AutoDeleteMediaTask reads "cache_limit"), which is why old videos vanish. Colgram raises
+    # that limit to the integer maximum and keeps the cache in app storage, so everything stays
+    # viewable without touching the gallery. The info cell below the row says exactly that.
+    data_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                             "org", "telegram", "ui", "DataSettingsActivity.java")
+
+    def data_memory_injector(content):
+        marker = "colgramMemoryRow"
+        if marker in content:
+            return content
+
+        field_anchor = "    private int usageSection2Row;\n"
+        if field_anchor not in content:
+            return content
+        content = content.replace(
+            field_anchor,
+            field_anchor
+            + "    private int colgramMemoryRow;\n"
+            + "    private int colgramMemoryInfoRow;\n", 1)
+
+        rows_anchor = ("        usageSection2Row = rowCount++;\n")
+        if rows_anchor not in content:
+            return content
+        content = content.replace(
+            rows_anchor,
+            ("        colgramMemoryRow = rowCount++;\n"
+             "        colgramMemoryInfoRow = rowCount++;\n"
+             + rows_anchor), 1)
+
+        viewtype_anchor = ("            if (position == mediaDownloadSection2Row || position == usageSection2Row "
+                           "|| position == callsSection2Row")
+        if viewtype_anchor not in content:
+            return content
+        content = content.replace(
+            viewtype_anchor,
+            ("            if (position == colgramMemoryInfoRow) {\n"
+             "                return 4;\n"
+             "            } else if (position == mediaDownloadSection2Row || position == usageSection2Row "
+             "|| position == callsSection2Row"), 1)
+
+        click_anchor = "            } else if (position == storageUsageRow) {\n"
+        if click_anchor not in content:
+            return content
+        content = content.replace(
+            click_anchor,
+            ("            } else if (position == colgramMemoryRow) {\n"
+             "                colgramShowMemoryDialog();\n"
+             + click_anchor), 1)
+
+        bind1_anchor = "                case 1: {\n                    TextSettingsCell textCell = (TextSettingsCell) holder.itemView;\n"
+        if bind1_anchor not in content:
+            return content
+        content = content.replace(
+            bind1_anchor,
+            bind1_anchor
+            + "                    if (position == colgramMemoryRow) {\n"
+            + "                        textCell.setTextAndValue(\"Безлимитная память Colgram\",\n"
+            + "                                org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled()\n"
+            + "                                        ? \"включена\" : \"выключена\", true);\n"
+            + "                    } else ", 1)
+
+        bind4_anchor = "                case 4: {\n"
+        if bind4_anchor not in content:
+            return content
+        content = content.replace(
+            bind4_anchor,
+            bind4_anchor
+            + "                    if (position == colgramMemoryInfoRow) {\n"
+            + "                        TextInfoPrivacyCell colgramInfo = (TextInfoPrivacyCell) holder.itemView;\n"
+            + "                        colgramInfo.setText(\"Медиа, видео и тексты хранятся в памяти \"\n"
+            + "                                + \"приложения без ограничения объёма: просмотренное остаётся \"\n"
+            + "                                + \"доступным всегда и не попадает в галерею телефона. \"\n"
+            + "                                + \"Colgram отключает автоматическую очистку кэша по лимиту.\");\n"
+            + "                    }\n", 1)
+
+        # The dialog builder, added as a private method before updateRows.
+        method_anchor = "    private void updateRows(boolean fullNotify) {\n"
+        if method_anchor not in content:
+            return content
+        content = content.replace(
+            method_anchor,
+            ("    private void colgramShowMemoryDialog() {\n"
+             "        final boolean enabled = org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+             "        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());\n"
+             "        builder.setTitle(\"Безлимитная память\");\n"
+             "        builder.setMessage(\"Включено: кэш медиа не ограничивается 300 МБ, просмотренные \"\n"
+             "                + \"фото, видео и тексты остаются доступными всегда и хранятся внутри \"\n"
+             "                + \"приложения, а не в галерее.\\n\\nВыключено: возвращается стандартное \"\n"
+             "                + \"поведение Telegram с очисткой кэша.\");\n"
+             "        builder.setPositiveButton(enabled ? \"Выключить\" : \"Включить\", (dialog, which) -> {\n"
+             "            boolean next = !org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+             "            org.colgram.core.ColgramConfig.setUnlimitedMemoryEnabled(next);\n"
+             "            org.colgram.core.ColgramUnlimitedMemory.apply(getContext(), next);\n"
+             "            updateRows(true);\n"
+             "        });\n"
+             "        builder.setNegativeButton(\"Отмена\", null);\n"
+             "        showDialog(builder.create());\n"
+             "    }\n"
+             "\n"
+             + method_anchor), 1)
+        return content
+
+    patch_file(data_file, data_memory_injector, "colgramMemoryRow",
+               "DataSettings Unlimited Memory Row")
+
+    # 62. SendMessagesHelper -> hand the replied-to author to the send hook.
+    #
+    # .мут is typed as a reply in a group, and the person to mute is the author of the quoted
+    # message. The original interceptor only carried the dialog and the reply id, which is not
+    # enough to resolve a sender without a database round trip, so the call site now extracts
+    # from_id itself and passes it along.
+    def send_hook_sender_injector(content):
+        marker = "colgramReplySender"
+        if marker in content:
+            return content
+        anchor = ("            int replyId = sendMessageParams.replyToMsg != null ? sendMessageParams.replyToMsg.getId() : 0;\n"
+                  "            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message)) {\n")
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            ("            int replyId = sendMessageParams.replyToMsg != null ? sendMessageParams.replyToMsg.getId() : 0;\n"
+             "            long colgramReplySender = sendMessageParams.replyToMsg != null\n"
+             "                    && sendMessageParams.replyToMsg.messageOwner != null\n"
+             "                    && sendMessageParams.replyToMsg.messageOwner.from_id != null\n"
+             "                    ? sendMessageParams.replyToMsg.messageOwner.from_id.user_id : 0L;\n"
+             "            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {\n"), 1)
+
+    patch_file(send_messages_helper, send_hook_sender_injector, "colgramReplySender",
+               "SendMessagesHelper Passes Reply Sender To Hook")
+
+    # 63. LiteMode -> power saving that saves power instead of features.
+    #
+    # Stock behaviour: once the battery drops to the slider level, getValue() returns
+    # PRESET_POWER_SAVER, which is 0 - every flag off, animated stickers dead, autoplay dead,
+    # chat background dead. That is "saving battery" by amputating the app, and he asked for the
+    # opposite: keep the functionality, cut the drain. The drain that actually matters is GPU
+    # compositing (blur, particles, liquid glass, scale/thanos animations) plus radio wakeups,
+    # and ColgramPowerGuard already stretches the latter. So the power-saver branch now keeps the
+    # user's own flag set and only strips the cosmetic GPU flags.
+    lite_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                             "org", "telegram", "messenger", "LiteMode.java")
+
+    def litemode_powersaver_injector(content):
+        marker = "colgramPowerSaverMask"
+        if marker in content:
+            return content
+        anchor = ("                if (!lastPowerSaverApplied) {\n"
+                  "                    onPowerSaverApplied(lastPowerSaverApplied = true);\n"
+                  "                }\n"
+                  "                return PRESET_POWER_SAVER;\n")
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            ("                if (!lastPowerSaverApplied) {\n"
+             "                    onPowerSaverApplied(lastPowerSaverApplied = true);\n"
+             "                }\n"
+             "                // Colgram: keep every feature the user enabled. Only the GPU-heavy\n"
+             "                // cosmetics go; ColgramPowerGuard stretches the background radio work.\n"
+             "                int colgramPowerSaverMask = FLAG_CHAT_BLUR | FLAG_PARTICLES\n"
+             "                        | FLAG_LIQUID_GLASS | FLAG_CHAT_SCALE | FLAG_CHAT_THANOS;\n"
+             "                return value & ~colgramPowerSaverMask;\n"), 1)
+
+    patch_file(lite_file, litemode_powersaver_injector, "colgramPowerSaverMask",
+               "LiteMode Power Saver Keeps Features")
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")

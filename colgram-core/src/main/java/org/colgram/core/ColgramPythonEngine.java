@@ -71,6 +71,11 @@ public class ColgramPythonEngine {
         fallbackScope.put("client", "Colgram");
     }
 
+    /** Application context for callers that need to reach the UI thread (toasts, dialogs). */
+    public static Context appContext() {
+        return appContext;
+    }
+
     /**
      * Starts the embedded CPython runtime if it is not already running.
      * Safe to call from any thread; the first caller wins and later callers

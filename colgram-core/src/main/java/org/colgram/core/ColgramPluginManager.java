@@ -154,6 +154,17 @@ public class ColgramPluginManager {
     }
 
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text) {
+        return hookOnSendMessage(dialogId, replyToMsgId, text, 0L);
+    }
+
+    /**
+     * Outgoing-message interceptor with the replied-to sender attached.
+     *
+     * The sender id is what makes .мут usable in a group: the command is typed as a reply, and
+     * the person being muted is the author of the quoted message, not the chat itself.
+     */
+    public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text, long replySenderId) {
+        if (text != null && handleMuteCommand(dialogId, text, replySenderId)) return true;
         if (text == null || !text.startsWith(".")) return false;
 
         String[] parts = text.substring(1).split("\\s+", 2);
@@ -246,6 +257,47 @@ public class ColgramPluginManager {
             sb.append("   • ").append(p.description).append("\n\n");
         }
         return sb.toString().trim();
+    }
+
+    /**
+     * .мут / .unmute — silence or restore a sender's pings without leaving the chat.
+     *
+     * The target is the author of the quoted message when the command is sent as a reply, and
+     * the private-chat peer otherwise. It feeds the same notifications-block list the
+     * NotificationsController hook consults, so a muted sender's messages still arrive but never
+     * ring, buzz or light the screen. The command message itself is swallowed (returns true) so
+     * the chat is not littered with ".мут".
+     */
+    private static boolean handleMuteCommand(long dialogId, String text, long replySenderId) {
+        String trimmed = text.trim();
+        String lower = trimmed.toLowerCase();
+        boolean mute;
+        if (lower.equals(".мут") || lower.equals(".mute") || lower.startsWith(".мут ") || lower.startsWith(".mute ")) {
+            mute = true;
+        } else if (lower.equals(".unmute") || lower.equals(".размут")
+                || lower.startsWith(".unmute ") || lower.startsWith(".размут ")) {
+            mute = false;
+        } else {
+            return false;
+        }
+        long target = replySenderId != 0 ? replySenderId : (dialogId > 0 ? dialogId : 0);
+        if (target == 0) {
+            toast("`.мут` — в личке или ответом на сообщение того, кого заглушить");
+            return true;
+        }
+        ColgramHookHandler.setNotificationsBlocked(target, mute);
+        toast(mute ? "Пинги от пользователя отключены" : "Пинги от пользователя включены");
+        return true;
+    }
+
+    private static void toast(final String text) {
+        try {
+            final Context ctx = ColgramPythonEngine.appContext();
+            if (ctx == null) return;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
+                    android.widget.Toast.makeText(ctx, text, android.widget.Toast.LENGTH_SHORT).show());
+        } catch (Throwable ignored) {
+        }
     }
 
     private static void handleSpamCommand(long dialogId, String args) {

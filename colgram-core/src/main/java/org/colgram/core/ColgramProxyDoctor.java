@@ -44,8 +44,11 @@ public class ColgramProxyDoctor {
         int unchecked = ColgramProxyManager.getUncheckedCount();
         int total = ColgramProxyManager.getPoolSize();
         int fakeTls = ColgramProxyManager.getFakeTlsCount();
+        int chained = ColgramProxyManager.getChainedCount();
+        int relays = ColgramProxyManager.getRelayCount();
         String stats = "в пуле " + total + ": " + alive + " работает, " + dead + " не отвечает, "
-                + unchecked + " без проверки; fake-TLS " + fakeTls;
+                + unchecked + " без проверки; fake-TLS " + fakeTls
+                + "; через ретранслятор " + chained + " (ретрансляторов " + relays + ")";
 
         if (current != null) {
             return "Активный прокси: " + current.address + ":" + current.port

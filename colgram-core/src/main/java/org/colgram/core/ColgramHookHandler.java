@@ -23,6 +23,7 @@ public class ColgramHookHandler {
             appContext = context.getApplicationContext();
             ColgramOptimizer.optimizeStartup(appContext);
             ColgramConfig.init(appContext);
+            ColgramUnlimitedMemory.restore(appContext);
             ColgramStorageSandbox.init(appContext);
             ColgramDatabase.getInstance(appContext);
             // Registers the context only. The CPython runtime itself is started
@@ -53,6 +54,11 @@ public class ColgramHookHandler {
         return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text);
     }
 
+    /** Same hook with the replied-to message's author, so reply-targeted commands work. */
+    public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text, long replySenderId) {
+        return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text, replySenderId);
+    }
+
     /**
      * HOOK: Called from MessagesController when a new message is received or created.
      *
@@ -64,6 +70,33 @@ public class ColgramHookHandler {
     public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
         if (!isOut && !colgramRememberDispatch(dialogId, messageId)) return;
         ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
+        if (!isOut) colgramAutoReply(dialogId);
+    }
+
+    /** Per-dialog timestamp of the last automatic answer. */
+    private static final java.util.HashMap<Long, Long> colgramAutoReplyAt = new java.util.HashMap<>();
+
+    /**
+     * Native auto-reply: answer an inbound message with the configured text.
+     *
+     * It rides the same dispatch that feeds plugins, so it sees exactly the messages a plugin
+     * would, and the dedupe above guarantees one answer per arrival. The cooldown is what keeps
+     * this from becoming a spam cannon in a busy chat: five minutes per dialog by default.
+     */
+    private static void colgramAutoReply(long dialogId) {
+        if (!ColgramConfig.isAutoReplyEnabled()) return;
+        // Positive dialog ids are private chats; groups are negative and opt-in; channels are
+        // negative too but cannot be answered unless you post in them, and the send simply fails.
+        if (dialogId < 0 && !ColgramConfig.isAutoReplyInGroups()) return;
+        long now = System.currentTimeMillis();
+        long cooldown = ColgramConfig.getAutoReplyCooldownSec() * 1000L;
+        synchronized (colgramAutoReplyAt) {
+            Long last = colgramAutoReplyAt.get(dialogId);
+            if (last != null && now - last < cooldown) return;
+            colgramAutoReplyAt.put(dialogId, now);
+            if (colgramAutoReplyAt.size() > 256) colgramAutoReplyAt.clear();
+        }
+        ColgramPythonEngine.sendMessage(dialogId, ColgramConfig.getAutoReplyText());
     }
 
     /** Bounded LRU of recently dispatched inbound messages; false means "already handled". */

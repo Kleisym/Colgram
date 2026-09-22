@@ -72,6 +72,28 @@ public class ColgramProxyManager {
         int failedVerdicts = 0;
         /** Fake-TLS (an "ee" secret): the handshake is wrapped in a plausible TLS record. */
         public final boolean fakeTls;
+        /** Last plain TCP connect result: -1 unknown, -2 unreachable, else RTT ms. */
+        public volatile int tcpMs = -1;
+        /** elapsedRealtime of the last TCP-level check. */
+        public volatile long tcpCheckedAt = 0L;
+        /** Set when a native MTProto/SOCKS handshake succeeded at least once. */
+        public volatile boolean nativeVerified = false;
+        /**
+         * Relay that can reach this node when a direct socket cannot. The block on this
+         * network is per-IP, so plenty of perfectly good proxies are simply unreachable from
+         * here; a relay that is reachable turns them back on through a loopback forwarder.
+         */
+        public volatile ColgramProxyChain.Relay chainRelay = null;
+        /** Loopback port of an open chain forwarder, when this node is applied through a relay. */
+        public volatile int chainPort = 0;
+
+        public String effectiveHost() {
+            return chainPort > 0 ? "127.0.0.1" : address;
+        }
+
+        public int effectivePort() {
+            return chainPort > 0 ? chainPort : port;
+        }
 
         public ProxyItem(String address, int port, String secret, int type) {
             this.address = address;
@@ -110,6 +132,16 @@ public class ColgramProxyManager {
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private static final List<ProxyItem> verifiedPool = Collections.synchronizedList(new ArrayList<>());
+    /** Reachable tunnels used only to chain to blocked pool entries. Never shown as proxies. */
+    private static final List<ColgramProxyChain.Relay> relayPool = Collections.synchronizedList(new ArrayList<>());
+    /**
+     * Parallel TCP sweep. The old prober walked the pool one handshake at a time with a 3 s gap,
+     * so a 200-entry pool needed ten minutes to report anything - the exact complaint that the
+     * check "takes forever while other sites check in a second". Third-party checkers are fast
+     * because they fan out; this does the same, and only the survivors earn a protocol handshake.
+     */
+    private static final ExecutorService sweeper = Executors.newFixedThreadPool(24);
+    private static final AtomicBoolean sweeping = new AtomicBoolean(false);
     private static volatile ProxyItem currentActiveProxy = null;
     private static volatile Context appContext = null;
     private static final AtomicBoolean initialized = new AtomicBoolean(false);
@@ -133,6 +165,20 @@ public class ColgramProxyManager {
         "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
     };
+
+    /**
+     * Relay lists. These are NOT Telegram proxies and never enter the pool or the stock proxy
+     * screen: they are tunnels. An HTTP CONNECT proxy that answers here and can reach a blocked
+     * MTProxy turns that MTProxy back on, which is the only way to use a node whose IP is on the
+     * same blocklist as Telegram's own.
+     */
+    private static final String[] RELAY_SOURCES_HTTP = {
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    };
+    private static final String[] RELAY_SOURCES_SOCKS = {
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    };
+    private static final int MAX_RELAYS = 60;
 
     /** Hard ceiling on the candidate list; the harvest replaces the oldest unverified entries. */
     private static final int MAX_POOL_SIZE = 200;
@@ -266,6 +312,20 @@ public class ColgramProxyManager {
                 Log.e(TAG, "Initial proxy fetch error", t);
             }
         });
+
+        // Reachability on a filtered network changes on the scale of minutes, and a stale "alive"
+        // is exactly why a chosen proxy silently stops working. Re-sweep every 5 minutes; the
+        // sweep is 24 parallel 1.2 s connects, so the whole pool costs a couple of seconds.
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                // On a low, unplugged battery the sweep waits: 200 parallel connects keep the
+                // radio at full power for seconds, and a proxy verdict is not worth that.
+                if (ColgramPowerGuard.shouldThrottle(appContext)) return;
+                if (ColgramConfig.isBuiltinProxyEnabled()) sweepFast(null);
+            } catch (Throwable t) {
+                Log.w(TAG, "periodic sweep failed", t);
+            }
+        }, 60000, 300000, java.util.concurrent.TimeUnit.MILLISECONDS);
 
         // 5. Periodic health check every 30 seconds (was 5 minutes)
         //
@@ -409,12 +469,9 @@ public class ColgramProxyManager {
         mainHandler.post(proberTick);
     }
 
-    /** Manual "check now": drop the freshness window so the prober walks everything again. */
+    /** Manual "check now": a parallel TCP sweep first, then protocol handshakes on survivors. */
     public static void checkPoolNow() {
-        for (ProxyItem p : verifiedPool) {
-            p.lastCheckAt = 0L;
-        }
-        startProber();
+        sweepFast(null);
     }
 
     /** Kept for the settings row; a manual tap always means "walk the list again". */
@@ -422,12 +479,145 @@ public class ColgramProxyManager {
         checkPoolNow();
     }
 
+    /**
+     * Parallel reachability sweep: every pool entry gets a plain TCP connect on its own thread
+     * (1.2 s budget), and every entry the blocklist hides gets one attempt through a relay.
+     * 24 threads over a 200-entry pool finishes in single-digit seconds, which is what the pool
+     * screen needs to show honest numbers instead of a ten-minute crawl.
+     *
+     * TCP-alive is not protocol-alive: the prober still hands the survivors to Telegram's native
+     * checkProxy afterwards, and only a native verdict sets {@code isAvailable}.
+     */
+    public static void sweepFast(final Runnable onDone) {
+        if (appContext == null) return;
+        if (!sweeping.compareAndSet(false, true)) return;
+        final List<ProxyItem> snapshot = new ArrayList<>(verifiedPool);
+        final List<ColgramProxyChain.Relay> relaySnapshot = new ArrayList<>(relayPool);
+        if (snapshot.isEmpty()) {
+            sweeping.set(false);
+            if (onDone != null) mainHandler.post(onDone);
+            return;
+        }
+        final java.util.concurrent.atomic.AtomicInteger remaining =
+                new java.util.concurrent.atomic.AtomicInteger(snapshot.size());
+        final java.util.concurrent.atomic.AtomicInteger doneCount =
+                new java.util.concurrent.atomic.AtomicInteger(0);
+        for (final ProxyItem item : snapshot) {
+            if (item.type == 2 || item.isLocalDpi()) {
+                if (remaining.decrementAndGet() == 0) finishSweep(onDone);
+                continue;
+            }
+            sweeper.execute(() -> {
+                try {
+                    int rtt = testProxy(item.address, item.port, 1200);
+                    if (rtt >= 0) {
+                        item.tcpMs = rtt;
+                        item.chainRelay = null;
+                        item.chainPort = 0;
+                    } else {
+                        item.tcpMs = -2;
+                        ColgramProxyChain.Relay relay = pickRelay(relaySnapshot, item);
+                        if (relay != null) {
+                            item.chainRelay = relay;
+                            item.tcpMs = relay.rttMs;
+                        }
+                    }
+                    item.tcpCheckedAt = SystemClock.elapsedRealtime();
+                    int finished = doneCount.incrementAndGet();
+                    if (finished % 10 == 0) postSweepProgress();
+                } catch (Throwable ignored) {
+                } finally {
+                    if (remaining.decrementAndGet() == 0) finishSweep(onDone);
+                }
+            });
+        }
+    }
+
+    private static void finishSweep(final Runnable onDone) {
+        sweeping.set(false);
+        postSweepProgress();
+        // Survivors earn a protocol handshake; the rest of the pool waits for the next sweep.
+        startProber();
+        autoConnectIfBlocked();
+        if (onDone != null) mainHandler.post(onDone);
+    }
+
+    /** Production Telegram endpoints, used only to answer "is Telegram reachable at all". */
+    private static final String[][] TELEGRAM_DC_ENDPOINTS = {
+            {"149.154.175.50", "443"},
+            {"149.154.167.50", "443"},
+            {"91.108.56.100", "443"},
+            {"185.76.151.1", "443"},
+    };
+
+    private static boolean telegramDirectlyReachable() {
+        for (String[] endpoint : TELEGRAM_DC_ENDPOINTS) {
+            try {
+                if (testProxy(endpoint[0], Integer.parseInt(endpoint[1]), 1200) >= 0) return true;
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The bypass actually bypassing: when every Telegram endpoint is unreachable and no proxy is
+     * applied, connect through the best node the protocol check confirmed. Without this the pool
+     * could hold a working proxy while the app sat on "Соединение..." forever - which is exactly
+     * what "the bypass finds proxies but never connects to them" meant. It only ever fires when
+     * the direct route is dead, so on an open network nothing changes.
+     */
+    private static void autoConnectIfBlocked() {
+        Context ctx = appContext;
+        if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled()) return;
+        if (isProxyEnabled(ctx)) return;
+        if (telegramDirectlyReachable()) return;
+        ProxyItem best = null;
+        for (ProxyItem p : verifiedPool) {
+            if (!p.nativeVerified || p.isLocalDpi() || p.type == 2) continue;
+            if (best == null || betterCandidate(p, best)) best = p;
+        }
+        if (best == null) return;
+        final ProxyItem chosen = best;
+        Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
+                + chosen.address + ":" + chosen.port);
+        mainHandler.post(() -> forceApplyProxy(chosen));
+    }
+
+    /** Live UI refresh while the sweep runs, so the pool screen counts up instead of freezing. */
+    private static void postSweepProgress() {
+        mainHandler.post(() -> {
+            try {
+                Class<?> ncClass = Class.forName("org.colgram.messenger.NotificationCenter");
+                Object nc = ncClass.getMethod("getGlobalInstance").invoke(null);
+                int id = ncClass.getField("proxySettingsChanged").getInt(null);
+                ncClass.getMethod("postNotificationName", int.class, Object[].class)
+                        .invoke(nc, id, new Object[0]);
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    /** Best relay for a blocked entry: alive, not dead, lowest measured RTT. */
+    private static ColgramProxyChain.Relay pickRelay(List<ColgramProxyChain.Relay> relays, ProxyItem item) {
+        ColgramProxyChain.Relay best = null;
+        synchronized (relays) {
+            for (ColgramProxyChain.Relay relay : relays) {
+                if (relay.dead || relay.rttMs < 0) continue;
+                if (best == null || relay.rttMs < best.rttMs) best = relay;
+            }
+        }
+        if (best == null) return null;
+        int rtt = ColgramProxyChain.probe(best, item.address, item.port, 2500);
+        return rtt >= 0 ? best : null;
+    }
+
     private static final Runnable proberTick = new Runnable() {
         @Override
         public void run() {
             final ProxyItem target = nextProberTarget();
             if (target == null) {
-                mainHandler.postDelayed(this, PROBE_IDLE_MS);
+                mainHandler.postDelayed(this, PROBE_IDLE_MS * ColgramPowerGuard.intervalFactor(appContext));
                 return;
             }
             final long startedAt = SystemClock.elapsedRealtime();
@@ -439,7 +629,7 @@ public class ColgramProxyManager {
                     // dead proxy, not an unknown one.
                     onVerdict(target, false);
                 }
-                mainHandler.postDelayed(this, PROBE_GAP_MS);
+                mainHandler.postDelayed(this, PROBE_GAP_MS * ColgramPowerGuard.intervalFactor(appContext));
             };
             boolean started;
             try {
@@ -459,23 +649,38 @@ public class ColgramProxyManager {
         }
     };
 
-    /** Next entry whose verdict is missing or stale; null when the whole pool is fresh. */
+    /**
+     * Next entry that deserves a protocol handshake; null when nothing does.
+     *
+     * The sweep's TCP verdict orders this: a node that answers TCP but has no protocol verdict
+     * yet goes first, because that is exactly the set the user sees as "found working proxies"
+     * and expects to be connectable. Stale protocol verdicts come second, everything else waits.
+     */
     private static ProxyItem nextProberTarget() {
         final long now = SystemClock.elapsedRealtime();
         final int size = verifiedPool.size();
         if (size == 0) return null;
+        ProxyItem tcpAlive = null;
+        ProxyItem stale = null;
         for (int step = 0; step < size; step++) {
             int idx = (proberCursor + step) % size;
             ProxyItem p = verifiedPool.get(idx);
             // A WEB entry needs a WebView bridge per check and the pool never holds one; the
             // user's own WEB proxy is exercised where it is actually applied.
-            if (p.type == 2) continue;
-            if (p.lastCheckAt > 0 && now - p.lastCheckAt < RECHECK_INTERVAL_MS) continue;
-            proberCursor = (idx + 1) % size;
-            return p;
+            if (p.type == 2 || p.isLocalDpi()) continue;
+            boolean fresh = p.lastCheckAt > 0 && now - p.lastCheckAt < RECHECK_INTERVAL_MS;
+            if (p.tcpMs >= 0 && !fresh) {
+                tcpAlive = p;
+                proberCursor = (idx + 1) % size;
+                break;
+            }
+            if (stale == null && !fresh) stale = p;
         }
-        proberCursor = 0;
-        return null;
+        ProxyItem target = tcpAlive != null ? tcpAlive : stale;
+        if (target != null && tcpAlive == null) {
+            proberCursor = (verifiedPool.indexOf(target) + 1) % Math.max(1, size);
+        }
+        return target;
     }
 
     /**
@@ -486,10 +691,12 @@ public class ColgramProxyManager {
         item.lastCheckAt = SystemClock.elapsedRealtime();
         if (alive) {
             item.isAvailable = true;
+            item.nativeVerified = true;
             item.nativeFailures = 0;
             item.failedVerdicts = 0;
             rememberAlive();
         } else {
+            item.nativeVerified = false;
             item.failedVerdicts++;
             if (item.failedVerdicts >= MAX_FAILED_VERDICTS) {
                 item.isAvailable = false;
@@ -634,8 +841,8 @@ public class ColgramProxyManager {
             Object builder = psClass.getDeclaredMethod("builder").invoke(null);
             Class<?> bClass = builder.getClass();
             bClass.getDeclaredMethod("setType", pstClass).invoke(builder, typeObj);
-            bClass.getDeclaredMethod("setAddress", String.class).invoke(builder, item.address);
-            bClass.getDeclaredMethod("setPort", int.class).invoke(builder, item.port);
+            bClass.getDeclaredMethod("setAddress", String.class).invoke(builder, item.effectiveHost());
+            bClass.getDeclaredMethod("setPort", int.class).invoke(builder, item.effectivePort());
             bClass.getDeclaredMethod("setSecret", String.class)
                     .invoke(builder, item.secret == null ? "" : item.secret);
             return bClass.getDeclaredMethod("build").invoke(builder);
@@ -883,8 +1090,13 @@ public class ColgramProxyManager {
         return best != null ? best : unchecked;
     }
 
-    /** Fake-TLS first, then lower latency. Both only ever compare two verified nodes. */
+    /**
+     * Native-verified first, then fake-TLS, then lower latency. A node that has actually completed
+     * a protocol handshake beats one that merely accepted a socket: "found a working proxy but
+     * never connects" was the rotator offering TCP-open nodes that had never spoken MTProto.
+     */
     private static boolean betterCandidate(ProxyItem a, ProxyItem b) {
+        if (a.nativeVerified != b.nativeVerified) return a.nativeVerified;
         if (a.fakeTls != b.fakeTls) return a.fakeTls;
         if (a.pingMs < 0) return false;
         if (b.pingMs < 0) return true;
@@ -934,11 +1146,72 @@ public class ColgramProxyManager {
                 Log.w(TAG, "source failed: " + url + " (" + t.getMessage() + ")");
             }
         }
-        Log.i(TAG, "harvest: " + before + " -> " + verifiedPool.size() + " candidates");
+        harvestRelays();
+        Log.i(TAG, "harvest: " + before + " -> " + verifiedPool.size() + " candidates, "
+                + relayPool.size() + " relays");
         mainHandler.post(() -> {
             startProber();
             publishPoolToStock();
         });
+    }
+
+    /**
+     * Pull tunnel lists and keep the ones that answer from here. A relay is only useful if this
+     * machine can open a socket to it, so each candidate gets one 1.2 s TCP check before it is
+     * kept; whether it can then reach a blocked node is discovered per chain, in pickRelay.
+     */
+    private static void harvestRelays() {
+        final List<ColgramProxyChain.Relay> found = new ArrayList<>();
+        for (String url : RELAY_SOURCES_HTTP) {
+            try {
+                collectRelays(httpGet(url), false, found);
+            } catch (Throwable t) {
+                Log.w(TAG, "relay source failed: " + url + " (" + t.getMessage() + ")");
+            }
+        }
+        for (String url : RELAY_SOURCES_SOCKS) {
+            try {
+                collectRelays(httpGet(url), true, found);
+            } catch (Throwable t) {
+                Log.w(TAG, "relay source failed: " + url + " (" + t.getMessage() + ")");
+            }
+        }
+        synchronized (relayPool) {
+            for (ColgramProxyChain.Relay relay : found) {
+                if (relayPool.size() >= MAX_RELAYS) break;
+                if (!relayPool.contains(relay)) relayPool.add(relay);
+            }
+            for (int i = relayPool.size() - 1; i >= 0; i--) {
+                if (relayPool.get(i).dead) relayPool.remove(i);
+            }
+        }
+        final List<ColgramProxyChain.Relay> snapshot = new ArrayList<>(relayPool);
+        for (final ColgramProxyChain.Relay relay : snapshot) {
+            if (relay.rttMs >= 0) continue;
+            sweeper.execute(() -> {
+                int rtt = testProxy(relay.host, relay.port, 1200);
+                relay.rttMs = rtt;
+                relay.dead = rtt < 0;
+            });
+        }
+    }
+
+    /** Parses host:port lines out of a relay list. */
+    private static void collectRelays(String body, boolean socks, List<ColgramProxyChain.Relay> out) {
+        if (body == null) return;
+        for (String line : body.split("\\r?\\n")) {
+            line = line.trim();
+            int colon = line.lastIndexOf(':');
+            if (colon <= 0 || colon == line.length() - 1) continue;
+            String host = line.substring(0, colon);
+            if (host.isEmpty() || host.indexOf(' ') >= 0) continue;
+            try {
+                int port = Integer.parseInt(line.substring(colon + 1));
+                if (port > 0 && port < 65536) out.add(new ColgramProxyChain.Relay(host, port, socks));
+            } catch (NumberFormatException ignored) {
+            }
+            if (out.size() >= MAX_RELAYS * 2) return;
+        }
     }
 
     /**
@@ -1077,9 +1350,30 @@ public class ColgramProxyManager {
     /**
      * Apply proxy into Telegram's native layer, SharedPreferences, and SharedConfig.
      */
+    /**
+     * Open a loopback forwarder when the node itself is unreachable from here but a relay can
+     * reach it, and point the item at the local port. Telegram then connects to 127.0.0.1 exactly
+     * as it does to WebProxyTransport's WebSocket bridge, and the blocked node carries traffic.
+     * A node that answers directly is never chained: the extra hop only costs latency.
+     */
+    private static void resolveChain(ProxyItem proxy) {
+        proxy.chainPort = 0;
+        if (proxy.chainRelay == null || proxy.isLocalDpi() || proxy.type == 2) return;
+        if (testProxy(proxy.address, proxy.port, 1200) >= 0) return;
+        int port = ColgramProxyChain.open(proxy.address, proxy.port, proxy.chainRelay);
+        if (port > 0) {
+            proxy.chainPort = port;
+            Log.i(TAG, "chained " + proxy.address + ":" + proxy.port + " through "
+                    + proxy.chainRelay + " at 127.0.0.1:" + port);
+        } else {
+            proxy.chainRelay = null;
+        }
+    }
+
     public static void forceApplyProxy(ProxyItem proxy) {
         if (proxy == null) return;
         currentActiveProxy = proxy;
+        resolveChain(proxy);
         if (proxy.isLocalDpi()) {
             // Start the grace window: the desync strategy prober needs several connections
             // to find a strategy that gets through, and rotating away before then defeats
@@ -1098,8 +1392,8 @@ public class ColgramProxyManager {
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
                 preferences.edit()
                         .putBoolean("proxy_enabled", true)
-                        .putString("proxy_ip", proxy.address)
-                        .putInt("proxy_port", proxy.port)
+                        .putString("proxy_ip", proxy.effectiveHost())
+                        .putInt("proxy_port", proxy.effectivePort())
                         .putString("proxy_user", "")
                         .putString("proxy_pass", "")
                         .putString("proxy_secret", proxy.secret)
@@ -1514,26 +1808,49 @@ public class ColgramProxyManager {
         return c;
     }
 
-    /** Entries that have been checked and failed. */
+    /** Entries that have been checked and failed, with no relay that can reach them either. */
     public static int getDeadCount() {
         int c = 0;
-        for (ProxyItem p : verifiedPool) if (p.pingMs == -2) c++;
+        for (ProxyItem p : verifiedPool) {
+            if (p.chainRelay != null) continue;
+            if (p.pingMs == -2 || p.tcpMs == -2) c++;
+        }
         return c;
     }
 
     /** Entries no verdict exists for yet. */
     public static int getUncheckedCount() {
         int c = 0;
-        for (ProxyItem p : verifiedPool) if (p.pingMs == -1) c++;
+        for (ProxyItem p : verifiedPool) if (p.pingMs == -1 && p.tcpMs == -1) c++;
+        return c;
+    }
+
+    /** Entries a direct socket cannot reach but a relay can: usable only through a chain. */
+    public static int getChainedCount() {
+        int c = 0;
+        for (ProxyItem p : verifiedPool) if (p.chainRelay != null) c++;
+        return c;
+    }
+
+    /** Tunnels currently known to answer from here. */
+    public static int getRelayCount() {
+        int c = 0;
+        synchronized (relayPool) {
+            for (ColgramProxyChain.Relay r : relayPool) if (!r.dead && r.rttMs >= 0) c++;
+        }
         return c;
     }
 
     /** Human-readable state of one ping result. */
     public static String describePing(ProxyItem item) {
         if (item == null) return "нет";
-        if (item.pingMs == -1) return "не проверен";
-        if (item.pingMs == -2) return "не отвечает";
-        return item.pingMs + " мс";
+        if (item.chainRelay != null) {
+            return "через ретранслятор " + item.chainRelay.host + " (" + item.chainRelay.rttMs + " мс)";
+        }
+        if (item.pingMs >= 0) return item.pingMs + " мс";
+        if (item.tcpMs >= 0) return "TCP " + item.tcpMs + " мс";
+        if (item.tcpMs == -2) return "недоступен напрямую";
+        return "не проверен";
     }
 
     /** Entries that carry a fake-TLS secret, i.e. the handshake looks like ordinary HTTPS. */

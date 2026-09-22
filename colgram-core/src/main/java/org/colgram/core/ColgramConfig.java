@@ -372,4 +372,65 @@ public class ColgramConfig {
             prefs.edit().putString(KEY_MINIAPP_PIP_POS_PREFIX + slot, x + "," + y).apply();
         }
     }
+
+    // --- Auto-reply ---
+    private static final String KEY_AUTO_REPLY_ENABLED = "auto_reply_enabled";
+    private static final String KEY_AUTO_REPLY_TEXT = "auto_reply_text";
+    private static final String KEY_AUTO_REPLY_GROUPS = "auto_reply_groups";
+    private static final String KEY_AUTO_REPLY_COOLDOWN = "auto_reply_cooldown_sec";
+    public static final String DEFAULT_AUTO_REPLY_TEXT =
+            "Я сейчас не у экрана, отвечу позже. (автоответ Colgram)";
+
+    public static boolean isAutoReplyEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_AUTO_REPLY_ENABLED, false);
+    }
+
+    public static void setAutoReplyEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_REPLY_ENABLED, enabled).apply();
+    }
+
+    public static String getAutoReplyText() {
+        return prefs != null ? prefs.getString(KEY_AUTO_REPLY_TEXT, DEFAULT_AUTO_REPLY_TEXT)
+                : DEFAULT_AUTO_REPLY_TEXT;
+    }
+
+    public static void setAutoReplyText(String text) {
+        if (prefs != null) prefs.edit().putString(KEY_AUTO_REPLY_TEXT, text).apply();
+    }
+
+    /** When off, the reply only answers private chats; groups stay quiet. */
+    public static boolean isAutoReplyInGroups() {
+        return prefs != null && prefs.getBoolean(KEY_AUTO_REPLY_GROUPS, false);
+    }
+
+    public static void setAutoReplyInGroups(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_REPLY_GROUPS, enabled).apply();
+    }
+
+    /** Minimum seconds between two replies to the same dialog; 0 answers every message. */
+    public static int getAutoReplyCooldownSec() {
+        return prefs != null ? prefs.getInt(KEY_AUTO_REPLY_COOLDOWN, 300) : 300;
+    }
+
+    public static void setAutoReplyCooldownSec(int seconds) {
+        if (prefs != null) prefs.edit().putInt(KEY_AUTO_REPLY_COOLDOWN, seconds).apply();
+    }
+
+    // --- Unlimited memory ---
+    private static final String KEY_UNLIMITED_MEMORY = "unlimited_memory_enabled";
+
+    /**
+     * "Unlimited memory" means the media cache is never auto-evicted: Telegram's own
+     * AutoDeleteMediaTask reads the cache_limit preference and defaults it to 300 MB, which is
+     * what makes old videos and photos silently disappear. With this on the limit is raised to
+     * the integer maximum, so everything already viewed stays viewable, and it lives in the app's
+     * own storage instead of the gallery, which is the "not cluttering the phone" half.
+     */
+    public static boolean isUnlimitedMemoryEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_UNLIMITED_MEMORY, true);
+    }
+
+    public static void setUnlimitedMemoryEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_UNLIMITED_MEMORY, enabled).apply();
+    }
 }

@@ -55,10 +55,6 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int bypassFlagSecureRow;
     private int ghostSectionRow;
 
-    private int themeHeaderRow;
-    private int cyberThemeRow;
-    private int themeSectionRow;
-
     private int networkHeaderRow;
     private int dpiBypassRow;
     private int dohRow;
@@ -109,10 +105,6 @@ public class ColgramSettingsActivity extends BaseFragment {
         ghostOnlineRow = rowCount++;
         bypassFlagSecureRow = rowCount++;
         ghostSectionRow = rowCount++;
-
-        themeHeaderRow = rowCount++;
-        cyberThemeRow = rowCount++;
-        themeSectionRow = rowCount++;
 
         networkHeaderRow = rowCount++;
         dpiBypassRow = rowCount++;
@@ -234,23 +226,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
-            } else if (position == cyberThemeRow) {
-                boolean val = !ColgramConfig.isCyberThemeEnabled();
-                ColgramConfig.setCyberThemeEnabled(val);
-                if (view instanceof TextCheckCell) {
-                    ((TextCheckCell) view).setChecked(val);
-                }
-                // Cyber is consulted when a colour is READ, so flipping the flag changes
-                // nothing for screens that already built their paints — which is why it
-                // looked half-applied and "ugly": whatever was on screen kept its old
-                // colours until the app restarted. There is no global theme-changed event
-                // in this Telegram version to broadcast (didApplyNewTheme has exactly one
-                // listener and it is account-scoped to ChatActivity), so recreate the host
-                // activity and let every screen resolve its colours again.
-                if (getParentActivity() != null) {
-                    getParentActivity().recreate();
-                }
-                Toast.makeText(getParentActivity(), "Тема изменена. Перезайдите на экран для обновления.", Toast.LENGTH_SHORT).show();
             } else if (position == dpiBypassRow) {
                 // Persist + route + run, in one call. This row used to only start or stop the
                 // listener, so the choice was lost on restart and the toggle could show
@@ -369,7 +344,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             return position == cloakEnabledRow || position == cloakModelRow ||
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
-                   position == cyberThemeRow || position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
+                   position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
                    position == ownProxyRow || position == proxyStatusRow ||
                    position == sandboxStorageRow || position == sandboxFilesRow ||
                    position == botRealtimeRow || position == pluginsRow;
@@ -378,7 +353,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         @Override
         public int getItemViewType(int position) {
             if (position == cloakingHeaderRow || position == vaultHeaderRow || position == ghostHeaderRow ||
-                position == themeHeaderRow || position == networkHeaderRow || position == sandboxHeaderRow ||
+                position == networkHeaderRow || position == sandboxHeaderRow ||
                 position == botsHeaderRow) {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow
@@ -386,7 +361,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                     || position == sandboxFilesRow || position == pluginsRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
-                       position == themeSectionRow || position == networkSectionRow || position == sandboxSectionRow ||
+                       position == networkSectionRow || position == sandboxSectionRow ||
                        position == botsSectionRow) {
                 return 3; // ShadowSectionCell
             }
@@ -428,8 +403,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                         headerCell.setText("Сейф сообщений (Anti-Delete)");
                     } else if (position == ghostHeaderRow) {
                         headerCell.setText("Режим призрака (Ghost Mode)");
-                    } else if (position == themeHeaderRow) {
-                        headerCell.setText("Оформление");
                     } else if (position == networkHeaderRow) {
                         headerCell.setText("Сеть и анонимность (Анти-ТСПУ)");
                     } else if (position == sandboxHeaderRow) {
@@ -463,8 +436,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                         checkCell.setTextAndCheck("Скрывать онлайн статус", ColgramConfig.isGhostOnlineEnabled(), true);
                     } else if (position == bypassFlagSecureRow) {
                         checkCell.setTextAndCheck("Разрешить скриншоты везде (FLAG_SECURE)", ColgramConfig.isBypassFlagSecureEnabled(), false);
-                    } else if (position == cyberThemeRow) {
-                        checkCell.setTextAndCheck("Красно-чёрная тема Colgram Cyber", ColgramConfig.isCyberThemeEnabled(), false);
                     } else if (position == dpiBypassRow) {
                         // Read the persisted intent, not just whether a socket happens to be
                         // bound: a listener that failed to bind is a fault, not a setting.
