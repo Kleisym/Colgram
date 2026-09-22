@@ -427,6 +427,7 @@ public class ColgramConfig {
 
     // --- Auto proxy ---
     private static final String KEY_AUTO_PROXY = "auto_proxy_enabled";
+    private static final String KEY_IPV6_BYPASS = "ipv6_bypass_enabled";
 
     /**
      * Whether Colgram may switch a proxy on by itself when Telegram looks unreachable.
@@ -444,6 +445,19 @@ public class ColgramConfig {
     }
 
     /**
+     * Route Telegram over IPv6 only. Off by default: on a network whose IPv6 cannot reach
+     * Telegram this breaks a connection IPv4 was carrying, so it is a choice, not a guess.
+     * Where IPv6 does work it is the only bypass with no proxy and no third party in the path.
+     */
+    public static boolean isIpv6BypassEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_IPV6_BYPASS, false);
+    }
+
+    public static void setIpv6BypassEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_IPV6_BYPASS, enabled).apply();
+    }
+
+    /**
      * Optional user-supplied HTTPS forwarder (a Cloudflare Worker URL). It carries the Bot API,
      * the mail providers and the proxy-list fetches on networks where those IPs are dropped and
      * no public SOCKS relay answers. Empty means "no relay configured".
@@ -455,6 +469,20 @@ public class ColgramConfig {
     public static void setRelayUrl(String url) {
         if (prefs != null) {
             prefs.edit().putString(KEY_RELAY_URL, url == null ? "" : url.trim()).apply();
+        }
+    }
+
+    /**
+     * The address that last answered for a hostname. Persisted because a cold start should not
+     * have to re-probe the whole address pool before it can reach the Bot API.
+     */
+    public static String getPinnedEndpoint(String host) {
+        return prefs != null ? prefs.getString("pin_" + host, "") : "";
+    }
+
+    public static void setPinnedEndpoint(String host, String address) {
+        if (prefs != null && host != null && address != null && !address.isEmpty()) {
+            prefs.edit().putString("pin_" + host, address).apply();
         }
     }
 

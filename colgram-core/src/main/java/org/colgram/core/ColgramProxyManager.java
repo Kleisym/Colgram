@@ -365,6 +365,20 @@ public class ColgramProxyManager {
             } catch (Throwable ignored) {}
         }, 30, 30, TimeUnit.SECONDS);
 
+        // 5b. The connection watchdog: an applied proxy that stopped carrying traffic.
+        //
+        // Fresh verdicts fix rotation for a node that is measurably dead. They do not fix the two
+        // cases that actually keep the header reading "Соединение...": the node still answers TCP
+        // but no longer tunnels, and tgnet sitting on a socket it already gave up on. So look at
+        // what Telegram's own connection state says, and act on it.
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                connectionWatchdogTick();
+            } catch (Throwable t) {
+                Log.w(TAG, "connection watchdog: " + t);
+            }
+        }, 15, 10, TimeUnit.SECONDS);
+
         // 6. Re-harvest every 20 minutes. Public MTProxy lists churn on that timescale - nodes
         // disappear and new ones appear - and the prober keeps the verdicts fresh in between.
         scheduler.scheduleWithFixedDelay(() -> {
@@ -372,6 +386,88 @@ public class ColgramProxyManager {
                 fetchAndVerifyAllSources();
             } catch (Throwable ignored) {}
         }, 20, 20, TimeUnit.MINUTES);
+    }
+
+    /** tgnet's ConnectionStateConnected, from org.telegram.tgnet.ConnectionsManager. */
+    private static final int TG_STATE_CONNECTED = 3;
+    private static int watchdogUnconnectedTicks = 0;
+    private static int watchdogRedials = 0;
+
+    /**
+     * One watchdog pass: if a proxy is applied and Telegram is not connected, either re-dial or
+     * move to another node. Three ticks of grace (30 s) before acting, because a normal reconnect
+     * is not an outage, and a cap on re-dials so a node that answers but cannot carry traffic gets
+     * replaced instead of being poked forever.
+     */
+    private static void connectionWatchdogTick() {
+        Context ctx = appContext;
+        if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled()) return;
+        if (!isProxyEnabled(ctx)) {
+            watchdogUnconnectedTicks = 0;
+            watchdogRedials = 0;
+            return;
+        }
+        int state = tgnetConnectionState();
+        if (state < 0) return;                        // no accessor: nothing to judge
+        if (state == TG_STATE_CONNECTED) {
+            watchdogUnconnectedTicks = 0;
+            watchdogRedials = 0;
+            return;
+        }
+        if (++watchdogUnconnectedTicks < 3) return;
+        watchdogUnconnectedTicks = 0;
+
+        ProxyItem active = currentActiveProxy;
+        if (active == null) {
+            autoConnectIfBlocked();
+            return;
+        }
+        boolean reachable = active.isLocalDpi()
+                || probeTcp(active.effectiveHost(), active.effectivePort(), 2500) >= 0;
+        if (!reachable) {
+            Log.i(TAG, "applied proxy " + active.address + ":" + active.port
+                    + " stopped answering while disconnected; rotating");
+            onVerdict(active, false);
+            return;
+        }
+        if (watchdogRedials++ < 2) {
+            Log.i(TAG, "applied proxy answers but Telegram is not connected (state "
+                    + state + "); asking tgnet to re-dial");
+            tgnetCheckConnection();
+            return;
+        }
+        Log.i(TAG, "applied proxy " + active.address + ":" + active.port
+                + " answers but carries nothing; rotating to another node");
+        watchdogRedials = 0;
+        switchToNextProxy(true);
+    }
+
+    /** Telegram's own connection state for the main account, or -1 when unavailable. */
+    private static int tgnetConnectionState() {
+        try {
+            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Object inst = cm.getMethod("getInstance", int.class).invoke(null, 0);
+            Object state = cm.getMethod("getConnectionState").invoke(inst);
+            return state instanceof Integer ? (Integer) state : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** Public entry for the settings screen: re-read the network policy right now. */
+    public static void recheckConnectionNow() {
+        executor.execute(ColgramProxyManager::tgnetCheckConnection);
+    }
+
+    /** Ask tgnet to re-evaluate the network and rebuild its connections. */
+    private static void tgnetCheckConnection() {
+        try {
+            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Object inst = cm.getMethod("getInstance", int.class).invoke(null, 0);
+            cm.getMethod("checkConnection").invoke(inst);
+        } catch (Throwable t) {
+            Log.w(TAG, "could not ask tgnet to re-dial: " + t);
+        }
     }
 
     private static void initVerifiedPool() {
@@ -541,6 +637,9 @@ public class ColgramProxyManager {
         autoConnectIfBlocked();
         if (onDone != null) mainHandler.post(onDone);
     }
+
+    /** How often the node that is currently carrying traffic earns a fresh verdict. */
+    private static final long ACTIVE_RECHECK_MS = 20000L;
 
     /** Production Telegram endpoints, used only to answer "is Telegram reachable at all". */
     private static final String[][] TELEGRAM_DC_ENDPOINTS = {
@@ -719,6 +818,19 @@ public class ColgramProxyManager {
         final long now = SystemClock.elapsedRealtime();
         final int size = verifiedPool.size();
         if (size == 0) return null;
+        // The applied proxy is checked before anything else, every tick.
+        //
+        // The comment by the 30-second health check claims the prober re-verifies the applied node
+        // "inside a two-minute window"; it does not. The prober walks the pool one entry per tick,
+        // and a harvested pool is ~200 entries at ~15 s per verdict, so a full cycle is around
+        // fifty minutes. Measured on 2026-09-23: seven nodes were called alive at ~100 ms while the
+        // header sat on "Соединение..." - the node actually carrying the tunnel had simply not been
+        // looked at since it died. Rotation is driven by that verdict, so nothing rotated.
+        ProxyItem applied = currentActiveProxy;
+        if (applied != null && applied.type != 2 && !applied.isLocalDpi()
+                && now - applied.lastCheckAt >= ACTIVE_RECHECK_MS) {
+            return applied;
+        }
         ProxyItem tcpAlive = null;
         ProxyItem stale = null;
         for (int step = 0; step < size; step++) {

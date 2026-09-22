@@ -304,7 +304,7 @@ public class ColgramBotSync {
                 upstreamPort = tu.getPort() != -1 ? tu.getPort() : 80;
             }
 
-            java.net.InetAddress v4 = colgramResolveIpv4(host);
+            java.net.InetAddress v4 = colgramResolveIpv4(host, upstreamPort);
             if (v4 == null) {
                 Log.w(TAG, "proxy: no A record for " + host + ", refusing");
                 cout.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes("US-ASCII"));
@@ -350,6 +350,17 @@ public class ColgramBotSync {
             if (isConnect) {
                 cout.write("HTTP/1.1 200 Connection established\r\n\r\n".getBytes("US-ASCII"));
                 cout.flush();
+                // THE TUNNEL MUST NOT CARRY AN IDLE DEADLINE.
+                //
+                // The setSoTimeout at the top of this method belongs to the header phase. Left in
+                // place for the relay it fires on the client -> upstream leg, which is idle for as
+                // long as the server is thinking - and the Bot API long poll waits 20 s for updates
+                // by design. colgramCopy treats that timeout like an EOF and closes both sockets,
+                // so every proxied long poll ended in "unexpected end of stream" and no incoming
+                // message reached the UI through this path. Zero means "wait as long as the caller
+                // asked for", which is exactly what the read timeout on the connection is for.
+                client.setSoTimeout(0);
+                upstream.setSoTimeout(0);
             } else {
                 // Replay the request line plus the preserved header block, exactly once.
                 java.io.OutputStream uos = upstream.getOutputStream();
@@ -462,7 +473,20 @@ public class ColgramBotSync {
      * A record, or resolution fails - every caller then leaves the connection untouched.
      */
     static java.net.InetAddress colgramResolveIpv4(String host) {
+        return colgramResolveIpv4(host, 443);
+    }
+
+    /**
+     * Same, but allowed to choose among the host's addresses by whether one actually completes a
+     * TCP connection to `port`. Taking the first A record is precisely the wrong rule on a network
+     * that drops whole addresses: measured 2026-09-23, api.telegram.org answered with
+     * 149.154.166.110 (black hole, 8 s timeout) while another of its own addresses finished TLS in
+     * 300 ms. ColgramEndpoints probes the alternatives and remembers which one worked.
+     */
+    static java.net.InetAddress colgramResolveIpv4(String host, int port) {
         if (host == null || host.isEmpty() || colgramIsIpLiteral(host)) return null;
+        java.net.InetAddress live = ColgramEndpoints.select(host, port);
+        if (live != null) return live;
         try {
             java.net.InetAddress[] all = java.net.InetAddress.getAllByName(host);
             for (java.net.InetAddress a : all) {
@@ -588,44 +612,98 @@ public class ColgramBotSync {
         // Kept for the JVM-host case; on ART it is a documented no-op. Harmless and cheap.
         colgramDisableIpv6IfUnroutable();
 
-        // IPv6-capable only when the device genuinely has a routable v6 path. Otherwise pin
-        // the dial to IPv4 - see colgramForceDialIpv4 for why neither a global property nor
-        // the connection's SSLSocketFactory can do this on Android.
-        boolean wantIpv4Only = !colgramDeviceHasIpv6();
+        URL url = new URL(urlStr);
+        String host = url.getHost();
+        int port = url.getPort();
+        if (port < 0) port = "https".equalsIgnoreCase(url.getProtocol()) ? 443 : 80;
 
-        // Preference order for the transport:
-        //   1. the IPv4-forcing loopback proxy, when the device has no routable v6. OkHttp
-        //      honours `Proxy` unconditionally, unlike a SocketFactory, and the hostname still
-        //      reaches the origin so TLS identity is untouched.
-        //   2. the desync listener, if one is bound (it is itself a local SOCKS proxy).
+        // Transport ladder: every rung gets its own attempt. Picking a single transport used to be
+        // the whole bug - when that one happened to be a dead public relay, a Bot API write failed
+        // with a connection error although the API answered in 300 ms on another address of the
+        // same hostname.
+        //
+        //   1. the address-pinning front: still a direct connection to Telegram, only to one of
+        //      the host's addresses that answers. SNI and the certificate check stay correct,
+        //      because the hostname travels in the CONNECT line.
+        //   2. the IPv4-forcing loopback proxy (a plain IPv4 dial with no address choice).
         //   3. a plain direct connection.
-        java.net.Proxy proxy = null;
-        // A relay beats every local trick: the IPv4-forcing listener and the desync listener both
-        // still dial the origin, and api.telegram.org lives in the same dropped IP ranges, so on a
-        // blocked network choosing them first means an eight-second timeout on every call - what
-        // the user sees as "сеть недоступна" when he edits a bot name.
-        java.net.Proxy relay = ColgramHttp.pickRelayProxy();
-        if (relay != null) {
-            proxy = relay;
-        }
-        if (proxy == null && wantIpv4Only) {
-            int p = colgramIpv4ProxyPort();
-            if (p > 0) {
-                proxy = new java.net.Proxy(java.net.Proxy.Type.HTTP,
-                        new java.net.InetSocketAddress("127.0.0.1", p));
+        //   4. the DPI listener, when a plain dial has already been shown not to work here.
+        //   5. a relay - the applied proxy first, then the harvested pool. Last, because it is
+        //      someone else's machine, and on this network no public relay answers at all.
+        java.util.List<java.net.Proxy> rungs = transportLadder(host, port);
+
+        Throwable last = null;
+        // A short per-rung connect timeout on purpose: a working path here completes in a few
+        // hundred milliseconds, so a rung that has not dialled by 4 s is dead and the next one
+        // deserves its turn. The read timeout stays as the caller asked (long polling waits on it).
+        int connectTimeoutMs = Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000);
+        for (java.net.Proxy rung : rungs) {
+            try {
+                HttpURLConnection conn = rung == null || java.net.Proxy.NO_PROXY.equals(rung)
+                        ? (HttpURLConnection) url.openConnection()
+                        : (HttpURLConnection) url.openConnection(rung);
+                conn.setConnectTimeout(connectTimeoutMs);
+                conn.setReadTimeout(readTimeoutMs);
+                conn.connect();
+                return conn;
+            } catch (Throwable t) {
+                last = t;
             }
         }
-        if (proxy == null && !colgramShouldTryDirect() && ColgramDpiBypass.isBound()) {
-            proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
-                    new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.LOCAL_PORT));
+        // Nothing worked: forget the chosen address so the next call re-probes rather than walking
+        // into the same black hole, and report the last failure to the caller.
+        ColgramEndpoints.invalidate(host);
+        if (last instanceof Exception) throw (Exception) last;
+        throw new java.io.IOException(last == null ? "no transport" : String.valueOf(last));
+    }
+
+    /** Append a transport to the ladder when it is usable and not already there. */
+    private static void addRung(java.util.List<java.net.Proxy> rungs, java.net.Proxy p) {
+        if (p != null && !rungs.contains(p)) rungs.add(p);
+    }
+
+    /**
+     * The transports worth trying for this host, best first:
+     *
+     *   1. the address-pinning front: still a direct connection to Telegram, only to one of the
+     *      host's addresses that answers. SNI and the certificate check stay correct because the
+     *      hostname travels in the CONNECT line.
+     *   2. the IPv4-forcing loopback proxy (a plain IPv4 dial with no address choice).
+     *   3. a plain direct connection.
+     *   4. the DPI listener, when a plain dial has already been shown not to work here.
+     *   5. a relay - the applied proxy first, then the harvested pool. Last, because it is
+     *      someone else's machine, and on this network no public relay answers at all.
+     */
+    static java.util.List<java.net.Proxy> transportLadder(String host, int port) {
+        java.util.List<java.net.Proxy> rungs = new java.util.ArrayList<>();
+        java.net.Proxy front = ColgramEndpoints.frontProxy();
+        if (front != null && ColgramEndpoints.select(host, port) != null) {
+            addRung(rungs, front);
         }
+        int ipv4Port = colgramIpv4ProxyPort();
+        if (ipv4Port > 0) {
+            addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                    new java.net.InetSocketAddress("127.0.0.1", ipv4Port)));
+        }
+        if (colgramShouldTryDirect()) {
+            addRung(rungs, java.net.Proxy.NO_PROXY);
+        }
+        if (!colgramShouldTryDirect() && ColgramDpiBypass.isBound()) {
+            addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                    new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.LOCAL_PORT)));
+        }
+        addRung(rungs, ColgramHttp.pickRelayProxy());
+        if (rungs.isEmpty()) addRung(rungs, java.net.Proxy.NO_PROXY);
+        return rungs;
+    }
 
-        URL url = new URL(urlStr);
-        HttpURLConnection conn = proxy == null
+    /** Build a connection for one rung of the ladder. Does not dial - the caller decides. */
+    private static HttpURLConnection openVia(URL url, java.net.Proxy rung, int readTimeoutMs,
+                                             int connectTimeoutMs) throws Exception {
+        HttpURLConnection conn = rung == null || java.net.Proxy.NO_PROXY.equals(rung)
                 ? (HttpURLConnection) url.openConnection()
-                : (HttpURLConnection) url.openConnection(proxy);
-
-        conn.setConnectTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
+                : (HttpURLConnection) url.openConnection(rung);
+        conn.setConnectTimeout(connectTimeoutMs);
         conn.setReadTimeout(readTimeoutMs);
         return conn;
     }
@@ -902,13 +980,13 @@ public class ColgramBotSync {
                     Log.i(TAG, "webhook is set and passive mode is on - leaving it alone");
                     return;
                 }
-                String urlStr = "https://api.telegram.org/bot" + token + "/deleteWebhook?drop_pending_updates=false";
-                HttpURLConnection conn = openConnection(urlStr, 10000);
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.getOutputStream().close();
-                int code = conn.getResponseCode();
-                Log.d(TAG, "deleteWebhook result: " + code);
+                // Through botApiPost rather than a hand-rolled connection: openConnection() probes
+                // its transports by dialling them, and HttpURLConnection rejects setDoOutput() after
+                // that. The Bot API takes the parameter in the body just the same.
+                JSONObject body = new JSONObject();
+                body.put("drop_pending_updates", false);
+                JSONObject resp = botApiPost(token, "deleteWebhook", body);
+                Log.d(TAG, "deleteWebhook result: " + (resp == null ? "no answer" : resp.optBoolean("ok", false)));
             } catch (Throwable t) {
                 Log.w(TAG, "deleteWebhook error: " + t.getMessage());
             }
@@ -2145,55 +2223,77 @@ public class ColgramBotSync {
      *         carrying the transport failure so callers still report something honest
      */
     private static JSONObject botApiPost(String token, String method, JSONObject payload) {
-        final boolean viaDirect = colgramShouldTryDirect();
+        final String urlStr = "https://api.telegram.org/bot" + token + "/" + method;
+        // A POST cannot be probed the way a GET can: HttpURLConnection rejects setDoOutput() once
+        // the socket has been dialled, so the transport ladder has to be walked here, around the
+        // write, instead of inside openConnection(). Every Bot API method used through this is
+        // idempotent (a name or description set to the same value, an update offset), so retrying
+        // the next transport cannot double-apply anything.
+        java.util.List<java.net.Proxy> rungs;
         try {
-            HttpURLConnection conn = openConnection(
-                    "https://api.telegram.org/bot" + token + "/" + method, 15000);
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-            byte[] body = payload.toString().getBytes("UTF-8");
-            OutputStream os = conn.getOutputStream();
-            os.write(body);
-            os.close();
-
-            int code = conn.getResponseCode();
-            java.io.InputStream stream = (code >= 200 && code < 300)
-                    ? conn.getInputStream() : conn.getErrorStream();
-            StringBuilder sb = new StringBuilder();
-            if (stream != null) {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
-                String line;
-                while ((line = reader.readLine()) != null) sb.append(line);
-                reader.close();
-            }
-            if (sb.length() == 0) {
-                // Reached the server, but it said nothing. Worth distinguishing from an
-                // outright transport failure, because it usually means a proxy ate the body.
-                return transportFailure("пустой ответ (HTTP " + code + ")");
-            }
-            JSONObject result = new JSONObject(sb.toString());
-            if (code < 200 || code >= 300) {
-                Log.w(TAG, method + " HTTP " + code + ": " + sb);
-            }
-            return result;
-        } catch (java.net.SocketTimeoutException ste) {
-            Log.w(TAG, method + " timed out: " + ste.getMessage());
-            if (viaDirect) colgramReportDirectRouteFailed();
-            return transportFailure(connectionHint("таймаут подключения"));
-        } catch (javax.net.ssl.SSLException se) {
-            Log.w(TAG, method + " TLS failed: " + se.getMessage());
-            if (viaDirect) colgramReportDirectRouteFailed();
-            return transportFailure("ошибка TLS — соединение перехвачено или заблокировано");
-        } catch (java.io.IOException ioe) {
-            Log.w(TAG, method + " IO failed: " + ioe.getMessage());
-            if (viaDirect) colgramReportDirectRouteFailed();
-            return transportFailure(connectionHint("сеть недоступна"));
+            URL parsed = new URL(urlStr);
+            rungs = transportLadder(parsed.getHost(),
+                    parsed.getPort() > 0 ? parsed.getPort() : 443);
         } catch (Throwable t) {
-            Log.w(TAG, method + " failed: " + t.getMessage());
-            if (viaDirect) colgramReportDirectRouteFailed();
-            return transportFailure(connectionHint(t.getClass().getSimpleName()));
+            rungs = new java.util.ArrayList<>();
+            rungs.add(java.net.Proxy.NO_PROXY);
         }
+
+        Throwable last = null;
+        for (java.net.Proxy rung : rungs) {
+            HttpURLConnection conn = null;
+            try {
+                conn = openVia(new URL(urlStr), rung, 15000,
+                        Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000));
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                byte[] body = payload.toString().getBytes("UTF-8");
+                conn.setFixedLengthStreamingMode(body.length);
+                OutputStream os = conn.getOutputStream();
+                os.write(body);
+                os.close();
+
+                int code = conn.getResponseCode();
+                java.io.InputStream stream = (code >= 200 && code < 300)
+                        ? conn.getInputStream() : conn.getErrorStream();
+                StringBuilder sb = new StringBuilder();
+                if (stream != null) {
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
+                    String line;
+                    while ((line = reader.readLine()) != null) sb.append(line);
+                    reader.close();
+                }
+                if (sb.length() == 0) {
+                    // Reached the server, but it said nothing. Worth distinguishing from an
+                    // outright transport failure, because it usually means a proxy ate the body.
+                    return transportFailure("пустой ответ (HTTP " + code + ")");
+                }
+                if (code < 200 || code >= 300) {
+                    Log.w(TAG, method + " HTTP " + code + ": " + sb);
+                }
+                return new JSONObject(sb.toString());
+            } catch (javax.net.ssl.SSLException se) {
+                last = se;
+                Log.w(TAG, method + " TLS failed via " + rung + ": " + se.getMessage());
+            } catch (Throwable t) {
+                last = t;
+                Log.w(TAG, method + " failed via " + rung + ": " + t.getMessage());
+            } finally {
+                if (conn != null) {
+                    try { conn.disconnect(); } catch (Throwable ignore) {}
+                }
+            }
+        }
+
+        if (colgramShouldTryDirect()) colgramReportDirectRouteFailed();
+        // Nothing carried the write: drop the chosen address so the next call re-probes instead of
+        // walking into the same black hole, and hand the caller a reason rather than silence.
+        ColgramEndpoints.invalidate("api.telegram.org");
+        if (last instanceof javax.net.ssl.SSLException) {
+            return transportFailure("ошибка TLS — соединение перехвачено или заблокировано");
+        }
+        return transportFailure(connectionHint(reasonOf(last)));
     }
 
     /**
@@ -2311,9 +2411,111 @@ public class ColgramBotSync {
                             "Не удалось изменить имя: " + err, Toast.LENGTH_LONG).show());
                 }
             } catch (Throwable t) {
+                // The failure he reported is this shape: the button does nothing and no reason
+                // appears. A swallowed exception in a background task is indistinguishable from a
+                // dead app, so say what broke and where.
                 Log.e(TAG, "Error setMyName", t);
+                final String why = connectionHint(reasonOf(t));
+                mainHandler.post(() -> Toast.makeText(context,
+                        "Не удалось изменить имя: " + why, Toast.LENGTH_LONG).show());
             }
         });
+    }
+
+    /** Short, human-readable reason for a transport failure. */
+    private static String reasonOf(Throwable t) {
+        if (t == null) return "нет ошибки";
+        String m = t.getMessage();
+        return m == null || m.isEmpty() ? t.getClass().getSimpleName() : m;
+    }
+
+    /** Callback for the Bot API self-test; a named interface avoids java.util.function on old API. */
+    public interface BotApiReport {
+        void onReport(String text);
+    }
+
+    /**
+     * Prove the Bot API write path on the network the phone is actually on.
+     *
+     * Checking it otherwise means editing the bot profile and hoping: the write and the read-back
+     * are separate calls, and the failure he reported was a transport one, not an API one. The two
+     * writes put back exactly what the matching read returned, so running the test cannot leave
+     * the bot's public profile changed. Every step is timed, because "ошибка соединения" with no
+     * number attached is what made this undiagnosable in the first place.
+     */
+    public static void selfTestBotApi(final Context context, final int account,
+                                      final BotApiReport report) {
+        final String token = getBotToken(context, account);
+        if (token.isEmpty()) {
+            if (report != null) {
+                mainHandler.post(() -> report.onReport("Токен бота не найден для аккаунта " + account));
+            }
+            return;
+        }
+        executor.execute(() -> {
+            StringBuilder sb = new StringBuilder();
+            step(sb, token, "getMe", null);
+            String name = null;
+            try {
+                JSONObject res = postJson(token, "getMyName", new JSONObject());
+                name = res == null ? null : res.optString("name", null);
+                sb.append("getMyName: ").append(name == null ? "нет ответа" : quoted(name)).append('\n');
+            } catch (Throwable t) {
+                sb.append("getMyName: ").append(connectionHint(reasonOf(t))).append('\n');
+            }
+            if (name != null) {
+                try {
+                    JSONObject body = new JSONObject();
+                    body.put("name", name);
+                    step(sb, token, "setMyName", body);
+                } catch (Throwable ignore) {
+                }
+            }
+            String desc = null;
+            try {
+                JSONObject res = postJson(token, "getMyDescription", new JSONObject());
+                desc = res == null ? null : res.optString("description", null);
+                sb.append("getMyDescription: ").append(desc == null ? "нет ответа"
+                        : desc.length() + " симв.").append('\n');
+            } catch (Throwable t) {
+                sb.append("getMyDescription: ").append(connectionHint(reasonOf(t))).append('\n');
+            }
+            if (desc != null) {
+                try {
+                    JSONObject body = new JSONObject();
+                    body.put("description", desc);
+                    step(sb, token, "setMyDescription", body);
+                } catch (Throwable ignore) {
+                }
+            }
+            sb.append("адрес: ").append(ColgramEndpoints.describe());
+            final String text = sb.toString();
+            Log.i(TAG, "Bot API self-test:\n" + text);
+            if (report != null) mainHandler.post(() -> report.onReport(text));
+        });
+    }
+
+    /** One call inside the self-test: timed, with the server's own reason when it fails. */
+    private static void step(StringBuilder sb, String token, String method, JSONObject body) {
+        long t0 = android.os.SystemClock.elapsedRealtime();
+        try {
+            // The raw response is what gets judged: a write answers {"ok":true,"result":true},
+            // and unwrapping that "result" (a boolean) lost the answer and reported success as
+            // "no response".
+            JSONObject resp = botApiPost(token, method, body == null ? new JSONObject() : body);
+            long ms = android.os.SystemClock.elapsedRealtime() - t0;
+            String err = botApiError(resp);
+            sb.append(method).append(": ").append(err == null ? "ок" : err)
+                    .append(" (").append(ms).append(" мс)\n");
+        } catch (Throwable t) {
+            long ms = android.os.SystemClock.elapsedRealtime() - t0;
+            sb.append(method).append(": ").append(connectionHint(reasonOf(t)))
+                    .append(" (").append(ms).append(" мс)\n");
+        }
+    }
+
+    private static String quoted(String s) {
+        return "«" + s + "»";
     }
 
     /**
@@ -2358,6 +2560,12 @@ public class ColgramBotSync {
                 }
             });
         });
+    }
+
+    /** POST a Bot API method and return its "result" object, or null when the call failed. */
+    private static JSONObject postJson(String token, String method, JSONObject body) throws Exception {
+        JSONObject resp = botApiPost(token, method, body);
+        return resp == null ? null : resp.optJSONObject("result");
     }
 
     /**

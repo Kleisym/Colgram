@@ -65,6 +65,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int proxyStatusRow;
     private int relayUrlRow;
     private int autoProxyRow;
+    private int ipv6BypassRow;
     private int networkSectionRow;
 
     private int sandboxHeaderRow;
@@ -74,6 +75,8 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private int botsHeaderRow;
     private int botRealtimeRow;
+    private int botTestRow;
+    private String lastBotTestReport;
     private int pluginsRow;
     private int botsSectionRow;
 
@@ -118,6 +121,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         proxyStatusRow = rowCount++;
         relayUrlRow = rowCount++;
         autoProxyRow = rowCount++;
+        ipv6BypassRow = rowCount++;
         networkSectionRow = rowCount++;
 
         sandboxHeaderRow = rowCount++;
@@ -127,6 +131,7 @@ public class ColgramSettingsActivity extends BaseFragment {
 
         botsHeaderRow = rowCount++;
         botRealtimeRow = rowCount++;
+        botTestRow = rowCount++;
         pluginsRow = rowCount++;
         botsSectionRow = rowCount++;
 
@@ -279,6 +284,19 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
+            } else if (position == ipv6BypassRow) {
+                boolean val = !ColgramConfig.isIpv6BypassEnabled();
+                ColgramConfig.setIpv6BypassEnabled(val);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(val);
+                }
+                // The strategy is read when tgnet re-evaluates the network, so nudge it here -
+                // otherwise the switch only takes effect after the next connection change.
+                ColgramProxyManager.recheckConnectionNow();
+                Toast.makeText(getParentActivity(), val
+                        ? "Telegram будет дёргать только IPv6-адреса центров. Нужно, чтобы в сети был рабочий IPv6."
+                        : "Вернулись к IPv4.",
+                        Toast.LENGTH_LONG).show();
             } else if (position == relayUrlRow) {
                 editRelayUrl();
             } else if (position == proxyStatusRow) {
@@ -311,6 +329,22 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(!passive);
                 }
+            } else if (position == botTestRow) {
+                // "Connection error when I save the bot name" is not diagnosable from a toast that
+                // only says that. This runs the same calls the profile screen runs - read the name
+                // and description, write them straight back unchanged - and reports each one with
+                // the server's own reason and how long it took.
+                Toast.makeText(getParentActivity(), "Проверяю Bot API…", Toast.LENGTH_SHORT).show();
+                ColgramBotSync.selfTestBotApi(getContext(), currentAccount, text -> {
+                    lastBotTestReport = text;
+                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                    if (getParentActivity() == null) return;
+                    new AlertDialog.Builder(getParentActivity())
+                            .setTitle("Bot API")
+                            .setMessage(text)
+                            .setPositiveButton("Ок", null)
+                            .show();
+                });
             }
         });
 
@@ -345,6 +379,13 @@ public class ColgramSettingsActivity extends BaseFragment {
      * the difference between "сеть недоступна" and a working feature. It is not a Telegram
      * proxy and the UI says so; the worker source ships in the repo under deploy/.
      */
+    /** One line for the row: the first step of the last run, or the invitation to run it. */
+    private String botTestSummary() {
+        if (lastBotTestReport == null || lastBotTestReport.isEmpty()) return "запустить";
+        int nl = lastBotTestReport.indexOf('\n');
+        return nl < 0 ? lastBotTestReport : lastBotTestReport.substring(0, nl);
+    }
+
     private void editRelayUrl() {
         Context ctx = getParentActivity();
         if (ctx == null) return;
@@ -390,10 +431,10 @@ public class ColgramSettingsActivity extends BaseFragment {
             return position == cloakEnabledRow || position == cloakModelRow ||
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
-                   position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
+                   position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow || position == ipv6BypassRow ||
                    position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow || position == autoProxyRow ||
                    position == sandboxStorageRow || position == sandboxFilesRow ||
-                   position == botRealtimeRow || position == pluginsRow;
+                   position == botRealtimeRow || position == botTestRow || position == pluginsRow;
         }
 
         @Override
@@ -404,7 +445,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow
                     || position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow
-                    || position == sandboxFilesRow || position == pluginsRow) {
+                    || position == sandboxFilesRow || position == pluginsRow || position == botTestRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
                        position == networkSectionRow || position == sandboxSectionRow ||
@@ -498,6 +539,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                         checkCell.setTextAndCheck("Открывать ссылки в защищенном браузере", ColgramConfig.isProxyBrowserEnabled(), true);
                     } else if (position == sandboxStorageRow) {
                         checkCell.setTextAndCheck("Изолировать файлы в папке Colgram", ColgramConfig.isSandboxStorageEnabled(), false);
+                    } else if (position == ipv6BypassRow) {
+                        checkCell.setTextAndCheck("Обход по IPv6 без прокси",
+                                ColgramConfig.isIpv6BypassEnabled(), false);
                     } else if (position == botRealtimeRow) {
                         checkCell.setTextAndCheck("Получать сообщения бота в реальном времени",
                                 !ColgramBotSync.isPassiveBotMode(getContext(), currentAccount), true);
@@ -531,6 +575,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                         String relay = ColgramConfig.getRelayUrl();
                         settingsCell.setTextAndValue("Реле-адрес для Bot API и почты",
                                 relay.isEmpty() ? "не задан" : relay, true);
+                    } else if (position == botTestRow) {
+                        settingsCell.setTextAndValue("Проверка Bot API (имя и описание)",
+                                botTestSummary(), true);
                     } else if (position == proxyStatusRow) {
                         settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
                                 ColgramProxyDoctor.getStatusSummary(), false);

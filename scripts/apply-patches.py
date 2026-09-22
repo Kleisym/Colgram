@@ -4826,6 +4826,34 @@ def inject_hooks(repo_path):
                'A bot account has no phone at all',
                "SettingsActivity Bot Account Has No Phone")
 
+    # 68. ConnectionsManager.java -> an IPv6-only route, for networks that block IPv4 Telegram.
+    #
+    # Measured on the network Colgram is developed against: every Telegram DC address is dropped
+    # over IPv4, and the box has no IPv6 at all, so this cannot be proven here. It is shipped
+    # because it is the one bypass that needs no proxy and no third party, and because on Russian
+    # mobile networks IPv6 is commonly available while the IPv4 blocklist is what actually bites.
+    # Telegram already carries IPv6 addresses for every DC (addressesIpv6) and tgnet already
+    # understands USE_IPV6_ONLY - normally it only picks that when the device has no usable IPv4 -
+    # so this is a switch, not a new mechanism.
+    #
+    # It stays off unless the user turns it on: forcing IPv6 on a network whose IPv6 cannot reach
+    # Telegram would break a connection that IPv4 was carrying.
+    tgn_cm = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram",
+                          "tgnet", "ConnectionsManager.java")
+    patch_file(
+        tgn_cm,
+        "            if (hasIpv6) {\n                if (forceTryIpV6) {",
+        "            if (hasIpv6) {\n"
+        "                if (org.colgram.core.ColgramConfig.isIpv6BypassEnabled()) {\n"
+        "                    // Colgram: the user asked for the IPv6-only route (see the\n"
+        "                    // \"обход по IPv6\" switch). Opt-in, because on a network whose\n"
+        "                    // IPv6 cannot reach Telegram this would break a working IPv4 path.\n"
+        "                    return USE_IPV6_ONLY;\n"
+        "                }\n"
+        "                if (forceTryIpV6) {",
+        "ConnectionsManager IPv6-only bypass switch"
+    )
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"

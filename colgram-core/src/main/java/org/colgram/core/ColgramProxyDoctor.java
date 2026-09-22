@@ -52,6 +52,11 @@ public class ColgramProxyDoctor {
         // Say what the network is actually doing, so "the bypass does nothing" becomes a
         // diagnosis instead of a mystery.
         stats = ColgramProxyManager.describeBlockType() + " | " + stats;
+        // The Bot API and the MTProto DCs are blocked independently, and on this network only the
+        // DCs are: the API is reached directly on an address that answers. Saying which half works
+        // is the difference between "the bypass is broken" and "the bot works without a proxy, the
+        // account needs one".
+        stats = stats + "; Bot API: " + ColgramEndpoints.describe();
 
         if (current != null) {
             return "Активный прокси: " + current.address + ":" + current.port
