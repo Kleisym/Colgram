@@ -268,7 +268,15 @@ public class ColgramBotLogin {
                                 Object ms = msClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
                                 ArrayList users = new ArrayList();
                                 users.add(user);
-                                msClass.getMethod("putUsersAndChats", ArrayList.class, ArrayList.class, boolean.class, boolean.class)
+                                // getMethod matches DECLARED parameter types exactly: an
+                                // ArrayList argument says nothing about the signature, and
+                                // MessagesStorage declares List,List. Asking for ArrayList.class
+                                // threw NoSuchMethodException here, which — because it sits
+                                // mid-block in one big try — silently skipped everything after
+                                // it: the token was never saved, the dialog sync never ran, and
+                                // the progress dialog was never dismissed. Login looked like it
+                                // worked because setCurrentUser had already happened.
+                                msClass.getMethod("putUsersAndChats", java.util.List.class, java.util.List.class, boolean.class, boolean.class)
                                         .invoke(ms, users, null, true, true);
 
                                 ColgramBotSync.saveBotToken(context, currentAccount, token);

@@ -13,9 +13,30 @@ import zipfile
 import urllib.request
 import subprocess
 
+# Every patch that failed to apply during this run, in order.
+#
+# Why this exists: patch_file() returns False on an unmatched anchor, but 110 of its 114
+# call sites invoke it as a bare statement and throw the result away, and main() always
+# exited 0. A Telegram release that moves one anchor therefore deletes a feature and CI
+# still builds and publishes an APK that looks fine. That is how "one build for every
+# Telegram version" silently stopped being true, and it is why several fixes reported today
+# as working had never actually reached a build.
+PATCH_MISSES = []
+
+# Misses that are known-benign, with the reason. Anything NOT listed here fails the run.
+# Keeping this explicit is the point: a new miss cannot be waved through by accident, and a
+# stale entry becomes visible the moment it stops firing.
+ALLOWED_MISSES = {
+    # The injection is a callable that returns the file unchanged when Colgram init is
+    # already present, so patch_file reports "not matched" on every converged run.
+    "ApplicationLoader.onCreate Colgram initialization (after native load)",
+}
+
+
 def patch_file(filepath, search_pattern, replacement, description):
     if not os.path.exists(filepath):
         print(f" [!] File not found: {filepath}")
+        PATCH_MISSES.append(f"MISSING FILE: {description}")
         return False
 
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -29,10 +50,12 @@ def patch_file(filepath, search_pattern, replacement, description):
         new_content = search_pattern(content)
         if new_content == content:
             print(f" [!] Pattern not matched for: {description}")
+            PATCH_MISSES.append(description)
             return False
     elif isinstance(search_pattern, str):
         if search_pattern not in content:
             print(f" [!] Anchor string not found for: {description}")
+            PATCH_MISSES.append(description)
             return False
         new_content = content.replace(search_pattern, replacement, 1)
     else:
@@ -40,6 +63,7 @@ def patch_file(filepath, search_pattern, replacement, description):
         new_content, count = search_pattern.subn(replacement, content, count=1)
         if count == 0:
             print(f" [!] Regex not matched for: {description}")
+            PATCH_MISSES.append(description)
             return False
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -761,10 +785,18 @@ def inject_hooks(repo_path):
             # ---------------------------------------------------------------------------
             # Regex rather than a literal: the literal form was brittle to whitespace and
             # silently failed to match once already.
+            #
+            # It must accept the PRISTINE upstream form as well as the previously-patched
+            # one. The old pattern required `themeMargin + 64 + 8` in the right margin, but
+            # that string was produced by a LATER patch — so on a fresh clone this regex
+            # never matched, the later patch then wrote `top = 16` (a hard-coded margin that
+            # ignores statusBarHeight), and the badge rode under the status bar on every CI
+            # build while the local checkout looked correct. Anchoring on both forms makes
+            # this patch order-independent and convergent.
             badge_re = re.compile(
                 r'frameContainerView\.addView\(langBadge,\s*LayoutHelper\.createFrame\('
                 r'\s*LayoutHelper\.WRAP_CONTENT,\s*32,\s*Gravity\.TOP \| Gravity\.RIGHT,'
-                r'\s*0,\s*\d+,\s*themeMargin \+ 64 \+ 8,\s*0\)\);')
+                r'\s*0,\s*[^,()]+,\s*(?:\d+|themeMargin \+ 64 \+ 8),\s*0\)\);')
             good_badge = (
                 '        // Vertically centred against the theme switcher beside it.\n'
                 '        //\n'
@@ -800,8 +832,6 @@ def inject_hooks(repo_path):
             # also what the cyber palette overrides, so the screen finally matches the theme.
             # ---------------------------------------------------------------------------
             if 'colgramAccent' not in content:
-                old_col = (
-                    '        startMessagingButtonBackground.setColors(new int[]{0xFFD32F2F, 0xFF8B0000});\n')
                 new_col = (
                     '        // Derived from the active accent instead of a hardcoded red, so the\n'
                     '        // intro follows the theme (including the cyber palette).\n'
@@ -811,16 +841,28 @@ def inject_hooks(repo_path):
                     '                | ((int) (((colgramAccent >> 8) & 0xFF) * 0.7f) << 8)\n'
                     '                | (int) ((colgramAccent & 0xFF) * 0.7f);\n'
                     '        startMessagingButtonBackground.setColors(new int[]{colgramAccent, colgramAccentDark});\n')
-                if old_col in content:
-                    content = content.replace(old_col, new_col, 1)
+                # Accept BOTH the pristine upstream line and the hardcoded-red line. Only the
+                # red one was handled, and it is produced by a LATER patch — so on a fresh
+                # clone this block found nothing, the later patch then wrote raw reds, and the
+                # intro ignored the theme in every CI build.
+                for old_col in (
+                    '        startMessagingButtonBackground.setColors(new int[]{0xFFD32F2F, 0xFF8B0000});\n',
+                    '        startMessagingButtonBackground.setColors(new int[]{getThemedColor(Theme.key_featuredStickers_addButton), getThemedColor(Theme.key_featuredStickers_addButton2)});\n',
+                ):
+                    if old_col in content:
+                        content = content.replace(old_col, new_col, 1)
 
-                old_lang = '        switchLanguageTextView.setTextColor(0xFFEF5350);\n'
                 new_lang = (
                     '        // Was 0xFFEF5350 - a raw red that ignored the theme entirely.\n'
                     '        switchLanguageTextView.setTextColor(\n'
                     '                Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));\n')
-                if old_lang in content:
-                    content = content.replace(old_lang, new_lang, 1)
+                for old_lang in (
+                    '        switchLanguageTextView.setTextColor(0xFFEF5350);\n',
+                    '        switchLanguageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));\n',
+                ):
+                    if old_lang in content:
+                        content = content.replace(old_lang, new_lang, 1)
+                        break
 
             if "langBadge.setText" in content:
                 return content
@@ -1644,8 +1686,19 @@ def inject_hooks(repo_path):
     theme_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "Theme.java")
     if os.path.exists(theme_file):
         COLGRAM_GETCOLOR_WRAPPER = (
+        "    // Bump this whenever the wrapper or the cyber palette changes shape, and change\n"
+        "    // the patch_file marker below to match. Without it the marker stays satisfied by\n"
+        "    // an OLDER wrapper, patch_file reports 'already patched', the injector never\n"
+        "    // re-runs, and edits to the palette silently never reach a build. That exact trap\n"
+        "    // swallowed two separate theme fixes in this file before it was pinned down.\n"
+        "    private static final int COLGRAM_THEME_PATCH = 3;\n"
+        "\n"
         "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {\n"
-        "        int colgramResolved = colgramGetColorInternal(key, isDefault, ignoreAnimation);\n"
+        "        boolean[] colgramIsDefault = new boolean[1];\n"
+        "        int colgramResolved = colgramGetColorInternal(key, colgramIsDefault, ignoreAnimation);\n"
+        "        if (isDefault != null) {\n"
+        "            isDefault[0] = colgramIsDefault[0];\n"
+        "        }\n"
         "        final boolean colgramCyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();\n"
         # ---------------------------------------------------------------------------
         # The cyber palette, applied as a COMPLETE set.
@@ -1665,33 +1718,114 @@ def inject_hooks(repo_path):
         "                return colgramCyberColor;\n"
         "            }\n"
         "        }\n"
-        "        final int colgramSurface = colgramCyber\n"
-        "                ? COLGRAM_CYBER_BG\n"
-        "                : colgramGetColorInternal(key_windowBackgroundWhite, null, true);\n"
         "        final boolean colgramDarkSurface = colgramCyber || isCurrentThemeDark();\n"
-        # A palette hole (resolved 0) is filled from the complete night palette shipped in
-        # assets. This block used to live ONLY in the checked-out Theme.java and was absent
-        # from this patcher, so every fresh clone and every CI build was quietly missing it -
-        # which is why the black-on-black kept coming back after a clean build. It is now
-        # part of the patch itself.
-        "        if (colgramResolved == 0 && colgramNightHasKey(key)) {\n"
+        # ---------------------------------------------------------------------------
+        # What a "palette hole" actually is.
+        #
+        # This used to test `colgramResolved == 0`, and that is why the dark theme kept
+        # merging into itself: upstream NEVER returns 0 for an unknown key. It falls
+        # through to getDefaultColor(), which answers from the LIGHT palette. So every
+        # key a dark theme omits resolved to a light value — dark grey text on dark grey
+        # background — and the whole hole-filling block below was unreachable in practice.
+        #
+        # The honest signal is upstream's own out-parameter: it sets isDefault[0] = true
+        # on exactly that fall-through path. Testing it replaces a guess with the theme
+        # system telling us the truth.
+        #
+        # Night-palette filling is now gated on the surface actually being dark. Filling
+        # unconditionally would hand a LIGHT theme dark values for its own missing keys,
+        # which is the same bug mirrored.
+        # ---------------------------------------------------------------------------
+        "        final boolean colgramHole = colgramIsDefault[0] || colgramResolved == 0;\n"
+        "        if (colgramHole && colgramDarkSurface && colgramNightHasKey(key)) {\n"
         "            return colgramNightColor(key);\n"
         "        }\n"
-        "        // A zero colour for a readable key is a broken/partial theme palette.\n"
-        "        // Leaving it renders black text on a dark background - the invisible login form.\n"
-        "        if (colgramResolved == 0 && colgramIsReadableKey(key)) {\n"
+        "        if (colgramHole && colgramIsReadableKey(key)) {\n"
         "            return colgramDarkSurface ? 0xffffffff : 0xff000000;\n"
         "        }\n"
-        "        if (colgramDarkSurface && colgramIsForegroundKey(key)) {\n"
-        "            if (colgramContrast(colgramResolved, colgramSurface) < COLGRAM_MIN_CONTRAST) {\n"
-        "                int base = colgramGetColorInternal(key_windowBackgroundWhiteBlackText, null, true);\n"
-        "                if (colgramContrast(base, colgramSurface) < COLGRAM_MIN_CONTRAST) {\n"
-        "                    base = 0xffffffff;\n"
-        "                }\n"
-        "                return base;\n"
+        "        return colgramGuard(key, colgramResolved);\n"
+        "    }\n"
+        "\n"
+        "    /**\n"
+        "     * The single readability guard, shared by BOTH colour paths.\n"
+        "     *\n"
+        "     * getColor(key, ResourcesProvider) returns provider.getColor(key) directly and\n"
+        "     * never reaches the wrapper, so a provider-scoped screen (a themed chat, a sheet,\n"
+        "     * a settings section header) previously got no repair at all. Keeping one method\n"
+        "     * is what stops the two paths disagreeing about what readable means.\n"
+        "     */\n"
+        "    private static int colgramGuard(int key, int color) {\n"
+        "        boolean colgramCyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();\n"
+        "        if ((colgramCyber || isCurrentThemeDark()) && colgramLooksLikeForeground(key)) {\n"
+        "            if (colgramBestContrast(key, color, colgramCyber) < COLGRAM_MIN_CONTRAST) {\n"
+        "                return colgramReadableForeground(colgramCyber);\n"
         "            }\n"
         "        }\n"
-        "        return colgramResolved;\n"
+        "        return color;\n"
+        "    }\n"
+        "\n"
+        "    /**\n"
+        "     * Is this key a foreground (text / icon / stroke) rather than a fill?\n"
+        "     *\n"
+        "     * Colour keys carry no name at runtime, so this cannot be answered by pattern\n"
+        "     * matching, and the explicit allowlist it replaces covered about 25 of ~800 keys -\n"
+        "     * which is why most of the UI stayed grey-on-grey even after the guard existed.\n"
+        "     *\n"
+        "     * The light palette is the oracle: it was authored for a white background, so its\n"
+        "     * fills are light and its text and icons are dark. A key whose light default is dark\n"
+        "     * was therefore a foreground, and it is still a foreground under night — where\n"
+        "     * keeping that dark value on a dark surface is exactly the reported bug.\n"
+        "     *\n"
+        "     * Transparent values are excluded: they are not a paint at all, and treating them as\n"
+        "     * foreground would invent a colour for deliberately invisible layers.\n"
+        "     */\n"
+        "    private static boolean colgramLooksLikeForeground(int key) {\n"
+        "        if (colgramIsForegroundKey(key)) {\n"
+        "            return true;\n"
+        "        }\n"
+        "        int light = getDefaultColor(key);\n"
+        "        if ((light >>> 24) < 0x20) {\n"
+        "            return false;\n"
+        "        }\n"
+        "        return colgramLuma(light) < 128;\n"
+        "    }\n"
+        "\n"
+        "    /**\n"
+        "     * Best contrast a foreground colour gets against any surface it could plausibly\n"
+        "     * be drawn on.\n"
+        "     *\n"
+        "     * The guard used to measure everything against windowBackgroundWhite alone. That\n"
+        "     * is wrong twice over: a colour inside a chat, a dialog sheet or an action bar sits\n"
+        "     * on its own background, so a readable colour could be 'repaired' against the wrong\n"
+        "     * surface, and an unreadable one could slip through because it happened to contrast\n"
+        "     * well with the one surface we happened to check.\n"
+        "     *\n"
+        "     * Colour keys carry no name at runtime (they are sequential colorsCount++ ints and\n"
+        "     * Theme exposes no key->String), so we cannot know which family a key belongs to.\n"
+        "     * Taking the MAXIMUM over the candidate surfaces is the conservative answer: we only\n"
+        "     * intervene when the colour is unreadable everywhere, which can never break a place\n"
+        "     * where it already works.\n"
+        "     */\n"
+        "    private static int colgramBestContrast(int key, int color, boolean cyber) {\n"
+        "        if (cyber) {\n"
+        "            return colgramContrast(color, COLGRAM_CYBER_BG);\n"
+        "        }\n"
+        "        int best = colgramContrast(color, colgramGetColorInternal(key_windowBackgroundWhite, null, true));\n"
+        "        best = Math.max(best, colgramContrast(color, colgramGetColorInternal(key_dialogBackground, null, true)));\n"
+        "        best = Math.max(best, colgramContrast(color, colgramGetColorInternal(key_actionBarDefault, null, true)));\n"
+        "        return best;\n"
+        "    }\n"
+        "\n"
+        "    /** A foreground colour that is readable on every dark surface we test against. */\n"
+        "    private static int colgramReadableForeground(boolean cyber) {\n"
+        "        if (cyber) {\n"
+        "            return COLGRAM_CYBER_TEXT;\n"
+        "        }\n"
+        "        int candidate = colgramGetColorInternal(key_windowBackgroundWhiteBlackText, null, true);\n"
+        "        if (colgramBestContrast(0, candidate, false) >= COLGRAM_MIN_CONTRAST) {\n"
+        "            return candidate;\n"
+        "        }\n"
+        "        return 0xffffffff;\n"
         "    }\n"
         "\n"
         "    // Cyber palette. One place, so the whole scheme can be re-tuned without hunting\n"
@@ -1739,6 +1873,20 @@ def inject_hooks(repo_path):
         "                || key == key_dialogFloatingButton\n"
         "                || key == key_switchTrackChecked\n"
         "                || key == key_checkboxCheck) {\n"
+        "            return COLGRAM_CYBER_ACCENT;\n"
+        "        }\n"
+        "        // The blue accent family. These were missing entirely, which is why turning\n"
+        "        // Cyber on left every section header, link and blue icon stock blue next to a\n"
+        "        // red background - the reported 'cyber is broken and ugly'. HeaderCell paints\n"
+        "        // its label from windowBackgroundWhiteBlueHeader, so without this the palette\n"
+        "        // covered backgrounds and body text but not the one thing that names a section.\n"
+        "        if (key == key_windowBackgroundWhiteBlueHeader\n"
+        "                || key == key_windowBackgroundWhiteBlueText\n"
+        "                || key == key_windowBackgroundWhiteBlueText4\n"
+        "                || key == key_windowBackgroundWhiteBlueIcon\n"
+        "                || key == key_windowBackgroundWhiteValueText\n"
+        "                || key == key_dialogTextLink\n"
+        "                || key == key_featuredStickers_addButton) {\n"
         "            return COLGRAM_CYBER_ACCENT;\n"
         "        }\n"
         "        // Primary text and icons - the keys whose absence made the UI invisible.\n"
@@ -1952,6 +2100,26 @@ def inject_hooks(repo_path):
                 while doubled in content:
                     content = content.replace(doubled, inject, 1)
 
+            # --- Injection 1b: route the provider result through the shared guard ----
+            #
+            # Upstream returns provider.getColor(key) with no further processing, so every
+            # screen that draws through a provider skipped the readability repair entirely.
+            provider_raw = (
+                "        if (provider != null) {\n"
+                "            return provider.getColor(key);\n"
+                "        }"
+            )
+            provider_guarded = (
+                "        if (provider != null) {\n"
+                "            return colgramGuard(key, provider.getColor(key));\n"
+                "        }"
+            )
+            if provider_guarded not in content:
+                content = content.replace(provider_raw, provider_guarded, 1)
+            if provider_guarded not in content:
+                print(" [!] ResourcesProvider colour path not guarded - "
+                      "provider-scoped screens will keep grey-on-grey")
+
             # --- Injection 2: the boolean[] overload (the wrapper) --------------
             #
             # Two cases, and conflating them is what made this patch unreachable on a
@@ -1970,7 +2138,14 @@ def inject_hooks(repo_path):
             #   PATCHED - both signatures are present, so the regex can span and swap the
             #            old wrapper without touching the body.
             anchor = "public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {"
-            if anchor in content and "COLGRAM_CYBER_BG" not in content:
+            if anchor in content and "COLGRAM_THEME_PATCH = 3" not in content:
+                # Drop any older version marker first: the wrapper is inserted at the
+                # marker's own line, and the PATCHED branch below replaces from
+                # `public static int getColor(` onward — so a stale constant sitting above
+                # that line would survive and collide with the new one.
+                content = re.sub(
+                    r"[ \t]*private static final int COLGRAM_THEME_PATCH = \d+;[ \t]*\r?\n",
+                    "", content)
                 if "private static int colgramGetColorInternal(int key, boolean[] isDefault, boolean ignoreAnimation) {" in content:
                     # PATCHED: swap the stale wrapper out.
                     content = re.sub(
@@ -1981,13 +2156,17 @@ def inject_hooks(repo_path):
                 else:
                     # FRESH: rename upstream's method by prefixing the wrapper.
                     content = content.replace(anchor, COLGRAM_GETCOLOR_WRAPPER, 1)
-                if "COLGRAM_CYBER_BG" not in content:
+                if "COLGRAM_THEME_PATCH = 3" not in content:
                     print(" [!] FATAL: Theme wrapper did not land - cyber palette NOT applied")
             return content
-        # The marker MUST name something only the current version emits. With
-        # "isCyberThemeEnabled()" as the marker the guard was satisfied by every older
-        # build, so the injector never ran again and its internal repair was dead code.
-        patch_file(theme_file, theme_cyber_injector, "COLGRAM_CYBER_BG", "Theme Inject Colgram Cyber Red Colors")
+        # The marker MUST name something only the current version emits. It was
+        # "COLGRAM_CYBER_BG", which the PREVIOUS wrapper already contained — so once any
+        # wrapper had ever shipped, patch_file reported "already patched" forever and the
+        # injector never ran again. Every edit made to the wrapper since then had simply
+        # never reached a build. Same class of defect as the dead IntroActivity anchors.
+        # It then became "colgramLooksLikeForeground", which did the same thing to the NEXT
+        # edit — so the marker is now an explicit version constant that has to be bumped.
+        patch_file(theme_file, theme_cyber_injector, "COLGRAM_THEME_PATCH = 3", "Theme Inject Colgram Cyber Red Colors")
 
         # 24b. The cyber overrides above ALSO get applied at the real choke point, and a
         # zero-valued readable colour is repaired there. See COLGRAM_GETCOLOR_WRAPPER.
@@ -2051,8 +2230,6 @@ def inject_hooks(repo_path):
                                     "telegram", "ui", "Components", "ChatAttachAlert.java")
 
         def attach_sandbox_routes(content):
-            if "ColgramFileImport.pickFiles" in content:
-                return content
             changed = False
             for num, mime, comment, guard in [
                 (3, "audio/*",
@@ -2067,11 +2244,10 @@ def inject_hooks(repo_path):
                 if idx < 0:
                     print(" [!] ChatAttachAlert branch num==%s not found" % num)
                     continue
-                after = idx + len(head)
-                if not content[after:].startswith(guard):
-                    print(" [!] ChatAttachAlert branch num==%s has an unexpected body" % num)
-                    continue
-                end = after + len(guard)
+                # No body-shape check here: on a re-run the injected block legitimately sits
+                # between `head` and the guard, so testing for the guard at this point failed
+                # every second run and printed a false "unexpected body". The single real
+                # validation happens below, after the previous copy has been stripped.
                 inject = ('                    if (org.colgram.core.ColgramConfig.isSandboxStorageEnabled()) {\n'
                           '                        // ' + comment + '\n'
                           '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "' + mime + '", true, paths -> {\n'
@@ -2087,12 +2263,103 @@ def inject_hooks(repo_path):
                           '                        });\n'
                           '                        return;\n'
                           '                    }\n')
-                content = content[:end] + inject + content[end:]
+                # Remove every previously injected copy before placing this one, then
+                # recompute the insertion point. Without the strip, patch_file's
+                # "already patched" short-circuit (and the marker it tests) meant a fix to
+                # THIS block's placement never reached an existing checkout — which is
+                # exactly how the misplaced-inside-the-guard version kept surviving.
+                content = content.replace(inject, "")
+                idx = content.find(head)
+                after = idx + len(head)
+                if not content[after:].startswith(guard):
+                    print(" [!] ChatAttachAlert branch num==%s lost its expected body" % num)
+                    continue
+                # Insert at `after`, NOT at the end of the guard line. Inserting after the
+                # guard put this block INSIDE `if (!documentsEnabled && ...)` — so in an
+                # ordinary chat, where documentsEnabled is true, the whole branch was skipped
+                # and execution fell straight through to requestPermissions(READ_MEDIA_*).
+                # The SAF picker therefore only ever ran in a restricted channel, which made
+                # the entire storage-sandbox feature dead code in exactly the case it exists
+                # for.
+                content = content[:after] + inject + content[after:]
                 changed = True
             return content
 
-        patch_file(attach_alert, attach_sandbox_routes, "ColgramFileImport.pickFiles",
-                   "ChatAttachAlert documents + music use Colgram SAF import")
+        # Applied directly rather than through patch_file(), whose "already patched"
+        # short-circuit tests a substring that the MISPLACED injection also satisfies — so
+        # the marker could never distinguish "present" from "present in the right place",
+        # and the fix below would never reach an already-patched checkout. attach_sandbox_routes
+        # is idempotent on its own (it strips previous copies before re-inserting), so it can
+        # simply be run every time and report what it actually changed.
+        if os.path.exists(attach_alert):
+            with open(attach_alert, "r", encoding="utf-8", errors="ignore") as f:
+                _aa_before = f.read()
+            _aa_after = attach_sandbox_routes(_aa_before)
+            if _aa_after == _aa_before:
+                print(" [=] Already patched: ChatAttachAlert documents + music use Colgram SAF import")
+            elif _aa_after:
+                with open(attach_alert, "w", encoding="utf-8", newline="") as f:
+                    f.write(_aa_after)
+                print(" [+] Successfully patched: ChatAttachAlert documents + music use Colgram SAF import")
+            else:
+                print(" [!] ChatAttachAlert SAF routing could not be applied")
+
+        # 24b. PushListenerController -> do not initialize Firebase at all.
+        #
+        # Removing FirebaseInitProvider from the manifest was NOT enough, and the device log
+        # proved it: this call initializes Firebase by hand on every launch. It then asks for
+        # an FCM token, which makes Firebase Installations POST our package name to
+        # googleapis.com over a DIRECT connection that bypasses any proxy — a per-launch
+        # "Colgram is installed on this device" beacon, while the README claims Firebase was
+        # stripped.
+        #
+        # Push cannot work in this build regardless: Google answers 403 PERMISSION_DENIED /
+        # API_KEY_ANDROID_APP_BLOCKED for org.colgram.messenger, so the token request always
+        # fails after it has already been sent. Skipping it removes the leak and a pointless
+        # round trip without taking away anything that ever worked.
+        push_listener = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org",
+                                     "telegram", "messenger", "PushListenerController.java")
+
+        PRISTINE_FB_INIT = "                    FirebaseApp.initializeApp(ApplicationLoader.applicationContext);\n"
+        FIREBASE_SKIP = (
+            "                    // Colgram: Firebase is deliberately not initialized here.\n"
+            "                    // Firebase Installations beacons this package name to Google on every\n"
+            "                    // launch over an unproxied connection, and the API key blocks us\n"
+            "                    // anyway (403 API_KEY_ANDROID_APP_BLOCKED), so push never worked and\n"
+            "                    // the request only leaked the install. Pair with the\n"
+            "                    // FirebaseInitProvider removal in the manifest - the provider alone\n"
+            "                    // does not stop it, because this line initializes it explicitly.\n"
+            "                    // The `if (true)` is deliberate: a bare `return` here makes every\n"
+            "                    // statement below it unreachable, which javac rejects as an error,\n"
+            "                    // whereas an if-then that always completes abruptly still lets the\n"
+            "                    // enclosing block complete normally (JLS 14.21).\n"
+            "                    if (true) {\n"
+            "                        SharedConfig.pushStringStatus = \"__FIREBASE_DISABLED__\";\n"
+            "                        return;\n"
+            "                    }\n"
+        )
+
+        def push_skip_firebase(content):
+            # Normalise first, then apply. This block has already had three textual shapes
+            # (pristine, a bare `return` that does not compile, and the current if-true form
+            # with two different comment lengths). Matching them literally means a checkout
+            # whose copy differs by a single comment line can never be repaired: the anchor is
+            # consumed, the marker does not match, and the patch reports a miss forever.
+            # So: cut any Colgram block back to the pristine line by SHAPE, then re-emit.
+            content = re.sub(
+                r" *// Colgram: Firebase is deliberately not initialized here\..*?"
+                r"\n *\}\n(?= *FirebaseMessaging\.getInstance\(\)\.getToken\(\))",
+                PRISTINE_FB_INIT, content, count=1, flags=re.S)
+            if PRISTINE_FB_INIT not in content:
+                return content
+            return content.replace(PRISTINE_FB_INIT, FIREBASE_SKIP, 1)
+
+        patch_file(
+            push_listener,
+            push_skip_firebase,
+            FIREBASE_SKIP,
+            "PushListenerController Do Not Initialize Firebase"
+        )
 
         # 25. SettingsActivity.java -> Deep Integration of Colgram Settings, Plugins, TempMail, Versions
         settings_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "SettingsActivity.java")
@@ -2715,38 +2982,27 @@ def inject_hooks(repo_path):
             'titles[0] = "Colgram";',
             "IntroActivity Set Title to Colgram"
         )
+        # The replacement is the BILINGUAL form the checkout actually ships. It used to write
+        # a Russian-only literal, while the file had since been hand-improved to switch on the
+        # active language — so a fresh clone silently lost the English subtitle, and the patch
+        # reported a permanent miss locally because its own target had moved past it.
         patch_file(
             intro_file,
             'LocaleController.getString(R.string.Page1Message),',
-            '"Быстрый, приватный и свободный мессенджер",',
+            'ru ? "Быстрый, приватный и свободный мессенджер" : "A fast, private and free messenger",',
             "IntroActivity Set Subtitle to Colgram"
         )
-        patch_file(
-            intro_file,
-            'frameLayout2 = new FrameLayout(context);\n        frameContainerView.addView(frameLayout2, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.LEFT | Gravity.TOP, 0, 78, 0, 0));\n\n        TextureView textureView = new TextureView(context);',
-            '''frameLayout2 = new FrameLayout(context);
-        frameContainerView.addView(frameLayout2, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.LEFT | Gravity.TOP, 0, 78, 0, 0));
-
-        // The stock Telegram intro logo is drawn by the native Intro renderer into this
-        // TextureView's SurfaceTexture. Never hide or remove this view: the native side
-        // (org.telegram.messenger.Intro, JNI) keeps a reference to the SurfaceTexture and
-        // frees/draws into it on every frame. Making the view GONE while the renderer is
-        // still attached leaves the native code holding an invalid surface, which
-        // corrupts the heap and aborts the process:
-        //   Abort message: 'Scudo ERROR: invalid chunk state when deallocating address ...'
-        // (also seen as SIGSEGV / SEGV_MAPERR / fdsan in the same slot).
-        //
-        // So the Colgram logo is added as an OVERLAY that sits on top of the live native
-        // view rather than replacing it. The TextureView keeps rendering underneath and
-        // nothing native is invalidated.
-        android.widget.ImageView colgramLogo = new android.widget.ImageView(context);
-        colgramLogo.setImageResource(R.drawable.colgram_plane_splash);
-        colgramLogo.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
-        frameLayout2.addView(colgramLogo, LayoutHelper.createFrame(160, 160, Gravity.CENTER));
-
-        TextureView textureView = new TextureView(context);''',
-            "IntroActivity Show Colgram Red Airplane"
-        )
+        # "IntroActivity Show Colgram Red Airplane" REMOVED as obsolete.
+        #
+        # It added an ImageView overlay on top of the native intro TextureView. The anchor no
+        # longer matches upstream, so it has not applied for a long time — and the intro still
+        # shows the Colgram plane, verified on device with no `colgramLogo` present anywhere in
+        # the built tree. The branding therefore comes from the splash/launcher assets written
+        # by prepare_branding and the native intro, not from this patch.
+        #
+        # It is deleted rather than re-anchored because re-anchoring it would draw a SECOND
+        # logo on top of the native one, and because the native view must never be hidden —
+        # see the invalid-surface abort documented below.
         # NOTE: the day/night switcher used to be hidden here with
         # themeFrameLayout.setVisibility(View.GONE). That is deliberately NOT done any more.
         # The stock paragraph around this frame also carries the native intro surface; a
@@ -2768,36 +3024,21 @@ def inject_hooks(repo_path):
         # The fix is to stop fighting the theme. We brand in Colgram red (accents) and let
         # the background and all body text follow the active theme, so every form on this
         # container stays legible in both light and dark mode.
-        patch_file(
-            intro_file,
-            'startMessagingButtonBackground.setColors(new int[]{getThemedColor(Theme.key_featuredStickers_addButton), getThemedColor(Theme.key_featuredStickers_addButton2)});',
-            'startMessagingButtonBackground.setColors(new int[]{0xFFD32F2F, 0xFF8B0000});',
-            "IntroActivity Red Gradient Button"
-        )
-        patch_file(
-            intro_file,
-            'switchLanguageTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));',
-            'switchLanguageTextView.setTextColor(0xFFEF5350);',
-            "IntroActivity Red Switch Language Text"
-        )
-
-        # The Colgram language badge sat UNDER the stock day/night switcher.
+        # These three patches used to hard-code Colgram red into the intro and to place the
+        # language badge with a fixed top margin. They are GONE, deliberately:
         #
-        # Both are anchored Gravity.TOP | Gravity.RIGHT on the same container:
-        #   themeFrameLayout : createFrame(64, 64, TOP|RIGHT, 0, themeMargin, themeMargin, 0)
-        #   langBadge        : createFrame(WRAP_CONTENT, 32, TOP|RIGHT, 0, 16, 16, 0)
-        # themeMargin is 4, so the switcher occupies the rightmost 68dp. The badge, added
-        # at a 16dp right margin, lands inside it - and because the switcher is added to
-        # the container AFTER the badge, it draws on top. That is the "theme button is on
-        # top of the language button" bug.
+        #   * they wrote raw colours that ignore light/dark and the cyber palette, which is
+        #     the opposite of what the surrounding comment asks for;
+        #   * the badge one produced `top = 16`, the exact value that puts the badge under the
+        #     status bar;
+        #   * the intro patch above now consumes both the pristine upstream form and the red
+        #     form, so it no longer depends on these running first.
         #
-        # Fix: push the badge clear of the switcher. Right margin = themeMargin + 64 + 8.
-        patch_file(
-            intro_file,
-            'frameContainerView.addView(langBadge, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, 16, 16, 0));',
-            'frameContainerView.addView(langBadge, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, 16, themeMargin + 64 + 8, 0));',
-            "IntroActivity Language Badge Clear Of Theme Switcher"
-        )
+        # Leaving them in meant a fresh clone got reds and a misplaced badge while the local
+        # checkout — where they simply failed to match — looked correct. That split is the
+        # worst possible failure mode, because CI is what ships.
+        #
+        # Their replacements live in the intro patch near "colgramBadgeTop" / "colgramAccent".
 
         # 38b. strings.xml -> the in-app name still said "Telegram".
         #
@@ -2845,14 +3086,16 @@ def inject_hooks(repo_path):
         # background and text colours on every theme event, so any one-shot fix to the
         # constructor gets overwritten the moment the theme changes. Neutralise the
         # hardcoded black here and let the themed values flow through.
+        #
+        # Anchored on the background line ALONE. It used to span three lines including
+        # `switchLanguageTextView.setTextColor(0xFFEF5350)`, but the accent patch earlier in
+        # this run rewrites that exact line — so the span could never match once that patch
+        # had done its job, and this fix silently stopped applying. Only the background is
+        # this patch's business.
         patch_file(
             intro_file,
-            '''        fragmentView.setBackgroundColor(0xFF000000);
-        switchLanguageTextView.setTextColor(0xFFEF5350);
-        startMessagingButton.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText));''',
-            '''        fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
-        switchLanguageTextView.setTextColor(0xFFEF5350);
-        startMessagingButton.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText));''',
+            '        fragmentView.setBackgroundColor(0xFF000000);\n',
+            '        fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));\n',
             "IntroActivity updateColors Keeps Themed Background"
         )
 
@@ -3179,7 +3422,9 @@ def inject_hooks(repo_path):
         "                    if (!colgramBotName.isEmpty()) {\n"
         "                        firstNameEdit.setText(currentFirstName = colgramBotName);\n"
         "                    }\n"
-        "                    bioEdit.setText(currentBio = colgramBotDesc);\n"
+        "                    if (!colgramBotDesc.isEmpty()) {\n"
+        "                        bioEdit.setText(currentBio = colgramBotDesc);\n"
+        "                    }\n"
         "                    checkDone(true);\n"
         "                });\n"
         "            }, \"colgram-bot-profile\").start();\n"
@@ -3191,6 +3436,22 @@ def inject_hooks(repo_path):
         "            return;\n"
         "        }",
         "UserInfoActivity Bot Profile Load Via Bot API"
+    )
+
+    # Upgrade pass for the line above.
+    #
+    # The load patch originally wrote the fetched description unconditionally. getMe does not
+    # return a description, so that call blanked the bio field on every visit — and because
+    # the patch's anchor is the PRISTINE upstream code, editing its replacement could not
+    # reach a checkout that already carried the old form. This second pass repairs existing
+    # trees; the pristine path still handles fresh clones and CI.
+    patch_file(
+        user_info,
+        "                    bioEdit.setText(currentBio = colgramBotDesc);\n",
+        "                    if (!colgramBotDesc.isEmpty()) {\n"
+        "                        bioEdit.setText(currentBio = colgramBotDesc);\n"
+        "                    }\n",
+        "UserInfoActivity Bot Description Blank Guard"
     )
 
     # 47d. ConnectionsManager.onProxyError() -> rotate the proxy IMMEDIATELY.
@@ -4013,6 +4274,39 @@ def clone_required_submodules(repo_path):
         subprocess.run(["git", "checkout", "919e50b2f6f64b04b712cdb13d558ff9ecf9c8ed"], cwd=jlatex_dir, check=True)
         print(" [+] Successfully checked out jlatexmath submodule")
 
+def stamp_build_version(repo_path):
+    """Append a Colgram build id to APP_VERSION_NAME so a build can be identified on a phone.
+
+    Every Colgram APK so far has shipped the same versionName (12.10.3) and versionCode, so
+    two builds that differ by dozens of fixes are indistinguishable in Settings -> About and
+    in `dumpsys package`. That cost a full investigation cycle: half of a bug report turned
+    out to describe a build that already contained the fixes being re-attempted.
+
+    The stamp is stripped before being re-applied, so re-running the patcher converges
+    instead of appending a second suffix on every pass.
+    """
+    props = os.path.join(repo_path, "gradle.properties")
+    if not os.path.exists(props):
+        print(" [!] gradle.properties not found - build stamp NOT applied")
+        return
+    stamp = os.environ.get("COLGRAM_BUILD_STAMP", "").strip()
+    if not stamp:
+        import datetime
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    with open(props, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    m = re.search(r"^APP_VERSION_NAME=(.+)$", content, re.M)
+    if not m:
+        print(" [!] APP_VERSION_NAME not found - build stamp NOT applied")
+        return
+    base = m.group(1).split("-colgram.", 1)[0].strip()
+    updated = re.sub(r"^APP_VERSION_NAME=.+$", f"APP_VERSION_NAME={base}-colgram.{stamp}",
+                     content, count=1, flags=re.M)
+    with open(props, "w", encoding="utf-8", newline="") as f:
+        f.write(updated)
+    print(f" [+] Build stamp applied: {base}-colgram.{stamp}")
+
+
 def configure_package_and_branding(repo_path):
     print("[*] Configuring Colgram package identity and branding...")
     
@@ -4181,12 +4475,67 @@ def configure_package_and_branding(repo_path):
                 '                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />\n'
                 '            </intent-filter>\n'
                 '        </receiver>\n'
+                '\n'
+                '        <!-- Colgram: the boot broadcast cannot start a foreground service on\n'
+                '             Android 12+, but a running job can. This is the bridge. BIND_JOB_SERVICE\n'
+                '             is mandatory or the system refuses to start the job at all. -->\n'
+                '        <service\n'
+                '            android:name="org.colgram.core.ColgramBootJobService"\n'
+                '            android:enabled="true"\n'
+                '            android:exported="false"\n'
+                '            android:permission="android.permission.BIND_JOB_SERVICE" />\n'
             )
             if '    </application>' in m_content:
                 m_content = m_content.replace('    </application>', bg_block + '    </application>', 1)
                 print(" [+] Injected Colgram foreground service + boot receiver into AndroidManifest.xml")
             else:
                 print(" [!] FATAL: </application> not found - background sync NOT registered")
+        elif "org.colgram.core.ColgramBootJobService" not in m_content:
+            # The guard above keys on ColgramForegroundService, which an already-patched tree
+            # contains — so a later addition to bg_block would never reach that tree, and the
+            # boot bridge below would be missing from every build except a fresh clone. This
+            # pass brings an existing tree up to the same manifest.
+            job_block = (
+                '\n'
+                '        <!-- Colgram: the boot broadcast cannot start a foreground service on\n'
+                '             Android 12+, but a running job can. This is the bridge. -->\n'
+                '        <service\n'
+                '            android:name="org.colgram.core.ColgramBootJobService"\n'
+                '            android:enabled="true"\n'
+                '            android:exported="false"\n'
+                '            android:permission="android.permission.BIND_JOB_SERVICE" />\n'
+            )
+            if '    </application>' in m_content:
+                m_content = m_content.replace('    </application>', job_block + '    </application>', 1)
+                print(" [+] Added Colgram boot bridge JobService to AndroidManifest.xml")
+            else:
+                print(" [!] FATAL: </application> not found - boot bridge NOT registered")
+
+        # Firebase Installations is still in the build. Analytics and Crashlytics were removed,
+        # but FirebaseInitProvider is contributed by the com.google.gms.google-services plugin
+        # during manifest merging — not by the source manifest — so it survived the strip. On
+        # device it logs "FirebaseApp initialization successful" and then POSTS this package
+        # name to googleapis.com on every launch, over a DIRECT connection that bypasses any
+        # proxy. Google answers 403 because the API key blocks this app, so no data lands, but
+        # the beacon itself announces "Colgram is installed on this device" to Google each time
+        # the app starts, which is incompatible with what the README promises.
+        # Push is already dead for the same 403 reason, so removing it costs nothing.
+        if "com.google.firebase.provider.FirebaseInitProvider" not in m_content:
+            fb_block = (
+                '\n'
+                '        <!-- Colgram: remove the Firebase Installations beacon. It is merged in by\n'
+                '             the google-services plugin, not declared here, and it phones the package\n'
+                '             name to Google on every launch over an unproxied connection. -->\n'
+                '        <provider\n'
+                '            android:name="com.google.firebase.provider.FirebaseInitProvider"\n'
+                '            android:authorities="${applicationId}.firebaseinitprovider"\n'
+                '            tools:node="remove" />\n'
+            )
+            if '    </application>' in m_content:
+                m_content = m_content.replace('    </application>', fb_block + '    </application>', 1)
+                print(" [+] Removed FirebaseInitProvider beacon from AndroidManifest.xml")
+            else:
+                print(" [!] FATAL: </application> not found - Firebase beacon NOT removed")
 
         with open(main_manifest, "w", encoding="utf-8") as f:
             f.write(m_content)
@@ -4395,11 +4744,32 @@ def main():
 
     clone_required_submodules(target_repo)
     configure_package_and_branding(target_repo)
+    stamp_build_version(target_repo)
     apply_custom_app_icon(target_repo, custom_icon)
     inject_core(target_repo, core_dir)
     configure_chaquopy_build(target_repo)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)
+
+    unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]
+    stale = [m for m in ALLOWED_MISSES if m not in PATCH_MISSES]
+    if PATCH_MISSES:
+        print(f"\n[*] {len(PATCH_MISSES)} patch(es) did not apply:")
+        for miss in PATCH_MISSES:
+            tag = "allowed" if miss in ALLOWED_MISSES else "UNEXPECTED"
+            print(f"    [{tag}] {miss}")
+    if stale:
+        # An allow-list entry that no longer fires is dead weight that hides the fact that the
+        # patch it excuses was deleted or fixed. Say so instead of letting it rot silently.
+        print(f"\n[*] {len(stale)} allow-list entry(ies) no longer match any miss - prune them:")
+        for miss in stale:
+            print(f"    [stale] {miss}")
+    if unexpected:
+        print(f"\n[!] FATAL: {len(unexpected)} patch(es) failed unexpectedly.")
+        print("[!] An APK built now would silently be MISSING those features. Fix the anchors")
+        print("[!] or, if a miss is genuinely harmless, add it to ALLOWED_MISSES with a reason.")
+        sys.exit(1)
+
     print("\n[+] Colgram setup complete! Ready to build APK.")
 
 if __name__ == "__main__":

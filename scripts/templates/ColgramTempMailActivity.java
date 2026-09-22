@@ -125,6 +125,16 @@ public class ColgramTempMailActivity extends BaseFragment {
     private boolean autoRefreshEnabled = false;
     private boolean autoRefreshRunning = false;
 
+    /**
+     * True only while generateNewMailbox() is actually on the wire.
+     *
+     * The address label used to read "Генерация адреса..." whenever the field was empty, so a
+     * user who had simply never created a mailbox was told the app was working on it — and it
+     * never finished, because nothing had started. Distinguishing "busy" from "not created yet"
+     * is the whole point.
+     */
+    private volatile boolean mailboxGenerating = false;
+
     private static final String[][] WEB_TEMP_SERVICES = {
         {"smailpro.com", "https://smailpro.com/", "Временная почта Gmail / Outlook"},
         {"22.do", "https://22.do/en/", "Быстрый генератор disposable почты"},
@@ -250,14 +260,24 @@ public class ColgramTempMailActivity extends BaseFragment {
         final ArrayList<String> opts = new ArrayList<>();
         opts.add("По умолчанию (выберет сервис)");
         opts.addAll(availableDomains);
+        opts.add("Обновить список доменов");
+        final int reloadIndex = opts.size() - 1;
         new AlertDialog.Builder(ctx)
                 .setTitle("Домен для нового ящика")
                 .setItems(opts.toArray(new String[0]), (d, which) -> {
+                    if (which == reloadIndex) {
+                        // The list used to be cached for the lifetime of the process with no
+                        // way to refresh it, so a domain the provider added or re-activated
+                        // stayed invisible until an app restart.
+                        availableDomains.clear();
+                        showDomainPicker();
+                        return;
+                    }
                     pendingDomain = (which == 0) ? null : opts.get(which);
-                    Toast.makeText(ctx, pendingDomain == null
-                                    ? "Домен: по умолчанию"
-                                    : "Домен: @" + pendingDomain,
-                            Toast.LENGTH_SHORT).show();
+                    // Creating the mailbox here is the point of the picker. Previously the
+                    // choice only landed in pendingDomain and the user still had to press
+                    // "Новый ящик" afterwards, which read as the picker doing nothing.
+                    generateNewMailbox();
                 })
                 .setNegativeButton("Отмена", null)
                 .show();
@@ -412,6 +432,8 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void generateNewMailbox() {
+        mailboxGenerating = true;
+        if (listAdapter != null) listAdapter.notifyDataSetChanged();
         executor.execute(() -> {
             try {
                 // mail.tm — create a disposable mailbox.
@@ -503,17 +525,20 @@ public class ColgramTempMailActivity extends BaseFragment {
                     currentLogin = login;
                     currentDomain = domain;
                     mailTmToken = token;
+                    mailboxGenerating = false;
                     messages.clear();
                     if (listAdapter != null) listAdapter.notifyDataSetChanged();
                     fetchMessages(true);
                 });
             } catch (Throwable t) {
+                mailboxGenerating = false;
                 final String msg = humanizeError(t);
                 Log.w(TAG, "generateNewMailbox failed: " + t);
                 mainHandler.post(() -> {
                     if (getParentActivity() != null) {
                         Toast.makeText(getParentActivity(), "Не удалось создать ящик: " + msg, Toast.LENGTH_LONG).show();
                     }
+                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
                 });
             }
         });
@@ -1024,7 +1049,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                     btnRow.setOrientation(LinearLayout.HORIZONTAL);
 
                     TextView copyBtn = new TextView(mContext);
-                    copyBtn.setText("📋 Скопировать");
+                    copyBtn.setText("Скопировать");
                     copyBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
                     copyBtn.setTypeface(AndroidUtilities.bold());
                     copyBtn.setTextColor(Color.WHITE);
@@ -1039,7 +1064,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                     btnRow.addView(copyBtn, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1.0f, 0, 0, 8, 0));
 
                     TextView newBtn = new TextView(mContext);
-                    newBtn.setText("🔄 Новый ящик");
+                    newBtn.setText("Новый ящик");
                     newBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
                     newBtn.setTypeface(AndroidUtilities.bold());
                     newBtn.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
@@ -1081,7 +1106,9 @@ public class ColgramTempMailActivity extends BaseFragment {
                     LinearLayout card = (LinearLayout) holder.itemView;
                     TextView tv = card.findViewWithTag("email_tv");
                     if (tv != null) {
-                        tv.setText(currentEmail.isEmpty() ? "Генерация адреса..." : currentEmail);
+                        tv.setText(currentEmail.isEmpty()
+                            ? (mailboxGenerating ? "Генерация адреса..." : "Ящик ещё не создан — нажми «Новый ящик»")
+                            : currentEmail);
                     }
                     break;
                 }
@@ -1098,7 +1125,11 @@ public class ColgramTempMailActivity extends BaseFragment {
                     TextSettingsCell s = (TextSettingsCell) holder.itemView;
                     if (position >= 2 && position < shadowPos) {
                         if (msgCount == 0) {
-                            s.setText("Ожидание писем... (обновляется каждые 5 сек)", false);
+                            // Polling is opt-in, so promising a 5 second refresh while "Авто" is
+                            // off was simply false.
+                            s.setText(autoRefreshEnabled
+                                    ? "Ожидание писем... обновляется каждые 5 сек"
+                                    : "Писем пока нет. Включи «Авто», чтобы обновлять само", false);
                         } else {
                             int mIdx = position - 2;
                             TempMessage m = messages.get(mIdx);

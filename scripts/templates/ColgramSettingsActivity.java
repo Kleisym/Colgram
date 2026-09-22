@@ -9,6 +9,7 @@ import android.widget.Toast;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import org.colgram.core.ColgramBotSync;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramProxyManager;
@@ -69,6 +70,10 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int sandboxStorageRow;
     private int sandboxSectionRow;
 
+    private int botsHeaderRow;
+    private int botRealtimeRow;
+    private int botsSectionRow;
+
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
@@ -115,6 +120,10 @@ public class ColgramSettingsActivity extends BaseFragment {
         sandboxHeaderRow = rowCount++;
         sandboxStorageRow = rowCount++;
         sandboxSectionRow = rowCount++;
+
+        botsHeaderRow = rowCount++;
+        botRealtimeRow = rowCount++;
+        botsSectionRow = rowCount++;
 
         if (listAdapter != null) {
             listAdapter.notifyDataSetChanged();
@@ -222,6 +231,16 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
+                // Cyber is consulted when a colour is READ, so flipping the flag changes
+                // nothing for screens that already built their paints — which is why it
+                // looked half-applied and "ugly": whatever was on screen kept its old
+                // colours until the app restarted. There is no global theme-changed event
+                // in this Telegram version to broadcast (didApplyNewTheme has exactly one
+                // listener and it is account-scoped to ChatActivity), so recreate the host
+                // activity and let every screen resolve its colours again.
+                if (getParentActivity() != null) {
+                    getParentActivity().recreate();
+                }
                 Toast.makeText(getParentActivity(), "Тема изменена. Перезайдите на экран для обновления.", Toast.LENGTH_SHORT).show();
             } else if (position == dpiBypassRow) {
                 if (ColgramDpiBypass.isRunning()) {
@@ -260,6 +279,13 @@ public class ColgramSettingsActivity extends BaseFragment {
                 ColgramConfig.setSandboxStorageEnabled(val);
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
+                }
+            } else if (position == botRealtimeRow) {
+                // The cell shows "realtime", the preference stores "passive" — they are opposites.
+                boolean passive = !ColgramBotSync.isPassiveBotMode(getContext(), currentAccount);
+                ColgramBotSync.setPassiveBotMode(getContext(), currentAccount, passive);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(!passive);
                 }
             }
         });
@@ -307,18 +333,20 @@ public class ColgramSettingsActivity extends BaseFragment {
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
                    position == cyberThemeRow || position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
-                   position == sandboxStorageRow;
+                   position == sandboxStorageRow || position == botRealtimeRow;
         }
 
         @Override
         public int getItemViewType(int position) {
             if (position == cloakingHeaderRow || position == vaultHeaderRow || position == ghostHeaderRow ||
-                position == themeHeaderRow || position == networkHeaderRow || position == sandboxHeaderRow) {
+                position == themeHeaderRow || position == networkHeaderRow || position == sandboxHeaderRow ||
+                position == botsHeaderRow) {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
-                       position == themeSectionRow || position == networkSectionRow || position == sandboxSectionRow) {
+                       position == themeSectionRow || position == networkSectionRow || position == sandboxSectionRow ||
+                       position == botsSectionRow) {
                 return 3; // ShadowSectionCell
             }
             return 1; // TextCheckCell
@@ -365,6 +393,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                         headerCell.setText("Сеть и анонимность (Анти-ТСПУ)");
                     } else if (position == sandboxHeaderRow) {
                         headerCell.setText("Песочница файлов (Sandbox)");
+                    } else if (position == botsHeaderRow) {
+                        headerCell.setText("Бот-аккаунты");
                     }
                     break;
                 }
@@ -404,6 +434,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                         checkCell.setTextAndCheck("Открывать ссылки в защищенном браузере", ColgramConfig.isProxyBrowserEnabled(), true);
                     } else if (position == sandboxStorageRow) {
                         checkCell.setTextAndCheck("Изолировать файлы в Documents/Colgram", ColgramConfig.isSandboxStorageEnabled(), false);
+                    } else if (position == botRealtimeRow) {
+                        checkCell.setTextAndCheck("Получать сообщения бота в реальном времени",
+                                !ColgramBotSync.isPassiveBotMode(getContext(), currentAccount), true);
                     }
                     break;
                 }

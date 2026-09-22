@@ -100,7 +100,6 @@ public class ColgramBotSync {
         SharedPreferences globalPrefs = context.getSharedPreferences("colgram_bot_tokens_global", Context.MODE_PRIVATE);
         globalPrefs.edit()
                 .putString("token_account_" + account, token)
-                .putString("last_bot_token", token)
                 .apply();
 
         // A new token invalidates the previous poller (it was polling with the old one), so
@@ -126,10 +125,13 @@ public class ColgramBotSync {
         if (token.isEmpty()) {
             SharedPreferences globalPrefs = context.getSharedPreferences("colgram_bot_tokens_global", Context.MODE_PRIVATE);
             token = globalPrefs.getString("token_account_" + account, "");
-            if (token.isEmpty()) {
-                token = globalPrefs.getString("last_bot_token", "");
-            }
         }
+        // There used to be a third step here: fall back to "last_bot_token", the most recent
+        // token saved for ANY account. That made every account report the same bot, so
+        // ensurePollers() spun up to five long-pollers on one token (Bot API answers 409 to
+        // everyone but the first) and injected that bot's dialogs into ordinary accounts.
+        // A token is per-account or it does not exist; guessing across accounts is not a
+        // fallback, it is a leak.
         return token;
     }
 
@@ -908,20 +910,39 @@ public class ColgramBotSync {
     /**
      * True when Colgram should stay out of the update queue entirely.
      *
-     * Controlled by the "passive bot mode" preference, which defaults to ON. The safe
-     * default matters: a user who has a bot deployed somewhere must not have its update
-     * stream hijacked merely by adding the token in Colgram to browse its dialogs.
+     * Defaults to OFF, i.e. Colgram owns the update stream for a token it was given. Passive
+     * was the original default and it made the whole feature dead on arrival: the poller
+     * returns before its long-poll loop while passive is on, and nothing else ever calls
+     * getUpdates, so a bot chat could not receive a message until the app was restarted and
+     * something happened to refresh the dialog list. With no way to turn it off that default
+     * was not caution, it was a broken product.
+     *
+     * The caution itself is still real, so it is now the user's call rather than ours:
+     * ColgramSettingsActivity exposes this per account, and switching a deployed bot to
+     * passive releases the queue back to it.
      */
     public static boolean isPassiveBotMode(Context context, int account) {
-        if (context == null) return true;
+        if (context == null) return false;
         return context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE)
-                .getBoolean("passive_mode", true);
+                .getBoolean("passive_mode", false);
     }
 
+    /**
+     * Flip passive mode for an account and make the change take effect immediately.
+     *
+     * Tearing the poller down is not optional. The thread only checks passive once, before
+     * entering its loop, so without this an account switched to passive keeps consuming
+     * updates until the process dies, and one switched out of passive stays silent until the
+     * 60 s re-arm window happens to expire.
+     */
     public static void setPassiveBotMode(Context context, int account, boolean passive) {
         if (context == null) return;
         context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE)
                 .edit().putBoolean("passive_mode", passive).apply();
+        stopBotUpdatesPoller(account);
+        if (!passive) {
+            startBotUpdatesPoller(context, account);
+        }
     }
 
     /**
@@ -1071,6 +1092,37 @@ public class ColgramBotSync {
 
             Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
             Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+
+            // getMe returns no photo, so the object built above is photo-less. putUser()
+            // REPLACES the stored entry rather than merging into it, and auth
+            // .importBotAuthorization had already put the real user in there WITH a photo —
+            // so registering the bot's identity is what deleted its avatar. The photo only
+            // came back after a restart because that reloads the user from storage. Carry the
+            // visual identity over from whatever is already registered, and keep the access
+            // hash for the same reason: dropping it makes the peer unresolvable for outbound
+            // sends.
+            try {
+                Class<?> userBaseClass = Class.forName("org.telegram.tgnet.TLRPC$User");
+                // MessagesController declares getUser(Long), boxed. Asking for long.class threw
+                // NoSuchMethodException, which this catch turned into a warning — so on the
+                // first build that carried this fix the avatar was still wiped, and only the
+                // log line revealed it.
+                Object existing = mcClass.getMethod("getUser", Long.class)
+                        .invoke(mc, Long.valueOf(botId));
+                if (existing != null) {
+                    Object photo = userBaseClass.getField("photo").get(existing);
+                    if (photo != null) userBaseClass.getField("photo").set(user, photo);
+                    long existingHash = userBaseClass.getField("access_hash").getLong(existing);
+                    if (existingHash != 0) {
+                        userBaseClass.getField("access_hash").setLong(user, existingHash);
+                    }
+                    Log.i(TAG, "preserved existing bot photo=" + (photo != null)
+                            + " access_hash=" + (existingHash != 0) + " for id=" + botId);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "could not preserve existing bot photo/access_hash: " + t.getMessage());
+            }
+
             mcClass.getMethod("putUser", Class.forName("org.telegram.tgnet.TLRPC$User"), boolean.class)
                     .invoke(mc, user, true);
 
@@ -1181,6 +1233,7 @@ public class ColgramBotSync {
                 }
 
                 int consecutiveErrors = 0;
+                int applyFailures = 0;
 
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
@@ -1264,10 +1317,21 @@ public class ColgramBotSync {
                                         maxId = uid + 1;
                                     }
                                 }
-                                lastUpdateIds.put(account, maxId);
-                                prefs.edit().putInt("last_update_id", maxId).apply();
-
-                                processUpdatesJson(appContext, account, updates);
+                                // Ack only after the batch is in storage — same reason as in
+                                // syncBotDialogs. Retrying the same offset is safe and is the
+                                // point: the messages are still queued server-side.
+                                int applied = processUpdatesJson(appContext, account, updates);
+                                if (applied >= 0) {
+                                    lastUpdateIds.put(account, maxId);
+                                    prefs.edit().putInt("last_update_id", maxId).apply();
+                                    applyFailures = 0;
+                                } else if (++applyFailures >= 3) {
+                                    // Stop rather than spin. The offset was not advanced, so the
+                                    // 60 s poller re-arm picks the same batch up again later
+                                    // instead of this thread burning the battery on it.
+                                    Log.e(TAG, "update batch failed to apply 3 times; leaving it unacknowledged for the next poller run");
+                                    break;
+                                }
                             }
                         }
 
@@ -1375,8 +1439,12 @@ public class ColgramBotSync {
      */
     private static final long COLGRAM_SYNC_MIN_INTERVAL_MS = 3000L;
 
-    /** Timestamp of the last ACCEPTED automatic sync. Guarded by ColgramBotSync.class. */
-    private static volatile long colgramLastAutoSyncAt = 0L;
+    /** Timestamp of the last ACCEPTED automatic sync, per account. Guarded by ColgramBotSync.class. */
+    private static final ConcurrentHashMap<Integer, Long> colgramLastAutoSyncAt = new ConcurrentHashMap<>();
+
+    /** Accounts with a deferred automatic sync already queued. Guarded by ColgramBotSync.class. */
+    private static final java.util.Set<Integer> colgramAutoSyncQueued =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
 
     public static void syncBotDialogs(final Context context, final int account, final boolean userInitiated) {
         if (context == null) return;
@@ -1389,20 +1457,49 @@ public class ColgramBotSync {
         }
 
         // 🔴 THE CYCLE BREAK. Automatic calls only; a user-initiated sync always proceeds.
+        //
+        // A skipped sync used to be a bare `return`, which silently swallowed it: the only
+        // automatic caller is the loadDialogs hook, which fires on UI events, so if nothing
+        // else touched the dialog list the deferred work never came back. That is why the list
+        // stayed empty until a restart reset the static timestamp. The skip now queues exactly
+        // one retry for the remainder of the interval, and the queue is per-account so one busy
+        // bot cannot starve another.
         if (!userInitiated) {
+            long remaining;
             synchronized (ColgramBotSync.class) {
-                long now = System.currentTimeMillis();
-                if (now - colgramLastAutoSyncAt < COLGRAM_SYNC_MIN_INTERVAL_MS) {
-                    // Too soon after the last accepted automatic sync. This is the branch that
-                    // stops loadDialogs() -> syncBotDialogs() -> loadDialogs() from recursing.
-                    return;
+                Long last = colgramLastAutoSyncAt.get(account);
+                remaining = COLGRAM_SYNC_MIN_INTERVAL_MS
+                        - (System.currentTimeMillis() - (last == null ? 0L : last));
+                if (remaining <= 0) {
+                    colgramLastAutoSyncAt.put(account, System.currentTimeMillis());
+                    colgramAutoSyncQueued.remove(account);
                 }
-                colgramLastAutoSyncAt = now;
+            }
+            if (remaining > 0) {
+                synchronized (ColgramBotSync.class) {
+                    if (colgramAutoSyncQueued.contains(account)) return;
+                    colgramAutoSyncQueued.add(account);
+                }
+                mainHandler.postDelayed(() -> {
+                    synchronized (ColgramBotSync.class) {
+                        colgramAutoSyncQueued.remove(account);
+                    }
+                    syncBotDialogs(context, account, false);
+                }, remaining);
+                return;
             }
         }
 
         // Always ensure background poller is running
         startBotUpdatesPoller(context, account);
+
+        // The poller is the single owner of the update stream. If it is live, this method must
+        // NOT issue its own getUpdates: the Bot API answers 409 to the second consumer and
+        // terminates the loser's queue, which stopped the poller outright — the "chats are
+        // empty until I restart" symptom surviving every other fix here.
+        final Thread livePoller = pollerThreads.get(account);
+        final boolean pollerOwnsStream = livePoller != null && livePoller.isAlive()
+                && !isPassiveBotMode(context, account);
 
         if (userInitiated) {
             Toast.makeText(context, "🔄 Синхронизация чатов бота...", Toast.LENGTH_SHORT).show();
@@ -1410,6 +1507,13 @@ public class ColgramBotSync {
 
         executor.execute(() -> {
             try {
+                if (pollerOwnsStream) {
+                    // Nothing to fetch — the poller already consumes this stream and will
+                    // inject updates as they arrive. Just make the UI re-read what storage
+                    // holds so a manual press is never a visible no-op.
+                    notifyDialogsChanged(account);
+                    return;
+                }
                 // Resolve the bot's own identity FIRST. Without a current user the client
                 // cannot resolve its own id, so dialogs get inserted but never render —
                 // they look like "no chats" even when storage has them.
@@ -1473,16 +1577,26 @@ public class ColgramBotSync {
                         maxId = uid + 1;
                     }
                 }
-                if (maxId > 0) {
+                int count = processUpdatesJson(context, account, updates);
+                // Ack only once the batch is actually in storage. The offset used to be
+                // committed before this call, and because the Bot API marks everything it has
+                // returned as delivered, any failure inside processUpdatesJson lost those
+                // messages permanently rather than delaying them.
+                if (count >= 0 && maxId > 0) {
                     lastUpdateIds.put(account, maxId);
                     context.getSharedPreferences("colgram_bot_account_" + account, Context.MODE_PRIVATE)
                             .edit().putInt("last_update_id", maxId).apply();
                 }
-
-                int count = processUpdatesJson(context, account, updates);
                 if (userInitiated) {
                     final int finalCount = count;
-                    mainHandler.post(() -> Toast.makeText(context, "✅ Синхронизировано " + finalCount + " чатов бота!", Toast.LENGTH_SHORT).show());
+                    if (count < 0) {
+                        mainHandler.post(() -> Toast.makeText(context,
+                                "Не удалось применить полученные сообщения. Colgram не подтвердил их "
+                                        + "Telegram, так что они придут со следующей попыткой.",
+                                Toast.LENGTH_LONG).show());
+                    } else {
+                        mainHandler.post(() -> Toast.makeText(context, "✅ Синхронизировано " + finalCount + " чатов бота!", Toast.LENGTH_SHORT).show());
+                    }
                 }
 
             } catch (Throwable t) {
@@ -1495,7 +1609,57 @@ public class ColgramBotSync {
     }
 
     /**
+     * Sync every account that holds a bot token.
+     *
+     * Shared by the boot receiver and the boot job so neither grows its own copy of the
+     * account loop. Account range is bounded by MAX_ACCOUNT_COUNT rather than a literal, and
+     * a token is only ever stored for the account that authenticated with it — the old
+     * cross-account fallback made every slot look like the same bot.
+     */
+    public static void ensureAllAccountsSynced(Context context, String reason) {
+        if (context == null) {
+            return;
+        }
+        for (int account = 0; account < 5; account++) {
+            try {
+                String token = getBotToken(context, account);
+                if (token != null && !token.isEmpty()) {
+                    syncBotDialogs(context, account, false);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "sync failed for account " + account + " (" + reason + "): " + t.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Tell the dialog list to re-read storage, without writing anything.
+     *
+     * Reflection because colgram-core compiles before TMessagesProj and cannot reference its
+     * classes directly.
+     */
+    private static void notifyDialogsChanged(final int account) {
+        mainHandler.post(() -> {
+            try {
+                Class<?> ncClass = Class.forName("org.telegram.messenger.NotificationCenter");
+                Object nc = ncClass.getMethod("getInstance", int.class).invoke(null, account);
+                int dialogsNeedReload = ncClass.getField("dialogsNeedReload").getInt(null);
+                ncClass.getMethod("postNotificationName", int.class, Object[].class)
+                        .invoke(nc, dialogsNeedReload, new Object[0]);
+            } catch (Throwable t) {
+                Log.w(TAG, "notifyDialogsChanged failed: " + t.getMessage());
+            }
+        });
+    }
+
+    /**
      * Parses Bot API updates array and injects users, messages, and dialogs into MessagesStorage & MessagesController.
+     *
+     * @return the number of dialogs written, or -1 if the batch could not be applied. The
+     * negative case must stay distinguishable from a legitimate 0 (an update set carrying no
+     * message at all, e.g. only callback_query), because callers use it to decide whether to
+     * acknowledge the offset to Telegram. Returning 0 on error told them to ack, which lost
+     * messages outright.
      */
     private static int processUpdatesJson(Context context, int account, JSONArray updates) {
         if (updates == null || updates.length() == 0) return 0;
@@ -1528,6 +1692,9 @@ public class ColgramBotSync {
             // not all present on every update, so the last non-empty value wins.
             java.util.LinkedHashMap<Long, JSONObject> chatObjCache = new java.util.LinkedHashMap<>();
             java.util.LinkedHashMap<Long, String> titleCache = new java.util.LinkedHashMap<>();
+
+            // Resolved once: which sender in this batch is "us".
+            final long botSelfId = getBotSelfId(context, account);
 
             for (int i = 0; i < updates.length(); i++) {
                 JSONObject upd = updates.getJSONObject(i);
@@ -1597,7 +1764,10 @@ public class ColgramBotSync {
                 messageClass.getField("date").setInt(message, date);
                 messageClass.getField("message").set(message, text);
                 try {
-                    messageClass.getField("out").setBoolean(message, false);
+                    // The bot is "self" in this session, so anything it sent is an outgoing
+                    // message. Hard-coded false put every bot reply on the incoming side of
+                    // the thread, which reads as the bot's own messages never arriving.
+                    messageClass.getField("out").setBoolean(message, botSelfId != 0 && fromId == botSelfId);
                 } catch (Throwable ignored) {}
 
                 // Resolve the correct peer type and id.
@@ -1914,7 +2084,7 @@ public class ColgramBotSync {
             return dialogsList.size();
         } catch (Throwable t) {
             Log.e(TAG, "processUpdatesJson error", t);
-            return 0;
+            return -1;
         }
     }
 
@@ -2146,9 +2316,51 @@ public class ColgramBotSync {
             while ((line = reader.readLine()) != null) sb.append(line);
             reader.close();
             JSONObject root = new JSONObject(sb.toString());
-            return root.optBoolean("ok", false) ? root.optJSONObject("result") : null;
+            if (!root.optBoolean("ok", false)) return null;
+            JSONObject result = root.optJSONObject("result");
+            if (result == null) return null;
+
+            // getMe does NOT return the bot's description — the Bot API only serves it from
+            // getMyDescription. Callers read result.optString("description"), so without this
+            // extra request the field was always empty and the profile screen blanked the bot's
+            // real bio on every open. That is the "I edited the description and it only showed
+            // up after visiting the profile a couple of times" report.
+            try {
+                JSONObject desc = botApiGet(context, token, "getMyDescription");
+                if (desc != null) {
+                    String botDescription = desc.optString("description", "");
+                    if (!botDescription.isEmpty()) {
+                        result.put("description", botDescription);
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "getMyDescription failed: " + t.getMessage());
+            }
+            return result;
         } catch (Throwable t) {
             Log.w(TAG, "fetchBotProfile failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    /** A Bot API GET that returns the `result` object, or null on any failure. */
+    private static JSONObject botApiGet(Context context, String token, String method) {
+        try {
+            HttpURLConnection conn = openConnection(
+                    "https://api.telegram.org/bot" + token + "/" + method, 12000);
+            conn.setRequestMethod("GET");
+            int code = conn.getResponseCode();
+            java.io.InputStream stream = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+            JSONObject root = new JSONObject(sb.toString());
+            return root.optBoolean("ok", false) ? root.optJSONObject("result") : null;
+        } catch (Throwable t) {
+            Log.w(TAG, method + " failed: " + t.getMessage());
             return null;
         }
     }

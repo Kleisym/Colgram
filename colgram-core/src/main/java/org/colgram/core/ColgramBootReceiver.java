@@ -41,39 +41,19 @@ public class ColgramBootReceiver extends BroadcastReceiver {
                 && !"com.htc.intent.action.QUICKBOOT_POWERON".equals(action)) {
             return;
         }
-        Log.i(TAG, "received " + action + " - restarting background sync");
+        Log.i(TAG, "received " + action + " - scheduling the boot bridge job");
 
-        // Work off the main thread: onReceive has a ~10s budget and starting a service can block
-        // while the system settles after boot. A bare Thread is enough here and avoids pulling in
-        // a scheduler; the process is already being started by the broadcast.
-        final Context appContext = context.getApplicationContext();
-        final String act = action;
-        new Thread(() -> {
-            try {
-                // Give the framework a moment on a cold boot. Starting a foreground service in the
-                // first instants after BOOT_COMPLETED is the most likely moment for the OEM
-                // restrictions above to fire, and a short delay measurably improves the odds.
-                if (Intent.ACTION_BOOT_COMPLETED.equals(act)) {
-                    Thread.sleep(3000L);
-                }
-                ColgramForegroundService.start(appContext);
-                // Re-seed the bot chats: storage survived the reboot but the in-memory dialog
-                // cache did not, so without this the list renders empty until the user opens a
-                // chat. syncBotDialogs() is what rebuilds it.
-                for (int account = 0; account < 5; account++) {
-                    try {
-                        String token = ColgramBotSync.getBotToken(appContext, account);
-                        if (token != null && !token.isEmpty()) {
-                            ColgramBotSync.syncBotDialogs(appContext, account, false);
-                        }
-                    } catch (Throwable t) {
-                        Log.w(TAG, "post-boot sync failed for account " + account + ": " + t.getMessage());
-                    }
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "post-boot start failed: " + t);
-            }
-        }, "colgram-boot-start").start();
+        // Starting the foreground service from here is not permitted on Android 12+: the
+        // broadcast does not grant a background-start exemption, so startForegroundService()
+        // threw ForegroundServiceStartNotAllowedException, the fallback startService() was
+        // rejected for the same reason, both were swallowed, and nothing synced until the user
+        // opened the app by hand. A running job IS an exemption, so hand off to the job and do
+        // the work from inside it.
+        try {
+            ColgramBootJobService.schedule(context.getApplicationContext());
+        } catch (Throwable t) {
+            Log.w(TAG, "boot bridge scheduling failed: " + t);
+        }
     }
 
     /** True when this build declares the receiver, used by the patcher's preflight check. */

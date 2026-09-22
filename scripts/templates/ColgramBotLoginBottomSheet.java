@@ -273,11 +273,14 @@ public class ColgramBotLoginBottomSheet {
                     bottomSheet.dismiss();
                 } catch (Throwable ignored) {}
                 try {
-                    // Pre-save token to current account and all slots so getBotToken is never empty
+                    // Save for the account that is actually authenticating, and for
+                    // UserConfig.selectedAccount in case the two disagree — that mismatch is why
+                    // this used to spray the token across slots 0..3 "so getBotToken is never
+                    // empty". Spraying made every account look like the same bot: ensurePollers
+                    // then started up to four long-pollers on one token (Bot API 409s all but
+                    // one), each called deleteWebhook, and the bot's dialogs were injected into
+                    // ordinary accounts that had nothing to do with it.
                     org.colgram.core.ColgramBotSync.saveBotToken(context, currentAccount, token);
-                    for (int slot = 0; slot < 4; slot++) {
-                        org.colgram.core.ColgramBotSync.saveBotToken(context, slot, token);
-                    }
                     activity.onAuthSuccess((TLRPC.TL_auth_authorization) response);
                     org.colgram.core.ColgramBotSync.saveBotToken(context, UserConfig.selectedAccount, token);
                     org.colgram.core.ColgramBotSync.syncBotDialogs(context, UserConfig.selectedAccount, false);
