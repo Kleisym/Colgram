@@ -260,16 +260,24 @@ public class ColgramTempMailActivity extends BaseFragment {
         final ArrayList<String> opts = new ArrayList<>();
         opts.add("По умолчанию (выберет сервис)");
         opts.addAll(availableDomains);
+        // A second backend as a choice, not as a silent fallback: guerrillamail answers on
+        // networks where mail.tm does not, and picking it is a deliberate act.
+        opts.add(GUERRILLA_DOMAIN);
         opts.add("Обновить список доменов");
         final int reloadIndex = opts.size() - 1;
         AlertDialog.Builder domainDialog = new AlertDialog.Builder(ctx)
                 .setTitle("Домен для нового ящика");
+        // An empty list with no explanation is what made this read as a broken feature, so the
+        // failure is named per host. The endings people ask for are named too: gmail.com and
+        // googlemail.com belong to Google, no disposable service can hand out an address on
+        // them, and anything that promises one is a trap - so the honest answer lives here.
+        String note = "gmail.com / googlemail.com как одноразовые не существуют - это чужие почтовые домены.\n";
         if (availableDomains.isEmpty()) {
-            // An empty list with no explanation is what made this read as a broken feature.
-            // Say which host failed and how, and let him retry from inside the dialog.
-            domainDialog.setMessage("Список доменов не пришёл:\n"
+            domainDialog.setMessage(note + "Список доменов не пришёл:\n"
                     + (lastDomainError == null || lastDomainError.isEmpty()
                             ? "сервис не отвечал" : lastDomainError));
+        } else {
+            domainDialog.setMessage(note + "Ниже - домены, которые реально выдаёт активный сервис.");
         }
         domainDialog
                 .setItems(opts.toArray(new String[0]), (d, which) -> {
@@ -311,6 +319,9 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     /** The one disposable-mail API that did answer here, with its API shape verified by hand. */
     private static final String GUERRILLA_API = "https://api.guerrillamail.com/ajax.php";
+
+    /** Shown in the domain picker as a second backend. Its real address domain is fixed. */
+    private static final String GUERRILLA_DOMAIN = "guerrillamailblock.com (GuerrillaMail)";
 
     /**
      * The host that actually answered the domain probe. Every later call has to go to the same
@@ -519,6 +530,12 @@ public class ColgramTempMailActivity extends BaseFragment {
                 // Falling back to the literal meant account creation was rejected with 422
                 // and the whole feature looked dead. If the domain list cannot be read we
                 // must fail loudly instead of inventing an address.
+                if (pendingDomain != null && pendingDomain.startsWith(GUERRILLA_DOMAIN)) {
+                    if (!generateWithGuerrilla()) {
+                        throw new IOException("GuerrillaMail не ответил");
+                    }
+                    return;
+                }
                 final String domain = withRetry("resolve domain", () -> {
                     // The user's pick wins. Only fall back to "first active domain" when
                     // they have not chosen one.

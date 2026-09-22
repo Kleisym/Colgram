@@ -27,7 +27,7 @@ PATCH_MISSES = []
 # the wrapper or the palette: it is both the constant the wrapper declares and the patch_file
 # marker, so the two can no longer disagree and an old build can no longer report "already
 # patched" over a newer body.
-COLGRAM_THEME_PATCH_VERSION = "5"
+COLGRAM_THEME_PATCH_VERSION = "6"
 
 # Misses that are known-benign, with the reason. Anything NOT listed here fails the run.
 # Keeping this explicit is the point: a new miss cannot be waved through by accident, and a
@@ -1993,6 +1993,27 @@ def inject_hooks(repo_path):
         "        // key_telegram_color_text, so there is no per-view colour key to reach and the\n"
         "        // palette has to answer it here. Measured after the first cyber fix: the title,\n"
         "        // badge and tab label were #ff3344, the date alone was still #298acf.\n"
+        "                // Dialogs. The readability guard lightens any foreground it thinks sits on the\n"
+        "                // cyber background - including dialog text - but a dialog is its own surface, and\n"
+        "                // that surface was not in the palette at all. Seen in a screenshot: a white\n"
+        "                // AlertDialog with near-white text, nothing readable. Both halves have to move.\n"
+        "                if (key == key_dialogBackground || key == key_dialogButtonSelector) {\n"
+        "                    return COLGRAM_CYBER_SURFACE;\n"
+        "                }\n"
+        "                if (key == key_dialogTextBlack || key == key_dialogIcon) {\n"
+        "                    return COLGRAM_CYBER_TEXT;\n"
+        "                }\n"
+        "                if (key == key_dialogTextGray2 || key == key_dialogTextGray3) {\n"
+        "                    return COLGRAM_CYBER_TEXT_DIM;\n"
+        "                }\n"
+        "                if (key == key_dialogButton || key == key_dialog_inlineProgress\n"
+        "                        || key == key_dialogLineProgress) {\n"
+        "                    return COLGRAM_CYBER_ACCENT;\n"
+        "                }\n"
+        "                if (key == key_dialog_inlineProgressBackground\n"
+        "                        || key == key_dialogLineProgressBackground) {\n"
+        "                    return COLGRAM_CYBER_FIELD;\n"
+        "                }\n"
         "        if (key == key_telegram_color_dialogsLogo\n"
         "                || key == key_telegram_color || key == key_telegram_color_text\n"
         "                || key == key_chats_tabUnreadActiveBackground\n"
@@ -4073,6 +4094,52 @@ def inject_hooks(repo_path):
 
     patch_file(chat_attach_alert, attach_folder_injector, COLGRAM_ATTACH_FOLDER_MARKER,
                "ChatAttachAlert Colgram Folder Entry")
+
+    # 57. SettingsActivity.java -> the Cyber theme where themes are actually chosen.
+    #
+    # He asked for the red/black theme to live "по стандарту", in the normal settings, instead of
+    # being reachable only through Настройки Colgram. The stock Settings list is the right place:
+    # it is the first screen people open when they want to change how Telegram looks, and this
+    # file already carries a Colgram section, so the row sits with its siblings rather than in a
+    # separate app.
+    #
+    # Toggling recreates the activity. Cyber is consulted when a colour is READ, so every screen
+    # that already built its paints keeps its old colours otherwise - which is what made the
+    # switch look broken. The same trick is used by the row in ColgramSettingsActivity, and both
+    # read and write the one flag, so they cannot disagree.
+    def settings_cyber_item_injector(content):
+        target = ('items.add(SettingCell.Factory.of(104, 0xFF4CAF50, 0xFF2E7D32, R.drawable.msg_download, '
+                  '"Версии Telegram и обновления", "Переключение каналов и загрузка APK"));')
+        if target not in content:
+            return content
+        inject = target + ('\n        items.add(SettingCell.Factory.of(105, 0xFFFF3344, 0xFF7A0C14, '
+                           'R.drawable.msg_colors, "Красно-чёрная тема Colgram Cyber", '
+                           'org.colgram.core.ColgramConfig.isCyberThemeEnabled() ? "включена" : "выключена"));')
+        return content.replace(target, inject, 1)
+
+    patch_file(settings_activity, settings_cyber_item_injector,
+               'items.add(SettingCell.Factory.of(105, 0xFFFF3344',
+               "SettingsActivity Cyber Theme Row")
+
+    def settings_cyber_click_injector(content):
+        target = """            case 104:
+                presentSettingFragment(new ColgramVersionsActivity());
+                break;"""
+        if target not in content:
+            return content
+        inject = target + """
+            case 105:
+                org.colgram.core.ColgramConfig.init(getParentActivity());
+                org.colgram.core.ColgramConfig.setCyberThemeEnabled(
+                        !org.colgram.core.ColgramConfig.isCyberThemeEnabled());
+                if (getParentActivity() != null) {
+                    getParentActivity().recreate();
+                }
+                break;"""
+        return content.replace(target, inject, 1)
+
+    patch_file(settings_activity, settings_cyber_click_injector, "case 105:",
+               "SettingsActivity Cyber Theme Click")
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
