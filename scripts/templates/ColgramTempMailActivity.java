@@ -272,6 +272,9 @@ public class ColgramTempMailActivity extends BaseFragment {
         // googlemail.com belong to Google, no disposable service can hand out an address on
         // them, and anything that promises one is a trap - so the honest answer lives here.
         String note = "gmail.com / googlemail.com как одноразовые не существуют - это чужие почтовые домены.\n";
+        if (!providerStatusLine.isEmpty()) {
+            note = providerStatusLine + "\n" + note;
+        }
         if (availableDomains.isEmpty()) {
             domainDialog.setMessage(note + "Список доменов не пришёл:\n"
                     + (lastDomainError == null || lastDomainError.isEmpty()
@@ -370,7 +373,35 @@ public class ColgramTempMailActivity extends BaseFragment {
         }
         lastDomainError = reasons.length() == 0 ? "неизвестная ошибка" : reasons.toString().trim();
         Log.w(TAG, "fetchDomainList failed: " + lastDomainError);
+        probeProviderStatus();
         return out;
+    }
+
+    /** One line saying which backend answers from this network, and how fast. */
+    private String providerStatusLine = "";
+
+    /**
+     * Measured reachability of both backends, for the picker. "The temp mails do not work" is
+     * usually "this network cannot reach this host", and the only way to tell those apart is to
+     * actually try and say what happened. Runs on the caller's background thread.
+     */
+    private void probeProviderStatus() {
+        StringBuilder sb = new StringBuilder("Доступность с этой сети:\n");
+        long t = System.currentTimeMillis();
+        try {
+            httpGetJson(DOMAIN_ENDPOINTS[0]);
+            sb.append("mail.tm: отвечает (").append(System.currentTimeMillis() - t).append(" мс)\n");
+        } catch (Throwable e) {
+            sb.append("mail.tm: не отвечает\n");
+        }
+        t = System.currentTimeMillis();
+        try {
+            httpGetJson(GUERRILLA_API + "?f=get_email_address&lang=en");
+            sb.append("GuerrillaMail: отвечает (").append(System.currentTimeMillis() - t).append(" мс)");
+        } catch (Throwable e) {
+            sb.append("GuerrillaMail: не отвечает");
+        }
+        providerStatusLine = sb.toString();
     }
 
     private static String schemeAndHost(String url) {

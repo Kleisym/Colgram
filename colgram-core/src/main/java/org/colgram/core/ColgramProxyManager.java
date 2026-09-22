@@ -695,6 +695,11 @@ public class ColgramProxyManager {
             item.nativeFailures = 0;
             item.failedVerdicts = 0;
             rememberAlive();
+            // A proven node is worth connecting through right now when the direct route is
+            // dead; waiting for the next scheduled sweep left the app on "connecting" for
+            // minutes with a working proxy sitting in the pool. Off-main: the reachability
+            // test inside opens sockets.
+            executor.execute(() -> autoConnectIfBlocked());
         } else {
             item.nativeVerified = false;
             item.failedVerdicts++;
@@ -1152,6 +1157,10 @@ public class ColgramProxyManager {
         mainHandler.post(() -> {
             startProber();
             publishPoolToStock();
+            // The first sweep right after the harvest: TCP verdicts for the whole pool in a
+            // few seconds, and the ordering the prober needs to spend its handshakes on nodes
+            // that actually answer.
+            sweepFast(null);
         });
     }
 

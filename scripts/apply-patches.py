@@ -4538,6 +4538,161 @@ def inject_hooks(repo_path):
     patch_file(lite_file, litemode_powersaver_injector, "colgramPowerSaverMask",
                "LiteMode Power Saver Keeps Features")
 
+    # 64. DialogsSearchAdapter -> paste a link or a @username and jump straight to it.
+    #
+    # Stock search only knows dialogs, messages and the server's contacts search; a pasted
+    # t.me link produced an empty list and a @username only worked if the server happened to
+    # return it. One synthetic row at the end of the result list fixes both: it appears the
+    # moment the query is a URL or a handle, and tapping it deep-links internally (Browser.openUrl
+    # resolves t.me inside the app) or opens the peer by username.
+    dialogs_search_adapter = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                                          "org", "telegram", "ui", "Adapters", "DialogsSearchAdapter.java")
+
+    def search_jump_injector(content):
+        marker = "VIEW_TYPE_COLGRAM_JUMP"
+        if marker in content:
+            return content
+
+        anchor_const = "    public final static int VIEW_TYPE_EMPTY_RESULT = 10;\n"
+        if anchor_const not in content:
+            return content
+        content = content.replace(
+            anchor_const,
+            anchor_const
+            + "    public final static int VIEW_TYPE_COLGRAM_JUMP = 11;\n"
+            + "    /** Text of the synthetic jump row, or null when the query is not a link/handle. */\n"
+            + "    public String colgramJumpLabel;\n"
+            + "    public String colgramJumpTarget;\n"
+            + "    private int colgramLastCount;\n", 1)
+
+        # The inner hints adapter declares its own getItemCount/onBindViewHolder, so every
+        # anchor here has to include enough body to skip past that static nested class.
+        anchor_count = ("    public int getItemCount() {\n"
+                        "        if (waitingResponseCount == 3) {\n"
+                        "            return 0;\n"
+                        "        }\n")
+        if anchor_count not in content:
+            return content
+        content = content.replace(
+            anchor_count,
+            ("    public int getItemCount() {\n"
+             "        int colgramBase = colgramOriginalCount();\n"
+             "        colgramLastCount = colgramBase;\n"
+             "        return colgramBase + (colgramJumpLabel != null ? 1 : 0);\n"
+             "    }\n"
+             "\n"
+             "    private int colgramOriginalCount() {\n"
+             "        if (waitingResponseCount == 3) {\n"
+             "            return 0;\n"
+             "        }\n"), 1)
+
+        anchor_type = "    public int getItemViewType(int i) {\n"
+        if anchor_type not in content:
+            return content
+        content = content.replace(
+            anchor_type,
+            anchor_type
+            + "        if (colgramJumpLabel != null && i == colgramLastCount) {\n"
+            + "            return VIEW_TYPE_COLGRAM_JUMP;\n"
+            + "        }\n", 1)
+
+        anchor_enabled = "        return type != 1 && type != 4 && type != VIEW_TYPE_EMPTY_RESULT;\n"
+        if anchor_enabled not in content:
+            return content
+        content = content.replace(
+            anchor_enabled,
+            "        if (type == VIEW_TYPE_COLGRAM_JUMP) return true;\n" + anchor_enabled, 1)
+
+        anchor_create = "            case VIEW_TYPE_ADD_BY_PHONE:\n            default:\n"
+        if anchor_create not in content:
+            return content
+        content = content.replace(
+            anchor_create,
+            ("            case VIEW_TYPE_COLGRAM_JUMP:\n"
+             "                view = new TextCell(mContext, 16, false);\n"
+             "                break;\n"
+             + anchor_create), 1)
+
+        anchor_bind = ("    public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {\n"
+                       "        switch (holder.getItemViewType()) {\n")
+        if anchor_bind not in content:
+            return content
+        content = content.replace(
+            anchor_bind,
+            anchor_bind
+            + "            case VIEW_TYPE_COLGRAM_JUMP: {\n"
+            + "                ((TextCell) holder.itemView).setText(colgramJumpLabel, true);\n"
+            + "                break;\n"
+            + "            }\n", 1)
+
+        anchor_query = "        lastSearchText = text;\n"
+        if anchor_query not in content:
+            return content
+        content = content.replace(
+            anchor_query,
+            anchor_query
+            + "        colgramJumpLabel = null;\n"
+            + "        colgramJumpTarget = null;\n"
+            + "        String colgramQ = text == null ? \"\" : text.trim();\n"
+            + "        if (colgramQ.startsWith(\"http://\") || colgramQ.startsWith(\"https://\")\n"
+            + "                || colgramQ.startsWith(\"t.me/\") || colgramQ.startsWith(\"telegram.me/\")) {\n"
+            + "            colgramJumpTarget = colgramQ.startsWith(\"http\") ? colgramQ : \"https://\" + colgramQ;\n"
+            + "            colgramJumpLabel = \"Открыть ссылку: \" + colgramJumpTarget;\n"
+            + "        } else if (colgramQ.startsWith(\"@\") && colgramQ.length() >= 3 && colgramQ.indexOf(' ') < 0) {\n"
+            + "            colgramJumpTarget = colgramQ.substring(1);\n"
+            + "            colgramJumpLabel = \"Открыть профиль @\" + colgramJumpTarget;\n"
+            + "        }\n", 1)
+
+        anchor_perform = "    public boolean colgramPerformJump(int position) {\n"
+        if anchor_perform not in content:
+            anchor_outer_bind = ("    @Override\n"
+                                 "    public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {\n"
+                                 "        switch (holder.getItemViewType()) {\n")
+            if anchor_outer_bind not in content:
+                return content
+            content = content.replace(
+                anchor_outer_bind,
+                ("    /** Runs the jump row's action. True when the position was the jump row. */\n"
+                 "    public boolean colgramPerformJump(int position) {\n"
+                 "        if (colgramJumpLabel == null || position != colgramLastCount) return false;\n"
+                 "        if (mContext == null) return false;\n"
+                 "        if (colgramJumpTarget.startsWith(\"http\")) {\n"
+                 "            org.telegram.messenger.browser.Browser.openUrl(mContext, colgramJumpTarget);\n"
+                 "        } else {\n"
+                 "            org.telegram.messenger.MessagesController.getInstance(currentAccount)\n"
+                 "                    .openByUserName(colgramJumpTarget, dialogsActivity, 0, null);\n"
+                 "        }\n"
+                 "        return true;\n"
+                 "    }\n"
+                 "\n"
+                 + anchor_outer_bind), 1)
+        return content
+
+    patch_file(dialogs_search_adapter, search_jump_injector, "VIEW_TYPE_COLGRAM_JUMP",
+               "Search Jump Row For Links And Usernames")
+
+    dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                                    "org", "telegram", "ui", "DialogsActivity.java")
+
+    def search_jump_click_injector(content):
+        marker = "colgramPerformJump(position)"
+        if marker in content:
+            return content
+        anchor = ("        searchViewPager.searchListView.setOnItemClickListener((view, position, x, y) -> {\n"
+                  "            Object item = searchViewPager.dialogsSearchAdapter.getItem(position);\n")
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            ("        searchViewPager.searchListView.setOnItemClickListener((view, position, x, y) -> {\n"
+             "            if (searchViewPager.dialogsSearchAdapter.colgramPerformJump(position)) {\n"
+             "                return;\n"
+             "            }\n"
+             "            Object item = searchViewPager.dialogsSearchAdapter.getItem(position);\n"), 1)
+
+    patch_file(dialogs_activity, search_jump_click_injector, "colgramPerformJump(position)",
+               "Search List Routes Jump Row Clicks")
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
