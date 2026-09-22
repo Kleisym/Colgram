@@ -573,6 +573,25 @@ public class ColgramProxyManager {
         return "IP-дроп адресов Telegram — нужен релей или прокси";
     }
 
+    private static volatile boolean blockedReported;
+
+    /**
+     * Say once, in the interface, why the header reads "Соединение..." forever.
+     *
+     * Measured here: every client DC address is dropped (70 addresses over IPv4 and the IPv6 set,
+     * one live host and it is the API, not a DC), so no amount of local desync or retrying can
+     * carry the connection - a proxy or a relay has to be chosen. Without a word about that the
+     * only signal is a spinner, and the reasonable conclusion is that the app is broken rather
+     * than that the network is.
+     */
+    private static void reportBlockedOnce(Context ctx) {
+        if (blockedReported) return;
+        blockedReported = true;
+        final String text = describeBlockType()
+                + ". Включи прокси (щит вверху списка чатов) или самоподключение в Настройках Colgram.";
+        mainHandler.post(() -> toast(text));
+    }
+
     private static boolean telegramDirectlyReachable() {        for (String[] endpoint : TELEGRAM_DC_ENDPOINTS) {
             try {
                 if (testProxy(endpoint[0], Integer.parseInt(endpoint[1]), 1200) >= 0) return true;
@@ -592,11 +611,13 @@ public class ColgramProxyManager {
     private static void autoConnectIfBlocked() {
         Context ctx = appContext;
         if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled()) return;
-        // He switches the proxy off by hand; a background task that switches it back on is not a
-        // bypass, it is a override. Opt-in only.
-        if (!ColgramConfig.isAutoProxyEnabled()) return;
         if (isProxyEnabled(ctx)) return;
-        if (telegramDirectlyReachable()) return;
+        if (!telegramDirectlyReachable()) {
+            reportBlockedOnce(ctx);
+        }
+        // He switches the proxy off by hand; a background task that switches it back on is not a
+        // bypass, it is an override. Opt-in only.
+        if (!ColgramConfig.isAutoProxyEnabled()) return;
         // The local desync listener wins when it has actually completed a handshake: no third
         // party sees anything, and it is the only path that works with no proxy at all, which is
         // what the "анонимный обход без прокси" switch promises.
