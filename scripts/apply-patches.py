@@ -1225,30 +1225,45 @@ def inject_hooks(repo_path):
             args.putLong("user_id", UserConfig.getInstance(currentAccount).getClientUserId());
             presentFragment(new ChatActivity(args));
         });"""
-            if "🧩 Плагины и Маркетплейс" in content:
+            # De-brand first: trees patched by older versions carry emoji-prefixed titles, which
+            # is exactly what made the menu read as a foreign surface bolted onto Telegram's own.
+            for emoji, plain in (
+                    ("🧩 Плагины и Маркетплейс", "Плагины и маркетплейс"),
+                    ("⚙️ Настройки Colgram", "Настройки Colgram"),
+                    ("✉️ Временная почта (Temp Mail)", "Временная почта"),
+                    ("📥 Версии Telegram", "Версии Telegram"),
+                    ("🛡 Анти-спам (юзербот)", "Анти-спам"),
+                    ("🔄 Синхронизировать чаты бота", "Синхронизировать чаты бота"),
+                    ("✉️ Написать от имени бота", "Написать от имени бота"),
+            ):
+                if emoji in content:
+                    content = content.replace(emoji, plain)
+            if "Плагины и маркетплейс" in content:
+                return content
+            if target not in content:
                 return content
             inject = """
         io.addGap();
-        io.add(R.drawable.msg_customize, "🧩 Плагины и Маркетплейс", () -> {
+        io.add(R.drawable.msg_customize, "Плагины и маркетплейс", () -> {
             presentFragment(new ColgramPluginsActivity());
         });
-        io.add(R.drawable.msg_settings, "⚙️ Настройки Colgram", () -> {
+        io.add(R.drawable.msg_settings, "Настройки Colgram", () -> {
             presentFragment(new ColgramSettingsActivity());
         });
-        io.add(R.drawable.msg_send, "✉️ Временная почта (Temp Mail)", () -> {
+        io.add(R.drawable.msg_send, "Временная почта", () -> {
             presentFragment(new ColgramTempMailActivity());
         });
-        io.add(R.drawable.msg_download, "📥 Версии Telegram", () -> {
+        io.add(R.drawable.msg_download, "Версии Telegram", () -> {
             presentFragment(new ColgramVersionsActivity());
         });
-        io.add(R.drawable.msg_policy, "🛡 Анти-спам (юзербот)", () -> {
+        io.add(R.drawable.msg_policy, "Анти-спам", () -> {
             presentFragment(new ColgramAntiSpamActivity());
         });
         if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
-            io.add(R.drawable.msg_retry, "🔄 Синхронизировать чаты бота", () -> {
+            io.add(R.drawable.msg_retry, "Синхронизировать чаты бота", () -> {
                 org.colgram.core.ColgramBotSync.syncBotDialogs(getParentActivity(), currentAccount, true);
             });
-            io.add(R.drawable.msg_edit, "✉️ Написать от имени бота", () -> {
+            io.add(R.drawable.msg_edit, "Написать от имени бота", () -> {
                 org.colgram.core.ColgramBotSync.showStartChatDialog(getParentActivity(), currentAccount);
             });
         }"""
@@ -1257,9 +1272,38 @@ def inject_hooks(repo_path):
         patch_file(
             dialogs_activity,
             options_menu_injector,
-            "🧩 Плагины и Маркетплейс",
+            "Плагины и маркетплейс",
             "DialogsActivity Options Menu: Colgram Entries"
         )
+
+        # 65b. SettingsActivity -> drop the branded "Colgram" block so its rows sit inside the
+        # stock list like everything else. He asked for Colgram to stop being a separate surface
+        # with its own header; the rows keep their names, the foreign section wrapper goes.
+        def settings_merge_injector(content):
+            marker = ('R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));\n'
+                      '\n'
+                      '        items.add(SettingCell.Factory.of(101,')
+            if marker in content:
+                return content
+            anchor = ('        items.add(UItem.asShadow(null));\n'
+                      '        items.add(UItem.asHeader("Colgram"));\n'
+                      '        items.add(SettingCell.Factory.of(101,')
+            if anchor not in content:
+                return content
+            return content.replace(
+                anchor,
+                '        items.add(SettingCell.Factory.of(101,', 1)
+
+        patch_file(
+            os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                         "org", "telegram", "ui", "SettingsActivity.java"),
+            settings_merge_injector,
+            'R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));\n'
+            '\n'
+            '        items.add(SettingCell.Factory.of(101,',
+            "SettingsActivity Merges Colgram Rows Into Stock List"
+        )
+
 
     # 49. UserConfig.java -> more accounts. HARD CAP 5, imposed by the native library.
     #
