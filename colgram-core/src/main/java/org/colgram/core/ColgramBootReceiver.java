@@ -35,6 +35,14 @@ public class ColgramBootReceiver extends BroadcastReceiver {
             return;
         }
         String action = intent.getAction();
+        if (ColgramBypassNotice.ACTION_ENABLE_BYPASS.equals(action)) {
+            // The "Включить обход" button on the blocked notice. This is the consent: Colgram
+            // never turns the proxy on by itself, but once he asks, it should happen immediately
+            // and keep itself alive afterwards rather than wait for the next scheduled sweep.
+            Log.i(TAG, "bypass requested from the notice");
+            ColgramProxyManager.enableBypassFromNotification(context.getApplicationContext());
+            return;
+        }
         if (!Intent.ACTION_BOOT_COMPLETED.equals(action)
                 && !Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)
                 && !"android.intent.action.QUICKBOOT_POWERON".equals(action)

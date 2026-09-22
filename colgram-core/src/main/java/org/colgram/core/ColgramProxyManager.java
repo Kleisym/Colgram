@@ -412,6 +412,7 @@ public class ColgramProxyManager {
         if (state == TG_STATE_CONNECTED) {
             watchdogUnconnectedTicks = 0;
             watchdogRedials = 0;
+            ColgramBypassNotice.clear(ctx);
             return;
         }
         if (++watchdogUnconnectedTicks < 3) return;
@@ -689,6 +690,9 @@ public class ColgramProxyManager {
         final String text = describeBlockType()
                 + ". Включи прокси (щит вверху списка чатов) или самоподключение в Настройках Colgram.";
         mainHandler.post(() -> toast(text));
+        // The toast is gone in two seconds and the header keeps spinning, so the state also gets a
+        // notification with a button that turns the bypass on.
+        ColgramBypassNotice.showBlocked(ctx, describeBlockType());
     }
 
     private static boolean telegramDirectlyReachable() {        for (String[] endpoint : TELEGRAM_DC_ENDPOINTS) {
@@ -740,6 +744,20 @@ public class ColgramProxyManager {
         Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
                 + (picked.isLocalDpi() ? "local desync bypass" : picked.address + ":" + picked.port));
         mainHandler.post(() -> forceApplyProxy(picked));
+    }
+
+    /**
+     * The notice's "Включить обход" button lands here. Turns self-connect on (that is what the
+     * button means), clears the notice, and connects now instead of waiting for the next sweep.
+     */
+    public static void enableBypassFromNotification(final Context context) {
+        if (context == null) return;
+        ColgramConfig.setAutoProxyEnabled(true);
+        ColgramBypassNotice.clear(context);
+        if (!isProxyEnabled(context)) {
+            executor.execute(ColgramProxyManager::autoConnectIfBlocked);
+        }
+        if (appContext == null) appContext = context.getApplicationContext();
     }
 
     /** Live UI refresh while the sweep runs, so the pool screen counts up instead of freezing. */
@@ -1577,8 +1595,18 @@ public class ColgramProxyManager {
         }
     }
 
+    private static volatile long lastApplyAt = 0L;
+
     public static void forceApplyProxy(ProxyItem proxy) {
         if (proxy == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (proxy == currentActiveProxy && now - lastApplyAt < 10000L) {
+            // The same node asked for twice inside one grace window. Every alive verdict posts an
+            // auto-connect, and re-pushing the proxy tears Telegram's connections down again for
+            // no reason - the log used to read "Applying proxy" three times in a second.
+            return;
+        }
+        lastApplyAt = now;
         currentActiveProxy = proxy;
         resolveChain(proxy);
         if (proxy.isLocalDpi()) {
@@ -1640,6 +1668,9 @@ public class ColgramProxyManager {
                 appliedThroughStockPath = true;
                 Log.i(TAG, "proxy applied via ConnectionsManager.setProxySettings (type="
                         + proxy.type + ", " + proxy.address + ")");
+                // A tunnel is in place, by his hand or by the notice's button: the "Telegram is
+                // unreachable" notice has nothing left to say.
+                ColgramBypassNotice.clear(appContext);
             } catch (Throwable t) {
                 Log.e(TAG, "stock setProxySettings failed, falling back to native", t);
             }

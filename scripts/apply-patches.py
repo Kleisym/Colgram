@@ -4826,6 +4826,28 @@ def inject_hooks(repo_path):
                'A bot account has no phone at all',
                "SettingsActivity Bot Account Has No Phone")
 
+    # 67b. AndroidManifest.xml -> the blocked-notice button needs somewhere to land.
+    #
+    # ColgramBypassNotice posts a notification whose action broadcasts
+    # org.colgram.action.ENABLE_BYPASS. The app already declares ColgramBootReceiver with an
+    # intent-filter, so the action goes there instead of adding a second component.
+    bypass_manifest = os.path.join(repo_path, "TMessagesProj", "src", "main", "AndroidManifest.xml")
+
+    def bypass_action_injector(content):
+        marker = 'org.colgram.action.ENABLE_BYPASS'
+        if marker in content:
+            return content
+        anchor = ('                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />\n')
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            anchor + '                <action android:name="org.colgram.action.ENABLE_BYPASS" />\n', 1)
+
+    patch_file(bypass_manifest, bypass_action_injector,
+               'org.colgram.action.ENABLE_BYPASS',
+               'AndroidManifest Colgram Bypass Notice Action')
+
     # 68. ConnectionsManager.java -> an IPv6-only route, for networks that block IPv4 Telegram.
     #
     # Measured on the network Colgram is developed against: every Telegram DC address is dropped

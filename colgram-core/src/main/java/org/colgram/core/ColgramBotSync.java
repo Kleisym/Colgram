@@ -637,7 +637,7 @@ public class ColgramBotSync {
         // hundred milliseconds, so a rung that has not dialled by 4 s is dead and the next one
         // deserves its turn. The read timeout stays as the caller asked (long polling waits on it).
         int connectTimeoutMs = Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000);
-        for (java.net.Proxy rung : rungs) {
+        for (java.net.Proxy rung : withBestRungRetry(rungs)) {
             try {
                 HttpURLConnection conn = rung == null || java.net.Proxy.NO_PROXY.equals(rung)
                         ? (HttpURLConnection) url.openConnection()
@@ -648,6 +648,9 @@ public class ColgramBotSync {
                 return conn;
             } catch (Throwable t) {
                 last = t;
+                if (t instanceof javax.net.ssl.SSLException && isUnknownCert((javax.net.ssl.SSLException) t)) {
+                    ColgramEndpoints.parkCurrent(host, port);
+                }
             }
         }
         // Nothing worked: forget the chosen address so the next call re-probes rather than walking
@@ -660,6 +663,23 @@ public class ColgramBotSync {
     /** Append a transport to the ladder when it is usable and not already there. */
     private static void addRung(java.util.List<java.net.Proxy> rungs, java.net.Proxy p) {
         if (p != null && !rungs.contains(p)) rungs.add(p);
+    }
+
+    /**
+     * The ladder with its best rung tried once more at the end.
+     *
+     * The address the Bot API answers on here is lossy rather than down: measured, TCP completes
+     * and the TLS stream is then cut on roughly one attempt in three, while the resolver's answer
+     * is dropped outright. So walking straight past the front into a rung that cannot work, and
+     * reporting a failure, is the wrong order of operations - one more attempt at the rung that
+     * nearly worked beats every remaining rung put together.
+     */
+    private static java.util.List<java.net.Proxy> withBestRungRetry(
+            java.util.List<java.net.Proxy> rungs) {
+        if (rungs.isEmpty()) return rungs;
+        java.util.List<java.net.Proxy> out = new java.util.ArrayList<>(rungs);
+        out.add(rungs.get(0));
+        return out;
     }
 
     /**
@@ -2230,17 +2250,22 @@ public class ColgramBotSync {
         // idempotent (a name or description set to the same value, an update offset), so retrying
         // the next transport cannot double-apply anything.
         java.util.List<java.net.Proxy> rungs;
+        String parsedHost = "api.telegram.org";
+        int parsedPort = 443;
         try {
             URL parsed = new URL(urlStr);
-            rungs = transportLadder(parsed.getHost(),
-                    parsed.getPort() > 0 ? parsed.getPort() : 443);
+            parsedHost = parsed.getHost();
+            parsedPort = parsed.getPort() > 0 ? parsed.getPort() : 443;
+            rungs = transportLadder(parsedHost, parsedPort);
         } catch (Throwable t) {
             rungs = new java.util.ArrayList<>();
             rungs.add(java.net.Proxy.NO_PROXY);
         }
+        final String postHost = parsedHost;
+        final int postPort = parsedPort;
 
         Throwable last = null;
-        for (java.net.Proxy rung : rungs) {
+        for (java.net.Proxy rung : withBestRungRetry(rungs)) {
             HttpURLConnection conn = null;
             try {
                 conn = openVia(new URL(urlStr), rung, 15000,
@@ -2276,6 +2301,12 @@ public class ColgramBotSync {
             } catch (javax.net.ssl.SSLException se) {
                 last = se;
                 Log.w(TAG, method + " TLS failed via " + rung + ": " + se.getMessage());
+                if (isUnknownCert(se)) {
+                    // The address answered TCP but presented a certificate for something else -
+                    // Telegram's web fronts do exactly this. Without parking it, every retry dials
+                    // the same wrong host and the call never recovers.
+                    ColgramEndpoints.parkCurrent(postHost, postPort);
+                }
             } catch (Throwable t) {
                 last = t;
                 Log.w(TAG, method + " failed via " + rung + ": " + t.getMessage());
@@ -2420,6 +2451,19 @@ public class ColgramBotSync {
                         "Не удалось изменить имя: " + why, Toast.LENGTH_LONG).show());
             }
         });
+    }
+
+    /**
+     * True when TLS reached a server whose certificate this hostname cannot use - a wrong-address
+     * symptom, not a network one, and the only kind of failure worth re-picking an address for.
+     */
+    private static boolean isUnknownCert(Throwable t) {
+        for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
+            if (c instanceof java.security.cert.CertificateException) return true;
+            String m = c.getMessage();
+            if (m != null && (m.contains("Trust anchor") || m.contains("CertPathValidator"))) return true;
+        }
+        return false;
     }
 
     /** Short, human-readable reason for a transport failure. */

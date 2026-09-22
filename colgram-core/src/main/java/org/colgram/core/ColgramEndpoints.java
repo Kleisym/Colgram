@@ -54,6 +54,15 @@ public final class ColgramEndpoints {
     private static final long TTL_MS = 5 * 60 * 1000L;
     /** After a round where nothing answered, do not re-probe on every single request. */
     private static final long NEGATIVE_TTL_MS = 15 * 1000L;
+    /**
+     * How long to keep dialing the last address that worked when a probe round finds nothing.
+     *
+     * The Telegram API front this network leaves open is lossy: measured, roughly one connect in
+     * three does not complete. Treating that as "no live address" threw away the best known
+     * answer and made the next call re-probe from scratch - a six second stall on a request that
+     * then finished in 120 ms. An unconfirmed pin is therefore tried, but only briefly.
+     */
+    private static final long OPTIMISTIC_TTL_MS = 30 * 1000L;
     private static final int PROBE_TIMEOUT_MS = 1500;
 
     /**
@@ -86,16 +95,31 @@ public final class ColgramEndpoints {
         final InetAddress address;
         final long at;
         final boolean live;
+        /** How long this verdict may be trusted; an optimistic pin expires much sooner. */
+        final long ttl;
 
-        Choice(InetAddress address, long at, boolean live) {
+        Choice(InetAddress address, long at, boolean live, long ttl) {
             this.address = address;
             this.at = at;
             this.live = live;
+            this.ttl = ttl;
         }
     }
 
     /** host:port -> Choice. Keyed by port because a host can be open on 443 and dropped on 80. */
     private static final Map<String, Choice> cache = new ConcurrentHashMap<>();
+
+    /**
+     * Addresses that completed a TCP connection but were not the service being asked for.
+     *
+     * Telegram's own web fronts answer on 443 and pass a TCP probe, then present a certificate
+     * that is not valid for api.telegram.org - measured as "CertPathValidatorException: Trust
+     * anchor for certification path not found" on one poll cycle in three minutes. A probe cannot
+     * see that difference and the caller must not accept it, so the address gets parked and the
+     * next probe moves on to the others.
+     */
+    private static final Map<String, Long> parked = new ConcurrentHashMap<>();
+    private static final long PARK_MS = 10 * 60 * 1000L;
 
     private ColgramEndpoints() {}
 
@@ -110,14 +134,14 @@ public final class ColgramEndpoints {
         long now = System.currentTimeMillis();
 
         Choice cached = cache.get(key);
-        if (cached != null && now - cached.at < (cached.live ? TTL_MS : NEGATIVE_TTL_MS)) {
+        if (cached != null && now - cached.at < cached.ttl) {
             return cached.live ? cached.address : null;
         }
 
         synchronized (ColgramEndpoints.class) {
             cached = cache.get(key);
             now = System.currentTimeMillis();
-            if (cached != null && now - cached.at < (cached.live ? TTL_MS : NEGATIVE_TTL_MS)) {
+            if (cached != null && now - cached.at < cached.ttl) {
                 return cached.live ? cached.address : null;
             }
             Choice result = probe(host, port);
@@ -163,15 +187,36 @@ public final class ColgramEndpoints {
 
     /** One line describing what is currently pinned, for the diagnostics screen and logcat. */
     public static String describe() {
-        if (cache.isEmpty()) return "адреса не переопределены";
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, Choice> e : cache.entrySet()) {
             Choice c = e.getValue();
-            if (!c.live) continue;
+            if (!c.live || c.address == null) continue;
             if (sb.length() > 0) sb.append(", ");
             sb.append(e.getKey()).append(" -> ").append(c.address.getHostAddress());
+            if (c.ttl < TTL_MS) sb.append(" (повтор)");
         }
-        return sb.length() == 0 ? "ни один адрес не отвечал" : sb.toString();
+        if (sb.length() > 0) return sb.toString();
+        // Nothing is currently confirmed. Say what will still be dialed rather than "nothing
+        // answered", which reads like the bypass gave up when it is about to retry a good address.
+        String pinned = ColgramConfig.getPinnedEndpoint("api.telegram.org");
+        return pinned.isEmpty() ? "адреса не переопределены"
+                : "api.telegram.org -> " + pinned + " (ожидает подтверждения)";
+    }
+
+    /**
+     * Park the address currently chosen for {@code host} - called by a caller that reached an
+     * address which turned out not to serve this hostname. A wrong certificate is the case that
+     * matters: it is indistinguishable from a working front until TLS runs, and without this the
+     * same wrong address would be dialed again on every request.
+     */
+    public static void parkCurrent(String host, int port) {
+        if (host == null) return;
+        Choice c = cache.get(host + ":" + port);
+        if (c == null || c.address == null) return;
+        parked.put(c.address.getHostAddress(), System.currentTimeMillis());
+        Log.w(TAG, "parking " + c.address.getHostAddress() + " for " + host
+                + " - it answered, but was not serving this name");
+        invalidate(host);
     }
 
     /** Forget a host after a transport failure so the next call re-probes instead of reusing it. */
@@ -210,12 +255,27 @@ public final class ColgramEndpoints {
 
         long at = System.currentTimeMillis();
         if (chosen == null) {
+            // Nothing answered this round. If an address worked here before, keep dialing it for a
+            // short window rather than falling back to the resolver's answer, which is the address
+            // the network is known to drop.
+            String pinned = ColgramConfig.getPinnedEndpoint(host);
+            if (pinned != null && !pinned.isEmpty()) {
+                try {
+                    InetAddress optimistic = InetAddress.getByName(pinned);
+                    if (optimistic instanceof Inet4Address) {
+                        Log.w(TAG, "no answer for " + host + ":" + port
+                                + "; retrying last known " + optimistic.getHostAddress());
+                        return new Choice(optimistic, at, true, OPTIMISTIC_TTL_MS);
+                    }
+                } catch (Throwable ignore) {
+                }
+            }
             Log.w(TAG, "no live address for " + host + ":" + port);
-            return new Choice(null, at, false);
+            return new Choice(null, at, false, NEGATIVE_TTL_MS);
         }
         Log.i(TAG, "using " + host + " -> " + chosen.getHostAddress() + ":" + port);
         ColgramConfig.setPinnedEndpoint(host, chosen.getHostAddress());
-        return new Choice(chosen, at, true);
+        return new Choice(chosen, at, true, TTL_MS);
     }
 
     /** The address that answered for this host before, if any, as the first candidate. */
@@ -232,6 +292,11 @@ public final class ColgramEndpoints {
 
     /** Connect to every candidate in parallel; return the first that completes, or null. */
     private static InetAddress probeAll(List<InetAddress> candidates, int port) {
+        long now = System.currentTimeMillis();
+        candidates.removeIf(a -> {
+            Long at = parked.get(a.getHostAddress());
+            return at != null && now - at < PARK_MS;
+        });
         if (candidates.isEmpty()) return null;
         final AtomicReference<InetAddress> winner = new AtomicReference<>();
         final CountDownLatch done = new CountDownLatch(candidates.size());
