@@ -402,7 +402,10 @@ public class ColgramPluginsActivity extends BaseFragment {
                     err = "файл пустой или недоступен";
                 } else {
                     String name = displayNameFromUri(uri);
-                    if (!name.endsWith(".py")) name = name + ".py";
+                    String lowerName = name.toLowerCase();
+                    if (!lowerName.endsWith(".py") && !lowerName.endsWith(".plugin")) {
+                        name = name + ".py";
+                    }
                     ok = ColgramPluginManager.installPlugin(name, code);
                     if (!ok) err = "не удалось установить";
                 }

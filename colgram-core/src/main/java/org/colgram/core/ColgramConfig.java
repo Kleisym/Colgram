@@ -419,6 +419,54 @@ public class ColgramConfig {
     // --- Unlimited memory ---
     private static final String KEY_UNLIMITED_MEMORY = "unlimited_memory_enabled";
 
+    // --- Built-in spam guard ---
+    private static final String KEY_SPAM_GUARD = "spam_guard_enabled";
+
+    // --- Fetch relay ---
+    private static final String KEY_RELAY_URL = "relay_url";
+
+    // --- Auto proxy ---
+    private static final String KEY_AUTO_PROXY = "auto_proxy_enabled";
+
+    /**
+     * Whether Colgram may switch a proxy on by itself when Telegram looks unreachable.
+     *
+     * Off by default and it stays off until the user says otherwise: turning it on silently
+     * overrode a proxy the user had just switched off by hand, which is worse than the problem
+     * it solved - the whole point of the switch is that he controls the route.
+     */
+    public static boolean isAutoProxyEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_AUTO_PROXY, false);
+    }
+
+    public static void setAutoProxyEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_PROXY, enabled).apply();
+    }
+
+    /**
+     * Optional user-supplied HTTPS forwarder (a Cloudflare Worker URL). It carries the Bot API,
+     * the mail providers and the proxy-list fetches on networks where those IPs are dropped and
+     * no public SOCKS relay answers. Empty means "no relay configured".
+     */
+    public static String getRelayUrl() {
+        return prefs != null ? prefs.getString(KEY_RELAY_URL, "") : "";
+    }
+
+    public static void setRelayUrl(String url) {
+        if (prefs != null) {
+            prefs.edit().putString(KEY_RELAY_URL, url == null ? "" : url.trim()).apply();
+        }
+    }
+
+    /** On by default: it only ever silences strangers who score as advertising. */
+    public static boolean isSpamGuardEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_SPAM_GUARD, true);
+    }
+
+    public static void setSpamGuardEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_SPAM_GUARD, enabled).apply();
+    }
+
     /**
      * "Unlimited memory" means the media cache is never auto-evicted: Telegram's own
      * AutoDeleteMediaTask reads the cache_limit preference and defaults it to 300 MB, which is

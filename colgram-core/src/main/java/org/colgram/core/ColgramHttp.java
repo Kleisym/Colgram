@@ -10,6 +10,7 @@ import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
@@ -65,6 +66,9 @@ public final class ColgramHttp {
             attempts.add("напрямую: " + reason(t));
         }
 
+        Response configured = viaConfiguredRelay(urlStr, null, null, attempts);
+        if (configured != null) return configured;
+
         List<ColgramProxyManager.ProxyItem> relays = relayCandidates();
         if (relays.isEmpty()) {
             attempts.add("нет ни одного SOCKS-релея в пуле");
@@ -82,6 +86,8 @@ public final class ColgramHttp {
                 attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
             }
         }
+        Response tunneled = viaConnectRelays(urlStr, null, null, attempts);
+        if (tunneled != null) return tunneled;
         throw new IOException(join(attempts));
     }
 
@@ -93,6 +99,9 @@ public final class ColgramHttp {
         } catch (Throwable t) {
             attempts.add("напрямую: " + reason(t));
         }
+        Response configured = viaConfiguredRelay(urlStr, jsonBody, bearer, attempts);
+        if (configured != null) return configured;
+
         int used = 0;
         for (ColgramProxyManager.ProxyItem relay : relayCandidates()) {
             if (used++ >= MAX_RELAY_ATTEMPTS) break;
@@ -102,6 +111,8 @@ public final class ColgramHttp {
                 attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
             }
         }
+        Response tunneled = viaConnectRelays(urlStr, jsonBody, bearer, attempts);
+        if (tunneled != null) return tunneled;
         throw new IOException(join(attempts));
     }
 
@@ -113,6 +124,9 @@ public final class ColgramHttp {
         } catch (Throwable t) {
             attempts.add("напрямую: " + reason(t));
         }
+        Response configured = viaConfiguredRelay(urlStr, null, bearer, attempts);
+        if (configured != null) return configured;
+
         int used = 0;
         for (ColgramProxyManager.ProxyItem relay : relayCandidates()) {
             if (used++ >= MAX_RELAY_ATTEMPTS) break;
@@ -122,8 +136,107 @@ public final class ColgramHttp {
                 attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
             }
         }
+        Response tunneled = viaConnectRelays(urlStr, null, bearer, attempts);
+        if (tunneled != null) return tunneled;
         throw new IOException(join(attempts));
     }
+
+    /**
+     * A user-supplied fetch relay, tried before anything else.
+     *
+     * On a network that drops api.telegram.org by IP and where every public SOCKS list is dead,
+     * the one route that reliably works is a tiny forwarder on a host the block will not touch:
+     * a Cloudflare Worker on <name>.workers.dev. It is not a proxy in the tgnet sense - it
+     * forwards one HTTPS request at a time - so it cannot carry Telegram itself, but it carries
+     * the Bot API, the mail providers and proxy-list fetches, which is where "сеть недоступна"
+     * actually bit. The worker source ships in the repo (deploy/colgram-relay-worker.js); pasting
+     * its URL into settings is the whole setup.
+     */
+    private static Response viaConfiguredRelay(String urlStr, String jsonBody, String bearer,
+                                               List<String> attempts) {
+        String relay = ColgramConfig.getRelayUrl();
+        if (relay == null || relay.trim().isEmpty()) return null;
+        try {
+            String target = URLEncoder.encode(urlStr, "UTF-8");
+            String sep = relay.contains("?") ? "&" : "?";
+            String via = relay + sep + "url=" + target;
+            HttpURLConnection conn = (HttpURLConnection) new URL(via).openConnection();
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(READ_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("Accept", "application/json");
+            if (bearer != null && !bearer.isEmpty()) {
+                conn.setRequestProperty("X-Colgram-Authorization", bearer);
+            }
+            if (jsonBody != null) {
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setRequestProperty("X-Colgram-Method", "POST");
+                java.io.OutputStream os = conn.getOutputStream();
+                os.write(jsonBody.getBytes("UTF-8"));
+                os.close();
+            }
+            int code = conn.getResponseCode();
+            InputStream stream = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            StringBuilder sb = new StringBuilder();
+            if (stream != null) {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(stream, Charset.forName("UTF-8")));
+                String line;
+                while ((line = reader.readLine()) != null) sb.append(line).append('\n');
+                reader.close();
+            }
+            conn.disconnect();
+            if (code >= 200 && code < 300) {
+                Log.i(TAG, "fetched " + hostOf(urlStr) + " through the configured relay");
+                return new Response(code, sb.toString());
+            }
+            attempts.add("реле-адрес: HTTP " + code);
+        } catch (Throwable t) {
+            attempts.add("реле-адрес: " + reason(t));
+        }
+        return null;
+    }
+
+    /**
+     * A {@link Proxy} that can carry HTTPS right now: the local desync listener when the user
+     * switched it on, else a live SOCKS5 node, else a loopback front tunnelled through a
+     * reachable CONNECT relay. Null means "nothing works, dial directly".
+     *
+     * Cached because choosing it costs a TCP probe, and callers ask on every request.
+     */
+    public static synchronized Proxy pickRelayProxy() {
+        long now = System.currentTimeMillis();
+        if (now - transportPickedAt < TRANSPORT_CACHE_MS) return transportProxy;
+        Proxy picked = null;
+        for (ColgramProxyManager.ProxyItem relay : relayCandidates()) {
+            if (ColgramProxyManager.probeTcp(relay.address, relay.port, 900) >= 0) {
+                picked = new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(relay.address, relay.port));
+                break;
+            }
+        }
+        if (picked == null) {
+            for (ColgramProxyChain.Relay relay : ColgramProxyManager.getReachableRelays()) {
+                if (relay.socks) continue;
+                int port = ColgramProxyChain.openProxyFront(relay);
+                if (port > 0) {
+                    picked = new Proxy(Proxy.Type.HTTP, new InetSocketAddress("127.0.0.1", port));
+                    break;
+                }
+            }
+        }
+        transportProxy = picked;
+        transportPickedAt = now;
+        if (picked != null) {
+            Log.i(TAG, "transport proxy for plain HTTP is " + picked.type() + " " + picked.address());
+        }
+        return picked;
+    }
+
+    private static Proxy transportProxy;
+    private static long transportPickedAt;
+    private static final long TRANSPORT_CACHE_MS = 60000L;
 
     /**
      * Relays worth trying: SOCKS5 entries only (MTProto and WEB cannot carry plain HTTP), the
@@ -133,6 +246,12 @@ public final class ColgramHttp {
         List<ColgramProxyManager.ProxyItem> out = new ArrayList<>();
         List<ColgramProxyManager.ProxyItem> pool = ColgramProxyManager.getVerifiedPool();
         ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
+        // The local desync listener first when the user switched it on: it is the one relay with
+        // nobody else in the path, so the bot API and the mail providers should reach Telegram
+        // through it before any stranger's proxy is touched.
+        if (ColgramConfig.isDpiBypassEnabled() && ColgramDpiBypass.isBound()) {
+            out.add(new ColgramProxyManager.ProxyItem("127.0.0.1", ColgramDpiBypass.LOCAL_PORT, "", 0));
+        }
         if (active != null && active.type == 0 && !active.isLocalDpi()) out.add(active);
         for (ColgramProxyManager.ProxyItem p : pool) {
             if (p.type != 0 || p.isLocalDpi() || p.equals(active)) continue;
@@ -145,19 +264,53 @@ public final class ColgramHttp {
         return out;
     }
 
+    /**
+     * Last resort when the pool has no usable SOCKS5: the harvested tunnel list. An HTTP CONNECT
+     * proxy is an order of magnitude more common than a SOCKS5 one, and a CONNECT tunnel carries
+     * TLS untouched, so api.telegram.org and the mail providers become reachable through it even
+     * when every SOCKS5 in the pool is dead. This is what "сеть недоступна" on a bot request
+     * actually needed: the applied proxy was MTProto, which plain Java HTTPS cannot speak.
+     */
+    private static Response viaConnectRelays(String urlStr, String jsonBody, String bearer,
+                                             List<String> attempts) {
+        List<ColgramProxyChain.Relay> relays = ColgramProxyManager.getReachableRelays();
+        int used = 0;
+        for (ColgramProxyChain.Relay relay : relays) {
+            if (used++ >= MAX_RELAY_ATTEMPTS) break;
+            try {
+                Response r = relay.socks
+                        ? open(urlStr, relay.host, relay.port, jsonBody, bearer)
+                        : openViaConnect(urlStr, relay.host, relay.port, jsonBody, bearer);
+                Log.i(TAG, "fetched " + hostOf(urlStr) + " through tunnel " + relay);
+                return r;
+            } catch (Throwable t) {
+                attempts.add(relay.key() + " -> " + reason(t));
+            }
+        }
+        return null;
+    }
+
     private static Response open(String urlStr, ColgramProxyManager.ProxyItem relay) throws Exception {
         return open(urlStr, relay, null, null);
     }
 
     private static Response open(String urlStr, ColgramProxyManager.ProxyItem relay,
                                  String jsonBody, String bearer) throws Exception {
+        if (relay == null) {
+            return open(urlStr, (String) null, 0, jsonBody, bearer);
+        }
+        return open(urlStr, relay.address, relay.port, jsonBody, bearer);
+    }
+
+    private static Response open(String urlStr, String socksHost, int socksPort,
+                                 String jsonBody, String bearer) throws Exception {
         HttpURLConnection conn;
         URL url = new URL(urlStr);
-        if (relay == null) {
+        if (socksHost == null) {
             conn = (HttpURLConnection) url.openConnection();
         } else {
             conn = (HttpURLConnection) url.openConnection(new Proxy(Proxy.Type.SOCKS,
-                    new InetSocketAddress(relay.address, relay.port)));
+                    new InetSocketAddress(socksHost, socksPort)));
         }
         try {
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
@@ -194,6 +347,116 @@ public final class ColgramHttp {
             return new Response(code, sb.toString());
         } finally {
             conn.disconnect();
+        }
+    }
+
+    /**
+     * HTTPS through an HTTP CONNECT proxy, spoken by hand.
+     *
+     * HttpURLConnection cannot be given a raw tunnelled socket, so the tunnel is opened here and
+     * TLS is layered over it with the real hostname (SNI and certificate verification included).
+     * Connection: close keeps the response framing trivial: read until the peer hangs up.
+     */
+    private static Response openViaConnect(String urlStr, String proxyHost, int proxyPort,
+                                           String jsonBody, String bearer) throws Exception {
+        URL url = new URL(urlStr);
+        boolean tls = "https".equals(url.getProtocol());
+        int port = url.getPort() > 0 ? url.getPort() : (tls ? 443 : 80);
+        String host = url.getHost();
+        String path = url.getFile().isEmpty() ? "/" : url.getFile();
+
+        java.net.Socket tunnel = new java.net.Socket();
+        tunnel.connect(new InetSocketAddress(proxyHost, proxyPort), CONNECT_TIMEOUT_MS);
+        tunnel.setSoTimeout(READ_TIMEOUT_MS);
+        try {
+            java.io.OutputStream rawOut = tunnel.getOutputStream();
+            rawOut.write(("CONNECT " + host + ":" + port + " HTTP/1.1\r\n"
+                    + "Host: " + host + ":" + port + "\r\n"
+                    + "User-Agent: Colgram/1.0\r\n\r\n").getBytes("UTF-8"));
+            rawOut.flush();
+            String status = readLine(tunnel.getInputStream());
+            if (status == null || !status.contains(" 200")) {
+                throw new IOException("CONNECT отклонён: " + status);
+            }
+            drainHeaders(tunnel.getInputStream());
+
+            java.io.OutputStream out;
+            InputStream in;
+            if (tls) {
+                javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket)
+                        ((javax.net.ssl.SSLSocketFactory) javax.net.ssl.SSLSocketFactory.getDefault())
+                                .createSocket(tunnel, host, port, true);
+                ssl.startHandshake();
+                if (!javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
+                        .verify(host, ssl.getSession())) {
+                    throw new IOException("сертификат не для " + host);
+                }
+                out = ssl.getOutputStream();
+                in = ssl.getInputStream();
+            } else {
+                out = tunnel.getOutputStream();
+                in = tunnel.getInputStream();
+            }
+
+            StringBuilder req = new StringBuilder();
+            req.append(jsonBody != null ? "POST " : "GET ").append(path).append(" HTTP/1.1\r\n");
+            req.append("Host: ").append(host).append("\r\n");
+            req.append("User-Agent: Mozilla/5.0\r\n");
+            req.append("Accept: application/json\r\n");
+            if (bearer != null && !bearer.isEmpty()) {
+                req.append("Authorization: Bearer ").append(bearer).append("\r\n");
+            }
+            if (jsonBody != null) {
+                byte[] body = jsonBody.getBytes("UTF-8");
+                req.append("Content-Type: application/json\r\n");
+                req.append("Content-Length: ").append(body.length).append("\r\n");
+                req.append("Connection: close\r\n\r\n");
+                out.write(req.toString().getBytes("UTF-8"));
+                out.write(body);
+            } else {
+                req.append("Connection: close\r\n\r\n");
+                out.write(req.toString().getBytes("UTF-8"));
+            }
+            out.flush();
+
+            String statusLine = readLine(in);
+            if (statusLine == null) throw new IOException("пустой ответ из туннеля");
+            int code = parseCode(statusLine);
+            drainHeaders(in);
+            StringBuilder body = new StringBuilder();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) body.append(new String(buf, 0, n, "UTF-8"));
+            return new Response(code, body.toString());
+        } finally {
+            try { tunnel.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int c;
+        while ((c = in.read()) != -1) {
+            if (c == '\n') break;
+            if (c != '\r') sb.append((char) c);
+        }
+        return c == -1 && sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static void drainHeaders(InputStream in) throws IOException {
+        String line;
+        while ((line = readLine(in)) != null && !line.isEmpty()) {
+            // headers are irrelevant to the callers; they only have to be consumed
+        }
+    }
+
+    private static int parseCode(String statusLine) {
+        int space = statusLine.indexOf(' ');
+        if (space < 0 || space + 4 > statusLine.length()) return -1;
+        try {
+            return Integer.parseInt(statusLine.substring(space + 1, space + 4));
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 

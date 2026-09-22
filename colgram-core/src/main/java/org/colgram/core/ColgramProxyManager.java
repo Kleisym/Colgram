@@ -550,8 +550,30 @@ public class ColgramProxyManager {
             {"185.76.151.1", "443"},
     };
 
-    private static boolean telegramDirectlyReachable() {
-        for (String[] endpoint : TELEGRAM_DC_ENDPOINTS) {
+    /**
+     * What kind of interference this network actually applies, measured rather than assumed.
+     *
+     * The two cases need opposite fixes: an IP-level drop cannot be beaten by desync at all -
+     * only a relay carries it - while an SNI/DPI filter is exactly what the local listener
+     * defeats. Telling them apart is the difference between a bypass that works and a button the
+     * user presses while nothing can help him.
+     */
+    public static String describeBlockType() {
+        if (telegramDirectlyReachable()) {
+            return "Telegram доступен напрямую — блокировки нет";
+        }
+        if (localBypassUsable()) {
+            for (ProxyItem p : verifiedPool) {
+                if (p.isLocalDpi() && p.nativeVerified) {
+                    return "SNI/DPI-фильтр — обходчик без прокси работает";
+                }
+            }
+            return "IP-дроп адресов Telegram — обходчик бессилен, нужен релей";
+        }
+        return "IP-дроп адресов Telegram — нужен релей или прокси";
+    }
+
+    private static boolean telegramDirectlyReachable() {        for (String[] endpoint : TELEGRAM_DC_ENDPOINTS) {
             try {
                 if (testProxy(endpoint[0], Integer.parseInt(endpoint[1]), 1200) >= 0) return true;
             } catch (Throwable ignored) {
@@ -570,18 +592,34 @@ public class ColgramProxyManager {
     private static void autoConnectIfBlocked() {
         Context ctx = appContext;
         if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled()) return;
+        // He switches the proxy off by hand; a background task that switches it back on is not a
+        // bypass, it is a override. Opt-in only.
+        if (!ColgramConfig.isAutoProxyEnabled()) return;
         if (isProxyEnabled(ctx)) return;
         if (telegramDirectlyReachable()) return;
-        ProxyItem best = null;
-        for (ProxyItem p : verifiedPool) {
-            if (!p.nativeVerified || p.isLocalDpi() || p.type == 2) continue;
-            if (best == null || betterCandidate(p, best)) best = p;
+        // The local desync listener wins when it has actually completed a handshake: no third
+        // party sees anything, and it is the only path that works with no proxy at all, which is
+        // what the "анонимный обход без прокси" switch promises.
+        ProxyItem chosen = null;
+        if (localBypassUsable()) {
+            for (ProxyItem p : verifiedPool) {
+                if (p.isLocalDpi() && p.nativeVerified) {
+                    chosen = p;
+                    break;
+                }
+            }
         }
-        if (best == null) return;
-        final ProxyItem chosen = best;
+        if (chosen == null) {
+            for (ProxyItem p : verifiedPool) {
+                if (!p.nativeVerified || p.isLocalDpi() || p.type == 2) continue;
+                if (chosen == null || betterCandidate(p, chosen)) chosen = p;
+            }
+        }
+        if (chosen == null) return;
+        final ProxyItem picked = chosen;
         Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
-                + chosen.address + ":" + chosen.port);
-        mainHandler.post(() -> forceApplyProxy(chosen));
+                + (picked.isLocalDpi() ? "local desync bypass" : picked.address + ":" + picked.port));
+        mainHandler.post(() -> forceApplyProxy(picked));
     }
 
     /** Live UI refresh while the sweep runs, so the pool screen counts up instead of freezing. */
@@ -667,7 +705,11 @@ public class ColgramProxyManager {
             ProxyItem p = verifiedPool.get(idx);
             // A WEB entry needs a WebView bridge per check and the pool never holds one; the
             // user's own WEB proxy is exercised where it is actually applied.
-            if (p.type == 2 || p.isLocalDpi()) continue;
+            if (p.type == 2) continue;
+            // The local desync listener IS worth a protocol check: it is the only candidate with
+            // no third party in the path, and excluding it from probing meant it could never earn
+            // a verdict, so the "no proxy" bypass was never applied and never tested.
+            if (p.isLocalDpi() && !localBypassUsable()) continue;
             boolean fresh = p.lastCheckAt > 0 && now - p.lastCheckAt < RECHECK_INTERVAL_MS;
             if (p.tcpMs >= 0 && !fresh) {
                 tcpAlive = p;
@@ -917,7 +959,19 @@ public class ColgramProxyManager {
      */
     public static void reportProxyFailure() {
         ProxyItem active = currentActiveProxy;
-        if (active == null || active.isLocalDpi()) return;
+        if (active == null) return;
+        if (active.isLocalDpi()) {
+            // The local bypass used to be exempt from failure counting, so when it could not
+            // carry traffic the app just sat on "Соединение..." with no explanation. Three
+            // native failures through it is the measurement that says what kind of block this
+            // is - and the user gets told instead of watching a spinner.
+            active.nativeFailures++;
+            if (active.nativeFailures == 3) {
+                Log.w(TAG, "local desync bypass failed three handshakes: " + describeBlockType());
+                toast("Обходчик не помог: " + describeBlockType());
+            }
+            return;
+        }
         active.nativeFailures++;
         if (active.nativeFailures < 2) return;
         active.isAvailable = false;
@@ -935,6 +989,13 @@ public class ColgramProxyManager {
      *              used when the user asks for a different node explicitly.
      */
     public static synchronized void switchToNextProxy(boolean force) {
+        Context rotateCtx = appContext;
+        if (rotateCtx != null && !isProxyEnabled(rotateCtx) && !ColgramConfig.isAutoProxyEnabled()) {
+            // The proxy is off because the user put it off. Rotation exists to keep a running
+            // tunnel alive; with nothing applied it would silently turn the proxy back on.
+            Log.i(TAG, "proxy is switched off by the user; not rotating or applying anything");
+            return;
+        }
         if (verifiedPool.isEmpty()) {
             // Pool genuinely empty: nothing to rotate to. Re-seed and re-fetch instead of
             // returning silently, which is what made this look like a dead feature.
@@ -1345,8 +1406,12 @@ public class ColgramProxyManager {
         Log.i(TAG, "json source " + sourceUrl + " added " + added);
     }
 
-    private static int testProxy(String host, int port, int timeoutMs) {
-        long start = System.currentTimeMillis();
+    /** TCP reachability of a relay, for callers that must pick a transport. */
+    public static int probeTcp(String host, int port, int timeoutMs) {
+        return testProxy(host, port, timeoutMs);
+    }
+
+    private static int testProxy(String host, int port, int timeoutMs) {        long start = System.currentTimeMillis();
         try (Socket socket = new Socket()) {
             socket.setTcpNoDelay(true);
             socket.connect(new InetSocketAddress(host, port), timeoutMs);
@@ -1848,6 +1913,22 @@ public class ColgramProxyManager {
             for (ColgramProxyChain.Relay r : relayPool) if (!r.dead && r.rttMs >= 0) c++;
         }
         return c;
+    }
+
+    /**
+     * Reachable tunnels, fastest first, for callers that need to carry plain HTTP(S): the bot
+     * API, the mail providers, the proxy lists. SOCKS relays and CONNECT relays are both
+     * included; the caller picks the handshake per relay kind.
+     */
+    public static List<ColgramProxyChain.Relay> getReachableRelays() {
+        List<ColgramProxyChain.Relay> out = new ArrayList<>();
+        synchronized (relayPool) {
+            for (ColgramProxyChain.Relay r : relayPool) {
+                if (!r.dead && r.rttMs >= 0) out.add(r);
+            }
+        }
+        out.sort((a, b) -> Integer.compare(a.rttMs, b.rttMs));
+        return out;
     }
 
     /** Human-readable state of one ping result. */

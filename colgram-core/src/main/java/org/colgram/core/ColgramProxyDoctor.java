@@ -49,6 +49,9 @@ public class ColgramProxyDoctor {
         String stats = "в пуле " + total + ": " + alive + " работает, " + dead + " не отвечает, "
                 + unchecked + " без проверки; fake-TLS " + fakeTls
                 + "; через ретранслятор " + chained + " (ретрансляторов " + relays + ")";
+        // Say what the network is actually doing, so "the bypass does nothing" becomes a
+        // diagnosis instead of a mystery.
+        stats = ColgramProxyManager.describeBlockType() + " | " + stats;
 
         if (current != null) {
             return "Активный прокси: " + current.address + ":" + current.port

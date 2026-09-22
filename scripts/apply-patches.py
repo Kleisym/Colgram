@@ -2359,6 +2359,25 @@ def inject_hooks(repo_path):
             else:
                 print(f" [!] Warning: template {src_t} not found")
 
+        # 24.1b. Ship the plugin catalog inside the APK.
+        #
+        # The marketplace entries point at raw.githubusercontent.com, so with no network (or a
+        # blocked one) nothing could be installed at all, and installBundledPlugin() read
+        # assets/plugins/ - a directory that was never created, so the offline fallback was
+        # dead code. Copying the repo's plugins/ into assets makes them genuinely built in:
+        # ColgramPluginManager installs every one of them on first run.
+        plugin_src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugins")
+        plugin_dst_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "assets", "plugins")
+        if os.path.isdir(plugin_src_dir):
+            os.makedirs(plugin_dst_dir, exist_ok=True)
+            shipped = 0
+            for fname in sorted(os.listdir(plugin_src_dir)):
+                if fname.endswith(".py") or fname == "catalog.json":
+                    shutil.copyfile(os.path.join(plugin_src_dir, fname),
+                                    os.path.join(plugin_dst_dir, fname))
+                    shipped += 1
+            print(f" [+] Shipped {shipped} bundled plugin file(s) into assets/plugins")
+
         # ---------------------------------------------------------------------------
         # 24.2 Colgram file sandbox: stop requesting the media library.
         #
@@ -4736,6 +4755,76 @@ def inject_hooks(repo_path):
 
     patch_file(dialogs_activity, search_jump_click_injector, "colgramPerformJump(position)",
                "Search List Routes Jump Row Clicks")
+
+    # 66. MessagesStorage -> the built-in spam guard sees every inbound message.
+    #
+    # The old anti-spam was a Telethon userbot needing api_id, api_hash and a second phone
+    # number - and its python modules were never even shipped in the APK, so it could not
+    # install. This is the same protection with no setup: score the message where it is already
+    # being dispatched to plugins, and silence a stranger who reads as advertising.
+    def storage_spam_guard_injector(content):
+        marker = "colgramSpamVerdict"
+        if marker in content:
+            return content
+        anchor = ("                org.colgram.core.ColgramHookHandler.hookOnMessageReceived(\n"
+                  "                        colgramDialogId, colgramMessage.id, colgramMessage.message, false);\n")
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            ("                long colgramSender = colgramMessage.from_id != null\n"
+             "                        ? colgramMessage.from_id.user_id : 0L;\n"
+             "                if (colgramSender != 0 && colgramSender\n"
+             "                        != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
+             "                    int colgramVerdict = org.colgram.core.ColgramHookHandler.colgramSpamVerdict(\n"
+             "                            colgramDialogId, colgramSender, colgramMessage.message,\n"
+             "                            colgramDialogId < 0);\n"
+             "                    if (colgramVerdict >= org.colgram.core.ColgramSpamGuard.VERDICT_MUTE) {\n"
+             "                        org.colgram.core.ColgramHookHandler.setNotificationsBlocked(colgramSender, true);\n"
+             "                    }\n"
+             "                }\n"
+             + anchor), 1)
+
+    patch_file(messages_storage, storage_spam_guard_injector, "colgramSpamVerdict",
+               "MessagesStorage Built-In Spam Guard")
+
+    # 67. SettingsActivity -> a bot account has no phone, so stop printing "+null".
+    #
+    # The account subtitle is ours ("+7… • @username"), and string concatenation turned a null
+    # phone into the literal "+null" under the bot's name.
+    def settings_phone_null_injector(content):
+        marker = 'A bot account has no phone at all'
+        if marker in content:
+            return content
+        anchor = ('        final StringBuilder sb = new StringBuilder();\n'
+                  '        if (user != null) {\n'
+                  '            sb.append(PhoneFormat.getInstance().format("+" + user.phone));\n'
+                  '        }\n'
+                  '        final String username = UserObject.getPublicUsername(user);\n'
+                  '        if (username != null) {\n'
+                  '            sb.append(" • @").append(username);\n'
+                  '        }\n')
+        if anchor not in content:
+            return content
+        return content.replace(
+            anchor,
+            ('        final StringBuilder sb = new StringBuilder();\n'
+             '        // A bot account has no phone at all, and "+" + null used to print "+null"\n'
+             '        // under the name.\n'
+             '        if (user != null && !TextUtils.isEmpty(user.phone)) {\n'
+             '            sb.append(PhoneFormat.getInstance().format("+" + user.phone));\n'
+             '        }\n'
+             '        final String username = UserObject.getPublicUsername(user);\n'
+             '        if (username != null) {\n'
+             '            if (sb.length() > 0) {\n'
+             '                sb.append(" • ");\n'
+             '            }\n'
+             '            sb.append("@").append(username);\n'
+             '        }\n'), 1)
+
+    patch_file(settings_activity, settings_phone_null_injector,
+               'A bot account has no phone at all',
+               "SettingsActivity Bot Account Has No Phone")
 
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")

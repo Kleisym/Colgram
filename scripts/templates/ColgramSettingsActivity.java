@@ -63,6 +63,8 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int currentProxyRow;
     private int ownProxyRow;
     private int proxyStatusRow;
+    private int relayUrlRow;
+    private int autoProxyRow;
     private int networkSectionRow;
 
     private int sandboxHeaderRow;
@@ -114,6 +116,8 @@ public class ColgramSettingsActivity extends BaseFragment {
         currentProxyRow = rowCount++;
         ownProxyRow = rowCount++;
         proxyStatusRow = rowCount++;
+        relayUrlRow = rowCount++;
+        autoProxyRow = rowCount++;
         networkSectionRow = rowCount++;
 
         sandboxHeaderRow = rowCount++;
@@ -269,6 +273,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                 // IP-level block with no VPN and no server of your own. Colgram only ever
                 // offered its own list here, so that mechanism was unreachable from this app.
                 presentFragment(new ProxyListActivity());
+            } else if (position == autoProxyRow) {
+                boolean val = !ColgramConfig.isAutoProxyEnabled();
+                ColgramConfig.setAutoProxyEnabled(val);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(val);
+                }
+            } else if (position == relayUrlRow) {
+                editRelayUrl();
             } else if (position == proxyStatusRow) {
                 ColgramProxyManager.checkPoolNow(true);
                 Toast.makeText(getParentActivity(),
@@ -326,6 +338,40 @@ public class ColgramSettingsActivity extends BaseFragment {
         showDialog(builder.create());
     }
 
+    /**
+     * A self-hosted forwarder for the traffic tgnet cannot carry: the Bot API, the mail
+     * providers and the proxy-list fetches. On a network that drops those addresses by IP and
+     * where every public SOCKS list is dead, one Worker on a domain the block will not touch is
+     * the difference between "сеть недоступна" and a working feature. It is not a Telegram
+     * proxy and the UI says so; the worker source ships in the repo under deploy/.
+     */
+    private void editRelayUrl() {
+        Context ctx = getParentActivity();
+        if (ctx == null) return;
+        final android.widget.EditText input = new android.widget.EditText(ctx);
+        input.setHint("https://имя.workers.dev");
+        input.setText(ColgramConfig.getRelayUrl());
+        input.setSingleLine(true);
+        input.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8),
+                AndroidUtilities.dp(16), AndroidUtilities.dp(8));
+        new org.telegram.ui.ActionBar.AlertDialog.Builder(ctx)
+                .setTitle("Реле-адрес")
+                .setMessage("Через него идут Bot API, временные почты и списки прокси, когда их "
+                        + "адреса блокируют по IP. Трафик самого Telegram он не заменяет — "
+                        + "для него нужен прокси или обходчик.")
+                .setView(input)
+                .setPositiveButton("Сохранить", (dialog, which) -> {
+                    ColgramConfig.setRelayUrl(input.getText().toString().trim());
+                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                })
+                .setNeutralButton("Сбросить", (dialog, which) -> {
+                    ColgramConfig.setRelayUrl("");
+                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
         private final Context mContext;
 
@@ -345,7 +391,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
                    position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow ||
-                   position == ownProxyRow || position == proxyStatusRow ||
+                   position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow || position == autoProxyRow ||
                    position == sandboxStorageRow || position == sandboxFilesRow ||
                    position == botRealtimeRow || position == pluginsRow;
         }
@@ -357,7 +403,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                 position == botsHeaderRow) {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow
-                    || position == ownProxyRow || position == proxyStatusRow
+                    || position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow
                     || position == sandboxFilesRow || position == pluginsRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
@@ -436,6 +482,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                         checkCell.setTextAndCheck("Скрывать онлайн статус", ColgramConfig.isGhostOnlineEnabled(), true);
                     } else if (position == bypassFlagSecureRow) {
                         checkCell.setTextAndCheck("Разрешить скриншоты везде (FLAG_SECURE)", ColgramConfig.isBypassFlagSecureEnabled(), false);
+                    } else if (position == autoProxyRow) {
+                        checkCell.setTextAndCheck("Самоподключение прокси, если Telegram не отвечает",
+                                ColgramConfig.isAutoProxyEnabled(), true);
                     } else if (position == dpiBypassRow) {
                         // Read the persisted intent, not just whether a socket happens to be
                         // bound: a listener that failed to bind is a fault, not a setting.
@@ -478,6 +527,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == pluginsRow) {
                         settingsCell.setTextAndValue("Плагины: автоответчик, алерты, лог",
                                 "открыть", false);
+                    } else if (position == relayUrlRow) {
+                        String relay = ColgramConfig.getRelayUrl();
+                        settingsCell.setTextAndValue("Реле-адрес для Bot API и почты",
+                                relay.isEmpty() ? "не задан" : relay, true);
                     } else if (position == proxyStatusRow) {
                         settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
                                 ColgramProxyDoctor.getStatusSummary(), false);

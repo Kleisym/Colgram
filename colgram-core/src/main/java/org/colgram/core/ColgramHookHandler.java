@@ -60,6 +60,27 @@ public class ColgramHookHandler {
     }
 
     /**
+     * Built-in spam verdict for one inbound message. No api_id, no userbot: the score is computed
+     * in-process and the caller only has to act on it.
+     */
+    public static int colgramSpamVerdict(long dialogId, long senderId, String text, boolean isGroup) {
+        try {
+            boolean isContact = false;
+            try {
+                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, 0);
+                java.util.HashMap<?, ?> contacts =
+                        (java.util.HashMap<?, ?>) mcClass.getField("contactsDict").get(mc);
+                isContact = contacts != null && contacts.containsKey(senderId);
+            } catch (Throwable ignored) {
+            }
+            return ColgramSpamGuard.judge(dialogId, senderId, text, isContact, isGroup);
+        } catch (Throwable t) {
+            return ColgramSpamGuard.VERDICT_OK;
+        }
+    }
+
+    /**
      * HOOK: Called from MessagesController when a new message is received or created.
      *
      * Deduplicated on (dialog, message id) because more than one transport can report the same

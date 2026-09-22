@@ -600,7 +600,15 @@ public class ColgramBotSync {
         //   2. the desync listener, if one is bound (it is itself a local SOCKS proxy).
         //   3. a plain direct connection.
         java.net.Proxy proxy = null;
-        if (wantIpv4Only) {
+        // A relay beats every local trick: the IPv4-forcing listener and the desync listener both
+        // still dial the origin, and api.telegram.org lives in the same dropped IP ranges, so on a
+        // blocked network choosing them first means an eight-second timeout on every call - what
+        // the user sees as "сеть недоступна" when he edits a bot name.
+        java.net.Proxy relay = ColgramHttp.pickRelayProxy();
+        if (relay != null) {
+            proxy = relay;
+        }
+        if (proxy == null && wantIpv4Only) {
             int p = colgramIpv4ProxyPort();
             if (p > 0) {
                 proxy = new java.net.Proxy(java.net.Proxy.Type.HTTP,

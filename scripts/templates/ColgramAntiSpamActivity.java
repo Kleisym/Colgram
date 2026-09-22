@@ -52,6 +52,11 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     private ListAdapter listAdapter;
 
     private int rowCount;
+    private int guardHeaderRow;
+    private int guardToggleRow;
+    private int guardCommandsRow;
+    private int guardShadowRow;
+
     private int infoHeaderRow;
     private int infoRow;
     private int credsHeaderRow;
@@ -120,6 +125,10 @@ public class ColgramAntiSpamActivity extends BaseFragment {
 
     private void buildRows() {
         rowCount = 0;
+        guardHeaderRow = rowCount++;
+        guardToggleRow = rowCount++;
+        guardCommandsRow = rowCount++;
+        guardShadowRow = rowCount++;
         infoHeaderRow = rowCount++;
         infoRow = rowCount++;
         credsHeaderRow = rowCount++;
@@ -187,7 +196,22 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         if (context == null) return;
         int acc = account();
 
-        if (position == apiIdRow) {
+        if (position == guardToggleRow) {
+            boolean val = !org.colgram.core.ColgramConfig.isSpamGuardEnabled();
+            org.colgram.core.ColgramConfig.setSpamGuardEnabled(val);
+            buildRows();
+            if (listAdapter != null) listAdapter.notifyDataSetChanged();
+        } else if (position == guardCommandsRow) {
+            new AlertDialog.Builder(context)
+                    .setTitle("Команды прямо в чате")
+                    .setMessage(".мут — заглушить пинги того, кому отвечаешь (в личке — собеседника)\n"
+                            + ".unmute — вернуть пинги\n\n"
+                            + "Сообщение с командой не отправляется. Детектор рекламы работает сам: "
+                            + "ссылки, капс, «подпишись/казино/заработок», повторяющиеся сообщения "
+                            + "от незнакомцев — такой собеседник глушится автоматически.")
+                    .setPositiveButton("Понятно", null)
+                    .show();
+        } else if (position == apiIdRow) {
             editField("api_id", "Только цифры, из my.telegram.org",
                     ColgramAntiSpam.getApiId(context, acc), false, value ->
                             ColgramAntiSpam.saveCredentials(context, acc, value,
@@ -334,7 +358,9 @@ public class ColgramAntiSpamActivity extends BaseFragment {
             switch (holder.getItemViewType()) {
                 case 0: {
                     HeaderCell headerCell = (HeaderCell) holder.itemView;
-                    if (position == infoHeaderRow) {
+                    if (position == guardHeaderRow) {
+                        headerCell.setText("Встроенный антиспам");
+                    } else if (position == infoHeaderRow) {
                         headerCell.setText("Что это такое");
                     } else if (position == credsHeaderRow) {
                         headerCell.setText("Данные аккаунта-юзербота");
@@ -349,7 +375,14 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                     TextSettingsCell cell = (TextSettingsCell) holder.itemView;
                     int acc = account();
                     Context ctx = getParentActivity();
-                    if (position == apiIdRow) {
+                    if (position == guardToggleRow) {
+                        cell.setTextAndValue("Детектор рекламы и спама",
+                                org.colgram.core.ColgramConfig.isSpamGuardEnabled()
+                                        ? "включён" : "выключен", true);
+                    } else if (position == guardCommandsRow) {
+                        cell.setTextAndValue("Команды в чате",
+                                ".мут / .unmute", false);
+                    } else if (position == apiIdRow) {
                         String v = ctx == null ? "" : ColgramAntiSpam.getApiId(ctx, acc);
                         cell.setTextAndValue("api_id", v.isEmpty() ? "не задан" : v, true);
                     } else if (position == apiHashRow) {
@@ -402,10 +435,12 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         @Override
         public int getItemViewType(int position) {
             if (position == infoHeaderRow || position == credsHeaderRow
-                    || position == controlHeaderRow || position == noteHeaderRow) {
+                    || position == controlHeaderRow || position == noteHeaderRow
+                    || position == guardHeaderRow) {
                 return 0;
             }
-            if (position == credsShadowRow || position == controlShadowRow) {
+            if (position == credsShadowRow || position == controlShadowRow
+                    || position == guardShadowRow) {
                 return 2;
             }
             if (position == infoRow || position == noteRow) {

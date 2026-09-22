@@ -82,7 +82,7 @@ public final class ColgramProxyChain {
         }
     }
 
-    private static final class Forwarder {
+    private static class Forwarder {
         final ServerSocket server;
         final String targetHost;
         final int targetPort;
@@ -132,7 +132,7 @@ public final class ColgramProxyChain {
             }
         }
 
-        private void relayOne(Socket client) {
+        protected void relayOne(Socket client) {
             Socket upstream = null;
             try {
                 client.setTcpNoDelay(true);
@@ -257,6 +257,102 @@ public final class ColgramProxyChain {
             return -1;
         } finally {
             closeQuietly(socket);
+        }
+    }
+
+    /**
+     * Loopback HTTP proxy front: it accepts the ordinary `CONNECT host:port` a Java
+     * HttpURLConnection sends, answers 200, and then pumps that connection through the relay.
+     *
+     * This is what lets the bot API and the mail providers use a relay at all. They speak
+     * `HttpsURLConnection`, which cannot be handed a pre-tunnelled socket - but it will happily
+     * use an HTTP proxy, and pointing it here keeps the real hostname in the URL, so SNI and
+     * certificate validation stay correct while the bytes leave through the tunnel.
+     */
+    public static synchronized int openProxyFront(Relay relay) {
+        if (relay == null) return 0;
+        String key = "front|" + relay.key();
+        Forwarder existing = forwarders.get(key);
+        if (existing != null && !existing.closed && existing.server.isBound()) {
+            return existing.port();
+        }
+        try {
+            ServerSocket server = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+            Front front = new Front(server, relay);
+            forwarders.put(key, front);
+            front.start();
+            Log.i(TAG, "proxy front 127.0.0.1:" + front.port() + " -> " + relay);
+            return front.port();
+        } catch (Throwable t) {
+            Log.e(TAG, "cannot bind proxy front", t);
+            return 0;
+        }
+    }
+
+    /** A listening socket that terminates the client's CONNECT and forwards it through a relay. */
+    private static final class Front extends Forwarder {
+        private final Relay uplink;
+
+        Front(ServerSocket server, Relay relay) {
+            super(server, null, 0, relay);
+            this.uplink = relay;
+        }
+
+        @Override
+        protected void relayOne(Socket client) {
+            Socket upstream = null;
+            try {
+                client.setTcpNoDelay(true);
+                java.io.InputStream in = client.getInputStream();
+                String request = readLine(in);
+                if (request == null) return;
+                drainHeaders(in);
+                String[] parts = request.split("\\s+");
+                if (parts.length < 2 || !parts[0].equalsIgnoreCase("CONNECT")) {
+                    client.getOutputStream().write(
+                            "HTTP/1.1 405 Method Not Allowed\r\n\r\n".getBytes("UTF-8"));
+                    return;
+                }
+                int colon = parts[1].lastIndexOf(':');
+                String host = colon > 0 ? parts[1].substring(0, colon) : parts[1];
+                int port = colon > 0 ? Integer.parseInt(parts[1].substring(colon + 1)) : 443;
+                upstream = connectThrough(uplink, host, port, CONNECT_TIMEOUT_MS);
+                if (upstream == null) {
+                    client.getOutputStream().write(
+                            "HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes("UTF-8"));
+                    return;
+                }
+                client.getOutputStream().write(
+                        "HTTP/1.1 200 Connection established\r\n\r\n".getBytes("UTF-8"));
+                client.getOutputStream().flush();
+                final Socket up = upstream;
+                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramFront-up");
+                toUpstream.setDaemon(true);
+                toUpstream.start();
+                pump(up, client);
+            } catch (Throwable t) {
+                Log.w(TAG, "proxy front request failed", t);
+            } finally {
+                closeQuietly(client);
+                closeQuietly(upstream);
+            }
+        }
+
+        private static String readLine(java.io.InputStream in) throws java.io.IOException {
+            StringBuilder sb = new StringBuilder();
+            int c;
+            while ((c = in.read()) != -1) {
+                if (c == '\n') break;
+                if (c != '\r') sb.append((char) c);
+            }
+            return sb.length() == 0 ? null : sb.toString();
+        }
+
+        private static void drainHeaders(java.io.InputStream in) throws java.io.IOException {
+            String line;
+            while ((line = readLine(in)) != null && !line.isEmpty()) {
+                // The request headers are not needed: CONNECT targets came from the first line.
+            }
         }
     }
 

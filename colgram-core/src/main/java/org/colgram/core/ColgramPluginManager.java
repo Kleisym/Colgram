@@ -85,11 +85,39 @@ public class ColgramPluginManager {
             //     having to clear app data.
             installExteraCompatShim(internalPluginsDir);
 
+            // 3c. Install the marketplace set as built-ins.
+            installBundledCatalog();
+
             // 4. Reload
             reloadPlugins();
 
         } catch (Throwable t) {
             Log.e(TAG, "Failed to initialize ColgramPluginManager", t);
+        }
+    }
+
+    /**
+     * Copy every plugin the APK ships in assets/plugins into the live plugins directory.
+     *
+     * The marketplace used to be a list of download URLs, which meant that on a blocked or
+     * offline network the catalog was decoration: nothing could be installed, and the entries
+     * people actually want (auto-reply, keyword alerts, message logging, chat export) never ran.
+     * The apply-patches script puts those files in assets, so here they simply become built in.
+     * Refreshed on every start, exactly like the compatibility shim, so a Colgram update ships
+     * fixed plugins without the user clearing anything; enabled/disabled state lives in prefs and
+     * is not touched by rewriting the file.
+     */
+    public static void installBundledCatalog() {
+        if (appContext == null || internalPluginsDir == null) return;
+        try {
+            String[] names = appContext.getAssets().list("plugins");
+            if (names == null || names.length == 0) return;
+            for (String name : names) {
+                if (!name.endsWith(".py") && !name.endsWith(".plugin")) continue;
+                installBundledPlugin(name);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "installBundledCatalog failed: " + t.getMessage());
         }
     }
 
@@ -107,9 +135,43 @@ public class ColgramPluginManager {
             ColgramPythonEngine.addPythonPath(externalPluginsDir.getAbsolutePath());
         }
 
+        normalizePluginExtensions(internalPluginsDir);
+        normalizePluginExtensions(externalPluginsDir);
         scanDir(internalPluginsDir, prefs);
         if (externalPluginsDir != null && externalPluginsDir.exists()) {
             scanDir(externalPluginsDir, prefs);
+        }
+    }
+
+    /**
+     * Give every {@code *.plugin} file a {@code *.py} twin.
+     *
+     * ".plugin" is how a Colgram plugin is meant to be shared and dropped in — a recognisable
+     * extension instead of a bare .py — but the interpreter imports modules by file name, so the
+     * extension itself cannot be loaded. Copying on scan means the user drops one file in and it
+     * works; the original stays untouched so re-sharing it keeps working. A twin is refreshed
+     * whenever the source is newer, so editing the .plugin still takes effect.
+     */
+    private static void normalizePluginExtensions(File dir) {
+        if (dir == null || !dir.exists()) return;
+        File[] files = dir.listFiles((d, name) -> name.toLowerCase().endsWith(".plugin"));
+        if (files == null) return;
+        for (File src : files) {
+            try {
+                String base = src.getName().substring(0, src.getName().length() - ".plugin".length());
+                File twin = new File(dir, base + ".py");
+                if (twin.exists() && twin.lastModified() >= src.lastModified()) continue;
+                java.io.InputStream in = new java.io.FileInputStream(src);
+                java.io.OutputStream out = new java.io.FileOutputStream(twin, false);
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                out.close();
+                in.close();
+                Log.i(TAG, "installed plugin " + src.getName() + " as " + twin.getName());
+            } catch (Throwable t) {
+                Log.w(TAG, "cannot expand " + src.getName(), t);
+            }
         }
     }
 
@@ -405,6 +467,11 @@ public class ColgramPluginManager {
     public static boolean installPlugin(String fileName, String code) {
         try {
             if (internalPluginsDir == null) return false;
+            if (fileName == null || fileName.isEmpty()) return false;
+            // A download or share can arrive named *.plugin; the interpreter needs *.py.
+            if (fileName.toLowerCase().endsWith(".plugin")) {
+                fileName = fileName.substring(0, fileName.length() - ".plugin".length()) + ".py";
+            }
             File target = new File(internalPluginsDir, fileName);
             try (FileWriter w = new FileWriter(target)) {
                 w.write(code);
