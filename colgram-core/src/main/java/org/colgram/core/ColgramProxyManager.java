@@ -413,6 +413,8 @@ public class ColgramProxyManager {
     /** Watchdog ticks spent waiting for the direct remap to produce a connection. */
     private static int dcRemapTicks = 0;
     private static final int DC_REMAP_VERDICT_TICKS = 6;
+    /** How often to ask Telegram for its published server addresses. */
+    private static final long FRESH_ADDRESSES_INTERVAL_MS = 120000L;
 
     /** True once the remap has had its window and Telegram is still not connected. */
     private static boolean dcRemapGaveUp() {
@@ -440,19 +442,35 @@ public class ColgramProxyManager {
     private static void connectionWatchdogTick() {
         Context ctx = appContext;
         if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled()) return;
-        if (!isProxyEnabled(ctx)) {
+        // The remap deliberately does not write Telegram's proxy prefs (its port dies with the
+        // process), so isProxyEnabled() cannot be the only test for "something is carrying
+        // connections". Reading it alone meant the watchdog quit on the first tick while the remap
+        // was applied: no verdict, no report, no fresh addresses - just a spinner.
+        if (!isProxyEnabled(ctx) && !isDcRemapActive()) {
             watchdogUnconnectedTicks = 0;
             watchdogRedials = 0;
             return;
         }
         int state = tgnetConnectionState();
         if (state < 0) return;                        // no accessor: nothing to judge
-        if (state == TG_STATE_CONNECTED) {
+        ProxyItem applied = currentActiveProxy;
+        boolean endpointProvenDead = applied != null
+                && (applied.nativeFailures >= 2 || applied.failedVerdicts >= 2);
+        if (state == TG_STATE_CONNECTED && !endpointProvenDead) {
             watchdogUnconnectedTicks = 0;
             watchdogRedials = 0;
             dcRemapTicks = 0;
             ColgramBypassNotice.clear(ctx);
             return;
+        }
+        if (state == TG_STATE_CONNECTED && endpointProvenDead) {
+            // getInstance(0).getConnectionState() is not a per-connection truth: it read
+            // "connected" for minutes while the remap it was supposedly using refused every
+            // single CONNECT. Trusting it alone meant no verdict, no report and no fallback -
+            // an explanation-free spinner. Protocol failures on the applied endpoint outrank it.
+            Log.w(TAG, "tgnet says connected but " + applied.address + ":" + applied.port
+                    + " failed " + Math.max(applied.nativeFailures, applied.failedVerdicts)
+                    + " protocol checks; treating as disconnected");
         }
         if (isDcRemapActive() && currentActiveProxy == dcRemapItem) {
             // tgnet is the only honest judge of whether the remap carried a real MTProto session:
@@ -468,6 +486,11 @@ public class ColgramProxyManager {
                 // behaviour to go away. So the verdict is reported - in the header, in a toast, in a
                 // notification with the one tap that opts in - and the choice stays his.
                 Log.i(TAG, "direct remap exhausted; reporting it and waiting for him to decide");
+                // Worth trying Telegram's own remedy before declaring the network closed: the
+                // published addresses rotate precisely because the old ones get blocked, and the
+                // native side only asks for them when a real DC connection fails - which never
+                // happens while the remap's loopback socket opens happily.
+                requestFreshDcAddresses("direct remap exhausted");
                 mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает. "
                         + "Обход без прокси не найден - включи прокси сам, если нужно."));
                 ColgramBypassNotice.showBlocked(ctx,
@@ -480,6 +503,7 @@ public class ColgramProxyManager {
 
         ProxyItem active = currentActiveProxy;
         if (active == null) {
+            requestFreshDcAddresses("no proxy applied and not connected");
             autoConnectIfBlocked();
             return;
         }
@@ -528,6 +552,38 @@ public class ColgramProxyManager {
             cm.getMethod("checkConnection").invoke(inst);
         } catch (Throwable t) {
             Log.w(TAG, "could not ask tgnet to re-dial: " + t);
+        }
+    }
+
+    private static long lastFreshAddressesAt = 0L;
+
+    /**
+     * Ask Telegram for its current server addresses, through Telegram's own mechanism.
+     *
+     * ConnectionsManager.onRequestNewServerIpAndPort is the callback native tgnet uses when it has
+     * run out of addresses to dial: it fetches the signed DnsConfig published as TXT records on
+     * apv3.stel.com (Google first, Mozilla as the alternate) and applies the fresh IP:port:secret
+     * triples. That is the only censorship bypass Telegram itself ships, it needs no third-party
+     * relay, and it is the one thing that can replace a hardcoded 2018 DC list that a block has
+     * already learned. Measured on this link: dns.google answers in 276 ms, so the source is
+     * reachable - the callback simply was not firing often enough to matter.
+     *
+     * Rate limited: each call kicks off a network fetch and a reconnect, and doing that every
+     * watchdog tick is a storm, not a retry.
+     */
+    private static void requestFreshDcAddresses(String reason) {
+        long now = System.currentTimeMillis();
+        if (now - lastFreshAddressesAt < FRESH_ADDRESSES_INTERVAL_MS) return;
+        lastFreshAddressesAt = now;
+        try {
+            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            cm.getMethod("onRequestNewServerIpAndPort", int.class, int.class)
+                    .invoke(null, 0, 0);
+            cm.getMethod("onRequestNewServerIpAndPort", int.class, int.class)
+                    .invoke(null, 2, 0);
+            Log.i(TAG, "asked Telegram for its current server addresses (" + reason + ")");
+        } catch (Throwable t) {
+            Log.w(TAG, "could not ask Telegram for fresh addresses: " + t);
         }
     }
 
