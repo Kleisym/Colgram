@@ -79,6 +79,13 @@ public class ColgramProxyManager {
         /** Set when a native MTProto/SOCKS handshake succeeded at least once. */
         public volatile boolean nativeVerified = false;
         /**
+         * True when Colgram picked this node itself, false when he typed or tapped it. Persisted,
+         * because without it an auto-selected node came back as "the proxy the user chose" on the
+         * next start and was restored even after he switched auto-connect off - which is the
+         * "it put me on a proxy again" complaint, wearing a different hat.
+         */
+        public volatile boolean autoSelected = false;
+        /**
          * Relay that can reach this node when a direct socket cannot. The block on this
          * network is per-IP, so plenty of perfectly good proxies are simply unreachable from
          * here; a relay that is reachable turns them back on through a loopback forwarder.
@@ -283,7 +290,24 @@ public class ColgramProxyManager {
         // The direct-address remap is an explicit choice and its port is ephemeral, so it must be
         // re-bound on every start rather than restored from the saved 127.0.0.1:<old port>, which
         // points at a socket that died with the previous process.
-        if (ColgramConfig.isDcRemapEnabled() && ColgramConfig.isBuiltinProxyEnabled()) {
+        if (localReady && ColgramConfig.isBuiltinProxyEnabled()) {
+            // The local desync listener is what his "анонимный обход без прокси" switch turns on,
+            // and it is the only bypass with no third party in the chain. It used to be started,
+            // waited for, and then never pointed at: applying anything was gated behind a proxy
+            // being saved or auto-proxy being on, so the switch produced a bound socket and
+            // nothing else - "обходник не работает от слова совсем", exactly as reported. It is
+            // not a proxy he must consent to; he asked for this one by name.
+            ProxyItem local = null;
+            for (ProxyItem p : verifiedPool) {
+                if (p.isLocalDpi()) { local = p; break; }
+            }
+            if (local != null) {
+                Log.i(TAG, "applying the local DPI bypass he switched on");
+                forceApplyProxy(local);
+            } else {
+                Log.w(TAG, "DPI listener bound but no local entry in the pool to apply");
+            }
+        } else if (ColgramConfig.isDcRemapEnabled() && ColgramConfig.isBuiltinProxyEnabled()) {
             executor.execute(() -> applyDcRemap(true));
         } else if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
             // Restore the proxy the user actually chose. This used to apply
@@ -291,6 +315,15 @@ public class ColgramProxyManager {
             // who picked a public MTProto proxy was silently moved back onto the loopbar hop
             // the next time the app started, and "my proxy does not stick" was the result.
             ProxyItem saved = findSavedProxy(mainPrefs);
+            if (saved != null && mainPrefs.getBoolean("proxy_auto_applied", false)
+                    && !ColgramConfig.isAutoProxyEnabled()) {
+                // Chosen by the auto-connect of an earlier session, not by him, and he has since
+                // switched that behaviour off. Restoring it made the app sit on a proxy he never
+                // picked - and the header's "Подключение прокси..." with it.
+                Log.i(TAG, "saved proxy " + saved.address + ":" + saved.port
+                        + " was auto-selected, and auto-connect is off; not restoring it");
+                saved = null;
+            }
             if (saved != null && isStaleLocalHop(saved)) {
                 // A build of ours wrote the remap's 127.0.0.1:<port> into Telegram's prefs, so an
                 // existing install can hold a hop that died with a process from last week. Applying
@@ -491,8 +524,9 @@ public class ColgramProxyManager {
                 // native side only asks for them when a real DC connection fails - which never
                 // happens while the remap's loopback socket opens happily.
                 requestFreshDcAddresses("direct remap exhausted");
-                mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает. "
-                        + "Обход без прокси не найден - включи прокси сам, если нужно."));
+                // No relay is dialed from here. He asked twice: a bypass that quietly puts him on
+                // somebody else's server is not a bypass. The state is reported and stopped.
+                mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает."));
                 ColgramBypassNotice.showBlocked(ctx,
                         "Напрямую ни один адрес Telegram не отвечает. " + ColgramDcRemap.describe());
             }
@@ -784,9 +818,9 @@ public class ColgramProxyManager {
                     return "SNI/DPI-фильтр — обходчик без прокси работает";
                 }
             }
-            return "IP-дроп адресов Telegram — обходчик бессилен, нужен релей";
+            return "Серверы Telegram не отвечают напрямую";
         }
-        return "IP-дроп адресов Telegram — нужен релей или прокси";
+        return "Серверы Telegram не отвечают напрямую";
     }
 
     private static volatile boolean blockedReported;
@@ -887,6 +921,7 @@ public class ColgramProxyManager {
             return;
         }
         final ProxyItem picked = chosen;
+        picked.autoSelected = true;
         Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
                 + (picked.isLocalDpi() ? "local desync bypass" : picked.address + ":" + picked.port)
                 + (picked.nativeVerified ? "" : " (не проверена нативно)"));
@@ -1304,6 +1339,21 @@ public class ColgramProxyManager {
      * Two failures, not one: a single drop is what a mobile network looks like, and demoting on
      * the first one makes the pool shrink itself into nothing.
      */
+    /**
+     * Whether the stock "proxy unavailable" alert belongs on his screen right now.
+     *
+     * It does when the failing endpoint is one he put there himself - then the dialog is
+     * information he needs. It does not when the endpoint was chosen by the bypass: the rotation
+     * that follows is already fixing it, and a dialog on top of a self-healing transport is what
+     * made the bypass feel broken ("какого хуя ошибка, я ничего не трогал").
+     */
+    public static boolean shouldShowProxyAlert() {
+        ProxyItem active = currentActiveProxy;
+        if (active == null) return true;
+        if (active.autoSelected || active.isLocalDpi() || active == dcRemapItem) return false;
+        return true;
+    }
+
     public static void reportProxyFailure() {
         ProxyItem active = currentActiveProxy;
         if (active == null) return;
@@ -1314,8 +1364,11 @@ public class ColgramProxyManager {
             // is - and the user gets told instead of watching a spinner.
             active.nativeFailures++;
             if (active.nativeFailures == 3) {
+                // The measurement, recorded honestly: this network refuses the destination
+                // outright, so no amount of packet shaping from Java will carry it. The bypass is
+                // not swapped for a relay here - that would make it the very thing it claims not
+                // to be. It says so and stops.
                 Log.w(TAG, "local desync bypass failed three handshakes: " + describeBlockType());
-                toast("Обходчик не помог: " + describeBlockType());
             }
             return;
         }
@@ -1454,6 +1507,9 @@ public class ColgramProxyManager {
             return;
         }
         Log.d(TAG, "Rotating proxy to: " + next);
+        // The rotator chose this endpoint, not he did - so it is not written to his settings and
+        // his own saved entry survives the rotation to be restored on the next start.
+        next.autoSelected = true;
 
         // Nothing verified alive left in the list: refresh it in the background so a later
         // cycle has real candidates. Falling back to the local desync listener here used to be
@@ -1840,7 +1896,16 @@ public class ColgramProxyManager {
             // process, so writing it into Telegram's own prefs made the next start restore a
             // socket nothing listens on, report it dead, and hold it as "the proxy the user
             // configured". The remap is restored from its own switch instead (see init).
-            if (proxy != dcRemapItem) {
+            // Only a proxy he picked himself goes into Telegram's settings. An endpoint chosen by
+            // auto-connect or by rotation is runtime state: persisting it made it come back on the
+            // next start as "the proxy the user configured", so a build that had once dialled a
+            // node for him kept him on that node even after he switched the behaviour off - and
+            // the header said "Подключение прокси..." to a proxy he never chose. The local desync
+            // listener is skipped for the same reason plus one: writing it flips Telegram's own
+            // "Использовать прокси" on, which is what made "обход без прокси" read as a proxy.
+            // The bypass is re-applied from its own switch on every start, so it does not need to
+            // live in his settings to work.
+            if (proxy != dcRemapItem && !proxy.autoSelected && !proxy.isLocalDpi()) {
                 for (int a = 0; a < colgramAccountSlots; a++) {
                     String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                     SharedPreferences preferences =
@@ -1856,6 +1921,7 @@ public class ColgramProxyManager {
                             .putString("proxy_pass", "")
                             .putString("proxy_secret", proxy.secret)
                             .putInt("proxy_type", proxy.type)
+                            .putBoolean("proxy_auto_applied", proxy.autoSelected)
                             .apply();
                 }
             }
@@ -2196,6 +2262,16 @@ public class ColgramProxyManager {
     private static void publishPoolToStock() {
         Context ctx = appContext;
         if (ctx == null) return;
+        // While either bypass switch is on, the pool is not published and stock rotation is not
+        // armed. Upstream's ProxyRotationController picks the lowest-ping entry the moment
+        // Telegram stalls, and it did exactly that over a running bypass: it wrote
+        // proxy_ip=fleet.telehelp.top, replaced the local listener, and the user watched
+        // "обход без прокси" turn into a public proxy on its own. Rotation stays available for
+        // the mode where he chose a proxy himself.
+        if (ColgramConfig.isDpiBypassEnabled() || ColgramConfig.isDcRemapEnabled()) {
+            Log.i(TAG, "bypass is on; not publishing the pool or arming stock rotation");
+            return;
+        }
         try {
             Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
             Class<?> piClass = Class.forName("org.telegram.messenger.SharedConfig$ProxyInfo");
@@ -2212,8 +2288,11 @@ public class ColgramProxyManager {
             int published = 0;
             for (ProxyItem p : verifiedPool) {
                 if (published >= MAX_PUBLISHED_TO_STOCK) break;
-                // Do not offer a listener the user switched off as if it were a proxy option.
-                if (p.isLocalDpi() && !ColgramConfig.isDpiBypassEnabled()) continue;
+                // The local desync listener is never offered as a proxy. It is an internal
+                // transport the bypass switch turns on, and publishing it made "обход без
+                // прокси" appear inside Telegram's proxy list as 127.0.0.1:9876 and flip
+                // "Использовать прокси" on - which is precisely why it reads as a proxy.
+                if (p.isLocalDpi()) continue;
                 Object settings = buildProxySettings(p);
                 if (settings == null) continue;
                 addProxy.invoke(null, piCtor.newInstance(settings));

@@ -289,6 +289,18 @@ public class ColgramDpiBypass {
             }
             targetSocket = establishConnection(destHost, destPort);
             if (targetSocket == null) {
+                // The DC address tgnet was told about is often the one this network refuses.
+                // Searching for a Telegram address that opens a socket at all is what the
+                // address-remap component already does; desync is only worth trying against a
+                // server that answers.
+                String live = ColgramDcRemap.liveAddressFor(destHost, destPort);
+                if (live != null && !live.equals(destHost)) {
+                    Log.i(TAG, "desync: " + destHost + ":" + destPort + " refused, trying "
+                            + live + ":" + destPort);
+                    targetSocket = establishConnection(live, destPort);
+                }
+            }
+            if (targetSocket == null) {
                 Log.w(TAG, "Failed to connect to target: " + destHost + ":" + destPort);
                 out.write(new byte[]{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
                 out.flush();

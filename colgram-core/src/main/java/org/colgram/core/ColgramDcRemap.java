@@ -339,6 +339,18 @@ public final class ColgramDcRemap {
     // ---------------------------------------------------------------------- address choice
 
     /**
+     * A Telegram address that is worth dialling for {@code host}:{@code port} right now - the
+     * requested one if it is live, otherwise a sibling that answers. Exposed so the local DPI
+     * desync bypass can search addresses too: it used to give up on the single address tgnet
+     * asked for, which on a blocked network is a dead DC, so the desync strategies never got
+     * applied to any of the addresses that do open a socket.
+     */
+    static String liveAddressFor(String host, int port) {
+        if (!isTelegramAddress(host)) return null;
+        return chooseTarget(host, port);
+    }
+
+    /**
      * The address to dial for a requested one: itself first, then its own /16, then the rest of
      * Telegram's published addresses. Non-Telegram destinations are returned unchanged - this
      * component has no business rewriting traffic that is not Telegram's.

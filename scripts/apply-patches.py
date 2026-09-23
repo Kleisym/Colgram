@@ -3702,6 +3702,31 @@ def inject_hooks(repo_path):
         "        } catch (Throwable ignore) {\n"
         "\n"
         "        }\n"
+        "        // The stock alert is his to see only when the proxy was his choice. A transport the\n"
+        "        // bypass picked - and is already replacing - must not pop a dialog on top of the\n"
+        "        // rotation that is fixing it.\n"
+        "        AndroidUtilities.runOnUIThread(() -> {\n"
+        "            if (org.colgram.core.ColgramProxyManager.shouldShowProxyAlert()) {\n"
+        "                NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3);\n"
+        "            }\n"
+        "        });\n"
+        "    }"
+    )
+    cm_proxy_alerting = (
+        "    public static void onProxyError() {\n"
+        "        // Colgram: the native layer reports a proxy connection failure here, which is the\n"
+        "        // only signal that actually travelled the whole proxy path. Record it against the\n"
+        "        // applied entry, then rotate immediately instead of waiting for the health check.\n"
+        "        try {\n"
+        "            org.colgram.core.ColgramProxyManager.reportProxyFailure();\n"
+        "        } catch (Throwable ignore) {\n"
+        "\n"
+        "        }\n"
+        "        try {\n"
+        "            org.colgram.core.ColgramProxyManager.switchToNextProxy();\n"
+        "        } catch (Throwable ignore) {\n"
+        "\n"
+        "        }\n"
         "        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needShowAlert, 3));\n"
         "    }"
     )
@@ -3709,6 +3734,8 @@ def inject_hooks(repo_path):
     def proxy_error_hook(content):
         if cm_proxy_current in content:
             return content
+        if cm_proxy_alerting in content:
+            return content.replace(cm_proxy_alerting, cm_proxy_current, 1)
         if cm_proxy_previous in content:
             return content.replace(cm_proxy_previous, cm_proxy_current, 1)
         if cm_proxy_stock in content:
