@@ -339,29 +339,28 @@ public final class ColgramEndpoints {
         });
         if (candidates.isEmpty()) return null;
         final AtomicReference<InetAddress> winner = new AtomicReference<>();
-        final CountDownLatch done = new CountDownLatch(candidates.size());
+        // Signalled by the first address that answers. Waiting for every thread instead - which is
+        // what this did - made a cold request pay the whole probe window even when the pinned
+        // address replied in 120 ms: measured as "getMe: ок (20047 мс)" after every restart, and
+        // the message poller runs through here too, so a reboot cost twenty seconds of silence.
+        final CountDownLatch answered = new CountDownLatch(1);
         for (final InetAddress candidate : candidates) {
             Thread t = new Thread(() -> {
+                if (winner.get() != null) return;
+                Socket s = new Socket();
                 try {
-                    if (winner.get() != null) return;
-                    Socket s = new Socket();
-                    try {
-                        s.connect(new InetSocketAddress(candidate, port), PROBE_TIMEOUT_MS);
-                        // Any live address is a good answer, so a plain set-once is enough.
-                        winner.compareAndSet(null, candidate);
-                    } catch (Throwable ignored) {
-                    } finally {
-                        try { s.close(); } catch (Throwable ignored) {}
-                    }
+                    s.connect(new InetSocketAddress(candidate, port), PROBE_TIMEOUT_MS);
+                    if (winner.compareAndSet(null, candidate)) answered.countDown();
+                } catch (Throwable ignored) {
                 } finally {
-                    done.countDown();
+                    try { s.close(); } catch (Throwable ignored) {}
                 }
             }, "colgram-endpoint-probe");
             t.setDaemon(true);
             t.start();
         }
         try {
-            done.await(PROBE_TIMEOUT_MS * 2L + 2000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            answered.await(PROBE_TIMEOUT_MS * 2L + 2000L, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

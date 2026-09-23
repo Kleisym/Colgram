@@ -361,22 +361,23 @@ public final class ColgramDcRemap {
         candidates.removeIf(ColgramDcRemap::isParked);
         final java.util.concurrent.atomic.AtomicReference<String> winner =
                 new java.util.concurrent.atomic.AtomicReference<>();
-        final java.util.concurrent.CountDownLatch done =
-                new java.util.concurrent.CountDownLatch(candidates.size());
+        // First answer wins outright: waiting for the whole probe budget held every Telegram
+        // connection this proxy serves for three seconds even when the first address opened
+        // immediately, which made the remap look like it was stalling rather than searching.
+        final java.util.concurrent.CountDownLatch answered =
+                new java.util.concurrent.CountDownLatch(1);
         for (final String candidate : candidates) {
             Thread t = new Thread(() -> {
-                try {
-                    if (winner.get() != null) return;
-                    if (probe(port, candidate)) winner.compareAndSet(null, candidate);
-                } finally {
-                    done.countDown();
+                if (winner.get() != null) return;
+                if (probe(port, candidate) && winner.compareAndSet(null, candidate)) {
+                    answered.countDown();
                 }
             }, "colgram-dc-remap-probe");
             t.setDaemon(true);
             t.start();
         }
         try {
-            done.await(PROBE_BUDGET_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            answered.await(PROBE_BUDGET_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
