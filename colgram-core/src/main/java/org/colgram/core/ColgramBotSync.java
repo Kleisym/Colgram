@@ -2297,6 +2297,9 @@ public class ColgramBotSync {
                 if (code < 200 || code >= 300) {
                     Log.w(TAG, method + " HTTP " + code + ": " + sb);
                 }
+                // The address carried a full request/response exchange, which is the only proof a
+                // TCP connect cannot give.
+                ColgramEndpoints.noteSuccess(postHost, postPort);
                 return new JSONObject(sb.toString());
             } catch (javax.net.ssl.SSLException se) {
                 last = se;
@@ -2310,6 +2313,7 @@ public class ColgramBotSync {
             } catch (Throwable t) {
                 last = t;
                 Log.w(TAG, method + " failed via " + rung + ": " + t.getMessage());
+                ColgramEndpoints.noteFailure(postHost, postPort);
             } finally {
                 if (conn != null) {
                     try { conn.disconnect(); } catch (Throwable ignore) {}

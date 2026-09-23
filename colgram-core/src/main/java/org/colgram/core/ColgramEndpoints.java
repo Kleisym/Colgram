@@ -110,6 +110,17 @@ public final class ColgramEndpoints {
     private static final Map<String, Choice> cache = new ConcurrentHashMap<>();
 
     /**
+     * Addresses that completed a TCP connect and then failed to carry the request.
+     *
+     * A handshake is not a service: an emulator's NAT answers SYN for a whole /24, and a
+     * middlebox can accept and then cut. The probe cannot tell those from a working host, so the
+     * caller reports what happened after the connect - two consecutive failures and the address
+     * is parked, which lets the next probe move on instead of walking into the same wall.
+     */
+    private static final Map<String, Integer> consecutiveFailures = new ConcurrentHashMap<>();
+    private static final int FAILURES_BEFORE_PARK = 2;
+
+    /**
      * Addresses that completed a TCP connection but were not the service being asked for.
      *
      * Telegram's own web fronts answer on 443 and pass a TCP probe, then present a certificate
@@ -217,6 +228,35 @@ public final class ColgramEndpoints {
         Log.w(TAG, "parking " + c.address.getHostAddress() + " for " + host
                 + " - it answered, but was not serving this name");
         invalidate(host);
+    }
+
+    /**
+     * The caller reached {@code host}'s chosen address and the request did not survive it. Two in
+     * a row and the address is parked; a single miss is usually the front being lossy, and parking
+     * on that would throw away a working answer.
+     */
+    public static void noteFailure(String host, int port) {
+        if (host == null) return;
+        Choice c = cache.get(host + ":" + port);
+        if (c == null || c.address == null) return;
+        String key = host + "|" + c.address.getHostAddress();
+        int fails = (consecutiveFailures.get(key) == null ? 0 : consecutiveFailures.get(key)) + 1;
+        consecutiveFailures.put(key, fails);
+        if (fails >= FAILURES_BEFORE_PARK) {
+            parked.put(c.address.getHostAddress(), System.currentTimeMillis());
+            consecutiveFailures.remove(key);
+            Log.w(TAG, "parking " + c.address.getHostAddress() + " for " + host
+                    + " after " + fails + " failed requests on a socket that opened");
+            invalidate(host);
+        }
+    }
+
+    /** The chosen address carried a request: forget any pending strike against it. */
+    public static void noteSuccess(String host, int port) {
+        if (host == null) return;
+        Choice c = cache.get(host + ":" + port);
+        if (c == null || c.address == null) return;
+        consecutiveFailures.remove(host + "|" + c.address.getHostAddress());
     }
 
     /** Forget a host after a transport failure so the next call re-probes instead of reusing it. */
