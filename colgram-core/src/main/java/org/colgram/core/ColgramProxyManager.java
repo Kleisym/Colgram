@@ -291,6 +291,19 @@ public class ColgramProxyManager {
             // who picked a public MTProto proxy was silently moved back onto the loopbar hop
             // the next time the app started, and "my proxy does not stick" was the result.
             ProxyItem saved = findSavedProxy(mainPrefs);
+            if (saved != null && isStaleLocalHop(saved)) {
+                // A build of ours wrote the remap's 127.0.0.1:<port> into Telegram's prefs, so an
+                // existing install can hold a hop that died with a process from last week. Applying
+                // it means "Подключение прокси..." forever; drop it and stop claiming a proxy is on.
+                Log.w(TAG, "saved proxy " + saved.address + ":" + saved.port
+                        + " is a local hop from an earlier process; discarding it");
+                for (int a = 0; a < colgramAccountSlots; a++) {
+                    appContext.getSharedPreferences(a == 0 ? "mainconfig" : ("mainconfig" + a),
+                            Context.MODE_PRIVATE).edit()
+                            .putBoolean("proxy_enabled", false).apply();
+                }
+                saved = null;
+            }
             if (saved != null && !(saved.isLocalDpi() && !localReady)) {
                 forceApplyProxy(saved);
                 Log.i(TAG, "restored proxy " + saved.address + ":" + saved.port
@@ -1766,23 +1779,29 @@ public class ColgramProxyManager {
 
         try {
             // 1. Persist proxy settings in SharedPreferences for every account slot.
-            for (int a = 0; a < colgramAccountSlots; a++) {
-                String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
-                SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
-                // Write the node itself, never the loopback hop that reaches it. A chained
-                // proxy used to be stored as 127.0.0.1:<ephemeral port>, so the next start
-                // restored a port nothing listens on, Telegram reported it dead, and rotation
-                // refused to touch it because it looked like a proxy the user typed in - the
-                // header sat on "Подключение прокси..." until the settings were cleared by hand.
-                preferences.edit()
-                        .putBoolean("proxy_enabled", true)
-                        .putString("proxy_ip", proxy.address)
-                        .putInt("proxy_port", proxy.port)
-                        .putString("proxy_user", "")
-                        .putString("proxy_pass", "")
-                        .putString("proxy_secret", proxy.secret)
-                        .putInt("proxy_type", proxy.type)
-                        .apply();
+            //
+            // Skipped for the remap: its endpoint is 127.0.0.1 on a port that dies with the
+            // process, so writing it into Telegram's own prefs made the next start restore a
+            // socket nothing listens on, report it dead, and hold it as "the proxy the user
+            // configured". The remap is restored from its own switch instead (see init).
+            if (proxy != dcRemapItem) {
+                for (int a = 0; a < colgramAccountSlots; a++) {
+                    String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
+                    SharedPreferences preferences =
+                            ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
+                    // The node itself, never the loopback hop that reaches it: a chained proxy
+                    // used to be stored as 127.0.0.1:<ephemeral port>, so the next start restored
+                    // a port nothing listens on.
+                    preferences.edit()
+                            .putBoolean("proxy_enabled", true)
+                            .putString("proxy_ip", proxy.address)
+                            .putInt("proxy_port", proxy.port)
+                            .putString("proxy_user", "")
+                            .putString("proxy_pass", "")
+                            .putString("proxy_secret", proxy.secret)
+                            .putInt("proxy_type", proxy.type)
+                            .apply();
+                }
             }
 
             // 2. Apply through Telegram's OWN entry point.
