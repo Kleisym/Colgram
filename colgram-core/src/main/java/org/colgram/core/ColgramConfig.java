@@ -433,15 +433,13 @@ public class ColgramConfig {
     /**
      * Whether Colgram may switch a proxy on by itself when Telegram is unreachable.
      *
-     * On until he says otherwise: a build that sits on "Соединение..." until somebody finds a
-     * switch is a build where the bypass does not work, and that is how it reads from the phone.
-     *
-     * This is not a licence to override him. Once he has written the key the stored value wins
-     * forever, and nothing in the background flips it back - the remap's own exhaustion connects
-     * through a node for that session without touching this switch.
+     * Off, and it stays off until he says otherwise. He asked for this behaviour to be removed
+     * after a build started dialing a public node the moment the direct route hung: from the phone
+     * that is not a bypass, it is the app quietly putting him back on a proxy he turned off. The
+     * blocked state is reported instead, as a notification he can act on.
      */
     public static boolean isAutoProxyEnabled() {
-        return prefs == null || prefs.getBoolean(KEY_AUTO_PROXY, true);
+        return prefs != null && prefs.getBoolean(KEY_AUTO_PROXY, false);
     }
 
     public static void setAutoProxyEnabled(boolean enabled) {

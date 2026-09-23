@@ -86,6 +86,21 @@ public final class ColgramDcRemap {
     private static final long TARGET_TTL_MS = 60 * 1000L;
 
     /**
+     * How long a server gets to answer the handshake before the address is parked. Telegram's own
+     * API servers reply to req_pq_multi in a few hundred milliseconds from anywhere, so four
+     * seconds is generous - and it is what lets the remap walk away from a silent address instead
+     * of sitting on it until tgnet gives up.
+     */
+    private static final int FIRST_BYTE_MS = 4000;
+
+    /**
+     * What a connection has to look like for its address to be kept: at least one whole MTProto
+     * message back (Telegram's smallest is a 20-byte pong) and enough life to carry a session.
+     */
+    private static final int MIN_ANSWER_BYTES = 20;
+    private static final int MIN_TUNNEL_MS = 5000;
+
+    /**
      * Addresses found by sweeping the requested DC's own /24.
      *
      * A fixed list of published addresses can only ever be as good as the last time somebody
@@ -252,17 +267,21 @@ public final class ColgramDcRemap {
                 Log.i(TAG, "remapped " + host + ":" + port + " -> " + target + ":" + port);
             }
             long openedAt = System.currentTimeMillis();
-            long upstreamBytes = pipe(client, upstream);
-            if (upstreamBytes == 0) {
-                // Not one byte came back for the whole life of the tunnel. A Telegram API server
-                // answers the handshake in well under a second, and an MTProto proxy does too, so
-                // silence means the address is not one - it is a NAT that accepted the SYN, or a
-                // web front waiting for a request line that MTProto never sends. The earlier rule
-                // also required the close to happen within five seconds, which never matched a
-                // silently held socket, so the same dead address was chosen again every minute.
+            long upstreamBytes = pipe(client, upstream, FIRST_BYTE_MS);
+            long lived = System.currentTimeMillis() - openedAt;
+            if (upstreamBytes < MIN_ANSWER_BYTES || lived < MIN_TUNNEL_MS) {
+                // Not a server that can carry a session. Two things have to be true of a real API
+                // address, and both are read off traffic tgnet generates anyway: it answers the
+                // handshake with at least one MTProto message (the smallest one Telegram sends is
+                // a 20-byte pong), and the connection survives long enough to be useful.
+                //
+                // "zero bytes" was not enough. The emulator's NAT answers SYN for the whole /24 and
+                // leaks the odd byte back, so a dead address cleared the old bar, stayed in the
+                // cache for its whole TTL, and was handed to every reconnect - observed as
+                // "remapped -> 149.154.167.2" about twice a second with no verdict ever reached.
                 targetCache.remove(host + ":" + port);
-                park(target, "TCP открылся, но ни байта обратно за "
-                        + (System.currentTimeMillis() - openedAt) + " мс");
+                park(target, "TCP открылся, но ответа нет: " + upstreamBytes
+                        + " байт обратно за " + lived + " мс");
             }
         } catch (Throwable t) {
             Log.d(TAG, "connection: " + t);
@@ -484,7 +503,7 @@ public final class ColgramDcRemap {
         discoveredAt.put(key, System.currentTimeMillis());
         Log.i(TAG, "swept " + subnet + "1-254 on :" + port + " - " + snapshot.size()
                 + " открывают TCP" + (snapshot.isEmpty() ? "" : ": " + preview(snapshot))
-                + "; бесполезные отсеет парковка по нулям байт");
+                + "; бесполезные отсеет парковка по ответу");
         return snapshot;
     }
 
@@ -540,18 +559,32 @@ public final class ColgramDcRemap {
      * bypass exists to find, and it reports the result as a fact about the network.
      *
      * So the cheap gate is a TCP connect, and the verdict comes from the connection itself: an
-     * address that carries no byte back within a couple of seconds is parked (see serve()), which
-     * is what distinguishes Telegram's web fronts and a NAT that answers SYN for a whole /24 from
-     * a server that speaks the protocol - using the traffic tgnet generates anyway.
+     * address has to answer tgnet's own handshake with at least a full MTProto message and keep the
+     * tunnel alive long enough to be useful, or it is parked (see serve()). That reads the shape of
+     * traffic tgnet generates anyway, so it separates Telegram's web fronts and a NAT that answers
+     * SYN for a whole /24 from a server that can carry a session - without pretending to parse the
+     * protocol.
      */
 
     // ---------------------------------------------------------------------- relay
 
-    /** Relay both ways and report how many bytes came back from Telegram. */
-    private static long pipe(final Socket a, final Socket b) {
+    /**
+     * Relay both ways, giving up on a server that never answers.
+     *
+     * Waiting for the tunnel to close is not enough: tgnet keeps a silent connection open, times
+     * out on its own, reconnects, and the remap hands it the same dead address from the cache
+     * again - observed as an endless "remapped -> 149.154.167.2" while the header spun. So the
+     * first read from Telegram carries a deadline. Once a byte has arrived the deadline is cleared,
+     * because an idle MTProto connection is normal and must not be cut.
+     */
+    private static long pipe(final Socket a, final Socket b, final int firstByteMs) {
         final java.util.concurrent.atomic.AtomicLong upstreamBytes =
                 new java.util.concurrent.atomic.AtomicLong();
         Thread t = new Thread(() -> {
+            try {
+                b.setSoTimeout(firstByteMs);
+            } catch (Throwable ignored) {
+            }
             upstreamBytes.set(copy(b, a));
             close(a);
         }, "colgram-dc-remap-back");
@@ -575,6 +608,9 @@ public final class ColgramDcRemap {
             OutputStream out = to.getOutputStream();
             int n;
             while ((n = in.read(buf)) > 0) {
+                if (total == 0) {
+                    try { from.setSoTimeout(0); } catch (Throwable ignored) {}
+                }
                 out.write(buf, 0, n);
                 out.flush();
                 total += n;

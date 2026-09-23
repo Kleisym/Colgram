@@ -441,7 +441,7 @@ public class ColgramProxyManager {
             ColgramBypassNotice.clear(ctx);
             return;
         }
-        if (isDcRemapActive()) {
+        if (isDcRemapActive() && currentActiveProxy == dcRemapItem) {
             // tgnet is the only honest judge of whether the remap carried a real MTProto session:
             // it does the full handshake, so "connected" means an address was found and "still
             // connecting" after a minute means this network has none. Say so, then let the
@@ -450,15 +450,15 @@ public class ColgramProxyManager {
                     && dcRemapTicks % DC_REMAP_VERDICT_TICKS == 0) {
                 Log.i(TAG, "DC remap verdict: Telegram not connected directly. "
                         + ColgramDcRemap.describe());
-                // The direct route is exhausted. Leaving the app dead because one switch is on
-                // is not a bypass, so fall through to what does work - and say out loud that it
-                // happened, instead of letting the header quietly start spinning again.
-                // connectThroughBestNode(), not autoConnectIfBlocked(): his auto-proxy switch
-                // stays exactly where he left it.
-                Log.i(TAG, "direct remap exhausted; falling back to a verified node");
-                mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает — "
-                        + "подключаюсь через верифицированную ноду."));
-                connectThroughBestNode();
+                // The direct route is exhausted. What must NOT happen here is dialing a public
+                // node: he asked twice for the "hanging connection quietly moved me onto a proxy"
+                // behaviour to go away. So the verdict is reported - in the header, in a toast, in a
+                // notification with the one tap that opts in - and the choice stays his.
+                Log.i(TAG, "direct remap exhausted; reporting it and waiting for him to decide");
+                mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает. "
+                        + "Обход без прокси не найден - включи прокси сам, если нужно."));
+                ColgramBypassNotice.showBlocked(ctx,
+                        "Напрямую ни один адрес Telegram не отвечает. " + ColgramDcRemap.describe());
             }
             return;
         }
@@ -801,10 +801,26 @@ public class ColgramProxyManager {
                 if (chosen == null || betterCandidate(p, chosen)) chosen = p;
             }
         }
-        if (chosen == null) return;
+        if (chosen == null) {
+            // Nothing carries a native verdict. While the remap is applied the prober spends its
+            // budget re-checking that one entry, so the pool can hold a hundred TCP-alive nodes and
+            // not a single verified one - and the fallback that exists to end "Подключение прокси…"
+            // would quietly do nothing. A node that completes TCP is worth dialing; the native
+            // checker then decides whether it stays.
+            for (ProxyItem p : verifiedPool) {
+                if (p.tcpMs < 0 || p.isLocalDpi() || p.type == 2) continue;
+                if (chosen == null || betterCandidate(p, chosen)) chosen = p;
+            }
+        }
+        if (chosen == null) {
+            Log.w(TAG, "no node to fall back to: pool=" + verifiedPool.size()
+                    + " candidates are all unverified or unreachable");
+            return;
+        }
         final ProxyItem picked = chosen;
         Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
-                + (picked.isLocalDpi() ? "local desync bypass" : picked.address + ":" + picked.port));
+                + (picked.isLocalDpi() ? "local desync bypass" : picked.address + ":" + picked.port)
+                + (picked.nativeVerified ? "" : " (не проверена нативно)"));
         mainHandler.post(() -> forceApplyProxy(picked));
     }
 
