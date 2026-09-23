@@ -66,6 +66,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int relayUrlRow;
     private int autoProxyRow;
     private int ipv6BypassRow;
+    private int dcRemapRow;
     private int networkSectionRow;
 
     private int sandboxHeaderRow;
@@ -122,6 +123,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         relayUrlRow = rowCount++;
         autoProxyRow = rowCount++;
         ipv6BypassRow = rowCount++;
+        dcRemapRow = rowCount++;
         networkSectionRow = rowCount++;
 
         sandboxHeaderRow = rowCount++;
@@ -284,6 +286,17 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
+            } else if (position == dcRemapRow) {
+                boolean remap = !ColgramConfig.isDcRemapEnabled();
+                ColgramConfig.setDcRemapEnabled(remap);
+                ColgramProxyManager.applyDcRemap(remap);
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(remap);
+                }
+                Toast.makeText(getParentActivity(), remap
+                        ? "Telegram будет звонить на тот свой адрес, который отвечает. Это не прокси: между тобой и Telegram остаётся только Telegram."
+                        : "Прямой выбор адреса выключен.",
+                        Toast.LENGTH_LONG).show();
             } else if (position == ipv6BypassRow) {
                 boolean val = !ColgramConfig.isIpv6BypassEnabled();
                 ColgramConfig.setIpv6BypassEnabled(val);
@@ -431,7 +444,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             return position == cloakEnabledRow || position == cloakModelRow ||
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
-                   position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow || position == ipv6BypassRow ||
+                   position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow || position == ipv6BypassRow || position == dcRemapRow ||
                    position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow || position == autoProxyRow ||
                    position == sandboxStorageRow || position == sandboxFilesRow ||
                    position == botRealtimeRow || position == botTestRow || position == pluginsRow;
@@ -539,6 +552,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                         checkCell.setTextAndCheck("Открывать ссылки в защищенном браузере", ColgramConfig.isProxyBrowserEnabled(), true);
                     } else if (position == sandboxStorageRow) {
                         checkCell.setTextAndCheck("Изолировать файлы в папке Colgram", ColgramConfig.isSandboxStorageEnabled(), false);
+                    } else if (position == dcRemapRow) {
+                        checkCell.setTextAndCheck(
+                                "Обход без прокси: звонить на доступный адрес Telegram",
+                                ColgramConfig.isDcRemapEnabled(), false);
                     } else if (position == ipv6BypassRow) {
                         checkCell.setTextAndCheck("Обход по IPv6 без прокси",
                                 ColgramConfig.isIpv6BypassEnabled(), false);

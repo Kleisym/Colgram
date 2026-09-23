@@ -280,7 +280,12 @@ public class ColgramProxyManager {
         SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
         boolean hasSetProxy = mainPrefs.contains("proxy_enabled");
         boolean isProxyEnabled = hasSetProxy && mainPrefs.getBoolean("proxy_enabled", false);
-        if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
+        // The direct-address remap is an explicit choice and its port is ephemeral, so it must be
+        // re-bound on every start rather than restored from the saved 127.0.0.1:<old port>, which
+        // points at a socket that died with the previous process.
+        if (ColgramConfig.isDcRemapEnabled() && ColgramConfig.isBuiltinProxyEnabled()) {
+            executor.execute(() -> applyDcRemap(true));
+        } else if (isProxyEnabled && ColgramConfig.isBuiltinProxyEnabled() && !verifiedPool.isEmpty()) {
             // Restore the proxy the user actually chose. This used to apply
             // verifiedPool.get(0) unconditionally, which is the local desync node - so anyone
             // who picked a public MTProto proxy was silently moved back onto the loopbar hop
@@ -392,6 +397,14 @@ public class ColgramProxyManager {
     private static final int TG_STATE_CONNECTED = 3;
     private static int watchdogUnconnectedTicks = 0;
     private static int watchdogRedials = 0;
+    /** Watchdog ticks spent waiting for the direct remap to produce a connection. */
+    private static int dcRemapTicks = 0;
+    private static final int DC_REMAP_VERDICT_TICKS = 6;
+
+    /** True once the remap has had its window and Telegram is still not connected. */
+    private static boolean dcRemapGaveUp() {
+        return dcRemapTicks >= DC_REMAP_VERDICT_TICKS;
+    }
 
     /**
      * One watchdog pass: if a proxy is applied and Telegram is not connected, either re-dial or
@@ -412,7 +425,28 @@ public class ColgramProxyManager {
         if (state == TG_STATE_CONNECTED) {
             watchdogUnconnectedTicks = 0;
             watchdogRedials = 0;
+            dcRemapTicks = 0;
             ColgramBypassNotice.clear(ctx);
+            return;
+        }
+        if (isDcRemapActive()) {
+            // tgnet is the only honest judge of whether the remap carried a real MTProto session:
+            // it does the full handshake, so "connected" means an address was found and "still
+            // connecting" after a minute means this network has none. Say so, then let the
+            // consented fallback run.
+            if (++dcRemapTicks >= DC_REMAP_VERDICT_TICKS
+                    && dcRemapTicks % DC_REMAP_VERDICT_TICKS == 0) {
+                Log.i(TAG, "DC remap verdict: Telegram not connected directly. "
+                        + ColgramDcRemap.describe());
+                if (ColgramConfig.isAutoProxyEnabled()) {
+                    Log.i(TAG, "escalating to a verified proxy, as self-connect allows");
+                    autoConnectIfBlocked();
+                } else {
+                    ColgramBypassNotice.showBlocked(ctx,
+                            "Напрямую ни один адрес Telegram не отвечает. "
+                                    + ColgramDcRemap.describe());
+                }
+            }
             return;
         }
         if (++watchdogUnconnectedTicks < 3) return;
@@ -721,6 +755,10 @@ public class ColgramProxyManager {
         // He switches the proxy off by hand; a background task that switches it back on is not a
         // bypass, it is an override. Opt-in only.
         if (!ColgramConfig.isAutoProxyEnabled()) return;
+        // The direct remap is the same request taken further: "connect without sitting on a
+        // proxy". Auto-connecting a public node behind it would undo that, so the remap gets its
+        // own window first and only escalates if Telegram still is not connected.
+        if (isDcRemapActive() && !dcRemapGaveUp()) return;
         // The local desync listener wins when it has actually completed a handshake: no third
         // party sees anything, and it is the only path that works with no proxy at all, which is
         // what the "анонимный обход без прокси" switch promises.
@@ -744,6 +782,55 @@ public class ColgramProxyManager {
         Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
                 + (picked.isLocalDpi() ? "local desync bypass" : picked.address + ":" + picked.port));
         mainHandler.post(() -> forceApplyProxy(picked));
+    }
+
+    private static volatile ProxyItem dcRemapItem = null;
+
+    /**
+     * Turn the direct-address remap on or off.
+     *
+     * On: bind the loopback endpoint and hand tgnet a SOCKS5 setting that points at it, through
+     * the same stock path a real proxy uses - so the plumbing, the persistence and the reconnect
+     * are the ones Telegram already trusts. The entry is deliberately kept out of verifiedPool:
+     * a pool entry can be rotated away on a failed verdict, and this one is not a node somebody
+     * else runs.
+     */
+    public static void applyDcRemap(final boolean enabled) {
+        Context ctx = appContext;
+        if (ctx == null) return;
+        if (!enabled) {
+            if (dcRemapItem == null) return;
+            dcRemapItem = null;
+            ColgramDcRemap.stop();
+            disableProxy(ctx);
+            Log.i(TAG, "DC remap switched off");
+            return;
+        }
+        int port = ColgramDcRemap.start();
+        if (port <= 0) {
+            Log.w(TAG, "DC remap could not bind; nothing applied");
+            return;
+        }
+        ProxyItem item = new ProxyItem("127.0.0.1", port, "", 0);
+        dcRemapItem = item;
+        lastApplyAt = 0L;                       // an explicit switch is never a duplicate
+        forceApplyProxy(item);
+        Log.i(TAG, "DC remap applied through 127.0.0.1:" + port);
+    }
+
+    /**
+     * True while the remap is what the user asked to carry the connection.
+     *
+     * Deliberately not compared against currentActiveProxy: a failed native verdict clears that
+     * field, and then this reported "off" while the remap was still applied - which silenced the
+     * watchdog exactly when it had something to say.
+     */
+    public static boolean isDcRemapActive() {
+        return dcRemapItem != null;
+    }
+
+    public static String describeDcRemap() {
+        return ColgramDcRemap.describe();
     }
 
     /**
@@ -1141,6 +1228,14 @@ public class ColgramProxyManager {
      */
     public static synchronized void switchToNextProxy(boolean force) {
         Context rotateCtx = appContext;
+        if (isDcRemapActive() && !ColgramConfig.isAutoProxyEnabled()) {
+            // The remap failing its native verdict means "no Telegram address answers here", not
+            // "try somebody else's proxy". Rotating would replace the route he picked with a
+            // public node - the exact behaviour that made "it switches my proxy behind my back"
+            // a complaint. The watchdog reports the verdict instead.
+            Log.i(TAG, "direct remap is active; not replacing it with a pool proxy");
+            return;
+        }
         if (rotateCtx != null && !isProxyEnabled(rotateCtx) && !ColgramConfig.isAutoProxyEnabled()) {
             // The proxy is off because the user put it off. Rotation exists to keep a running
             // tunnel alive; with nothing applied it would silently turn the proxy back on.

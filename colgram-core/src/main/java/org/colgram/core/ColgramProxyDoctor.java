@@ -57,6 +57,9 @@ public class ColgramProxyDoctor {
         // is the difference between "the bypass is broken" and "the bot works without a proxy, the
         // account needs one".
         stats = stats + "; Bot API: " + ColgramEndpoints.describe();
+        if (ColgramProxyManager.isDcRemapActive()) {
+            stats = stats + "; напрямую: " + ColgramProxyManager.describeDcRemap();
+        }
 
         if (current != null) {
             return "Активный прокси: " + current.address + ":" + current.port

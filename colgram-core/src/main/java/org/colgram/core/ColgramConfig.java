@@ -428,6 +428,7 @@ public class ColgramConfig {
     // --- Auto proxy ---
     private static final String KEY_AUTO_PROXY = "auto_proxy_enabled";
     private static final String KEY_IPV6_BYPASS = "ipv6_bypass_enabled";
+    private static final String KEY_DC_REMAP = "dc_remap_enabled";
 
     /**
      * Whether Colgram may switch a proxy on by itself when Telegram looks unreachable.
@@ -455,6 +456,21 @@ public class ColgramConfig {
 
     public static void setIpv6BypassEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_IPV6_BYPASS, enabled).apply();
+    }
+
+    /**
+     * Dial whichever of Telegram's own DC addresses answers instead of the one tgnet hardcodes.
+     *
+     * Not a proxy: the traffic still goes straight to Telegram, only the address is chosen better,
+     * and nothing in between can read it. Off by default because it works only where some DC
+     * address is reachable at all - on a network that drops every one of them it changes nothing.
+     */
+    public static boolean isDcRemapEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_DC_REMAP, false);
+    }
+
+    public static void setDcRemapEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DC_REMAP, enabled).apply();
     }
 
     /**
