@@ -85,6 +85,30 @@ public final class ColgramDcRemap {
     private static final Map<String, Long> targetCacheAt = new ConcurrentHashMap<>();
     private static final long TARGET_TTL_MS = 60 * 1000L;
 
+    /**
+     * Addresses found by sweeping the requested DC's own /24.
+     *
+     * A fixed list of published addresses can only ever be as good as the last time somebody
+     * wrote it down. Telegram announces its blocks as aggregates and a DC's addresses sit in one
+     * or two /24s, so sweeping the /24 the client actually asked for finds what is reachable
+     * today on this network - including an address that is not in any public list. Cached per
+     * subnet and port, because 254 probes is not something to repeat for every connection.
+     */
+    private static final Map<String, List<String>> discovered = new ConcurrentHashMap<>();
+    private static final Map<String, Long> discoveredAt = new ConcurrentHashMap<>();
+    private static final java.util.Set<String> sweeping =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private static final long DISCOVERY_TTL_MS = 10 * 60 * 1000L;
+    // Sized so a /24 is actually walked inside the budget: at 48 workers and 1.2s per probe the
+    // 254 addresses need ~6.4s and the 4s cutoff returned "0 адресов отвечают" for a /24 that does
+    // contain a reachable address - the sweep looked conclusive while it had only reached a
+    // quarter of the range.
+    private static final int DISCOVERY_CONCURRENCY = 96;
+    private static final int DISCOVERY_TIMEOUT_MS = 900;
+    /** How long a candidate is allowed to take to produce an MTProto answer. */
+    private static final int MTPROTO_ANSWER_MS = 1500;
+    private static final long DISCOVERY_BUDGET_MS = 12000L;
+
     private static volatile ServerSocket listener;
     private static volatile int boundPort = -1;
     private static final AtomicInteger remapped = new AtomicInteger();
@@ -193,8 +217,8 @@ public final class ColgramDcRemap {
             String target = chooseTarget(host, port);
             if (target == null) {
                 refused.incrementAndGet();
-                lastDecision = host + ":" + port + " — ни один адрес Telegram не отвечает ("
-                        + candidatesFor(host).size() + " проверено)";
+                lastDecision = host + ":" + port + " — ни один адрес Telegram не говорит по MTProto ("
+                        + candidatesFor(host, port).size() + " проверено)";
                 Log.w(TAG, lastDecision);
                 refuse(out);
                 close(client);
@@ -303,14 +327,14 @@ public final class ColgramDcRemap {
         String cached = targetCache.get(key);
         if (cached != null && cachedAt != null
                 && System.currentTimeMillis() - cachedAt < TARGET_TTL_MS
-                && !isParked(cached) && probe(port, cached)) {
+                && !isParked(cached) && speaksMtproto(cached, port)) {
             return cached;
         }
         // Probed in parallel, not in sequence. Tried sequentially at 2.5 s each, the candidate
         // list cost tens of seconds and the cap that kept that tolerable silently cut off
         // 149.154.167.220 - the one Telegram address on this network that answers TCP. The
         // answer must not depend on where the list happened to be truncated.
-        final List<String> candidates = candidatesFor(host);
+        final List<String> candidates = candidatesFor(host, port);
         candidates.removeIf(ColgramDcRemap::isParked);
         final java.util.concurrent.atomic.AtomicReference<String> winner =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -320,7 +344,7 @@ public final class ColgramDcRemap {
             Thread t = new Thread(() -> {
                 try {
                     if (winner.get() != null) return;
-                    if (probe(port, candidate)) winner.compareAndSet(null, candidate);
+                    if (speaksMtproto(candidate, port)) winner.compareAndSet(null, candidate);
                 } finally {
                     done.countDown();
                 }
@@ -341,6 +365,17 @@ public final class ColgramDcRemap {
         return chosen;
     }
 
+    /** At most a handful of addresses in a log line: a whole /24 once drowned the rest. */
+    private static String preview(List<String> addresses) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < addresses.size() && i < 6; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(addresses.get(i));
+        }
+        if (addresses.size() > 6) sb.append(" …");
+        return sb.toString();
+    }
+
     private static boolean isParked(String address) {
         Long at = parked.get(address);
         if (at == null) return false;
@@ -356,8 +391,12 @@ public final class ColgramDcRemap {
         Log.i(TAG, "parked " + address + ": " + why);
     }
 
-    /** Requested address, then same-/16 neighbours, then everything else. */
-    static List<String> candidatesFor(String host) {
+    /**
+     * Requested address, then whatever is live in its own /24, then same-/16 neighbours from the
+     * published list, then the rest. The discovered addresses come early because they are the
+     * same DC the client asked for and they were found answering right now.
+     */
+    static List<String> candidatesFor(String host, int port) {
         LinkedHashSet<String> sameSubnet = new LinkedHashSet<>();
         LinkedHashSet<String> other = new LinkedHashSet<>();
         String prefix = subnetPrefix(host);
@@ -368,15 +407,82 @@ public final class ColgramDcRemap {
         }
         List<String> out = new ArrayList<>();
         out.add(host);
+        if (prefix != null) {
+            for (String live : discoverLive(prefix, port)) {
+                if (!live.equals(host)) out.add(live);
+            }
+        }
         out.addAll(sameSubnet);
         out.addAll(other);
         return out;
     }
 
+    /**
+     * Sweep one /24 for addresses that complete a TCP connection on {@code port}.
+     *
+     * Bounded and best-effort on purpose: the budget returns whatever answered by the cutoff
+     * rather than waiting out 254 timeouts, and a second caller asking during a sweep gets an
+     * empty list instead of a duplicate sweep - the published list still covers that call.
+     */
+    static List<String> discoverLive(String subnet, int port) {
+        final String key = subnet + port;
+        Long at = discoveredAt.get(key);
+        List<String> cached = discovered.get(key);
+        if (cached != null && at != null && System.currentTimeMillis() - at < DISCOVERY_TTL_MS) {
+            return cached;
+        }
+        if (!sweeping.add(key)) return java.util.Collections.emptyList();
+        final List<String> found = java.util.Collections.synchronizedList(new ArrayList<String>());
+        try {
+            final java.util.concurrent.atomic.AtomicInteger next =
+                    new java.util.concurrent.atomic.AtomicInteger(1);
+            final java.util.concurrent.CountDownLatch done =
+                    new java.util.concurrent.CountDownLatch(254);
+            for (int w = 0; w < DISCOVERY_CONCURRENCY; w++) {
+                Thread t = new Thread(() -> {
+                    while (true) {
+                        int last = next.getAndIncrement();
+                        if (last > 254) {
+                            // This worker took no address, so it owes no countdown.
+                            return;
+                        }
+                        try {
+                            String candidate = subnet + last;
+                            if (!isParked(candidate) && speaksMtproto(candidate, port)) {
+                                found.add(candidate);
+                            }
+                        } finally {
+                            done.countDown();
+                        }
+                    }
+                }, "colgram-dc-sweep");
+                t.setDaemon(true);
+                t.start();
+            }
+            try {
+                done.await(DISCOVERY_BUDGET_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            sweeping.remove(key);
+        }
+        List<String> snapshot = new ArrayList<>(found);
+        discovered.put(key, snapshot);
+        discoveredAt.put(key, System.currentTimeMillis());
+        Log.i(TAG, "swept " + subnet + "1-254 on :" + port + " - " + snapshot.size()
+                + " говорят по MTProto" + (snapshot.isEmpty() ? "" : ": " + preview(snapshot)));
+        return snapshot;
+    }
+
+    /** The "a.b.c." part of an IPv4 literal - the /24 whose neighbours are worth sweeping. */
     private static String subnetPrefix(String host) {
-        int first = host.indexOf('.');
-        int second = first < 0 ? -1 : host.indexOf('.', first + 1);
-        return second < 0 ? null : host.substring(0, second + 1);
+        int seen = 0;
+        for (int i = 0; i < host.length(); i++) {
+            if (host.charAt(i) != '.') continue;
+            if (++seen == 3) return host.substring(0, i + 1);
+        }
+        return null;                                        // not an IPv4 literal
     }
 
     static boolean isTelegramAddress(String host) {
@@ -388,18 +494,73 @@ public final class ColgramDcRemap {
         return host.endsWith(".telegram.org") || host.endsWith(".telegram.dog");
     }
 
-    /** True when something completes a TCP connection on {@code port}. */
+    /**
+     * True when the address completes a TCP connection on {@code port}.
+     *
+     * Kept only for the caller that has nothing better to ask. On an emulated network this is
+     * worthless as a liveness test: the NAT answers SYN for every address in the /24, so a sweep
+     * of 149.154.167.0/24 "found" 254 live hosts, all of which then carried zero bytes.
+     */
     private static boolean probe(int port, String address) {
+        return probe(CONNECT_TIMEOUT_MS, address, port);
+    }
+
+    private static boolean probe(int timeoutMs, String address, int port) {
         Socket s = new Socket();
         try {
-            s.connect(new InetSocketAddress(InetAddress.getByName(address), port),
-                    CONNECT_TIMEOUT_MS);
+            s.connect(new InetSocketAddress(InetAddress.getByName(address), port), timeoutMs);
             return true;
         } catch (Throwable t) {
             return false;
         } finally {
             close(s);
         }
+    }
+
+    /**
+     * True when the address actually speaks MTProto on {@code port}.
+     *
+     * This is the only question worth asking, and a TCP connect does not answer it: Telegram's web
+     * fronts, an emulator's NAT and a middlebox all complete handshakes, and then nothing comes
+     * back. So the probe performs the transport's own reserve query - the abridged frame, with a
+     * msg_id whose low bits mark it as a query - and requires the 16-byte answer that only an
+     * MTProto server sends.
+     */
+    private static boolean speaksMtproto(String address, int port) {
+        Socket s = new Socket();
+        try {
+            s.connect(new InetSocketAddress(InetAddress.getByName(address), port),
+                    DISCOVERY_TIMEOUT_MS);
+            s.setSoTimeout(MTPROTO_ANSWER_MS);
+            java.io.OutputStream out = s.getOutputStream();
+            java.io.InputStream in = s.getInputStream();
+            long msgId = (System.currentTimeMillis() * 1000L) << 12;   // low two bits clear
+            out.write(0x00);                                            // abridged, no GET prefix
+            out.write(longBytes(msgId));
+            out.write(longBytes(0x7bL));                                // resq
+            out.write(new byte[8]);                                     // nonce
+            out.flush();
+            byte[] answer = new byte[16];
+            int off = 0;
+            while (off < 16) {
+                int n = in.read(answer, off, 16 - off);
+                if (n <= 0) break;
+                off += n;
+            }
+            // The reply is the server's nonce followed by the resq id.
+            return off >= 16 && answer[8] == 0x7b && answer[9] == 0
+                    && answer[10] == 0 && answer[11] == 0;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            close(s);
+        }
+    }
+
+    private static byte[] longBytes(long v) {
+        byte[] b = new byte[8];
+        for (int i = 0; i < 8; i++) b[i] = (byte) ((v >>> (8 * i)) & 0xff);
+        return b;
     }
 
     // ---------------------------------------------------------------------- relay
