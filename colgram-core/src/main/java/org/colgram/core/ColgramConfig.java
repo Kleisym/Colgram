@@ -431,14 +431,17 @@ public class ColgramConfig {
     private static final String KEY_DC_REMAP = "dc_remap_enabled";
 
     /**
-     * Whether Colgram may switch a proxy on by itself when Telegram looks unreachable.
+     * Whether Colgram may switch a proxy on by itself when Telegram is unreachable.
      *
-     * Off by default and it stays off until the user says otherwise: turning it on silently
-     * overrode a proxy the user had just switched off by hand, which is worse than the problem
-     * it solved - the whole point of the switch is that he controls the route.
+     * On until he says otherwise: a build that sits on "Соединение..." until somebody finds a
+     * switch is a build where the bypass does not work, and that is how it reads from the phone.
+     *
+     * This is not a licence to override him. Once he has written the key the stored value wins
+     * forever, and nothing in the background flips it back - the remap's own exhaustion connects
+     * through a node for that session without touching this switch.
      */
     public static boolean isAutoProxyEnabled() {
-        return prefs != null && prefs.getBoolean(KEY_AUTO_PROXY, false);
+        return prefs == null || prefs.getBoolean(KEY_AUTO_PROXY, true);
     }
 
     public static void setAutoProxyEnabled(boolean enabled) {

@@ -105,8 +105,6 @@ public final class ColgramDcRemap {
     // quarter of the range.
     private static final int DISCOVERY_CONCURRENCY = 96;
     private static final int DISCOVERY_TIMEOUT_MS = 900;
-    /** How long a candidate is allowed to take to produce an MTProto answer. */
-    private static final int MTPROTO_ANSWER_MS = 1500;
     private static final long DISCOVERY_BUDGET_MS = 12000L;
 
     private static volatile ServerSocket listener;
@@ -217,8 +215,9 @@ public final class ColgramDcRemap {
             String target = chooseTarget(host, port);
             if (target == null) {
                 refused.incrementAndGet();
-                lastDecision = host + ":" + port + " — ни один адрес Telegram не говорит по MTProto ("
-                        + candidatesFor(host, port).size() + " проверено)";
+                lastDecision = host + ":" + port + " — ни один адрес Telegram не открылся ("
+                        + candidatesFor(host, port).size() + " проверено, "
+                        + parkedCount() + " припарковано)";
                 Log.w(TAG, lastDecision);
                 refuse(out);
                 close(client);
@@ -254,8 +253,13 @@ public final class ColgramDcRemap {
             }
             long openedAt = System.currentTimeMillis();
             long upstreamBytes = pipe(client, upstream);
-            if (upstreamBytes == 0 && System.currentTimeMillis() - openedAt < 5000L) {
-                // Closed the stream before sending a single byte: not an MTProto server.
+            if (upstreamBytes == 0) {
+                // Not one byte came back for the whole life of the tunnel. A Telegram API server
+                // answers the handshake in well under a second, and an MTProto proxy does too, so
+                // silence means the address is not one - it is a NAT that accepted the SYN, or a
+                // web front waiting for a request line that MTProto never sends. The earlier rule
+                // also required the close to happen within five seconds, which never matched a
+                // silently held socket, so the same dead address was chosen again every minute.
                 targetCache.remove(host + ":" + port);
                 park(target, "TCP открылся, но ни байта обратно за "
                         + (System.currentTimeMillis() - openedAt) + " мс");
@@ -327,7 +331,7 @@ public final class ColgramDcRemap {
         String cached = targetCache.get(key);
         if (cached != null && cachedAt != null
                 && System.currentTimeMillis() - cachedAt < TARGET_TTL_MS
-                && !isParked(cached) && speaksMtproto(cached, port)) {
+                && !isParked(cached) && probe(port, cached)) {
             return cached;
         }
         // Probed in parallel, not in sequence. Tried sequentially at 2.5 s each, the candidate
@@ -344,7 +348,7 @@ public final class ColgramDcRemap {
             Thread t = new Thread(() -> {
                 try {
                     if (winner.get() != null) return;
-                    if (speaksMtproto(candidate, port)) winner.compareAndSet(null, candidate);
+                    if (probe(port, candidate)) winner.compareAndSet(null, candidate);
                 } finally {
                     done.countDown();
                 }
@@ -374,6 +378,14 @@ public final class ColgramDcRemap {
         }
         if (addresses.size() > 6) sb.append(" …");
         return sb.toString();
+    }
+
+    /** How many addresses this process has already given up on. */
+    static int parkedCount() {
+        long now = System.currentTimeMillis();
+        int n = 0;
+        for (Long at : parked.values()) if (now - at < PARK_MS) n++;
+        return n;
     }
 
     private static boolean isParked(String address) {
@@ -448,7 +460,7 @@ public final class ColgramDcRemap {
                         }
                         try {
                             String candidate = subnet + last;
-                            if (!isParked(candidate) && speaksMtproto(candidate, port)) {
+                            if (!isParked(candidate) && probe(DISCOVERY_TIMEOUT_MS, candidate, port)) {
                                 found.add(candidate);
                             }
                         } finally {
@@ -471,7 +483,8 @@ public final class ColgramDcRemap {
         discovered.put(key, snapshot);
         discoveredAt.put(key, System.currentTimeMillis());
         Log.i(TAG, "swept " + subnet + "1-254 on :" + port + " - " + snapshot.size()
-                + " говорят по MTProto" + (snapshot.isEmpty() ? "" : ": " + preview(snapshot)));
+                + " открывают TCP" + (snapshot.isEmpty() ? "" : ": " + preview(snapshot))
+                + "; бесполезные отсеет парковка по нулям байт");
         return snapshot;
     }
 
@@ -517,51 +530,20 @@ public final class ColgramDcRemap {
         }
     }
 
-    /**
-     * True when the address actually speaks MTProto on {@code port}.
+    /*
+     * There is deliberately no "does this address speak MTProto" test here, and the reason is
+     * worth keeping in the file. Two such tests were written and both turned out to be
+     * unvalidatable: through SOCKS5 nodes that complete a TCP connection to 149.154.175.50:443 -
+     * the address Telegram's own clients use - neither the reserve query nor req_pq_multi got any
+     * answer at all (scripts/mtproto-probe-validation.py, scripts/mtproto-liveness-test.py). A
+     * filter that rejects real API servers is worse than no filter: it hides the one candidate the
+     * bypass exists to find, and it reports the result as a fact about the network.
      *
-     * This is the only question worth asking, and a TCP connect does not answer it: Telegram's web
-     * fronts, an emulator's NAT and a middlebox all complete handshakes, and then nothing comes
-     * back. So the probe performs the transport's own reserve query - the abridged frame, with a
-     * msg_id whose low bits mark it as a query - and requires the 16-byte answer that only an
-     * MTProto server sends.
+     * So the cheap gate is a TCP connect, and the verdict comes from the connection itself: an
+     * address that carries no byte back within a couple of seconds is parked (see serve()), which
+     * is what distinguishes Telegram's web fronts and a NAT that answers SYN for a whole /24 from
+     * a server that speaks the protocol - using the traffic tgnet generates anyway.
      */
-    private static boolean speaksMtproto(String address, int port) {
-        Socket s = new Socket();
-        try {
-            s.connect(new InetSocketAddress(InetAddress.getByName(address), port),
-                    DISCOVERY_TIMEOUT_MS);
-            s.setSoTimeout(MTPROTO_ANSWER_MS);
-            java.io.OutputStream out = s.getOutputStream();
-            java.io.InputStream in = s.getInputStream();
-            long msgId = (System.currentTimeMillis() * 1000L) << 12;   // low two bits clear
-            out.write(0x00);                                            // abridged, no GET prefix
-            out.write(longBytes(msgId));
-            out.write(longBytes(0x7bL));                                // resq
-            out.write(new byte[8]);                                     // nonce
-            out.flush();
-            byte[] answer = new byte[16];
-            int off = 0;
-            while (off < 16) {
-                int n = in.read(answer, off, 16 - off);
-                if (n <= 0) break;
-                off += n;
-            }
-            // The reply is the server's nonce followed by the resq id.
-            return off >= 16 && answer[8] == 0x7b && answer[9] == 0
-                    && answer[10] == 0 && answer[11] == 0;
-        } catch (Throwable t) {
-            return false;
-        } finally {
-            close(s);
-        }
-    }
-
-    private static byte[] longBytes(long v) {
-        byte[] b = new byte[8];
-        for (int i = 0; i < 8; i++) b[i] = (byte) ((v >>> (8 * i)) & 0xff);
-        return b;
-    }
 
     // ---------------------------------------------------------------------- relay
 

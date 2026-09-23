@@ -412,6 +412,18 @@ public class ColgramProxyManager {
      * is not an outage, and a cap on re-dials so a node that answers but cannot carry traffic gets
      * replaced instead of being poked forever.
      */
+    /**
+     * True for an applied entry that points at this process's own loopback plumbing but is
+     * neither the DPI listener nor the DC remap - i.e. a chain hop whose port died with the
+     * previous process. Those are never user choices and must not block rotation.
+     */
+    private static boolean isStaleLocalHop(ProxyItem item) {
+        if (item == null || !"127.0.0.1".equals(item.address)) return false;
+        if (item.isLocalDpi()) return false;
+        if (item == dcRemapItem) return false;
+        return true;
+    }
+
     private static void connectionWatchdogTick() {
         Context ctx = appContext;
         if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled()) return;
@@ -438,14 +450,15 @@ public class ColgramProxyManager {
                     && dcRemapTicks % DC_REMAP_VERDICT_TICKS == 0) {
                 Log.i(TAG, "DC remap verdict: Telegram not connected directly. "
                         + ColgramDcRemap.describe());
-                if (ColgramConfig.isAutoProxyEnabled()) {
-                    Log.i(TAG, "escalating to a verified proxy, as self-connect allows");
-                    autoConnectIfBlocked();
-                } else {
-                    ColgramBypassNotice.showBlocked(ctx,
-                            "Напрямую ни один адрес Telegram не отвечает. "
-                                    + ColgramDcRemap.describe());
-                }
+                // The direct route is exhausted. Leaving the app dead because one switch is on
+                // is not a bypass, so fall through to what does work - and say out loud that it
+                // happened, instead of letting the header quietly start spinning again.
+                // connectThroughBestNode(), not autoConnectIfBlocked(): his auto-proxy switch
+                // stays exactly where he left it.
+                Log.i(TAG, "direct remap exhausted; falling back to a verified node");
+                mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает — "
+                        + "подключаюсь через верифицированную ноду."));
+                connectThroughBestNode();
             }
             return;
         }
@@ -759,6 +772,17 @@ public class ColgramProxyManager {
         // proxy". Auto-connecting a public node behind it would undo that, so the remap gets its
         // own window first and only escalates if Telegram still is not connected.
         if (isDcRemapActive() && !dcRemapGaveUp()) return;
+        connectThroughBestNode();
+    }
+
+    /**
+     * Apply the best node without consulting the auto-proxy switch.
+     *
+     * The remap uses this when it has *proven* the direct route dead. That is not overriding him
+     * on a guess - but it must not write his switch either, or a single exhaustion would turn
+     * "обход без прокси" back into "сидеть на прокси" permanently.
+     */
+    private static void connectThroughBestNode() {
         // The local desync listener wins when it has actually completed a handshake: no third
         // party sees anything, and it is the only path that works with no proxy at all, which is
         // what the "анонимный обход без прокси" switch promises.
@@ -1263,9 +1287,18 @@ public class ColgramProxyManager {
         // user-supplied tunnel with one of our public nodes - and to the user that looks like
         // "the proxy I set keeps turning itself off".
         if (currentActiveProxy != null && !verifiedPool.contains(currentActiveProxy)) {
-            Log.i(TAG, "holding user-configured proxy " + currentActiveProxy.address
-                    + " (type=" + currentActiveProxy.type + "); it is not in the managed pool");
-            return;
+            if (isStaleLocalHop(currentActiveProxy)) {
+                // A loopback endpoint from a previous process is not a choice the user made.
+                // Letting rotation treat it as one parked the app on a dead 127.0.0.1 forever.
+                Log.w(TAG, "applied entry " + currentActiveProxy.address + ":"
+                        + currentActiveProxy.port + " is a local hop from an earlier process;"
+                        + " rotating away from it");
+                currentActiveProxy = null;
+            } else {
+                Log.i(TAG, "holding user-configured proxy " + currentActiveProxy.address
+                        + " (type=" + currentActiveProxy.type + "); it is not in the managed pool");
+                return;
+            }
         }
 
         // One failed handshake is not a verdict. Observed on the emulator: three nodes that the
@@ -1720,10 +1753,15 @@ public class ColgramProxyManager {
             for (int a = 0; a < colgramAccountSlots; a++) {
                 String prefName = a == 0 ? "mainconfig" : ("mainconfig" + a);
                 SharedPreferences preferences = ctx.getSharedPreferences(prefName, Context.MODE_PRIVATE);
+                // Write the node itself, never the loopback hop that reaches it. A chained
+                // proxy used to be stored as 127.0.0.1:<ephemeral port>, so the next start
+                // restored a port nothing listens on, Telegram reported it dead, and rotation
+                // refused to touch it because it looked like a proxy the user typed in - the
+                // header sat on "Подключение прокси..." until the settings were cleared by hand.
                 preferences.edit()
                         .putBoolean("proxy_enabled", true)
-                        .putString("proxy_ip", proxy.effectiveHost())
-                        .putInt("proxy_port", proxy.effectivePort())
+                        .putString("proxy_ip", proxy.address)
+                        .putInt("proxy_port", proxy.port)
                         .putString("proxy_user", "")
                         .putString("proxy_pass", "")
                         .putString("proxy_secret", proxy.secret)
