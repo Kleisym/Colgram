@@ -230,7 +230,7 @@ public final class ColgramDcRemap {
             String target = chooseTarget(host, port);
             if (target == null) {
                 refused.incrementAndGet();
-                lastDecision = host + ":" + port + " — ни один адрес Telegram не открылся ("
+                lastDecision = host + ":" + port + " — ни один адрес Telegram не ответил ("
                         + candidatesFor(host, port).size() + " проверено, "
                         + parkedCount() + " припарковано)";
                 Log.w(TAG, lastDecision);
