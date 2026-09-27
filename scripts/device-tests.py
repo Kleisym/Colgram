@@ -29,6 +29,10 @@ RESULTS = (GRADLE_SRC / "TMessagesProj_AppTests/build/outputs/androidTest-result
             / "flavors/afat")
 
 DEVICE_TESTS = [
+    "org.colgram.singbox.ColgramProfileDeviceTest",
+    "org.colgram.singbox.ColgramSubscriptionStoreDeviceTest",
+    "org.colgram.singbox.ColgramTunnelDeviceTest",
+    "org.colgram.singbox.LibboxPresenceDeviceTest",
     "org.colgram.core.ColgramCallProxyDeviceTest",
     "org.colgram.core.ColgramDpiBypassDeviceTest",
     "org.colgram.core.ColgramProxyAutonomyDeviceTest",
