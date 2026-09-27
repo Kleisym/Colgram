@@ -1064,6 +1064,7 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("ColgramGlobalSearchHistoryDeviceTest", runner)
         self.assertIn("ColgramGlobalSearchRestoreDeviceTest", runner)
         self.assertIn("ColgramThemeContrastDeviceTest", runner)
+        self.assertIn("ColgramWarpUdpReachabilityDeviceTest", runner)
         self.assertIn("test-results.log", runner)
         self.assertIn("Failed to receive the UTP test results", runner)
         # It must clear stale results first, or a previous run reads as this one's outcome.
@@ -1085,7 +1086,8 @@ public final class DialogRefreshSequencerHarness {
         for name in ("ColgramThemeContrastDeviceTest.java",
                      "ColgramGlobalSearchHistoryDeviceTest.java",
                      "ColgramGlobalSearchRestoreDeviceTest.java",
-                     "ColgramProxyAutonomyDeviceTest.java"):
+                     "ColgramProxyAutonomyDeviceTest.java",
+                     "ColgramWarpUdpReachabilityDeviceTest.java"):
             template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
             self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")
             self.assertEqual(template, (installed / name).read_text(encoding="utf-8"),
