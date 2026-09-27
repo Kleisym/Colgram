@@ -5371,6 +5371,36 @@ def inject_hooks(repo_path):
                'org.colgram.action.ENABLE_BYPASS',
                'AndroidManifest Colgram Bypass Notice Action')
 
+    # 67c. AndroidManifest.xml -> the subscription tunnel, which has to route the whole phone.
+    #
+    # Without BIND_VPN_SERVICE the system refuses to grant consent and ColgramVpnService is dead
+    # code, so a subscription the user paid for would never protect anything. The service is
+    # foreground because a tunnel that can be killed silently is the exact failure this work
+    # exists to remove.
+    def vpn_service_injector(content):
+        if 'org.colgram.singbox.ColgramVpnService' in content:
+            return content
+        # Anchor on the CLOSING angle bracket of the <application ...> tag, not on the literal
+        # "<application" text: matching that would insert between the tag name and its attributes
+        # and split the tag in half, which the manifest merger rejects as unparseable.
+        match = re.search(r'<application\b[^>]*>', content)
+        if not match:
+            return content
+        service = (
+            '\n        <service android:name="org.colgram.singbox.ColgramVpnService"'
+            ' android:permission="android.permission.BIND_VPN_SERVICE"'
+            ' android:exported="false"'
+            ' android:foregroundServiceType="specialUse">'
+            '\n            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"'
+            ' android:value="Colgram VPN tunnel" />'
+            '\n        </service>'
+        )
+        return content[:match.end()] + service + content[match.end():]
+
+    patch_file(bypass_manifest, vpn_service_injector,
+               'org.colgram.singbox.ColgramVpnService',
+               'AndroidManifest Colgram VPN Service')
+
     # 68. ConnectionsManager.java -> an IPv6-only route, for networks that block IPv4 Telegram.
     #
     # Measured on the network Colgram is developed against: every Telegram DC address is dropped
