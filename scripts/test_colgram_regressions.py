@@ -2295,6 +2295,39 @@ public class SecretCheck {
         device_test = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramDohResolverDeviceTest.java").read_text(encoding="utf-8")
         self.assertIn("000181800001000100000000036170690874656c656772616d036f72670000010001c00c", device_test)
         self.assertIn("theReplyParserReadsARealCapturedAnswer", device_test)
+    def test_the_app_introduces_itself_as_colgram_but_still_names_the_account(self):
+        """The launcher said Colgram while the first screen said Telegram.
+
+        AppName had been rebranded for a long time; AppNameBeta in values-ru had not, and neither
+        had the five onboarding pages, so a new install introduced itself as Telegram and then
+        used that name in the launcher. The distinction that matters is which "Telegram" is being
+        named: the pages describe THIS application and are ours, while "we sent a code to your
+        Telegram app" and "your Telegram account" name the service the account lives on, and
+        rewriting those would describe an account that does not exist.
+        """
+        ru = (ROOT / "Telegram-Src/TMessagesProj/src/main/res/values-ru/strings.xml").read_text(encoding="utf-8")
+        en = (ROOT / "Telegram-Src/TMessagesProj/src/main/res/values/strings.xml").read_text(encoding="utf-8")
+
+        def value(text, name):
+            match = re.search('(?s)<string name="' + name + '">(.*?)</string>', text)
+            return match.group(1) if match else ""
+
+        for text, label in ((ru, "ru"), (en, "en")):
+            self.assertIn("Colgram", value(text, "AppName"), label + " AppName")
+            self.assertIn("Colgram", value(text, "AppNameBeta"), label + " AppNameBeta")
+            for page in ("Page1Title", "Page2Message", "Page3Message", "Page4Message",
+                         "Page5Message", "Page6Message"):
+                body = value(text, page)
+                self.assertIn("Colgram", body, label + " " + page + " must name the app")
+                self.assertNotIn("Telegram", body, label + " " + page + " still says Telegram")
+
+        # The account lives on Telegram's service; these must keep saying so.
+        for name in ("SentAppCode", "CancelAccountResetInfo2", "AddEmailSubtitle"):
+            self.assertIn("Telegram", value(ru, name),
+                          name + " describes the account service and must not be rebranded")
+
+        # And the injector has to carry the rebrand, or a regenerate puts Telegram back.
+        self.assertIn("rebrand_onboarding", PATCHER.read_text(encoding="utf-8"))
     def test_proxy_rotation_prefers_a_measured_proxy_over_an_unprobed_one(self):
         """The reported bug: a proxy whose state was never known, stuck until changed by hand.
 

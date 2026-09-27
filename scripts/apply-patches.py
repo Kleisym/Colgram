@@ -3551,6 +3551,70 @@ def inject_hooks(repo_path):
             "strings.xml AppNameBeta -> Colgram Beta"
         )
 
+        # The same rebranding was never applied to the Russian resources, so the launcher said
+        # "Colgram" while the beta build and the onboarding screen still introduced themselves as
+        # Telegram - the app contradicting its own name on first launch.
+        ru_strings_xml = os.path.join(repo_path, "TMessagesProj", "src", "main", "res",
+                                     "values-ru", "strings.xml")
+        for old, new, label in (
+            ('<string name="AppName">Telegram</string>',
+             '<string name="AppName">Colgram</string>',
+             "strings-ru AppName -> Colgram"),
+            ('<string name="AppNameBeta">Telegram Beta</string>',
+             '<string name="AppNameBeta">Colgram Beta</string>',
+             "strings-ru AppNameBeta -> Colgram Beta"),
+            ('<string name="Page1Title">Telegram</string>',
+             '<string name="Page1Title">Colgram</string>',
+             "strings-ru Page1Title -> Colgram"),
+        ):
+            patch_file(ru_strings_xml, old, new, label)
+
+        # The onboarding pages describe THIS application, so their brand name is ours. Only
+        # those are touched: strings that name the account rather than the app - "we sent a code
+        # to your Telegram app", "your Telegram account" - are about the service the account
+        # lives on, and rewriting them would describe a service that does not exist.
+        for old, new, label in (
+            ('<string name="Page1Title">Telegram</string>',
+             '<string name="Page1Title">Colgram</string>',
+             "strings Page1Title -> Colgram"),
+        ):
+            patch_file(strings_xml, old, new, label)
+
+        # The five onboarding blurbs also name the application, in both languages. Rewritten as
+        # whole elements rather than a search for the word, because the markup around the name
+        # (bold tags, a line break in the middle) differs between the two files and a blind
+        # replace would only ever catch one of them.
+        # Matched by element name and rewritten inside the element, because the two languages
+        # differ in markup: a line break lands in a different place in each, so a whole-element
+        # match would only ever have caught one of them and the other would have looked done.
+        def rebrand_onboarding(path, label):
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                body = handle.read()
+            changed = False
+            for name in ("Page2Message", "Page3Message", "Page4Message", "Page5Message",
+                         "Page6Message"):
+                start = body.find('name="' + name + '"')
+                if start < 0:
+                    continue
+                open_tag = body.rfind(">", 0, start)
+                close_tag = body.find("</string>", start)
+                if open_tag < 0 or close_tag < 0 or close_tag < open_tag:
+                    continue
+                inner = body[open_tag + 1:close_tag]
+                replaced = inner.replace("Telegram", "Colgram")
+                if replaced != inner:
+                    body = body[:open_tag + 1] + replaced + body[close_tag:]
+                    changed = True
+            if changed:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+                print(" [+] Rebranded the onboarding pages in " + label)
+
+        rebrand_onboarding(strings_xml, "strings.xml")
+        rebrand_onboarding(ru_strings_xml, "values-ru/strings.xml")
+
         # BUG #2 (dark themes rendering black-on-black) is closed, so the temporary
         # IntroActivity theme probe that used to live here has been removed. It served its
         # purpose: it proved the palette really does resolve to 0 for a partial dark theme

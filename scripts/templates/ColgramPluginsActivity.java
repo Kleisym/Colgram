@@ -236,7 +236,12 @@ public class ColgramPluginsActivity extends BaseFragment {
         int builtInCount = 0;
         for (ColgramPluginManager.PluginInfo p : installed) if (p.builtIn) builtInCount++;
         if (builtInCount > 0) {
-            rows.add(new Row(Row.KIND_HEADER, "Встроенные плагины (" + builtInCount + ")", null, null));
+            // These are Colgram's own features that happen to be implemented as scripts, not
+            // marketplace plugins. Calling them plugins put them in the same list a user
+            // uninstalls from, which is the wrong model: they cannot be removed and are not
+            // something that was ever installed.
+            rows.add(new Row(Row.KIND_HEADER,
+                    "Встроенные возможности Colgram (" + builtInCount + ")", null, null));
             for (ColgramPluginManager.PluginInfo p : installed) {
                 if (p.builtIn) rows.add(new Row(Row.KIND_BUILTIN, null, p, null));
             }
