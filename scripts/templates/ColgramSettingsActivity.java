@@ -452,9 +452,18 @@ public class ColgramSettingsActivity extends BaseFragment {
     private void openCloudflareWarp() {
         Context context = getContext();
         android.app.Activity activity = getParentActivity();
-        if (context == null || activity == null) return;
+        if (context == null || activity == null) {
+            // Returning here used to leave the persisted flag set with nothing running behind
+            // it, which is exactly what the user saw: the switch on, the row saying connected,
+            // and no traffic. Leave nothing half-applied on the way out.
+            org.colgram.core.ColgramConfig.setWarpEnabled(false);
+            return;
+        }
         if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) {
             Toast.makeText(context, "WireGuard-бэкенд недоступен в этой сборке", Toast.LENGTH_LONG).show();
+            org.colgram.core.ColgramConfig.setWarpEnabled(false);
+            org.colgram.core.ColgramWarpTunnel.clearFailure();
+            listAdapter.notifyDataSetChanged();
             return;
         }
         if (org.colgram.core.ColgramConfig.isWarpEnabled()) {
@@ -464,7 +473,6 @@ public class ColgramSettingsActivity extends BaseFragment {
             listAdapter.notifyDataSetChanged();
             return;
         }
-        org.colgram.core.ColgramConfig.setWarpEnabled(true);
         if (!org.colgram.core.ColgramWarp.isRegistered()) {
             Toast.makeText(context, "Регистрирую устройство в WARP…", Toast.LENGTH_SHORT).show();
             new Thread(() -> {
@@ -526,6 +534,11 @@ public class ColgramSettingsActivity extends BaseFragment {
             android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
             h.post(() -> {
                 if (result == null) {
+                    // The flag is written here, after the tunnel is actually up, rather than when
+                    // the row was tapped. Written on tap, every refusal below - a declined VPN
+                    // consent, a missing backend, a killed screen - left it on with nothing
+                    // behind it, and that half-applied state is what a user cannot switch off.
+                    org.colgram.core.ColgramConfig.setWarpEnabled(true);
                     Toast.makeText(context, "WARP запускается; проверяю связь (порт "
                             + org.colgram.core.ColgramWarp.currentEndpointPort() + ")",
                             Toast.LENGTH_SHORT).show();

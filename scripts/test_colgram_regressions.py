@@ -964,10 +964,68 @@ public final class DialogRefreshSequencerHarness {
         self.assertNotIn('"proxy_enabled_calls"', disable)
         self.assertIn("ColgramConfig.isWarpEnabled()", source.split("private static void autoConnectIfBlocked()", 1)[1].split("private static", 1)[0])
 
+    def test_warp_flag_is_written_only_once_the_tunnel_is_actually_up(self):
+        """Found by the churn test: round 0, flag on, nothing running, no reason recorded.
+
+        The flag was written when the row was tapped, so every refusal on the way to a tunnel -
+        a declined VPN consent, a missing backend, a screen torn down mid-start - left it set
+        with nothing behind it. That is the state a user cannot switch off. It is now written
+        only after bringUp succeeds, and a pending start is tracked separately so the row can
+        still show "connecting" while the flag deliberately still reads false.
+        """
+        source = PROXY_LIST_ACTIVITY.read_text(encoding="utf-8")
+        settings = SETTINGS.read_text(encoding="utf-8")
+
+        # The tap must not persist the flag.
+        warp_click = source.split("} else if (position == warpRow)", 1)[1].split(
+            "} else if (position >= proxyStartRow", 1
+        )[0]
+        self.assertNotIn("ColgramConfig.setWarpEnabled(true);", warp_click)
+        # Success is the only thing that may write it.
+        bring_up = source.split("private void bringWarpUp()", 1)[1].split(
+            "private void watchWarpVerdict", 1
+        )[0]
+        self.assertIn("ColgramWarpTunnel.bringUp(context);", bring_up)
+        self.assertIn("ColgramConfig.setWarpEnabled(true);", bring_up)
+        self.assertLess(bring_up.index("ColgramWarpTunnel.bringUp(context);"),
+                        bring_up.index("ColgramConfig.setWarpEnabled(true);"))
+        # A pending start is its own state, cancelled by tapping again.
+        self.assertIn("private volatile boolean warpStartPending = false;", source)
+        self.assertIn("warpStartPending = true;", bring_up)
+        self.assertIn("warpStartPending = false;", source)
+        # And no path may return with the flag claiming WARP is on.
+        self.assertIn("No context, nothing to start", source)
+        self.assertIn("private void failWarpStart", source)
+        fail_body = source.split("private void failWarpStart", 1)[1].split("private void refreshWarpState", 1)[0]
+        self.assertIn("warpStartPending = false;", fail_body)
+        self.assertIn("setWarpEnabled(false);", fail_body)
+
+        # The settings screen had the same ordering plus two unguarded early returns.
+        settings_open = settings.split("private void openCloudflareWarp()", 1)[1].split(
+            "/** Android requires the one-time VPN consent", 1
+        )[0]
+        self.assertNotIn("if (context == null || activity == null) return;", settings_open)
+        self.assertIn("setWarpEnabled(false);", settings_open)
+        self.assertIn("ColgramWarpTunnel.clearFailure();", settings_open)
+        settings_up = settings.split("private void startWarpTunnel()", 1)[1].split(
+            "/** Polls until WARP", 1
+        )[0]
+        self.assertIn("ColgramConfig.setWarpEnabled(true);", settings_up)
+        self.assertLess(settings_up.index("ColgramWarpTunnel.bringUp("),
+                        settings_up.index("ColgramConfig.setWarpEnabled(true);"))
+
+        # And the device test that found it stays in the tree.
+        churn = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramWarpChurnDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn("togglingRepeatedlyLeavesAConsistentState", churn)
+        self.assertIn("bringDownIsSafeBeforeAnyBringUp", churn)
+
     def test_warp_row_uses_selected_state_and_refreshes_after_async_result(self):
         source = PROXY_LIST_ACTIVITY.read_text(encoding="utf-8")
         voip = (ROOT / "Telegram-Src/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java").read_text(encoding="utf-8")
-        self.assertIn("setTextAndValueAndCheck(warpLabel, warpState, org.colgram.core.ColgramConfig.isWarpEnabled()", source)
+        # The row must reflect the pending start as well as the persisted flag, or the switch
+        # reads "off" under the user's finger while the tunnel is coming up.
+        self.assertIn("setTextAndValueAndCheck(warpLabel, warpState, warpUp", source)
+        self.assertIn("boolean warpUp = org.colgram.core.ColgramConfig.isWarpEnabled() || warpPending;", source)
         self.assertIn("org.colgram.core.ColgramProxyManager.notifyProxySettingsChanged();", source)
         self.assertIn("else if (requestCode == REQ_WARP_CONSENT)", source)
         self.assertIn('useProxyForCalls = preferences.getBoolean("proxy_enabled_calls", true);', source)
@@ -1065,6 +1123,7 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("ColgramGlobalSearchRestoreDeviceTest", runner)
         self.assertIn("ColgramThemeContrastDeviceTest", runner)
         self.assertIn("ColgramWarpUdpReachabilityDeviceTest", runner)
+        self.assertIn("ColgramWarpChurnDeviceTest", runner)
         self.assertIn("test-results.log", runner)
         self.assertIn("Failed to receive the UTP test results", runner)
         # It must clear stale results first, or a previous run reads as this one's outcome.
@@ -1087,6 +1146,7 @@ public final class DialogRefreshSequencerHarness {
                      "ColgramGlobalSearchHistoryDeviceTest.java",
                      "ColgramGlobalSearchRestoreDeviceTest.java",
                      "ColgramProxyAutonomyDeviceTest.java",
+                     "ColgramWarpChurnDeviceTest.java",
                      "ColgramWarpUdpReachabilityDeviceTest.java"):
             template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
             self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")

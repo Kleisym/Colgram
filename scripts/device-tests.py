@@ -33,6 +33,7 @@ DEVICE_TESTS = [
     "org.colgram.core.ColgramGlobalSearchHistoryDeviceTest",
     "org.colgram.core.ColgramGlobalSearchRestoreDeviceTest",
     "org.colgram.core.ColgramThemeContrastDeviceTest",
+    "org.colgram.core.ColgramWarpChurnDeviceTest",
     "org.colgram.core.ColgramWarpUdpReachabilityDeviceTest",
 ]
 
