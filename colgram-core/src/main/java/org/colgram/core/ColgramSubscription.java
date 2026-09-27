@@ -105,6 +105,10 @@ public final class ColgramSubscription {
             int schemeEnd = uri.indexOf("://");
             if (schemeEnd <= 0) return null;
             String scheme = uri.substring(0, schemeEnd).toLowerCase(java.util.Locale.ROOT);
+            // Both spellings are in the wild, and the two spellings mean the same protocol. Left
+            // unnormalised, a socks5:// node reached the profile builder as an unknown scheme and
+            // was dropped - the user would see a subscription that silently lost its entries.
+            if ("socks5".equals(scheme)) scheme = SOCKS;
             String rest = uri.substring(schemeEnd + 3);
 
             // The fragment is after the parameters and is the only human-readable name.

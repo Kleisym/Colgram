@@ -43,7 +43,10 @@ CASES = [
      "hysteria2", "a2.example.net", "443", "sni=cdn.example.net"),
     ("hysteria v1", "hysteria://pw@a1.example.net:36712?protocol=udp&auth=abc#Hysteria1",
      "hysteria", "a1.example.net", "36712", "password=pw"),
-    ("socks5", "socks5://1.2.3.4:1080#Local", "socks5", "1.2.3.4", "1080", "name=Local"),
+    # socks5:// is normalised to "socks": the tunnel's protocol name has no version in it, and an
+    # unnormalised socks5 reached the profile builder as an unknown scheme and was dropped - which
+    # showed up as a subscription that silently lost entries rather than as an error.
+    ("socks5", "socks5://1.2.3.4:1080#Local", "socks", "1.2.3.4", "1080", "name=Local"),
     ("ipv6 literal", "vless://uuid@[2001:db8::1]:443?type=tcp#IPv6",
      "vless", "2001:db8::1", "443", ""),
 ]

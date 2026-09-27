@@ -2328,6 +2328,64 @@ public class SecretCheck {
 
         # And the injector has to carry the rebrand, or a regenerate puts Telegram back.
         self.assertIn("rebrand_onboarding", PATCHER.read_text(encoding="utf-8"))
+    def test_a_generated_profile_matches_what_the_engine_expects(self):
+        """The profile shape is the engine's contract, and only the engine can say what it is.
+
+        Every one of these was found by asking sing-box to check a generated profile on the
+        device, not by reading its documentation or a sample config. Each was a profile that
+        compiled, parsed and looked right, and would have failed at connect time with the tunnel
+        up and every packet refused:
+
+          * the flat DNS "address" form was removed in sing-box 1.14 - the new shape is a transport
+            type with the resolver nested under "server";
+          * Reality without uTLS is refused outright, because unshaped it announces a VPN client to
+            exactly the censor it exists to hide from;
+          * a routing rule must name an outbound TAG. Handing it the outbound object instead
+            silently produced a rule that matched nothing, so the TUN came up and routed nothing;
+          * with no failover group the tunnel binds to the first node and stays on it when that
+            node is blocked, which is the whole reason to hold several;
+          * Hysteria v1 takes "auth" where v2 takes "password", and v1 requires TLS rather than
+            treating it as optional;
+          * socks5:// and socks:// are the same protocol, and the unnormalised spelling reached the
+            builder as an unknown scheme and was dropped from the subscription.
+        """
+        builder = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramProfileBuilder.java").read_text(encoding="utf-8")
+        parser = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramSubscription.java").read_text(encoding="utf-8")
+
+        # DNS: the transport type, with the resolver nested. Not the removed flat form.
+        self.assertIn('.put("type", "https")', builder)
+        self.assertIn('.put("server", "1.1.1.1")', builder)
+        self.assertIn('.put("path", "/dns-query")', builder)
+        self.assertNotIn('.put("address", "https://1.1.1.1/dns-query")', builder)
+        # The resolver is reached outside the tunnel, or a dead first node strands the phone.
+        self.assertIn('.put("detour", "direct")', builder)
+
+        # Reality carries a browser fingerprint; that is the whole point of the protocol.
+        self.assertIn('.put("utls"', builder)
+        self.assertIn('.put("fingerprint", "chrome")', builder)
+        self.assertIn('.put("reality"', builder)
+
+        # The catch-all rule names a tag that exists.
+        self.assertIn('.put("outbound", "auto")', builder)
+        self.assertNotIn('.put("outbound", outbounds.getString(0))', builder)
+        # And a subscription with several nodes fails over instead of binding to the first.
+        self.assertIn('.put("type", "urltest")', builder)
+        self.assertIn('.put("outbounds", members)', builder)
+        self.assertIn('interrupt_exist_connections', builder)
+
+        # Hysteria v1 and v2 are different shapes, not one branch with two names.
+        v1 = builder.split(ColgramSubscription := '    } else if (ColgramSubscription.HYSTERIA.equals', 1)
+        self.assertIn('.put("auth"', v1[1])
+        self.assertIn('.put("tls"', v1[1])
+
+        # socks5:// and socks:// are one protocol.
+        self.assertIn('if ("socks5".equals(scheme)) scheme = SOCKS;', parser)
+
+        # And the device test that asks the engine itself stays in the tree.
+        profile_test = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/singbox/ColgramProfileDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn('checkConfig', profile_test)
+        self.assertIn('everyProtocolWePromiseProducesAProfileTheEngineAccepts', profile_test)
+        self.assertIn('aWholeSubscriptionBecomesOneProfileWithFailover', profile_test)
     def test_proxy_rotation_prefers_a_measured_proxy_over_an_unprobed_one(self):
         """The reported bug: a proxy whose state was never known, stuck until changed by hand.
 
