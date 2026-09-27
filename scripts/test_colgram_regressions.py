@@ -1051,6 +1051,66 @@ public final class DialogRefreshSequencerHarness {
         )[0]
         self.assertIn("ignoring background proxy application", force_apply)
 
+    def test_device_tests_are_mirrored_so_they_survive_a_fresh_checkout(self):
+        """Telegram-Src/ is gitignored, so the device tests need a tracked copy.
+
+        The on-device tests found two real defects that the source-level suite could not: a
+        NullPointerException in the night palette, and a history entry that changed its own
+        spelling when re-searched. If they only lived in the ignored tree they would be gone on
+        the next clone, and the tests that found real bugs would be the first thing lost.
+        """
+        installed = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core"
+        for name in ("ColgramThemeContrastDeviceTest.java", "ColgramGlobalSearchHistoryDeviceTest.java"):
+            template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
+            self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")
+            self.assertEqual(template, (installed / name).read_text(encoding="utf-8"),
+                             name + " has drifted from its tracked template")
+            self.assertIn("@RunWith(AndroidJUnit4.class)", template)
+
+    def test_search_history_keeps_the_spelling_it_was_first_saved_with(self):
+        """Found by the new on-device history test: expected:<[cats]> but was:<[CATS]>.
+
+        Re-running an old search removed its entry case-insensitively and then re-added whatever
+        the user had just typed, so a query saved as "Colgram" came back as "COLGRAM" after one
+        more search - the list silently changing under the user who is trying to re-run it.
+        """
+        pager = SEARCH_PAGER.read_text(encoding="utf-8")
+        save = pager.split("private void saveGlobalSearchHistory(String text)", 1)[1].split(
+            "private void removeGlobalSearchHistory", 1
+        )[0]
+        self.assertIn("String canonical = query;", save)
+        self.assertIn("canonical = history.get(i);", save)
+        self.assertIn("history.add(0, canonical);", save)
+        self.assertNotIn("history.add(0, query);", save)
+        # And the device test that found it stays in the tree.
+        history_test = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramGlobalSearchHistoryDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn("historyIsCappedAndOldestEntriesFallOff", history_test)
+        self.assertIn("two\nlines", history_test.replace("\\n", "\n"))
+
+    def test_night_palette_lookup_cannot_throw_while_the_loader_runs(self):
+        """getColor is called from draw passes, so it must not raise.
+
+        Found by running the new on-device contrast test: it crashed with
+        NullPointerException: Attempt to read from null array in colgramNightColor. The has-key
+        check read the volatile field safely, but the colour read a few lines later indexed the
+        raw field again, and the background loader had not finished assigning it yet. This is one
+        of the confirmed causes behind "the app often crashes".
+        """
+        theme = (ROOT / "Telegram-Src/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java").read_text(encoding="utf-8")
+        injector = PATCHER.read_text(encoding="utf-8")
+        accessor = theme.split("private static int colgramNightColor(int key)", 1)[1].split("\n    }", 1)[0]
+        self.assertNotIn("return colgramNightColors[key];", accessor)
+        self.assertIn("int[] night = colgramNightColors;", accessor)
+        self.assertIn("if (night == null || key < 0 || key >= night.length)", accessor)
+        # The injector owns this body, so it has to carry the same fix or the next regenerate
+        # would put the crashing version straight back.
+        self.assertNotIn('"        return colgramNightColors[key];\\n"', injector)
+        self.assertIn("int[] night = colgramNightColors;", injector)
+        # And the device test that caught it must stay in the tree.
+        contrast = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramThemeContrastDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn("MIN_CONTRAST = 60", contrast)
+        self.assertIn("everyDarkThemeKeepsTextOffItsOwnBackground", contrast)
+
     def test_injector_can_never_truncate_a_source_file(self):
         """A bad replacer return must not become an empty file on disk.
 
