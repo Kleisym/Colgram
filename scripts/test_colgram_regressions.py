@@ -1019,6 +1019,24 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("togglingRepeatedlyLeavesAConsistentState", churn)
         self.assertIn("bringDownIsSafeBeforeAnyBringUp", churn)
 
+        # A start in flight must be cancellable. The flag is deliberately false while pending,
+        # so deriving the tap's intent from the flag alone made a second tap start a SECOND
+        # tunnel instead of cancelling the first - and the first would then switch WARP back on
+        # after the user had turned it off.
+        self.assertIn("boolean wantWarp = !org.colgram.core.ColgramConfig.isWarpEnabled() && !warpStartPending;", source)
+        self.assertIn("if (org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending) {", settings)
+        self.assertIn("private volatile boolean warpStartPending = false;", settings)
+        self.assertIn('if (warpStartPending) return "запускается…";', settings)
+        self.assertIn("warpStartPending = true;", settings_up)
+
+        # patch_proxylist_warp.py owns the proxy-screen row and the tap handler, so it has to
+        # carry the same fix. Without it, regenerating the tree silently puts the bug back and
+        # every source-level assertion above keeps passing against a reverted file.
+        patcher = (ROOT / "scripts/patch_proxylist_warp.py").read_text(encoding="utf-8")
+        self.assertIn("!org.colgram.core.ColgramConfig.isWarpEnabled() && !warpStartPending", patcher)
+        self.assertIn("boolean warpUp = org.colgram.core.ColgramConfig.isWarpEnabled() || warpPending;", patcher)
+        self.assertIn("'warpState, warpUp, false, false)'", patcher)
+
     def test_warp_row_uses_selected_state_and_refreshes_after_async_result(self):
         source = PROXY_LIST_ACTIVITY.read_text(encoding="utf-8")
         voip = (ROOT / "Telegram-Src/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java").read_text(encoding="utf-8")

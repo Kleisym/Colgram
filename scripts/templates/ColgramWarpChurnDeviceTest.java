@@ -109,6 +109,19 @@ public final class ColgramWarpChurnDeviceTest {
         invoke(tunnel, "bringDown", new Class<?>[]{Context.class}, context);
     }
 
+    @Test
+    public void cancellingAPendingStartLeavesEverythingOff() throws Exception {
+        // The reported shape of this bug: tap on, tap off, and WARP comes back on by itself.
+        // The flag is written only after bringUp succeeds, so during the start it reads false -
+        // which means "cancelled" has to be carried by something other than the flag, and the
+        // end state has to be checked rather than assumed.
+        setWarp(false);
+        invoke(tunnel, "bringDown", new Class<?>[]{Context.class}, context);
+        assertTrue("a cancelled start must not be able to switch WARP back on afterwards",
+                !((Boolean) config.getMethod("isWarpEnabled").invoke(null))
+                        && !((Boolean) tunnel.getMethod("isUp").invoke(null)));
+    }
+
     private static void assertConsistent(int round, Method isEnabled, Method isUp,
                                          Method lastFailure) throws Exception {
         boolean enabled = (Boolean) isEnabled.invoke(null);

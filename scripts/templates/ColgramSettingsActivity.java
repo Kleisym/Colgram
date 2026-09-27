@@ -63,6 +63,9 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int ghostSectionRow;
     private int cloudflareWarpRow;
 
+    /** True while a WARP start is in flight, before the persisted flag says anything. */
+    private volatile boolean warpStartPending = false;
+
     private int networkHeaderRow;
     private int dpiBypassRow;
     private int dohRow;
@@ -466,7 +469,11 @@ public class ColgramSettingsActivity extends BaseFragment {
             listAdapter.notifyDataSetChanged();
             return;
         }
-        if (org.colgram.core.ColgramConfig.isWarpEnabled()) {
+        // A start in flight has to be cancellable too. The persisted flag is written only once
+        // the tunnel is really up, so while it is pending this test alone would say "off" and a
+        // second tap would start a second tunnel instead of cancelling the first.
+        if (org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending) {
+            warpStartPending = false;
             org.colgram.core.ColgramConfig.setWarpEnabled(false);
             org.colgram.core.ColgramWarpTunnel.bringDown(context);
             Toast.makeText(context, "WARP отключён", Toast.LENGTH_SHORT).show();
@@ -518,6 +525,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     private void startWarpTunnel() {
         final Context context = getContext();
         if (context == null) return;
+        warpStartPending = true;
         Toast.makeText(context, "Поднимаю WARP-туннель…", Toast.LENGTH_SHORT).show();
         // Watch the tunnel for the same verdict the watchdog records, so a route that cannot
         // carry traffic reports itself instead of leaving a toggle that silently switches off.
@@ -543,6 +551,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                             + org.colgram.core.ColgramWarp.currentEndpointPort() + ")",
                             Toast.LENGTH_SHORT).show();
                 } else {
+                    warpStartPending = false;
                     org.colgram.core.ColgramConfig.setWarpEnabled(false);
                     Toast.makeText(context, "WARP не поднялся — " + result, Toast.LENGTH_LONG).show();
                 }
@@ -588,6 +597,7 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private String warpStatusLine() {
         if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) return "бэкенд недоступен";
+        if (warpStartPending) return "запускается…";
         String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();
         if (failure != null && !failure.isEmpty()
                 && !org.colgram.core.ColgramWarpTunnel.isUp()) {

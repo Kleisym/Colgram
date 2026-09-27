@@ -76,11 +76,17 @@ def upgrade_generated(s):
          '                                    ? (warpConnected ? "подключен — обычный прокси выключен" : "подключается — обычный прокси выключен")\n'
          '                                    : (warpConnected ? "connected — regular proxy off" : "connecting — regular proxy off");'),
         ('warpState, org.colgram.core.ColgramWarpTunnel.isUp(), false, false)',
-         'warpState, org.colgram.core.ColgramConfig.isWarpEnabled(), false, false)'),
+        # The row must show the pending start as well as the persisted flag, or the switch reads
+        # "off" under the user's finger while the tunnel is actually coming up.
+        'warpState, warpUp, false, false)'),
         ('checkCell.setChecked(org.colgram.core.ColgramWarpTunnel.isUp());',
          'checkCell.setChecked(org.colgram.core.ColgramConfig.isWarpEnabled());'),
         ('boolean wantWarp = !org.colgram.core.ColgramWarpTunnel.isUp();',
-         'boolean wantWarp = !org.colgram.core.ColgramConfig.isWarpEnabled();'),
+         # A start in flight is NOT reflected in the persisted flag - that is written only once
+         # the tunnel is really up. Deriving the tap's intent from the flag alone therefore made
+         # a second tap ask for WARP again instead of cancelling the start already running, and
+         # the first start would then switch WARP back on after the user had turned it off.
+         'boolean wantWarp = !org.colgram.core.ColgramConfig.isWarpEnabled() && !warpStartPending;'),
         ('if (useProxySettings) {\n                    // One default route at a time: the regular proxy replacing WARP.\n'
          '                    org.colgram.core.ColgramWarpTunnel.bringDown(getContext());',
          'if (useProxySettings) {\n                    // One default route at a time: the regular proxy replacing WARP.\n'
@@ -274,7 +280,10 @@ def apply(repo_path):
     new_bind = """                    } else if (position == callsRow) {
                         checkCell.setTextAndCheck(getString(R.string.UseProxyForCalls), useProxyForCalls, false);
                     } else if (position == warpRow) {
-                        boolean warpUp = org.colgram.core.ColgramWarpTunnel.isUp();
+                        // A start in flight is not yet in the persisted flag, so it has to be
+                        // considered here or the switch would read "off" while it is coming up.
+                        boolean warpPending = warpStartPending;
+                        boolean warpUp = org.colgram.core.ColgramConfig.isWarpEnabled() || warpPending;
                         boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
                         String warpLabel = isRu ? "Использовать Cloudflare WARP" : "Use Cloudflare WARP";
                         String warpState;
