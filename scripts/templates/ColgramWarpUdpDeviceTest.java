@@ -78,6 +78,51 @@ public final class ColgramWarpUdpDeviceTest {
         }
     }
 
+    @Test
+    public void doWarpEndpointsSpeakTcpAtAll() throws Exception {
+        // The measurement that decides whether any client-side work can help. UDP is dropped on
+        // every Cloudflare address here, so the only remaining hope would be a WireGuard endpoint
+        // reachable over TCP. WireGuard has no TCP transport, so a correct implementation must
+        // stay silent - but that is worth measuring on the device rather than assuming, because
+        // the host and the phone are on different networks and the host cannot reach 1.1.1.1 over
+        // UDP at all while the phone can.
+        InstrumentationRegistry.getInstrumentation().getTargetContext();
+
+        String[] hosts = {"162.159.192.1", "188.114.96.1"};
+        int[] ports = {2408, 500, 854, 934, 4500, 1640};
+        StringBuilder report = new StringBuilder();
+        int wireguardReplies = 0;
+        for (String host : hosts) {
+            for (int port : ports) {
+                java.net.Socket socket = new java.net.Socket();
+                socket.connect(new InetSocketAddress(host, port), TIMEOUT_MS);
+                try {
+                    socket.setSoTimeout(TIMEOUT_MS);
+                    socket.getOutputStream().write(initiation(new Random()));
+                    socket.getOutputStream().flush();
+                    byte[] reply = new byte[256];
+                    int read = socket.getInputStream().read(reply);
+                    if (read > 0 && read <= 4 && (reply[0] == 2 || reply[0] == 3 || reply[0] == 4)) {
+                        wireguardReplies++;
+                        report.append("  ").append(host).append(':').append(port)
+                                .append(" -> WIREGUARD REPLY type=").append(reply[0]).append('\n');
+                    }
+                } catch (java.net.SocketTimeoutException ignored) {
+                    // Connected, then silence: the normal answer for a port with no TCP service.
+                } catch (Exception ignored) {
+                    // Same conclusion, reached differently.
+                } finally {
+                    socket.close();
+                }
+            }
+        }
+        Log.i(TAG, "TCP to WARP endpoints produced " + wireguardReplies + " WireGuard replies");
+        Log.i(TAG, wireguardReplies == 0
+                ? "VERDICT: no WARP endpoint speaks TCP here, so the tunnel cannot be rescued "
+                  + "client-side; UDP is the only transport WARP has and it is filtered"
+                : report.toString());
+    }
+
     /** A real handshake initiation; a filter that targets WireGuard keys on exactly this shape. */
     private static byte[] initiation(Random random) {
         byte[] packet = new byte[148];
