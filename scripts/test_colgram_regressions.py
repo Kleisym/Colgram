@@ -964,6 +964,27 @@ public final class DialogRefreshSequencerHarness {
         self.assertNotIn('"proxy_enabled_calls"', disable)
         self.assertIn("ColgramConfig.isWarpEnabled()", source.split("private static void autoConnectIfBlocked()", 1)[1].split("private static", 1)[0])
 
+    def test_call_proxying_only_ever_applies_to_a_plain_proxy(self):
+        """Documented so it is not mistaken for a bug: calls cannot use an MTProto proxy.
+
+        VoIPService builds its proxy only when the proxy is enabled, the call switch is on, a
+        server is stored, AND no secret is present. A secret means MTProto, and a call cannot be
+        carried over MTProto, so Telegram falls back to direct. That gate is upstream behaviour
+        and was left alone - the only change is the switch's default. What matters is that we do
+        not claim otherwise, so the default is not read as "calls now go through the proxy" when
+        the user happens to be on an MTProto one.
+        """
+        voip = (ROOT / "Telegram-Src/TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java").read_text(encoding="utf-8")
+        gate = voip.split('preferences.getBoolean("proxy_enabled", false)', 1)[1].split("}" + chr(10), 1)[0]
+        self.assertIn('preferences.getBoolean("proxy_enabled_calls", true)', gate)
+        self.assertIn('preferences.getString("proxy_ip", null)', gate)
+        self.assertIn('TextUtils.isEmpty(secret)', gate)
+        # The switch must never be turned off implicitly anywhere.
+        self.assertNotIn('putBoolean("proxy_enabled_calls", false)', voip)
+        # And the device test that drives the real gate stays in the tree.
+        calls = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramCallProxyDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn("theDefaultOnlyMattersWhenAPlainProxyIsActuallyConfigured", calls)
+        self.assertIn("an MTProto secret means calls go direct", calls)
     def test_warp_flag_is_written_only_once_the_tunnel_is_actually_up(self):
         """Found by the churn test: round 0, flag on, nothing running, no reason recorded.
 
@@ -1161,6 +1182,7 @@ public final class DialogRefreshSequencerHarness {
         """
         installed = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core"
         for name in ("ColgramThemeContrastDeviceTest.java",
+                     "ColgramCallProxyDeviceTest.java",
                      "ColgramGlobalSearchHistoryDeviceTest.java",
                      "ColgramGlobalSearchRestoreDeviceTest.java",
                      "ColgramProxyAutonomyDeviceTest.java",
