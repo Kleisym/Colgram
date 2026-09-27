@@ -1,9 +1,12 @@
 package org.telegram.ui;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.net.Uri;
 import android.os.Build;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -90,7 +93,7 @@ public class ColgramFloatWindowManager {
     }
 
     public static boolean isSupported(Context context) {
-        return AndroidUtilities.checkInlinePermissions(context);
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context);
     }
 
     /**
@@ -117,20 +120,24 @@ public class ColgramFloatWindowManager {
             return null;
         }
 
+        ViewGroup oldParent = null;
+        ViewGroup.LayoutParams oldLayoutParams = null;
+        FrameLayout root = null;
+        WindowManager windowManager = null;
         try {
-            final WindowManager windowManager =
-                    (WindowManager) appContext.getSystemService(Context.WINDOW_SERVICE);
+            windowManager = (WindowManager) appContext.getSystemService(Context.WINDOW_SERVICE);
             if (windowManager == null) {
                 return null;
             }
 
-            final FrameLayout root = new FrameLayout(appContext);
+            root = new FrameLayout(appContext);
 
             // Detach from whatever tree the content currently lives in. A View can only
             // have one parent, and leaving it attached elsewhere silently removes it from
             // this window instead.
-            final ViewGroup oldParent = (ViewGroup) content.getParent();
+            oldParent = (ViewGroup) content.getParent();
             if (oldParent != null) {
+                oldLayoutParams = content.getLayoutParams();
                 oldParent.removeView(content);
             }
             root.addView(content, new FrameLayout.LayoutParams(
@@ -198,6 +205,19 @@ public class ColgramFloatWindowManager {
             return window;
 
         } catch (Throwable t) {
+            try {
+                if (root != null && root.getParent() != null && windowManager != null) {
+                    windowManager.removeViewImmediate(root);
+                }
+                if (content.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) content.getParent()).removeView(content);
+                }
+                if (oldParent != null && content.getParent() == null) {
+                    oldParent.addView(content, oldLayoutParams);
+                }
+            } catch (Throwable restoreFailure) {
+                FileLog.e(restoreFailure);
+            }
             FileLog.e(t);
             return null;
         }
@@ -285,14 +305,30 @@ public class ColgramFloatWindowManager {
      * This is the permission that unlocks genuinely parallel windows; without it the
      * caller should fall back to Telegram's single-window PiP.
      */
-    public static void requestOverlayPermission(Activity activity) {
+    public static boolean requestOverlayPermission(Activity activity) {
         if (activity == null) {
-            return;
+            return false;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(activity)) {
+            return true;
         }
         try {
-            AndroidUtilities.checkInlinePermissions(activity);
+            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                intent.setData(Uri.parse("package:" + activity.getPackageName()));
+            }
+            activity.startActivity(intent);
+            return true;
         } catch (Throwable t) {
             FileLog.e(t);
+            try {
+                activity.startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + activity.getPackageName())));
+                return true;
+            } catch (Throwable fallbackFailure) {
+                FileLog.e(fallbackFailure);
+                return false;
+            }
         }
     }
 }

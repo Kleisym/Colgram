@@ -1,6 +1,7 @@
 package org.colgram.core;
 
 import android.util.Log;
+import android.os.SystemClock;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -8,6 +9,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,6 +51,11 @@ public class ColgramDpiBypass {
     /** Keep the proxy listener out of the fragile application-startup window. */
     private static final long START_DELAY_MS = 8000L;
     private static final ExecutorService workerPool = Executors.newCachedThreadPool();
+    private static final long CONNECT_FAILURE_BASE_DELAY_MS = 3000L;
+    private static final long CONNECT_FAILURE_MAX_DELAY_MS = 60000L;
+    private static final ColgramConnectFailureBackoff connectFailures =
+            new ColgramConnectFailureBackoff(CONNECT_FAILURE_BASE_DELAY_MS,
+                    CONNECT_FAILURE_MAX_DELAY_MS);
 
     public static synchronized void start() {
         if (isRunning || startScheduled) return;
@@ -223,19 +230,27 @@ public class ColgramDpiBypass {
             OutputStream out = client.getOutputStream();
 
             // 1. SOCKS5 greeting
-            int ver = in.read();
+            int ver = ColgramSocks5Codec.readByte(in);
             if (ver != 5) {
                 closeQuietly(client);
                 return;
             }
-            int nmethods = in.read();
+            int nmethods = ColgramSocks5Codec.readByte(in);
             if (nmethods <= 0) {
                 closeQuietly(client);
                 return;
             }
-            byte[] methods = new byte[nmethods];
-            int read = in.read(methods);
-            if (read <= 0) {
+            byte[] methods = ColgramSocks5Codec.readFully(in, nmethods);
+            boolean supportsNoAuth = false;
+            for (byte method : methods) {
+                if (method == 0) {
+                    supportsNoAuth = true;
+                    break;
+                }
+            }
+            if (!supportsNoAuth) {
+                out.write(new byte[]{0x05, (byte) 0xFF});
+                out.flush();
                 closeQuietly(client);
                 return;
             }
@@ -245,12 +260,16 @@ public class ColgramDpiBypass {
             out.flush();
 
             // 2. SOCKS5 request
-            int reqVer = in.read();
-            int cmd = in.read();
-            int rsv = in.read();
-            int atyp = in.read();
+            int reqVer = ColgramSocks5Codec.readByte(in);
+            int cmd = ColgramSocks5Codec.readByte(in);
+            int rsv = ColgramSocks5Codec.readByte(in);
+            int atyp = ColgramSocks5Codec.readByte(in);
 
-            if (reqVer != 5 || cmd != 1) { // CONNECT only
+            if (reqVer != 5 || rsv != 0) {
+                closeQuietly(client);
+                return;
+            }
+            if (cmd != 1) { // CONNECT only
                 out.write(new byte[]{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
                 out.flush();
                 closeQuietly(client);
@@ -259,24 +278,27 @@ public class ColgramDpiBypass {
 
             String destHost;
             if (atyp == 1) { // IPv4
-                byte[] ip = new byte[4];
-                in.read(ip);
+                byte[] ip = ColgramSocks5Codec.readFully(in, 4);
                 destHost = (ip[0] & 0xFF) + "." + (ip[1] & 0xFF) + "." + (ip[2] & 0xFF) + "." + (ip[3] & 0xFF);
             } else if (atyp == 3) { // Domain
-                int len = in.read();
+                int len = ColgramSocks5Codec.readByte(in);
+                if (len <= 0) {
+                    closeQuietly(client);
+                    return;
+                }
                 byte[] domainBytes = new byte[len];
-                in.read(domainBytes);
+                domainBytes = ColgramSocks5Codec.readFully(in, len);
                 destHost = new String(domainBytes, StandardCharsets.UTF_8);
             } else if (atyp == 4) { // IPv6
-                byte[] ip6 = new byte[16];
-                in.read(ip6);
+                byte[] ip6 = ColgramSocks5Codec.readFully(in, 16);
                 destHost = InetAddress.getByAddress(ip6).getHostAddress();
             } else {
                 closeQuietly(client);
                 return;
             }
 
-            int destPort = ((in.read() & 0xFF) << 8) | (in.read() & 0xFF);
+            byte[] portBytes = ColgramSocks5Codec.readFully(in, 2);
+            int destPort = ((portBytes[0] & 0xFF) << 8) | (portBytes[1] & 0xFF);
 
             // 3. Connect to destination with multi-port fallback & TCP desync
             //
@@ -287,21 +309,49 @@ public class ColgramDpiBypass {
             if (waitMs > 0) {
                 sleep(Math.min(waitMs, MAX_BACKOFF_SLEEP_MS));
             }
-            targetSocket = establishConnection(destHost, destPort);
+            if (!ColgramDcRemap.shouldSkipDirectAddress(destHost)) {
+                targetSocket = connectWithBackoff(destHost, destPort);
+            } else {
+                Log.i(TAG, "skipping temporarily silent Telegram address " + destHost + ":" + destPort);
+            }
             if (targetSocket == null) {
                 // The DC address tgnet was told about is often the one this network refuses.
                 // Searching for a Telegram address that opens a socket at all is what the
                 // address-remap component already does; desync is only worth trying against a
                 // server that answers.
-                String live = ColgramDcRemap.liveAddressFor(destHost, destPort);
+                String live = ColgramDcRemap.liveAlternativeFor(destHost, destPort);
                 if (live != null && !live.equals(destHost)) {
                     Log.i(TAG, "desync: " + destHost + ":" + destPort + " refused, trying "
                             + live + ":" + destPort);
-                    targetSocket = establishConnection(live, destPort);
+                    targetSocket = connectWithBackoff(live, destPort);
+                }
+            }
+            if (targetSocket == null && ColgramProxyManager.hasReachableRelays()) {
+                // The listener is a local gateway, not a dead end. Direct dial and remap
+                // alternatives both refused: hand the connection to a reachable relay front.
+                // The relay is a stranger's machine, but it is the ONLY way a destination whose
+                // SYN the carrier drops can be reached at all - and it is bounded to Telegram
+                // destinations so ordinary traffic never routes through it.
+                if (isMtProtoHost(destHost) || ColgramTelegramDcAddresses.isKnownAddress(destHost)) {
+                    int chainPort = ColgramProxyManager.openRelayRouteFor(destHost, destPort);
+                    if (chainPort > 0) {
+                        try {
+                            Socket chained = new Socket();
+                            chained.setTcpNoDelay(true);
+                            chained.connect(new InetSocketAddress("127.0.0.1", chainPort), 3000);
+                            targetSocket = chained;
+                            Log.i(TAG, "direct dial refused; routed " + destHost + ":" + destPort
+                                    + " through relay front 127.0.0.1:" + chainPort);
+                        } catch (Throwable t) {
+                            Log.d(TAG, "relay front dial failed for " + destHost);
+                        }
+                    }
                 }
             }
             if (targetSocket == null) {
-                Log.w(TAG, "Failed to connect to target: " + destHost + ":" + destPort);
+                // Per-retry noise from tgnet hammering the listener; a Log.w here floods
+                // logcat a hundred lines a second on a network where the DCs refuse TCP.
+                Log.d(TAG, "Failed to connect to target: " + destHost + ":" + destPort);
                 out.write(new byte[]{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
                 out.flush();
                 closeQuietly(client);
@@ -319,23 +369,49 @@ public class ColgramDpiBypass {
             pipeWithAdvancedDesync(client, targetSocket);
 
         } catch (Exception e) {
+            Log.d(TAG, "SOCKS5 handshake/tunnel failed: " + e.getMessage());
             closeQuietly(client);
             closeQuietly(targetSocket);
         }
+    }
+
+    private static Socket connectWithBackoff(String host, int port) {
+        String endpoint = host.toLowerCase(java.util.Locale.US) + ":" + port;
+        long now = SystemClock.elapsedRealtime();
+        long ticket = connectFailures.tryBegin(endpoint, now);
+        if (ticket < 0L) {
+            Log.d(TAG, "skipping direct TCP dial during endpoint cooldown: " + endpoint);
+            return null;
+        }
+        Socket socket = establishConnection(host, port);
+        if (socket == null) {
+            long delay = connectFailures.finish(endpoint, ticket, false, SystemClock.elapsedRealtime());
+            if (delay > 0L) {
+                Log.i(TAG, "direct TCP dial failed for " + endpoint + "; retry in " + delay + "ms");
+            }
+        } else {
+            connectFailures.finish(endpoint, ticket, true, SystemClock.elapsedRealtime());
+        }
+        return socket;
+    }
+
+    /** Drop stale dial failures as soon as Android reports a network transition. */
+    public static void clearConnectionFailureBackoff() {
+        connectFailures.clear();
     }
 
     /**
      * Connects to target host with multi-port fallback.
      *
      * The fallback list exists for MTProto, where Telegram genuinely serves the same
-     * account on several ports. It must NOT be applied blindly to every host: the original
-     * code tried {443, 80, 5222, 8443} for any target on 443, so an HTTPS request to
-     * api.telegram.org that missed on 443 then burned three more connect attempts against
-     * ports that do not speak TLS on that host, and returned null ~9s later. The caller
-     * saw only "no response".
+     * account on several ports. It must NOT be applied blindly to every host: an HTTPS
+     * request to api.telegram.org should not be sent to ports that do not speak TLS. Telegram
+     * DC alternatives race within one shared 1.8-second budget; other hosts use only their
+     * requested port.
      *
      * Ports are now used only when the destination is one of Telegram's own MTProto DC
-     * hosts. Everything else gets exactly the port that was asked for.
+     * hosts. Everything else gets exactly the port that was asked for. The DC alternatives
+     * race inside one deadline rather than serially burning four connect timeouts on an IP block.
      */
     private static Socket establishConnection(String host, int port) {
         int[] candidatePorts;
@@ -345,15 +421,8 @@ public class ColgramDpiBypass {
             candidatePorts = new int[]{port};
         }
 
-        for (int p : candidatePorts) {
-            try {
-                Socket directSocket = new Socket();
-                directSocket.setTcpNoDelay(true);
-                directSocket.connect(new InetSocketAddress(host, p), 3000);
-                return directSocket;
-            } catch (Exception ignored) {}
-        }
-        return null;
+        int budgetMs = candidatePorts.length > 1 ? TELEGRAM_DIAL_BUDGET_MS : 3000;
+        return ColgramSocketConnectRace.connect(host, candidatePorts, budgetMs);
     }
 
     /**
@@ -367,7 +436,8 @@ public class ColgramDpiBypass {
                 || h.endsWith(".t.me")
                 || h.contains("telegram.dog")
                 || h.startsWith("149.154.")
-                || h.startsWith("91.108.");
+                || h.startsWith("91.108.")
+                || ColgramTelegramDcAddresses.isKnownAddress(h);
     }
 
     // ==================================================================================
@@ -391,6 +461,9 @@ public class ColgramDpiBypass {
     // per-ISP hand-tuning.
 
     private static final int STRATEGY_COUNT = 6;
+    /** Fail a TCP-open-but-silent endpoint promptly; do not leave Telegram spinning indefinitely. */
+    private static final int FIRST_REPLY_TIMEOUT_MS = 3000;
+    private static final int TELEGRAM_DIAL_BUDGET_MS = 1800;
     private static final int STRATEGY_SPLIT_1 = 0;        // 1 byte | rest
     private static final int STRATEGY_SPLIT_RANDOM = 1;   // random offset | rest
     private static final int STRATEGY_SPLIT_3 = 2;        // three fragments
@@ -577,9 +650,17 @@ public class ColgramDpiBypass {
      * Only the first packet is desynced. Everything after the handshake is ordinary
      * stream traffic that a DPI has already stopped caring about, and mangling it would
      * cost throughput for no benefit.
+     *
+     * When the first packet is a TLS ClientHello and the mimic is on, it is REWRITTEN into a
+     * browser fingerprint and sent fragmented — not merely split. This is what makes the
+     * listener a general-purpose bypass: Telegram's FakeTLS hello, YouTube, GitHub, Cloudflare
+     * and every other HTTPS destination forwarded through it stop matching the ClientHello
+     * signatures the TSPU holds for those services, while each real server accepts the rebuilt
+     * hello as ordinary TLS.
      */
     private static void pipeWithAdvancedDesync(final Socket client, final Socket dest) {
         final int strategy = pickStrategy();
+        final boolean mimic = ColgramConfig.isTlsMimicEnabled();
         final java.util.concurrent.atomic.AtomicLong fromTarget =
                 new java.util.concurrent.atomic.AtomicLong(0);
 
@@ -588,23 +669,34 @@ public class ColgramDpiBypass {
             try {
                 InputStream cin = client.getInputStream();
                 OutputStream dout = dest.getOutputStream();
-                byte[] buffer = new byte[16384];
-                boolean firstPacket = true;
-                int len;
-
-                while ((len = cin.read(buffer)) != -1) {
-                    if (firstPacket) {
-                        firstPacket = false;
-                        if (len > 1) {
-                            sendDesynced(dest, dout, buffer, len, strategy);
-                        } else {
-                            dout.write(buffer, 0, len);
-                            dout.flush();
-                        }
-                    } else {
-                        dout.write(buffer, 0, len);
+                byte[] firstPayload = ColgramInitialPacketReader.readPrefix(client, 517, 60);
+                if (ColgramTlsMimic.needsMoreBytes(firstPayload)) {
+                    byte[] more = ColgramInitialPacketReader.readPrefix(client, 517, 150);
+                    byte[] joined = new byte[firstPayload.length + more.length];
+                    System.arraycopy(firstPayload, 0, joined, 0, firstPayload.length);
+                    System.arraycopy(more, 0, joined, firstPayload.length, more.length);
+                    firstPayload = joined;
+                }
+                if (mimic && ColgramTlsMimic.looksLikeClientHello(firstPayload)) {
+                    byte[] rewritten = ColgramTlsMimic.rewrite(firstPayload);
+                    java.util.Random rnd = new java.util.Random();
+                    for (byte[] segment : ColgramTlsMimic.fragment(rewritten, rnd)) {
+                        dout.write(segment);
                         dout.flush();
+                        sleep(1 + rnd.nextInt(3));
                     }
+                } else if (firstPayload.length > 1) {
+                    sendDesynced(dest, dout, firstPayload, firstPayload.length, strategy);
+                } else if (firstPayload.length == 1) {
+                    dout.write(firstPayload, 0, 1);
+                    dout.flush();
+                }
+
+                byte[] buffer = new byte[16384];
+                int len;
+                while ((len = cin.read(buffer)) != -1) {
+                    dout.write(buffer, 0, len);
+                    dout.flush();
                 }
             } catch (Throwable ignored) {
             } finally {
@@ -619,13 +711,26 @@ public class ColgramDpiBypass {
                 InputStream din = dest.getInputStream();
                 OutputStream cout = client.getOutputStream();
                 byte[] buffer = new byte[16384];
-                int len;
-
-                while ((len = din.read(buffer)) != -1) {
+                int len = ColgramFirstResponseReader.readFirst(dest, buffer, FIRST_REPLY_TIMEOUT_MS);
+                if (len > 0) {
                     fromTarget.addAndGet(len);
                     cout.write(buffer, 0, len);
                     cout.flush();
+                    while ((len = din.read(buffer)) != -1) {
+                        fromTarget.addAndGet(len);
+                        cout.write(buffer, 0, len);
+                        cout.flush();
+                    }
+                } else {
+                    Log.w(TAG, "upstream stayed silent (EOF) on " + dest.getRemoteSocketAddress());
+                    ColgramDcRemap.reportSilentAddress(
+                            dest.getInetAddress().getHostAddress(), dest.getPort());
                 }
+            } catch (SocketTimeoutException silent) {
+                Log.w(TAG, "upstream stayed silent for " + FIRST_REPLY_TIMEOUT_MS + "ms on "
+                        + dest.getRemoteSocketAddress());
+                ColgramDcRemap.reportSilentAddress(
+                        dest.getInetAddress().getHostAddress(), dest.getPort());
             } catch (Throwable ignored) {
             } finally {
                 closeQuietly(client);

@@ -1,17 +1,16 @@
 package org.colgram.core;
 
 import android.util.Log;
+import android.os.SystemClock;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.List;
@@ -29,11 +28,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * and the traffic is ordinary MTProto to Telegram, not a tunnel through somebody's VPS.
  *
  * The order of candidates is deliberate:
- *   1. the address tgnet asked for - on an unblocked network this succeeds and nothing changes;
- *   2. other addresses in the same /16, which belong to the same DC and can therefore carry the
- *      session without a migration dance;
- *   3. the rest of Telegram's published API addresses, last, because a live address of the wrong
- *      DC answers the handshake and then redirects, which is progress but not a connection.
+ *   1. the address tgnet asked for;
+ *   2. only documented aliases for that exact DC.
+ *
+ * Do not probe neighboring /24 or /16 addresses: Telegram assigns different DCs inside those
+ * ranges, and a TCP-open web front or another DC is not a valid substitute for the requested DC.
  *
  * What it cannot do is invent a listener: if no Telegram address that speaks MTProto is reachable,
  * every candidate fails and the verdict is logged. That is the honest outcome, and it is why each
@@ -46,27 +45,12 @@ public final class ColgramDcRemap {
 
     private static final int CONNECT_TIMEOUT_MS = 2500;
     /** Wall-clock budget for the parallel probe of Telegram's addresses. */
-    private static final long PROBE_BUDGET_MS = 3000L;
+    private static final long PROBE_BUDGET_MS = 1800L;
 
     /** Prefixes of Telegram's own address space. Anything else is passed through untouched. */
     private static final String[] TELEGRAM_PREFIXES = {
             "149.154.", "91.108.", "185.76.151.", "185.76.150.", "5.142.", "95.161.76.",
             "139.45.", "109.239.140.", "67.198.55.", "31.13.",
-    };
-
-    /**
-     * Telegram's published API and DC addresses. Only ever used as candidates to try, never
-     * trusted: each has to complete a TCP connection before anything is piped through it.
-     */
-    private static final String[] TELEGRAM_ADDRESSES = {
-            "149.154.175.50", "149.154.175.51", "149.154.175.53", "149.154.175.56",
-            "149.154.175.40", "149.154.175.100", "149.154.175.117",
-            "149.154.167.51", "149.154.167.56", "149.154.167.91", "149.154.167.40",
-            "149.154.167.220", "149.154.167.99", "149.154.166.110",
-            "149.154.171.5", "149.154.171.20",
-            "91.108.56.100", "91.108.56.130", "91.108.4.130", "91.108.8.130",
-            "91.108.12.130", "91.108.16.130", "91.108.20.130", "95.161.76.100",
-            "185.76.151.112", "185.76.151.1", "5.142.99.58", "5.142.134.227",
     };
 
     /**
@@ -79,11 +63,19 @@ public final class ColgramDcRemap {
      */
     private static final Map<String, Long> parked = new ConcurrentHashMap<>();
     private static final long PARK_MS = 10 * 60 * 1000L;
+    /** A TCP-open address that gave no MTProto reply cools down briefly, then can be retried. */
+    private static final Map<String, Long> temporarilyParkedUntil = new ConcurrentHashMap<>();
+    private static final long SILENT_ADDRESS_COOLDOWN_MS = 60 * 1000L;
 
     /** requested host:port -> chosen address, so a burst of connections probes once. */
     private static final Map<String, String> targetCache = new ConcurrentHashMap<>();
     private static final Map<String, Long> targetCacheAt = new ConcurrentHashMap<>();
     private static final long TARGET_TTL_MS = 60 * 1000L;
+    /** Repeated requests for the same DC subnet share one scan and briefly cool down on misses. */
+    private static final long TARGET_MISS_COOLDOWN_MS = 30 * 1000L;
+    private static final ColgramProbeMissCache probeMisses =
+            new ColgramProbeMissCache(TARGET_MISS_COOLDOWN_MS);
+    private static volatile long lastSuppressedLogAt;
 
     /**
      * How long a server gets to answer the handshake before the address is parked. Telegram's own
@@ -99,28 +91,6 @@ public final class ColgramDcRemap {
      */
     private static final int MIN_ANSWER_BYTES = 20;
     private static final int MIN_TUNNEL_MS = 5000;
-
-    /**
-     * Addresses found by sweeping the requested DC's own /24.
-     *
-     * A fixed list of published addresses can only ever be as good as the last time somebody
-     * wrote it down. Telegram announces its blocks as aggregates and a DC's addresses sit in one
-     * or two /24s, so sweeping the /24 the client actually asked for finds what is reachable
-     * today on this network - including an address that is not in any public list. Cached per
-     * subnet and port, because 254 probes is not something to repeat for every connection.
-     */
-    private static final Map<String, List<String>> discovered = new ConcurrentHashMap<>();
-    private static final Map<String, Long> discoveredAt = new ConcurrentHashMap<>();
-    private static final java.util.Set<String> sweeping =
-            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
-    private static final long DISCOVERY_TTL_MS = 10 * 60 * 1000L;
-    // Sized so a /24 is actually walked inside the budget: at 48 workers and 1.2s per probe the
-    // 254 addresses need ~6.4s and the 4s cutoff returned "0 адресов отвечают" for a /24 that does
-    // contain a reachable address - the sweep looked conclusive while it had only reached a
-    // quarter of the range.
-    private static final int DISCOVERY_CONCURRENCY = 96;
-    private static final int DISCOVERY_TIMEOUT_MS = 900;
-    private static final long DISCOVERY_BUDGET_MS = 12000L;
 
     private static volatile ServerSocket listener;
     private static volatile int boundPort = -1;
@@ -170,7 +140,7 @@ public final class ColgramDcRemap {
     /** Counters and the last decision, for the settings screen and the proxy doctor. */
     public static String describe() {
         if (boundPort <= 0) return "не запущен";
-        return "127.0.0.1:" + boundPort + "; перенаправлено " + remapped.get()
+        return "внутренний маршрут DC; перенаправлено " + remapped.get()
                 + ", отказов " + refused.get() + "; последний выбор: " + lastDecision;
     }
 
@@ -230,10 +200,17 @@ public final class ColgramDcRemap {
             String target = chooseTarget(host, port);
             if (target == null) {
                 refused.incrementAndGet();
-                lastDecision = host + ":" + port + " — ни один адрес Telegram не ответил ("
-                        + candidatesFor(host, port).size() + " проверено, "
-                        + parkedCount() + " припарковано)";
-                Log.w(TAG, lastDecision);
+                if (probeMisses.isSuppressed(probeMissKey(host, port), SystemClock.elapsedRealtime())) {
+                    lastDecision = host + ":" + port + " — повторная проверка адресов отложена";
+                    long now = SystemClock.elapsedRealtime();
+                    if (now - lastSuppressedLogAt >= 10000L) {
+                        lastSuppressedLogAt = now;
+                        Log.w(TAG, lastDecision);
+                    }
+                } else {
+                    lastDecision = host + ":" + port + " — адреса Telegram не ответили";
+                    Log.w(TAG, lastDecision + " (" + parkedCount() + " припарковано)");
+                }
                 refuse(out);
                 close(client);
                 return;
@@ -347,7 +324,18 @@ public final class ColgramDcRemap {
      */
     static String liveAddressFor(String host, int port) {
         if (!isTelegramAddress(host)) return null;
-        return chooseTarget(host, port);
+        return chooseTarget(host, port, true);
+    }
+
+    /** Fallback lookup used after the local listener already failed the requested destination. */
+    static String liveAlternativeFor(String host, int port) {
+        if (!isTelegramAddress(host)) return null;
+        return chooseTarget(host, port, false);
+    }
+
+    /** Skip a TCP-open destination for a short period after its MTProto handshake stayed silent. */
+    public static boolean shouldSkipDirectAddress(String host) {
+        return isTelegramAddress(host) && isParked(host);
     }
 
     /**
@@ -356,20 +344,35 @@ public final class ColgramDcRemap {
      * component has no business rewriting traffic that is not Telegram's.
      */
     private static String chooseTarget(String host, int port) {
+        return chooseTarget(host, port, true);
+    }
+
+    private static String chooseTarget(String host, int port, boolean includeRequestedAddress) {
         if (!isTelegramAddress(host)) return host;
         final String key = host + ":" + port;
         Long cachedAt = targetCacheAt.get(key);
         String cached = targetCache.get(key);
         if (cached != null && cachedAt != null
                 && System.currentTimeMillis() - cachedAt < TARGET_TTL_MS
+                && (includeRequestedAddress || !cached.equals(host))
                 && !isParked(cached) && probe(port, cached)) {
             return cached;
         }
-        // Probed in parallel, not in sequence. Tried sequentially at 2.5 s each, the candidate
-        // list cost tens of seconds and the cap that kept that tolerable silently cut off
-        // 149.154.167.220 - the one Telegram address on this network that answers TCP. The
-        // answer must not depend on where the list happened to be truncated.
+        if (cached != null) targetCache.remove(key, cached);
+        if (cachedAt != null) targetCacheAt.remove(key, cachedAt);
+
+        final String missKey = probeMissKey(host, port);
+        if (!probeMisses.tryBegin(missKey, SystemClock.elapsedRealtime())) {
+            lastDecision = host + ":" + port + " — проверка адресов уже выполняется или отложена";
+            return null;
+        }
+
+        String chosen = null;
+        try {
+        // Probe only the small official alias set for this DC, in parallel. TCP-open is only a
+        // dial hint: the first MTProto reply is bounded and a silent endpoint is cooled down.
         final List<String> candidates = candidatesFor(host, port);
+        if (!includeRequestedAddress) candidates.remove(host);
         candidates.removeIf(ColgramDcRemap::isParked);
         final java.util.concurrent.atomic.AtomicReference<String> winner =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -393,34 +396,46 @@ public final class ColgramDcRemap {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        String chosen = winner.get();
+        chosen = winner.get();
         if (chosen != null) {
             targetCache.put(key, chosen);
             targetCacheAt.put(key, System.currentTimeMillis());
         }
         return chosen;
+        } finally {
+            probeMisses.finish(missKey, chosen != null, SystemClock.elapsedRealtime());
+        }
     }
 
-    /** At most a handful of addresses in a log line: a whole /24 once drowned the rest. */
-    private static String preview(List<String> addresses) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < addresses.size() && i < 6; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(addresses.get(i));
-        }
-        if (addresses.size() > 6) sb.append(" …");
-        return sb.toString();
+    /** Clear stale misses after a route change or an explicit user-triggered retry. */
+    public static void invalidateFailedProbes() {
+        probeMisses.clearFailures();
+    }
+
+    private static String probeMissKey(String host, int port) {
+        String subnet = subnetPrefix(host);
+        return (subnet == null ? host : subnet + "*") + ":" + port;
     }
 
     /** How many addresses this process has already given up on. */
     static int parkedCount() {
         long now = System.currentTimeMillis();
-        int n = 0;
-        for (Long at : parked.values()) if (now - at < PARK_MS) n++;
-        return n;
+        java.util.Set<String> active = new java.util.HashSet<>();
+        for (Map.Entry<String, Long> entry : parked.entrySet()) {
+            if (now - entry.getValue() < PARK_MS) active.add(entry.getKey());
+        }
+        for (Map.Entry<String, Long> entry : temporarilyParkedUntil.entrySet()) {
+            if (now < entry.getValue()) active.add(entry.getKey());
+        }
+        return active.size();
     }
 
     private static boolean isParked(String address) {
+        Long temporaryUntil = temporarilyParkedUntil.get(address);
+        if (temporaryUntil != null) {
+            if (System.currentTimeMillis() < temporaryUntil) return true;
+            temporarilyParkedUntil.remove(address, temporaryUntil);
+        }
         Long at = parked.get(address);
         if (at == null) return false;
         if (System.currentTimeMillis() - at < PARK_MS) return true;
@@ -436,91 +451,34 @@ public final class ColgramDcRemap {
     }
 
     /**
-     * Requested address, then whatever is live in its own /24, then same-/16 neighbours from the
-     * published list, then the rest. The discovered addresses come early because they are the
-     * same DC the client asked for and they were found answering right now.
+     * The local DPI tunnel accepted TCP but the selected address did not answer MTProto.
+     * Drop every cached mapping to it so the next tgnet retry can try a different candidate.
      */
-    static List<String> candidatesFor(String host, int port) {
-        LinkedHashSet<String> sameSubnet = new LinkedHashSet<>();
-        LinkedHashSet<String> other = new LinkedHashSet<>();
-        String prefix = subnetPrefix(host);
-        for (String address : TELEGRAM_ADDRESSES) {
-            if (address.equals(host)) continue;
-            if (prefix != null && address.startsWith(prefix)) sameSubnet.add(address);
-            else other.add(address);
-        }
-        List<String> out = new ArrayList<>();
-        out.add(host);
-        if (prefix != null) {
-            for (String live : discoverLive(prefix, port)) {
-                if (!live.equals(host)) out.add(live);
+    public static void reportSilentAddress(String address, int port) {
+        if (!isTelegramAddress(address) || port <= 0) return;
+        long until = System.currentTimeMillis() + SILENT_ADDRESS_COOLDOWN_MS;
+        temporarilyParkedUntil.put(address, until);
+        String directKey = address + ":" + port;
+        targetCache.remove(directKey);
+        targetCacheAt.remove(directKey);
+        for (Map.Entry<String, String> entry : targetCache.entrySet()) {
+            if (address.equals(entry.getValue()) && targetCache.remove(entry.getKey(), address)) {
+                targetCacheAt.remove(entry.getKey());
             }
         }
-        out.addAll(sameSubnet);
-        out.addAll(other);
+        probeMisses.clearFailures();
+        Log.w(TAG, "parked silent MTProto address " + address + ":" + port
+                + " for " + SILENT_ADDRESS_COOLDOWN_MS + "ms; next retry will select another candidate");
+    }
+
+    /** Requested address followed only by the stock-configured aliases for its own DC. */
+    static List<String> candidatesFor(String host, int port) {
+        List<String> out = new ArrayList<>();
+        java.util.Collections.addAll(out, ColgramTelegramDcAddresses.candidatesFor(host));
         return out;
     }
 
-    /**
-     * Sweep one /24 for addresses that complete a TCP connection on {@code port}.
-     *
-     * Bounded and best-effort on purpose: the budget returns whatever answered by the cutoff
-     * rather than waiting out 254 timeouts, and a second caller asking during a sweep gets an
-     * empty list instead of a duplicate sweep - the published list still covers that call.
-     */
-    static List<String> discoverLive(String subnet, int port) {
-        final String key = subnet + port;
-        Long at = discoveredAt.get(key);
-        List<String> cached = discovered.get(key);
-        if (cached != null && at != null && System.currentTimeMillis() - at < DISCOVERY_TTL_MS) {
-            return cached;
-        }
-        if (!sweeping.add(key)) return java.util.Collections.emptyList();
-        final List<String> found = java.util.Collections.synchronizedList(new ArrayList<String>());
-        try {
-            final java.util.concurrent.atomic.AtomicInteger next =
-                    new java.util.concurrent.atomic.AtomicInteger(1);
-            final java.util.concurrent.CountDownLatch done =
-                    new java.util.concurrent.CountDownLatch(254);
-            for (int w = 0; w < DISCOVERY_CONCURRENCY; w++) {
-                Thread t = new Thread(() -> {
-                    while (true) {
-                        int last = next.getAndIncrement();
-                        if (last > 254) {
-                            // This worker took no address, so it owes no countdown.
-                            return;
-                        }
-                        try {
-                            String candidate = subnet + last;
-                            if (!isParked(candidate) && probe(DISCOVERY_TIMEOUT_MS, candidate, port)) {
-                                found.add(candidate);
-                            }
-                        } finally {
-                            done.countDown();
-                        }
-                    }
-                }, "colgram-dc-sweep");
-                t.setDaemon(true);
-                t.start();
-            }
-            try {
-                done.await(DISCOVERY_BUDGET_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        } finally {
-            sweeping.remove(key);
-        }
-        List<String> snapshot = new ArrayList<>(found);
-        discovered.put(key, snapshot);
-        discoveredAt.put(key, System.currentTimeMillis());
-        Log.i(TAG, "swept " + subnet + "1-254 on :" + port + " - " + snapshot.size()
-                + " открывают TCP" + (snapshot.isEmpty() ? "" : ": " + preview(snapshot))
-                + "; бесполезные отсеет парковка по ответу");
-        return snapshot;
-    }
-
-    /** The "a.b.c." part of an IPv4 literal - the /24 whose neighbours are worth sweeping. */
+    /** The "a.b.c." part of an IPv4 literal for grouping a short-lived negative cache. */
     private static String subnetPrefix(String host) {
         int seen = 0;
         for (int i = 0; i < host.length(); i++) {
@@ -532,6 +490,7 @@ public final class ColgramDcRemap {
 
     static boolean isTelegramAddress(String host) {
         if (host == null) return false;
+        if (ColgramTelegramDcAddresses.isKnownAddress(host)) return true;
         for (String prefix : TELEGRAM_PREFIXES) {
             if (host.startsWith(prefix)) return true;
         }
@@ -560,6 +519,31 @@ public final class ColgramDcRemap {
         } finally {
             close(s);
         }
+    }
+
+    /**
+     * Quick "can this network even route to Telegram" check, for startup ordering.
+     *
+     * Probes two production DC addresses on 443 with a short budget. Any answer means the
+     * network still routes Telegram (possibly behind signature filtering, which is what the
+     * desync listener is for); both refused or dropped means an IP-level block, where only a
+     * real proxy carries traffic. Returns the winning RTT in ms, or -1.
+     */
+    public static int telegramDcProbe() {
+        long startedAt = System.currentTimeMillis();
+        String[][] candidates = {
+                {"149.154.167.51", "443"},
+                {"149.154.175.50", "443"},
+        };
+        for (String[] c : candidates) {
+            try {
+                int port = Integer.parseInt(c[1]);
+                if (probe(1500, c[0], port)) {
+                    return (int) Math.max(1L, System.currentTimeMillis() - startedAt);
+                }
+            } catch (Throwable ignored) {}
+        }
+        return -1;
     }
 
     /*

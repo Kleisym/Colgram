@@ -62,7 +62,7 @@ public class ColgramProxyDoctor {
         }
 
         if (current != null) {
-            return "Активный прокси: " + current.address + ":" + current.port
+            return "Активный маршрут: " + current
                     + " (" + ColgramProxyManager.describePing(current) + ") | " + stats;
         }
         return "Прокси не применён (прямое соединение) | " + stats;

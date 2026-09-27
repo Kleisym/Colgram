@@ -43,7 +43,9 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
@@ -163,7 +165,7 @@ public class ColgramTempMailActivity extends BaseFragment {
         restoreSavedMailboxLocal();
 
         try {
-            Context ctx = getParentActivity();
+            Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
             if (ctx != null) {
                 autoRefreshEnabled = ctx
                         .getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE)
@@ -185,7 +187,9 @@ public class ColgramTempMailActivity extends BaseFragment {
      */
     private boolean restoreSavedMailboxLocal() {
         try {
-            Context ctx = getParentActivity();
+            // onFragmentCreate runs before this fragment is attached to an Activity.
+            // The application context is already live and owns the same preferences.
+            Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
             if (ctx == null) return false;
             android.content.SharedPreferences prefs =
                     ctx.getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE);
@@ -197,6 +201,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             currentLogin = prefs.getString("login", "");
             currentDomain = prefs.getString("domain", "");
             mailTmToken = prefs.getString("token", "");
+            apiBase = prefs.getString("api_base", "https://api.mail.tm");
             return true;
         } catch (Throwable t) {
             Log.w(TAG, "restoreSavedMailboxLocal failed: " + t.getMessage());
@@ -268,10 +273,10 @@ public class ColgramTempMailActivity extends BaseFragment {
         AlertDialog.Builder domainDialog = new AlertDialog.Builder(ctx)
                 .setTitle("Домен для нового ящика");
         // An empty list with no explanation is what made this read as a broken feature, so the
-        // failure is named per host. The endings people ask for are named too: gmail.com and
-        // googlemail.com belong to Google, no disposable service can hand out an address on
-        // them, and anything that promises one is a trap - so the honest answer lives here.
-        String note = "gmail.com / googlemail.com как одноразовые не существуют - это чужие почтовые домены.\n";
+        // Failure is named per host. The built-in API mailbox can only create addresses on
+        // domains operated by its provider; web providers may expose other flows, including
+        // their own Gmail/Outlook account pools. Keep those choices in the website list above.
+        String note = "Встроенный ящик выдаёт только домены своего сервиса. Для вариантов Gmail / Outlook открой SmailPro или 22.do в верхнем списке.\n";
         if (!providerStatusLine.isEmpty()) {
             note = providerStatusLine + "\n" + note;
         }
@@ -280,7 +285,8 @@ public class ColgramTempMailActivity extends BaseFragment {
                     + (lastDomainError == null || lastDomainError.isEmpty()
                             ? "сервис не отвечал" : lastDomainError));
         } else {
-            domainDialog.setMessage(note + "Ниже - домены, которые реально выдаёт активный сервис.");
+            domainDialog.setMessage(note + "Ниже - активные домены доступных сервисов."
+                    + (lastDomainError == null ? "" : "\nЧасть сервисов недоступна:\n" + lastDomainError));
         }
         domainDialog
                 .setItems(opts.toArray(new String[0]), (d, which) -> {
@@ -312,12 +318,9 @@ public class ColgramTempMailActivity extends BaseFragment {
      * of these hosts fails to connect, while guerrillamail.com answers, so "no domains" here is
      * the network, not the code.
      */
-    private static final String[] DOMAIN_ENDPOINTS = {
-            // Tested from this network on 2026-09-22: api.mail.tm times out mid-TLS, and the
-            // community mirrors I listed here first do not even resolve - they were guesses, so
-            // they are gone. Kept because mail.tm is the real API on a normal network, and every
-            // failure is now reported per host instead of showing an empty list.
-            "https://api.mail.tm/domains?page=1",
+    private static final String[] DOMAIN_API_BASES = {
+            "https://api.mail.tm",
+            "https://api.mail.gw",
     };
 
     /** The one disposable-mail API that did answer here, with its API shape verified by hand. */
@@ -332,6 +335,8 @@ public class ColgramTempMailActivity extends BaseFragment {
      * cannot receive anything.
      */
     private String apiBase = "https://api.mail.tm";
+    /** The mailbox must be created and polled on the service that listed its domain. */
+    private final Map<String, String> domainApiBases = new HashMap<>();
 
     /** "mailtm" or "guerrilla"; decides which backend the inbox calls go to. */
     private String provider = "mailtm";
@@ -342,46 +347,57 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private ArrayList<String> fetchDomainList() {
         ArrayList<String> out = new ArrayList<>();
+        domainApiBases.clear();
         StringBuilder reasons = new StringBuilder();
-        for (String endpoint : DOMAIN_ENDPOINTS) {
+        for (String base : DOMAIN_API_BASES) {
             try {
-                JSONObject domRes = httpGetJson(endpoint);
-                JSONArray members = domRes.optJSONArray("hydra:member");
-                if (members == null || members.length() == 0) {
-                    reasons.append(hostOf(endpoint)).append(": пустой ответ\n");
-                    continue;
+                int page = 1;
+                int seen = 0;
+                while (page <= 20) {
+                    JSONObject domRes = httpGetJson(base + "/domains?page=" + page);
+                    JSONArray members = domRes.optJSONArray("hydra:member");
+                    if (members == null || members.length() == 0) break;
+                    seen += members.length();
+                    for (int i = 0; i < members.length(); i++) {
+                        JSONObject d = members.optJSONObject(i);
+                        if (d == null || !d.optBoolean("isActive", true)
+                                || d.optBoolean("isPrivate", false)) continue;
+                        String dn = d.optString("domain", "").trim();
+                        if (!dn.isEmpty() && !domainApiBases.containsKey(dn)) {
+                            domainApiBases.put(dn, base);
+                            out.add(dn);
+                        }
+                    }
+                    JSONObject view = domRes.optJSONObject("hydra:view");
+                    String next = view == null ? "" : view.optString("hydra:next", "");
+                    int total = domRes.optInt("hydra:totalItems", -1);
+                    if (next.isEmpty() && (total >= 0 ? seen >= total : members.length() < 30)) break;
+                    page++;
+                    // Both services document an 8 QPS limit. Domain loading is never on the UI thread.
+                    Thread.sleep(175);
                 }
-                for (int i = 0; i < members.length(); i++) {
-                    JSONObject d = members.optJSONObject(i);
-                    if (d == null) continue;
-                    // An inactive domain accepts the account and then rejects the token.
-                    if (!d.optBoolean("isActive", true)) continue;
-                    String dn = d.optString("domain", "");
-                    if (!dn.isEmpty()) out.add(dn);
-                }
-                if (!out.isEmpty()) {
-                    lastDomainError = null;
-                    return out;
-                }
-                reasons.append(hostOf(endpoint)).append(": нет активных доменов\n");
+                if (seen == 0) reasons.append(hostOf(base)).append(": нет активных доменов\n");
             } catch (Throwable t) {
                 String msg = t.getMessage();
-                reasons.append(hostOf(endpoint)).append(": ")
+                reasons.append(hostOf(base)).append(": ")
                         .append(msg == null || msg.isEmpty() ? t.getClass().getSimpleName() : msg)
                         .append('\n');
             }
         }
-        lastDomainError = reasons.length() == 0 ? "неизвестная ошибка" : reasons.toString().trim();
-        Log.w(TAG, "fetchDomainList failed: " + lastDomainError);
-        probeProviderStatus();
+        lastDomainError = reasons.length() == 0 ? null : reasons.toString().trim();
+        if (out.isEmpty()) {
+            if (lastDomainError == null) lastDomainError = "сервисы не вернули активных доменов";
+            Log.w(TAG, "fetchDomainList failed: " + lastDomainError);
+            probeProviderStatus();
+        }
         return out;
     }
 
-    /** One line saying which backend answers from this network, and how fast. */
+    /** Which backends answer from this network, and how fast. */
     private String providerStatusLine = "";
 
     /**
-     * Measured reachability of both backends, for the picker. "The temp mails do not work" is
+     * Measured reachability of the backends, for the picker. "The temp mails do not work" is
      * usually "this network cannot reach this host", and the only way to tell those apart is to
      * actually try and say what happened. Runs on the caller's background thread.
      */
@@ -389,10 +405,17 @@ public class ColgramTempMailActivity extends BaseFragment {
         StringBuilder sb = new StringBuilder("Доступность с этой сети:\n");
         long t = System.currentTimeMillis();
         try {
-            httpGetJson(DOMAIN_ENDPOINTS[0]);
+            httpGetJson(DOMAIN_API_BASES[0] + "/domains?page=1");
             sb.append("mail.tm: отвечает (").append(System.currentTimeMillis() - t).append(" мс)\n");
         } catch (Throwable e) {
             sb.append("mail.tm: не отвечает\n");
+        }
+        t = System.currentTimeMillis();
+        try {
+            httpGetJson(DOMAIN_API_BASES[1] + "/domains?page=1");
+            sb.append("mail.gw: отвечает (").append(System.currentTimeMillis() - t).append(" мс)\n");
+        } catch (Throwable e) {
+            sb.append("mail.gw: не отвечает\n");
         }
         t = System.currentTimeMillis();
         try {
@@ -453,7 +476,7 @@ public class ColgramTempMailActivity extends BaseFragment {
      */
     private boolean restoreSavedMailbox() {
         try {
-            Context ctx = getParentActivity();
+            Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
             if (ctx == null) return false;
             android.content.SharedPreferences prefs =
                     ctx.getSharedPreferences("colgram_tempmail", Context.MODE_PRIVATE);
@@ -465,6 +488,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             currentLogin = prefs.getString("login", "");
             currentDomain = prefs.getString("domain", "");
             mailTmToken = prefs.getString("token", "");
+            apiBase = prefs.getString("api_base", "https://api.mail.tm");
 
             // The stored token is probably stale; refresh it up front so the first poll
             // does not have to fail before recovering.
@@ -590,6 +614,9 @@ public class ColgramTempMailActivity extends BaseFragment {
                     }
                     return resolved;
                 });
+                // A domain is only valid on the provider that advertised it. Mixing a Mail.gw
+                // domain with Mail.tm /accounts causes 422 and leaves the picker looking broken.
+                apiBase = domainApiBases.getOrDefault(domain, "https://api.mail.tm");
 
                 final String login = "colgram" + System.currentTimeMillis() % 1000000 + (int) (Math.random() * 9000 + 1000);
                 final String address = login + "@" + domain;
@@ -628,13 +655,15 @@ public class ColgramTempMailActivity extends BaseFragment {
                     // Persist the mailbox credentials: the JWT is short-lived and the
                     // account is the only way to get a new one, so it must survive a
                     // restart or the user loses the inbox they were watching.
-                    if (getParentActivity() != null) {
-                        getParentActivity().getSharedPreferences("colgram_tempmail", android.content.Context.MODE_PRIVATE)
+                    Context prefsContext = org.telegram.messenger.ApplicationLoader.applicationContext;
+                    if (prefsContext != null) {
+                        prefsContext.getSharedPreferences("colgram_tempmail", android.content.Context.MODE_PRIVATE)
                                 .edit()
                                 .putString("address", address)
                                 .putString("password", password)
                                 .putString("login", login)
                                 .putString("domain", domain)
+                                .putString("api_base", apiBase)
                                 .putString("token", token)
                                 .apply();
                     }
@@ -1029,20 +1058,47 @@ public class ColgramTempMailActivity extends BaseFragment {
         Toast.makeText(getParentActivity(), "Загрузка письма...", Toast.LENGTH_SHORT).show();
         executor.execute(() -> {
             try {
-                // Find the mail.tm message id from the cached list by hash code match
-                String targetId = null;
+                // Find the message id from the cached list by hash code match
+                TempMessage target = null;
                 for (TempMessage m : messages) {
-                    if (m.id == messageId) { targetId = m.tmId; break; }
+                    if (m.id == messageId) { target = m; break; }
                 }
-                if (targetId == null) return;
+                if (target == null) return;
 
-                JSONObject obj = httpGetJsonWithAuth(apiBase + "/messages/" + targetId, mailTmToken);
-                String from = "";
-                JSONObject fromObj = obj.optJSONObject("from");
-                if (fromObj != null) from = fromObj.optString("address", "");
-                String subject = obj.optString("subject", "");
-                String textBody = obj.optString("text", "");
-                if (textBody.isEmpty()) textBody = obj.optString("intro", "");
+                String from;
+                String subject;
+                String textBody;
+                if ("guerrilla".equals(provider)) {
+                    // GuerrillaMail body read. This branch did not exist before: the code
+                    // below always hit the mail.tm endpoint, so a guerrilla inbox listed its
+                    // letters fine and then failed to open every single one of them. The
+                    // tmId slot carries "mail_id:mail_secret" (see loadGuerrillaInbox).
+                    int sep = target.tmId.indexOf(':');
+                    String gid = sep > 0 ? target.tmId.substring(0, sep) : target.tmId;
+                    JSONObject obj = guerrillaGet("f=fetch_email&email_id="
+                            + java.net.URLEncoder.encode(gid, "UTF-8"));
+                    from = obj.optString("mail_from", target.from);
+                    subject = obj.optString("mail_subject", target.subject);
+                    textBody = obj.optString("mail_body", "");
+                    // The body arrives as HTML; a plain-text read of the tags is what the
+                    // dialog needs. Strip tags and unescape the handful of entities that
+                    // matter instead of showing raw markup.
+                    textBody = textBody.replaceAll("(?is)<br\\s*/?>", "\n")
+                            .replaceAll("(?is)</p>", "\n\n")
+                            .replaceAll("(?is)<[^>]+>", "")
+                            .replace("&nbsp;", " ").replace("&amp;", "&")
+                            .replace("&lt;", "<").replace("&gt;", ">")
+                            .replace("&quot;", "\"").replace("&#39;", "'")
+                            .replaceAll("\n{3,}", "\n\n").trim();
+                } else {
+                    JSONObject obj = httpGetJsonWithAuth(apiBase + "/messages/" + target.tmId, mailTmToken);
+                    from = "";
+                    JSONObject fromObj = obj.optJSONObject("from");
+                    if (fromObj != null) from = fromObj.optString("address", "");
+                    subject = obj.optString("subject", "");
+                    textBody = obj.optString("text", "");
+                    if (textBody.isEmpty()) textBody = obj.optString("intro", "");
+                }
 
                 String detectedOtp = "";
                 Pattern pattern = Pattern.compile("\\b(\\d{4,8})\\b");
@@ -1145,13 +1201,14 @@ public class ColgramTempMailActivity extends BaseFragment {
 
         listView.setOnItemClickListener((view, position) -> {
             int msgCount = messages.size();
-            if (position >= 2 && position < 2 + msgCount) {
-                int msgIndex = position - 2;
-                readMessageContent(messages.get(msgIndex).id);
+            if (position >= 1 && position <= WEB_TEMP_SERVICES.length) {
+                int webIndex = position - 1;
+                Browser.openUrl(getParentActivity(), WEB_TEMP_SERVICES[webIndex][1]);
             } else {
-                int webIndex = position - (2 + (msgCount == 0 ? 1 : msgCount) + 2);
-                if (webIndex >= 0 && webIndex < WEB_TEMP_SERVICES.length) {
-                    Browser.openUrl(getParentActivity(), WEB_TEMP_SERVICES[webIndex][1]);
+                int messageStart = WEB_TEMP_SERVICES.length + 4;
+                if (msgCount > 0 && position >= messageStart && position < messageStart + msgCount) {
+                    int msgIndex = position - messageStart;
+                    readMessageContent(messages.get(msgIndex).id);
                 }
             }
         });
@@ -1169,7 +1226,7 @@ public class ColgramTempMailActivity extends BaseFragment {
         @Override
         public int getItemCount() {
             int msgCount = messages.size();
-            return 1 + 1 + (msgCount == 0 ? 1 : msgCount) + 1 + 1 + WEB_TEMP_SERVICES.length;
+            return 1 + WEB_TEMP_SERVICES.length + 1 + 1 + 1 + (msgCount == 0 ? 1 : msgCount);
         }
 
         @Override
@@ -1177,20 +1234,23 @@ public class ColgramTempMailActivity extends BaseFragment {
             int pos = holder.getAdapterPosition();
             int msgCount = messages.size();
             if (pos == 0) return false;
-            if (pos == 1) return false;
-            if (msgCount == 0 && pos == 2) return false;
-            int shadowPos = 2 + (msgCount == 0 ? 1 : msgCount);
-            if (pos == shadowPos || pos == shadowPos + 1) return false;
+            int shadowPos = WEB_TEMP_SERVICES.length + 1;
+            int addressPos = shadowPos + 1;
+            int inboxHeaderPos = addressPos + 1;
+            int contentPos = inboxHeaderPos + 1;
+            if (pos == shadowPos || pos == addressPos || pos == inboxHeaderPos) return false;
+            if (msgCount == 0 && pos == contentPos) return false;
             return true;
         }
 
         @Override
         public int getItemViewType(int position) {
-            int msgCount = messages.size();
-            int shadowPos = 2 + (msgCount == 0 ? 1 : msgCount);
-            if (position == 0) return 10;
-            if (position == 1 || position == shadowPos + 1) return 0;
+            int shadowPos = WEB_TEMP_SERVICES.length + 1;
+            int addressPos = shadowPos + 1;
+            int inboxHeaderPos = addressPos + 1;
+            if (position == 0 || position == inboxHeaderPos) return 0;
             if (position == shadowPos) return 3;
+            if (position == addressPos) return 10;
             return 2;
         }
 
@@ -1272,7 +1332,10 @@ public class ColgramTempMailActivity extends BaseFragment {
         @Override
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
             int msgCount = messages.size();
-            int shadowPos = 2 + (msgCount == 0 ? 1 : msgCount);
+            int shadowPos = WEB_TEMP_SERVICES.length + 1;
+            int addressPos = shadowPos + 1;
+            int inboxHeaderPos = addressPos + 1;
+            int contentPos = inboxHeaderPos + 1;
 
             switch (holder.getItemViewType()) {
                 case 10: {
@@ -1287,16 +1350,20 @@ public class ColgramTempMailActivity extends BaseFragment {
                 }
                 case 0: {
                     HeaderCell h = (HeaderCell) holder.itemView;
-                    if (position == 1) {
-                        h.setText("Входящие письма (" + msgCount + ")");
+                    if (position == 0) {
+                        h.setText("Сайты без API-ключей");
                     } else {
-                        h.setText("Веб-сервисы временных почт");
+                        h.setText("Входящие письма (" + msgCount + ")");
                     }
                     break;
                 }
                 case 2: {
                     TextSettingsCell s = (TextSettingsCell) holder.itemView;
-                    if (position >= 2 && position < shadowPos) {
+                    if (position >= 1 && position <= WEB_TEMP_SERVICES.length) {
+                        int webIndex = position - 1;
+                        s.setTextAndValue(WEB_TEMP_SERVICES[webIndex][0], WEB_TEMP_SERVICES[webIndex][2],
+                                webIndex < WEB_TEMP_SERVICES.length - 1);
+                    } else if (position >= contentPos) {
                         if (msgCount == 0) {
                             // Polling is opt-in, so promising a 5 second refresh while "Авто" is
                             // off was simply false.
@@ -1304,14 +1371,9 @@ public class ColgramTempMailActivity extends BaseFragment {
                                     ? "Ожидание писем... обновляется каждые 5 сек"
                                     : "Писем пока нет. Включи «Авто» — будут приходить сами", false);
                         } else {
-                            int mIdx = position - 2;
+                            int mIdx = position - contentPos;
                             TempMessage m = messages.get(mIdx);
                             s.setTextAndValue(m.subject.isEmpty() ? "(Без темы)" : m.subject, m.from, mIdx < msgCount - 1);
-                        }
-                    } else {
-                        int webIndex = position - (shadowPos + 2);
-                        if (webIndex >= 0 && webIndex < WEB_TEMP_SERVICES.length) {
-                            s.setTextAndValue(WEB_TEMP_SERVICES[webIndex][0], WEB_TEMP_SERVICES[webIndex][2], webIndex < WEB_TEMP_SERVICES.length - 1);
                         }
                     }
                     break;

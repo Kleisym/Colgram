@@ -2,6 +2,7 @@ package org.colgram.core;
 
 import android.content.Context;
 import android.os.Environment;
+import android.util.Log;
 
 import java.io.File;
 
@@ -13,6 +14,7 @@ import java.io.File;
 public class ColgramStorageSandbox {
 
     private static File sandboxRoot;
+    private static File cacheRoot;
 
     public static void init(Context context) {
         if (context == null) return;
@@ -42,6 +44,16 @@ public class ColgramStorageSandbox {
         if (sandboxRoot != null && !sandboxRoot.exists()) {
             sandboxRoot.mkdirs();
         }
+
+        // Telegram's media cache is private working storage, not a user export. Public
+        // Documents/Colgram/Cache made Android 16's MediaProvider reject image and video
+        // reads even though the app itself could create the files there. Keep exported media
+        // in the selected sandbox, but place cache files in this app's own external area.
+        File external = context.getExternalFilesDir(null);
+        File candidate = external == null ? null : new File(external, "Colgram/Cache");
+        if (!isWritable(candidate)) candidate = new File(context.getCacheDir(), "Colgram");
+        cacheRoot = candidate;
+        Log.i("ColgramStorageSandbox", "media cache=" + cacheRoot.getAbsolutePath());
     }
 
     /**
@@ -89,6 +101,7 @@ public class ColgramStorageSandbox {
     public static File getSandboxedDirectory(Context context, int type) {
         File root = getSandboxRootDir(context);
         if (root == null) return null;
+        if (type == 4) return cacheRoot;
 
         String subFolder;
         switch (type) {
@@ -130,7 +143,12 @@ public class ColgramStorageSandbox {
         try {
             String canonicalRoot = root.getCanonicalPath();
             String canonicalPath = new File(path).getCanonicalPath();
-            return canonicalPath.startsWith(canonicalRoot);
+            boolean inRoot = canonicalPath.equals(canonicalRoot)
+                    || canonicalPath.startsWith(canonicalRoot + File.separator);
+            if (cacheRoot == null) return inRoot;
+            String canonicalCache = cacheRoot.getCanonicalPath();
+            return inRoot || canonicalPath.equals(canonicalCache)
+                    || canonicalPath.startsWith(canonicalCache + File.separator);
         } catch (Exception e) {
             return false;
         }

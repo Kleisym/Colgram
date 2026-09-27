@@ -38,9 +38,10 @@ public class ColgramPluginManager {
         public final String author;
         public final String version;
         public final String command;
+        public final boolean builtIn;
         public boolean isEnabled = true;
 
-        public PluginInfo(String name, String fileName, String description, String author, String version, String command, boolean isEnabled) {
+        public PluginInfo(String name, String fileName, String description, String author, String version, String command, boolean isEnabled, boolean builtIn) {
             this.name = name;
             this.fileName = fileName;
             this.description = description;
@@ -48,6 +49,7 @@ public class ColgramPluginManager {
             this.version = version;
             this.command = command;
             this.isEnabled = isEnabled;
+            this.builtIn = builtIn;
         }
     }
 
@@ -76,9 +78,6 @@ public class ColgramPluginManager {
                 }
             } catch (Throwable ignored) {}
 
-            // 3. Create default built-in plugins if none exist
-            createDefaultPluginsIfEmpty(internalPluginsDir);
-
             // 3b. Always refresh the exteraGram compatibility shim. It is infrastructure,
             //     not a user plugin, so it is overwritten on every start — that way a
             //     Colgram update that changes the shim takes effect without the user
@@ -99,26 +98,34 @@ public class ColgramPluginManager {
     /**
      * Copy every plugin the APK ships in assets/plugins into the live plugins directory.
      *
-     * The marketplace used to be a list of download URLs, which meant that on a blocked or
-     * offline network the catalog was decoration: nothing could be installed, and the entries
-     * people actually want (auto-reply, keyword alerts, message logging, chat export) never ran.
-     * The apply-patches script puts those files in assets, so here they simply become built in.
-     * Refreshed on every start, exactly like the compatibility shim, so a Colgram update ships
-     * fixed plugins without the user clearing anything; enabled/disabled state lives in prefs and
-     * is not touched by rewriting the file.
+     * The four features that used to ship as Python plugins (auto reply, keyword alerts,
+     * message logger, chat exporter) are native built-ins now, so they are deliberately NOT
+     * installed any more - and stale copies from an older build are removed, because a
+     * leftover auto_reply.py answered alongside the native auto-reply and made every incoming
+     * message produce two replies. Only the exteraGram compatibility shim remains here, since
+     * it is infrastructure for imported .plugin files, not a feature.
      */
     public static void installBundledCatalog() {
         if (appContext == null || internalPluginsDir == null) return;
         try {
-            String[] names = appContext.getAssets().list("plugins");
-            if (names == null || names.length == 0) return;
-            for (String name : names) {
-                if (!name.endsWith(".py") && !name.endsWith(".plugin")) continue;
-                installBundledPlugin(name);
+            for (String name : new String[]{"auto_reply.py", "keyword_alerts.py",
+                    "message_logger.py", "chat_exporter.py"}) {
+                File stale = new File(internalPluginsDir, name);
+                if (stale.exists() && stale.delete()) {
+                    Log.i(TAG, "removed stale bundled plugin " + name + " (now a built-in feature)");
+                }
             }
         } catch (Throwable t) {
             Log.w(TAG, "installBundledCatalog failed: " + t.getMessage());
         }
+    }
+
+    /** Packaged features are part of Colgram, not removable marketplace plugins. */
+    public static boolean isBundledFeature(String fileName) {
+        return "auto_reply.py".equals(fileName)
+                || "keyword_alerts.py".equals(fileName)
+                || "message_logger.py".equals(fileName)
+                || "chat_exporter.py".equals(fileName);
     }
 
     public static synchronized void reloadPlugins() {
@@ -183,6 +190,7 @@ public class ColgramPluginManager {
         for (File f : files) {
             try {
                 String fileName = f.getName();
+                if ("extera_compat.py".equals(fileName)) continue;
                 String name = fileName.replace(".py", "");
                 String description = "Colgram Script Plugin";
                 String author = "Colgram Team";
@@ -191,8 +199,11 @@ public class ColgramPluginManager {
 
                 BufferedReader r = new BufferedReader(new FileReader(f));
                 String line;
+                StringBuilder head = new StringBuilder();
+                int headLines = 0;
                 while ((line = r.readLine()) != null) {
                     line = line.trim();
+                    if (headLines++ < 60) head.append(line).append('\n');
                     if (line.startsWith("# name:")) description = line.substring(7).trim();
                     else if (line.startsWith("# title:")) name = line.substring(8).trim();
                     else if (line.startsWith("# author:")) author = line.substring(9).trim();
@@ -201,8 +212,21 @@ public class ColgramPluginManager {
                 }
                 r.close();
 
+                // exteraGram plugin metadata (https://plugins.exteragram.app): Python string
+                // constants such as __name__ = "Weather" declared at module top level. Their
+                // .plugin files carry no "# name:" comment header, so without this every
+                // imported extera plugin showed up as its file name with no author or version.
+                String h = head.toString();
+                String v;
+                if ((v = stringConst(h, "__name__")) != null) name = v;
+                if ((v = stringConst(h, "__description__")) != null) description = v;
+                if ((v = stringConst(h, "__author__")) != null) author = v;
+                if ((v = stringConst(h, "__version__")) != null) version = v;
+                if ((v = stringConst(h, "__command__")) != null) command = v.toLowerCase();
+
                 boolean isEnabled = prefs == null || prefs.getBoolean("plugin_enabled_" + fileName, true);
-                PluginInfo p = new PluginInfo(name, fileName, description, author, version, command, isEnabled);
+                boolean builtIn = dir.equals(internalPluginsDir) && isBundledFeature(fileName);
+                PluginInfo p = new PluginInfo(name, fileName, description, author, version, command, isEnabled, builtIn);
                 loadedPlugins.add(p);
 
                 if (isEnabled && !command.isEmpty()) {
@@ -213,6 +237,14 @@ public class ColgramPluginManager {
                 Log.e(TAG, "Error parsing plugin: " + f.getName(), t);
             }
         }
+    }
+
+    /** Pull a module-level string constant (`__name__ = "..."`) out of the file head. */
+    private static String stringConst(String head, String varName) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "^" + varName + "\\s*=\\s*[\"'](.+?)[\"']", java.util.regex.Pattern.MULTILINE)
+                .matcher(head);
+        return m.find() ? m.group(1) : null;
     }
 
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text) {
@@ -245,6 +277,9 @@ public class ColgramPluginManager {
         // 2. Built-in command handlers
         if ("spam".equals(cmd)) {
             handleSpamCommand(dialogId, args);
+            return true;
+        } else if ("export".equals(cmd)) {
+            handleExportCommand(dialogId);
             return true;
         } else if ("info".equals(cmd)) {
             handleInfoCommand(dialogId);
@@ -379,24 +414,47 @@ public class ColgramPluginManager {
         }).start();
     }
 
+    /**
+     * Built-in chat export (the former chat_exporter.py plugin, now native).
+     */
+    private static void handleExportCommand(long dialogId) {
+        toast("Собираю экспорт диалога…");
+        new Thread(() -> {
+            final java.io.File file = ColgramChatExport.exportDialog(dialogId);
+            if (file != null) {
+                toast("Экспорт готов: " + file.getAbsolutePath());
+            } else {
+                toast("Экспорт не удался: в кэше нет сообщений этого диалога");
+            }
+        }, "colgram-export").start();
+    }
+
     private static void handleInfoCommand(long dialogId) {
         String info = "ℹ️ **Colgram Chat Info**\n"
                 + "• Dialog ID: `" + dialogId + "`\n"
                 + "• Client: `Colgram v11.1.3`\n"
                 + "• Plugins Loaded: `" + loadedPlugins.size() + "`\n"
                 + "• Engine: `CPython 3.11 Embedded`\n"
-                + "• DPI Bypass: `" + (ColgramDpiBypass.isRunning() ? "Active (127.0.0.1:9876)" : "Offline") + "`";
+                + "• DPI Bypass: `" + (ColgramDpiBypass.isRunning() ? "Встроенный маршрут активен" : "Offline") + "`";
         ColgramPythonEngine.sendMessage(dialogId, info);
     }
 
     private static void executePluginCommand(long dialogId, PluginInfo plugin, String cmd, String args) {
         new Thread(() -> {
             try {
-                String pySnippet = "import " + plugin.name + "\n"
-                        + "if hasattr(" + plugin.name + ", 'on_command'):\n"
-                        + "    res = " + plugin.name + ".on_command('" + cmd + "', '''" + args.replace("'", "\\'") + "''')\n"
-                        + "    if res: print(res)";
-                String output = ColgramPythonEngine.executeCode(pySnippet);
+                String module = plugin.fileName.substring(0, plugin.fileName.length() - 3);
+                if (!module.matches("[A-Za-z_][A-Za-z0-9_]*")) return;
+                String encoded = android.util.Base64.encodeToString(
+                        args.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
+                String firstArg = plugin.builtIn ? Long.toString(dialogId) : "'" + cmd + "'";
+                String pySnippet = "import base64, importlib\n"
+                        + "_m = importlib.import_module('" + module + "')\n"
+                        + "_f = getattr(_m, 'on_command', None)\n"
+                        + "if _f is not None:\n"
+                        + "    _a = base64.b64decode('" + encoded + "').decode('utf-8')\n"
+                        + "    _r = _f(" + firstArg + ", _a)\n"
+                        + "    if _r: print(_r)\n";
+                String output = ColgramPythonEngine.executePluginCode(pySnippet);
                 if (output != null && !output.trim().isEmpty() && !output.startsWith("Executed")) {
                     ColgramPythonEngine.sendMessage(dialogId, output.trim());
                 }
@@ -449,7 +507,7 @@ public class ColgramPluginManager {
                             + "    _r = _f(" + dialogId + ", _t)\n"
                             + "    if _r:\n"
                             + "        print(_r)\n";
-                    String out = ColgramPythonEngine.executeCode(snippet);
+                    String out = ColgramPythonEngine.executePluginCode(snippet);
                     if (out == null) continue;
                     String reply = out.trim();
                     // executeCode prefixes successful-but-silent runs; anything else is the
@@ -465,14 +523,41 @@ public class ColgramPluginManager {
     }
 
     public static boolean installPlugin(String fileName, String code) {
+        return installPluginInternal(false, fileName, code);
+    }
+
+    private static boolean installPluginInternal(boolean bundled, String fileName, String code) {
         try {
             if (internalPluginsDir == null) return false;
-            if (fileName == null || fileName.isEmpty()) return false;
-            // A download or share can arrive named *.plugin; the interpreter needs *.py.
-            if (fileName.toLowerCase().endsWith(".plugin")) {
-                fileName = fileName.substring(0, fileName.length() - ".plugin".length()) + ".py";
+            if (fileName == null || code == null || code.trim().isEmpty()) return false;
+            // ".plugin" is the share/import extension (exteraGram ships its Python plugins as
+            // .plugin files); the interpreter imports modules by file name, so it becomes .py.
+            String base = fileName;
+            String lower = base.toLowerCase();
+            if (lower.endsWith(".plugin")) {
+                base = base.substring(0, base.length() - ".plugin".length());
+            } else if (lower.endsWith(".py")) {
+                base = base.substring(0, base.length() - ".py".length());
+            } else if (lower.endsWith(".txt") || lower.endsWith(".json")) {
+                base = base.substring(0, base.lastIndexOf('.'));
             }
-            File target = new File(internalPluginsDir, fileName);
+            // Sanitize rather than reject. exteraStore plugins commonly carry names like
+            // "my-plugin-1.2", and rejecting them made installing a downloaded plugin look
+            // impossible ("плагины нельзя загрузить"). A valid python module name is what the
+            // interpreter needs, and a lossy rename loses nothing that matters.
+            StringBuilder module = new StringBuilder();
+            for (char c : base.toLowerCase().replace(' ', '_').toCharArray()) {
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') module.append(c);
+                else if (module.length() == 0 || module.charAt(module.length() - 1) != '_') module.append('_');
+            }
+            while (module.length() > 0 && module.charAt(module.length() - 1) == '_') {
+                module.setLength(module.length() - 1);
+            }
+            if (module.length() == 0) module.append("plugin");
+            if (module.charAt(0) >= '0' && module.charAt(0) <= '9') module.insert(0, 'p');
+            String pyName = module + ".py";
+            if (!bundled && (isBundledFeature(pyName) || "extera_compat.py".equals(pyName))) return false;
+            File target = new File(internalPluginsDir, pyName);
             try (FileWriter w = new FileWriter(target)) {
                 w.write(code);
             }
@@ -505,7 +590,7 @@ public class ColgramPluginManager {
             in.close();
             String code = new String(bos.toByteArray(), "UTF-8");
             if (code.trim().isEmpty()) return false;
-            return installPlugin(fileName, code);
+            return installPluginInternal(true, fileName, code);
         } catch (Throwable t) {
             Log.w(TAG, "installBundledPlugin(" + fileName + ") failed: " + t.getMessage());
             return false;
@@ -514,6 +599,7 @@ public class ColgramPluginManager {
 
     public static boolean deletePlugin(String fileName) {
         try {
+            if (isBundledFeature(fileName) || "extera_compat.py".equals(fileName)) return false;
             boolean deleted = false;
             if (internalPluginsDir != null) {
                 File f = new File(internalPluginsDir, fileName);
@@ -882,7 +968,7 @@ public class ColgramPluginManager {
             if (base.isEmpty()) return null;
             // Only permit a bare filename — never let a crafted URL escape the plugin dir.
             if (base.contains("..") || base.contains("/") || base.contains("\\")) return null;
-            if (!base.endsWith(".py") && !base.endsWith(".json") && !base.endsWith(".txt")) {
+            if (!base.endsWith(".py") && !base.endsWith(".plugin") && !base.endsWith(".json") && !base.endsWith(".txt")) {
                 base = base + ".py";
             }
             return base;

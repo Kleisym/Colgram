@@ -53,6 +53,9 @@ public class ColgramBotSync {
     private static final String TAG = "ColgramBotSync";
     private static final ExecutorService executor = Executors.newCachedThreadPool();
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /** The phantom-dialog sweep runs once per process, after the first cache seed. */
+    private static final java.util.concurrent.atomic.AtomicBoolean phantomCleanupDone =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private static final ConcurrentHashMap<Integer, Thread> pollerThreads = new ConcurrentHashMap<>();
     /**
@@ -90,6 +93,95 @@ public class ColgramBotSync {
     private static final ConcurrentHashMap<Integer, Long> botPollerLastSpawnAt = new ConcurrentHashMap<>();
     private static final long POLLER_REARM_MS = 60_000L;
     private static final ConcurrentHashMap<Integer, Integer> lastUpdateIds = new ConcurrentHashMap<>();
+    private static final java.util.Set<Integer> mtprotoBotLoops =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
+    private static final java.util.Set<Integer> mtprotoDialogRefreshPending =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
+
+    private static boolean isMtprotoBotAccount(int account) {
+        try {
+            Class<?> userConfig = Class.forName("org.telegram.messenger.UserConfig");
+            Object config = userConfig.getMethod("getInstance", int.class).invoke(null, account);
+            Object user = userConfig.getMethod("getCurrentUser").invoke(config);
+            return user != null && user.getClass().getField("bot").getBoolean(user);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean isMtprotoConnected(int account) {
+        try {
+            Class<?> connections = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Object manager = connections.getMethod("getInstance", int.class).invoke(null, account);
+            return ((Integer) connections.getMethod("getConnectionState").invoke(manager)) == 3;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Recover missed bot updates over Telegram's authenticated MTProto session. */
+    private static void ensureMtprotoBotLoop(final Context context, final int account) {
+        if (!mtprotoBotLoops.add(account)) return;
+        Thread old = pollerThreads.remove(account);
+        if (old != null) old.interrupt();
+        botPollerSpawned.remove(account);
+        botPollerLastSpawnAt.remove(account);
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (!mtprotoBotLoops.contains(account)) return;
+                if (!isMtprotoBotAccount(account) || isPassiveBotMode(context, account)) {
+                    mtprotoBotLoops.remove(account);
+                    return;
+                }
+                if (isMtprotoConnected(account)) {
+                    try {
+                        Class<?> controller = Class.forName("org.telegram.messenger.MessagesController");
+                        Object instance = controller.getMethod("getInstance", int.class).invoke(null, account);
+                        controller.getMethod("getDifference").invoke(instance);
+                        Log.i(TAG, "MTProto bot update recovery requested for account " + account);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "MTProto bot update recovery failed: " + t.getMessage());
+                    }
+                }
+                mainHandler.postDelayed(this, 30000L);
+            }
+        });
+        refreshMtprotoBotDialogs(context, account);
+    }
+
+    /** Refresh the bot account's local dialog cache for an explicit sync action. */
+    private static void refreshMtprotoBotDialogs(final Context context, final int account) {
+        if (context == null || !mtprotoDialogRefreshPending.add(account)) return;
+        mainHandler.post(() -> {
+            try {
+                if (!mtprotoBotLoops.contains(account)
+                        || !isMtprotoBotAccount(account)
+                        || isPassiveBotMode(context, account)) {
+                    return;
+                }
+                Class<?> controller = Class.forName("org.telegram.messenger.MessagesController");
+                Object instance = controller.getMethod("getInstance", int.class).invoke(null, account);
+                if (isMtprotoConnected(account)) {
+                    try {
+                        controller.getMethod("getDifference").invoke(instance);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "MTProto bot manual difference request failed: " + t.getMessage());
+                    }
+                }
+                // Bot dialogs are backed by local storage in the patched MessagesController.
+                // Reloading that cache makes the button useful even when the periodic update
+                // loop was already armed and ensureMtprotoBotLoop() therefore returned early.
+                controller.getMethod("loadDialogs", int.class, int.class, int.class,
+                        boolean.class, Runnable.class).invoke(instance, 0, 0, 100, true, null);
+                Log.i(TAG, "MTProto bot manual dialog refresh requested for account " + account);
+            } catch (Throwable t) {
+                Log.w(TAG, "MTProto bot manual dialog refresh failed: " + t.getMessage());
+            } finally {
+                mtprotoDialogRefreshPending.remove(account);
+            }
+        });
+    }
 
     public static void saveBotToken(Context context, int account, String token) {
         if (context == null || token == null) return;
@@ -1064,9 +1156,16 @@ public class ColgramBotSync {
     /**
      * A Bot API chat id is a supergroup/channel when it carries the -100 prefix.
      * Legacy groups are negative without it; private chats are positive.
+     *
+     * The prefix is a RANGE, not a string shape: a supergroup id is
+     * chatId <= -1000000000000. A string check on "100" also matched legacy group ids
+     * like -1001234567, which routed them into the channel branch where
+     * channelIdFromBotApi produced a negative channel id and a positive dialog id that
+     * matches no peer — that phantom dialog row then loaded forever without ever
+     * resolving, exactly the skeleton row in the chat list.
      */
     private static boolean isSupergroupOrChannel(long botApiChatId) {
-        return botApiChatId < 0 && String.valueOf(Math.abs(botApiChatId)).startsWith("100");
+        return botApiChatId <= -1000000000000L;
     }
 
     /**
@@ -1276,6 +1375,10 @@ public class ColgramBotSync {
      */
     public static synchronized void startBotUpdatesPoller(final Context context, final int account) {
         if (context == null) return;
+        if (isMtprotoBotAccount(account) && !isPassiveBotMode(context, account)) {
+            ensureMtprotoBotLoop(context.getApplicationContext(), account);
+            return;
+        }
 
         // Fast path: a live thread is already running.
         Thread existing = pollerThreads.get(account);
@@ -1483,6 +1586,7 @@ public class ColgramBotSync {
      * Call on logout, on account switch, and when the bot token is replaced.
      */
     public static synchronized void stopBotUpdatesPoller(final int account) {
+        mtprotoBotLoops.remove(account);
         Thread existing = pollerThreads.remove(account);
         if (existing != null) {
             existing.interrupt();
@@ -1559,6 +1663,14 @@ public class ColgramBotSync {
 
     public static void syncBotDialogs(final Context context, final int account, final boolean userInitiated) {
         if (context == null) return;
+        if (isMtprotoBotAccount(account) && !isPassiveBotMode(context, account)) {
+            ensureMtprotoBotLoop(context.getApplicationContext(), account);
+            if (userInitiated) refreshMtprotoBotDialogs(context.getApplicationContext(), account);
+            if (userInitiated) {
+                Toast.makeText(context, "Синхронизирую чаты по MTProto", Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
         final String token = getBotToken(context, account);
         if (token.isEmpty()) {
             if (userInitiated && context instanceof Activity) {
@@ -1856,22 +1968,20 @@ public class ColgramBotSync {
                     if (!t.isEmpty()) titleCache.put(chatId, t);
                 }
 
-                // Create TLRPC.TL_user
-                if (fromId != 0 && !processedUserIds.contains(fromId)) {
-                    processedUserIds.add(fromId);
-                    Object user = userClass.getConstructor().newInstance();
-                    userClass.getField("id").setLong(user, fromId);
-                    userClass.getField("first_name").set(user, firstName);
-                    userClass.getField("last_name").set(user, lastName);
-                    userClass.getField("username").set(user, username);
-                    userClass.getField("phone").set(user, "");
-                    userClass.getField("status").set(user, userStatusClass.getConstructor().newInstance());
+                // Preserve an existing Telegram User object (avatar/access hash/self flags).
+                // Bot API chat and sender snapshots are partial; replacing a cached user with
+                // one of these photo-less objects made peers render as “Deleted Account” until
+                // the next full MTProto refresh.
+                ensureBotApiUser(mc, mcClass, userClass, userStatusClass, usersList,
+                        processedUserIds, fromId, fromObj,
+                        fromObj != null && fromObj.optBoolean("is_bot", false), fromId == botSelfId);
 
-                    usersList.add(user);
-                    try {
-                        mcClass.getMethod("putUser", Class.forName("org.telegram.tgnet.TLRPC$User"), boolean.class)
-                                .invoke(mc, user, false);
-                    } catch (Throwable ignored) {}
+                // In a private outgoing update, `from` is the bot, while `chat` is the human
+                // recipient. Creating only `from` leaves the dialog's peer_user missing, so the
+                // chat row falls back to a deleted/unknown account. Cache that peer separately.
+                if (chatObj != null && "private".equals(chatObj.optString("type")) && chatId != fromId) {
+                    ensureBotApiUser(mc, mcClass, userClass, userStatusClass, usersList,
+                            processedUserIds, chatId, chatObj, false, chatId == botSelfId);
                 }
 
                 // Create TLRPC.TL_message
@@ -2104,6 +2214,65 @@ public class ColgramBotSync {
                         for (Object c : finalChatsList) putChat.invoke(mc, c, false);
                     }
 
+                    // Phantom dialog cleanup.
+                    //
+                    // Earlier builds wrote dialogs under peers that do not exist (a supergroup
+                    // id sent to TL_peerChat, a legacy group id misread as a channel, a raw
+                    // -100 value). putDialogs(..., check=1) never repairs an existing row, so
+                    // every such row loaded forever as a skeleton row with no resolvable peer.
+                    // On a bot account dialogs only ever come from our own Bot API sync, so a
+                    // dialog whose peer is unknown AFTER the users/chats above were registered
+                    // cannot render anything and is garbage. Drop it from the live cache and
+                    // from the dialogs table, once per process.
+                    try {
+                        if (!phantomCleanupDone.compareAndSet(false, true)) {
+                            // already ran in this process
+                        } else {
+                            Method sizeM = dict.getClass().getMethod("size");
+                            Method keyAtM = dict.getClass().getMethod("keyAt", int.class);
+                            Method removeM = dict.getClass().getMethod("remove", long.class);
+                            Method getUserM = mcClass.getMethod("getUser", Long.class);
+                            Method getChatM = mcClass.getMethod("getChat", Long.class);
+
+                            java.util.List<Long> doomed = new java.util.ArrayList<>();
+                            int n = (Integer) sizeM.invoke(dict);
+                            for (int i = 0; i < n; i++) {
+                                long did = (Long) keyAtM.invoke(dict, i);
+                                // Encrypted and folder dialogs use high-bit ids that are not
+                                // user/chat shaped; leave them alone no matter what.
+                                if ((did & 0x4000000000000000L) != 0 || (did & 0x2000000000000000L) != 0) {
+                                    continue;
+                                }
+                                boolean bogus;
+                                if (did > 0) {
+                                    // Private chat: the dialog id IS the user id.
+                                    bogus = getUserM.invoke(mc, did) == null;
+                                } else {
+                                    // DialogObject.getDialogId(Chat) = -chat.id, so the chat
+                                    // cache key for every negative dialog id is -did.
+                                    bogus = getChatM.invoke(mc, -did) == null;
+                                }
+                                if (bogus) doomed.add(did);
+                            }
+                            if (!doomed.isEmpty()) {
+                                Object dbObj = msClass.getMethod("getDatabase").invoke(ms);
+                                Method execFast = dbObj.getClass().getMethod("executeFast", String.class);
+                                for (long did : doomed) {
+                                    removeM.invoke(dict, did);
+                                    msgs.getClass().getMethod("remove", long.class).invoke(msgs, did);
+                                    try {
+                                        Object stmt = execFast.invoke(dbObj, "DELETE FROM dialogs WHERE uid=" + did);
+                                        stmt.getClass().getMethod("stepThis").invoke(stmt);
+                                        stmt.getClass().getMethod("dispose").invoke(stmt);
+                                    } catch (Throwable sqlIgnore) {}
+                                }
+                                Log.i(TAG, "removed " + doomed.size() + " phantom dialog row(s) from the bot account");
+                            }
+                        }
+                    } catch (Throwable cleanup) {
+                        Log.w(TAG, "phantom dialog cleanup skipped: " + cleanup);
+                    }
+
                     for (Object d : finalDialogsList) {
                         long did = dialogClass.getField("id").getLong(d);
                         putSparse.invoke(dict, did, d);
@@ -2166,21 +2335,14 @@ public class ColgramBotSync {
                     Log.w(TAG, "could not seed in-memory dialog cache: " + t.getMessage());
                 }
             };
-            // Run the seeding on a WORKER, never on the main thread.
-            //
-            // This block does an O(dialogs x messages) nested scan plus reflection per row,
-            // and it used to run inline whenever the caller happened to be the main thread:
-            //     if (myLooper() == getMainLooper()) seedCache.run(); else mainHandler.post(...)
-            // So the expensive path fired exactly when the UI was most fragile. Measured on
-            // device: "Skipped 47/34/55 frames" at the same instants as the poller churn -
-            // ~0.8s of frozen UI per stall.
-            //
-            // Storage is thread-safe here, and the UI reload below is posted to mainHandler
-            // explicitly, so moving the seeding off-main is safe and is the whole fix.
-            executor.execute(seedCache);
-
-            // Reload UI dialogs & messages
-            mainHandler.post(() -> {
+            // Keep the O(dialogs x messages) scan and reflection work on the worker, but do
+            // not let loadDialogs race ahead and reload stale in-memory dialog maps. The UI
+            // refresh is enqueued only after this cache seed has finished.
+            ColgramDialogRefreshSequencer.seedThenRefresh(
+                    executor,
+                    command -> mainHandler.post(command),
+                    seedCache,
+                    () -> {
                 try {
                     Method loadDialogs = mcClass.getMethod("loadDialogs", int.class, int.class, int.class, boolean.class, Runnable.class);
                     loadDialogs.invoke(mc, 0, 0, 100, true, null);
@@ -2222,6 +2384,61 @@ public class ColgramBotSync {
         } catch (Throwable t) {
             Log.e(TAG, "processUpdatesJson error", t);
             return -1;
+        }
+    }
+
+    /**
+     * Add the partial identity included in a Bot API update without erasing richer MTProto data.
+     * Existing User objects carry photos, access hashes, self/deleted state, and flags that the
+     * Bot API payload does not include. Reusing that instance keeps the cache and dialog rows
+     * stable; a new peer is synthesized only when the update is the first source of its identity.
+     */
+    private static void ensureBotApiUser(Object mc, Class<?> mcClass, Class<?> userClass,
+            Class<?> userStatusClass, ArrayList usersList, Set<Long> processedUserIds,
+            long userId, JSONObject source, boolean isBot, boolean isSelf) throws Exception {
+        if (userId == 0 || !processedUserIds.add(userId)) return;
+
+        Object existing = mcClass.getMethod("getUser", Long.class)
+                .invoke(mc, Long.valueOf(userId));
+        Class<?> userBaseClass = Class.forName("org.telegram.tgnet.TLRPC$User");
+        if (existing != null) {
+            copyBotApiName(existing, userBaseClass, source, "first_name");
+            copyBotApiName(existing, userBaseClass, source, "last_name");
+            copyBotApiName(existing, userBaseClass, source, "username");
+            if (isBot) setBotApiBoolean(existing, "bot", true);
+            if (isSelf) setBotApiBoolean(existing, "self", true);
+            setBotApiBoolean(existing, "deleted", false);
+            // Keep the exact cached object: putUser() replaces entries and a Bot API snapshot
+            // has no photo/access_hash with which to populate a replacement.
+            usersList.add(existing);
+            return;
+        }
+
+        Object user = userClass.getConstructor().newInstance();
+        userBaseClass.getField("id").setLong(user, userId);
+        copyBotApiName(user, userBaseClass, source, "first_name");
+        copyBotApiName(user, userBaseClass, source, "last_name");
+        copyBotApiName(user, userBaseClass, source, "username");
+        userBaseClass.getField("phone").set(user, "");
+        userBaseClass.getField("status").set(user, userStatusClass.getConstructor().newInstance());
+        setBotApiBoolean(user, "bot", isBot);
+        setBotApiBoolean(user, "self", isSelf);
+        setBotApiBoolean(user, "deleted", false);
+        usersList.add(user);
+        mcClass.getMethod("putUser", userBaseClass, boolean.class).invoke(mc, user, false);
+    }
+
+    private static void copyBotApiName(Object user, Class<?> userBaseClass,
+            JSONObject source, String field) throws Exception {
+        if (source == null) return;
+        String value = source.optString(field, "");
+        if (!value.isEmpty()) userBaseClass.getField(field).set(user, value);
+    }
+
+    private static void setBotApiBoolean(Object user, String field, boolean value) {
+        try {
+            user.getClass().getField(field).setBoolean(user, value);
+        } catch (Throwable ignored) {
         }
     }
 

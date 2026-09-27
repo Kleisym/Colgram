@@ -147,25 +147,29 @@ public class ColgramEditHistorySheet {
                         cardBg == 0 ? 0x22888888 : cardBg));
                 card.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(10), AndroidUtilities.dp(14), AndroidUtilities.dp(10));
 
+                // Header carries the revision number AND the time in one line - two stacked
+                // small labels read as clutter inside a card list.
                 final TextView header = new TextView(context);
-                header.setText((isRu ? "Редакция #" : "Revision #") + revisionNumber);
+                header.setText((isRu ? "Редакция #" : "Revision #") + revisionNumber
+                        + "  ·  " + formatTs(entry.timestamp));
                 header.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
                 header.setTypeface(AndroidUtilities.bold());
                 header.setTextColor(accentColor);
                 card.addView(header, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 4));
 
                 final TextView body = new TextView(context);
-                body.setText(entry.text == null ? "" : entry.text);
+                String revisionText = entry.text == null ? "" : entry.text;
+                if (revisionText.trim().isEmpty()) {
+                    // An edit that stripped the message down (or a wiped revision) used to
+                    // render as an empty card body.
+                    revisionText = isRu ? "(текст удалён)" : "(text removed)";
+                    body.setTypeface(Typeface.create("sans-serif", Typeface.ITALIC));
+                }
+                body.setText(revisionText);
                 body.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
                 body.setTextColor(textPrimary);
                 body.setLineSpacing(AndroidUtilities.dp(2), 1.0f);
                 card.addView(body, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 6));
-
-                final TextView timestamp = new TextView(context);
-                timestamp.setText(formatTs(entry.timestamp));
-                timestamp.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11);
-                timestamp.setTextColor(textSecondary);
-                card.addView(timestamp, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
 
                 list.addView(card, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
             }

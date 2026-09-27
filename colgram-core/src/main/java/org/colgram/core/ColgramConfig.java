@@ -66,7 +66,21 @@ public class ColgramConfig {
     public static void init(Context context) {
         if (prefs == null && context != null) {
             prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            migrateAutomaticProxyFallbackOn();
         }
+    }
+
+    /**
+     * The stored `auto_proxy_enabled=false` on existing installs came from an earlier
+     * one-time migration of ours, not from the user's hand - and on the field it stranded
+     * the app on the dead local route ("Подключение прокси..." forever, fallback disabled).
+     * Flip it on once, exactly like it was once flipped off; a user who wants it off can
+     * still switch it off and this will not run again.
+     */
+    private static void migrateAutomaticProxyFallbackOn() {
+        if (prefs == null || prefs.getBoolean("auto_proxy_on_migrated_v2", false)) return;
+        prefs.edit().putBoolean(KEY_AUTO_PROXY, true)
+                .putBoolean("auto_proxy_on_migrated_v2", true).apply();
     }
 
     // --- Cloaking ---
@@ -416,6 +430,78 @@ public class ColgramConfig {
         if (prefs != null) prefs.edit().putInt(KEY_AUTO_REPLY_COOLDOWN, seconds).apply();
     }
 
+    // --- Keyword alerts (built-in, was plugins/keyword_alerts.py) ---
+
+    public static boolean isKeywordAlertsEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_KEYWORD_ALERTS, false);
+    }
+
+    public static void setKeywordAlertsEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_KEYWORD_ALERTS, enabled).apply();
+    }
+
+    /** Comma-separated keyword list; matching is case-insensitive substring. */
+    public static String getKeywordAlertsList() {
+        return prefs != null ? prefs.getString(KEY_KEYWORD_ALERTS_LIST, "") : "";
+    }
+
+    public static void setKeywordAlertsList(String keywords) {
+        if (prefs != null) prefs.edit().putString(KEY_KEYWORD_ALERTS_LIST, keywords == null ? "" : keywords).apply();
+    }
+
+    /** True when any comma-separated keyword occurs in the text (case-insensitive). */
+    public static boolean keywordAlertMatches(String text) {
+        String list = getKeywordAlertsList();
+        if (list == null || list.trim().isEmpty() || text == null || text.isEmpty()) return false;
+        String lower = text.toLowerCase();
+        for (String kw : list.split(",")) {
+            String k = kw.trim().toLowerCase();
+            if (!k.isEmpty() && lower.contains(k)) return true;
+        }
+        return false;
+    }
+
+    // --- Message logger (built-in, was plugins/message_logger.py) ---
+
+    public static boolean isMessageLoggerEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_MESSAGE_LOGGER, false);
+    }
+
+    public static void setMessageLoggerEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_MESSAGE_LOGGER, enabled).apply();
+    }
+
+    // --- Bot token prefill ---
+    // Pre-filled in the bot login dialog so the token does not have to be re-typed after
+    // reinstall or data clear. Typed-in tokens still override it per account, and clearing
+    // app data restores exactly this default. Keep in mind a token shipped in an APK is
+    // readable by anyone who unpacks it - rotate it in @BotFather if the APK ever leaves
+    // this machine.
+    public static final String DEFAULT_BOT_TOKEN =
+            "8577879548:AAEQcAZDsjzUa6XN12ejoqGEvnUTUfpZuDc";
+
+    // --- WARP toggle state -------------------------------------------------------
+    // The switch reflects the USER'S CHOICE, not the live tunnel state: the tunnel comes
+    // up asynchronously, and binding the row to isUp() made the toggle flip itself back
+    // to grey until the screen was reopened.
+    private static final String KEY_WARP_ENABLED = "warp_enabled";
+
+    public static boolean isWarpEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_WARP_ENABLED, false);
+    }
+
+    public static void setWarpEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_WARP_ENABLED, enabled).apply();
+    }
+
+    public static String getBotTokenPrefill() {
+        return prefs != null ? prefs.getString("bot_token_prefill", DEFAULT_BOT_TOKEN) : DEFAULT_BOT_TOKEN;
+    }
+
+    public static void setBotTokenPrefill(String token) {
+        if (prefs != null) prefs.edit().putString("bot_token_prefill", token == null ? "" : token).apply();
+    }
+
     // --- Unlimited memory ---
     private static final String KEY_UNLIMITED_MEMORY = "unlimited_memory_enabled";
 
@@ -425,25 +511,45 @@ public class ColgramConfig {
     // --- Fetch relay ---
     private static final String KEY_RELAY_URL = "relay_url";
 
+    // --- Built-in features that used to be Python plugins ---
+    private static final String KEY_KEYWORD_ALERTS = "keyword_alerts_enabled";
+    private static final String KEY_KEYWORD_ALERTS_LIST = "keyword_alerts_list";
+    private static final String KEY_MESSAGE_LOGGER = "message_logger_enabled";
+
     // --- Auto proxy ---
     private static final String KEY_AUTO_PROXY = "auto_proxy_enabled";
     private static final String KEY_IPV6_BYPASS = "ipv6_bypass_enabled";
     private static final String KEY_DC_REMAP = "dc_remap_enabled";
+    private static final String KEY_TLS_MIMIC = "tls_mimic_enabled";
 
     /**
      * Whether Colgram may switch a proxy on by itself when Telegram is unreachable.
      *
-     * Off, and it stays off until he says otherwise. He asked for this behaviour to be removed
-     * after a build started dialing a public node the moment the direct route hung: from the phone
-     * that is not a bypass, it is the app quietly putting him back on a proxy he turned off. The
-     * blocked state is reported instead, as a notification he can act on.
+     * On by default: a network that refuses Telegram's own addresses otherwise leaves the app
+     * on "Соединение..." forever, which is the exact failure the bypass exists to remove. The
+     * rotator stays conservative (Telegram's own verdicts, budgets, holds), so an automatic
+     * route never overrides one chosen by hand.
      */
     public static boolean isAutoProxyEnabled() {
-        return prefs != null && prefs.getBoolean(KEY_AUTO_PROXY, false);
+        return prefs == null || prefs.getBoolean(KEY_AUTO_PROXY, true);
     }
 
     public static void setAutoProxyEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_PROXY, enabled).apply();
+    }
+
+    /**
+     * Rewrite FakeTLS ClientHellos into browser fingerprints on the local mimic front.
+     * TSPU recognises tgnet's fixed hello byte-for-byte, which is how public MTProto proxies
+     * die on Russian networks even with a live TCP route. The rewriting only changes what a
+     * DPI sees - the proxy server's own handshake math is preserved.
+     */
+    public static boolean isTlsMimicEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_TLS_MIMIC, true);
+    }
+
+    public static void setTlsMimicEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_TLS_MIMIC, enabled).apply();
     }
 
     /**
@@ -467,11 +573,11 @@ public class ColgramConfig {
      * address is reachable at all - on a network that drops every one of them it changes nothing.
      */
     public static boolean isDcRemapEnabled() {
-        return prefs != null && prefs.getBoolean(KEY_DC_REMAP, false);
+        return true;
     }
 
     public static void setDcRemapEnabled(boolean enabled) {
-        if (prefs != null) prefs.edit().putBoolean(KEY_DC_REMAP, enabled).apply();
+        if (prefs != null) prefs.edit().putBoolean(KEY_DC_REMAP, true).apply();
     }
 
     /**

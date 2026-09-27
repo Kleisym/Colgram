@@ -452,6 +452,24 @@ public class ColgramPythonEngine {
         return runPythonCode(code);
     }
 
+    /** Plugin dispatch runs off the UI thread and must not fall through to the toy evaluator
+     * while Chaquopy is still starting. That race lost the first command/message every launch. */
+    public static String executePluginCode(String code) {
+        if (Looper.myLooper() == Looper.getMainLooper()) return null;
+        ensureInitialized();
+        long deadline = android.os.SystemClock.elapsedRealtime() + 15000L;
+        while (!pythonInitialized && pythonStarting
+                && android.os.SystemClock.elapsedRealtime() < deadline) {
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return pythonInitialized ? runPythonCode(code) : null;
+    }
+
     public static String runPythonCode(String code) {
         if (code == null || code.trim().isEmpty()) return "None";
 

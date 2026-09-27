@@ -41,6 +41,19 @@ public class ColgramHookHandler {
             // so this method no longer calls ColgramDpiBypass.start() directly.
             ColgramProxyManager.activateBuiltinProxy(appContext);
             ColgramProxyDoctor.init(appContext);
+            // WARP that was left on: re-establish it on every start (consent is already
+            // granted system-wide after the first dialog; prepare() returns null then).
+            if (ColgramConfig.isWarpEnabled()) {
+                new Thread(() -> {
+                    try {
+                        ColgramWarpTunnel.bringUp(appContext);
+                    } catch (Throwable t) {
+                        ColgramConfig.setWarpEnabled(false);
+                        ColgramProxyManager.notifyProxySettingsChanged();
+                        android.util.Log.w("ColgramHookHandler", "WARP restore failed: " + t.getMessage());
+                    }
+                }, "colgram-warp-restore").start();
+            }
         } catch (Throwable t) {
             android.util.Log.e("ColgramHookHandler", "Error during Colgram initialization", t);
         }
@@ -92,10 +105,100 @@ public class ColgramHookHandler {
         if (!isOut && !colgramRememberDispatch(dialogId, messageId)) return;
         ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
         if (!isOut) colgramAutoReply(dialogId);
+        colgramKeywordAlerts(dialogId, text, isOut);
+        colgramMessageLog(dialogId, messageId, text, isOut);
     }
 
     /** Per-dialog timestamp of the last automatic answer. */
     private static final java.util.HashMap<Long, Long> colgramAutoReplyAt = new java.util.HashMap<>();
+
+    /**
+     * Built-in keyword alerts (was plugins/keyword_alerts.py).
+     *
+     * A keyword configured in settings that shows up in any message raises a heads-up
+     * notification-style toast with the dialog it came from. Outgoing messages are skipped:
+     * the point is to catch other people talking about the things you watch for.
+     */
+    private static void colgramKeywordAlerts(long dialogId, String text, boolean isOut) {
+        if (isOut || !ColgramConfig.isKeywordAlertsEnabled()) return;
+        if (!ColgramConfig.keywordAlertMatches(text)) return;
+        final String message = text == null ? "" : text;
+        final long dialog = dialogId;
+        new Thread(() -> {
+            String title = "🔔 Ключевое слово";
+            String who;
+            try {
+                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, 0);
+                // getUser/getChat are declared with boxed Long parameters, so the lookup must
+                // ask for Long.class: getMethod matches declared types exactly.
+                if (dialog > 0) {
+                    Object user = mcClass.getMethod("getUser", Long.class).invoke(mc, dialog);
+                    who = user == null ? Long.toString(dialog) : (String)
+                            firstNonNull(user.getClass().getField("first_name").get(user),
+                                    user.getClass().getField("username").get(user), "чат " + dialog);
+                } else {
+                    Object chat = mcClass.getMethod("getChat", Long.class).invoke(mc, -dialog);
+                    who = chat == null ? Long.toString(dialog) : String.valueOf(
+                            chat.getClass().getField("title").get(chat));
+                }
+            } catch (Throwable t) {
+                who = Long.toString(dialog);
+            }
+            String body = who + ": " + (message.length() > 120 ? message.substring(0, 120) + "…" : message);
+            final String line = title + "\n" + body;
+            android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+            h.post(() -> {
+                try {
+                    android.content.Context ctx = appContext;
+                    if (ctx == null) return;
+                    android.widget.Toast.makeText(ctx, line, android.widget.Toast.LENGTH_LONG).show();
+                } catch (Throwable ignored) {}
+            });
+        }, "colgram-keyword-alert").start();
+    }
+
+    private static Object firstNonNull(Object... values) {
+        for (Object v : values) {
+            if (v != null && !String.valueOf(v).isEmpty()) return v;
+        }
+        return null;
+    }
+
+    /** One JSONL writer for the built-in message log; appends are cheap and crash-safe. */
+    private static final Object messageLogLock = new Object();
+
+    /**
+     * Built-in message log (was plugins/message_logger.py).
+     *
+     * Every dispatched message lands as one JSON line in files/messages_log.jsonl inside the
+     * app sandbox - incoming and outgoing, with the dialog id and a direction flag. The file
+     * is append-only JSONL so it stays readable while the app is running and never needs a
+     * schema migration.
+     */
+    private static void colgramMessageLog(long dialogId, int messageId, String text, boolean isOut) {
+        if (!ColgramConfig.isMessageLoggerEnabled() || appContext == null) return;
+        final long dialog = dialogId;
+        final int mid = messageId;
+        final String safeText = text == null ? "" : text.replace("\\", "\\\\").replace("\"", "\\\"");
+        final boolean out = isOut;
+        new Thread(() -> {
+            synchronized (messageLogLock) {
+                try {
+                    java.io.File dir = new java.io.File(appContext.getFilesDir(), "Colgram");
+                    if (!dir.exists()) dir.mkdirs();
+                    java.io.File file = new java.io.File(dir, "messages_log.jsonl");
+                    try (java.io.FileWriter w = new java.io.FileWriter(file, true)) {
+                        w.write("{\"ts\":" + System.currentTimeMillis() / 1000L
+                                + ",\"dialog\":" + dialog
+                                + ",\"id\":" + mid
+                                + ",\"out\":" + out
+                                + ",\"text\":\"" + safeText + "\"}\n");
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }, "colgram-msg-log").start();
+    }
 
     /**
      * Native auto-reply: answer an inbound message with the configured text.

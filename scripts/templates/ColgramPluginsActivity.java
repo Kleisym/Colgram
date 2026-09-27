@@ -2,10 +2,12 @@ package org.telegram.ui;
 
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.util.Log;
 import android.view.Gravity;
@@ -134,7 +136,11 @@ public class ColgramPluginsActivity extends BaseFragment {
                 case Row.KIND_NEW_PLUGIN:
                     showPluginEditorDialog(null, null);
                     break;
+                case Row.KIND_FEATURE:
+                    handleFeatureTap(row);
+                    break;
                 case Row.KIND_INSTALLED:
+                case Row.KIND_BUILTIN:
                     if (row.plugin != null) {
                         ColgramPluginManager.togglePlugin(row.plugin.fileName, !row.plugin.isEnabled);
                         listAdapter.notifyDataSetChanged();
@@ -175,18 +181,33 @@ public class ColgramPluginsActivity extends BaseFragment {
         static final int KIND_NEW_PLUGIN = 1;
         static final int KIND_INSTALLED = 2;
         static final int KIND_CATALOG = 3;
+        static final int KIND_BUILTIN = 4;
+        static final int KIND_FEATURE = 5;
 
         final int kind;
         final String header;
         final ColgramPluginManager.PluginInfo plugin;
         final ColgramPluginManager.CatalogEntry entry;
+        /** For KIND_FEATURE: auto_reply | keywords | logger | export. */
+        final String featureKey;
+        final String featureTitle;
+        final String featureSubtitle;
 
         Row(int kind, String header, ColgramPluginManager.PluginInfo plugin,
             ColgramPluginManager.CatalogEntry entry) {
+            this(kind, header, plugin, entry, null, null, null);
+        }
+
+        Row(int kind, String header, ColgramPluginManager.PluginInfo plugin,
+            ColgramPluginManager.CatalogEntry entry, String featureKey,
+            String featureTitle, String featureSubtitle) {
             this.kind = kind;
             this.header = header;
             this.plugin = plugin;
             this.entry = entry;
+            this.featureKey = featureKey;
+            this.featureTitle = featureTitle;
+            this.featureSubtitle = featureSubtitle;
         }
     }
 
@@ -195,13 +216,34 @@ public class ColgramPluginsActivity extends BaseFragment {
     private void rebuildRows() {
         rows.clear();
 
+        // Built-in features. These used to ship as Python plugins in this very list, which
+        // made "по умолчанию в приложении" depend on a script engine booting. They are part
+        // of Colgram now: toggles here, logic in colgram-core, no interpreter in the path.
+        rows.add(new Row(Row.KIND_HEADER, "Встроенные функции", null, null));
+        rows.add(new Row(Row.KIND_FEATURE, null, null, null, "auto_reply", "Автоответчик",
+                "отвечает за вас в личке (и в группах — по настройке)"));
+        rows.add(new Row(Row.KIND_FEATURE, null, null, null, "keywords", "Ключевые слова",
+                "уведомляет, когда в сообщениях всплывает ваше слово"));
+        rows.add(new Row(Row.KIND_FEATURE, null, null, null, "logger", "Журнал сообщений",
+                "все входящие и исходящие в локальный JSONL-файл"));
+        rows.add(new Row(Row.KIND_FEATURE, null, null, null, "export", "Экспорт чата",
+                "команда .export сохраняет диалог в HTML"));
+
         rows.add(new Row(Row.KIND_HEADER, "Создать плагин", null, null));
         rows.add(new Row(Row.KIND_NEW_PLUGIN, null, null, null));
 
         List<ColgramPluginManager.PluginInfo> installed = ColgramPluginManager.getLoadedPlugins();
-        rows.add(new Row(Row.KIND_HEADER, "Установленные (" + installed.size() + ")", null, null));
+        int builtInCount = 0;
+        for (ColgramPluginManager.PluginInfo p : installed) if (p.builtIn) builtInCount++;
+        if (builtInCount > 0) {
+            rows.add(new Row(Row.KIND_HEADER, "Встроенные плагины (" + builtInCount + ")", null, null));
+            for (ColgramPluginManager.PluginInfo p : installed) {
+                if (p.builtIn) rows.add(new Row(Row.KIND_BUILTIN, null, p, null));
+            }
+        }
+        rows.add(new Row(Row.KIND_HEADER, "Пользовательские плагины (" + (installed.size() - builtInCount) + ")", null, null));
         for (ColgramPluginManager.PluginInfo p : installed) {
-            rows.add(new Row(Row.KIND_INSTALLED, null, p, null));
+            if (!p.builtIn) rows.add(new Row(Row.KIND_INSTALLED, null, p, null));
         }
 
         String catHeader;
@@ -227,6 +269,79 @@ public class ColgramPluginsActivity extends BaseFragment {
         return rows.get(position);
     }
 
+    // ------------------------------------------------------------ built-in features
+
+    /** Toggle a built-in feature, or open its editor when it needs configuration. */
+    private void handleFeatureTap(Row row) {
+        if (getParentActivity() == null) return;
+        switch (row.featureKey) {
+            case "auto_reply":
+                boolean ar = !org.colgram.core.ColgramConfig.isAutoReplyEnabled();
+                org.colgram.core.ColgramConfig.setAutoReplyEnabled(ar);
+                Toast.makeText(getParentActivity(),
+                        ar ? "Автоответчик включён" : "Автоответчик выключен", Toast.LENGTH_SHORT).show();
+                listAdapter.notifyDataSetChanged();
+                break;
+            case "keywords":
+                boolean kw = !org.colgram.core.ColgramConfig.isKeywordAlertsEnabled();
+                org.colgram.core.ColgramConfig.setKeywordAlertsEnabled(kw);
+                if (kw && org.colgram.core.ColgramConfig.getKeywordAlertsList().trim().isEmpty()) {
+                    showKeywordsDialog();
+                } else {
+                    Toast.makeText(getParentActivity(),
+                            kw ? "Оповещения по ключевым словам включены" : "Ключевые слова выключены",
+                            Toast.LENGTH_SHORT).show();
+                }
+                listAdapter.notifyDataSetChanged();
+                break;
+            case "logger":
+                boolean lg = !org.colgram.core.ColgramConfig.isMessageLoggerEnabled();
+                org.colgram.core.ColgramConfig.setMessageLoggerEnabled(lg);
+                Toast.makeText(getParentActivity(),
+                        lg ? "Журнал сообщений включён" : "Журнал сообщений выключен",
+                        Toast.LENGTH_SHORT).show();
+                listAdapter.notifyDataSetChanged();
+                break;
+            case "export":
+                Toast.makeText(getParentActivity(),
+                        "Откройте чат и отправьте .export — файл появится в Colgram/exports",
+                        Toast.LENGTH_LONG).show();
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** One-line editor for the keyword list; enabling without words opens it automatically. */
+    private void showKeywordsDialog() {
+        if (getParentActivity() == null) return;
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        builder.setTitle("Ключевые слова");
+        android.widget.EditText input = new android.widget.EditText(getParentActivity());
+        input.setHint("через запятую: работа, счёт, дедлайн");
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+        input.setText(org.colgram.core.ColgramConfig.getKeywordAlertsList());
+        input.setSelection(input.getText().length());
+        android.widget.LinearLayout wrap = new android.widget.LinearLayout(getParentActivity());
+        wrap.setOrientation(android.widget.LinearLayout.VERTICAL);
+        wrap.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12), AndroidUtilities.dp(20), 0);
+        wrap.addView(input);
+        builder.setView(wrap);
+        builder.setPositiveButton("Сохранить", (d, w) -> {
+            org.colgram.core.ColgramConfig.setKeywordAlertsList(input.getText().toString());
+            listAdapter.notifyDataSetChanged();
+        });
+        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), (d, w) -> {
+            // Leaving the list empty leaves the toggle meaningless; switch it back off.
+            if (org.colgram.core.ColgramConfig.getKeywordAlertsList().trim().isEmpty()) {
+                org.colgram.core.ColgramConfig.setKeywordAlertsEnabled(false);
+            }
+            listAdapter.notifyDataSetChanged();
+        });
+        showDialog(builder.create());
+    }
+
     // ------------------------------------------------------------ catalog
 
     private void loadCatalog(boolean showToast) {
@@ -248,7 +363,11 @@ public class ColgramPluginsActivity extends BaseFragment {
             mainHandler.post(() -> {
                 if (destroyed) return;
                 catalog.clear();
-                catalog.addAll(result);
+                for (ColgramPluginManager.CatalogEntry entry : result) {
+                    if (!ColgramPluginManager.isBundledFeature(ColgramPluginManager.fileNameFor(entry))) {
+                        catalog.add(entry);
+                    }
+                }
                 catalogIsRemote = isRemote;
                 catalogLoading = false;
                 rebuildRows();
@@ -374,9 +493,8 @@ public class ColgramPluginsActivity extends BaseFragment {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             intent.setType("*/*");
-            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                    "text/x-python", "text/plain", "application/octet-stream"
-            });
+            // Providers assign .plugin many different MIME types; filtering here made
+            // the attached file invisible in some document pickers.
             startActivityForResult(intent, REQ_PICK_PY);
         } catch (Throwable t) {
             Toast.makeText(getParentActivity(),
@@ -401,13 +519,14 @@ public class ColgramPluginsActivity extends BaseFragment {
                 if (code == null || code.trim().isEmpty()) {
                     err = "файл пустой или недоступен";
                 } else {
-                    String name = displayNameFromUri(uri);
+                    String name = displayNameFromUri(ctx, uri);
                     String lowerName = name.toLowerCase();
                     if (!lowerName.endsWith(".py") && !lowerName.endsWith(".plugin")) {
-                        name = name + ".py";
+                        err = "выберите файл .py или .plugin";
+                    } else {
+                        ok = ColgramPluginManager.installPlugin(name, code);
+                        if (!ok) err = "некорректное имя или файл встроенной функции";
                     }
-                    ok = ColgramPluginManager.installPlugin(name, code);
-                    if (!ok) err = "не удалось установить";
                 }
             } catch (Throwable t) {
                 err = t.getMessage() == null ? t.toString() : t.getMessage();
@@ -431,7 +550,13 @@ public class ColgramPluginsActivity extends BaseFragment {
             java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
             byte[] buf = new byte[4096];
             int n;
-            while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+            while ((n = in.read(buf)) != -1) {
+                if (bos.size() + n > 2 * 1024 * 1024) {
+                    in.close();
+                    return null;
+                }
+                bos.write(buf, 0, n);
+            }
             in.close();
             return new String(bos.toByteArray(), "UTF-8");
         } catch (Throwable t) {
@@ -440,9 +565,16 @@ public class ColgramPluginsActivity extends BaseFragment {
         }
     }
 
-    /** Best-effort display name for a content:// URI (the last path segment). */
-    private static String displayNameFromUri(Uri uri) {
+    /** SAF document IDs are not filenames; query the provider's display name. */
+    private static String displayNameFromUri(Context ctx, Uri uri) {
         try {
+            try (Cursor cursor = ctx.getContentResolver().query(uri,
+                    new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    String name = cursor.getString(0);
+                    if (name != null && !name.isEmpty()) return name;
+                }
+            }
             String last = uri.getLastPathSegment();
             if (last == null) return "plugin.py";
             int slash = last.lastIndexOf('/');
@@ -545,7 +677,7 @@ public class ColgramPluginsActivity extends BaseFragment {
         public int getItemViewType(int position) {
             Row row = rowAt(position);
             if (row == null || row.kind == Row.KIND_HEADER) return 0;
-            if (row.kind == Row.KIND_INSTALLED) return 1;
+            if (row.kind == Row.KIND_INSTALLED || row.kind == Row.KIND_BUILTIN || row.kind == Row.KIND_FEATURE) return 1;
             return 2;
         }
 
@@ -579,6 +711,18 @@ public class ColgramPluginsActivity extends BaseFragment {
                     break;
                 case 1: {
                     TextCheckCell c = (TextCheckCell) holder.itemView;
+                    if (row.kind == Row.KIND_FEATURE) {
+                        boolean on;
+                        switch (row.featureKey) {
+                            case "auto_reply": on = org.colgram.core.ColgramConfig.isAutoReplyEnabled(); break;
+                            case "keywords": on = org.colgram.core.ColgramConfig.isKeywordAlertsEnabled(); break;
+                            case "logger": on = org.colgram.core.ColgramConfig.isMessageLoggerEnabled(); break;
+                            default: on = true; break;
+                        }
+                        c.setTextAndCheck(row.featureTitle, on, true);
+                        c.setTypeface(null);
+                        break;
+                    }
                     if (row.plugin != null) {
                         String cmd = row.plugin.command == null || row.plugin.command.isEmpty()
                                 ? row.plugin.fileName

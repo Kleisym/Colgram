@@ -38,6 +38,10 @@ public final class ColgramHttp {
     private static final String TAG = "ColgramHttp";
     private static final int CONNECT_TIMEOUT_MS = 8000;
     private static final int READ_TIMEOUT_MS = 12000;
+    /** Public source feeds are expendable; one stalled mirror must not stall the entire refresh. */
+    private static final int FAST_CONNECT_TIMEOUT_MS = 1800;
+    private static final int FAST_READ_TIMEOUT_MS = 2800;
+    private static final int MAX_FAST_RELAY_ATTEMPTS = 2;
     /** How many relay candidates one request is allowed to walk before giving up. */
     private static final int MAX_RELAY_ATTEMPTS = 4;
 
@@ -89,6 +93,110 @@ public final class ColgramHttp {
         Response tunneled = viaConnectRelays(urlStr, null, null, attempts);
         if (tunneled != null) return tunneled;
         throw new IOException(join(attempts));
+    }
+
+    /**
+     * Short-budget GET for public candidate feeds. A feed is retried on the next refresh, so it
+     * must not hold the whole 16-source batch behind four 20-second relay attempts.
+     */
+    public static Response getFast(String urlStr) throws IOException {
+        List<String> attempts = new ArrayList<>();
+        try {
+            return openFast(urlStr, null);
+        } catch (Throwable t) {
+            attempts.add("напрямую: " + reason(t));
+        }
+
+        Response configured = viaConfiguredRelayFast(urlStr, attempts);
+        if (configured != null) return configured;
+
+        int used = 0;
+        ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
+        for (ColgramProxyManager.ProxyItem relay : relayCandidates()) {
+            boolean userSelected = relay != null && relay.equals(active);
+            if (relay == null || (!relay.isLocalDpi() && !userSelected && !relay.isAvailable)) continue;
+            if (used++ >= MAX_FAST_RELAY_ATTEMPTS) break;
+            try {
+                return openFast(urlStr, relay);
+            } catch (Throwable t) {
+                attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
+            }
+        }
+
+        int connectAttempts = 0;
+        for (ColgramProxyChain.Relay relay : ColgramProxyManager.getReachableRelays()) {
+            if (relay == null || relay.rttMs < 0) continue;
+            if (connectAttempts++ >= 1) break;
+            try {
+                Response response = openViaConnect(urlStr, relay.host, relay.port, null, null,
+                        FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS);
+                if (response.code >= 200 && response.code < 300) return response;
+                attempts.add(relay.key() + " -> HTTP " + response.code);
+            } catch (Throwable t) {
+                attempts.add(relay.key() + " -> " + reason(t));
+            }
+        }
+        throw new IOException(join(attempts));
+    }
+
+    private static Response viaConfiguredRelayFast(String urlStr, List<String> attempts) {
+        String relay = ColgramConfig.getRelayUrl();
+        if (relay == null || relay.trim().isEmpty()) return null;
+        HttpURLConnection conn = null;
+        try {
+            String target = URLEncoder.encode(urlStr, "UTF-8");
+            String sep = relay.contains("?") ? "&" : "?";
+            conn = (HttpURLConnection) new URL(relay + sep + "url=" + target).openConnection();
+            conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("Accept", "application/json");
+            int code = conn.getResponseCode();
+            InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
+            StringBuilder body = new StringBuilder();
+            if (stream != null) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, Charset.forName("UTF-8")))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) body.append(line).append('\n');
+                }
+            }
+            if (code >= 200 && code < 300) return new Response(code, body.toString());
+            attempts.add("реле-адрес: HTTP " + code);
+        } catch (Throwable t) {
+            attempts.add("реле-адрес: " + reason(t));
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        return null;
+    }
+
+    private static Response openFast(String urlStr, ColgramProxyManager.ProxyItem relay) throws Exception {
+        URL url = new URL(urlStr);
+        HttpURLConnection conn;
+        if (relay == null) {
+            conn = (HttpURLConnection) url.openConnection();
+        } else {
+            conn = (HttpURLConnection) url.openConnection(new Proxy(Proxy.Type.SOCKS,
+                    new InetSocketAddress(relay.address, relay.port)));
+        }
+        try {
+            conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("Accept", "application/json");
+            int code = conn.getResponseCode();
+            InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
+            StringBuilder body = new StringBuilder();
+            if (stream != null) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, Charset.forName("UTF-8")))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) body.append(line).append('\n');
+                }
+            }
+            return new Response(code, body.toString());
+        } finally {
+            conn.disconnect();
+        }
     }
 
     /** POST a JSON body, with the same relay fallback as GET. */
@@ -359,6 +467,13 @@ public final class ColgramHttp {
      */
     private static Response openViaConnect(String urlStr, String proxyHost, int proxyPort,
                                            String jsonBody, String bearer) throws Exception {
+        return openViaConnect(urlStr, proxyHost, proxyPort, jsonBody, bearer,
+                CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
+    }
+
+    private static Response openViaConnect(String urlStr, String proxyHost, int proxyPort,
+                                           String jsonBody, String bearer,
+                                           int connectTimeoutMs, int readTimeoutMs) throws Exception {
         URL url = new URL(urlStr);
         boolean tls = "https".equals(url.getProtocol());
         int port = url.getPort() > 0 ? url.getPort() : (tls ? 443 : 80);
@@ -366,8 +481,8 @@ public final class ColgramHttp {
         String path = url.getFile().isEmpty() ? "/" : url.getFile();
 
         java.net.Socket tunnel = new java.net.Socket();
-        tunnel.connect(new InetSocketAddress(proxyHost, proxyPort), CONNECT_TIMEOUT_MS);
-        tunnel.setSoTimeout(READ_TIMEOUT_MS);
+        tunnel.connect(new InetSocketAddress(proxyHost, proxyPort), connectTimeoutMs);
+        tunnel.setSoTimeout(readTimeoutMs);
         try {
             java.io.OutputStream rawOut = tunnel.getOutputStream();
             rawOut.write(("CONNECT " + host + ":" + port + " HTTP/1.1\r\n"

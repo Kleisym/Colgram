@@ -118,6 +118,15 @@ public class ColgramBotLogin {
             // EditText for token
             final EditText input = new EditText(context);
             input.setHint("123456789:ABCdefGhIJKlm...");
+            // Prefill with the remembered token: re-entering it after every reinstall was
+            // busywork, and an empty field read as "the login does not work".
+            try {
+                String colgramPrefill = ColgramConfig.getBotTokenPrefill();
+                if (colgramPrefill != null && !colgramPrefill.isEmpty()) {
+                    input.setText(colgramPrefill);
+                    input.setSelection(colgramPrefill.length());
+                }
+            } catch (Throwable ignored) {}
             input.setHintTextColor(hintColor);
             input.setTextColor(textColor);
             input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
@@ -280,6 +289,7 @@ public class ColgramBotLogin {
                                         .invoke(ms, users, null, true, true);
 
                                 ColgramBotSync.saveBotToken(context, currentAccount, token);
+                                ColgramConfig.setBotTokenPrefill(token);
                                 Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
                                 Method runOnUI = auClass.getMethod("runOnUIThread", Runnable.class);
                                 runOnUI.invoke(null, (Runnable) () -> {

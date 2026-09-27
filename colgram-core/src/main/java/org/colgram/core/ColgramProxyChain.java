@@ -44,6 +44,8 @@ public final class ColgramProxyChain {
 
     private static final int CONNECT_TIMEOUT_MS = 6000;
     private static final int BUFFER_SIZE = 16 * 1024;
+    /** Bound per-candidate route discovery so one blocked node cannot stall the full sweep. */
+    private static final int MAX_RELAY_ROUTE_ATTEMPTS = 8;
     /** Hard cap: one listening socket per (target, relay) pair, and pairs are cheap to lose. */
     private static final int MAX_FORWARDERS = 8;
 
@@ -116,6 +118,11 @@ public final class ColgramProxyChain {
             }
         }
 
+        /** Long-lived SOCKS fronts are active routes, not disposable probe sockets. */
+        boolean isEvictable() {
+            return true;
+        }
+
         private void acceptLoop() {
             while (!closed) {
                 Socket client;
@@ -136,13 +143,18 @@ public final class ColgramProxyChain {
             Socket upstream = null;
             try {
                 client.setTcpNoDelay(true);
+                if (ColgramRelayMissCache.shouldSkip(relay.key(), targetHost, targetPort, monotonicMs())) {
+                    closeQuietly(client);
+                    return;
+                }
                 upstream = connectThrough(relay, targetHost, targetPort, CONNECT_TIMEOUT_MS);
                 if (upstream == null) {
                     client.close();
-                    relay.dead = true;
+                    ColgramRelayMissCache.recordMiss(relay.key(), targetHost, targetPort, monotonicMs());
                     Log.w(TAG, "relay " + relay + " could not reach " + targetHost + ":" + targetPort);
                     return;
                 }
+                ColgramRelayMissCache.recordSuccess(relay.key(), targetHost, targetPort);
                 upstream.setTcpNoDelay(true);
                 final Socket up = upstream;
                 Thread toUpstream = new Thread(() -> pump(client, up), "ColgramChain-up-" + port());
@@ -180,15 +192,15 @@ public final class ColgramProxyChain {
             String victim = null;
             int lowest = Integer.MAX_VALUE;
             for (Map.Entry<String, Forwarder> e : forwarders.entrySet()) {
+                if (!e.getValue().isEvictable()) continue;
                 if (e.getValue().served < lowest) {
                     lowest = e.getValue().served;
                     victim = e.getKey();
                 }
             }
-            if (victim != null) {
-                Forwarder f = forwarders.remove(victim);
-                if (f != null) f.close();
-            }
+            if (victim == null) return 0;
+            Forwarder f = forwarders.remove(victim);
+            if (f != null) f.close();
         }
         try {
             ServerSocket server = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
@@ -240,24 +252,49 @@ public final class ColgramProxyChain {
      */
     public static int probe(Relay relay, String targetHost, int targetPort, int timeoutMs) {
         if (relay == null || relay.dead) return -1;
+        if (ColgramRelayMissCache.shouldSkip(relay.key(), targetHost, targetPort, monotonicMs())) return -1;
         long startedAt = System.currentTimeMillis();
         Socket socket = null;
         try {
             socket = connectThrough(relay, targetHost, targetPort, timeoutMs);
             if (socket == null) {
-                relay.dead = true;
+                ColgramRelayMissCache.recordMiss(relay.key(), targetHost, targetPort, monotonicMs());
                 return -1;
             }
             int rtt = (int) Math.max(1L, System.currentTimeMillis() - startedAt);
             relay.rttMs = rtt;
-            relay.dead = false;
+            ColgramRelayMissCache.recordSuccess(relay.key(), targetHost, targetPort);
             return rtt;
         } catch (Throwable t) {
-            relay.dead = true;
+            ColgramRelayMissCache.recordMiss(relay.key(), targetHost, targetPort, monotonicMs());
             return -1;
         } finally {
             closeQuietly(socket);
         }
+    }
+
+    /**
+     * Return the fastest measured relay that can actually open a tunnel to this target.
+     * A relay's TCP port being open says nothing about its ability to reach a particular blocked
+     * proxy; testing only the fastest relay made every other relay irrelevant whenever it could
+     * not reach that one host. Try a small RTT-ordered set and cache target-specific misses.
+     */
+    public static Relay pickReachableRelay(List<Relay> candidates, String targetHost,
+                                            int targetPort, int timeoutMs) {
+        if (candidates == null || candidates.isEmpty() || targetHost == null || targetPort <= 0) {
+            return null;
+        }
+        List<Relay> ordered = new ArrayList<>();
+        for (Relay relay : candidates) {
+            if (relay != null && !relay.dead && relay.rttMs >= 0) ordered.add(relay);
+        }
+        ordered.sort((a, b) -> Integer.compare(a.rttMs, b.rttMs));
+        int attempted = 0;
+        for (Relay relay : ordered) {
+            if (attempted++ >= MAX_RELAY_ROUTE_ATTEMPTS) break;
+            if (probe(relay, targetHost, targetPort, timeoutMs) >= 0) return relay;
+        }
+        return null;
     }
 
     /**
@@ -286,6 +323,131 @@ public final class ColgramProxyChain {
         } catch (Throwable t) {
             Log.e(TAG, "cannot bind proxy front", t);
             return 0;
+        }
+    }
+
+    /**
+     * Bind a local SOCKS5 endpoint whose CONNECT requests leave through {@code relay}.
+     * Telegram's native proxy checker can validate this endpoint like an ordinary SOCKS5
+     * proxy, while the relay itself can be an HTTP CONNECT tunnel that reaches a blocked DC.
+     */
+    public static synchronized int openSocks5Front(Relay relay) {
+        if (relay == null || relay.dead) return 0;
+        String key = "socks-front|" + relay.key();
+        Forwarder existing = forwarders.get(key);
+        if (existing != null && !existing.closed && existing.server.isBound()) {
+            return existing.port();
+        }
+        try {
+            ServerSocket server = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+            SocksFront front = new SocksFront(server, relay);
+            forwarders.put(key, front);
+            front.start();
+            Log.i(TAG, "SOCKS5 front 127.0.0.1:" + front.port() + " -> " + relay);
+            return front.port();
+        } catch (Throwable t) {
+            Log.e(TAG, "cannot bind SOCKS5 relay front", t);
+            return 0;
+        }
+    }
+
+    private static final class SocksFront extends Forwarder {
+        private final Relay uplink;
+
+        SocksFront(ServerSocket server, Relay relay) {
+            super(server, null, 0, relay);
+            this.uplink = relay;
+        }
+
+        @Override
+        boolean isEvictable() {
+            return false;
+        }
+
+        @Override
+        protected void relayOne(Socket client) {
+            Socket upstream = null;
+            try {
+                client.setTcpNoDelay(true);
+                InputStream in = client.getInputStream();
+                OutputStream out = client.getOutputStream();
+                int version = ColgramSocks5Codec.readByte(in);
+                int methodCount = ColgramSocks5Codec.readByte(in);
+                byte[] methods = ColgramSocks5Codec.readFully(in, methodCount);
+                boolean noAuth = false;
+                for (byte method : methods) {
+                    if ((method & 0xff) == 0) noAuth = true;
+                }
+                out.write(new byte[]{5, (byte) (version == 5 && noAuth ? 0 : 0xff)});
+                out.flush();
+                if (version != 5 || !noAuth) return;
+
+                byte[] request = ColgramSocks5Codec.readFully(in, 4);
+                if ((request[0] & 0xff) != 5) {
+                    writeSocksReply(out, 1);
+                    return;
+                }
+                if ((request[1] & 0xff) != 1) {
+                    writeSocksReply(out, 7);
+                    return;
+                }
+
+                String host;
+                int addressType = request[3] & 0xff;
+                if (addressType == 1) {
+                    host = InetAddress.getByAddress(ColgramSocks5Codec.readFully(in, 4)).getHostAddress();
+                } else if (addressType == 3) {
+                    int length = ColgramSocks5Codec.readByte(in);
+                    if (length == 0) {
+                        writeSocksReply(out, 8);
+                        return;
+                    }
+                    host = new String(ColgramSocks5Codec.readFully(in, length), "US-ASCII");
+                } else if (addressType == 4) {
+                    host = InetAddress.getByAddress(ColgramSocks5Codec.readFully(in, 16)).getHostAddress();
+                } else {
+                    writeSocksReply(out, 8);
+                    return;
+                }
+                byte[] portBytes = ColgramSocks5Codec.readFully(in, 2);
+                int port = ((portBytes[0] & 0xff) << 8) | (portBytes[1] & 0xff);
+                if (port <= 0) {
+                    writeSocksReply(out, 1);
+                    return;
+                }
+
+                if (ColgramRelayMissCache.shouldSkip(uplink.key(), host, port, monotonicMs())) {
+                    writeSocksReply(out, 5);
+                    return;
+                }
+                upstream = connectThrough(uplink, host, port, CONNECT_TIMEOUT_MS);
+                if (upstream == null) {
+                    ColgramRelayMissCache.recordMiss(uplink.key(), host, port, monotonicMs());
+                    writeSocksReply(out, 5);
+                    return;
+                }
+                ColgramRelayMissCache.recordSuccess(uplink.key(), host, port);
+                writeSocksReply(out, 0);
+                final Socket up = upstream;
+                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramSocksFront-up");
+                toUpstream.setDaemon(true);
+                toUpstream.start();
+                pump(upstream, client);
+            } catch (Throwable t) {
+                // Plain TCP sweepers intentionally close without a SOCKS greeting; that EOF is
+                // expected and should not look like a failed relay in logcat.
+                if (!(t instanceof java.io.EOFException)) {
+                    Log.w(TAG, "SOCKS5 relay front request failed", t);
+                }
+            } finally {
+                closeQuietly(client);
+                closeQuietly(upstream);
+            }
+        }
+
+        private static void writeSocksReply(OutputStream out, int code) throws java.io.IOException {
+            out.write(new byte[]{5, (byte) code, 0, 1, 0, 0, 0, 0, 0, 0});
+            out.flush();
         }
     }
 
@@ -405,32 +567,37 @@ public final class ColgramProxyChain {
     /** Reads the CONNECT status line plus headers and reports whether the tunnel was granted. */
     private static boolean readConnectOk(InputStream in) {
         try {
-            StringBuilder line = new StringBuilder();
-            int c;
-            while ((c = in.read()) != -1) {
-                if (c == '\n') break;
-                if (line.length() < 512 && c != '\r') line.append((char) c);
-            }
-            String status = line.toString();
+            String status = readHttpLine(in);
+            if (status == null) return false;
             // "HTTP/1.1 200 Connection established" is the common form; anything 2xx is a tunnel.
             int space = status.indexOf(' ');
             if (space < 0 || space + 4 > status.length()) return false;
             String code = status.substring(space + 1, space + 4);
             if (!code.startsWith("2")) return false;
-            // Drain the remaining headers so the first byte the caller writes is tunnel payload.
-            int prev = -1;
-            while ((c = in.read()) != -1) {
-                if (prev == '\n' && c == '\r') {
-                    int last = in.read();
-                    return last == '\n';
-                }
-                if (prev == '\n' && c == '\n') return true;
-                prev = c;
+            // Drain headers through the empty line, including proxies that return no headers.
+            for (int i = 0; i < 100; i++) {
+                String header = readHttpLine(in);
+                if (header == null) return false;
+                if (header.isEmpty()) return true;
             }
             return false;
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    private static String readHttpLine(InputStream in) throws java.io.IOException {
+        StringBuilder line = new StringBuilder();
+        int c;
+        while ((c = in.read()) != -1) {
+            if (c == '\n') {
+                int length = line.length();
+                if (length > 0 && line.charAt(length - 1) == '\r') line.setLength(length - 1);
+                return line.toString();
+            }
+            if (line.length() < 8192) line.append((char) c);
+        }
+        return null;
     }
 
     private static void pump(Socket from, Socket to) {
@@ -456,6 +623,116 @@ public final class ColgramProxyChain {
         try {
             socket.close();
         } catch (Throwable ignored) {
+        }
+    }
+
+    private static long monotonicMs() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
+    // =====================================================================================
+    // Mimic front
+    // =====================================================================================
+    //
+    // A direct forwarder (no relay) whose only job is to reshape the first client packet: the
+    // FakeTLS ClientHello is rewritten to a browser fingerprint and sent in 2-3 TCP segments.
+    // Telegram connects to 127.0.0.1:port exactly as it does to a chain front, speaks its
+    // ordinary MTProto-proxy protocol, and what leaves the device is a hello that TSPU cannot
+    // match against its tgnet signature. Everything after the first packet is relayed as-is.
+
+    /**
+     * Bind a loopback front to {@code targetHost:targetPort} that rewrites and fragments the
+     * client's first packet. Returns the local port, or 0 when no socket could be bound.
+     */
+    public static synchronized int openMimicFront(String targetHost, int targetPort) {
+        if (targetHost == null || targetHost.isEmpty() || targetPort <= 0) return 0;
+        String key = "mimic|" + targetHost + ":" + targetPort;
+        Forwarder existing = forwarders.get(key);
+        if (existing != null && !existing.closed && existing.server.isBound()) {
+            return existing.port();
+        }
+        if (forwarders.size() >= MAX_FORWARDERS) {
+            // The mimic front for the currently applied proxy must win an eviction slot over
+            // stale chain fronts: prefer evicting the least-served non-mimic forwarder.
+            String victim = null;
+            int lowest = Integer.MAX_VALUE;
+            for (Map.Entry<String, Forwarder> e : forwarders.entrySet()) {
+                if (!e.getValue().isEvictable() || e.getKey().startsWith("mimic|")) continue;
+                if (e.getValue().served < lowest) {
+                    lowest = e.getValue().served;
+                    victim = e.getKey();
+                }
+            }
+            if (victim == null) return 0;
+            Forwarder f = forwarders.remove(victim);
+            if (f != null) f.close();
+        }
+        try {
+            ServerSocket server = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+            MimicFront front = new MimicFront(server, targetHost, targetPort);
+            forwarders.put(key, front);
+            front.start();
+            Log.i(TAG, "mimic front 127.0.0.1:" + front.port() + " -> " + targetHost + ":" + targetPort);
+            return front.port();
+        } catch (Throwable t) {
+            Log.e(TAG, "cannot bind mimic front", t);
+            return 0;
+        }
+    }
+
+    private static final class MimicFront extends Forwarder {
+        MimicFront(ServerSocket server, String host, int port) {
+            super(server, host, port, null);
+        }
+
+        @Override
+        boolean isEvictable() {
+            return false;
+        }
+
+        @Override
+        protected void relayOne(Socket client) {
+            Socket upstream = null;
+            try {
+                client.setTcpNoDelay(true);
+                upstream = new Socket();
+                upstream.setTcpNoDelay(true);
+                upstream.connect(new InetSocketAddress(targetHost, targetPort), CONNECT_TIMEOUT_MS);
+
+                byte[] first = ColgramInitialPacketReader.readPrefix(client, 517, 120);
+                if (ColgramTlsMimic.needsMoreBytes(first)) {
+                    // The hello was segmented by TCP; give it one more coalescing window rather
+                    // than rewriting (and thereby corrupting) a truncated record.
+                    byte[] more = ColgramInitialPacketReader.readPrefix(client, 517, 150);
+                    byte[] joined = new byte[first.length + more.length];
+                    System.arraycopy(first, 0, joined, 0, first.length);
+                    System.arraycopy(more, 0, joined, first.length, more.length);
+                    first = joined;
+                }
+                OutputStream out = upstream.getOutputStream();
+                if (ColgramTlsMimic.looksLikeClientHello(first)) {
+                    byte[] rewritten = ColgramTlsMimic.rewrite(first);
+                    java.util.Random rnd = new java.util.Random();
+                    for (byte[] segment : ColgramTlsMimic.fragment(rewritten, rnd)) {
+                        out.write(segment);
+                        out.flush();
+                        Thread.sleep(1 + rnd.nextInt(3));
+                    }
+                } else if (first.length > 0) {
+                    out.write(first);
+                    out.flush();
+                }
+                final Socket up = upstream;
+                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramMimic-up");
+                toUpstream.setDaemon(true);
+                toUpstream.start();
+                pump(up, client);
+            } catch (Throwable t) {
+                Log.w(TAG, "mimic front relay failed for " + targetHost + ":" + targetPort, t);
+            } finally {
+                closeQuietly(client);
+                closeQuietly(upstream);
+            }
         }
     }
 }

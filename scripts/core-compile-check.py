@@ -23,16 +23,50 @@ sdk = r"C:\android-sdk"
 platforms = sorted(os.listdir(os.path.join(sdk, "platforms")))
 android_jar = os.path.join(sdk, "platforms", platforms[-1], "android.jar")
 
+GRADLE_CACHE = r"C:\Users\virsu\.gradle\caches\modules-2\files-2.1"
+
+def find_aar(group, artifact, version_hint):
+    """Locate an AAR by group/artifact under the Gradle cache, any pinned hash.
+
+    The hash directory in the middle of the path changes whenever Gradle re-resolves
+    the dependency, and a probe that hardcodes it silently loses its classpath and
+    starts reporting fake 'cannot find symbol' errors (androidx.core.content went
+    missing exactly this way).
+    """
+    base = os.path.join(GRADLE_CACHE, group, artifact)
+    if not os.path.isdir(base):
+        return None
+    hits = []
+    for version_dir in sorted(os.listdir(base)):
+        if version_hint and not version_dir.startswith(version_hint):
+            continue
+        for root, _, files in os.walk(os.path.join(base, version_dir)):
+            for f in files:
+                if f.endswith(".aar"):
+                    hits.append(os.path.join(root, f))
+    return max(hits, key=os.path.getmtime) if hits else None
+
 AARS = [
-    r"C:\Users\virsu\.gradle\caches\modules-2\files-2.1\androidx.core\core\1.12.0\5aa3088ed93ba8ebaea2b8a83befdfa829339e7a\core-1.12.0.aar",
-    r"C:\Users\virsu\.gradle\caches\modules-2\files-2.1\androidx.appcompat\appcompat\1.6.1\6c7577004b7ebbee5ed87d512b578dd20e3c8c31\appcompat-1.6.1.aar",
-    r"C:\Users\virsu\.gradle\caches\modules-2\files-2.1\com.google.android.material\material\1.11.0\e46abb2e27abed3ad274ba96b169a4c61fbb11fd\material-1.11.0.aar",
+    find_aar("androidx.core", "core", "1."),
+    find_aar("androidx.appcompat", "appcompat", "1."),
+    find_aar("com.google.android.material", "material", "1."),
 ]
 
 cp = [android_jar]
-for aar in AARS:
-    if not os.path.exists(aar):
-        print("!! missing aar:", aar)
+FALLBACK_JARS = {
+    "core": os.path.join(r"C:\Colgram\ci-artifact\tmpl-check\libs", "core-1.12.0.jar"),
+    "appcompat": os.path.join(r"C:\Colgram\ci-artifact\tmpl-check\libs", "appcompat-1.6.1.jar"),
+    "material": os.path.join(r"C:\Colgram\ci-artifact\tmpl-check\libs", "material-1.11.0.jar"),
+}
+FALLBACK_KEYS = ["core", "appcompat", "material"]
+for i, aar in enumerate(AARS):
+    if aar is None or not os.path.exists(aar):
+        fallback = FALLBACK_JARS.get(FALLBACK_KEYS[i]) if i < len(FALLBACK_KEYS) else None
+        if fallback and os.path.exists(fallback):
+            print("!! aar missing, using extracted fallback:", fallback)
+            cp.append(fallback)
+        else:
+            print("!! missing aar:", aar)
         continue
     dest = os.path.join(LIBS, os.path.basename(aar).replace(".aar", ".jar"))
     if not os.path.exists(dest):

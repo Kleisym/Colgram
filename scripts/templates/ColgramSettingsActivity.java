@@ -1,6 +1,9 @@
 package org.telegram.ui;
 
 import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
+import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -30,6 +33,10 @@ import org.telegram.ui.Components.RecyclerListView;
 
 public class ColgramSettingsActivity extends BaseFragment {
 
+    private static final String CLOUDFLARE_WARP_PACKAGE = "com.cloudflare.onedotonedotonedotone";
+    /** Request code for the system VPN consent dialog started by prepareAndStartWarp(). */
+    private static final int REQ_WARP_VPN = 9181;
+
     private RecyclerListView listView;
     private ListAdapter listAdapter;
 
@@ -54,6 +61,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int ghostOnlineRow;
     private int bypassFlagSecureRow;
     private int ghostSectionRow;
+    private int cloudflareWarpRow;
 
     private int networkHeaderRow;
     private int dpiBypassRow;
@@ -89,6 +97,21 @@ public class ColgramSettingsActivity extends BaseFragment {
         return true;
     }
 
+    @Override
+    public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQ_WARP_VPN) {
+            if (resultCode == android.app.Activity.RESULT_OK) {
+                // The user granted VPN consent; the tunnel can actually come up now.
+                startWarpTunnel();
+            } else if (getContext() != null) {
+                Toast.makeText(getContext(),
+                        "Без разрешения на VPN WARP-туннель не включается", Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        super.onActivityResultFragment(requestCode, resultCode, data);
+    }
+
     private void updateRows() {
         rowCount = 0;
         cloakingHeaderRow = rowCount++;
@@ -111,20 +134,11 @@ public class ColgramSettingsActivity extends BaseFragment {
         ghostOnlineRow = rowCount++;
         bypassFlagSecureRow = rowCount++;
         ghostSectionRow = rowCount++;
+        cloudflareWarpRow = rowCount++;
 
-        networkHeaderRow = rowCount++;
-        dpiBypassRow = rowCount++;
-        dohRow = rowCount++;
-        builtinProxyRow = rowCount++;
-        proxyBrowserRow = rowCount++;
-        currentProxyRow = rowCount++;
-        ownProxyRow = rowCount++;
-        proxyStatusRow = rowCount++;
-        relayUrlRow = rowCount++;
-        autoProxyRow = rowCount++;
-        ipv6BypassRow = rowCount++;
-        dcRemapRow = rowCount++;
-        networkSectionRow = rowCount++;
+        networkHeaderRow = dpiBypassRow = dohRow = builtinProxyRow = proxyBrowserRow =
+                currentProxyRow = ownProxyRow = proxyStatusRow = relayUrlRow = autoProxyRow =
+                ipv6BypassRow = dcRemapRow = networkSectionRow = -1;
 
         sandboxHeaderRow = rowCount++;
         sandboxStorageRow = rowCount++;
@@ -169,7 +183,9 @@ public class ColgramSettingsActivity extends BaseFragment {
         listView.setAdapter(listAdapter);
 
         listView.setOnItemClickListener((view, position) -> {
-            if (position == cloakEnabledRow) {
+            if (position == cloudflareWarpRow) {
+                openCloudflareWarp();
+            } else if (position == cloakEnabledRow) {
                 boolean val = !ColgramConfig.isCloakEnabled();
                 ColgramConfig.setCloakEnabled(val);
                 if (view instanceof TextCheckCell) {
@@ -289,7 +305,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             } else if (position == dcRemapRow) {
                 boolean remap = !ColgramConfig.isDcRemapEnabled();
                 ColgramConfig.setDcRemapEnabled(remap);
-                ColgramProxyManager.applyDcRemap(remap);
+                ColgramProxyManager.applyDcRemapFromUser(remap);
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(remap);
                 }
@@ -426,6 +442,152 @@ public class ColgramSettingsActivity extends BaseFragment {
                 .show();
     }
 
+    /**
+     * Built-in WARP. The old row just launched the official 1.1.1.1 app — the very app whose
+     * pinned :2408 endpoint TSPU drops, which made the row a dead end on the networks this
+     * feature exists for. Colgram now registers its own device (one HTTPS POST, keys never
+     * leave the phone) and runs the tunnel through the embedded WireGuard backend, rotating
+     * the UDP port when the edge stays silent.
+     */
+    private void openCloudflareWarp() {
+        Context context = getContext();
+        android.app.Activity activity = getParentActivity();
+        if (context == null || activity == null) return;
+        if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) {
+            Toast.makeText(context, "WireGuard-бэкенд недоступен в этой сборке", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (org.colgram.core.ColgramConfig.isWarpEnabled()) {
+            org.colgram.core.ColgramConfig.setWarpEnabled(false);
+            org.colgram.core.ColgramWarpTunnel.bringDown(context);
+            Toast.makeText(context, "WARP отключён", Toast.LENGTH_SHORT).show();
+            listAdapter.notifyDataSetChanged();
+            return;
+        }
+        org.colgram.core.ColgramConfig.setWarpEnabled(true);
+        if (!org.colgram.core.ColgramWarp.isRegistered()) {
+            Toast.makeText(context, "Регистрирую устройство в WARP…", Toast.LENGTH_SHORT).show();
+            new Thread(() -> {
+                String reason;
+                try {
+                    org.colgram.core.ColgramWarp.register(context);
+                    reason = null;
+                } catch (Throwable t) {
+                    reason = t.getMessage() == null ? t.toString() : t.getMessage();
+                }
+                final String failure = reason;
+                android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                h.post(() -> {
+                    if (failure == null) {
+                        Toast.makeText(context, "WARP: устройство зарегистрировано", Toast.LENGTH_SHORT).show();
+                        if (getParentActivity() != null) prepareAndStartWarp();
+                    } else {
+                        org.colgram.core.ColgramConfig.setWarpEnabled(false);
+                        Toast.makeText(context, "WARP: регистрация не удалась — " + failure,
+                                Toast.LENGTH_LONG).show();
+                    }
+                });
+            }, "colgram-warp-reg").start();
+            return;
+        }
+        prepareAndStartWarp();
+    }
+
+    /** Android requires the one-time VPN consent dialog before a tunnel can come up. */
+    private void prepareAndStartWarp() {
+        try {
+            Intent prepare = android.net.VpnService.prepare(getParentActivity());
+            if (prepare != null) {
+                startActivityForResult(prepare, REQ_WARP_VPN);
+            } else {
+                startWarpTunnel();
+            }
+        } catch (Throwable t) {
+            Toast.makeText(getContext(), "WARP: " + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void startWarpTunnel() {
+        final Context context = getContext();
+        if (context == null) return;
+        Toast.makeText(context, "Поднимаю WARP-туннель…", Toast.LENGTH_SHORT).show();
+        // Watch the tunnel for the same verdict the watchdog records, so a route that cannot
+        // carry traffic reports itself instead of leaving a toggle that silently switches off.
+        watchWarpVerdict(context);
+        new Thread(() -> {
+            String failure;
+            try {
+                org.colgram.core.ColgramWarpTunnel.bringUp(context.getApplicationContext());
+                failure = null;
+            } catch (Throwable t) {
+                failure = t.getMessage() == null ? t.toString() : t.getMessage();
+            }
+            final String result = failure;
+            android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+            h.post(() -> {
+                if (result == null) {
+                    Toast.makeText(context, "WARP запускается; проверяю связь (порт "
+                            + org.colgram.core.ColgramWarp.currentEndpointPort() + ")",
+                            Toast.LENGTH_SHORT).show();
+                } else {
+                    org.colgram.core.ColgramConfig.setWarpEnabled(false);
+                    Toast.makeText(context, "WARP не поднялся — " + result, Toast.LENGTH_LONG).show();
+                }
+                if (listAdapter != null) listAdapter.notifyDataSetChanged();
+            });
+        }, "colgram-warp-up").start();
+    }
+
+    /** Polls until WARP either starts carrying traffic or the watchdog gives up on the route. */
+    private void watchWarpVerdict(final Context context) {
+        new Thread(() -> {
+            long deadline = android.os.SystemClock.elapsedRealtime()
+                    + (org.colgram.core.ColgramWarp.endpointPortCount() * 8L + 20L) * 1000L;
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                try {
+                    Thread.sleep(1000L);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (org.colgram.core.ColgramWarpTunnel.isConnected()) {
+                    android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                    h.post(() -> {
+                        Toast.makeText(context, "WARP подключён", Toast.LENGTH_SHORT).show();
+                        if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                    });
+                    return;
+                }
+                String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();
+                if (failure != null && !failure.isEmpty()
+                        && !org.colgram.core.ColgramWarpTunnel.isUp()) {
+                    final String reason = failure;
+                    android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                    h.post(() -> {
+                        Toast.makeText(context, "WARP не работает: " + reason,
+                                Toast.LENGTH_LONG).show();
+                        if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                    });
+                    return;
+                }
+            }
+        }, "colgram-warp-verdict").start();
+    }
+
+    private String warpStatusLine() {
+        if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) return "бэкенд недоступен";
+        String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();
+        if (failure != null && !failure.isEmpty()
+                && !org.colgram.core.ColgramWarpTunnel.isUp()) {
+            return "не работает: " + failure;
+        }
+        if (org.colgram.core.ColgramWarpTunnel.isUp()) {
+            return (org.colgram.core.ColgramWarpTunnel.isConnected() ? "подключен · порт " : "подключается · порт ")
+                    + org.colgram.core.ColgramWarp.currentEndpointPort();
+        }
+        if (org.colgram.core.ColgramWarp.isRegistered()) return "выключен · нажмите, чтобы включить";
+        return "выключен · нажмите, чтобы подключить";
+    }
+
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
         private final Context mContext;
 
@@ -447,7 +609,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                    position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow || position == ipv6BypassRow || position == dcRemapRow ||
                    position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow || position == autoProxyRow ||
                    position == sandboxStorageRow || position == sandboxFilesRow ||
-                   position == botRealtimeRow || position == botTestRow || position == pluginsRow;
+                   position == botRealtimeRow || position == botTestRow || position == pluginsRow ||
+                   position == cloudflareWarpRow;
         }
 
         @Override
@@ -458,7 +621,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow
                     || position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow
-                    || position == sandboxFilesRow || position == pluginsRow || position == botTestRow) {
+                    || position == sandboxFilesRow || position == pluginsRow || position == botTestRow
+                    || position == cloudflareWarpRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
                        position == networkSectionRow || position == sandboxSectionRow ||
@@ -523,7 +687,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == editHistoryRow) {
                         checkCell.setTextAndCheck("Сохранять историю редакций текста", ColgramConfig.isEditHistoryEnabled(), true);
                     } else if (position == antiDeleteHighlightRow) {
-                        checkCell.setTextAndCheck("Помечать удалённые значком 🗑", ColgramConfig.isAntiDeleteHighlightEnabled(), true);
+                        checkCell.setTextAndCheck("Показывать метку «Удалено»", ColgramConfig.isAntiDeleteHighlightEnabled(), true);
                     } else if (position == antiDeleteWipeRow) {
                         checkCell.setTextAndCheck("Стирать текст удалённых (иначе — архив)", ColgramConfig.isAntiDeleteWipeEnabled(), true);
                     } else if (position == autoHidePhoneRow) {
@@ -571,14 +735,18 @@ public class ColgramSettingsActivity extends BaseFragment {
                         settingsCell.setTextAndValue("Модель устройства", ColgramConfig.getSpoofDeviceModel(), false);
                     } else if (position == currentProxyRow) {
                         ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
-                        boolean proxyOn = ColgramProxyManager.isProxyEnabled(getContext());
+                        // Automatic failover deliberately keeps Telegram's persisted proxy
+                        // preference off. The live route still needs to be shown as active.
+                        boolean proxyOn = ColgramProxyManager.isProxyEnabled(getContext())
+                                || active != null;
                         String proxyStr = !proxyOn
                                 ? "выключено — прямое соединение"
                                 : (active != null ? active.toString() : "включено, узел не определён");
                         settingsCell.setTextAndValue("Сменить узел обходчика", proxyStr, false);
                     } else if (position == ownProxyRow) {
                         settingsCell.setTextAndValue("Свой прокси: MTProto / WebSocket / SOCKS5",
-                                ColgramProxyManager.isProxyEnabled(getContext())
+                                (ColgramProxyManager.isProxyEnabled(getContext())
+                                        || ColgramProxyManager.getCurrentActiveProxy() != null)
                                         ? "открыть экран Telegram" : "добавить и включить", false);
                     } else if (position == sandboxFilesRow) {
                         // Show the path that is actually in effect: scoped storage decides it, so
@@ -598,6 +766,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == proxyStatusRow) {
                         settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
                                 ColgramProxyDoctor.getStatusSummary(), false);
+                    } else if (position == cloudflareWarpRow) {
+                        settingsCell.setTextAndValue("Cloudflare WARP (встроенный обход)",
+                                warpStatusLine(), false);
                     }
                     break;
                 }
