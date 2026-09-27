@@ -1062,6 +1062,7 @@ public final class DialogRefreshSequencerHarness {
         runner = (ROOT / "scripts/device-tests.py").read_text(encoding="utf-8")
         self.assertIn("ColgramProxyAutonomyDeviceTest", runner)
         self.assertIn("ColgramGlobalSearchHistoryDeviceTest", runner)
+        self.assertIn("ColgramGlobalSearchRestoreDeviceTest", runner)
         self.assertIn("ColgramThemeContrastDeviceTest", runner)
         self.assertIn("test-results.log", runner)
         self.assertIn("Failed to receive the UTP test results", runner)
@@ -1083,6 +1084,7 @@ public final class DialogRefreshSequencerHarness {
         installed = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core"
         for name in ("ColgramThemeContrastDeviceTest.java",
                      "ColgramGlobalSearchHistoryDeviceTest.java",
+                     "ColgramGlobalSearchRestoreDeviceTest.java",
                      "ColgramProxyAutonomyDeviceTest.java"):
             template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
             self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")
