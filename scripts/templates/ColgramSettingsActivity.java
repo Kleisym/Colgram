@@ -3,6 +3,7 @@ package org.telegram.ui;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.util.Log;
 import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
@@ -36,6 +37,8 @@ public class ColgramSettingsActivity extends BaseFragment {
     private static final String CLOUDFLARE_WARP_PACKAGE = "com.cloudflare.onedotonedotonedotone";
     /** Request code for the system VPN consent dialog started by prepareAndStartWarp(). */
     private static final int REQ_WARP_VPN = 9181;
+    /** Android's consent for the subscription tunnel, which routes the whole phone. */
+    private static final int REQ_SUBSCRIPTION_VPN = 9183;
 
     private RecyclerListView listView;
     private ListAdapter listAdapter;
@@ -62,6 +65,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int bypassFlagSecureRow;
     private int ghostSectionRow;
     private int cloudflareWarpRow;
+    private int subscriptionRow;
 
     /** True while a WARP start is in flight, before the persisted flag says anything. */
     private volatile boolean warpStartPending = false;
@@ -112,6 +116,18 @@ public class ColgramSettingsActivity extends BaseFragment {
             }
             return;
         }
+        if (requestCode == REQ_SUBSCRIPTION_VPN) {
+            Context context = getContext();
+            if (resultCode == android.app.Activity.RESULT_OK) {
+                if (context != null) startSubscriptionTunnel(context);
+            } else if (context != null) {
+                // Without the consent the tunnel cannot exist, and saying so plainly beats a
+                // switch that appears to work while nothing is routed.
+                Toast.makeText(context,
+                        "Без разрешения на VPN туннель не запускается", Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
         super.onActivityResultFragment(requestCode, resultCode, data);
     }
 
@@ -138,6 +154,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         bypassFlagSecureRow = rowCount++;
         ghostSectionRow = rowCount++;
         cloudflareWarpRow = rowCount++;
+        subscriptionRow = rowCount++;
 
         networkHeaderRow = dpiBypassRow = dohRow = builtinProxyRow = proxyBrowserRow =
                 currentProxyRow = ownProxyRow = proxyStatusRow = relayUrlRow = autoProxyRow =
@@ -188,6 +205,8 @@ public class ColgramSettingsActivity extends BaseFragment {
         listView.setOnItemClickListener((view, position) -> {
             if (position == cloudflareWarpRow) {
                 openCloudflareWarp();
+            } else if (position == subscriptionRow) {
+                openSubscription();
             } else if (position == cloakEnabledRow) {
                 boolean val = !ColgramConfig.isCloakEnabled();
                 ColgramConfig.setCloakEnabled(val);
@@ -508,6 +527,112 @@ public class ColgramSettingsActivity extends BaseFragment {
         prepareAndStartWarp();
     }
 
+    /**
+     * Paste a subscription link, and switch the tunnel to it.
+     *
+     * The link is the user's paid access to someone else's server, so it is only ever handed to
+     * the store inside the app's own storage and never leaves it in a log. The parse happens on a
+     * worker thread because a subscription can carry a few hundred nodes, and a link that turns
+     * out to be unusable has to say so at paste time - otherwise the tunnel comes up and routes
+     * nothing, which is indistinguishable from a broken subscription.
+     */
+    private void openSubscription() {
+        final Context context = getContext();
+        if (context == null) return;
+
+        final android.widget.EditText input = new android.widget.EditText(context);
+        input.setHint("vless://... или ss://...");
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        input.setTextSize(13);
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        input.setSingleLine(false);
+        input.setMinLines(3);
+        input.setMaxLines(6);
+        // Long links are unreadable on one line, and a link the user cannot check is a link they
+        // will not trust.
+        input.setHorizontallyScrolling(false);
+
+        org.telegram.ui.ActionBar.AlertDialog.Builder builder =
+                new org.telegram.ui.ActionBar.AlertDialog.Builder(getParentActivity());
+        builder.setTitle("Подписка на VPN");
+        builder.setMessage("Вставьте ссылку из бота. Она хранится только в приложении.");
+        builder.setView(input);
+        builder.setPositiveButton("Подключить", (d, w) -> applySubscription(input.getText().toString()));
+        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
+        if (org.colgram.core.ColgramSubscriptionStore.hasSubscription(context)) {
+            builder.setNeutralButton("Удалить", (d, w) -> {
+                org.colgram.core.ColgramSubscriptionStore.clear(context);
+                try {
+                    Class.forName("org.colgram.singbox.ColgramVpnService");
+                    org.colgram.singbox.ColgramVpnService.stop(context);
+                } catch (Throwable ignored) {
+                    // The engine may not be present in this build; the link is still gone.
+                }
+                if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                Toast.makeText(context, "Подписка удалена", Toast.LENGTH_SHORT).show();
+            });
+        }
+        builder.show();
+    }
+
+    private void applySubscription(final String link) {
+        final Context context = getContext();
+        if (context == null) return;
+        final String trimmed = link == null ? "" : link.trim();
+        if (trimmed.isEmpty()) {
+            Toast.makeText(context, "Ссылка пустая", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Toast.makeText(context, "Разбираю подписку…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String failure = null;
+            String detail = "";
+            try {
+                org.colgram.core.ColgramSubscriptionStore.State state =
+                        org.colgram.core.ColgramSubscriptionStore.save(context, trimmed);
+                detail = state.total + " узлов, первый: " + state.name;
+            } catch (Throwable t) {
+                failure = t.getMessage() == null ? t.toString() : t.getMessage();
+            }
+            final String error = failure;
+            final String summary = detail;
+            android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
+            handler.post(() -> {
+                if (getParentActivity() == null) return;
+                if (error != null) {
+                    Toast.makeText(context, "Подписка не подошла: " + error, Toast.LENGTH_LONG).show();
+                    return;
+                }
+                if (listAdapter != null) listAdapter.notifyDataSetChanged();
+                Toast.makeText(context, summary, Toast.LENGTH_SHORT).show();
+                startSubscriptionTunnel(context);
+            });
+        }, "colgram-subscription").start();
+    }
+
+    /**
+     * Ask the system for consent, then hand the profile to the engine.
+     *
+     * The consent dialog is Android's, not ours: a tunnel that routes the whole phone is exactly
+     * the thing that permission exists for, and showing our own would defeat the point of it.
+     */
+    private void startSubscriptionTunnel(final Context context) {
+        try {
+            Class<?> service = Class.forName("org.colgram.singbox.ColgramVpnService");
+            android.content.Intent prepare = android.net.VpnService.prepare(getParentActivity());
+            if (prepare != null) {
+                startActivityForResult(prepare, REQ_SUBSCRIPTION_VPN);
+                return;
+            }
+            service.getMethod("start", Context.class, String.class).invoke(null, context,
+                    org.colgram.core.ColgramSubscriptionStore.profilePath(context));
+        } catch (Throwable t) {
+            Log.w("ColgramSub", "cannot start the tunnel: " + t);
+            Toast.makeText(context, "Туннель не запустился: " + t, Toast.LENGTH_LONG).show();
+        }
+    }
+
     /** Android requires the one-time VPN consent dialog before a tunnel can come up. */
     private void prepareAndStartWarp() {
         try {
@@ -609,6 +734,24 @@ public class ColgramSettingsActivity extends BaseFragment {
         }
         if (org.colgram.core.ColgramWarp.isRegistered()) return "выключен · нажмите, чтобы включить";
         return "выключен · нажмите, чтобы подключить";
+    }
+
+    /** What the subscription row shows, read back from the store rather than from a guess. */
+    private String subscriptionStatusLine() {
+        Context context = getContext();
+        if (context == null) return "не настроена";
+        try {
+            Class<?> store = Class.forName("org.colgram.core.ColgramSubscriptionStore");
+            Object state = store.getMethod("current", Context.class).invoke(null, context);
+            if (state == null) return "не настроена · нажмите, чтобы вставить";
+            int total = (Integer) state.getClass().getField("total").get(state);
+            String name = String.valueOf(state.getClass().getField("name").get(state));
+            if (total <= 1) return "узел: " + name;
+            return total + " узлов, первый: " + name;
+        } catch (Throwable t) {
+            // The store is absent in a build without it, and that is not an error to surface.
+            return "недоступно";
+        }
     }
 
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
@@ -792,6 +935,12 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == cloudflareWarpRow) {
                         settingsCell.setTextAndValue("Cloudflare WARP (встроенный обход)",
                                 warpStatusLine(), false);
+                    } else if (position == subscriptionRow) {
+                        // The row says what is actually stored, never what the user hopes for:
+                        // a link that parsed to nothing shows as absent, not as a tunnel waiting
+                        // to start.
+                        settingsCell.setTextAndValue("Подписка (VPN на весь телефон)",
+                                subscriptionStatusLine(), false);
                     }
                     break;
                 }
