@@ -1051,6 +1051,27 @@ public final class DialogRefreshSequencerHarness {
         )[0]
         self.assertIn("ignoring background proxy application", force_apply)
 
+    def test_device_test_runner_reads_the_device_not_the_broken_utp_stream(self):
+        """gradle fails these runs even when every test passed, so the build is not the evidence.
+
+        On two consecutive runs the emulator reported `OK (3 tests)` with every per-test
+        INSTRUMENTATION_STATUS_CODE at 0, and gradle still failed with "Failed to receive the UTP
+        test results". A runner that trusted the exit code would report a failure that never
+        happened, and a green/red signal nobody can trust is worse than none.
+        """
+        runner = (ROOT / "scripts/device-tests.py").read_text(encoding="utf-8")
+        self.assertIn("ColgramProxyAutonomyDeviceTest", runner)
+        self.assertIn("ColgramGlobalSearchHistoryDeviceTest", runner)
+        self.assertIn("ColgramThemeContrastDeviceTest", runner)
+        self.assertIn("test-results.log", runner)
+        self.assertIn("Failed to receive the UTP test results", runner)
+        # It must clear stale results first, or a previous run reads as this one's outcome.
+        self.assertIn("a stale log cannot be read as this run", runner)
+        self.assertIn('item.unlink()', runner)
+        # And it must decide on per-test status, not on gradle's exit code.
+        self.assertIn("INSTRUMENTATION_STATUS_CODE", runner)
+        self.assertNotIn("return proc.returncode", runner)
+
     def test_device_tests_are_mirrored_so_they_survive_a_fresh_checkout(self):
         """Telegram-Src/ is gitignored, so the device tests need a tracked copy.
 
@@ -1060,7 +1081,9 @@ public final class DialogRefreshSequencerHarness {
         the next clone, and the tests that found real bugs would be the first thing lost.
         """
         installed = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core"
-        for name in ("ColgramThemeContrastDeviceTest.java", "ColgramGlobalSearchHistoryDeviceTest.java"):
+        for name in ("ColgramThemeContrastDeviceTest.java",
+                     "ColgramGlobalSearchHistoryDeviceTest.java",
+                     "ColgramProxyAutonomyDeviceTest.java"):
             template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
             self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")
             self.assertEqual(template, (installed / name).read_text(encoding="utf-8"),
