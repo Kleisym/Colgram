@@ -2273,6 +2273,64 @@ public class SecretCheck {
         self.assertIn("AndroidUtilities.cancelRunOnUIThread(timeout)", scheduler)
         self.assertIn('"private static final long STOCK_PROXY_CHECK_TIMEOUT_MS = 15_000L;"', scheduler)
 
+    def test_the_wire_parser_reads_a_question_header_before_its_answers(self):
+        """A real Cloudflare answer made the parser return nothing, silently.
+
+        A DNS question is a name FOLLOWED BY qtype and qclass. The parser skipped only the name,
+        so the cursor sat two bytes short, the first answer was read as type 256 instead of type 1,
+        and the function returned an empty list. That is the worst shape of failure available: the
+        resolver looked exactly like one that had been cut, so the app would have rotated through
+        every endpoint and blamed the network for a bug in its own reader.
+
+        The bytes are the real reply Cloudflare returned on the device, including the compression
+        pointer (c00c) in the answer name - a parser that had only ever seen uncompressed answers
+        would have passed on hand-written samples and failed here.
+        """
+        resolver = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramDohResolver.java").read_text(encoding="utf-8")
+        parser = resolver.split("static String[] parseARecords", 1)[1].split("private static void skipName", 1)[0]
+        self.assertIn("buffer.position(buffer.position() + 4); // QTYPE + QCLASS", parser)
+        self.assertNotIn("for (int i = 0; i < questions; i++) skipName(buffer);", parser)
+        self.assertIn("if (type == 1 && clazz == 1 && length == 4)", parser)
+
+        device_test = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramDohResolverDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn("000181800001000100000000036170690874656c656772616d036f72670000010001c00c", device_test)
+        self.assertIn("theReplyParserReadsARealCapturedAnswer", device_test)
+    def test_proxy_rotation_prefers_a_measured_proxy_over_an_unprobed_one(self):
+        """The reported bug: a proxy whose state was never known, stuck until changed by hand.
+
+        Three separate defects in ProxyRotationController all produced it, and all three are
+        upstream Telegram behaviour, so none of them was visible from Colgram's own code:
+
+          * the rotation deadline was armed only for ConnectionStateConnectingToProxy. A proxy
+            applied and then sitting in Connecting / WaitingForIp - the "state unknown" screen -
+            armed nothing, so the rotation never ran and never moved off the dead server;
+          * the sort compared ping ascending, and an entry that was never probed carries
+            ping = -1, which sorts ABOVE every real latency. The rotation therefore preferred the
+            least-known server in the list;
+          * proxyCheckDone switched on the FIRST result, so with several proxies the choice was
+            made from a partially-checked list - the servers not yet probed looked unprobed and
+            won the sort above.
+        """
+        rotation = (ROOT / "Telegram-Src/TMessagesProj/src/main/java/org/telegram/messenger/ProxyRotationController.java").read_text(encoding="utf-8")
+
+        # 1. The deadline must arm for every state that is not Connected.
+        state_block = rotation.split("int state = ConnectionsManager.getInstance(account).getConnectionState();", 1)[1].split("}", 1)[0]
+        self.assertIn("state != ConnectionsManager.ConnectionStateConnected", state_block)
+        self.assertNotIn("state == ConnectionsManager.ConnectionStateConnectingToProxy", state_block)
+
+        # 2. An unprobed entry must sort last, not first.
+        sort_block = rotation.split("private void switchToAvailable()", 1)[1].split("for (SharedConfig.ProxyInfo info : sortedList)", 1)[0]
+        self.assertIn("boolean u1 = o1.ping < 0;", sort_block)
+        self.assertIn("if (u1 != u2) return u1 ? 1 : -1;", sort_block)
+        self.assertNotIn("Collections.sort(sortedList, (o1, o2) -> Long.compare(o1.ping, o2.ping));", sort_block)
+
+        # 3. The switch must wait for the whole batch, not the first result.
+        self.assertIn("drainCompletedChecksAndSwitch();", rotation)
+        self.assertNotIn("            switchToAvailable();\n        } else if (id == NotificationCenter.proxySettingsChanged)", rotation)
+        drain = rotation.split("private void drainCompletedChecksAndSwitch()", 1)[1].split(chr(10) + "    }", 1)[0]
+        self.assertIn("if (info.checking)", drain)
+        self.assertIn("return;", drain)
+        self.assertIn("switchToAvailable();", drain)
     def test_standalone_release_variant_uses_release_signing_config(self):
         build = STANDALONE_GRADLE.read_text(encoding="utf-8")
         self.assertIn("    buildTypes {", build, "standalone application build types are missing")

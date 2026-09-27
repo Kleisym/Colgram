@@ -416,6 +416,14 @@ public final class ColgramHttp {
         URL url = new URL(urlStr);
         if (socksHost == null) {
             conn = (HttpURLConnection) url.openConnection();
+            // Resolve the host ourselves first, then aim the socket at that answer. The name in
+            // the URL is untouched, so SNI, Host and certificate verification are unchanged and a
+            // resolver that has been cut by SNI cannot be swapped for an impostor.
+            java.net.InetAddress resolved = ColgramDohResolver.resolveOrNull(url.getHost());
+            if (resolved != null && conn instanceof javax.net.ssl.HttpsURLConnection) {
+                conn = ColgramPinnedConnection.create(
+                        (javax.net.ssl.HttpsURLConnection) conn, url, resolved);
+            }
         } else {
             conn = (HttpURLConnection) url.openConnection(new Proxy(Proxy.Type.SOCKS,
                     new InetSocketAddress(socksHost, socksPort)));
