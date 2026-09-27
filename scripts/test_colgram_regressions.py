@@ -964,6 +964,29 @@ public final class DialogRefreshSequencerHarness {
         self.assertNotIn('"proxy_enabled_calls"', disable)
         self.assertIn("ColgramConfig.isWarpEnabled()", source.split("private static void autoConnectIfBlocked()", 1)[1].split("private static", 1)[0])
 
+    def test_bypass_liveness_is_asserted_on_a_socket_not_a_flag(self):
+        """A flag can be true while nothing is bound, and that is the reported symptom.
+
+        The device test found `running=true bound=false accepts=true` on the first read and
+        `ready=true bound=true accepts=true` a moment later: startNow() binds on a worker
+        thread, so isBound() read immediately after startImmediately() races the bind. A test
+        that asserted on the flag alone would have reported a failure that had not happened yet,
+        and one that asserted only on the flag would have passed while a wedged accept loop left
+        the port closed. The device test therefore connects a real socket, and waits through
+        awaitReady first - the same deadline the app itself uses before pointing Telegram at
+        the port.
+        """
+        bypass = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core/ColgramDpiBypassDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn("theListenerReallyAcceptsAConnection", bypass)
+        self.assertIn("accepts(port)", bypass)
+        self.assertIn('new InetSocketAddress("127.0.0.1", port)', bypass)
+        self.assertIn("awaitReady", bypass)
+        # stop() must clear bound as well as closing the socket, or the health check keeps
+        # believing a listener that no longer exists.
+        core = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramDpiBypass.java").read_text(encoding="utf-8")
+        stop_body = core.split("public static synchronized void stop()", 1)[1].split(chr(10) + "    }", 1)[0]
+        self.assertIn("serverSocket.close();", stop_body)
+        self.assertIn("bound = false;", stop_body)
     def test_call_proxying_only_ever_applies_to_a_plain_proxy(self):
         """Documented so it is not mistaken for a bug: calls cannot use an MTProto proxy.
 
@@ -1183,6 +1206,7 @@ public final class DialogRefreshSequencerHarness {
         installed = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/core"
         for name in ("ColgramThemeContrastDeviceTest.java",
                      "ColgramCallProxyDeviceTest.java",
+                     "ColgramDpiBypassDeviceTest.java",
                      "ColgramGlobalSearchHistoryDeviceTest.java",
                      "ColgramGlobalSearchRestoreDeviceTest.java",
                      "ColgramProxyAutonomyDeviceTest.java",

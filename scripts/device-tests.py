@@ -30,6 +30,7 @@ RESULTS = (GRADLE_SRC / "TMessagesProj_AppTests/build/outputs/androidTest-result
 
 DEVICE_TESTS = [
     "org.colgram.core.ColgramCallProxyDeviceTest",
+    "org.colgram.core.ColgramDpiBypassDeviceTest",
     "org.colgram.core.ColgramProxyAutonomyDeviceTest",
     "org.colgram.core.ColgramGlobalSearchHistoryDeviceTest",
     "org.colgram.core.ColgramGlobalSearchRestoreDeviceTest",
