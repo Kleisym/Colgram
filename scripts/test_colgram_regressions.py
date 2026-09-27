@@ -1604,8 +1604,12 @@ public final class FirstResponseReaderHarness {
     try (ServerSocket listener = new ServerSocket(0)) {
       Thread silent = new Thread(() -> {
         try (Socket peer = listener.accept()) { Thread.sleep(300); }
-        catch (Exception e) { throw new RuntimeException(e); }
+        // The client closes first on purpose, so a peer-side error here is the expected end of
+        // the scenario, not a failure. Throwing it on an uncaught handler made a passing run
+        // report a read timeout when the machine was busy.
+        catch (Exception ignored) { }
       });
+      silent.setDaemon(true);
       silent.start();
       try (Socket client = new Socket("127.0.0.1", listener.getLocalPort())) {
         byte[] b = new byte[16];
@@ -1619,22 +1623,23 @@ public final class FirstResponseReaderHarness {
           if (client.getSoTimeout() != 0) throw new AssertionError("timeout state leaked");
         }
       }
-      silent.join();
+      silent.join(2000);
     }
     try (ServerSocket listener = new ServerSocket(0)) {
       Thread replies = new Thread(() -> {
         try (Socket peer = listener.accept()) {
           Thread.sleep(20); peer.getOutputStream().write(0x7f); peer.getOutputStream().flush();
           Thread.sleep(250);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception ignored) { }
       });
+      replies.setDaemon(true);
       replies.start();
       try (Socket client = new Socket("127.0.0.1", listener.getLocalPort())) {
         int count = ColgramFirstResponseReader.readFirst(client, new byte[16], 100);
         if (count != 1 || client.getSoTimeout() != 0)
           throw new AssertionError("first response should restore an unbounded idle read");
       }
-      replies.join();
+      replies.join(2000);
     }
     System.out.println("FIRST_RESPONSE_DEADLINE_OK");
   }
