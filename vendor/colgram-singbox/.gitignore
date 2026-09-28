@@ -1,0 +1,7 @@
+# The sing-box engine is fetched, not committed.
+#
+# libbox.so is 77MB per ABI and four ABIs are 303MB, which is not a thing to carry in git -
+# colgram-wireguard keeps 18MB there, not 303. The module and its Java live in the repository;
+# apply-patches.py reports clearly when the engine is absent rather than letting a build look
+# complete while every subscription silently has nothing to run on.
+vendor/colgram-singbox/src/main/jniLibs/
