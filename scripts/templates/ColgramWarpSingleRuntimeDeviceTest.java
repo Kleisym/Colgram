@@ -312,7 +312,13 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
                 java.net.DatagramPacket reply =
                         new java.net.DatagramPacket(new byte[2048], 2048);
                 client.receive(reply);
-                assertEqualsCompat(148, reply.getLength());
+                // Compared as bytes, not as a length: assertEqualsCompat here takes Strings, and
+                // an int would not compile - which is a cheap way to find out a test was never
+                // actually run. The content matters more than the size anyway, since a relay that
+                // answered with an error page of the right length would pass a length check.
+                org.junit.Assert.assertArrayEquals(initiation,
+                        java.util.Arrays.copyOf(reply.getData(), 148),
+                        "the relay returned something other than the datagram it was given");
                 Log.i(TAG, "a relay on the profile's port answers a 148-byte initiation over UDP");
             } finally {
                 client.close();
