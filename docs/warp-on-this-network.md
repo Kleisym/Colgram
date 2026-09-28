@@ -1906,3 +1906,31 @@ than `error_code`, and `send(byte[])`/`receive(byte[])` not existing on the API 
 compiles against - so the device half would have stayed unrun while the host's said QUIC is
 filtered.
 
+### A protected Initial, on the phone, with the key schedule checked first
+
+The device probe above sends a long header and classifies the reply. That cannot tell "the path
+drops QUIC" from "the destination does not serve it" - an unencrypted Initial is not something a
+server can respond to. A real Initial is sealed with keys derived from the Destination Connection
+ID, so a server that speaks QUIC *must* answer it, and silence then means the packet never got
+somewhere.
+
+QUIC's Initial protection is HKDF-SHA256 plus AES-128-GCM, and all three are in the platform's
+JCA - which is the difference from the WireGuard side, where the equivalent is HKDF-BLAKE2s and
+BLAKE2s is not present. That gap is why the transport half of the relay exchange could only be
+measured on a host; a QUIC handshake has no such gap, so the phone can make a real client
+measurement.
+
+**Writing it found a bug, and the vector caught it.** `initial_secret` is
+`HKDF-Extract(salt, dcid)` - the Destination Connection ID is the input keying material. An empty
+IKM reads naturally, is wrong, and gives:
+
+```
+mine:   4d935051a5bd7a3689f673ec43abe541a2f5c0a661658541280d485fd72dbd4d
+RFC:    c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea
+```
+
+A key sharing no bytes with the specification, and a server drops the packet for a reason that is
+indistinguishable from a filtered path. The test asserts the RFC 9001 A.1 vector before it sends
+anything, because that is the one bug which would have invalidated the whole measurement while
+looking exactly like the result it reports.
+
