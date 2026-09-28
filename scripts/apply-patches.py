@@ -5504,6 +5504,97 @@ def sync_wireguard_module(repo_path, source_dir):
     print(f" [+] Colgram WireGuard module synced ({source_dir} -> {target_dir})")
 
 
+def sync_singbox_module(repo_path, root_dir):
+    """Put the sing-box engine where gradle can build it, from the tracked vendor copy.
+
+    The module is tracked under vendor/ because Telegram-Src/ is gitignored as a cloned upstream
+    tree; without this a fresh clone builds an app that has no engine in it, and the subscription
+    row would point at nothing. The 77MB native library is NOT vendored - see the module README -
+    so its absence is reported rather than silently producing a tunnel that cannot start.
+    """
+    source_dir = os.path.join(root_dir, "vendor", "colgram-singbox")
+    if not os.path.isdir(source_dir):
+        PATCH_MISSES.append("Colgram sing-box module source")
+        return
+
+    target_dir = os.path.join(repo_path, "colgram-singbox")
+    repo_real = os.path.realpath(repo_path)
+    target_real = os.path.realpath(target_dir)
+    if os.path.commonpath([repo_real, target_real]) != repo_real:
+        raise ValueError("sing-box destination escaped the Telegram checkout")
+    os.makedirs(target_dir, exist_ok=True)
+
+    def mirror(source, destination):
+        os.makedirs(destination, exist_ok=True)
+        names = set(os.listdir(source))
+        for name in os.listdir(destination):
+            if name in names:
+                continue
+            stale = os.path.join(destination, name)
+            # defpackage is the decompiler's name for another application's internals. It is not
+            # ours, nothing references it, and 8000 files of it in the module is noise; the
+            # build excludes it too, so a stray copy would only confuse the next reader.
+            if name == "defpackage":
+                continue
+            if os.path.isdir(stale) and not os.path.islink(stale):
+                shutil.rmtree(stale)
+            else:
+                os.remove(stale)
+        for name in names:
+            source_path = os.path.join(source, name)
+            destination_path = os.path.join(destination, name)
+            if name == "defpackage":
+                continue
+            if os.path.isdir(source_path) and not os.path.islink(source_path):
+                if os.path.exists(destination_path) and not os.path.isdir(destination_path):
+                    os.remove(destination_path)
+                mirror(source_path, destination_path)
+            else:
+                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                shutil.copy2(source_path, destination_path)
+
+    for source_file in ("build.gradle", "README.md"):
+        source_path = os.path.join(source_dir, source_file)
+        if os.path.isfile(source_path):
+            shutil.copy2(source_path, os.path.join(target_dir, source_file))
+    for source_tree in ("src",):
+        source_path = os.path.join(source_dir, source_tree)
+        if not os.path.isdir(source_path):
+            print(f" [!] FATAL: missing vendored sing-box tree: {source_path}")
+            PATCH_MISSES.append(f"Colgram sing-box {source_tree} tree")
+            return
+        mirror(source_path, os.path.join(target_dir, source_tree))
+
+    settings_path = os.path.join(repo_path, "settings.gradle")
+    if not os.path.isfile(settings_path):
+        PATCH_MISSES.append("Colgram sing-box settings.gradle registration")
+        print(f" [!] FATAL: settings.gradle not found at {settings_path}")
+        return
+    with open(settings_path, "r", encoding="utf-8") as settings_file:
+        settings = settings_file.read()
+    if "include ':colgram-singbox'" not in settings and 'include ":colgram-singbox"' not in settings:
+        settings += "\ninclude ':colgram-singbox'\n"
+    if "project(':colgram-singbox').projectDir" not in settings:
+        settings += "project(':colgram-singbox').projectDir = file('colgram-singbox')\n"
+    with open(settings_path, "w", encoding="utf-8") as settings_file:
+        settings_file.write(settings)
+
+    engine = os.path.join(target_dir, "src", "main", "jniLibs")
+    present = []
+    if os.path.isdir(engine):
+        for abi in ("arm64-v8a", "armeabi-v7a", "x86", "x86_64"):
+            if os.path.isfile(os.path.join(engine, abi, "libbox.so")):
+                present.append(abi)
+    if len(present) == 4:
+        print(f" [+] Colgram sing-box module synced, engine present for all four ABIs")
+    else:
+        # Said plainly: a missing engine is a build the user has to complete, and a row that
+        # promises a VPN it cannot start is the failure this whole work exists to remove.
+        print(f" [!] sing-box module synced WITHOUT the engine ({', '.join(present) or 'none'}).")
+        print("     Drop libbox.so per ABI into vendor/colgram-singbox/src/main/jniLibs/ first.")
+        PATCH_MISSES.append("Colgram sing-box engine (libbox.so)")
+
+
 def inject_warp_device_test_support(repo_path, root_dir):
     """Keep the account-free on-device WARP integration test reproducible."""
     module_dir = os.path.join(repo_path, "TMessagesProj_AppTests")
@@ -6649,6 +6740,7 @@ def main():
         target_repo,
         os.path.join(root_dir, "vendor", "colgram-wireguard"),
     )
+    sync_singbox_module(target_repo, root_dir)
     inject_warp_device_test_support(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
     download_official_binaries(target_repo)
