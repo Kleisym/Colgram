@@ -118,9 +118,35 @@ split-segment test fail with `ConnectionAbortedError`, which is what makes it wo
 | The TCP bridge carries a frame out and an answer back | `scripts/test_warp_relay.py` |
 | It carries a real 148-byte WireGuard handshake intact | `scripts/test_warp_relay_handshake.py` |
 | The endpoint answers only its own peer's key | same test, second case |
+| **The same handshake crosses the UDP listener** | same test, third case - the hop Colgram can actually take |
+| The UDP listener carries a 148-byte initiation out and back | `scripts/test_warp_relay.py` |
+| Colgram and the relay agree on a transport | `scripts/test_warp_relay_join.py` |
 | Colgram sends its handshake to the relay over TCP 443 | profile carries the relay address, port and the relay's key; `ColgramWarpSingleRuntimeDeviceTest` |
+| A relay started with `--udp-listen` answers a real DNS query over both hops | run below, 64 bytes, QR bit set on each |
 | The far side reaches Cloudflare's UDP | **not measured** — needs a host without the filter |
 | Cloudflare answers `warp=on` | **not measured** — needs the whole chain |
 
 The last two are the ones that would make "WARP works" true rather than likely, and neither can be
 established from a network where Cloudflare's WireGuard ports are silent on every protocol tried.
+
+### The relay, running for real
+
+Both hops were driven against a live instance rather than only in unit tests, pointed at a target
+that genuinely answers on this network - `1.1.1.1:53` - so the bytes coming back are Cloudflare's
+and not a stand-in's:
+
+```
+python scripts/warp-relay-server.py --listen 127.0.0.1:15120 \
+    --udp-listen 127.0.0.1:15120 --endpoint 1.1.1.1:53
+
+relay listening on 127.0.0.1:15120, forwarding to 1.1.1.1:53 over UDP
+UDP listener on 127.0.0.1:15120 - this is the port to put in Colgram
+
+UDP through relay: 64B from 127.0.0.1:15120, QR bit=1
+TCP through relay: 64B, QR bit=1
+```
+
+64 bytes with the QR bit set is a real DNS response, over each hop, in both framings. It says the
+relay moves bytes correctly end to end in the two shapes it offers - and it deliberately says
+nothing about WARP, because the endpoint on the far side here is a resolver, not Cloudflare's
+WireGuard ingress. The distinction is the whole point of the table above.
