@@ -1041,6 +1041,21 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_every_protocol_the_goal_names_is_asked_of_the_engine(self):
+        # The goal names seven protocols. The parser had all seven, but the ENGINE acceptance test
+        # covered six - VMess was missing entirely, so a VMess subscription could parse, produce a
+        # profile, and nothing in the suite would ever have asked whether the engine starts it.
+        # That is the same gap as a missing TUN inbound: the part that looks right is checked, and
+        # the part that decides is not.
+        profile_test = ROOT / ("Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram"
+                              "/singbox/ColgramProfileDeviceTest.java")
+        self.assertTrue(profile_test.exists(), "the engine-acceptance test is not installed")
+        body = profile_test.read_text(encoding="utf-8")
+        for scheme in ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://",
+                       "hysteria://", "socks5://"):
+            self.assertIn(scheme, body, scheme + " is never checked against the engine")
+        self.assertIn("everyProtocolWePromiseProducesAProfileTheEngineAccepts", body)
+
     def test_a_subscription_link_shared_from_a_chat_reaches_the_tunnel(self):
         # The goal says a subscription bought in a bot works on the phone, and the bot sends a link.
         # The only route from that link to a tunnel was: open settings, tap the row, paste the text

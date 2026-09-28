@@ -45,6 +45,10 @@ public final class ColgramProfileDeviceTest {
                 "vless://8f2a1b44-1111-2222-3333-444455556666@vpn.example.net:443"
                         + "?security=reality&sni=www.microsoft.com&pbk=bmXOC-F1FxEMF9dyiK2H5_1SUtzH0JuVo51h2wPfgyo&sid=abcd"
                         + "&type=tcp&flow=xtls-rprx-vision#Berlin",
+                // VMess is named in the same breath as VLESS and was missing here, so the parser
+                // could accept it while nothing ever asked the engine whether it starts. A base64
+                // JSON payload in the modern format, which is what a bot actually sends.
+                "vmess://eyJ2IjoiMiIsInBzIjoidmVzcyIsImFkZCI6InZtZXNzLmV4YW1wbGUubmV0IiwiaG9zdCI6InZtZXNzLmV4YW1wbGUubmV0IiwicG9ydCI6IjQ0MyIsImlkIjoiZjgxZjJiNDQtMTExMS0yMjIyLTMzMzMtNDQ0NDU1NTU2NjYiLCJhaWQiOjAsIm5ldCI6IndzcyIsInR5cGUiOiJub25lIiwidGxzIjoiIn0",
                 "trojan://p4ssw0rd@trojan.example.com:443?security=tls"
                         + "&sni=front.example.com&type=ws&path=%2Fws#Amsterdam",
                 "ss://YWVzLTI1Ni1nY206c2VjcmV0@aes.example.io:8388#Tokyo",

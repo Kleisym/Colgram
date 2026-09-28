@@ -162,6 +162,29 @@ The one that took longest to build is the second, and it is the one that would h
 empty tunnel: a configurator that records instead of building, so the engine's actual request is
 the evidence.
 
+## What the goal asks for, and where each part stands
+
+Audited item by item rather than assumed. "Proven" means a measurement produced it.
+
+| Requirement | State | Evidence |
+|---|---|---|
+| VLESS Reality | proven | engine accepts the built profile |
+| VMess | proven | engine accepts the built profile |
+| Trojan | proven | engine accepts the built profile |
+| Shadowsocks | proven | engine accepts the built profile |
+| Hysteria2 | proven | engine accepts the built profile |
+| Hysteria 1 | proven | engine accepts the built profile |
+| SOCKS | proven | engine accepts the built profile |
+| UDP ASSOCIATE in the SOCKS bridge | proven | a datagram makes the round trip through the associate socket |
+| VpnService routes the whole device | proven | the engine asks Android for `0.0.0.0/0` and `::/0` |
+| A subscription from the bot works | proven | shared link → stored → profile → engine accepts |
+| WARP carries traffic | **not proven** | 0 of 16 ingresses answer, 6 of 6 resolvers do |
+
+The one row that is not proven is not a rounding error. Cloudflare's WireGuard UDP is filtered on
+this network, WireGuard has no TCP transport, and no client-side option changes that. A relay is
+the only path, it is wired and engine-verified, and it needs a VPS on an unfiltered network to be
+measured. Until one exists, "WARP works" would be a claim rather than a result.
+
 ## The local SOCKS bridge, for completeness
 
 Unrelated to WARP but part of the same bypass machinery, and fixed in the same pass: the loopback
