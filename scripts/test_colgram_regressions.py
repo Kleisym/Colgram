@@ -1041,6 +1041,23 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_device_reachability_probe_is_above_the_size_floor(self):
+        # The device test probed with a 140-byte datagram, while the network answers nothing under
+        # about 1200 bytes on a non-DNS path. So it could not tell a filtered port from a live one,
+        # and "16 of 16 silent" was measured with an instrument that could only ever say silent.
+        # The verdict happened to be right; the reason it was right was not evidence.
+        #
+        # Re-measured on the device with a 1200-byte probe, control answering throughout:
+        #   ColgramWarpUdp: WARP endpoints silent from the device: 16 of 16
+        # Same answer, now from an instrument that could have said otherwise.
+        body = (ROOT / "scripts/templates/ColgramWarpUdpReachabilityDeviceTest.java").read_text(
+            encoding="utf-8")
+        self.assertIn("new byte[1200]", body,
+                      "a 140-byte probe sits below the floor and cannot see a live port")
+        self.assertNotIn("new byte[140]", body)
+        self.assertIn("dnsAnswers", body)
+        self.assertIn("theDeviceCanSendUdpAtAll", body)
+
     def test_the_relay_carries_a_real_handshake_not_just_bytes(self):
         # The byte-bridge test proved the transport forwards frames. That is necessary and not
         # sufficient: a relay could carry bytes perfectly and still not carry WireGuard, and the

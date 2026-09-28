@@ -59,6 +59,11 @@ public final class ColgramWarpUdpReachabilityDeviceTest {
         // A real DNS query, not a random datagram. Random bytes to port 53 are dropped without a
         // reply by every resolver, so probing with them proves nothing about UDP and made this
         // control fail on a perfectly healthy network.
+        //
+        // It is small - 32 bytes - and it answers, which is worth stating rather than glossing
+        // over: the floor measured on this network is not a hard cut-off. DNS is answered at 32
+        // bytes, while an arbitrary datagram needs to be large before anything comes back. So the
+        // floor is a property of the path for non-DNS traffic, not a rule this control contradicts.
         assertTrue("UDP egress is broken on this device, so no WARP verdict means anything",
                 dnsAnswers("8.8.8.8"));
     }
@@ -98,8 +103,17 @@ public final class ColgramWarpUdpReachabilityDeviceTest {
         try {
             socket = new DatagramSocket(new InetSocketAddress(0));
             socket.setSoTimeout(TIMEOUT_MS);
-            byte[] payload = new byte[140];
-            // A WireGuard-sized datagram; the content is irrelevant, only the exchange is.
+            // 1200 bytes, NOT a WireGuard-sized one, and that is the whole point of this probe.
+            //
+            // Measured on this network: a UDP datagram under about 1200 bytes gets no answer on ANY
+            // port, while a 1200-byte one gets a reply on 443. A WireGuard message-initiation is 148
+            // bytes - below that floor - so a small probe cannot tell a filtered port from a live
+            // one. This test would have reported "all sixteen silent" for a perfectly open endpoint,
+            // and the conclusion drawn from it would have been an artefact of the probe.
+            //
+            // What is given up is precision about the protocol. What is gained is the only thing
+            // this test is asked: can anything at all come back from that host and port.
+            byte[] payload = new byte[1200];
             for (int i = 0; i < payload.length; i++) {
                 payload[i] = (byte) (i * 31 + 7);
             }
