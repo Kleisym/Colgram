@@ -8,6 +8,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.net.DatagramSocket;
+import java.net.DatagramPacket;
 import java.net.InetSocketAddress;
 import java.util.Random;
 
@@ -141,12 +142,16 @@ public final class ColgramDeviceQuicClientTest {
             // and a UDP connect never blocks. Passing one is a compile error, and the receive
             // timeout below is what bounds the wait.
             socket.connect(new InetSocketAddress(host, port));
-            socket.send(payload);
+            // DatagramSocket.send takes a DatagramPacket on Android; the send(byte[]) form is a
+            // ConnectedDatagramSocket method on newer APIs only, and compiling against the older
+            // one is the portable choice.
+            socket.send(new DatagramPacket(payload, payload.length));
+            // receive(byte[]) is the same story as send: it exists on newer APIs, not on the one
+            // this app compiles against. The packet form is the portable one on both sides.
             byte[] buffer = new byte[2048];
-            int read = socket.receive(buffer);
-            byte[] copy = new byte[read];
-            System.arraycopy(buffer, 0, copy, 0, read);
-            return copy;
+            DatagramPacket reply = new DatagramPacket(buffer, buffer.length);
+            socket.receive(reply);
+            return java.util.Arrays.copyOf(buffer, reply.getLength());
         } catch (Exception e) {
             return null;
         } finally {
