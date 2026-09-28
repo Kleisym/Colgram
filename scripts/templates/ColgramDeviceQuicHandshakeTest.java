@@ -10,7 +10,6 @@ import org.junit.runner.RunWith;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
@@ -215,13 +214,19 @@ public final class ColgramDeviceQuicHandshakeTest {
     private static byte[] hkdfLabel(byte[] secret, String label, byte[] context, int length)
             throws Exception {
         byte[] fullLabel = ("tls13 " + label).getBytes(StandardCharsets.US_ASCII);
-        ByteBuffer info = ByteBuffer.allocate(2 + 1 + fullLabel.length + 1 + context.length);
-        info.putShort((short) length);
-        info.put((byte) fullLabel.length);
-        info.put(fullLabel);
-        info.put((byte) context.length);
-        info.put(context);
-        return hkdfExpand(secret, info.array(), length);
+        // Built as a plain array rather than through ByteBuffer. allocate() leaves the tail
+        // uninitialised and array() hands back the whole buffer, so a label that does not fill it
+        // exactly contributes stack garbage to the HKDF info - a different key, and a different key
+        // is dropped by the server for a reason indistinguishable from a filter.
+        byte[] info = new byte[2 + 1 + fullLabel.length + 1 + context.length];
+        info[0] = (byte) (length >>> 8);
+        info[1] = (byte) length;
+        info[2] = (byte) fullLabel.length;
+        System.arraycopy(fullLabel, 0, info, 3, fullLabel.length);
+        int at = 3 + fullLabel.length;
+        info[at++] = (byte) context.length;
+        System.arraycopy(context, 0, info, at, context.length);
+        return hkdfExpand(secret, info, length);
     }
 
     /** HKDF-Extract: HMAC-SHA256 over the salt with the input keying material as the message. */
@@ -234,11 +239,23 @@ public final class ColgramDeviceQuicHandshakeTest {
     private static byte[] hkdfExpand(byte[] secret, byte[] info, int length) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(secret, "HmacSHA256"));
-        byte[] block = mac.doFinal(info);
+        // RFC 5869: T(i) = HMAC(PRK, T(i-1) || info || i) - the counter byte is part of the
+        // input and its absence is silent. HMAC(PRK, info) yields
+        // 4dff6073... where RFC 9001 A.1 says c00cf151... , a key sharing no bytes with the
+        // specification, and a server drops that for a reason indistinguishable from a filter.
+        byte[] withCounter = Arrays.copyOf(info, info.length + 1);
+        withCounter[info.length] = 1;
+        byte[] block = mac.doFinal(withCounter);
         // A prefix of the expand output; length <= 32 here so one block is enough.
         return block.length >= length
                 ? Arrays.copyOf(block, length)
-                : Arrays.copyOf(mac.doFinal(block), length);
+                : Arrays.copyOf(mac.doFinal(concat(block, (byte) 2)), length);
+    }
+
+    private static byte[] concat(byte[] a, byte b) {
+        byte[] out = Arrays.copyOf(a, a.length + 1);
+        out[a.length] = b;
+        return out;
     }
 
     private static String classify(byte[] answer) {
