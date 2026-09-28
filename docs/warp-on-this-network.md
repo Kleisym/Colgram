@@ -624,3 +624,76 @@ to both and compares:
 A 31-byte answer is also too short to be a Retry carrying a token and its 16-byte integrity tag at
 any connection-id size, which is a second reason the first byte alone is not enough to classify.
 
+## The SNI filter: what the official client runs into, and exactly what the filter matches
+
+Cloudflare's own client is installed and registered on this host, and it fails. Its service log
+names the reason, and it is not the network:
+
+    connect_with_protocol_racing{primary="masque" secondary="H2"}
+    h2_tun: Connecting to edge sni="consumer-masque.cloudflareclient.com"
+    Start racer 0.0.0.0:35945 ---> 162.159.198.2:443
+
+So the client races QUIC over UDP first - ports 1701, 4500, 4443, 8443 and 8095, all measured
+silent here, as expected - and then **falls back to HTTP/2 over TCP 443**, which is the one
+transport this network carries. That fallback is the whole route to WARP, and it fails on the
+name.
+
+Measured to `162.159.198.2:443`, changing only `server_name`, keeping the address, port and
+everything else identical:
+
+| server_name | result | time |
+|---|---|---|
+| `engage.cloudflareclient.com` | OK, TLS 1.3, ALPN h2 | 164 ms |
+| `connectivity.cloudflareclient.com` | OK, TLS 1.3, ALPN h2 | 143 ms |
+| `cloudflareclient.com` | OK, TLS 1.3, ALPN h2 | 121 ms |
+| `example.com` | OK, TLS 1.3, ALPN h2 | 146 ms |
+| `consumer-masque.cloudflareclient.com` | FAIL, SSLEOFError | 2111 ms |
+| `masque.cloudflareclient.com` | FAIL, SSLEOFError | 2563 ms |
+| `masque.example.com` | FAIL, SSLEOFError | 2131 ms |
+| `consumer-masque.example.com` | FAIL, SSLEOFError | 2132 ms |
+| `mqs.cloudflareclient.com` | FAIL, SSLEOFError | 2150 ms |
+| `notmasque.com` | FAIL, SSLEOFError | 2085 ms |
+| `MASQUE.cloudflareclient.com` | FAIL, SSLEOFError | 2152 ms |
+
+**The filter is not a whole-name match.** It fires on any `server_name` containing `masque` or
+`mqs`, case-insensitively, in any domain - `masque.example.com` and `notmasque.com` are dropped
+exactly like Cloudflare's own name. A blocked name takes ~2.1 s against ~130 ms for one that
+passes, so the delay is the filter's own rather than a timeout, and the same result appears on
+162.159.198.1, .2 and 162.159.197.3 - so it follows the name, not the address.
+
+The same split appears on `engage.cloudflareclient.com` at 162.159.197.x too, and a ClientHello
+with no `server_name` at all completes on .2. So the door is reachable; the name is what is shut.
+
+### …and reaching the door is still not reaching WARP
+
+Under every name that passes the filter, the MASQUE path is answered, and refused:
+
+    CONNECT /.well-known/masque/udp/default/  :protocol connect-ip   400
+    CONNECT /.well-known/masque/ip/1/1/      :protocol connect-ip   400
+    GET  /                                        403
+    GET  /cdn-cgi/trace                          200   warp=off
+
+All from one colo and one `cf-ray`. The virtual host behind an unfiltered name does not route to
+the WARP backend, so passing the filter gets a client to Cloudflare's edge over TCP 443 and not one
+byte further into WARP. That is a narrower result than a block and a much narrower one than a
+tunnel, and it is why the relay is still the answer for the WireGuard ingress.
+
+    python scripts/warp-sni-bypass-probe.py
+    python scripts/warp-masque-endpoint.py --all
+
+### A 403 here is not what a 403 from Cloudflare looks like
+
+For most of this investigation a 403 was read as Cloudflare declining a request. It was not. httpx
+was applying an `sni_hostname` override that turned a 200 into a 403 on *every* path, including
+`/robots.txt` and `/cdn-cgi/trace` - and a host that 403s robots.txt is serving an error page, not
+a tunnel. The control that caught it: the identical request without the override returned 200 with
+a real trace body. Two rules came out of it, and both are now built into the probes rather than
+remembered:
+
+  * an endpoint is dialled **by name**, with the address pinned by an in-process resolver, so the
+    SNI, the Host header and the certificate check are correct by construction;
+  * httpx is built with `trust_env=False`, because a proxy on this host answers 403 to everything.
+
+With both in place, all five MASQUE addresses serve a genuine `warp=off` trace, which is the first
+honest signal that the endpoint is alive and the earlier 403s were manufactured locally.
+
