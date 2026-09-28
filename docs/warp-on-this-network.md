@@ -240,6 +240,54 @@ The relay's case does not rest on which port is shut, and now does not have to.
 
     python scripts/warp-udp-port-reachability.py --host 162.159.192.1
 
+## The identity half, proven on the device
+
+Every transport result above describes what cannot get through. The other half - whether the phone
+can obtain a WARP identity at all - had never been measured, and it is the half that decides whether
+the transport results are about a tunnel or about nothing.
+
+The host cannot answer it: its resolver sends `api.cloudflareclient.com` to `8.47.69.0`, and no
+certificate covering that name is served there. The device resolves it correctly, so the app was
+asked, driving its own `ColgramWarp.register()` rather than a hand-rolled request:
+
+```
+register() returned true in 2697ms
+stored identity: endpoint host=engage.cloudflareclient.com  advertised ports=4
+                 reserved=33d034   key length=44
+```
+
+**A real registration, on the device, on this network.** A private key, a peer host, four
+advertised ports and the three-byte client id Cloudflare pins into WireGuard's reserved header - all
+present, so the profile builder has genuine material rather than placeholders. `2697 ms` is also
+worth noting on its own: the identity round trip completes over HTTPS while the WireGuard ports are
+unreachable, which is precisely the split the relay exists to bridge.
+
+That `ColgramHttp` does this without depending on the system resolver is not luck either - it
+resolves through `ColgramDohResolver` and pins the address, and that resolver is built for exactly
+this: it survives an SNI cut by dialling a filtered resolver under a permitted name while still
+checking the certificate against the resolver's real name, so a cut resolver cannot be swapped for
+an impostor. Both public DoH endpoints answer the WARP zone correctly from here:
+
+```
+cloudflare-dns.com/dns-query   status=0  ['104.16.192.82', '104.16.24.84']
+dns.google/resolve             status=0  ['104.16.192.82', '104.16.24.84']
+```
+
+    python scripts/device-tests.py org.colgram.core.ColgramDeviceWarpRegistrationTest
+
+### Where the two halves now stand
+
+| Half | State | Evidence |
+|---|---|---|
+| Identity — key, peer, ports, client id | **works on the device** | register() true in 2697 ms |
+| Profile — the engine accepts what the app builds | **works** | 8/8, engine confirms the endpoint shape |
+| Join — a relay on the profile's port answers | **works** | 148-byte initiation answered over UDP, on device |
+| Transport — WARP's own UDP reaching Cloudflare | **does not work** | 0 of 7 ports on the device, 53 included |
+| End to end — `warp=on` | **not measured** | needs a relay on a host without the filter |
+
+Four of the five rows are now measured rather than argued. The fifth is the one that cannot be
+measured from here, and it is the only one that says WARP works.
+
 ## A layer underneath all of it: DNS here answers with the wrong addresses
 
 Found while checking the control plane, and it is the only finding in this file that is not about
