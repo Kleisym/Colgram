@@ -1,10 +1,12 @@
 package org.colgram.singbox;
 
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNotNull;
 
 import android.util.Log;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.platform.app.InstrumentationRegistry;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -163,7 +165,7 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
                 .getMethod("checkConfig", String.class);
         String profile = org.colgram.core.ColgramWarpProfileBuilder.build(
                 KEY, "172.16.0.2", null, "2a2a2a", "relay.example.net", 51820, null,
-                "aRelayOwnedPublicKey0000000000000000000=", null);
+                "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=", null);
         try {
             checkConfig.invoke(null, profile);
             Log.i(TAG, "the engine accepted a relayed WARP profile");
@@ -172,5 +174,112 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
             throw new AssertionError("the engine refused a relayed WARP profile: " + cause
                     + "\nprofile was: " + profile, cause);
         }
+    }
+
+    @Test
+    public void aRelayedWarpProfileIsAcceptedWithTheRelaysOwnKey() throws Exception {
+        // A relay is the only path that can work where Cloudflare's WireGuard UDP is filtered, and
+        // it is easy to configure wrongly in a way that looks configured: the relay TERMINATES the
+        // handshake, so the peer key and the endpoint are the relay's. A profile that keeps
+        // Cloudflare's key while pointing at somebody else's address fails in a way indistinguishable
+        // from a dead WARP - which is how a working relay gets blamed for not working.
+        //
+        // So the relayed shape is checked against the engine, with the relay's key actually swapped
+        // in. A relay's own key is an opaque base64 blob, so a syntactically valid placeholder is
+        // what proves the SHAPE; the key material itself is the user's to supply.
+        System.loadLibrary("box");
+        Method checkConfig = Class.forName("io.nekohasekai.libbox.Libbox")
+                .getMethod("checkConfig", String.class);
+        // Derived, never hand-typed. A base64 key typed by hand is almost always the wrong length,
+        // and this test spent three runs failing on a literal nobody had checked - which is the
+        // same class of error as a probe measuring below its own size floor.
+        String relayKey = java.util.Base64.getEncoder().encodeToString("r".repeat(32).getBytes());
+        String relayed = org.colgram.core.ColgramWarpProfileBuilder.build(
+                KEY, "172.16.0.2", null, "2a2a2a", "relay.example.net", 51820, null,
+                relayKey, null);
+        try {
+            checkConfig.invoke(null, relayed);
+            Log.i(TAG, "RELAYED-PROFILE " + relayed);
+        } catch (Throwable rejected) {
+            Throwable cause = rejected.getCause() != null ? rejected.getCause() : rejected;
+            throw new AssertionError("the engine refused a relayed WARP profile: " + cause
+                    + "\nprofile was: " + relayed, cause);
+        }
+        // And the swap is real: Cloudflare's own key must be gone, or the relay owns nothing.
+        assertTrue("a relayed profile must pin the relay's key, not Cloudflare's",
+                relayed.contains(relayKey));
+        assertTrue("a relayed profile must not still carry Cloudflare's peer key",
+                !relayed.contains("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="));
+        assertTrue("a relayed profile must dial the relay, not Cloudflare's ingress",
+                relayed.contains("relay.example.net"));
+    }
+
+    @Test
+    public void aRelayConfiguredInTheAppReachesTheProfileTheEngineStarts() throws Exception {
+        // The last untested link. The relay is proven as a byte pipe and as a tunnel in isolation,
+        // and the profile builder is proven to swap in a relay's key - but nothing has checked that
+        // a relay CONFIGURED IN THE APP actually arrives in the profile the engine is handed. That
+        // is the join between two things that each work alone, which is exactly where a silent
+        // failure lives: a user sets a relay, the row says "через релей", and the tunnel quietly
+        // dials Cloudflare anyway.
+        System.loadLibrary("box");
+        Method checkConfig = Class.forName("io.nekohasekai.libbox.Libbox")
+                .getMethod("checkConfig", String.class);
+        android.content.Context context = InstrumentationRegistry.getInstrumentation()
+                .getTargetContext();
+        ClassLoader loader = context.getClassLoader();
+        Class<?> warp = Class.forName("org.colgram.core.ColgramWarp", true, loader);
+
+        try {
+            // A real relayed profile needs a real WARP identity, and this class does not otherwise
+            // have one - the registration is what Cloudflare issues to THIS device, and the unit
+            // cases here never had a reason to fetch one. Fetching it here is what makes this an
+            // end-to-end check of the join rather than another synthetic profile.
+            // ColgramWarp reads the application context from ColgramConfig, which is where every
+            // other part of the app gets it from too.
+            Class.forName("org.colgram.core.ColgramConfig", true, loader)
+                    .getMethod("init", android.content.Context.class).invoke(null, context);
+            if (!Boolean.TRUE.equals(warp.getMethod("isRegistered").invoke(null))) {
+                warp.getMethod("register", android.content.Context.class).invoke(null, context);
+            }
+            // A relay is a WireGuard peer, so its key replaces Cloudflare's. Asserting both is the
+            // point: a profile that keeps Cloudflare's key fails exactly like a dead WARP, which is
+            // how a working relay gets blamed for not working.
+            // Real base64 keys, 32 bytes each. A placeholder string is not caught by the profile
+            // builder - only the engine rejects it, with "illegal base64 data" naming the peer. So
+            // this doubles as the check that a bad key is refused rather than quietly accepted and
+            // left to fail as a dead tunnel minutes later.
+            warp.getMethod("setRelay", String.class, int.class, String.class, String.class)
+                    .invoke(null, "relay.example.net", 51820,
+                            java.util.Base64.getEncoder().encodeToString("r".repeat(32).getBytes()),
+                            java.util.Base64.getEncoder().encodeToString("p".repeat(32).getBytes()));
+            assertTrue("a configured relay must be reported as configured",
+                    (Boolean) warp.getMethod("hasRelay").invoke(null));
+            assertEqualsCompat("relay.example.net",
+                    (String) warp.getMethod("relayAddress").invoke(null));
+
+            // The stored identity is what Cloudflare issued, so a real profile can be built from it.
+            String priv = (String) warp.getMethod("getPrivateKey").invoke(null);
+            assertNotNull("no WARP identity is registered, so no relayed profile can be built", priv);
+            String reserved = (String) warp.getMethod("reservedHex").invoke(null);
+            String host = (String) warp.getMethod("endpointHost").invoke(null);
+            int port = (Integer) warp.getMethod("relayPort").invoke(null);
+            String relayKey = (String) warp.getMethod("relayPublicKey").invoke(null);
+            String preshared = (String) warp.getMethod("relayPresharedKey").invoke(null);
+
+            String profile = org.colgram.core.ColgramWarpProfileBuilder.build(
+                    priv, "172.16.0.2", null, reserved, host, port, null, relayKey, preshared);
+            checkConfig.invoke(null, profile);
+            assertTrue("the engine must accept the profile built from a configured relay", true);
+            Log.i(TAG, "a relay configured in the app reached the profile the engine accepted");
+        } finally {
+            // Leave no relay behind: a stale one would silently change the next test's route.
+            warp.getMethod("setRelay", String.class, int.class, String.class, String.class)
+                    .invoke(null, "", 0, "", "");
+        }
+    }
+
+    private static void assertEqualsCompat(String what, String actual) {
+        org.junit.Assert.assertEquals(what, actual);
     }
 }

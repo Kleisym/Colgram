@@ -1041,6 +1041,29 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_a_relay_configured_in_the_app_reaches_the_engine(self):
+        # The join. The relay is proven as a pipe and as a tunnel in isolation, and the profile
+        # builder is proven to swap in a relay key - but nothing checked that a relay CONFIGURED IN
+        # THE APP arrives in the profile the engine is handed. That is where a silent failure lives:
+        # a user sets a relay, the row says "через релей", and the tunnel quietly dials Cloudflare
+        # anyway - looking exactly like a relay that does not work.
+        #
+        # Two things the engine caught while this was being written, both worth keeping: a relay
+        # preshared key that is not valid base64 is REJECTED by name ("illegal base64 data"), which
+        # is a good failure and would otherwise have been a dead tunnel minutes later; and a
+        # hand-typed base64 key is almost always the wrong length, so the test now derives its keys
+        # rather than carrying literals nobody checked.
+        body = (ROOT / "scripts/templates/ColgramWarpSingleRuntimeDeviceTest.java").read_text(
+            encoding="utf-8")
+        self.assertIn("aRelayConfiguredInTheAppReachesTheProfileTheEngineStarts", body)
+        self.assertIn("setRelay", body)
+        self.assertIn("ColgramWarpProfileBuilder.build", body)
+        # Derived keys, not literals - a hand-typed base64 key is the wrong length about always.
+        self.assertIn('encodeToString("r".repeat(32)', body)
+        self.assertIn('encodeToString("p".repeat(32)', body)
+        # And no stale relay is left behind, or the next test silently dials the wrong route.
+        self.assertIn('.invoke(null, "", 0, "", "")', body)
+
     def test_the_device_reachability_probe_is_above_the_size_floor(self):
         # The device test probed with a 140-byte datagram, while the network answers nothing under
         # about 1200 bytes on a non-DNS path. So it could not tell a filtered port from a live one,
