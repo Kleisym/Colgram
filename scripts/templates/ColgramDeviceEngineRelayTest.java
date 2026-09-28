@@ -48,7 +48,7 @@ public final class ColgramDeviceEngineRelayTest {
         Class<?> warpClass = Class.forName("org.colgram.core.ColgramWarp", true, loader);
         Class<?> tunnelClass = Class.forName("org.colgram.core.ColgramWarpTunnel", true, loader);
 
-        invoke(configClass, "init", new Class<?>[]{Context.class}, context);
+        callStatic(configClass, "init", new Class<?>[]{Context.class}, context);
         setupEngine(context);
 
         if (!Boolean.TRUE.equals(warpClass.getMethod("isRegistered").invoke(null))) {
@@ -57,8 +57,8 @@ public final class ColgramDeviceEngineRelayTest {
 
         String relayKey = readRelayKey(context);
         if (relayKey == null) {
-            Log.w(TAG, "no relay public key on the device, so the profile would carry the
-                    + " registered identity key and the peer would reject it. Saying so rather
+            Log.w(TAG, "no relay public key on the device, so the profile would carry the"
+                    + " registered identity key and the peer would reject it. Saying so rather"
                     + " than reporting a relay failure that is really a missing argument.");
             return;
         }
@@ -70,21 +70,24 @@ public final class ColgramDeviceEngineRelayTest {
             org.junit.Assert.assertTrue("the relay was not recorded",
                     (Boolean) warpClass.getMethod("hasRelay").invoke(null));
 
-            String profile = (String) invoke(tunnelClass, "warpProfile");
+            // The empty type array is required, not optional: the helper takes (Class, String,
+            // Class<?>[], Object...) and a two-argument call resolves against Object.invoke instead,
+            // which fails to compile with "cannot be applied to given types".
+            String profile = (String) callStatic(tunnelClass, "warpProfile", new Class<?>[0]);
             Log.i(TAG, "the profile names the relay: " + profile.contains(RELAY_HOST));
             org.junit.Assert.assertTrue("the profile does not name the relay",
                     profile.contains(RELAY_HOST));
             org.junit.Assert.assertTrue("the profile does not carry the peer key",
                     profile.contains(relayKey));
 
-            invoke(tunnelClass, "bringDown", new Class<?>[]{Context.class}, context);
-            invoke(configClass, "setWarpEnabled", new Class<?>[]{boolean.class}, true);
-            invoke(tunnelClass, "bringUp", new Class<?>[]{Context.class}, context);
+            callStatic(tunnelClass, "bringDown", new Class<?>[]{Context.class}, context);
+            callStatic(configClass, "setWarpEnabled", new Class<?>[]{boolean.class}, true);
+            callStatic(tunnelClass, "bringUp", new Class<?>[]{Context.class}, context);
 
             long expires = android.os.SystemClock.elapsedRealtime() + WINDOW_MS;
             boolean up = false;
             while (android.os.SystemClock.elapsedRealtime() < expires) {
-                if (Boolean.TRUE.equals(invoke(tunnelClass, "isUp"))) {
+                if (Boolean.TRUE.equals(callStatic(tunnelClass, "isUp", new Class<?>[0]))) {
                     up = true;
                     break;
                 }
@@ -92,11 +95,11 @@ public final class ColgramDeviceEngineRelayTest {
             }
             Log.i(TAG, "the engine reported the tunnel up: " + up);
             Log.i(TAG, "VERDICT: the shipping engine was started with a profile naming the relay."
-                    + " Whether a handshake arrived is visible in the relay log, not here - the app
+                    + " Whether a handshake arrived is visible in the relay log, not here - the app"
                     + " cannot see that, so this does not claim it.");
         } finally {
-            invoke(tunnelClass, "bringDown", new Class<?>[]{Context.class}, context);
-            invoke(configClass, "setWarpEnabled", new Class<?>[]{boolean.class}, false);
+            callStatic(tunnelClass, "bringDown", new Class<?>[]{Context.class}, context);
+            callStatic(configClass, "setWarpEnabled", new Class<?>[]{boolean.class}, false);
             warpClass.getMethod("setRelay", String.class, int.class, String.class, String.class)
                     .invoke(null, "", 0, "", "");
         }
@@ -157,7 +160,7 @@ public final class ColgramDeviceEngineRelayTest {
         return null;
     }
 
-    private static Object invoke(Class<?> type, String name, Class<?>[] types, Object... args)
+    private static Object callStatic(Class<?> type, String name, Class<?>[] types, Object... args)
             throws Exception {
         Method method = type.getDeclaredMethod(name, types);
         method.setAccessible(true);
