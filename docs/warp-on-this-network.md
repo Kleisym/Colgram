@@ -598,6 +598,29 @@ it, and this is the fifth time that has had to be relearned:
 | `Connection refused` from the device | busybox `nc` failing before it sent anything |
 | **316 bytes on tcp/443** | **an HTTP 400 from the HTTPS endpoint** |
 
+### One more thing that was not a new path, and how to tell
+
+The WSL distro on this machine carries three addresses, including `26.226.94.158` - the same one
+Cloudflare's own log had listed among the network interfaces. That reads like a second egress, and it
+is worth checking rather than assuming, because a second measurement of the same path is worse than
+no second measurement: it looks like a confirmation.
+
+It is the same path. The routing table answers it directly:
+
+```
+ip route get 162.159.192.1
+  ->  via 100.127.255.1 dev eth5 src 100.127.255.2
+```
+
+`100.127.255.1` is the WireGuard tunnel. So a probe from WSL, whatever address it binds, leaves
+through the tunnel this file has been measuring all along - and the result, `silent` on all five
+destinations including the DNS control, is the same measurement in new clothes.
+
+**The check is one command and it belongs before any second probe**: `ip route get <destination>`,
+read the interface, and if it is the tunnel, the probe is not independent. A second vantage point
+that is really the first one again is the most dangerous kind of null result, because it looks like
+a control passing.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
