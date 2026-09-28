@@ -74,6 +74,13 @@ public final class ColgramDeviceRelayWireGuardTest {
             // Reachability first, and reported rather than asserted - see the class comment.
             byte[] marker = new byte[PROBE_BYTES];
             random.nextBytes(marker);
+            // The first byte must not be a WireGuard message type. A random marker is a coin
+            // flip: a first byte of 1 makes the relay treat a 1200-byte reachability probe as a
+            // message-initiation and answer it from its own path, so the probe's reply arrives as
+            // RELAY-OK instead of whatever the handshake would have produced. Pinning it to a value
+            // no WireGuard packet uses removes the coin flip entirely.
+            marker[0] = (byte) 0x5A;   // 'Z', not a message type
+            marker[1] = (byte) 0x4D;   // 'M'
             try {
                 client.send(new DatagramPacket(marker, marker.length,
                         InetAddress.getByName(host), port));
