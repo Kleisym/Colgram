@@ -63,6 +63,35 @@ reset, and no WireGuard or MASQUE port answers at all. The conclusion that the r
 route is unaffected and if anything strengthened - but the diagnosis above it was wrong, and it
 was wrong because a probe counted a reset as a server.
 
+### The corrected probe, over every port that mattered
+
+`warp_udp_probe.py` was the file those `ANSWERED` readings came from, and it is fixed the same way.
+With a real QUIC Initial and RESET separated from ANSWERED by size:
+
+```
+162.159.192.1  2408 silent 3/3    500  silent 3/3    1701 silent 3/3    4500 silent 3/3
+162.159.192.1   443 silent 3/3    854  silent 3/3    1640 silent 3/3
+188.114.96.1   2408 silent 3/3    500  silent 3/3    1701 silent 3/3    4500 silent 3/3
+188.114.96.1    443 silent 3/3    854  silent 3/3    1640 silent 3/3
+```
+
+**14 of 14 silent, including both 443s** - the port this document spent its length insisting was
+open. The device agrees and can say why: 2 of 10 answers on 443, every one exactly 31 bytes,
+classified in the log as `short-header-31B(encrypted; impossible pre-handshake)`. A short header
+cannot arrive before the handshake completes, and a Retry is the only answer a QUIC server may give
+before then - not one of these was a Retry. Ports 2408 and 500 stayed at 0 of 10 on the same run,
+so the answers do not come from the path either.
+
+So the shape of the network is now: **DNS over UDP works, everything else is filtered, and
+undecryptable UDP to Cloudflare's edge draws a stateless reset rather than silence.** That reset is
+the single most misleading thing measured in this project, because it looks exactly like a service
+answering and it survived in the record for a long time under a name that said otherwise.
+
+The one caution the file still carries is the right one and is worth keeping: a single unanswered
+probe still proves nothing, because the filter's behaviour has been observed changing between
+sessions. What changed here is not that the network is now silent - it is that the probe is asking
+a question whose answer means what it says.
+
 ### The block is not "all Cloudflare UDP" — and that correction matters
 
 An earlier version of this file said the whole of Cloudflare's UDP was filtered. That was wider than

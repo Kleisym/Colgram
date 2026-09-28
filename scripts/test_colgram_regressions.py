@@ -1235,8 +1235,22 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("ANSWERED %d/%d", probe,
                       "the probe must report n-of-N rather than a single result")
         # And the payload has to be the size that can actually get an answer: a 148-byte probe sits
-        # below the measured floor and cannot tell a filtered port from a live one.
-        self.assertIn("range(1200)", probe)
+        # below the measured floor and cannot tell a filtered port from a live one. This was
+        # asserted as the literal text "range(1200)", which is the same class of check as the
+        # detector that matched its own documentation: it pinned one way of writing the size rather
+        # than the property, so replacing the payload with a real QUIC Initial - padded to 1200, and
+        # strictly better, since a random 1200-byte payload draws a stateless reset that reads as a
+        # service - failed a regression test while making the probe correct.
+        #
+        # So it asserts the property now: the payload is built to 1200, and it is a QUIC Initial
+        # rather than filler, because that distinction is the one this file got wrong for a long
+        # time and the one a future edit is most likely to undo.
+        self.assertIn("1200", probe)
+        self.assertIn("quic_initial", probe,
+                      "the probe must send a real QUIC Initial: 1200 random bytes draw a stateless"
+                      " reset that reads as a reachable service")
+        self.assertIn("classify", probe,
+                      "a 31-byte stateless reset must be reported as a reset, not as ANSWERED")
         # The relay is what survives a moving filter, so its presence is asserted too.
         self.assertTrue((ROOT / "scripts/warp-relay-server.py").is_file())
         relay_test = (ROOT / "scripts/test_warp_relay.py").read_text(encoding="utf-8")
