@@ -152,11 +152,7 @@ class RelayHandshakeTest(unittest.TestCase):
                              "a WireGuard initiation is 148 bytes and the relay must carry it")
 
             client.sendall(relay.HEADER.pack(len(initiation)) + initiation)
-            client.settimeout(6)
-            head = client.recv(2)
-            self.assertEqual(2, len(head), "no frame came back through the relay")
-            (length,) = relay.HEADER.unpack(head)
-            response = client.recv(length)
+            response = read_frame(client, 6)
 
             self.assertGreaterEqual(len(response), INITIATION_BYTES)
             # The endpoint answers from its own socket, so `answered` counts packets it SAW - and a
@@ -191,6 +187,31 @@ class RelayHandshakeTest(unittest.TestCase):
         finally:
             probe.close()
         self.assertEqual(0, self.peer.answered)
+
+
+def read_frame(client, timeout):
+    """One length-prefixed frame, read to completion.
+
+    A single recv(2) is the same mistake the relay used to make: a TCP read returns whatever has
+    arrived, so a two-byte prefix that arrives one byte at a time comes back as one byte, the
+    assert on its length fires, and the test reports "no frame came back" for a relay that sent one
+    perfectly well. A test that can fail on its own framing reports transport bugs as relay bugs.
+    """
+    client.settimeout(timeout)
+    head = b""
+    while len(head) < 2:
+        chunk = client.recv(2 - len(head))
+        if not chunk:
+            raise AssertionError("the relay closed before sending a frame header")
+        head += chunk
+    (length,) = relay.HEADER.unpack(head)
+    body = b""
+    while len(body) < length:
+        chunk = client.recv(length - len(body))
+        if not chunk:
+            raise AssertionError("the relay closed mid-frame")
+        body += chunk
+    return body
 
 
 if __name__ == "__main__":

@@ -96,7 +96,16 @@ def serve_client(client: socket.socket, endpoint: tuple[str, int], quiet: bool) 
         while not peer_closed:
             # Drain anything the client has sent us and forward it.
             try:
-                head = client.recv(2)
+                # read_exactly, not recv(2). A TCP read returns whatever has arrived rather
+                # than the two bytes asked for, so a length prefix split across two segments -
+                # one byte in each - makes recv(2) return 1, unpacks it as a 256-byte frame,
+                # and the next real frame's first byte is then consumed as the rest of that
+                # length. Framing desynchronises and the relay drops the connection mid-stream,
+                # which is the failure a WireGuard handshake is most likely to cause: a 148-byte
+                # initiation written in one burst is free to arrive as three segments, and a
+                # relay that only survives whole writes works on the author's machine and
+                # nowhere else.
+                head = read_exactly(client, 2)
             except socket.timeout:
                 head = b""
             except OSError:
@@ -139,9 +148,72 @@ def serve_client(client: socket.socket, endpoint: tuple[str, int], quiet: bool) 
             pass
 
 
+def serve_udp_client(listener: socket.socket, endpoint: tuple[str, int], quiet: bool) -> None:
+    """Bridge one UDP client's datagrams to the WireGuard endpoint and back.
+
+    This is the half that makes the relay reachable from Colgram at all, and it exists because of a
+    measured mismatch rather than a preference. With only the TCP listener, Colgram cannot use
+    this relay: the app puts the relay's address into a sing-box `wireguard` **endpoint**, which
+    dials its peer over **UDP**, while the TCP listener reads a TCP handshake and expects a
+    length-prefixed frame. The two never meet, so the WireGuard initiation never leaves the phone.
+    From the settings screen that is indistinguishable from a blocked network - the switch turns
+    blue and nothing is routed.
+
+    UDP is also the only form that works without new client code. Carrying the length-prefixed
+    framing over UDP would mean inventing a transport Colgram does not speak; speaking plain
+    WireGuard over UDP means the stock endpoint reaches it, because that is what a WireGuard peer
+    is. The framing stays on the TCP listener for anyone driving this by hand.
+    """
+    listener.settimeout(1.0)
+    peer: tuple[str, int] | None = None
+    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    upstream.settimeout(1.0)
+    try:
+        while True:
+            try:
+                data, address = listener.recvfrom(MAX_FRAME)
+            except socket.timeout:
+                data = None
+            except OSError:
+                return
+            if data:
+                # One client at a time per socket, chosen by whoever speaks first. A WireGuard
+                # endpoint opens no session of its own to learn this, so there is nothing to
+                # authenticate the choice on - which is why the UDP listener is opt-in and why a
+                # real deployment runs one per client behind a firewall.
+                peer = address
+                try:
+                    upstream.sendto(data, endpoint)
+                except OSError as e:
+                    if not quiet:
+                        print(f"send to {endpoint} failed: {e}", flush=True)
+
+            if peer is None:
+                continue
+            while True:
+                try:
+                    answer, _ = upstream.recvfrom(MAX_FRAME)
+                except socket.timeout:
+                    break
+                except OSError:
+                    return
+                try:
+                    listener.sendto(answer, peer)
+                except OSError:
+                    return
+    finally:
+        upstream.close()
+        try:
+            listener.close()
+        except OSError:
+            pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--listen", default="0.0.0.0:51820", help="TCP address to accept on")
+    parser.add_argument("--udp-listen", default="",
+                        help="UDP address to accept on, same wire format as --listen")
     parser.add_argument("--endpoint", default="162.159.192.1:2408",
                         help="Cloudflare WireGuard UDP endpoint to forward to")
     parser.add_argument("--keygen", action="store_true",
@@ -170,6 +242,20 @@ def main() -> int:
         print(f"  python -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
               f"s.settimeout(3);s.sendto(b'0'*1200,('{ehost}',{eport}));print('ok')\"",
               flush=True)
+
+    if args.udp_listen:
+        uhost, _, uport = args.udp_listen.rpartition(":")
+        udp_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_listener.bind((uhost or "0.0.0.0", int(uport)))
+        if not args.quiet:
+            # Worth saying out loud: this is the port Colgram can actually reach. Without it the
+            # TCP listener is the only way in, and no sing-box profile can name a TCP peer - the
+            # tunnel would never start and would look exactly like a blocked network.
+            print(f"UDP listener on {args.udp_listen} - this is the port to put in Colgram",
+                  flush=True)
+        threading.Thread(target=serve_udp_client,
+                         args=(udp_listener, endpoint, args.quiet), daemon=True).start()
 
     while True:
         try:
