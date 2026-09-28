@@ -532,3 +532,95 @@ phone" is only usually true.
 The device test asserts both directions — that the built profiles carry a TUN, and that a profile
 without one is valid *and inert*. The second half is the point: it is the shape that looks like
 success to every other check in the suite.
+
+## The measurement that changed the conclusion: WARP has a second endpoint, and it is not filtered
+
+Everything above measured Cloudflare's **WireGuard** ingress - 162.159.192.x, 162.159.193.x and
+188.114.9x.x on UDP 2408. The conclusion drawn from it was "the only route to WARP is a relay on a
+network that does not filter UDP". That conclusion was correct about WireGuard and wrong about
+WARP, because WARP clients do not only speak WireGuard.
+
+WARP's **MASQUE** endpoint is a different service, in a different block, on a different port.
+The addresses Cloudflare hands out for it sit in **162.159.197.0/24**, and it is reached over
+**HTTP/2 on TCP 443**. That is the one transport this network does not filter.
+
+Measured here, over TCP, on 162.159.197.1/5/0/10:
+
+    TLSv1.3   ALPN h2   certificate CN=engage.cloudflareclient.com   server: cloudflare
+
+So the endpoint is reachable, it negotiates HTTP/2, and Cloudflare's edge serves a real WARP
+certificate for it. That is a materially better position than "the WireGuard port is filtered":
+the whole earlier argument - that no client-side framing can move a datagram onto a filtered port -
+never applied to this service, and the relay is not the only option any more.
+
+### What the endpoint then said, and how to read it
+
+    server SETTINGS: MAX_CONCURRENT_STREAMS=100  INITIAL_WINDOW_SIZE=65536
+                     MAX_FRAME_SIZE=16777215
+    Extended CONNECT allowed (0x08):  NO
+
+    GET  /.well-known/masque/udp/default/   403
+    CONNECT :protocol connect-ip            403
+    CONNECT :protocol connect-udp           403
+    CONNECT :protocol connect-tcp           403
+    GET  /.well-known/masque/ip/default/    403
+    GET  /                                   403
+
+**The absence of 0x08 is the decisive detail.** Extended CONNECT is only legal when a server
+advertises ENABLE_CONNECT_PROTOCOL, and without it every CONNECT is refused regardless of path or
+protocol. That matters because WARP's 1:1 and streaming protocols tunnel at layer 3 via
+:protocol=connect-ip (RFC 9484) - connect-udp is the wrong protocol for WARP entirely. So the
+server here is closed to the one protocol WARP actually speaks.
+
+The 403s are a Cloudflare edge decision (cf-ray present, "server: cloudflare"), and they are what
+an unauthenticated request to this hostname gets. What they do **not** show is a block: a 403
+arrives in 1-2 ms over a completed TLS 1.3 h2 session on a port that is open. Nothing here was
+filtered - the request was understood and declined.
+
+**What this changes and what it does not.** It changes the shape of the problem. The endpoint is
+identified, reachable, and speaking the right protocol version, and it refused every route shape
+tried with no credentials. Whether it will accept one with a WARP registration is a different
+question from anything measured so far, and answering it needs a real client - which is the next
+step, not a claim. It does not change the relay's role: the relay is still built and still proven,
+and it is still the answer for the WireGuard path.
+
+Run it with: python scripts/warp-masque-443-probe.py
+
+### A correction to two earlier "no answer" results
+
+Both were client bugs, and both are worth recording because a probe that cannot speak the protocol
+produces silence that looks exactly like a block.
+
+A QUIC Initial was measured at 0 of 40 on the host. A first attempt at the same probe read no
+answer at all, because it looked for the "PRI * HTTP/2.0" preface in the *server's* reply - that
+preface is client-only, and a server that is answering perfectly never sends it. The same file
+wrote HTTP/2 frame lengths as 4-byte big-endian integers when the format uses 3, which shifts
+every byte after the length and makes the peer ignore the frame. Both produce silence on an
+endpoint that is working.
+
+Run them with:
+    python scripts/warp-quic-initial-443.py
+    python scripts/warp-quic-response-anatomy.py
+
+### The phone's 4 of 40, and why it was not progress
+
+The device run reported 4 of 40 valid Initials answered, with first bytes 0x9e, 0xca, 0xd5 and
+every answer exactly 31 bytes - while the host, on the same network, answered 0 of 40. That looked
+like the QEMU NAT distorting host measurements, which would have been worth knowing.
+
+It is not a real QUIC reply. Short-header packets are encrypted with keys derived from the
+completed handshake, and a server that has seen one Initial and no client hello has no such keys -
+so 0xca and 0xd5 cannot be real replies. 0x9e is more interesting: it is a long header with the
+fixed bit clear and packet type 10, which is Retry, and a Retry is the one answer a server may
+send before a handshake completes.
+
+The control that settles it is a **dead port**. 2408 and 500 have nothing listening and are
+filtered, so an answer from them cannot come from a server. The anatomy test sends the same probe
+to both and compares:
+
+    python scripts/warp-quic-response-anatomy.py
+    python scripts/device-tests.py org.colgram.core.ColgramDeviceQuicAnatomyTest
+
+A 31-byte answer is also too short to be a Retry carrying a token and its 16-byte integrity tag at
+any connection-id size, which is a second reason the first byte alone is not enough to classify.
+

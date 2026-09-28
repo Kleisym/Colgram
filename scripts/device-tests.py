@@ -38,6 +38,8 @@ DEVICE_TESTS = [
     "org.colgram.singbox.LibboxPresenceDeviceTest",
     "org.colgram.core.ColgramCallProxyDeviceTest",
     "org.colgram.core.ColgramDpiBypassDeviceTest",
+    "org.colgram.core.ColgramDeviceQuicInitialTest",
+    "org.colgram.core.ColgramDeviceQuicAnatomyTest",
     "org.colgram.core.ColgramProxyAutonomyDeviceTest",
     "org.colgram.core.ColgramGlobalSearchHistoryDeviceTest",
     "org.colgram.core.ColgramGlobalSearchRestoreDeviceTest",
@@ -55,7 +57,13 @@ def newest_log(since=None):
     # second emulator's older log can be read as this run's outcome, which is how a run that
     # really passed gets reported as "the device log carried no test results".
     device = os.environ.get("ANDROID_SERIAL")
-    pattern = (device + "/testlog/test-results.log") if device else "*/testlog/test-results.log"
+    # The folder is not named after the serial alone. AndroidJUnitRunner appends a display
+    # suffix - "emulator-5554 - 15" - which changes with the emulator's display id, so a glob of
+    # "<serial>/testlog/..." finds nothing and a run that genuinely passed on the device is
+    # reported as "no device results were produced". Matching the serial as a prefix is what
+    # actually identifies the device, and the mtime filter below is what keeps it to this run.
+    prefix = (device + "*") if device else "*"
+    pattern = prefix + "/testlog/test-results.log"
     logs = sorted(RESULTS.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     if since is not None:
         # Only a log written after this run began. A build that fails before the tests start

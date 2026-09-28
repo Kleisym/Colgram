@@ -5846,6 +5846,8 @@ def inject_core_device_test_support(repo_path, root_dir):
                  "ColgramDpiBypassDeviceTest.java",
                  "ColgramDeviceUdpProbeTest.java",
                  "ColgramDeviceUdpShapeTest.java",
+                 "ColgramDeviceQuicInitialTest.java",
+                 "ColgramDeviceQuicAnatomyTest.java",
                  "ColgramGlobalSearchHistoryDeviceTest.java",
                  "ColgramGlobalSearchRestoreDeviceTest.java",
                  "ColgramProxyAutonomyDeviceTest.java",
