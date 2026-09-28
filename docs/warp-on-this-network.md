@@ -2015,9 +2015,14 @@ scripts/warp-quic-watch.py --minutes 20 --interval 15
   05:35:17  control answered 64B    quic silent
 ```
 
-**Over 70 consecutive iterations the control answered every single time, and no handshake ever
-completed.** A run whose control is intermittent would be worth little; this one has none, which is
-what makes the silence a measurement rather than an absence of one.
+```
+255 iterations, 255 with a working control, 0 handshakes completed
+No window was seen in 20 minutes with a working control on 255 of 255 iterations.
+```
+
+**A run whose control is intermittent would be worth little; this one had none.** That is what makes
+the silence a measurement rather than an absence of one - 255 opportunities, every one of them with
+the path demonstrably up, and not one handshake.
 
 And the device, on the same morning, with its own control answering 18 bytes:
 
