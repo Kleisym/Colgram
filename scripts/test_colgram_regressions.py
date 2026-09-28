@@ -1041,6 +1041,30 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_small_packet_floor_is_udp_only_so_a_relay_still_works(self):
+        # The result that decides whether a relay is viable, and the one most likely to be
+        # misread. A ~1200-byte floor on small UDP datagrams looks like "nothing small crosses
+        # this link", and a WireGuard initiation is 148 bytes - so the fast conclusion is that a
+        # relay is pointless too, because it would carry the same small packets.
+        #
+        # That conclusion is wrong, and sending the same small payload over TCP is what shows it:
+        # a 64-byte TCP payload completes a real TLS 1.3 handshake to Cloudflare while a 64-byte
+        # UDP datagram to the same host and port gets nothing. The floor is a property of the UDP
+        # path, not of the link, and the relay depends on exactly that asymmetry - the initiation
+        # arrives over TCP, the WireGuard UDP leaves from the relay.
+        probe = ROOT / "scripts/udp-vs-tcp-small-payload.py"
+        self.assertTrue(probe.is_file(), "there is no UDP-vs-TCP comparison to back this")
+        body = probe.read_text(encoding="utf-8")
+        # A completed TLS handshake, not a connect: a connect succeeds here on ports nothing
+        # listens on and carries nothing, so it proves the network lies about TCP.
+        self.assertIn("ssl.create_default_context", body)
+        self.assertIn("wrap_socket", body)
+        # Both protocols, same host, same port, same sizes - otherwise it is not a comparison.
+        self.assertIn("udp_probe", body)
+        self.assertIn("tcp_small_payload", body)
+        notes = (ROOT / "docs/warp-on-this-network.md").read_text(encoding="utf-8")
+        self.assertIn("UDP-only", notes)
+
     def test_the_warp_block_is_measured_as_a_port_allowlist_not_a_wireguard_verdict(self):
         # The sharpened question, and the one that actually decides whether a transport could help.
         # A port-specific result has two readings - WireGuard specifically is blocked, or only a few

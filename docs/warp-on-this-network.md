@@ -127,6 +127,33 @@ handshake sits below the 1200-byte floor, so even a WireGuard port that were ope
 unobservable to a probe - which is why the device test asserts against a real handshake with
 Cloudflare's own `cdn-cgi/trace` rather than against reachability.
 
+### …but the floor is UDP-only, and that is what makes a relay viable
+
+Read carelessly, a ~1200-byte floor on small packets says nothing small can cross this link at all,
+and a WireGuard initiation is 148 bytes - so the obvious conclusion is that a relay is pointless
+too, because it would have to carry those same small packets.
+
+**That conclusion would be wrong, and the way to know is to send the same small payload over
+TCP.**
+
+```
+python scripts/udp-vs-tcp-small-payload.py
+
+  TCP   64 bytes   TLS TLSv1.3 ok        UDP   64 bytes   silent
+  TCP  148 bytes   TLS TLSv1.3 ok        UDP  148 bytes   silent
+  TCP  512 bytes   TLS TLSv1.3 ok        UDP  512 bytes   silent
+  TCP 1200 bytes   TLS TLSv1.3 ok        UDP 1200 bytes   ANSWERED
+```
+
+Small packets cross this network over **TCP** and get nothing over **UDP**. The floor is a
+property of the UDP path, not of the link - and TCP is proven here by a completed TLS 1.3
+handshake, not by a connect, which succeeds on ports nothing listens on and carries nothing.
+
+**This is the asymmetry a WireGuard relay depends on.** The 148-byte initiation arrives over TCP,
+where small payloads demonstrably work; the relay then originates the WireGuard UDP itself from a
+network without this filter. Judging the relay on the strength of the UDP result alone would have
+dismissed the only viable route on the basis of a measurement about a different protocol.
+
 Reproduce:
 
 ```
