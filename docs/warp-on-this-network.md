@@ -261,6 +261,30 @@ That is every transport available on the device, and each is measured:
 | Patience / retry | 0 of 104 attempts over six minutes |
 | **Relay over TCP 443** | **the one that survives — built and tested** |
 
+### Two independent paths, the same answer
+
+The host and the phone do not share a path. The emulator sits behind the QEMU user-mode NAT, and
+its ICMP to `162.159.192.1` answers in **9 ms** while the host's UDP to the same address times out.
+So "the host cannot reach 2408" was never a statement about the device the app actually runs on —
+it had been doing that job implicitly.
+
+Probed from the device itself, 1200-byte datagrams, control answering throughout:
+
+```
+from the device 162.159.192.1  2408:no 500:no 1701:no 4500:no
+from the device 162.159.193.1  2408:no 500:no 1701:no 4500:no
+from the device 188.114.96.1   2408:no 500:no 1701:no 4500:no
+from the device 188.114.97.1   2408:no 500:no 1701:no 4500:no
+
+MEASURED-WARP-UDP 0 of 16 answered from the device
+```
+
+Zero, like the host. So the block is **not an artifact of the build machine**, and two independent
+paths agreeing is what makes the relay conclusion hold rather than merely go untested on one of
+them. It is also worth noting what the 9 ms ICMP rules out: the route exists and the packets are
+not being dropped as "no route to host". The block is specific to this destination and port over
+UDP.
+
 Reproduce:
 
 ```

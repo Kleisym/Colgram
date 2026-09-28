@@ -1041,6 +1041,32 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_device_path_is_measured_separately_from_the_host_path(self):
+        # The host and the phone do not share a path - the emulator sits behind the QEMU user-mode
+        # NAT, and its ICMP to 162.159.192.1 answers in single-digit milliseconds while the host's
+        # UDP to the same address times out. So "the host cannot reach 2408" was never a statement
+        # about the device this actually runs on, and it had been doing that job implicitly.
+        #
+        # Measured on the device itself, 1200-byte probes, control answering:
+        #   from the device 162.159.192.1  2408:no 500:no 1701:no 4500:no
+        #   ... and the same for all four ingresses ...
+        #   MEASURED-WARP-UDP 0 of 16 answered from the device
+        #
+        # Zero, like the host - so the block is not an artifact of the build machine, and two
+        # independent paths agreeing is what makes the relay conclusion hold rather than merely
+        # being untested on one of them.
+        body = (ROOT / "scripts/templates/ColgramDeviceUdpProbeTest.java").read_text(
+            encoding="utf-8")
+        self.assertIn("MEASURED-WARP-UDP", body)
+        # Reported, never asserted: a test that failed on a filtered network could only ever pass
+        # on an unfiltered one, which is exactly where it would be least needed.
+        self.assertIn("Reported, not asserted", body)
+        self.assertIn("PROBE_BYTES = 1200", body,
+                      "a small probe sits below the floor and would report silent always")
+        patcher = (ROOT / "scripts/apply-patches.py").read_text(encoding="utf-8")
+        self.assertIn("ColgramDeviceUdpProbeTest.java", patcher,
+                      "an unmirrored test is a test a fresh clone does not run")
+
     def test_a_relay_configured_in_the_app_reaches_the_engine(self):
         # The join. The relay is proven as a pipe and as a tunnel in isolation, and the profile
         # builder is proven to swap in a relay key - but nothing checked that a relay CONFIGURED IN
