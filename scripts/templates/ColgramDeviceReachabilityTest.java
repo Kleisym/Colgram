@@ -44,11 +44,21 @@ public final class ColgramDeviceReachabilityTest {
     private static final String TAG = "ColgramReach";
     private static final int TIMEOUT_MS = 3000;
 
-    /** A well-known resolver, the host's own gateway, and the relay's port on the host. */
+    /**
+     * A well-known resolver, the host's gateway by both names, the relay's port, and a UDP echo
+     * that is known to be listening on the host.
+     *
+     * The last row is the control, and it is the reason this file exists. Without a destination
+     * that is provably alive, every row reading "silent" is ambiguous: the device may be filtered,
+     * or the port may be closed, or the probe may be at fault. With one, a silent row means the
+     * path is filtered and a non-silent row means it is not - and the whole question is answered by
+     * a difference rather than by an absence.
+     */
     private static final String[][] TARGETS = {
             {"1.1.1.1", "53", "a public resolver"},
             {"10.0.2.2", "51823", "the host's relay port"},
             {"192.168.0.4", "51823", "the host's LAN address"},
+            {"10.0.2.2", "51827", "a known-live UDP echo on the host - the control"},
             {"8.8.8.8", "53", "a second public resolver"},
     };
 
