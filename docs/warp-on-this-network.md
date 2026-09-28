@@ -285,6 +285,30 @@ them. It is also worth noting what the 9 ms ICMP rules out: the route exists and
 not being dropped as "no route to host". The block is specific to this destination and port over
 UDP.
 
+### The shape of the block, measured on the device
+
+Knowing *that* UDP to 2408 fails is less useful than knowing what the boundary is. Probed from the
+device across ports and destinations:
+
+```
+162.159.192.1  53:no   443:YES  2408:no 500:no 4500:no 1234:no
+1.1.1.1         53:YES  443:YES  2408:no 500:no 4500:no 1234:no
+8.8.8.8         53:YES  443:no   2408:no 500:no 4500:no 1234:no
+```
+
+Two things fall out of this, and both matter for the relay's design:
+
+1. **DNS is not blocked.** It answers on its own resolver, so a relay does not need to carry name
+   resolution — only the handshake.
+2. **UDP is not blocked wholesale.** Port 443 answers on Cloudflare addresses, so the failure is
+   specific to the WireGuard ports rather than to the protocol or the destination. That is what makes
+   a relay that *receives over TCP 443 and originates the WireGuard UDP itself* the right shape
+   rather than merely a possible one — the receiving hop uses a port that is measurably open here,
+   and the originating hop happens on a machine that does not have this filter at all.
+
+Port 1234 is silent on every destination, which is the control for the sweep: a port nothing
+listens on is silent wherever the network is not filtering by destination.
+
 Reproduce:
 
 ```

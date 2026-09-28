@@ -1041,6 +1041,29 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_udp_block_shape_is_measured_on_the_device_not_inferred(self):
+        # The device reaches Cloudflare over ICMP in about 9 ms, so the route is up and only UDP is
+        # affected. Probing it across ports and destinations, from the device itself:
+        #   162.159.192.1  53:no   443:YES  2408:no 500:no 4500:no 1234:no
+        #   1.1.1.1         53:YES  443:YES  2408:no 500:no 4500:no 1234:no
+        #   8.8.8.8         53:YES  443:no   2408:no 500:no 4500:no 1234:no
+        #
+        # Sharper than "WARP ports are silent", and it settles two things at once. DNS is not
+        # blocked - it answers on its own resolver - so the relay does not need to carry name
+        # resolution, only the handshake. And 443 answers on Cloudflare addresses, so UDP is not
+        # blocked wholesale: the failure is specific to the WireGuard ports, which is why a relay
+        # receiving over TCP 443 and originating the WireGuard UDP is the right shape rather than
+        # merely a possible one.
+        body = (ROOT / "scripts/templates/ColgramDeviceUdpShapeTest.java").read_text(
+            encoding="utf-8")
+        self.assertIn("theDeviceIsProbedAcrossPortsAndDestinations", body)
+        for port in ("53", "443", "2408", "500", "4500"):
+            self.assertIn(port, body,
+                          "port " + port + " is not probed, so the block shape is unknown")
+        self.assertIn("PROBE_BYTES = 1200", body)
+        patcher = (ROOT / "scripts/apply-patches.py").read_text(encoding="utf-8")
+        self.assertIn("ColgramDeviceUdpShapeTest.java", patcher)
+
     def test_the_device_path_is_measured_separately_from_the_host_path(self):
         # The host and the phone do not share a path - the emulator sits behind the QEMU user-mode
         # NAT, and its ICMP to 162.159.192.1 answers in single-digit milliseconds while the host's
