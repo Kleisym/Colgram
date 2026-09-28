@@ -100,6 +100,11 @@ public final class ColgramDeviceEngineRelayTest {
             Log.i(TAG, "so a profile naming the relay is handed to the shipping engine and the"
                     + " engine starts, whether or not anything crossed the relay. Those are two"
                     + " different facts, and only the second is a tunnel.");
+            // Whether the relay answers this device at all, with nothing else in the way. If the
+            // app routes its own traffic into the TUN it just built, the relay would never see a
+            // handshake even with everything configured correctly - and that is a fact about the
+            // device reaching the relay, not about WireGuard, so it is measured here separately.
+            Log.i(TAG, "a bare datagram to the relay: " + bareProbe());
             Log.i(TAG, "VERDICT: the shipping engine was started with a profile naming the relay."
                     + " Whether a handshake arrived is visible in the relay log, not here - the app"
                     + " cannot see that, so this does not claim it.");
@@ -138,6 +143,34 @@ public final class ColgramDeviceEngineRelayTest {
      * "no key" and "an empty key" are rejected for different reasons and only one of them is a
      * relay problem.
      */
+    /**
+     * A datagram to the relay, with no tunnel involved.
+     *
+     * <p>The relay answers anything that is not a WireGuard message with RELAY-OK and its length, so
+     * a reply here means the device reaches the host at all. Silence means it does not, and every
+     * later conclusion about the tunnel has to wait for that to be true - which is the same order
+     * the QUIC work ended up needing: establish the path first, then read anything off it.
+     */
+    private static String bareProbe() {
+        java.net.DatagramSocket socket = null;
+        try {
+            socket = new java.net.DatagramSocket(new java.net.InetSocketAddress(0));
+            socket.setSoTimeout(3000);
+            byte[] payload = new byte[64];
+            socket.send(new java.net.DatagramPacket(payload, payload.length,
+                    java.net.InetAddress.getByName(RELAY_HOST), RELAY_PORT));
+            java.net.DatagramPacket reply = new java.net.DatagramPacket(new byte[512], 512);
+            socket.receive(reply);
+            return "answered " + reply.getLength() + "B";
+        } catch (Exception e) {
+            return e.getClass().getSimpleName() + " - the device does not reach the relay";
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+    }
+
     private static String readRelayKey(Context context) {
         File[] candidates = {
                 new File("/data/local/tmp/colgram-relay-key.txt"),
