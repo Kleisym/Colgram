@@ -422,6 +422,30 @@ conflating them is how a gap becomes a claim.
 
     python scripts/device-tests.py org.colgram.core.ColgramDeviceUdpPortTest
 
+### A later run, where the stub check could run at all
+
+The device reached the stub host on a later run, so the shape check had something to bite on rather
+than reporting itself unavailable:
+
+```
+162.159.192.1  53:silent 443:silent 2408:silent 500:silent 4500:silent 8443:silent 51820:silent
+162.159.192.1 answered 0/7 ports to a real DNS query, 53 included
+stub check: 208.67.222.222:443 answers 12B that no QUIC server could send -
+            version 0x00808100, dcid len 0
+VERDICT: no port on 162.159.192.1 answered, 53 included, while DNS answers elsewhere.
+         UDP does not reach that address on this path, so the silence is about the path and not
+         about 2408 being shut.
+```
+
+The port result is unchanged - 0 of 7, 53 included - and the trap is now demonstrated **on the
+device** rather than only on the host: a port that answers, on a host that answers, with a packet no
+QUIC server could have sent. Any sweep of this network that counts answers as services would report
+that port as an open QUIC endpoint, and a `warp=on` claim built on it would be worth nothing.
+
+Reachability of the stub host also moves between runs, which is the same instability this file has
+recorded twice. It is why the control is re-run rather than remembered: a control that was available
+once and unavailable once is not a settled fact either way, and the test says which one it got.
+
 ### The same mistake, for the third time in this project
 
 Counting a 31-byte stateless reset as a QUIC service. Counting a 12-byte stub on a Cisco resolver

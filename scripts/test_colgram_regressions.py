@@ -1130,6 +1130,25 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("dnsAnswers", body)
         self.assertIn("theDeviceCanSendUdpAtAll", body)
 
+    def test_every_device_test_is_copied_into_the_build(self):
+        # A device test in the runner that apply-patches does not copy is a test that silently
+        # stops being the test you think it is: the build compiles whatever was copied last, and
+        # the runner reports a pass for a file that may predate the change. That happened while
+        # adding tests here - one edit landed in the template, one in the tree, and only the second
+        # one was in the build, with nothing reporting the difference.
+        runner = (ROOT / "scripts/device-tests.py").read_text(encoding="utf-8")
+        patches = (ROOT / "scripts/apply-patches.py").read_text(encoding="utf-8")
+        listed = re.findall(r'"org\.colgram[\w.]*\.(Colgram\w*Test)"', runner)
+        self.assertTrue(listed, "no device tests found in the runner at all")
+        registered = set(re.findall(r'"(Colgram\w*Test)\.java"', patches))
+        missing = sorted({name for name in listed} - registered)
+        self.assertEqual([], missing,
+                         "these device tests are in the runner but never copied into the build, so"
+                         " what runs is whatever was there before:\n  " + "\n  ".join(missing))
+        for name in listed:
+            self.assertTrue((ROOT / "scripts/templates" / (name + ".java")).is_file(),
+                            name + " is listed in the runner with no template to copy from")
+
     def test_the_relay_carries_a_real_wireguard_session_not_a_stand_ins(self):
         # The handshake test above proves the relay moves a 148-byte initiation intact, but the far
         # end answers with a scheme of its own devising - a keystream from the shared secret, not
