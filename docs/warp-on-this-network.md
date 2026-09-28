@@ -208,6 +208,40 @@ Two consequences, and the second is the one that matters most:
    `warp=on`, rather than against any reachability measurement, and why a "WARP works" claim on
    this network would need that and not a probe.
 
+### The last transport: WireGuard on 443, and why it cannot work
+
+443 is the one port that is open over both UDP and TCP, so "carry WireGuard there" is the obvious
+last idea. Measured rather than assumed:
+
+```
+python scripts/warp-quic-443-check.py
+
+  162.159.192.1:2408   TLS -> TimeoutError
+  1.1.1.1:2408         TLS -> TimeoutError
+  162.159.192.1:443     TLS TLSv1.3        (for comparison)
+```
+
+**The WireGuard port does not listen on TCP at all.** There is nothing there to encapsulate
+towards, so no client-side framing changes anything — the destination itself is unreachable on
+both protocols.
+
+And QUIC on 443 is not a way in either. A real QUIC server does answer there — short-header
+packets, first byte `0xba`/`0xb3` — but that port terminates **HTTP/3 and nothing else**. A
+WireGuard message-initiation sent to it is dropped. QUIC being reachable does not make it a tunnel
+to Cloudflare's WireGuard ingress; it is a different service on a different port, and "QUIC is
+open, therefore maybe WARP can ride it" is a natural and wrong inference.
+
+That is every transport available on the device, and each is measured:
+
+| Scheme | Result |
+|---|---|
+| Direct WireGuard over UDP | port filtered |
+| Direct WireGuard over TCP | port does not listen |
+| AmneziaWG / obfuscation | no reproducible response |
+| WireGuard inside QUIC on 443 | 443 terminates HTTP/3; initiation dropped |
+| Patience / retry | 0 of 104 attempts over six minutes |
+| **Relay over TCP 443** | **the one that survives — built and tested** |
+
 Reproduce:
 
 ```

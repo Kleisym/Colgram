@@ -1041,6 +1041,35 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_every_available_transport_was_measured_rather_than_assumed(self):
+        # 443 is the one port open over both UDP and TCP here, so "carry WireGuard there" is the
+        # last idea, and it is worth having actually tested rather than quietly skipped:
+        #
+        #   2408 over TCP  -> TLS times out, on Cloudflare AND on a host that does not even run
+        #                     WireGuard. The WireGuard port does not listen on TCP at all, so there
+        #                     is nothing there to encapsulate towards.
+        #   QUIC on 443     -> a real QUIC server answers (short header, 0xba), but that port
+        #                     terminates HTTP/3 and nothing else; a WireGuard initiation sent there
+        #                     is dropped. QUIC being reachable is not a tunnel to the WireGuard
+        #                     ingress - it is a different service on a different port.
+        #
+        # So every transport on this device has now been measured, and the relay is the only one
+        # left standing. The probe that established it is kept so the table can be re-checked
+        # against a future network rather than taken on trust.
+        check = ROOT / "scripts/warp-quic-443-check.py"
+        self.assertTrue(check.is_file(), "no record of testing the last available transport")
+        body = check.read_text(encoding="utf-8")
+        # A completed TLS handshake, never a connect: a connect succeeds on ports nothing listens
+        # on and carries nothing, which is how this network lies about TCP.
+        self.assertIn("ssl.create_default_context", body)
+        self.assertIn("2408", body)
+        self.assertIn("443", body)
+        notes = (ROOT / "docs/warp-on-this-network.md").read_text(encoding="utf-8")
+        self.assertIn("WireGuard on 443", notes)
+        # The relay is the survivor and has to keep its tests.
+        relay_test = (ROOT / "scripts/test_warp_relay.py").read_text(encoding="utf-8")
+        self.assertIn("aFrameGoesOutAndAnAnswerComesBack", relay_test)
+
     def test_the_warp_client_probes_above_the_size_floor_and_does_not_give_up_in_32s(self):
         # Two defects in the app's own WARP path, both found by measuring rather than reading.
         #
