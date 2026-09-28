@@ -81,7 +81,6 @@ public final class ColgramProfileBuilder {
             // Direct last, so a subscription whose every node is blocked leaves the phone
             // reachable instead of offline with no way back.
             outbounds.put(new JSONObject().put("type", "direct").put("tag", "direct"));
-
             JSONArray members = new JSONArray();
             for (int i = 0; i < outbounds.length(); i++) {
                 members.put(outbounds.getJSONObject(i).getString("tag"));
@@ -259,6 +258,13 @@ public final class ColgramProfileBuilder {
                 .put("mtu", 9000)
                 // The whole point: every route the device has goes into the tunnel.
                 .put("auto_route", true)
+                // AND the default routes, named explicitly. auto_route on its own is not enough,
+                // and the engine proved it: with only auto_route it asked Android for the tunnel
+                // ADDRESSES and then for NO routes at all, so the TUN would come up carrying
+                // nothing - which is the same invisible failure the missing TUN inbound caused,
+                // one layer further in. Measured on the device:
+                //   engine asked for addresses=[172.19.0.1/30, ...] routes=[]
+                .put("route_address", new JSONArray().put("0.0.0.0/0").put("::/0"))
                 // strict_route stops traffic escaping around the tunnel via the physical
                 // interface, which is what makes "covers the whole phone" true rather than
                 // "usually covers the phone".
@@ -283,7 +289,20 @@ public final class ColgramProfileBuilder {
                         .put("tag", "dns-out")
                         .put("server", "1.1.1.1")
                         .put("path", "/dns-query")
-                        .put("detour", "direct")))
+                        // NO DETOUR, and that is the fix rather than a simplification. The engine
+                        // starts DNS before it has resolved the detour, so naming one fails the
+                        // whole profile - "start dns/https[dns-out]: detour to an empty direct
+                        // outbound makes no sense" - and checkConfig accepts it, so nothing else
+                        // in the suite noticed. Measured on the device: with this detour the
+                        // service refused to start at all; without any DNS block it came up and
+                        // asked for the tunnel.
+                        //
+                        // Leaving the detour off is also correct rather than merely working:
+                        // resolving the node's own name through the tunnel is a loop, since while
+                        // the first node is down its name resolves to nothing and there is no way
+                        // out to reach the second one. A DoH resolver reached on the real network
+                        // is the resolver that can actually break that loop.
+                        ))
                 .put("final", "dns-out")
                 .put("strategy", "prefer_ipv4");
     }

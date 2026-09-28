@@ -5761,7 +5761,8 @@ def inject_singbox_device_test_support(repo_path, root_dir):
     template_dir = os.path.join(root_dir, "scripts", "templates")
     destination_dir = os.path.join(
         module_dir, "src", "androidTest", "java", "org", "colgram", "singbox")
-    for name in ("ColgramTunInboundDeviceTest.java",
+    for name in ("ColgramDeviceRouteCaptureDeviceTest.java",
+                 "ColgramTunInboundDeviceTest.java",
                  "ColgramProfileDeviceTest.java",
                  "ColgramSubscriptionStoreDeviceTest.java",
                  "ColgramTunnelDeviceTest.java",

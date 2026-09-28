@@ -183,6 +183,12 @@ public final class ColgramWarpProfileBuilder {
                 // endpoint is configured perfectly and the phone still talks to the network
                 // directly - a green switch over an inert tunnel.
                 .put("auto_route", true)
+                // auto_route alone gave the engine the tunnel ADDRESSES and no routes at all,
+                // measured on the device, so the TUN would come up carrying nothing. The
+                // default routes are named explicitly for the same reason they are in the
+                // subscription profile: a tunnel that captures nothing is indistinguishable from
+                // a working one from the settings screen.
+                .put("route_address", new JSONArray().put("0.0.0.0/0").put("::/0"))
                 .put("strict_route", true));
         inbounds.put(new JSONObject()
                 .put("type", "mixed")

@@ -1041,6 +1041,25 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_tun_names_its_default_routes_because_auto_route_alone_captures_nothing(self):
+        # auto_route on its own gave the engine the tunnel addresses and no routes at all, measured
+        # on the device by running the real engine and recording what it asked Android for:
+        #   engine asked for addresses=[172.19.0.1/30, fdfe:dcba:9876::1/126] routes=[]
+        # So the TUN came up carrying nothing: the same invisible failure the missing TUN inbound
+        # caused, one layer further in, and equally invisible, because checkConfig accepts the
+        # profile, the service starts and the switch turns blue while every byte leaves directly.
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        for name in ("ColgramProfileBuilder.java", "ColgramWarpProfileBuilder.java"):
+            source = (core / name).read_text(encoding="utf-8")
+            self.assertIn("route_address", source, name + " names no default routes")
+            self.assertIn("0.0.0.0/0", source, name + " does not cover IPv4")
+            self.assertIn("::/0", source, name + " does not cover IPv6")
+            self.assertIn("auto_route", source)
+        # And the measurement that produced this stays in the suite.
+        capture = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/singbox/ColgramDeviceRouteCaptureDeviceTest.java"
+        self.assertTrue(capture.exists(), "the route-capture device test is not installed")
+        self.assertIn("getInet4RouteAddress", capture.read_text(encoding="utf-8"))
+
     def test_the_built_profiles_carry_a_tun_or_the_phone_is_never_routed(self):
         """A valid profile with no TUN is a green switch over an inert tunnel.
 
@@ -2698,8 +2717,18 @@ public class SecretCheck {
         self.assertIn('.put("server", "1.1.1.1")', builder)
         self.assertIn('.put("path", "/dns-query")', builder)
         self.assertNotIn('.put("address", "https://1.1.1.1/dns-query")', builder)
-        # The resolver is reached outside the tunnel, or a dead first node strands the phone.
-        self.assertIn('.put("detour", "direct")', builder)
+        # The resolver is reached outside the tunnel, or a dead first node strands the phone. The
+        # detour must name a TOP-LEVEL outbound though, and "direct" is not one: assemble() puts
+        # direct inside the urltest group so the subscription can fail over. The engine refuses the
+        # whole config for this, by name - "detour to an empty direct outbound makes no sense" -
+        # which meant the profile Colgram built for every subscription did not start at all.
+        # ...and it must carry NO detour at all. The engine starts DNS before it has resolved a
+        # detour, so naming one fails the whole profile with "detour to an empty direct outbound
+        # makes no sense" - while checkConfig accepts it, so no other check noticed. Measured: with
+        # the detour the service refused to start; without it the tunnel came up and asked for its
+        # routes. Resolving through the tunnel would be a loop anyway, since while the first node
+        # is down its name resolves to nothing and there is no way out to reach the second one.
+        self.assertNotIn('.put("detour"', builder)
 
         # Reality carries a browser fingerprint; that is the whole point of the protocol.
         self.assertIn('.put("utls"', builder)
