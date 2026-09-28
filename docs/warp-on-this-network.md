@@ -343,6 +343,45 @@ measurement, and on this emulator it cannot be measured, because the emulator wi
 own host over TCP or UDP. That is worth stating rather than working around: a second device on the
 same network, or a physical phone, is what would close it.
 
+### Correction: `nc` was reporting its own failure as a network one
+
+The section above rests on `nc: xwrite: Connection refused` from the device. That message is false,
+and it took a live listener to prove it.
+
+```
+# a host-side UDP echo, bound and running, printing the port it bound
+LISTENING 0.0.0.0:51826
+
+adb shell toybox nc -u -w 5 10.0.2.2 51826 < /dev/zero
+  nc: xwrite: Connection refused
+
+received 0 datagrams
+```
+
+**A port with a live listener returned `Connection refused` and received nothing.** So busybox `nc`
+never transmitted a byte: the refusal describes its own `connect()`, not the network. Every earlier
+reading taken from it - "the emulator refuses its host", "TCP and UDP to the host are refused" -
+was a statement about the tool.
+
+The Java probe disagrees, and is the one to believe, because it has a real timeout and a real
+exception to distinguish outcomes with:
+
+```
+1.1.1.1:53       silent - nothing came back and nothing objected
+10.0.2.2:51823   silent - nothing came back and nothing objected
+192.168.0.4:51823 silent - nothing came back and nothing objected
+8.8.8.8:53       silent - nothing came back and nothing objected
+```
+
+`silent`, not `refused` - and that is the shape of a filter rather than a closed port, which is the
+whole distinction the previous section claimed to have measured and did not.
+
+This is the fourth time in this project that a probe's own limitation has been read as a property
+of the network, after the 31-byte stateless reset counted as a service, the 12-byte stub counted as
+a port, and the httpx SNI override turning 200 into 403. The rule holds: **a tool that cannot
+distinguish refused from filtered from broken cannot answer a question about filtering**, and the
+cheapest check is a live listener on the far end that counts what actually arrives.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
