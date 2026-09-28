@@ -412,6 +412,37 @@ exactly like a port that is not reached - which is the bug this file spent three
 which a reachability probe cannot distinguish from a network. That is the argument for measuring
 the exchange end to end rather than the port, and for not concluding "blocked" from "silent".
 
+### Why the answer still cannot come back, and it is not the relay
+
+The control proves the device's datagram reaches a host-side listener, and the relay log proves the
+device's 148-byte packet reaches the relay too. What neither gets back is an answer. The reason is
+in the echo's own log:
+
+```
+echo on the host, what it saw as the source:
+  from 127.0.0.1:17491   1200 bytes     <- the device's packet, seen as loopback
+
+the same echo, what it sees from this host:
+  from 127.0.0.1:51827   16 bytes
+```
+
+**QEMU's user-mode network delivers the device's datagram from `127.0.0.1`.** So every reply - the
+echo's `ECHO:1200`, the peer's message-response, anything - is sent to a loopback port on the host
+that is not the device. The return path does not exist, and no relay implementation can supply it.
+
+That is why the control answered and the relay did not, and it is not a property of either. The
+echo happens to be built to reply to whatever address it saw, so its reply went to a host port; the
+relay does the same thing and the difference is only whether anything useful is listening there.
+
+**So the honest end state of the device half is this.** The emulator is a one-way path to the host
+for UDP: datagrams arrive, replies cannot get back. A port-forward is the only thing that would fix
+it, and that is a property of the harness rather than of the network. Closing the last link needs a
+device that is not behind QEMU user-mode NAT - a physical phone on the same network, which would
+turn this from a harness limitation into a measurement.
+
+    adb -s emulator-5554 reverse --remove-all
+    adb forward tcp:51823 tcp:51823        # TCP only; there is no UDP equivalent
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
