@@ -1934,3 +1934,37 @@ indistinguishable from a filtered path. The test asserts the RFC 9001 A.1 vector
 anything, because that is the one bug which would have invalidated the whole measurement while
 looking exactly like the result it reports.
 
+### The first run of it, and what the control said about it
+
+The vector assertion earned its place immediately. On the first real device run the test failed on
+the schedule, not on the network:
+
+```
+RFC 9001 A.1 client_initial_secret expected c00cf151...  but was 4dff6073...
+```
+
+Then, with the key schedule right, two more silent failures in the header protection - a 12-byte
+buffer asked to hold a 16-byte sample, and a packet-number offset derived from the DCID length
+alone, which skips the SCID and the token and lands 118 bytes past the packet. All three would have
+been reported as "no reply" if the packet had gone out at all.
+
+**And then the result that matters - which is the control failing.** With the packet correct:
+
+```
+142.250.74.174:443  silent   Google - a real QUIC deployment on udp/443
+104.16.132.229:443  silent   Cloudflare - the same edge that answers h2 on tcp/443
+157.240.1.35:443     silent   Facebook - a real QUIC deployment on udp/443
+control  1.1.1.1:53  silent   a resolver that always answers
+```
+
+The three silent rows mean nothing on their own, and the run says so. The verdict text - "while DNS
+answers on the same path" - is **false for this run**: the control was silent too, where an hour
+earlier the same probe on the same device returned 18 bytes. So this run cannot distinguish a
+filtered QUIC path from a moment when the device's own UDP was not getting out, and the honest
+reading is that the measurement did not take.
+
+That is the ninth time in this project that a result had to be withdrawn for want of a control, and
+the first time the missing control was noticed by the test that needed it rather than by reading the
+number afterwards. The right response is to re-run until the control answers, not to report either
+the three silences or the control's silence as a finding.
+
