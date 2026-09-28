@@ -240,6 +240,49 @@ The relay's case does not rest on which port is shut, and now does not have to.
 
     python scripts/warp-udp-port-reachability.py --host 162.159.192.1
 
+## A layer underneath all of it: DNS here answers with the wrong addresses
+
+Found while checking the control plane, and it is the only finding in this file that is not about
+packets at all.
+
+```
+api.cloudflareclient.com              ->  8.47.69.0, 8.6.112.0        not a Cloudflare range
+engage.cloudflareclient.com           ->  162.159.192.1               Cloudflare range
+connectivity.cloudflareclient.com     ->  162.159.137.65, .138.65     Cloudflare range
+one.one.one.one                       ->  1.0.0.1, 1.1.1.1            not a Cloudflare range (expected)
+```
+
+Only `api.cloudflareclient.com` is wrong, and the WARP client talks to that host for registration.
+Asking a public resolver over DoH, which is not the system resolver:
+
+```
+api.cloudflareclient.com          status=0 answers=['104.16.192.82', '104.16.24.84']
+engage.cloudflareclient.com       status=0 answers=['162.159.192.1']
+connectivity.cloudflareclient.com status=0 answers=['162.159.138.65', '162.159.137.65']
+```
+
+**The truth is 104.16.x, and this network says 8.47.69.0.** And a plain UDP query to 1.1.1.1 for
+either name returns *no A record* - so it is not only UDP 53 that is unreliable here; the system
+resolver's answers for this zone are not the zone's answers at all.
+
+What that costs is concrete. `8.47.69.0` is a real Cloudflare edge - it completes a TLS 1.3
+handshake and presents `CN=cloudflare.com` with SANs `cloudflare.com`, `ns.cloudflare.com`,
+`*.secondary.cloudflare.com` - but **nothing covering `cloudflareclient.com`**, on either address. So
+the registration host resolves somewhere that cannot serve it, and the certificate check fails
+there in the same way it fails on Cloudflare's own `162.159.192.1`. An empty subject on the retry is
+the edge declining the name rather than serving a wrong one.
+
+This is the same class as everything else in this file, one level down: a name that resolved, a
+connection that completed, and a result that means something other than what it appears to mean. It
+is also why `warp-cli` reported `Skipped uploading aggregate stats because registration was none` -
+there was no usable registration to upload.
+
+**What it does not change.** A WARP relay does not use the system resolver for Cloudflare's
+addresses, and the registration the app already holds was issued before this. The relay's case does
+not rest on DNS either. But any attempt that starts by resolving a `cloudflareclient.com` name will
+fail here for a reason that has nothing to do with the filtering this file is about, and that is
+worth knowing before someone spends a day on it.
+
 ### The same mistake, for the third time in this project
 
 Counting a 31-byte stateless reset as a QUIC service. Counting a 12-byte stub on a Cisco resolver

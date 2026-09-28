@@ -53,21 +53,47 @@ def tcp(ip, port, timeout=3):
         return "closed/unreachable %s" % type(e).__name__
 
 
+def describe(data):
+    """What a reply can be, judged by its shape rather than by the fact that it arrived.
+
+    Three times in this project a bare "answered" was wrong: a 31-byte stateless reset read as a
+    QUIC service, a 12-byte stub on a Cisco resolver read as an open QUIC port, and an httpx SNI
+    override turning 200 into 403 read as Cloudflare refusing. A reply is evidence that a path is
+    open. It is evidence that a *service* is running only when it is a packet the service could
+    only have produced - which for QUIC means a real version and non-zero connection ids.
+    """
+    if len(data) < 7 or not (data[0] & 0x80):
+        return "reply (not a QUIC packet)"
+    version = int.from_bytes(data[1:5], "big")
+    dcid = data[5]
+    if version in (0, 1) and dcid != 0:
+        return "answered (real QUIC)"
+    return "stub (version 0x%08x, dcid len %d)" % (version, dcid)
+
+
 def udp_probe(ip, port, timeout=3):
     """Send a WireGuard-style init packet and see whether anything comes back.
 
     A live endpoint that is merely not answering would be indistinguishable from a filtered one,
     so an ICMP error (which surfaces as an OS error on the next read/write) is the useful signal:
     it means the network delivered the packet and something refused it, as opposed to silence.
+
+    Two things were wrong with that and are fixed here. The payload was 148 bytes - below the
+    ~1200-byte floor this network has, so a filtered port and an unfilled buffer were the same
+    reading - and any reply was reported as "answered", which counts a 31-byte stateless reset or a
+    12-byte stub as a service. Both have produced wrong verdicts in this project before. The packet
+    is now 1200 bytes and the reply is described, not assumed.
     """
     pkt = struct.pack("<BBI", 1, 0, 0) + b"\x00" * 32 + struct.pack("<Q", int(time.time())) + b"\x00" * 64
+    pkt += b"\x00" * (1200 - len(pkt))
     t0 = time.time()
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     try:
         s.sendto(pkt, (ip, port))
-        data, _ = s.recvfrom(1024)
-        return "answered %d bytes in %dms" % (len(data), int((time.time() - t0) * 1000))
+        data, _ = s.recvfrom(2048)
+        return "%s %d bytes in %dms" % (describe(data), len(data),
+                                        int((time.time() - t0) * 1000))
     except socket.timeout:
         return "silent (no reply, no ICMP)"
     except OSError as e:
