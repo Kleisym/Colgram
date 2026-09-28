@@ -777,3 +777,30 @@ The relay over TCP remains the only route to the WireGuard ingress, and it is bu
 Reaching Cloudflare's edge over TCP 443 under a name the filter does not match is real, and it is
 not WARP.
 
+### The last unmeasured UDP shape on the MASQUE block, and why it is nothing
+
+The MASQUE block had not been swept the way the WireGuard block was, so every UDP port the official
+client races - 1701, 4500, 4443, 8443, 8095 - plus 443 and 500 were measured directly with a 1200-byte
+QUIC Initial:
+
+```
+162.159.198.2  udp/443 silent  8443 silent  8095 silent  4443 silent  4500 silent  1701 silent
+162.159.198.1  udp/443 silent  8443 silent  8095 silent  4443 silent  4500 silent  1701 silent
+162.159.197.3  udp/443 silent  8443 silent  8095 silent
+162.159.198.2  udp/500  98B first=0xf0   <- the one answer, on one attempt
+```
+
+`0xf0` is an IKE response and 98 bytes is about the size of an IKE_SA_INIT reply, which is a
+tempting read: IKE_SA_INIT carries no authentication, so an endpoint would answer it before knowing
+who was asking. It does not survive being repeated. Sending the same QUIC Initial to 500 six more
+times returned **0 of 6**; sending 1200 random bytes returned **0 of 4**. One answer in a single
+attempt is the filter's own behaviour, not a service - the same instability this file has recorded
+twice before, where `188.114.96.1:2408` answered once and then went silent for 20 consecutive
+probes. That is why no verdict here rests on a single answered packet, and why this one is recorded
+as noise rather than as an IKE path that did not work.
+
+The two 198.x and 197.x addresses that do not answer 500 also do not answer anything else, so there is
+no second unfiltered route hiding on this block either. Every UDP port the client tries is closed;
+the one transport that works is TCP 443, and on that transport the endpoint refuses Extended
+CONNECT for every client and the app has no MASQUE outbound to speak with anyway.
+
