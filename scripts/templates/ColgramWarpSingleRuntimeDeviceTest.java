@@ -294,7 +294,11 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
                     // A real 148-byte message-initiation: the size matters, because a datagram
                     // this network drops for being small would prove nothing about a relay that
                     // merely accepts whatever arrives.
-                    byte[] answer = new byte[148];
+                    // Echo the bytes that arrived, not a fresh array. A fresh array is 148
+                    // zeros, which fails the comparison with "expected:<1> but was:<0>" and reads
+                    // as a broken relay - the exact misreading this test exists to avoid, caused
+                    // by the echo rather than by anything under test.
+                    byte[] answer = java.util.Arrays.copyOf(in.getData(), in.getLength());
                     java.net.DatagramPacket out = new java.net.DatagramPacket(
                             answer, answer.length, in.getAddress(), in.getPort());
                     relay.send(out);

@@ -183,6 +183,48 @@ class RelayBridgeTest(unittest.TestCase):
         finally:
             client.close()
 
+    def test_twoUdpClientsEachGetTheirOwnAnswersBack(self) -> None:
+        """A second client must not steal the first one's replies.
+
+        Measured doing exactly that. The listener kept one upstream socket and treated "whoever
+        spoke last" as the client, so A sent and was answered, B sent, and A then sent again and
+        heard nothing - the response went to B. For WARP that is a tunnel that dies on endpoint
+        rotation or when a second device connects, and it presents as a blocked network rather
+        than as a relay bug, which is the failure this file exists to prevent.
+
+        The traffic is interleaved on purpose. Sequential traffic passes under the broken
+        behaviour too, because each client is still the most recent speaker when it replies.
+        """
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        clients = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(3)]
+        for client in clients:
+            client.settimeout(4)
+        try:
+            threading.Thread(target=relay.serve_udp_client,
+                             args=(listener, self.endpoint.address, True),
+                             daemon=True).start()
+            for client in clients:
+                client.sendto(b"x" * 148, listener.getsockname())
+            for index, client in enumerate(clients):
+                answer, _ = client.recvfrom(2048)
+                self.assertEqual(b"ANSWERED:148", answer,
+                                 "client " + str(index) + " never received its own answer")
+
+            # All three at once, which is where "last speaker wins" collapses.
+            for client in clients:
+                client.sendto(b"y" * 92, listener.getsockname())
+            for index, client in enumerate(clients):
+                answer, _ = client.recvfrom(2048)
+                self.assertEqual(b"ANSWERED:92", answer,
+                                 "client " + str(index) + " lost its answer to another client")
+        finally:
+            for client in clients:
+                client.close()
+            listener.close()
+
+
     @staticmethod
     def _initiation() -> bytes:
         initiation = struct.pack("<IB", 1, 0) + bytes(range(32)) + bytes(range(32, 64))

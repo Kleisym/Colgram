@@ -165,9 +165,15 @@ def serve_udp_client(listener: socket.socket, endpoint: tuple[str, int], quiet: 
     is. The framing stays on the TCP listener for anyone driving this by hand.
     """
     listener.settimeout(1.0)
-    peer: tuple[str, int] | None = None
-    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstream.settimeout(1.0)
+    # Every client gets its own upstream socket, so a reply is matched to the request that caused
+    # it. A single shared socket with "last speaker wins" was measured doing exactly that: client
+    # A sent, got its answer, client B sent, and A then sent again and heard nothing - because the
+    # response went to B. For WARP that is a tunnel that dies whenever the endpoint rotates or a
+    # second device connects, which looks like a blocked network rather than a relay bug.
+    upstreams: dict[tuple[str, int], socket.socket] = {}
+    # Cap on concurrent clients, so an open relay cannot be turned into a socket-per-source leak.
+    # A WireGuard endpoint is one client; anything past this is an address sweep.
+    MAX_CLIENTS = 32
     try:
         while True:
             try:
@@ -177,32 +183,44 @@ def serve_udp_client(listener: socket.socket, endpoint: tuple[str, int], quiet: 
             except OSError:
                 return
             if data:
-                # One client at a time per socket, chosen by whoever speaks first. A WireGuard
-                # endpoint opens no session of its own to learn this, so there is nothing to
-                # authenticate the choice on - which is why the UDP listener is opt-in and why a
-                # real deployment runs one per client behind a firewall.
-                peer = address
+                upstream = upstreams.get(address)
+                if upstream is None:
+                    if len(upstreams) >= MAX_CLIENTS:
+                        # Dropped rather than served: a datagram from a new source with the
+                        # listener already full is a scan, and answering it would make the relay
+                        # an open relay for anyone who found the port.
+                        if not quiet:
+                            print(f"refusing {address[0]}:{address[1]}, {MAX_CLIENTS} clients already",
+                                  flush=True)
+                        continue
+                    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    upstream.settimeout(0.2)
+                    upstreams[address] = upstream
                 try:
                     upstream.sendto(data, endpoint)
                 except OSError as e:
                     if not quiet:
                         print(f"send to {endpoint} failed: {e}", flush=True)
-
-            if peer is None:
                 continue
-            while True:
-                try:
-                    answer, _ = upstream.recvfrom(MAX_FRAME)
-                except socket.timeout:
-                    break
-                except OSError:
-                    return
-                try:
-                    listener.sendto(answer, peer)
-                except OSError:
-                    return
+
+            # Drain every client's replies. Done on a short timeout rather than after one client's
+            # traffic, so one busy peer cannot delay another's answer past its retransmit window.
+            for address, upstream in list(upstreams.items()):
+                while True:
+                    try:
+                        answer, _ = upstream.recvfrom(MAX_FRAME)
+                    except socket.timeout:
+                        break
+                    except OSError:
+                        upstreams.pop(address, None)
+                        break
+                    try:
+                        listener.sendto(answer, address)
+                    except OSError:
+                        return
     finally:
-        upstream.close()
+        for upstream in upstreams.values():
+            upstream.close()
         try:
             listener.close()
         except OSError:
