@@ -177,7 +177,7 @@ public final class ColgramDeviceQuicHandshakeTest {
         for (int i = at; i < PROBE_BYTES; i++) {
             packet[i] = 0;
         }
-        return maskHeader(packet, iv, key, dcid);
+        return maskHeader(packet, iv, key, lengthOffset);
     }
 
     /** AES-128-GCM sealing, with the payload length carried in the tag's place. */
@@ -193,7 +193,8 @@ public final class ColgramDeviceQuicHandshakeTest {
      * Long-header protection: sample 16 bytes at offset 4, build the mask, and flip the packet
      * number's low bits plus the first byte's low four.
      */
-    private static byte[] maskHeader(byte[] packet, byte[] iv, byte[] key, byte[] dcid) throws Exception {
+    private static byte[] maskHeader(byte[] packet, byte[] iv, byte[] key, int lengthOffset)
+            throws Exception {
         // The sample is 16 bytes taken at offset 4, so the working buffer is the 12-byte IV with
         // four more bytes after it - not the IV itself. Writing the 12-byte IV and then copying 12
         // bytes in at offset 3 overflows it, and an ArrayIndexOutOfBoundsException in the header
@@ -205,10 +206,11 @@ public final class ColgramDeviceQuicHandshakeTest {
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"));
         byte[] sample = cipher.doFinal(ivCopy);
         byte first = (byte) (packet[0] ^ (sample[0] & 0x0f));
-        byte number = (byte) (packet[packet.length - 1] ^ 0);  // packet number is all zero
         packet[0] = first;
-        // The packet number sits just before the ciphertext; find it by the length field.
-        int lengthOffset = 6 + dcid.length;
+        // The packet number sits just before the ciphertext, and the length field counts it together
+        // with the ciphertext. Its offset is passed in rather than recomputed here: deriving it from
+        // the DCID length alone skips the SCID and the token length, which puts it 118 bytes past
+        // the real position and indexes beyond the packet.
         int length = ((packet[lengthOffset] & 0xff) << 8) | (packet[lengthOffset + 1] & 0xff);
         int numberOffset = lengthOffset + 2 + length - 16;
         packet[numberOffset] = (byte) (packet[numberOffset] ^ (sample[1] & 0x1f));
