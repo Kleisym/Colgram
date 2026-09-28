@@ -1041,6 +1041,33 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_warp_probe_repeats_because_this_filter_changes_over_time(self):
+        # The same hosts, ports and payload sizes, minutes apart, gave INVERTED answers:
+        #
+        #   session 1:  8.8.8.8:443 ANSWERED,  1.1.1.1:443 silent
+        #   session 2:  1.1.1.1:443 ANSWERED,  8.8.8.8:443 silent
+        #
+        # and a real WARP ingress, 188.114.96.1:2408, answered 1 of 3 probes - which looked like
+        # the filter opening a window and was not: 0 of 20 over the following minute.
+        #
+        # Within a session the outcome is stable, so this is not a flaky probe. The filtering itself
+        # moves. That makes every one-shot verdict a snapshot, and it means no probe can settle
+        # whether WARP works here - a single ANSWERED packet is exactly as unreliable as a single
+        # silent one. Hence the repeats, and hence the n/3 reporting.
+        probe = (ROOT / "scripts/warp_udp_probe.py").read_text(encoding="utf-8")
+        self.assertIn("REPEATS", probe, "a one-shot probe cannot settle a moving filter")
+        self.assertIn("ANSWERED %d/%d", probe,
+                      "the probe must report n-of-N rather than a single result")
+        # And the payload has to be the size that can actually get an answer: a 148-byte probe sits
+        # below the measured floor and cannot tell a filtered port from a live one.
+        self.assertIn("range(1200)", probe)
+        # The relay is what survives a moving filter, so its presence is asserted too.
+        self.assertTrue((ROOT / "scripts/warp-relay-server.py").is_file())
+        relay_test = (ROOT / "scripts/test_warp_relay.py").read_text(encoding="utf-8")
+        self.assertIn("aFrameGoesOutAndAnAnswerComesBack", relay_test)
+        self.assertIn("148", relay_test,
+                      "the relay test must drive a real initiation size, not a large frame")
+
     def test_the_small_packet_floor_is_udp_only_so_a_relay_still_works(self):
         # The result that decides whether a relay is viable, and the one most likely to be
         # misread. A ~1200-byte floor on small UDP datagrams looks like "nothing small crosses

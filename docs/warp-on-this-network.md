@@ -182,6 +182,32 @@ That is the honest boundary: everything up to Cloudflare's UDP path is built and
 missing is a machine whose UDP is not filtered, and until there is one, "WARP works" would be a
 claim rather than a result.
 
+### The filter's behaviour changes over time, so one run settles nothing
+
+Running the UDP probe twice on the same machine, minutes apart, with the same hosts, ports and
+payload sizes:
+
+```
+session 1:   8.8.8.8:443  ANSWERED      1.1.1.1:443  silent      9.9.9.9:443  silent
+session 2:   1.1.1.1:443  ANSWERED      8.8.8.8:443  silent      9.9.9.9:443  silent
+```
+
+**The results inverted.** Within a session the outcome is stable across repeated runs, so this is
+not a flaky probe — the filtering itself changes over time. A third run showed
+`188.114.96.1:2408` — a genuine WARP ingress — answering **1 of 3** probes, which looked like the
+filter opening a window. It did not: **0 of 20** over the following minute.
+
+Two consequences, and the second is the one that matters most:
+
+1. Every WARP verdict here is a snapshot, not a property. `warp_udp_probe.py` now repeats each
+   probe and reports `ANSWERED n/3` rather than a single result, because a lone `silent` reads as a
+   measurement when it may only be a moment in the filter's cycle.
+2. **No probe can settle whether WARP works here — including a successful one.** A single answered
+   packet would be exactly as unreliable as a single silent one. This is why the device test
+   asserts against a real end-to-end tunnel with Cloudflare's `cdn-cgi/trace` reporting
+   `warp=on`, rather than against any reachability measurement, and why a "WARP works" claim on
+   this network would need that and not a probe.
+
 Reproduce:
 
 ```
