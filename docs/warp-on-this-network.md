@@ -134,6 +134,34 @@ The general lesson, now written into the tests: a correct, validated, fully-load
 completely dead tunnel were indistinguishable to every check in the suite except one that actually
 started the thing.
 
+## The pattern behind most of these
+
+Four separate faults had the same shape, and it is worth naming because it predicts where the next
+one will be:
+
+| Fault | What `checkConfig` said | What actually happened |
+|---|---|---|
+| No `tun` inbound | accepted | no TUN, nothing captured |
+| `auto_route` alone | accepted | TUN up, `routes=[]` |
+| DNS `detour` | **accepted** | service refused to start at all |
+| `flow: ""` | accepted | treated as an empty outbound |
+
+`checkConfig` validates the *shape*. It does not validate that the engine can start, that a route
+is installed, or that a field means what it looks like. Three of these four were accepted by the
+validator while breaking the feature completely.
+
+So the rule this codebase now follows is: **anything that decides whether traffic actually moves is
+measured against the running engine, never against the profile text.** Concretely —
+
+- `ColgramTunInboundDeviceTest` — the engine accepts a TUN that claims the device.
+- `ColgramDeviceRouteCaptureDeviceTest` — the engine *asks Android* for `0.0.0.0/0`.
+- `ColgramWarpDeviceIntegrationTest` — the tunnel comes up and Cloudflare answers.
+- `ColgramUdpAssociateDeviceTest` — a datagram survives the SOCKS5 UDP framing.
+
+The one that took longest to build is the second, and it is the one that would have caught the
+empty tunnel: a configurator that records instead of building, so the engine's actual request is
+the evidence.
+
 ## The local SOCKS bridge, for completeness
 
 Unrelated to WARP but part of the same bypass machinery, and fixed in the same pass: the loopback
