@@ -109,6 +109,21 @@ should be read as the sandbox talking.
 UDP has no such artifact: a datagram either comes back or it does not. That is why the verdict
 above rests on UDP alone, and why the probe lives on the host as well as the device.
 
+### The same artifact applies to TCP, on the host too
+
+The `nc -z` behaviour above was reproduced on the **host**, and it is not the only way TCP lies
+here. Connecting reports success on every port tried — `1.1.1.1:22` and `1.1.1.1:2408` both
+"open" — and then every one of them returns **zero bytes** when bytes are sent, including
+`1.1.1.1:443`, which is an HTTPS endpoint that must answer.
+
+So a TCP reachability check on this machine is worth nothing at all, and any conclusion drawn from
+"the port accepts a connection" would be an artifact of the sandbox rather than a property of the
+network. This is the same trap as the emulator's `nc -z`, one layer up, and it is worth stating
+plainly because TCP-based relay plans would have been built on exactly that false signal.
+
+**What survives is UDP**, where a datagram either comes back or it does not, with the six-resolver
+control to prove the path is live. Every WARP verdict here rests on that and nothing else.
+
 ### IPv6 was never actually a way in
 
 Worth recording because it looks like an obvious untried angle. The device has IPv6 addresses, but
