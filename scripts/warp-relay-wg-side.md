@@ -122,6 +122,7 @@ split-segment test fail with `ConnectionAbortedError`, which is what makes it wo
 | The UDP listener carries a 148-byte initiation out and back | `scripts/test_warp_relay.py` |
 | Colgram and the relay agree on a transport | `scripts/test_warp_relay_join.py` |
 | Colgram sends its handshake to the relay over TCP 443 | profile carries the relay address, port and the relay's key; `ColgramWarpSingleRuntimeDeviceTest` |
+| **A relay on the profile's port answers a 148-byte initiation over UDP, on the device** | `ColgramWarpSingleRuntimeDeviceTest`, 8/8 on `emulator-5554` |
 | A relay started with `--udp-listen` answers a real DNS query over both hops | run below, 64 bytes, QR bit set on each |
 | The far side reaches Cloudflare's UDP | **not measured** — needs a host without the filter |
 | Cloudflare answers `warp=on` | **not measured** — needs the whole chain |
