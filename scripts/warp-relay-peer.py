@@ -185,6 +185,7 @@ def main() -> int:
             except OSError:
                 break
             relayed += 1
+            print("  from %s:%d  %d bytes" % (sender[0], sender[1], len(data)), flush=True)
             try:
                 relay.sendto(data, peer.address)
             except OSError:
