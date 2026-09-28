@@ -987,6 +987,32 @@ public final class DialogRefreshSequencerHarness {
         stop_body = core.split("public static synchronized void stop()", 1)[1].split(chr(10) + "    }", 1)[0]
         self.assertIn("serverSocket.close();", stop_body)
         self.assertIn("bound = false;", stop_body)
+    def test_the_local_socks_bridge_serves_udp_associate(self):
+        """A refused ASSOCIATE is not a degraded path; it is no path at all.
+
+        The bridge answered "host unreachable" to every UDP ASSOCIATE, on the reasoning that tgnet
+        had no use for one here. A client that asked for UDP then got no route rather than a worse
+        one, and the reply the user sees is a connection that cannot be established with nothing in
+        the log pointing at the reason. Telegram's own transports ask for it.
+
+        Two details are pinned because both fail silently. The BND address must be loopback:
+        0.0.0.0 reaches nothing on a real network and looks like a dropped association. And the UDP
+        header length has to come from the address FORM - a domain name carries its own length byte,
+        and getting it wrong shifts the port and payload by a byte or two.
+        """
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        remap = (core / "ColgramDcRemap.java").read_text(encoding="utf-8")
+        self.assertIn("cmd == 0x03", remap)
+        self.assertIn("serveUdpAssociate", remap)
+        self.assertIn("udpAddressLength", remap)
+        self.assertIn("public static int localPort()", remap)
+        installed = ROOT / ("Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram"
+                            "/core/ColgramUdpAssociateDeviceTest.java")
+        self.assertTrue(installed.exists(), "the UDP associate device test is not installed")
+        body = installed.read_text(encoding="utf-8")
+        self.assertIn("anAssociateHandshakeReturnsAReachableUdpPort", body)
+        self.assertIn("theHeaderLengthFollowsTheAddressForm", body)
+
     def test_warp_can_be_pointed_at_a_relay_when_cloudflare_udp_is_dark(self):
         """The only way WARP works where Cloudflare UDP is dropped.
 

@@ -40,18 +40,24 @@ DEVICE_TESTS = [
     "org.colgram.core.ColgramGlobalSearchHistoryDeviceTest",
     "org.colgram.core.ColgramGlobalSearchRestoreDeviceTest",
     "org.colgram.core.ColgramThemeContrastDeviceTest",
+    "org.colgram.core.ColgramUdpAssociateDeviceTest",
     "org.colgram.core.ColgramWarpChurnDeviceTest",
     "org.colgram.core.ColgramWarpUdpReachabilityDeviceTest",
 ]
 
 
-def newest_log():
+def newest_log(since=None):
     # Scoped to the device this run targeted. Globbing across every device folder means a
     # second emulator's older log can be read as this run's outcome, which is how a run that
     # really passed gets reported as "the device log carried no test results".
     device = os.environ.get("ANDROID_SERIAL")
     pattern = (device + "/testlog/test-results.log") if device else "*/testlog/test-results.log"
     logs = sorted(RESULTS.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if since is not None:
+        # Only a log written after this run began. A build that fails before the tests start
+        # leaves the previous run's log in place, and reading that reports a stale pass as this
+        # run's result - which is worse than a failure, because it looks like the tests ran.
+        logs = [p for p in logs if p.stat().st_mtime >= since]
     return logs[0] if logs else None
 
 
@@ -118,6 +124,7 @@ def main() -> int:
                     pass
 
     log_path = ROOT / "device-tests-run.log"
+    started = time.time()
     with log_path.open("w", encoding="utf-8") as sink:
         subprocess.run(
             [JAVA, "-cp", str(WRAPPER), "org.gradle.wrapper.GradleWrapperMain",
@@ -130,7 +137,7 @@ def main() -> int:
     deadline = time.time() + 120
     log = None
     while time.time() < deadline:
-        log = newest_log()
+        log = newest_log(since=started)
         if log and "OK (" in log.read_text(encoding="utf-8", errors="replace"):
             break
         time.sleep(5)

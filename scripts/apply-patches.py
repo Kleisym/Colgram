@@ -5749,6 +5749,42 @@ def inject_singbox_device_test_support(repo_path, root_dir):
     print(" [+] sing-box device tests are mirrored from tracked templates")
 
 
+def inject_core_device_test_support(repo_path, root_dir):
+    """Mirror the org.colgram.core device tests into the generated test tree.
+
+    Telegram-Src/ is gitignored, so a test that only exists there is gone on the next clone. The
+    mirroring assertion in the regression suite has always checked that these files are present and
+    identical to their templates, but nothing ever COPIED them - so the first thing a fresh clone
+    did was fail that assertion instead of installing the tests. This is the copy that makes the
+    assertion mean something, and it is why a clone gets the checks that found the real bugs.
+    """
+    module_dir = os.path.join(repo_path, "TMessagesProj_AppTests")
+    if not os.path.isdir(module_dir):
+        print(" [=] TMessagesProj_AppTests missing; skipping core device-test wiring")
+        return
+
+    template_dir = os.path.join(root_dir, "scripts", "templates")
+    destination_dir = os.path.join(
+        module_dir, "src", "androidTest", "java", "org", "colgram", "core")
+    for name in ("ColgramThemeContrastDeviceTest.java",
+                 "ColgramCallProxyDeviceTest.java",
+                 "ColgramDpiBypassDeviceTest.java",
+                 "ColgramGlobalSearchHistoryDeviceTest.java",
+                 "ColgramGlobalSearchRestoreDeviceTest.java",
+                 "ColgramProxyAutonomyDeviceTest.java",
+                 "ColgramUdpAssociateDeviceTest.java",
+                 "ColgramWarpChurnDeviceTest.java",
+                 "ColgramWarpUdpReachabilityDeviceTest.java"):
+        source = os.path.join(template_dir, name)
+        if not os.path.isfile(source):
+            PATCH_MISSES.append("core device-test template " + name)
+            print(" [!] FATAL: core device-test template is missing: " + name)
+            continue
+        os.makedirs(destination_dir, exist_ok=True)
+        shutil.copy2(source, os.path.join(destination_dir, name))
+    print(" [+] core device tests are mirrored from tracked templates")
+
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
@@ -6792,6 +6828,7 @@ def main():
     sync_singbox_module(target_repo, root_dir)
     inject_warp_device_test_support(target_repo, root_dir)
     inject_singbox_device_test_support(target_repo, root_dir)
+    inject_core_device_test_support(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)
