@@ -154,6 +154,52 @@ Nothing was changed to obtain any of this. The tunnel was left running, the serv
 restarted, and the bypass is a per-socket bind to `192.168.0.4` - which is also what proves the
 second path exists at all, since a bound DNS query answers while a bound QUIC Initial does not.
 
+### It is not the size floor again, which matters for what could still be tried
+
+The file above spends a long time on a ~1200-byte floor where small UDP gets no answer and 1200
+does. That floor was real, and it is also **not** what is happening on port 443 now. Same host, same
+port, varying only the size:
+
+```
+zeros 32B     udp/443 -> silent
+zeros 200B    udp/443 -> silent
+zeros 500B    udp/443 -> silent
+zeros 1000B   udp/443 -> silent
+zeros 1200B   udp/443 -> silent
+zeros 1400B   udp/443 -> silent
+
+DNS over the same path -> 64B
+```
+
+Nothing answers at any size, at any provider, on either path, while DNS answers on the same socket.
+So there is no length at which a QUIC packet gets through, and the earlier conclusion - "1200 is
+enough, the block is a size floor" - does not describe 443 on this network anymore.
+
+That distinction decides what is still worth trying. A size floor can be beaten by padding, and
+padding is free. A block on QUIC as such cannot be beaten by any framing that still produces a QUIC
+packet, because the thing being matched is the protocol, not the length. It is the same reason the
+relay exists and the same reason a cleverer wrapper would not have helped: the packet has to arrive
+as something other than QUIC, and the only transport that does that here is TCP 443 - which is
+already carrying TLS to Cloudflare's edge and is what the relay uses.
+
+### The same control on the device
+
+```
+control: DNS over UDP -> answers; probe 1200B
+Google 142.250.74.174:443     answered 0/3
+Facebook 157.240.1.35:443     answered 0/3
+Cloudflare resolver 1.1.1.1:443  answered 0/3
+Google DNS 8.8.8.8:443       answered 0/3
+TOTAL QUIC answered 0/12 across four unrelated providers
+```
+
+0 of 12 on the phone as well, with DNS answering on the same socket - so the device path is not a
+phone-shaped version of the host's tunnel problem, it is the same block. That is the first reading
+in this file that does not depend on the host at all, and it is the one that says the transport
+question is settled rather than open.
+
+    python scripts/device-tests.py org.colgram.core.ColgramDeviceQuicScopeTest
+
 ### The block is not "all Cloudflare UDP" — and that correction matters
 
 An earlier version of this file said the whole of Cloudflare's UDP was filtered. That was wider than

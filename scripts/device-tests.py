@@ -40,6 +40,7 @@ DEVICE_TESTS = [
     "org.colgram.core.ColgramDpiBypassDeviceTest",
     "org.colgram.core.ColgramDeviceQuicInitialTest",
     "org.colgram.core.ColgramDeviceQuicAnatomyTest",
+    "org.colgram.core.ColgramDeviceQuicScopeTest",
     "org.colgram.core.ColgramDeviceSniFilterTest",
     "org.colgram.core.ColgramProxyAutonomyDeviceTest",
     "org.colgram.core.ColgramGlobalSearchHistoryDeviceTest",
