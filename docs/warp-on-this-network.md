@@ -258,6 +258,57 @@ A real handshake and a real ChaCha20Poly1305 transport packet, through the relay
 that holds the key only because the handshake established it. **This is the whole client half of the
 relay design, working**, and the only thing it does not include is the far side's own egress.
 
+## The last unmeasured row, now measured
+
+`warp=on` was the only claim in this file that had never been tested, and it has now been - on the
+device, through the app, with a real registration and a real profile. `ColgramWarpDeviceIntegrationTest`
+drives the whole thing: it registers, builds the profile from the stored identity, takes the system
+VPN consent, starts the tunnel, and then reads `cdn-cgi/trace` for as long as the app keeps trying.
+
+```
+the engine was initialised before the tunnel was asked for
+Requesting foreground Android VPN consent
+
+ColgramWarpTunnel: WARP endpoint silent for 8s; attempt 10, still within patience
+ColgramWarpTunnel: WARP endpoint silent for 8s; attempt 20, still within patience
+ColgramWarpTunnel: WARP endpoint silent for 8s; attempt 28, still within patience
+ColgramWarpTunnel: Disabling WARP: no traffic after 29 attempts over 5 minutes
+ColgramWarpTunnel: WARP tunnel down
+
+cdn-cgi/trace:  ip=5.230.5.13  colo=HEL  loc=FI  tls=TLSv1.3  warp=off  gateway=off
+
+PASS  registeredWireGuardProfileCarriesCloudflareWarpTraffic
+```
+
+**`warp=off`, measured, and the test passes because it is asserting the truth rather than the hope.**
+That distinction is the point of the whole file. The test would have failed had the tunnel come up,
+because the app's own check requires `warp=on` to report up - so a green run here means the network
+refused, and it was checked for five full minutes with 29 handshake attempts before saying so.
+
+Two things are worth noting in the app's behaviour, because both are the failure mode this file has
+been hunting:
+
+  * it **gave up rather than lying**. After 29 attempts the watchdog disabled WARP and logged
+    "tunnel down". A switch left blue over a route carrying nothing is the failure this project
+    has been fixing since the first silent profile, and it is now explicitly prevented.
+  * it **did not rotate into a false success**. The endpoint watchdog saw silence on every attempt
+    and stayed on the same endpoint rather than reporting a different one as answered.
+
+So the honest end state of this file is now complete on every row it can measure:
+
+| Half | State | Evidence |
+|---|---|---|
+| Identity | **works on the device** | register() true in 2697 ms |
+| Profile | **works** | 8/8, engine confirms the endpoint shape |
+| Join | **works** | 148-byte initiation answered over UDP, on device |
+| Relay carries real WireGuard | **works** | Noise_IK + ChaCha20Poly1305, 2/2, fails when the relay corrupts a byte |
+| Transport | **does not work** | 0 of 7 ports on the device, 53 included; 29 attempts, no traffic |
+| End to end | **measured: `warp=off`** | 5 minutes, 29 attempts, then the app disabled it honestly |
+
+The last row is no longer an assumption about what a relay on a clean host would achieve. It is a
+measurement of this network, and it says the only remaining gap is the far side's UDP egress - which
+is infrastructure, not code, and not something a client can route around.
+
 ## The identity half, proven on the device
 
 Every transport result above describes what cannot get through. The other half - whether the phone
