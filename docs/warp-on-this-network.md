@@ -102,6 +102,38 @@ profile and the app wiring it up — not as an open tunnel with traffic on it.
 
 The next honest step is an end-to-end measurement against a real relay, not another config claim.
 
+### What the on-device integration test actually reports
+
+`ColgramWarpDeviceIntegrationTest` drives the real Android VPN consent dialog, starts a real
+tunnel, and reads Cloudflare's own `cdn-cgi/trace`. Run on this network it reports:
+
+```
+MEASURED warpOn=false connected=false
+lastFailure=WARP fail-closed after all advertised UDP endpoints stayed silent
+```
+
+That is the honest end state, and the test asserts it: `isUp()` false **and** a named reason. A
+route that cannot carry traffic must not be left looking alive.
+
+Getting there took four fixes, all of which had every other test passing while the tunnel could not
+survive its own first second:
+
+1. `FOREGROUND_SERVICE_SPECIAL_USE` was never declared. From API 34 that type requires its own
+   permission, and the process died with signal 6 the instant the tunnel came up.
+2. The AppTests module is a *standalone app* and does not inherit the app manifest, so it needed
+   the permission declared separately — the package had zero of them.
+3. `Libbox.touch()` looks like the engine's initialiser, because every generated class calls it
+   from its static initialiser. Its body is **empty**. `Libbox.setup(SetupOptions)` is the call
+   that does the work, and nothing called it — so the first real call walked into a nil.
+4. `CommandServer.start()` was never called before `startOrReloadService`, and the override
+   argument was `null`. Both are read without a nil check on the Go side. This one is worth
+   recording because the crash **survived** fix 3: same panic, same line, so the remaining nil had
+   to be somewhere else.
+
+The general lesson, now written into the tests: a correct, validated, fully-loaded profile and a
+completely dead tunnel were indistinguishable to every check in the suite except one that actually
+started the thing.
+
 ## The local SOCKS bridge, for completeness
 
 Unrelated to WARP but part of the same bypass machinery, and fixed in the same pass: the loopback
