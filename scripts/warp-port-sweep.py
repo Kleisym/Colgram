@@ -52,6 +52,24 @@ PORTS = [
 ]
 
 
+def quic_initial() -> bytes:
+    """A correctly shaped QUIC v1 Initial, 1200 bytes.
+
+    Long header, version 1, a random connection id, a CRYPTO frame at offset 0, padded to 1200
+    because nothing smaller is answered on this path at all. The bytes inside are filler: the
+    payload is encrypted, so a server cannot tell filler from a handshake without our keys. What is
+    being asked is whether it answers an Initial *as a packet type* - which is the question a
+    stateless reset cannot answer, and therefore the one that separates "there is a QUIC server"
+    from "there is something that resets packets it cannot read".
+    """
+    import os
+
+    crypto = b"\x06" + (0).to_bytes(8, "big") + (900).to_bytes(2, "big") + os.urandom(900)
+    packet = b"\xc3" + (1).to_bytes(4, "big") + os.urandom(8) + os.urandom(8)
+    packet += b"\x00" + (0x0001).to_bytes(2, "big") + crypto
+    return packet + b"\x00" * (1200 - len(packet))
+
+
 def control_dns(server: str = "1.1.1.1") -> bool:
     """A real DNS query. A silent control makes every other answer meaningless."""
     labels = b"".join(bytes([len(p)]) + p.encode() for p in "cloudflare.com".split("."))
@@ -71,10 +89,17 @@ def control_dns(server: str = "1.1.1.1") -> bool:
 def probe(host: str, port: int) -> bool:
     """True when a datagram of WireGuard-initialiation size comes back at all.
 
-    The payload is not a valid handshake and does not need to be: the question is whether the
-    destination is reachable by UDP, and anything at all coming back answers it. A QUIC endpoint
-    replies to a short garbage datagram with a version-negotiation or a close, and a WireGuard one
-    stays silent unless it is filtering - so "answered" and "silent" are both informative.
+    The payload is a real QUIC Initial, and that is a correction rather than a refinement. This
+    probe used to send `b"\x00" * 1200` and count *any* byte back as "reachable", on the reasoning
+    that anything coming back proves the destination is reachable. Measured, that "anything" was a
+    31-byte stateless reset with an arbitrary first byte - `ce`, `e3`, `a4`, `ef` across four runs -
+    and a real Initial on the same ports and address scores **0 of 8**. So the sweep was measuring
+    Cloudflare's reset path and reporting it as a QUIC service, and the port-allowlist conclusion
+    built on "443 answers" does not survive.
+
+    "Reachable" is now a question about a *service*, not about the path: a datagram that draws a
+    reply only proves something is there, and on a QUIC port that something may be answering
+    precisely because it could not read the packet. The distinction is the whole measurement.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # Bounded on the SEND as well as the receive. A connected-less UDP socket can block in sendto
@@ -85,7 +110,7 @@ def probe(host: str, port: int) -> bool:
     sock.settimeout(TIMEOUT)
     sock.setblocking(False)
     try:
-        sock.sendto(b"\x00" * 1200, (host, port))
+        sock.sendto(quic_initial(), (host, port))
     except OSError:
         sock.close()
         return False

@@ -11,11 +11,57 @@ Measured on the device, and re-measured from the host on the same network:
 |---|---|
 | UDP DNS, 6 resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9, 77.88.8.8, 208.67.222.222, 94.140.14.14) | **all 6 answer, 64B** |
 | UDP to all 16 Cloudflare WireGuard ingresses (ports 2408, 500, 1701, 4500), a real message-initiation | **0 of 16 answer** |
-| **UDP 443/QUIC on the same addresses** | **answers** |
+| **UDP 443/QUIC on the same addresses, a real QUIC Initial** | **0 of 8 answer** |
 | AmneziaWG, extended ranges, junk packets, S1/S2/S5/S6 | no reproducible response |
 
 UDP itself is not broken — six independent resolvers answer from the same host, immediately before
 the sweep. Cloudflare's WireGuard ingress specifically does not answer.
+
+### Correction: "UDP 443 answers" was a stateless reset, and the port-specific story collapses
+
+The table above used to say **443/QUIC answers**, and a whole conclusion was built on it - that the
+filter is a port allowlist sparing 443, that Cloudflare's edge is reachable over UDP, and that only
+the WireGuard service is shut. Re-measured with a real QUIC Initial instead of the payload the
+original sweep used:
+
+```
+host             port    1200 zeros     QUIC Initial
+1.1.1.1          443     31B 0x83       silent
+1.1.1.1          8443    31B 0xeb       silent
+1.1.1.1          2408    silent         silent
+1.1.1.1          500     silent         silent
+162.159.192.1    443     31B 0xfb       silent
+162.159.192.1    8443    silent         silent
+162.159.192.1    2408    silent         silent
+162.159.192.1    500     silent         silent
+```
+
+And the 31-byte answers, repeated:
+
+```
+zeros  -> 31 B  first8= ce00000000001400   last8= 0000000000000001
+zeros  -> 31 B  first8= e300000000001400   last8= 0000000000000001
+zeros  -> 31 B  first8= a400000000001400   last8= 0000000000000001
+zeros  -> 31 B  first8= ef000000000001400   last8= 0000000000000001
+QUIC   -> silent
+QUIC   -> silent
+QUIC   -> silent
+```
+
+**A stateless reset, and the giveaway is the first byte.** `ce`, `e3`, `a4`, `ef` - arbitrary, and
+different every time, which is exactly what a reset's random-looking prefix is. A QUIC server
+replies to a real Initial with a real Initial, and a real Initial draws **0 of 8**. The original
+`warp-port-sweep.py` sent `b"\x00" * 1200` and counted *any* byte back as "reachable", so it was
+measuring the reset, not the service. Its own output said `answered 6, silent 10` while a real
+handshake on the same ports scored zero.
+
+What survives: **UDP is not blocked wholesale, and DNS is not filtered** - six resolvers answer,
+and a 1200-byte datagram on 443 draws a reply, so the path carries UDP to Cloudflare's edge. What
+does not survive is the framing. There is no reachable QUIC service here, so this is not a port
+allowlist sparing 443; it is a UDP path that carries DNS and answers undecryptable QUIC with a
+reset, and no WireGuard or MASQUE port answers at all. The conclusion that the relay is the only
+route is unaffected and if anything strengthened - but the diagnosis above it was wrong, and it
+was wrong because a probe counted a reset as a server.
 
 ### The block is not "all Cloudflare UDP" — and that correction matters
 
