@@ -464,14 +464,15 @@ What is genuinely established, and what is not:
 |---|---|
 | device -> relay port, UDP | **works** - the relay logs both the 1200-byte marker and the 148-byte initiation |
 | relay -> device, bare probe | **works** - `RELAY-OK`, 13 bytes back |
-| relay -> device, after the peer answers | **not yet measured** - the initiation arrives at the relay and the log stops there |
+| relay -> device, after the peer answers | **works** - the relay logs `handshakes 1` and a message-response arrives on the device |
 
-That last row is the one that matters, and the reason it is open is not the network: the relay's
-return path drains the peer's queue on its own timer, and a run has to be long enough for a
-Diffie-Hellman and an AEAD seal to finish between two polls. The peer answers in about 14 ms and the
-relay polls every 500 ms, so the delay should be small - but a relay that dies between the forward
-and the reply, as one did, produces exactly this signature, and separating the two takes a run where
-the relay stays up.
+That last row was open for a reason that had nothing to do with the network, and it is worth
+recording because the signature was identical to a block. The relay's return path drained the peer's
+queue synchronously right after forwarding, and the peer needs about 14 ms of Diffie-Hellman and an
+AEAD seal before it has anything to say - so the queue was always empty, the peer counted nothing,
+and the client waited for a reply that had been produced and dropped. Draining on the timeout path as
+well is what closed it, and a relay that dies between the forward and the reply still produces the
+same log, which is why the run has to be one where the relay stays up.
 
 ## …and it is measured now: a real handshake crossed from the phone through the relay
 
