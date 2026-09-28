@@ -5854,6 +5854,7 @@ def inject_core_device_test_support(repo_path, root_dir):
                  "ColgramDeviceUdpPortTest.java",
                  "ColgramDeviceRelayWireGuardTest.java",
                  "ColgramDeviceRelayConfigTest.java",
+                 "ColgramDeviceEngineRelayTest.java",
                  "ColgramDeviceReachabilityTest.java",
                  "ColgramDeviceWarpRegistrationTest.java",
                  "ColgramDeviceSniFilterTest.java",

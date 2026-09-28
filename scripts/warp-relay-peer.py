@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import os
@@ -191,6 +192,13 @@ def main() -> int:
     print("LISTENING %d" % relay.getsockname()[1], flush=True)
     print("the peer is at %s:%d, the device should use 10.0.2.2:%d"
           % (peer.address[0], peer.address[1], relay.getsockname()[1]), flush=True)
+    # The device needs the peer's public key: a relayed profile that carries Cloudflare's key is
+    # rejected by the peer for a reason indistinguishable from a block, so the test has to be given
+    # the right one and there was no way to read it out of the relay before.
+    # base64, because that is what a sing-box profile carries - handing the test a hex key would
+    # be rejected as "illegal base64 data" and look like a relay problem rather than a formatting
+    # one.
+    print("PEER_PUBLIC_KEY " + base64.b64encode(public_of(peer.static_private)).decode(), flush=True)
 
     relayed = 0
     last_sender = None
