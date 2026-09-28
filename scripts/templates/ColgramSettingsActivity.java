@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.util.Log;
+import android.widget.LinearLayout;
 import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
@@ -204,6 +205,15 @@ public class ColgramSettingsActivity extends BaseFragment {
 
         listView.setOnItemClickListener((view, position) -> {
             if (position == cloudflareWarpRow) {
+                // Long press configures the relay; a tap still toggles WARP, because that is
+                // what the row is about and burying it behind a menu would make the common case
+                // harder to reach.
+                if (view != null) {
+                    view.setOnLongClickListener(v -> {
+                        showWarpRelayDialog();
+                        return true;
+                    });
+                }
                 openCloudflareWarp();
             } else if (position == subscriptionRow) {
                 openSubscription();
@@ -722,6 +732,13 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private String warpStatusLine() {
         if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) return "бэкенд недоступен";
+        String relay = org.colgram.core.ColgramWarp.relaySummary();
+        if (relay != null) {
+            // A relay is the only thing that can work where Cloudflare's UDP is dark, so the row
+            // says so rather than letting the user watch a doomed handshake time out.
+            return "через релей " + relay
+                    + (org.colgram.core.ColgramWarpTunnel.isUp() ? " · подключается" : "");
+        }
         if (warpStartPending) return "запускается…";
         String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();
         if (failure != null && !failure.isEmpty()
@@ -752,6 +769,69 @@ public class ColgramSettingsActivity extends BaseFragment {
             // The store is absent in a build without it, and that is not an error to surface.
             return "недоступно";
         }
+    }
+
+    /**
+     * Enter or clear the relay that carries WARP where Cloudflare's UDP is dropped.
+     *
+     * Four fields, because that is what a WireGuard peer actually needs: the relay terminates
+     * the handshake, so it has its own public key and it needs the peer's preshared key. The
+     * row reports it afterwards, so a relay that is entered but not working is visible as a relay
+     * rather than as WARP quietly failing.
+     */
+    private void showWarpRelayDialog() {
+        final Context context = getContext();
+        if (context == null) return;
+        LinearLayout layout = new LinearLayout(context);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12),
+                AndroidUtilities.dp(20), AndroidUtilities.dp(8));
+
+        android.widget.EditText address = relayField(layout, "Адрес релея",
+                org.colgram.core.ColgramWarp.relayAddress());
+        android.widget.EditText port = relayField(layout, "Порт",
+                org.colgram.core.ColgramWarp.relayPort() > 0
+                        ? String.valueOf(org.colgram.core.ColgramWarp.relayPort()) : "");
+        android.widget.EditText publicKey = relayField(layout, "Публичный ключ релея",
+                org.colgram.core.ColgramWarp.relayPublicKey());
+        android.widget.EditText preshared = relayField(layout, "Preshared key (если есть)",
+                org.colgram.core.ColgramWarp.relayPresharedKey());
+
+        org.telegram.ui.ActionBar.AlertDialog.Builder builder =
+                new org.telegram.ui.ActionBar.AlertDialog.Builder(getParentActivity());
+        builder.setTitle("Релей для WARP");
+        builder.setMessage("Нужен, если UDP Cloudflare заблокирован: релея держите сами, "
+                + "он принимает WireGuard по TCP и проксирует в Cloudflare.");
+        builder.setView(layout);
+        builder.setPositiveButton("Сохранить", (d, w) -> {
+            int portNumber = 0;
+            try {
+                portNumber = Integer.parseInt(port.getText().toString().trim());
+            } catch (Exception ignored) {
+                // A port that is not a number is the same as no port, and setRelay treats it as
+                // "clear" rather than writing something the tunnel cannot use.
+            }
+            org.colgram.core.ColgramWarp.setRelay(address.getText().toString(), portNumber,
+                    publicKey.getText().toString(), preshared.getText().toString());
+            if (listAdapter != null) listAdapter.notifyDataSetChanged();
+            Toast.makeText(context, org.colgram.core.ColgramWarp.hasRelay()
+                    ? "Релей сохранён" : "Релей очищен", Toast.LENGTH_SHORT).show();
+        });
+        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
+        builder.show();
+    }
+
+    private android.widget.EditText relayField(LinearLayout layout, String hint, String value) {
+        android.widget.EditText input = new android.widget.EditText(getContext());
+        input.setHint(hint);
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        input.setTextSize(13);
+        input.setSingleLine(true);
+        if (value != null) input.setText(value);
+        layout.addView(input, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        return input;
     }
 
     private class ListAdapter extends RecyclerListView.SelectionAdapter {

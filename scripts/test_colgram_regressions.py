@@ -987,6 +987,39 @@ public final class DialogRefreshSequencerHarness {
         stop_body = core.split("public static synchronized void stop()", 1)[1].split(chr(10) + "    }", 1)[0]
         self.assertIn("serverSocket.close();", stop_body)
         self.assertIn("bound = false;", stop_body)
+    def test_warp_can_be_pointed_at_a_relay_when_cloudflare_udp_is_dark(self):
+        """The only way WARP works where Cloudflare UDP is dropped.
+
+        Measured on the device: all 56 Cloudflare WireGuard endpoints silent, zero WireGuard
+        replies over TCP, while UDP itself answers. There is no port and no protocol version that
+        fixes that, because WireGuard has no TCP transport - a relay has to accept the handshake
+        and forward it.
+
+        What this pins is the part that is easy to get wrong. A relay TERMINATES the handshake,
+        so both the peer key and the endpoint are the relay's. Pointing Cloudflare's key at a relay
+        that does not own it fails in a way indistinguishable from a dead WARP, which is how a relay
+        gets blamed for not working.
+        """
+        warp = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramWarp.java").read_text(encoding="utf-8")
+        for key in ("KEY_RELAY_ADDRESS", "KEY_RELAY_PORT", "KEY_RELAY_PUBLIC_KEY",
+                    "KEY_RELAY_PRESHARED_KEY"):
+            self.assertIn("private static final String " + key, warp)
+        self.assertIn("public static boolean setRelay(String address, int port, String publicKey,", warp)
+        # Empty values clear the relay, so a user can go back to Cloudflare directly.
+        self.assertIn("editor.remove(KEY_RELAY_ADDRESS)", warp)
+        self.assertIn("portCache = null;", warp)
+
+        profile = warp.split("public static String buildWgQuickConf", 1)[1].split("public static final class X25519", 1)[0]
+        self.assertIn("String relayKey = relayPublicKey();", profile)
+        self.assertIn("if (relayKey != null && !relayKey.isEmpty() && relayAddress() != null) {", profile)
+        self.assertIn("peerKey = relayKey;", profile)
+        self.assertIn("host = relayAddress();", profile)
+        self.assertIn("portNumber = relayPort();", profile)
+        # The endpoint that reaches the wire is the one that was just chosen.
+        self.assertIn('sb.append("Endpoint = ").append(host).append(\':\').append(portNumber)', profile)
+        self.assertIn('sb.append("PresharedKey = ")', profile)
+        # And without a relay the direct path is untouched.
+        self.assertIn("String peerKey = WARP_PEER_PUBLIC_KEY;", profile)
     def test_call_proxying_only_ever_applies_to_a_plain_proxy(self):
         """Documented so it is not mistaken for a bug: calls cannot use an MTProto proxy.
 

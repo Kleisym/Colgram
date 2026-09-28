@@ -33,6 +33,12 @@ public final class ColgramWarp {
     private static final String KEY_PRIVATE = "private_key_b64";
     private static final String KEY_REGISTRATION = "registration_json";
     private static final String KEY_ENDPOINT_INDEX = "endpoint_index";
+    /** A relay that carries WireGuard for us, for networks that drop Cloudflare's UDP. */
+    private static final String KEY_RELAY_ADDRESS = "relay_address";
+    private static final String KEY_RELAY_PORT = "relay_port";
+    /** The relay's own WireGuard public key, which is NOT Cloudflare's. */
+    private static final String KEY_RELAY_PUBLIC_KEY = "relay_public_key";
+    private static final String KEY_RELAY_PRESHARED_KEY = "relay_preshared_key";
 
     private static final String REG_URL = "https://api.cloudflareclient.com/v0a2158/reg";
 
@@ -253,6 +259,83 @@ public final class ColgramWarp {
     }
 
     /**
+     * Point WARP at a relay instead of Cloudflare's own ingress.
+     *
+     * On a network that drops Cloudflare's UDP there is no port, no protocol version and no
+     * client-side trick that reaches the real endpoint: WireGuard has no TCP transport, and
+     * measured on this device every endpoint is silent while UDP itself is alive. What works is
+     * a relay the user runs elsewhere, which accepts the WireGuard handshake over TCP and
+     * forwards it to Cloudflare. The relay's public key is its own, not WARP's, which is why it
+     * is configured here rather than reused.
+     *
+     * Empty values clear the relay and return to Cloudflare directly.
+     */
+    public static boolean setRelay(String address, int port, String publicKey,
+                                  String presharedKey) {
+        Context ctx = ColgramPythonEngine.appContext();
+        if (ctx == null) return false;
+        SharedPreferences.Editor editor =
+                ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit();
+        if (address == null || address.trim().isEmpty() || port <= 0) {
+            editor.remove(KEY_RELAY_ADDRESS).remove(KEY_RELAY_PORT)
+                    .remove(KEY_RELAY_PUBLIC_KEY).remove(KEY_RELAY_PRESHARED_KEY);
+        } else {
+            editor.putString(KEY_RELAY_ADDRESS, address.trim()).putInt(KEY_RELAY_PORT, port);
+            putOrRemove(editor, KEY_RELAY_PUBLIC_KEY, publicKey);
+            putOrRemove(editor, KEY_RELAY_PRESHARED_KEY, presharedKey);
+        }
+        editor.apply();
+        // The port list is cached; a relay has to take effect on the next start.
+        portCache = null;
+        return true;
+    }
+
+    private static void putOrRemove(SharedPreferences.Editor editor, String key, String value) {
+        if (value == null || value.trim().isEmpty()) {
+            editor.remove(key);
+        } else {
+            editor.putString(key, value.trim());
+        }
+    }
+
+    public static boolean hasRelay() {
+        return relayAddress() != null;
+    }
+
+    public static String relayAddress() {
+        Context ctx = ColgramPythonEngine.appContext();
+        if (ctx == null) return null;
+        String address = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_RELAY_ADDRESS, null);
+        return address == null || address.trim().isEmpty() ? null : address.trim();
+    }
+
+    public static int relayPort() {
+        Context ctx = ColgramPythonEngine.appContext();
+        return ctx == null ? 0
+                : ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        .getInt(KEY_RELAY_PORT, 0);
+    }
+
+    public static String relayPublicKey() {
+        Context ctx = ColgramPythonEngine.appContext();
+        return ctx == null ? null : ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_RELAY_PUBLIC_KEY, null);
+    }
+
+    public static String relayPresharedKey() {
+        Context ctx = ColgramPythonEngine.appContext();
+        return ctx == null ? null : ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_RELAY_PRESHARED_KEY, null);
+    }
+
+    /** A short description for the settings row, so it never claims a relay it does not have. */
+    public static String relaySummary() {
+        String address = relayAddress();
+        return address == null ? null : address + ":" + relayPort();
+    }
+
+    /**
      * wg-quick profile for the embedded backend.
      *
      * MTU 1280 is not negotiable: WARP's tunnel refuses larger inner packets. AllowedIPs
@@ -281,9 +364,24 @@ public final class ColgramWarp {
                 String k = cfg.getJSONArray("peers").getJSONObject(0).optString("public_key", "");
                 if (!k.isEmpty()) peerKey = k;
             }
+            // A relay terminates the handshake itself, so BOTH the peer key and the endpoint are
+            // the relay's. Sending Cloudflare's key to a relay that does not own it fails the
+            // handshake for a reason that looks exactly like a dead WARP.
+            String host = endpointHost;
+            int portNumber = endpointPort;
+            String relayKey = relayPublicKey();
+            if (relayKey != null && !relayKey.isEmpty() && relayAddress() != null) {
+                peerKey = relayKey;
+                host = relayAddress();
+                portNumber = relayPort();
+            }
+            String preshared = relayPresharedKey();
+            if (preshared != null && !preshared.isEmpty()) {
+                sb.append("PresharedKey = ").append(preshared).append('\n');
+            }
             sb.append("PublicKey = ").append(peerKey).append('\n');
             sb.append("AllowedIPs = 0.0.0.0/0, ::/0\n");
-            sb.append("Endpoint = ").append(endpointHost).append(':').append(endpointPort).append('\n');
+            sb.append("Endpoint = ").append(host).append(':').append(portNumber).append('\n');
             sb.append("PersistentKeepalive = 25\n");
             return sb.toString();
         } catch (Throwable t) {
