@@ -360,61 +360,6 @@ public final class ColgramWarp {
     }
 
     /**
-     * wg-quick profile for the embedded backend.
-     *
-     * MTU 1280 is not negotiable: WARP's tunnel refuses larger inner packets. AllowedIPs
-     * default to the full table (a WARP route IS a full-device route); the caller may pass a
-     * narrower set later if a split-tunnel mode ever becomes a thing.
-     */
-    public static String buildWgQuickConf(String endpointHost, int endpointPort) {
-        String priv = getPrivateKey();
-        if (priv == null) return null;
-        String reg = getRegistration();
-        if (reg == null) return null;
-        try {
-            JSONObject cfg = new JSONObject(reg).getJSONObject("config");
-            JSONObject addrs = cfg.getJSONObject("interface").getJSONObject("addresses");
-            StringBuilder sb = new StringBuilder();
-            sb.append("[Interface]\n");
-            sb.append("PrivateKey = ").append(priv).append('\n');
-            sb.append("Address = ").append(addrs.optString("v4", "")).append("/32\n");
-            String v6 = addrs.optString("v6", "");
-            if (!v6.isEmpty()) sb.append("Address = ").append(v6).append("/128\n");
-            sb.append("DNS = 1.1.1.1, 1.0.0.1\n");
-            sb.append("MTU = 1280\n");
-            sb.append("[Peer]\n");
-            String peerKey = WARP_PEER_PUBLIC_KEY;
-            if (cfg.optJSONArray("peers") != null && cfg.getJSONArray("peers").length() > 0) {
-                String k = cfg.getJSONArray("peers").getJSONObject(0).optString("public_key", "");
-                if (!k.isEmpty()) peerKey = k;
-            }
-            // A relay terminates the handshake itself, so BOTH the peer key and the endpoint are
-            // the relay's. Sending Cloudflare's key to a relay that does not own it fails the
-            // handshake for a reason that looks exactly like a dead WARP.
-            String host = endpointHost;
-            int portNumber = endpointPort;
-            String relayKey = relayPublicKey();
-            if (relayKey != null && !relayKey.isEmpty() && relayAddress() != null) {
-                peerKey = relayKey;
-                host = relayAddress();
-                portNumber = relayPort();
-            }
-            String preshared = relayPresharedKey();
-            if (preshared != null && !preshared.isEmpty()) {
-                sb.append("PresharedKey = ").append(preshared).append('\n');
-            }
-            sb.append("PublicKey = ").append(peerKey).append('\n');
-            sb.append("AllowedIPs = 0.0.0.0/0, ::/0\n");
-            sb.append("Endpoint = ").append(host).append(':').append(portNumber).append('\n');
-            sb.append("PersistentKeepalive = 25\n");
-            return sb.toString();
-        } catch (Throwable t) {
-            Log.w(TAG, "cannot build WARP profile: " + t.getMessage());
-            return null;
-        }
-    }
-
-    /**
      * X25519 (RFC 7748) on BigInteger.
      *
      * Why not java.security: "X25519" KeyAgreement only exists on API 33+, and Conscrypt's

@@ -86,14 +86,28 @@ public final class ColgramWarpTunnel {
         if (addresses == null || addresses.trim().isEmpty()) {
             throw new Exception("нет адреса WARP");
         }
-        String host = ColgramWarp.endpointHost();
+        // A relay, when one is configured, REPLACES Cloudflare's ingress rather than sitting in
+        // front of it. The settings row already says "через релей" for a configured relay, so a
+        // profile that quietly dialled Cloudflare anyway would be the app disagreeing with its own
+        // UI - and the user would have no way to tell which one was true.
+        String host = relayEndpoint();
         if (host == null || host.trim().isEmpty()) {
             throw new Exception("нет адреса сервера WARP");
         }
+        boolean viaRelay = ColgramWarp.hasRelay();
+        int port = viaRelay ? ColgramWarp.relayPort() : ColgramWarp.currentEndpointPort();
         String[] parts = addresses.split(",");
         return ColgramWarpProfileBuilder.build(priv, parts[0].trim(),
                 parts.length > 1 ? parts[1].trim() : null,
-                ColgramWarp.reservedHex(), host, ColgramWarp.currentEndpointPort(), null);
+                ColgramWarp.reservedHex(), host, port, null,
+                viaRelay ? ColgramWarp.relayPublicKey() : null,
+                viaRelay ? ColgramWarp.relayPresharedKey() : null);
+    }
+
+    /** The relay's address when one is configured, otherwise Cloudflare's own ingress. */
+    private static String relayEndpoint() {
+        String relay = ColgramWarp.relayAddress();
+        return relay != null && !relay.trim().isEmpty() ? relay : ColgramWarp.endpointHost();
     }
 
     /** The same profile on the next advertised port, for rotation. */
@@ -103,10 +117,15 @@ public final class ColgramWarpTunnel {
             String addresses = ColgramWarp.interfaceAddresses();
             if (priv == null || addresses == null || addresses.trim().isEmpty()) return null;
             String[] parts = addresses.split(",");
+            // A relay has one fixed port, so rotating Cloudflare's ports through it would only
+            // produce profiles that cannot connect. The relay path is left alone.
+            boolean viaRelay = ColgramWarp.hasRelay();
             return ColgramWarpProfileBuilder.build(priv, parts[0].trim(),
                     parts.length > 1 ? parts[1].trim() : null,
-                    ColgramWarp.reservedHex(), ColgramWarp.endpointHost(),
-                    ColgramWarp.nextEndpointPort(), null);
+                    ColgramWarp.reservedHex(), relayEndpoint(),
+                    viaRelay ? ColgramWarp.relayPort() : ColgramWarp.nextEndpointPort(), null,
+                    viaRelay ? ColgramWarp.relayPublicKey() : null,
+                    viaRelay ? ColgramWarp.relayPresharedKey() : null);
         } catch (Throwable t) {
             Log.w(TAG, "cannot build the next WARP profile: " + t.getMessage());
             return null;
@@ -227,7 +246,10 @@ public final class ColgramWarpTunnel {
         rotating = true;
         Thread w = new Thread(() -> {
             int failedEndpoints = 0;
-            int endpointCount = ColgramWarp.endpointPortCount();
+            // A relay has a single fixed endpoint, so there is nothing to rotate through: the
+            // budget is one, and a silent relay is reported as itself rather than as four failed
+            // Cloudflare ports that were never dialled.
+            int endpointCount = ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount();
             try {
                 while (up && failedEndpoints < endpointCount) {
                     Thread.sleep(STALE_AFTER_SECS * 1000L);

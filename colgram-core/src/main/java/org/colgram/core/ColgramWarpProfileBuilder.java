@@ -39,6 +39,23 @@ public final class ColgramWarpProfileBuilder {
      */
     public static String build(String privateKey, String addressV4, String addressV6,
                                String reserved, String host, int port, String peerKey) {
+        return build(privateKey, addressV4, addressV6, reserved, host, port, peerKey, null, null);
+    }
+
+    /**
+     * Build the profile, optionally through a relay.
+     *
+     * A relay terminates the WireGuard handshake itself, so BOTH the peer key and the endpoint
+     * become the relay's. Pointing Cloudflare's key at a relay that does not own it fails in a way
+     * that is indistinguishable from a dead WARP, which is how a working relay gets blamed for not
+     * working - so the key is swapped together with the address, never on its own.
+     *
+     * @param relayKey    the relay's own WireGuard public key, or null to go to Cloudflare direct
+     * @param presharedKey the relay's preshared key, or null
+     */
+    public static String build(String privateKey, String addressV4, String addressV6,
+                               String reserved, String host, int port, String peerKey,
+                               String relayKey, String presharedKey) {
         if (privateKey == null || privateKey.trim().isEmpty()) {
             throw new IllegalArgumentException("нет ключа WARP");
         }
@@ -50,6 +67,12 @@ public final class ColgramWarpProfileBuilder {
         }
         String peer = peerKey == null || peerKey.trim().isEmpty()
                 ? ColgramWarp.WARP_PEER_PUBLIC_KEY : peerKey.trim();
+        String endpoint = host.trim();
+        int endpointPort = port;
+        if (relayKey != null && !relayKey.trim().isEmpty()) {
+            // The relay owns the handshake, so its key is the one the peer must be pinned to.
+            peer = relayKey.trim();
+        }
         try {
             JSONArray local = new JSONArray().put(addressV4.trim() + "/32");
             if (addressV6 != null && !addressV6.trim().isEmpty()) {
@@ -60,8 +83,8 @@ public final class ColgramWarpProfileBuilder {
             // itself, and precisely: `outbounds[0].server: json: unknown field "server"`.
             // Measured on the device against sing-box 1.14.2, where the flat shape was removed.
             JSONObject peerObject = new JSONObject()
-                    .put("address", host.trim())
-                    .put("port", port)
+                    .put("address", endpoint)
+                    .put("port", endpointPort)
                     .put("public_key", peer)
                     // A WARP route is a full-device route. Without this the tunnel comes up and
                     // routes nothing, which is indistinguishable from a dead subscription.
@@ -74,6 +97,9 @@ public final class ColgramWarpProfileBuilder {
                 // that times out, which looks exactly like a blocked network rather than a
                 // misconfigured identity.
                 peerObject.put("reserved", reservedField);
+            }
+            if (presharedKey != null && !presharedKey.trim().isEmpty()) {
+                peerObject.put("pre_shared_key", presharedKey.trim());
             }
 
             // A WireGuard ENDPOINT, not a WireGuard outbound. The outbound was deprecated in

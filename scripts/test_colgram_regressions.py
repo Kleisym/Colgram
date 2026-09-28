@@ -1009,17 +1009,24 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("editor.remove(KEY_RELAY_ADDRESS)", warp)
         self.assertIn("portCache = null;", warp)
 
-        profile = warp.split("public static String buildWgQuickConf", 1)[1].split("public static final class X25519", 1)[0]
-        self.assertIn("String relayKey = relayPublicKey();", profile)
-        self.assertIn("if (relayKey != null && !relayKey.isEmpty() && relayAddress() != null) {", profile)
-        self.assertIn("peerKey = relayKey;", profile)
-        self.assertIn("host = relayAddress();", profile)
-        self.assertIn("portNumber = relayPort();", profile)
-        # The endpoint that reaches the wire is the one that was just chosen.
-        self.assertIn('sb.append("Endpoint = ").append(host).append(\':\').append(portNumber)', profile)
-        self.assertIn('sb.append("PresharedKey = ")', profile)
+        # The relay now has to reach the profile the engine actually starts, not a wg-quick text
+        # left over from when WARP ran on the WireGuard backend. Storage and the settings row were
+        # already in place; the profile was the half that never got moved.
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        builder = (core / "ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        tunnel = (core / "ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        self.assertNotIn("buildWgQuickConf", warp,
+                         "the wg-quick builder is dead now that WARP is a sing-box profile, and "
+                         "leaving it invites someone to wire the relay back into it")
+        # Both halves of the swap travel together: the endpoint AND the peer key.
+        self.assertIn("peer = relayKey.trim();", builder)
+        self.assertIn("relayKey, String presharedKey", builder)
+        self.assertIn('pre_shared_key', builder)
+        self.assertIn("ColgramWarp.relayAddress()", tunnel)
+        self.assertIn("ColgramWarp.relayPort()", tunnel)
+        self.assertIn("ColgramWarp.relayPublicKey()", tunnel)
         # And without a relay the direct path is untouched.
-        self.assertIn("String peerKey = WARP_PEER_PUBLIC_KEY;", profile)
+        self.assertIn("ColgramWarp.WARP_PEER_PUBLIC_KEY", builder)
     def test_call_proxying_only_ever_applies_to_a_plain_proxy(self):
         """Documented so it is not mistaken for a bug: calls cannot use an MTProto proxy.
 
@@ -1192,7 +1199,7 @@ public final class DialogRefreshSequencerHarness {
         tunnel = WARP_TUNNEL.read_text(encoding="utf-8")
         manager = PROXY.read_text(encoding="utf-8")
         self.assertIn("private static final int STALE_AFTER_SECS = 8;", tunnel)
-        self.assertIn("int endpointCount = ColgramWarp.endpointPortCount();", tunnel)
+        self.assertIn("ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
         self.assertIn("while (up && failedEndpoints < endpointCount)", tunnel)
         self.assertIn("if (failedEndpoints >= endpointCount) break;", tunnel)
         self.assertIn("if (up && failedEndpoints >= endpointCount)", tunnel)
@@ -1312,6 +1319,32 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("isBackendAvailable", tunnel,
                       "the tunnel still has to report the backend is gone, so the settings row "
                       "can name the real reason instead of timing out silently")
+
+    def test_a_configured_relay_reaches_the_profile_the_engine_runs(self):
+        """The settings row says "через релей"; the profile has to agree with it.
+
+        WARP moved from the WireGuard backend to a sing-box profile, and the relay switch moved
+        with it in storage and in the UI but not in the profile: a configured relay was read by the
+        settings row and then ignored when the tunnel was built, so the app reported a relay it was
+        not using. On a network where every Cloudflare ingress is dark the relay is the only route
+        that can work, so this is the difference between a reachable tunnel and a dead one.
+        """
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        builder = (core / "ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        tunnel = (core / "ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        # The relay key must replace the peer key, never sit beside it: a relay terminates the
+        # handshake, so Cloudflare's key against a relay that does not own it fails exactly like
+        # a dead WARP, which is how a working relay gets blamed for not working.
+        self.assertIn("relayKey", builder)
+        self.assertIn("pre_shared_key", builder)
+        # The tunnel must actually consult the configured relay rather than always dialling
+        # Cloudflare's own ingress.
+        self.assertIn("ColgramWarp.hasRelay()", tunnel)
+        self.assertIn("ColgramWarp.relayAddress()", tunnel)
+        self.assertIn("ColgramWarp.relayPublicKey()", tunnel)
+        # A relay has one fixed port, so rotating Cloudflare's ports through it would only build
+        # profiles that cannot connect.
+        self.assertIn("ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
 
     def test_the_singbox_device_tests_are_mirrored_like_the_rest(self):
         """Three engine tests existed only in the ignored tree, so a clone lost them.

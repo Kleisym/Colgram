@@ -127,4 +127,50 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
                     expected.getMessage().contains("сервера"));
         }
     }
+
+    @Test
+    public void aConfiguredRelayActuallyReplacesCloudflaresIngress() throws Exception {
+        // The settings row says "через релей" for a configured relay, so a profile that quietly
+        // dialled Cloudflare anyway would be the app disagreeing with its own UI. A relay also
+        // TERMINATES the handshake, so its own key has to be pinned to the peer: sending
+        // Cloudflare's key to a relay that does not own it fails exactly like a dead WARP, which
+        // is how a working relay gets blamed for not working.
+        String direct = org.colgram.core.ColgramWarpProfileBuilder.build(
+                KEY, "172.16.0.2", null, "2a2a2a", "engage.cloudflareclient.com", 2408, null);
+        String viaRelay = org.colgram.core.ColgramWarpProfileBuilder.build(
+                KEY, "172.16.0.2", null, "2a2a2a", "relay.example.net", 51820, null,
+                "aRelayOwnedPublicKey0000000000000000000=", "psk");
+
+        assertTrue("a relay must become the endpoint, or the profile ignores the setting",
+                viaRelay.contains("relay.example.net"));
+        assertTrue("Cloudflare's ingress must not survive into a relayed profile",
+                !viaRelay.contains("engage.cloudflareclient.com"));
+        assertTrue("the relay's own key must be pinned to the peer",
+                viaRelay.contains("aRelayOwnedPublicKey0000000000000000000="));
+        assertTrue("the relay's preshared key must travel with the profile",
+                viaRelay.contains("pre_shared_key"));
+        // And the direct path must still be Cloudflare, or the relay would be the only route.
+        assertTrue("without a relay the profile must still dial Cloudflare directly",
+                direct.contains("engage.cloudflareclient.com"));
+    }
+
+    @Test
+    public void aRelayedProfileIsOneTheEngineStillAccepts() throws Exception {
+        // The relay fields are new to the profile, so the engine gets the final word rather than
+        // a comment claiming the shape is valid.
+        System.loadLibrary("box");
+        Method checkConfig = Class.forName("io.nekohasekai.libbox.Libbox")
+                .getMethod("checkConfig", String.class);
+        String profile = org.colgram.core.ColgramWarpProfileBuilder.build(
+                KEY, "172.16.0.2", null, "2a2a2a", "relay.example.net", 51820, null,
+                "aRelayOwnedPublicKey0000000000000000000=", null);
+        try {
+            checkConfig.invoke(null, profile);
+            Log.i(TAG, "the engine accepted a relayed WARP profile");
+        } catch (Throwable rejected) {
+            Throwable cause = rejected.getCause() != null ? rejected.getCause() : rejected;
+            throw new AssertionError("the engine refused a relayed WARP profile: " + cause
+                    + "\nprofile was: " + profile, cause);
+        }
+    }
 }
