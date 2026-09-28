@@ -3,7 +3,7 @@
 Everything below was measured from the device or the app, not inferred. A verdict here means a
 measurement produced it; a claim without one is marked as such.
 
-## The block is external, and port-specific
+## The block is external, and no Cloudflare UDP service answers
 
 Measured on the device, and re-measured from the host on the same network:
 
@@ -96,7 +96,14 @@ answered 1, silent 15        # the one answer is 443
 a WireGuard handshake, so this narrows the diagnosis without opening a route. It does mean the
 relay conclusion survives a sharper test than the one it was originally based on.
 
-### It is a UDP port allowlist, not a WireGuard block
+### It looked like a UDP port allowlist, and the allowlist did not survive
+
+**This section's conclusion was wrong and is kept because the way it was wrong is the useful part.**
+The "ANSWERED" markers below were the same 31-byte stateless resets described above, produced by a
+probe that sent 1200 zero bytes and counted any reply as a service. A real QUIC Initial on the same
+ports scores 0 of 8. So the allowlist reading is withdrawn: 443 is not an open service here, it is a
+path that answers packets it cannot read. The measurements themselves are real; what they were
+taken to mean was not.
 
 The port-specific result has two possible readings, and they call for opposite conclusions:
 
@@ -125,8 +132,8 @@ Thirteen ports from 53 to 55535 on one Cloudflare address, and the only answer i
 silent on hosts that **do not run WireGuard**, so the silence follows the port, not the protocol or
 the owner.
 
-**What this settles.** This network allows a small allowlist of UDP ports - DNS and HTTPS/3 - and
-filters everything else. WARP's 2408 is outside that allowlist on every host tested, so it cannot
+**What this settles.** This network carries DNS over UDP and filters everything else, and no
+Cloudflare UDP service answers on any port tested. WARP's 2408 is outside what is carried, so it cannot
 be reached directly, and no client-side transport moves a datagram onto a port that is filtered.
 Wrapping WireGuard in QUIC or TLS does not help, because the wrapper would still have to arrive on
 2408.
