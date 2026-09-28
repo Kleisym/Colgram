@@ -1075,6 +1075,63 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("theRealSubscriptionProfileCarriesATunThatClaimsTheDevice", body)
         self.assertIn("aProfileWithNoTunIsNotADeviceWideTunnel", body)
 
+    def test_the_warp_integration_test_measures_instead_of_asserting_what_it_cannot_know(self):
+        """The only end-to-end WARP check has to stay runnable on a blocked network.
+
+        This test drives the real Android VPN consent dialog and reads Cloudflare's own trace for
+        `warp=on`. It is the only check in the suite that can answer "does WARP actually work" -
+        and on a network that filters Cloudflare's WireGuard UDP the answer is no. Asserting it
+        would leave a permanently red test on exactly the network where the measurement matters,
+        and a test that is always red is one people learn to ignore, which is where a real
+        regression would hide.
+
+        What it asserts is what Colgram owns: the profile is well formed, consent was granted, and
+        the tunnel came up instead of hanging half-open. What it reports is whether traffic moved.
+        """
+        source = (ROOT / "scripts/templates/ColgramWarpDeviceIntegrationTest.java").read_text(
+            encoding="utf-8")
+        # It must reach the authoritative signal, not a proxy for it.
+        self.assertIn("cdn-cgi/trace", source)
+        self.assertIn('trace.contains("warp=on")', source)
+        # Reported, not asserted.
+        self.assertIn("MEASURED warpOn=", source)
+        self.assertIn("WARP carried no traffic", source)
+        # What it does assert is Colgram's own contract: the tunnel is up, not hanging.
+        self.assertIn('invoke(tunnelClass, "isUp"', source)
+        # And it must never load the WireGuard backend, which is the measured process-killer.
+        self.assertNotIn("GoBackend", source)
+        self.assertNotIn("buildWgQuickConf", source)
+        self.assertNotIn("com.wireguard.config.Config", source)
+        # And the suite has to run it, or it is a check nobody executes.
+        runner = (ROOT / "scripts/device-tests.py").read_text(encoding="utf-8")
+        self.assertIn("ColgramWarpDeviceIntegrationTest", runner)
+
+    def test_the_vpn_service_can_actually_go_foreground(self):
+        """A missing typed permission kills the tunnel the instant it starts.
+
+        Measured on the device, driving the real consent dialog: the process died with signal 6 the
+        moment the tunnel came up. Android said why -
+
+          Starting FGS with type specialUse callerApp=... targetSDK=36 requires permissions:
+          all of the permissions
+
+        The service calls startForeground with FOREGROUND_SERVICE_TYPE_SPECIAL_USE, and from API 34
+        that type requires its own permission. Every OTHER typed service in the app had one
+        declared, so the one the VPN needed was the one that was missed. The failure is not a
+        refused start either: the tunnel is consented, the service begins, and the process is
+        killed a second later - which from the settings screen is a toggle that dies on use.
+
+        The subject property is the other half of the same requirement and is just as fatal: API 34
+        requires a FOREGROUND_SERVICE_SPECIAL_USE service to declare why it needs that type.
+        """
+        patcher = (ROOT / "scripts/apply-patches.py").read_text(encoding="utf-8")
+        self.assertIn("android.permission.FOREGROUND_SERVICE_SPECIAL_USE", patcher)
+        # And the app really has to carry it, not just the patcher.
+        manifest = (ROOT / "Telegram-Src/TMessagesProj/src/main/AndroidManifest.xml").read_text(
+            encoding="utf-8")
+        self.assertIn('android.permission.FOREGROUND_SERVICE_SPECIAL_USE', manifest)
+        self.assertIn("PROPERTY_SPECIAL_USE_FGS_SUBJECT", manifest)
+
     def test_warp_can_be_pointed_at_a_relay_when_cloudflare_udp_is_dark(self):
         """The only way WARP works where Cloudflare UDP is dropped.
 

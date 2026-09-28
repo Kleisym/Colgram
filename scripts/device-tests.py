@@ -43,6 +43,7 @@ DEVICE_TESTS = [
     "org.colgram.core.ColgramThemeContrastDeviceTest",
     "org.colgram.core.ColgramUdpAssociateDeviceTest",
     "org.colgram.core.ColgramWarpChurnDeviceTest",
+    "org.colgram.core.ColgramWarpDeviceIntegrationTest",
     "org.colgram.core.ColgramWarpUdpReachabilityDeviceTest",
 ]
 

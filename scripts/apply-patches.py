@@ -6505,6 +6505,14 @@ def configure_package_and_branding(repo_path):
             # A foreground service needs both the base permission and, from API 34, a typed one.
             "android.permission.FOREGROUND_SERVICE",
             "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+            # The VPN service calls startForeground with FOREGROUND_SERVICE_TYPE_SPECIAL_USE, and
+            # from API 34 that type requires its own permission. Without it the platform throws
+            # SecurityException and kills the process the moment the tunnel starts - measured on
+            # the device: "Starting FGS with type specialUse callerApp=... targetSDK=36 requires
+            # permissions: all of the permissions". Every other typed service in the app had its
+            # permission declared, so the one the VPN needs was the one that was missed, and the
+            # failure is a dead tunnel rather than a refused start.
+            "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
             # To come back after a reboot.
             "android.permission.RECEIVE_BOOT_COMPLETED",
             # Best-effort: asks to be exempt from Doze so the heartbeat is not deferred.
