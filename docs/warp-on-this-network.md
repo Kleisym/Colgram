@@ -2104,3 +2104,27 @@ the app was still reporting a tunnel that carried nothing.
 The test now waits for `isConnected` and says plainly that a profile naming the relay being handed to
 the engine is not a tunnel - it is a shape.
 
+### The run where the relay had already died
+
+Re-run with the honest `isConnected` and a bare datagram to the relay, this came back:
+
+```
+isUp (the flag) was set: true; isConnected (real bytes from the peer): false
+a bare datagram to the relay: SocketTimeoutException - the device does not reach the relay
+```
+
+And the reason was not the network: the relay process had exited, minutes earlier, because it had
+been started with a bounded lifetime and a build had outlasted it. The device was reporting a
+timeout, the timeout was being read as a path that does not carry, and nothing in the run said
+otherwise.
+
+So the tenth thing this project has had to withdraw arrived in the same shape as the other nine: a
+missing piece of the setup, read as a property of the network. A relay that is not running and a
+network that drops the port are indistinguishable from the far end - which is why the relay now
+prints its peer key at startup, so a test that finds no key says "the relay is not there" rather
+than proceeding to prove that nothing works.
+
+With a live relay the same test is meaningful, and what it measures is the thing nine byte-level and
+protocol-level checks could not: whether the shipping engine, handed a profile naming a relay,
+actually sends anything.
+
