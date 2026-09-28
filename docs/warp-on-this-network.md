@@ -473,6 +473,44 @@ relay polls every 500 ms, so the delay should be small - but a relay that dies b
 and the reply, as one did, produces exactly this signature, and separating the two takes a run where
 the relay stays up.
 
+## …and it is measured now: a real handshake crossed from the phone through the relay
+
+That row is closed. On the device, against a relay on this host with a real WireGuard responder
+behind it:
+
+```
+the device reached 10.0.2.2:51823 over UDP - 13B came back
+a 148-byte message-initiation crossed to the relay and a message-response came back
+```
+
+**Every link in the chain, from the phone, measured individually:**
+
+| Link | Evidence |
+|---|---|
+| device -> relay port, UDP | the relay logs the 1200-byte marker and the 148-byte initiation |
+| relay -> device, bare probe | `RELAY-OK`, 13 bytes back |
+| relay -> peer | `forwarded to the peer` on the same run |
+| peer -> relay -> device | **a message-response came back** |
+
+So the client's half of the relay design works from a phone and not only from loopback, and the
+remaining gap is the one it has always been: the far side's own UDP egress to Cloudflare.
+
+### Four bugs this took, all of which read as a network failure
+
+The path was open for most of this. What was broken was the measurement of it, four times:
+
+| Bug | What it produced |
+|---|---|
+| the relay never answered a bare probe | a client waiting for reachability concluded the port was unreachable |
+| the peer's queue was drained right after the forward, when the reply takes ~14 ms to exist | a forwarded packet, zero handshakes at the peer, and no answer |
+| the peer's ephemeral was 16 arbitrary bytes | `Error computing shared key` killed the peer's thread; the relay stayed up and silent |
+| the test's own type byte was written and then overwritten by `nextBytes` | the relay read the handshake as a probe and answered `RELAY-OK` where a message-response was expected |
+
+The last one is the sharpest, and it is the same shape as everything else in this file: a packet
+that is the right size, well-formed, and wrong in one byte. A failure whose text says
+`0x52 rather than a message-response, so a handshake-sized packet did not survive the hop intact`
+is about a line of ordering in a test, and it took a log of the relay's own view to see it.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
