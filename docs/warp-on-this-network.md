@@ -1968,3 +1968,30 @@ the first time the missing control was noticed by the test that needed it rather
 number afterwards. The right response is to re-run until the control answers, not to report either
 the three silences or the control's silence as a finding.
 
+### Re-run: the control answers, and the answer is the result
+
+One minute later, the same probe on the same device:
+
+```
+142.250.74.174:443  silent   Google - a real QUIC deployment on udp/443
+104.16.132.229:443  silent   Cloudflare - the same edge that answers h2 on tcp/443
+157.240.1.35:443     silent   Facebook - a real QUIC deployment on udp/443
+control  1.1.1.1:53  18B     a resolver that always answers
+```
+
+**The control answers, so the three silences mean something.** This is the same device test that
+reported the control as silent a minute earlier, with no code change between the two runs - which is
+the filter's behaviour moving on a scale of minutes, the same instability this file recorded at the
+start and has to keep accounting for.
+
+So the measured result, on the device, with a control inside the same run and a QUIC Initial that
+the RFC 9001 vector says is correct:
+
+> **A correctly protected QUIC Initial is not answered by any of three hosts that are known to serve
+> it, while a DNS query to the same socket gets 18 bytes back.** A QUIC server cannot ignore a valid
+> Initial, so this is about the path.
+
+Both halves of the project now rest on measurements that could have succeeded and did not, which is
+the only kind this file has ever been able to distinguish from a null result: the aioquic client on
+the host, and a real Initial on a device with no tunnel of its own. QUIC does not complete here.
+
