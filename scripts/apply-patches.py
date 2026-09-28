@@ -5719,6 +5719,36 @@ def inject_warp_device_test_support(repo_path, root_dir):
     print(" [+] Account-free WARP integration test and debug-only consent host are synced")
 
 
+def inject_singbox_device_test_support(repo_path, root_dir):
+    """Mirror the org.colgram.singbox device tests into the generated test tree.
+
+    Telegram-Src/ is gitignored, so anything that only exists there is gone on the next clone
+    - and the tests that disappeared first were the ones that check the embedded engine accepts
+    a profile and reaches a tunnel. That is the same reason the org.colgram.core tests are
+    mirrored; these are the sing-box half of that set.
+    """
+    module_dir = os.path.join(repo_path, "TMessagesProj_AppTests")
+    if not os.path.isdir(module_dir):
+        print(" [=] TMessagesProj_AppTests missing; skipping sing-box device-test wiring")
+        return
+
+    template_dir = os.path.join(root_dir, "scripts", "templates")
+    destination_dir = os.path.join(
+        module_dir, "src", "androidTest", "java", "org", "colgram", "singbox")
+    for name in ("ColgramProfileDeviceTest.java",
+                 "ColgramSubscriptionStoreDeviceTest.java",
+                 "ColgramTunnelDeviceTest.java",
+                 "ColgramWarpSingleRuntimeDeviceTest.java"):
+        source = os.path.join(template_dir, name)
+        if not os.path.isfile(source):
+            PATCH_MISSES.append("sing-box device-test template " + name)
+            print(" [!] FATAL: sing-box device-test template is missing: " + name)
+            continue
+        os.makedirs(destination_dir, exist_ok=True)
+        shutil.copy2(source, os.path.join(destination_dir, name))
+    print(" [+] sing-box device tests are mirrored from tracked templates")
+
+
 def download_official_binaries(repo_path):
     print("[*] Setting up precompiled official native libraries...")
     apk_url = "https://telegram.org/dl/android/apk"
@@ -6761,6 +6791,7 @@ def main():
     )
     sync_singbox_module(target_repo, root_dir)
     inject_warp_device_test_support(target_repo, root_dir)
+    inject_singbox_device_test_support(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)

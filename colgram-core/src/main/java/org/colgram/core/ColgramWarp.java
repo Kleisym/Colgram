@@ -204,6 +204,30 @@ public final class ColgramWarp {
         return sb.toString();
     }
 
+    /**
+     * The interface addresses Cloudflare assigned, as "v4,v6" without prefix lengths.
+     *
+     * The engine's WireGuard endpoint takes these itself, so the profile builder needs them
+     * separately from the wg-quick text: the endpoint adds the /32 and /128 that the quick
+     * format would have spelled out, and getting that wrong is a config the engine refuses.
+     */
+    public static String interfaceAddresses() {
+        String reg = getRegistration();
+        if (reg == null || reg.isEmpty()) return null;
+        try {
+            JSONObject addrs = new JSONObject(reg).getJSONObject("config")
+                    .getJSONObject("interface").getJSONObject("addresses");
+            String v4 = addrs.optString("v4", "").trim();
+            String v6 = addrs.optString("v6", "").trim();
+            if (v4.isEmpty() && v6.isEmpty()) return null;
+            if (v6.isEmpty()) return v4;
+            if (v4.isEmpty()) return "" + v6;
+            return v4 + "," + v6;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** Cloudflare places this 24-bit client identifier in WireGuard's reserved header bytes. */
     public static byte[] reservedBytes() {
         String reg = getRegistration();

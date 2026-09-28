@@ -1181,7 +1181,11 @@ public final class DialogRefreshSequencerHarness {
         active_sender = (active_wireguard / "send.go").read_text(encoding="utf-8")
         self.assertIn('msg.Type = device.messageType(MessageResponseType)', active_noise)
         self.assertIn('reply.Type = device.messageType(MessageCookieReplyType)', active_sender)
-        self.assertIn('setClientReserved', tunnel)
+        # The client id now travels in the engine's profile rather than through the backend's
+        # UAPI line: the reserved bytes are part of the WireGuard endpoint Colgram builds, so the
+        # backend is no longer in the path at all. The vendor patches stay pinned above, because
+        # a future bump of that artifact must still carry the reserved-byte support.
+        self.assertIn('ColgramWarp.reservedHex()', tunnel)
         self.assertIn("clientReservedUapiLine + config.toWgUserspaceString()", go_backend)
 
     def test_stalled_warp_has_a_finite_retry_budget_and_clears_selected_route(self):
@@ -1193,7 +1197,7 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("if (failedEndpoints >= endpointCount) break;", tunnel)
         self.assertIn("if (up && failedEndpoints >= endpointCount)", tunnel)
         self.assertIn("distinct endpoint attempts", tunnel)
-        self.assertIn('if (conf == null) {', tunnel)
+        self.assertIn('if (next == null) {', tunnel)
         self.assertIn('disableStalledTunnel(ctx, "endpoint watchdog failed")', tunnel)
         self.assertIn("private static void disableStalledTunnel(Context ctx, String reason)", tunnel)
         self.assertIn("ColgramConfig.setWarpEnabled(false);", tunnel)
@@ -1245,6 +1249,82 @@ public final class DialogRefreshSequencerHarness {
                      "ColgramProxyAutonomyDeviceTest.java",
                      "ColgramWarpChurnDeviceTest.java",
                      "ColgramWarpUdpReachabilityDeviceTest.java"):
+            template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
+            self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")
+            self.assertEqual(template, (installed / name).read_text(encoding="utf-8"),
+                             name + " has drifted from its tracked template")
+            self.assertIn("@RunWith(AndroidJUnit4.class)", template)
+
+    def test_the_engine_object_is_released_and_not_left_to_the_finalizer(self):
+        """A leaked CommandServer segfaults the process on the next engine call.
+
+        Measured on the device: the full suite ended in `Process 48424 exited due to signal 11`
+        inside Libbox.checkConfig, 24ms after the call started, where the same call on a clean
+        process takes 1.4s and succeeds. No tombstone, no Java stack. The cause is that
+        closeService() stops the tunnel but leaves the Go object alive; gomobile tracks it with a
+        phantom reference, so the GoRefQueue finalizer thread eventually calls Seq.destroyRef on
+        a native object that is already gone and walks freed memory. The test that constructs a
+        CommandServer had the same leak, which is why the crash only appeared once that test
+        ran before the profile test.
+        """
+        service = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                   "/ColgramVpnService.java").read_text(encoding="utf-8")
+        teardown = service.split("private void tearDown()", 1)[1].split("public void onDestroy", 1)[0]
+        self.assertIn("server.closeService()", teardown)
+        self.assertIn("server.close()", teardown,
+                      "tearDown must release the CommandServer itself; leaving it to the "
+                      "finalizer is what segfaults the process on the next engine call")
+        # And the tunnel test that proved it must not leave one behind either.
+        tunnel = (ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram"
+                  "/singbox/ColgramTunnelDeviceTest.java").read_text(encoding="utf-8")
+        self.assertIn('getMethod("close")', tunnel,
+                      "the tunnel test constructs a CommandServer and must release it too")
+
+    def test_warp_does_not_embed_a_second_go_runtime(self):
+        """Two cgo Go runtimes in one process segfault the app; measured, not assumed.
+
+        WARP was driven by the embedded WireGuard Android backend (libwg-go.so) while the
+        subscription ran on sing-box (libbox.so). Loading the WARP backend and then calling
+        Libbox.checkConfig killed the instrumentation process with signal 11 in about a second -
+        no Java exception, no tombstone, no stack - and either runtime alone was fine, which is
+        why it only ever showed up in the full suite. WARP is now a profile the same engine
+        starts, so the second runtime is gone rather than merely unloaded.
+        """
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        builder = (core / "ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        # The endpoint form, which is what this engine version accepts. The outbound was removed
+        # in sing-box 1.13.0 and the engine says so by name when given one.
+        self.assertIn('endpoints', builder)
+        self.assertIn('wireguard', builder)
+        # A WARP route is a full-device route, and the Cloudflare client id rides in WireGuard's
+        # three reserved bytes. Both fail silently when missing: a tunnel that routes nothing, and
+        # a handshake that times out looking exactly like a blocked network.
+        self.assertIn("0.0.0.0/0", builder)
+        self.assertIn("reserved", builder)
+        # Nothing may reintroduce the WireGuard backend that caused the crash. The check is on
+        # code, not on the file: the class comment deliberately names what it replaced, and a
+        # blanket text search would fail on the very explanation of the bug.
+        code = builder.split("public final class", 1)[-1]
+        self.assertNotIn("GoBackend", code)
+        self.assertNotIn("libwg-go", code)
+        self.assertNotIn("System.loadLibrary", code)
+        tunnel = (core / "ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        self.assertIn("isBackendAvailable", tunnel,
+                      "the tunnel still has to report the backend is gone, so the settings row "
+                      "can name the real reason instead of timing out silently")
+
+    def test_the_singbox_device_tests_are_mirrored_like_the_rest(self):
+        """Three engine tests existed only in the ignored tree, so a clone lost them.
+
+        The mirroring test above covers org.colgram.core. The org.colgram.singbox tests were
+        never mirrored, and those are the ones that check the engine actually accepts a profile
+        and actually starts a tunnel - exactly the tests that would notice a regression here.
+        """
+        installed = ROOT / "Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram/singbox"
+        for name in ("ColgramProfileDeviceTest.java",
+                     "ColgramSubscriptionStoreDeviceTest.java",
+                     "ColgramTunnelDeviceTest.java",
+                     "ColgramWarpSingleRuntimeDeviceTest.java"):
             template = (ROOT / "scripts/templates" / name).read_text(encoding="utf-8")
             self.assertTrue((installed / name).exists(), name + " is not installed into the test tree")
             self.assertEqual(template, (installed / name).read_text(encoding="utf-8"),
@@ -1352,12 +1432,14 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("// A verdict from a previous attempt must never be shown against a fresh one.\n        lastFailure = null;", tunnel)
         self.assertIn("lastFailure = reason;", tunnel)
 
-        # Rotating ports cannot help a route whose datagrams never left, so say so and stop.
-        self.assertIn("MIN_HANDSHAKE_TX_BYTES = 64L;", tunnel)
-        self.assertIn("if (tx < MIN_HANDSHAKE_TX_BYTES) {", tunnel)
-        self.assertIn("no UDP egress: handshake never left the device", tunnel)
-        self.assertIn("not rotating ports", tunnel)
+        # The rotation budget is finite and it names the failure. How liveness is measured changed
+        # - it is a datagram probe now, not the WireGuard backend's receive counter, because asking
+        # the backend would load the second Go runtime and crash the process - but the contract
+        # the user sees did not: a route that carries nothing is named, and the toggle is dropped
+        # rather than left lit.
+        self.assertIn("ColgramWarpEndpointProbe.answers", tunnel)
         self.assertIn("failedEndpoints = endpointCount;", tunnel)
+        self.assertIn("no traffic after ", tunnel)
 
         # Both surfaces report the reason rather than reverting to a bare "off".
         self.assertIn("ColgramWarpTunnel.lastFailureReason()", settings)
@@ -1400,10 +1482,23 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("com\\.wireguard\\.android:tunnel:", patcher)
         self.assertIn("implementation project(':colgram-wireguard')", patcher)
 
-    def test_warp_watchdog_reads_embedded_wireguard_statistics_api(self):
+    def test_warp_watchdog_never_loads_the_wireguard_backend(self):
+        """The watchdog used to poll the backend, which is the crash, not a detail.
+
+        libwg-go.so and libbox.so are each a complete cgo Go runtime; loading both in one Android
+        process segfaults it. The old watchdog read the WireGuard backend's receive counter, so a
+        user who left WARP on long enough for a slow endpoint would crash the app rather than get
+        a verdict. Liveness is now a plain datagram probe, which touches no native tunnel library.
+        """
         tunnel = WARP_TUNNEL.read_text(encoding="utf-8")
+        watchdog = tunnel.split("private static void startEndpointWatchdog", 1)[1].split(
+            "private static void disableStalledTunnel", 1
+        )[0]
+        self.assertNotIn("backend(ctx)", watchdog)
+        self.assertNotIn("GoBackend", watchdog)
+        self.assertIn("ColgramWarpEndpointProbe.answers", watchdog)
+
         stats = WARP_STATS.read_text(encoding="utf-8")
-        self.assertIn("ColgramWarpStatistics.statistics(be, t)", tunnel)
         self.assertIn('"getStatistics"', stats)
         self.assertIn("method.getParameterTypes()[0].isInstance(tunnel)", stats)
         self.assertIn('"totalRx"', stats)

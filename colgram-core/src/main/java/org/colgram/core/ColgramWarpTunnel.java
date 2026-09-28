@@ -70,6 +70,49 @@ public final class ColgramWarpTunnel {
         }
     }
 
+    /**
+     * The WARP profile, in the shape the one remaining engine accepts.
+     *
+     * An endpoint rather than an outbound, because the WireGuard outbound was removed in
+     * sing-box 1.13.0 - the engine states that itself, by name, when given one - and an address
+     * list the endpoint carries itself, because the direct outbound's destination override was
+     * removed at the same time. Both were measured, not read: each one was accepted only after
+     * the engine named the field it refused.
+     */
+    private static String warpProfile() throws Exception {
+        String priv = ColgramWarp.getPrivateKey();
+        if (priv == null) throw new Exception("нет ключа WARP");
+        String addresses = ColgramWarp.interfaceAddresses();
+        if (addresses == null || addresses.trim().isEmpty()) {
+            throw new Exception("нет адреса WARP");
+        }
+        String host = ColgramWarp.endpointHost();
+        if (host == null || host.trim().isEmpty()) {
+            throw new Exception("нет адреса сервера WARP");
+        }
+        String[] parts = addresses.split(",");
+        return ColgramWarpProfileBuilder.build(priv, parts[0].trim(),
+                parts.length > 1 ? parts[1].trim() : null,
+                ColgramWarp.reservedHex(), host, ColgramWarp.currentEndpointPort(), null);
+    }
+
+    /** The same profile on the next advertised port, for rotation. */
+    private static String nextProfile() {
+        try {
+            String priv = ColgramWarp.getPrivateKey();
+            String addresses = ColgramWarp.interfaceAddresses();
+            if (priv == null || addresses == null || addresses.trim().isEmpty()) return null;
+            String[] parts = addresses.split(",");
+            return ColgramWarpProfileBuilder.build(priv, parts[0].trim(),
+                    parts.length > 1 ? parts[1].trim() : null,
+                    ColgramWarp.reservedHex(), ColgramWarp.endpointHost(),
+                    ColgramWarp.nextEndpointPort(), null);
+        } catch (Throwable t) {
+            Log.w(TAG, "cannot build the next WARP profile: " + t.getMessage());
+            return null;
+        }
+    }
+
     private static synchronized Object backend(Context ctx) throws Exception {
         if (backend != null) return backend;
         Class<?> goCls = Class.forName("com.wireguard.android.backend.GoBackend");
@@ -118,32 +161,20 @@ public final class ColgramWarpTunnel {
         // A verdict from a previous attempt must never be shown against a fresh one.
         lastFailure = null;
         if (!ColgramWarp.isRegistered()) throw new Exception("WARP не зарегистрирован");
-        String conf = ColgramWarp.buildWgQuickConf(
-                ColgramWarp.endpointHost(), ColgramWarp.currentEndpointPort());
-        if (conf == null) throw new Exception("профиль WARP не собрался");
-
-        Class<?> configCls = Class.forName("com.wireguard.config.Config");
-        // parse(BufferedReader) - the 1.0.20230706 artifact has no parse(Reader); probing
-        // against the real artifact signature, not the docs.
-        Object profile = configCls.getMethod("parse", java.io.BufferedReader.class)
-                .invoke(null, new java.io.BufferedReader(new StringReader(conf)));
-
-        Object be = backend(ctx);
-        setReservedClientId(be);
-        Object t = ensureTunnel();
-        Class<?> stateCls = Class.forName("com.wireguard.android.backend.Tunnel$State");
-        // Resolve by NAME, not ordinal: the enum is {DOWN, TOGGLE, UP}, and an ordinal guess
-        // of [1] would hand setState the TOGGLE value - bringing the tunnel up by accident.
-        Object upState = stateState(stateCls, "UP");
-        Method setState = be.getClass().getMethod("setState",
-                Class.forName("com.wireguard.android.backend.Tunnel"),
-                stateCls, configCls);
-        setState.invoke(be, t, upState, profile);
+        // WARP is a sing-box profile now, started by the same engine that carries the
+        // subscription. It used to be handed to the embedded WireGuard Android backend, and that
+        // is what segfaulted the app: libwg-go.so and libbox.so are each a complete cgo Go
+        // runtime, and two of them in one Android process do not coexist. Measured on the device:
+        // loading the WireGuard backend and then calling into libbox killed the process with
+        // signal 11 in about a second, with no Java exception, no tombstone and no stack. Either
+        // runtime alone was fine, which is why it only ever appeared in the full device suite -
+        // the one run that loads both. So the second runtime is not merely unloaded; it is gone.
+        String profile = warpProfile();
+        ColgramWarpServiceBridge.start(ctx, profile);
 
         activeProfile = profile;
         up = true;
         connected = false;
-        rxAtStart = receivedBytes(be, t);
         startEndpointWatchdog(ctx);
         Log.i(TAG, "WARP tunnel up on " + ColgramWarp.endpointHost()
                 + ":" + ColgramWarp.currentEndpointPort());
@@ -152,19 +183,12 @@ public final class ColgramWarpTunnel {
     public static synchronized void bringDown(Context ctx) {
         up = false;
         rotating = false;
-        try {
-            Object be = backend(ctx);
-            Object t = ensureTunnel();
-            Class<?> stateCls = Class.forName("com.wireguard.android.backend.Tunnel$State");
-            Method setState = be.getClass().getMethod("setState",
-                    Class.forName("com.wireguard.android.backend.Tunnel"),
-                    stateCls, Class.forName("com.wireguard.config.Config"));
-            Object down = stateState(stateCls, "DOWN");
-            setState.invoke(be, t, down, activeProfile);
-            Log.i(TAG, "WARP tunnel down");
-        } catch (Throwable t) {
-            Log.w(TAG, "tunnel shutdown: " + t.getMessage());
-        }
+        // Stops the same engine that started it. Deliberately never touches the WireGuard
+        // backend: calling into it here would load libwg-go.so into a process that also has
+        // libbox.so, which is the pair that segfaults it. bringDown has to be as free of that
+        // library as bringUp now is, or a user who turns WARP off crashes the app.
+        ColgramWarpServiceBridge.stop(ctx);
+        Log.i(TAG, "WARP tunnel down");
         activeProfile = null;
     }
 
@@ -208,48 +232,31 @@ public final class ColgramWarpTunnel {
                 while (up && failedEndpoints < endpointCount) {
                     Thread.sleep(STALE_AFTER_SECS * 1000L);
                     if (!up) break;
-                    Object be = backend(ctx);
-                    Object t = ensureTunnel();
-                    long rx = receivedBytes(be, t);
-                    if (rx > (rxAtStart < 0 ? 0 : rxAtStart)) {
+                    // The engine, not the WireGuard backend, carries the tunnel now, so the
+                    // rotation decision has to come from something answerable without loading
+                    // libwg-go.so. Reachability is measured directly instead.
+                    if (ColgramWarpEndpointProbe.answers(ColgramWarp.endpointHost(),
+                            ColgramWarp.currentEndpointPort())) {
                         connected = true;
-                        Log.i(TAG, "WARP endpoint carrying traffic (rx=" + rx + "B); keeping it");
+                        Log.i(TAG, "WARP endpoint answered; keeping it");
                         ColgramProxyManager.notifyProxySettingsChanged();
                         break;
                     }
                     failedEndpoints++;
-                    long tx = transmittedBytes(be, t);
                     Log.w(TAG, "WARP endpoint silent for " + STALE_AFTER_SECS
-                            + "s (rx=" + rx + "B, tx=" + tx + "B); endpoint attempt "
+                            + "s; endpoint attempt "
                             + failedEndpoints + "/" + endpointCount);
                     if (failedEndpoints >= endpointCount) break;
-                    // A route that never even puts a handshake on the wire cannot be fixed by
-                    // trying the next port: nothing about the port is what failed. Rotating would
-                    // burn the whole budget to arrive at the same answer, so stop and say so.
-                    if (tx < MIN_HANDSHAKE_TX_BYTES) {
-                        lastFailure = "no UDP egress: handshake never left the device";
-                        Log.e(TAG, lastFailure + " (tx=" + tx + "B); not rotating ports");
+                    // Rotation restarts the engine on the next advertised port. The profile is
+                    // rebuilt rather than edited, because the port travels inside it now.
+                    String next = nextProfile();
+                    if (next == null) {
+                        Log.e(TAG, "WARP rotation produced no profile; stopping the stall");
                         failedEndpoints = endpointCount;
                         break;
                     }
-                    String conf = ColgramWarp.buildWgQuickConf(
-                            ColgramWarp.endpointHost(), ColgramWarp.nextEndpointPort());
-                    if (conf == null) {
-                        Log.e(TAG, "WARP endpoint rotation produced no profile; stopping the stalled tunnel");
-                        failedEndpoints = endpointCount;
-                        break;
-                    }
-                    setReservedClientId(be);
-                    Class<?> configCls = Class.forName("com.wireguard.config.Config");
-                    Object profile = configCls.getMethod("parse", java.io.BufferedReader.class)
-                            .invoke(null, new java.io.BufferedReader(new StringReader(conf)));
-                    Class<?> stateCls = Class.forName("com.wireguard.android.backend.Tunnel$State");
-                    Object upState = stateState(stateCls, "UP");
-                    be.getClass().getMethod("setState",
-                            Class.forName("com.wireguard.android.backend.Tunnel"),
-                            stateCls, configCls).invoke(be, t, upState, profile);
-                    activeProfile = profile;
-                    rxAtStart = receivedBytes(be, t);
+                    ColgramWarpServiceBridge.restart(ctx, next);
+                    activeProfile = next;
                     connected = false;
                 }
                 if (up && failedEndpoints >= endpointCount) {
@@ -278,23 +285,7 @@ public final class ColgramWarpTunnel {
         ColgramProxyManager.notifyProxySettingsChanged();
     }
 
-    private static void setReservedClientId(Object backend) throws Exception {
-        String reserved = ColgramWarp.reservedHex();
-        if (reserved == null) throw new IllegalStateException("Cloudflare registration has no 3-byte client ID");
-        backend.getClass().getMethod("setClientReserved", String.class).invoke(backend, reserved);
-    }
-
     private static Object stateState(Class<?> stateCls, String name) throws Exception {
         return stateCls.getMethod("valueOf", String.class).invoke(null, name);
-    }
-
-    private static long receivedBytes(Object be, Object t) {
-        // GoBackend.getStatistics requires the Tunnel argument. Omitting it silently failed
-        // into the previous zero-counter fallback on every WireGuard 1.0.20230706 build.
-        return ColgramWarpStatistics.totalRx(ColgramWarpStatistics.statistics(be, t));
-    }
-
-    private static long transmittedBytes(Object be, Object t) {
-        return ColgramWarpStatistics.totalTx(ColgramWarpStatistics.statistics(be, t));
     }
 }

@@ -141,6 +141,21 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             } catch (Throwable ignored) {
                 // The engine is already gone; closing again would only throw again.
             }
+            // closeService() stops the tunnel but does NOT release the Go object behind this
+            // CommandServer. The gomobile binding tracks it with a phantom reference, and the
+            // GoRefQueue finalizer thread calls Seq.destroyRef on it once Java collects it -
+            // by which point the native side has already been torn down, and destroyRef walks
+            // freed memory. That is a segfault with no tombstone and no Java stack: measured on
+            // the device, the next Libbox.checkConfig() call after a start/stop cycle died with
+            // signal 11 in ~24ms where a healthy call takes 1.4s. So the server is closed
+            // explicitly here and the field nulled, and the close is ordered after
+            // closeService() because the service owns the running tunnel first.
+            try {
+                server.close();
+            } catch (Throwable ignored) {
+                // Already closed, or the engine went away with the process. Either way there is
+                // nothing left to release.
+            }
             server = null;
         }
         stopForeground(true);

@@ -32,6 +32,7 @@ DEVICE_TESTS = [
     "org.colgram.singbox.ColgramProfileDeviceTest",
     "org.colgram.singbox.ColgramSubscriptionStoreDeviceTest",
     "org.colgram.singbox.ColgramTunnelDeviceTest",
+    "org.colgram.singbox.ColgramWarpSingleRuntimeDeviceTest",
     "org.colgram.singbox.LibboxPresenceDeviceTest",
     "org.colgram.core.ColgramCallProxyDeviceTest",
     "org.colgram.core.ColgramDpiBypassDeviceTest",
@@ -45,8 +46,12 @@ DEVICE_TESTS = [
 
 
 def newest_log():
-    logs = sorted(RESULTS.glob("*/testlog/test-results.log"),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
+    # Scoped to the device this run targeted. Globbing across every device folder means a
+    # second emulator's older log can be read as this run's outcome, which is how a run that
+    # really passed gets reported as "the device log carried no test results".
+    device = os.environ.get("ANDROID_SERIAL")
+    pattern = (device + "/testlog/test-results.log") if device else "*/testlog/test-results.log"
+    logs = sorted(RESULTS.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     return logs[0] if logs else None
 
 
@@ -94,9 +99,18 @@ def main() -> int:
     targets = sys.argv[1:] or DEVICE_TESTS
     env = dict(os.environ, JAVA_HOME=r"C:\colgram-tools\jdk-17.0.20.1+1",
                ANDROID_HOME=r"C:\android-sdk")
+    # Pin the device. Two emulators are attached here, and gradle then runs the whole suite on
+    # BOTH at once: the second copy is installed over the first, so instrumentation is killed
+    # with signal 9 mid-run and the log is a bare "Process crashed" with no test named in it.
+    # That reads exactly like the engine segfault it was sitting next to in the log, and it is
+    # why a pair of classes that pass together appeared to crash on their own.
+    if "ANDROID_SERIAL" not in env:
+        env["ANDROID_SERIAL"] = "emulator-5554"
     # Start clean, so a stale log cannot be read as this run's outcome.
     if RESULTS.exists():
-        for child in RESULTS.glob("*/testlog"):
+        device_dir = env.get("ANDROID_SERIAL")
+        scope = RESULTS / device_dir if device_dir else RESULTS
+        for child in scope.glob("*/testlog"):
             for item in child.glob("*"):
                 try:
                     item.unlink()
