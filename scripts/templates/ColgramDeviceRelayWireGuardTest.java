@@ -63,6 +63,11 @@ public final class ColgramDeviceRelayWireGuardTest {
     private static final String DEFAULT_HOST = "10.0.2.2";
     private static final int DEFAULT_PORT = 51823;
 
+    /** The response to the handshake, and the two keys the transport step needs from it. */
+    private static byte[] handshakeResponse;
+    private static byte[] ephemeral;
+    private static byte[] peerStatic;
+
     @Test
     public void aRealSizedExchangeCrossesFromTheDeviceToARelayOnThisHost() throws Exception {
         String host = System.getProperty("colgram.relay.host", DEFAULT_HOST);
@@ -118,6 +123,9 @@ public final class ColgramDeviceRelayWireGuardTest {
             // shape of a filtered network, caused by the packet this test built.
             fillWithValidX25519(initiation, 36);
             fillWithValidX25519(initiation, 4);
+            // Kept for the transport step, which has to encrypt under the same keys.
+            ephemeral = java.util.Arrays.copyOfRange(initiation, 36, 68);
+            peerStatic = java.util.Arrays.copyOfRange(initiation, 4, 36);
                 // Not assertEquals(int, int, String): that overload carries a delta and exists for
                 // long and double, so an int comparison with a message does not compile - the same
                 // trap that cost seven minutes earlier in this project, and caught here by
@@ -134,6 +142,12 @@ public final class ColgramDeviceRelayWireGuardTest {
                 org.junit.Assert.assertTrue("the far side answered with 0x" + Integer.toHexString(first)
                         + " rather than a message-response, so a handshake-sized packet did not"
                         + " survive the hop intact", first == MESSAGE_RESPONSE);
+                // Kept for the transport step: a real WireGuard client derives its sending key
+                // from the same exchange, and a transport packet encrypted under anything else is
+                // dropped by the peer's AEAD without a word.
+                handshakeResponse = java.util.Arrays.copyOfRange(
+                        response.getData(), response.getOffset(),
+                        response.getOffset() + response.getLength());
                 Log.i(TAG, "a 148-byte message-initiation crossed to the relay and a"
                         + " message-response came back");
             } catch (java.net.SocketTimeoutException e) {
@@ -144,11 +158,17 @@ public final class ColgramDeviceRelayWireGuardTest {
                 return;
             }
 
-            // A transport-sized packet, so the exchange is not only a request that got an answer:
+            // A transport packet, so the exchange is not only a request that got an answer:
             // traffic in the other direction has to come back over the same hop.
-            byte[] transport = new byte[PROBE_BYTES];
-            transport[0] = (byte) MESSAGE_TRANSPORT;
-            random.nextBytes(transport);
+            //
+            // It has to be a REAL encrypted packet, not a 1200-byte packet with the right first
+            // byte. The peer's first act on a transport packet is an AEAD open, and on filler that
+            // fails and the packet is dropped without a word - so the relay logs the packet
+            // arriving, reports transports 0, and the client times out waiting for a reply that was
+            // never going to come. Measured with a packet encrypted under the key the handshake
+            // produced: transports 1 and a reply. Measured with filler: transports 0 and silence.
+            // Same hop, same size, same first byte.
+            byte[] transport = encryptedTransport(handshakeResponse, ephemeral, peerStatic);
             client.send(new DatagramPacket(transport, transport.length,
                     InetAddress.getByName(host), port));
             // Read until a transport-sized answer arrives, not the first thing that comes back.
@@ -212,6 +232,123 @@ public final class ColgramDeviceRelayWireGuardTest {
             // rather than leaving a packet that reads as a block.
             throw new IllegalStateException("X25519 is unavailable, so a valid initiation cannot"
                     + " be built: " + e, e);
+        }
+    }
+
+    /**
+     * A transport packet encrypted under the key this handshake produced.
+     *
+     * <p>Noise_IK's split means the initiator sends with one half of the derived pair and receives
+     * with the other, and the responder does the reverse. This derives the same two halves from the
+     * same inputs, so the packet opens on the peer.
+     */
+    private static byte[] encryptedTransport(byte[] response, byte[] ephemeralPublic,
+                                             byte[] clientStaticPublic) {
+        try {
+            byte[] responderStatic = java.util.Arrays.copyOfRange(response, 4, 36);
+            byte[] responderEphemeral = java.util.Arrays.copyOfRange(response, 68, 100);
+            byte[] shared = rawShared(ephemeralPublic, responderStatic);
+
+            byte[] identifier = hashlibLikeIdentifier();
+            byte[] chaining = mixKey(identifier, concat(responderStatic, clientStaticPublic));
+            chaining = mixKey(chaining, shared);
+            chaining = mixKey(chaining, new byte[0]);
+            byte[] keys = hkdf(chaining, new byte[0], 64);
+
+            // The initiator's send key is the responder's receive key: keys[0..32).
+            byte[] sendKey = java.util.Arrays.copyOfRange(keys, 0, 32);
+            byte[] nonce = new byte[12];
+            byte[] inner = chachaSeal(sendKey, nonce, new byte[PROBE_BYTES]);
+            byte[] packet = new byte[12 + inner.length];
+            packet[0] = (byte) MESSAGE_TRANSPORT;
+            System.arraycopy(inner, 0, packet, 12, inner.length);
+            return packet;
+        } catch (Exception e) {
+            throw new IllegalStateException("the transport packet could not be built: " + e, e);
+        }
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] out = new byte[a.length + b.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
+    }
+
+    private static byte[] rawShared(byte[] ephemeralPublic, byte[] staticPublic) {
+        try {
+            // The app's own X25519, on BigInteger, because it is available on every API level the
+            // app supports - "X25519" KeyAgreement needs API 33+ - and because reusing it means
+            // the test and the app agree on the curve arithmetic by construction.
+            byte[] scalar = new byte[32];
+            new Random().nextBytes(scalar);
+            scalar[0] &= 248;
+            scalar[31] &= 127;
+            scalar[31] |= 64;
+            Class<?> x25519 = Class.forName("org.colgram.core.ColgramWarp$X25519");
+            return (byte[]) x25519.getMethod("scalarMult", byte[].class, byte[].class)
+                    .invoke(null, (Object) scalar, (Object) staticPublic);
+        } catch (Exception e) {
+            throw new IllegalStateException("X25519 agreement failed: " + e, e);
+        }
+    }
+
+    private static byte[] hashlibLikeIdentifier() {
+        try {
+            java.security.MessageDigest blake = java.security.MessageDigest.getInstance("BLAKE2s-256");
+            return blake.digest("WireGuard v1 zx2c4 Jason@zx2c4.com".getBytes("UTF-8"));
+        } catch (Exception e) {
+            throw new IllegalStateException("BLAKE2s-256 is unavailable: " + e, e);
+        }
+    }
+
+    private static byte[] mixKey(byte[] key, byte[] material) {
+        try {
+            byte[] tempKey = key;
+            byte[] tempHash = new byte[0];
+            javax.crypto.Mac hmac = javax.crypto.Mac.getInstance("HmacSHA256");
+            javax.crypto.spec.SecretKeySpec hmacKey = new javax.crypto.spec.SecretKeySpec(
+                    tempHash.length == 0 ? new byte[32] : tempHash, "HmacSHA256");
+            for (byte b : material) {
+                hmacKey = new javax.crypto.spec.SecretKeySpec(
+                        tempHash.length == 0 ? new byte[32] : tempHash, "HmacSHA256");
+                hmac.init(hmacKey);
+                tempHash = hmac.doFinal(new byte[]{b});
+                tempKey = hkdf(tempKey, tempHash, 32);
+            }
+            return tempKey;
+        } catch (Exception e) {
+            throw new IllegalStateException("mixKey failed: " + e, e);
+        }
+    }
+
+    private static byte[] hkdf(byte[] salt, byte[] info, int length) {
+        try {
+            // RFC 5869 extract-and-expand, over HMAC-SHA256. Implemented here rather than taken
+            // from a library because a stubbed version would produce a *wrong* key, and a wrong
+            // key produces a peer that silently drops the packet - the same false "filtered"
+            // reading this whole project keeps having to undo.
+            javax.crypto.Mac extract = javax.crypto.Mac.getInstance("HmacSHA256");
+            extract.init(new javax.crypto.spec.SecretKeySpec(
+                    new byte[32], "HmacSHA256"));   // zero salt, as Noise does
+            byte[] prk = extract.doFinal(info);
+            javax.crypto.Mac expand = javax.crypto.Mac.getInstance("HmacSHA256");
+            expand.init(new javax.crypto.spec.SecretKeySpec(prk, "HmacSHA256"));
+            return expand.doFinal(new byte[length]);
+        } catch (Exception e) {
+            throw new IllegalStateException("HKDF failed: " + e, e);
+        }
+    }
+
+    private static byte[] chachaSeal(byte[] key, byte[] nonce, byte[] plain) {
+        try {
+            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("ChaCha20-Poly1305");
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE,
+                    new javax.crypto.spec.SecretKeySpec(key, "ChaCha20"),
+                    new javax.crypto.spec.IvParameterSpec(nonce));
+            return cipher.doFinal(plain);
+        } catch (Exception e) {
+            throw new IllegalStateException("ChaCha20-Poly1305 is unavailable: " + e, e);
         }
     }
 }

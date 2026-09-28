@@ -511,6 +511,28 @@ that is the right size, well-formed, and wrong in one byte. A failure whose text
 `0x52 rather than a message-response, so a handshake-sized packet did not survive the hop intact`
 is about a line of ordering in a test, and it took a log of the relay's own view to see it.
 
+### The transport step failed for the same reason, one level on
+
+With the handshake passing, the transport step timed out and the relay reported `transports 0` after
+`handshakes 2` - a real session, and packets it dropped.
+
+The transport packet was **filler with the right first byte**. The peer's first act on a transport
+packet is an AEAD open, and on filler that fails and the packet is dropped without a word: the relay
+logs it arriving, the peer counts nothing, and the client waits for a reply that was never going to
+come. Measured both ways on the same hop, same size, same first byte:
+
+```
+encrypted under the key the handshake produced   ->  transports 1, and a reply
+1200 bytes of filler with the same first byte     ->  transports 0, and silence
+```
+
+So the transport step now encrypts under the key derived from the exchange - the initiator's send
+half of Noise's split, which is the responder's receive half - using the app's own `ColgramWarp.X25519`
+for the curve and a real HMAC-SHA256 HKDF for the chain. **The first version of that used a stubbed
+HKDF**, which is worse than no implementation: it produces a *wrong* key rather than an error, and a
+wrong key produces exactly the same silence as a filtered network. Every layer of this file has come
+down to the same thing - a client that cannot tell "refused" from "my own output is wrong".
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
