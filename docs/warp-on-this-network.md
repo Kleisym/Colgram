@@ -113,3 +113,31 @@ destination with a reader so replies actually come back, and a header length der
 address form so a domain name's own length byte is not guessed at.
 
 It still only carries Telegram addresses. That is the listener's purpose, not a limitation to fix.
+
+## The TUN, and why "valid profile" was not enough
+
+Recorded because it is the shape of bug this codebase kept hitting: the configuration was correct,
+validated cleanly, and did nothing.
+
+sing-box hands the operating system its addresses and routes through
+`PlatformInterface.openTun`, and it only does that for a **`tun` inbound**. The subscription profile
+carried only a local `mixed` inbound on `127.0.0.1` — a SOCKS port for something on the device to
+dial deliberately, capturing nothing by itself. So there was no `openTun` call, no descriptor and
+no installed routes: the service started, the switch turned blue, and the phone talked to the
+network directly, exactly as before. From the settings screen that is indistinguishable from a
+working tunnel.
+
+`checkConfig` accepted the profile the whole time. A valid profile and a completely inert one are
+the same string to the validator — the same trap as the removed `wireguard` outbound, which the
+engine also accepted until it named the field it wanted. The engine is the only authority on these
+names, and it is worth asking rather than assuming: this version has **no `route_address` key at
+all** and claims the device with **`auto_route`**, so a profile written against the older shape
+would have been refused by name.
+
+Both profiles now carry a TUN with `auto_route` and `strict_route`. `strict_route` matters as much:
+without it, traffic can slip around the tunnel via the physical interface, and "covers the whole
+phone" is only usually true.
+
+The device test asserts both directions — that the built profiles carry a TUN, and that a profile
+without one is valid *and inert*. The second half is the point: it is the shape that looks like
+success to every other check in the suite.
