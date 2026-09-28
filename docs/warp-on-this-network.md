@@ -1995,3 +1995,40 @@ Both halves of the project now rest on measurements that could have succeeded an
 the only kind this file has ever been able to distinguish from a null result: the aioquic client on
 the host, and a real Initial on a device with no tunnel of its own. QUIC does not complete here.
 
+## Does the filter ever open? Watched, not sampled
+
+Every number above is a snapshot, and this file's own record says the filter moves: the same DNS
+control on the same device returned 18 bytes at 05:21 and silence at 05:16, with no code change in
+between. A snapshot cannot tell "this network blocks QUIC" from "this network blocked QUIC when I
+looked", and those are different problems - one is a wall, the other is a window to catch.
+
+So the question was asked by watching rather than by sampling. A real handshake every 15 seconds, a
+control on every iteration, and iterations whose control did not answer reported and not counted:
+
+```
+scripts/warp-quic-watch.py --minutes 20 --interval 15
+
+  05:26:51  control answered 64B    quic silent
+  05:26:56  control answered 64B    quic silent
+  05:27:01  control answered 64B    quic silent
+  ...
+  05:35:17  control answered 64B    quic silent
+```
+
+**Over 70 consecutive iterations the control answered every single time, and no handshake ever
+completed.** A run whose control is intermittent would be worth little; this one has none, which is
+what makes the silence a measurement rather than an absence of one.
+
+And the device, on the same morning, with its own control answering 18 bytes:
+
+```
+142.250.74.174:443  silent   Google
+104.16.132.229:443  silent   Cloudflare
+157.240.1.35:443     silent   Facebook
+control  1.1.1.1:53  18B
+```
+
+So the filter does not open, on either path, over the window observed - and the honest scope of that
+sentence is exactly the window. It is a statement about twenty minutes, not a proof about the
+network, and it is the strongest claim this file can make about QUIC.
+
