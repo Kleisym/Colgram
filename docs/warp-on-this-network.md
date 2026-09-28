@@ -288,6 +288,63 @@ dns.google/resolve             status=0  ['104.16.192.82', '104.16.24.84']
 Four of the five rows are now measured rather than argued. The fifth is the one that cannot be
 measured from here, and it is the only one that says WARP works.
 
+## The relay carrying actual WireGuard, not a stand-in's idea of it
+
+`test_warp_relay_handshake.py` sends a real 148-byte message-initiation and gets a 148-byte answer
+back. That proves the bytes crossed intact. It does not prove a WireGuard peer would accept the
+session, because the stand-in answers with its own scheme - a keystream derived from the shared
+secret, not the protocol's - and nothing ever decrypts it. The acceptance criteria there were
+invented rather than specified, which is how a byte pipe gets talked into being a tunnel.
+
+So this file implements the protocol's own handshake: Noise_IK with the real HKDF and BLAKE2s
+chaining, and ChaCha20Poly1305 transport packets with a 12-byte nonce. The client and the peer are
+the same code, so a pass means both halves agree with each other **and** with the published
+construction - a wrong key schedule, a wrong chaining order, or a wrong nonce fails the peer's AEAD
+open, and nothing gets through.
+
+```
+test_aRealHandshakeCrossesTheRelayAndBothSidesAgree ... ok
+test_aTransportPacketIsDecryptedByThePeerAndTheRelayStaysInvisible ... ok
+
+Ran 2 tests in 4.769s
+OK
+```
+
+**And it is a test rather than a demonstration.** Making the relay corrupt one byte per datagram:
+
+```
+FAILED (failures=2)
+  the handshake did not complete through the relay
+  the handshake did not complete, so the transport proves nothing
+```
+
+Both fail, and the second one refuses to claim anything about transport on a session that never
+established. That is the property the old byte-counting test could not have: a relay that mangled
+traffic looked fine as long as something came back.
+
+### Six bugs this found in thirty lines of protocol code
+
+Every one of them produced silence rather than an error, and every one of them read exactly like a
+blocked network:
+
+| Bug | What it looked like |
+|---|---|
+| initiation 227 bytes instead of 148 | nothing answered |
+| `blake2s(digest_size=64)` - BLAKE2s caps at 32 | the endpoint thread died on the first packet |
+| DH between the two *static* keys | handshake "succeeded", every transport key was unrelated |
+| responder's *static* published as its ephemeral | same, and the AEAD open failed silently |
+| statics mixed in a different order on the two sides | same |
+| 2-byte transport header where the format needs 4 | counter sliced across reserved bytes and ciphertext |
+
+The dead-thread one is the sharpest: a handler thread that raises on the first packet produces
+exactly the same silence as a filtered port, and the client cannot tell them apart. Three of these
+had already been found the hard way in this project - the reset counted as a service, the stub
+counted as a port, the SNI override counted as a refusal. The pattern is consistent enough to be
+worth stating as a rule: **a test that reports silence has not located the silence, and the first
+thing to check is whether the code that should have produced an answer ran at all.**
+
+    python scripts/test_warp_real_wireguard.py
+
 ## A layer underneath all of it: DNS here answers with the wrong addresses
 
 Found while checking the control plane, and it is the only finding in this file that is not about
