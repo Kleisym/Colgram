@@ -151,21 +151,35 @@ public final class ColgramDeviceRelayWireGuardTest {
             random.nextBytes(transport);
             client.send(new DatagramPacket(transport, transport.length,
                     InetAddress.getByName(host), port));
-            try {
-                DatagramPacket echo = new DatagramPacket(new byte[2048], 2048);
-                client.receive(echo);
-                org.junit.Assert.assertTrue("the far side's traffic did not survive the hop:"
-                        + echo.getLength() + "B came back instead of " + PROBE_BYTES,
-                        echo.getLength() == PROBE_BYTES);
-                Log.i(TAG, "VERDICT: a 148-byte handshake-sized packet and a "
-                        + PROBE_BYTES + "-byte transport packet both crossed from the device to a"
-                        + " relay on this host and came back. The phone's half of the relay path"
-                        + " works; the relay's real WireGuard is proven separately on the host.");
-            } catch (java.net.SocketTimeoutException e) {
-                Log.w(TAG, "the transport packet was not echoed back within " + TIMEOUT_MS + "ms");
-                Log.i(TAG, "VERDICT: the handshake-sized packet came back but the larger one did"
-                        + " not, so something on this path drops by size rather than by port.");
+            // Read until a transport-sized answer arrives, not the first thing that comes back.
+            // The relay's own acknowledgements and the peer's replies share this socket, so a
+            // RELAY-OK left over from the marker step can land here first - and a test that asserts
+            // on the first datagram reports that as "the far side's traffic did not survive", which
+            // is a statement about a stale packet on the same port rather than about the hop.
+            long deadline = System.currentTimeMillis() + TIMEOUT_MS * 3;
+            int received = -1;
+            while (System.currentTimeMillis() < deadline && received != PROBE_BYTES) {
+                try {
+                    DatagramPacket echo = new DatagramPacket(new byte[2048], 2048);
+                    client.setSoTimeout(TIMEOUT_MS);
+                    client.receive(echo);
+                    if (echo.getLength() == PROBE_BYTES) {
+                        received = echo.getLength();
+                    } else {
+                        Log.i(TAG, "ignoring a " + echo.getLength() + "B packet on the same"
+                                + " socket while waiting for the transport reply");
+                    }
+                } catch (java.net.SocketTimeoutException again) {
+                    break;
+                }
             }
+            org.junit.Assert.assertTrue("the far side's traffic did not survive the hop: no "
+                    + PROBE_BYTES + "B packet arrived within " + (TIMEOUT_MS * 3) + "ms",
+                    received == PROBE_BYTES);
+            Log.i(TAG, "VERDICT: a 148-byte handshake-sized packet and a "
+                    + PROBE_BYTES + "-byte transport packet both crossed from the device to a"
+                    + " relay on this host and came back. The phone's half of the relay path"
+                    + " works; the relay's real WireGuard is proven separately on the host.");
         } catch (Exception e) {
             Log.w(TAG, "the exchange could not be run: " + e.getClass().getSimpleName()
                     + " - " + e.getMessage());
