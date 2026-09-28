@@ -569,6 +569,34 @@ that overstates what ran is how a green result came to report a handshake while 
 never executed, and it is the same failure as every other one here wearing a different hat: something
 answered, and it was taken to mean more than it did.
 
+## The last transport nobody had tried: WireGuard inside TLS on 443
+
+Every transport measured so far put WireGuard somewhere it was filtered. One was never tried at all:
+TCP 443 is **provably open** here, and sending a real 148-byte initiation into a TLS stream on it
+would reach Cloudflare's edge over a port that carries TLS all day.
+
+```
+TCP 443 to 162.159.192.1:   TLSv1.3 in 127ms
+send a 148-byte initiation into the stream
+
+HTTP/1.1 400 Bad Request
+Server: cloudflare
+```
+
+**It answers, and what it answers with is an HTTP error page.** Port 443 terminates HTTPS and
+nothing else; the initiation is read as a malformed request. So the last open door in this file is
+closed too, and closed for a reason that took one measurement to establish - which is the whole
+point of the transports table. A port being open was never evidence that a service was running on
+it, and this is the fifth time that has had to be relearned:
+
+| what answered | what it actually was |
+|---|---|
+| 31 bytes on udp/443 | a stateless reset from a QUIC endpoint that could not read the packet |
+| 12 bytes on udp/443 of a Cisco resolver | a stub holding a port open |
+| a 403 on every path | an httpx `sni_hostname` override, on this host |
+| `Connection refused` from the device | busybox `nc` failing before it sent anything |
+| **316 bytes on tcp/443** | **an HTTP 400 from the HTTPS endpoint** |
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
