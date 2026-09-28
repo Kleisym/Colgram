@@ -50,6 +50,46 @@ answered 1, silent 15        # the one answer is 443
 a WireGuard handshake, so this narrows the diagnosis without opening a route. It does mean the
 relay conclusion survives a sharper test than the one it was originally based on.
 
+### It is a UDP port allowlist, not a WireGuard block
+
+The port-specific result has two possible readings, and they call for opposite conclusions:
+
+- *WireGuard is blocked specifically* - then some other transport could reach the same host, and
+  wrapping WARP in it might work.
+- *Only a couple of ports get through at all* - then no transport helps, because the WireGuard
+  port can never carry a byte no matter what is wrapped around it.
+
+Measured, and it is the second:
+
+```
+python scripts/warp-port-allowlist.py
+
+  162.159.192.1:53     silent        162.159.192.1:4444   silent
+  162.159.192.1:80     silent        162.159.192.1:8080   silent
+  162.159.192.1:123    silent        162.159.192.1:8443   silent
+  162.159.192.1:443    ANSWERED      162.159.192.1:31337  silent
+  162.159.192.1:1234   silent        162.159.192.1:55555  silent
+
+  1.1.1.1:2408   silent      # 1.1.1.1 does not run WireGuard at all
+  8.8.8.8:2408   silent
+  1.1.1.1:443    ANSWERED
+```
+
+Thirteen ports from 53 to 55535 on one Cloudflare address, and the only answer is 443. Port 2408 is
+silent on hosts that **do not run WireGuard**, so the silence follows the port, not the protocol or
+the owner.
+
+**What this settles.** This network allows a small allowlist of UDP ports - DNS and HTTPS/3 - and
+filters everything else. WARP's 2408 is outside that allowlist on every host tested, so it cannot
+be reached directly, and no client-side transport moves a datagram onto a port that is filtered.
+Wrapping WireGuard in QUIC or TLS does not help, because the wrapper would still have to arrive on
+2408.
+
+**What it does not settle.** A relay is still the only route, because a relay receives the
+handshake over TCP - 443 and 22 are both open here - and originates the WireGuard UDP itself from a
+network without this allowlist. What is settled is the *reason*, which is now a measurement rather
+than an assumption, and that reason is testable against any future network.
+
 Reproduce:
 
 ```

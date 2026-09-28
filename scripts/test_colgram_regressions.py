@@ -1041,6 +1041,28 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_warp_block_is_measured_as_a_port_allowlist_not_a_wireguard_verdict(self):
+        # The sharpened question, and the one that actually decides whether a transport could help.
+        # A port-specific result has two readings - WireGuard specifically is blocked, or only a few
+        # ports get through at all - and they call for opposite conclusions. Measured: thirteen
+        # ports on one Cloudflare address answer only on 443, and 2408 is silent on hosts that do
+        # not run WireGuard, so the silence follows the PORT. That means no client-side transport
+        # can help, because a wrapper would still have to arrive on a filtered port.
+        allowlist = ROOT / "scripts/warp-port-allowlist.py"
+        self.assertTrue(allowlist.is_file(), "there is no allowlist probe to back the conclusion")
+        body = allowlist.read_text(encoding="utf-8")
+        # Non-blocking with a wall-clock deadline: settimeout does not cover a sendto that stalls,
+        # and a probe that hangs produces no verdict rather than a wrong one.
+        self.assertIn("setblocking(False)", body)
+        self.assertIn("deadline", body)
+        # Hosts that do NOT run WireGuard, which is what makes this a port filter rather than a
+        # protocol one. Without them the conclusion is not reachable.
+        self.assertIn("1.1.1.1", body)
+        self.assertIn("2408", body)
+        self.assertIn("443", body)
+        notes = (ROOT / "docs/warp-on-this-network.md").read_text(encoding="utf-8")
+        self.assertIn("allowlist", notes.lower())
+
     def test_the_warp_probes_sweep_ports_rather_than_assuming_a_blanket_block(self):
         # "All Cloudflare UDP is filtered" was the standing claim and it was too wide. Sweeping the
         # ports found 443/udp answering on the same addresses whose WireGuard ports are all silent,
