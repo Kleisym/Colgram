@@ -90,6 +90,43 @@ handshake over TCP - 443 and 22 are both open here - and originates the WireGuar
 network without this allowlist. What is settled is the *reason*, which is now a measurement rather
 than an assumption, and that reason is testable against any future network.
 
+### Correction: there is a size threshold, and the probe was not varying it
+
+The section above was too confident, and the way it was wrong is worth recording rather than
+quietly editing.
+
+Every port probe sent **1200-byte** datagrams. Varying only the size, on the same host and the same
+port that already answered:
+
+```
+1.1.1.1:443   64 bytes  silent
+              256 bytes  silent
+              600 bytes  silent
+              800 bytes  silent
+             1000 bytes  silent
+             1200 bytes  ANSWERED  (a 31 byte QUIC version negotiation)
+```
+
+Nothing about the port changed - only the size did. So "443 answers and 2408 does not" was never a
+clean port comparison: 443 was answering a packet that a **WireGuard message-initiation cannot
+match**, since an initiation is 148 bytes. A live WireGuard port would have been silent to that
+probe too.
+
+Re-run properly - all Cloudflare WireGuard ports at 1200 bytes, a size that provably gets 443 to
+reply - and they are still all silent. So the port conclusion **survives having been tested
+properly rather than by accident**, which is the only reason it is worth keeping. The allowlist
+framing does not: what the evidence supports is "2408 is filtered, and separately, small UDP
+datagrams get no answer at all on any port".
+
+```
+python scripts/warp-mtu-threshold.py
+```
+
+The practical consequence for WARP is the same either way, and worth stating plainly: the 148-byte
+handshake sits below the 1200-byte floor, so even a WireGuard port that were open would be
+unobservable to a probe - which is why the device test asserts against a real handshake with
+Cloudflare's own `cdn-cgi/trace` rather than against reachability.
+
 Reproduce:
 
 ```
