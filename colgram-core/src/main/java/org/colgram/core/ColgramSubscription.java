@@ -99,6 +99,54 @@ public final class ColgramSubscription {
         return found;
     }
 
+    /**
+     * Does this text even claim to be a VPN subscription?
+     *
+     * A cheap prefix test, for the place that has to decide whether to treat a blob of text as a
+     * subscription at all - a link shared from a chat, where the blob is usually a caption with a
+     * link somewhere inside it. parse() is the authority and is what decides; this only avoids
+     * handing it an ordinary http link, and it is deliberately the same scheme list parseUri
+     * understands so the two cannot drift apart.
+     */
+    public static boolean looksLikeSubscription(String text) {
+        if (text == null) return false;
+        String trimmed = text.trim();
+        if (trimmed.isEmpty()) return false;
+        int schemeEnd = trimmed.indexOf("://");
+        if (schemeEnd <= 0) return false;
+        String scheme = trimmed.substring(0, schemeEnd).toLowerCase(java.util.Locale.ROOT);
+        return VLESS.equals(scheme) || VMESS.equals(scheme) || TROJAN.equals(scheme)
+                || SHADOWSOCKS.equals(scheme) || "shadowsocks".equals(scheme)
+                || "ssr".equals(scheme) || HYSTERIA.equals(scheme) || "hysteria2".equals(scheme)
+                || "hy2".equals(scheme) || "socks".equals(scheme) || "socks5".equals(scheme);
+    }
+
+    /**
+     * The first subscription link inside a blob of text, or null when there is none.
+     *
+     * A bot does not send a bare URI. It sends a message with a caption, sometimes a payment link,
+     * an expiry note and the subscription somewhere in the middle - so a link that arrives by being
+     * shared has to be found inside that text rather than taken whole. Anything the parser does not
+     * recognise is skipped, which is what keeps an ordinary http link in a shared message from
+     * being read as a VPN config and replacing a working tunnel with a nonsense one.
+     */
+    public static String firstLinkIn(String text) {
+        if (text == null) return null;
+        for (String candidate : text.split("[\\s\\r\\n]+")) {
+            String trimmed = candidate.trim();
+            if (trimmed.isEmpty()) continue;
+            if (!looksLikeSubscription(trimmed)) continue;
+            if (!parse(trimmed).isEmpty()) return trimmed;
+        }
+        // And a base64 subscription list, which is the other shape a bot sends: one long token
+        // rather than a vless:// URI.
+        String whole = text.trim();
+        if (!whole.isEmpty() && whole.indexOf("://") < 0 && !parse(whole).isEmpty()) {
+            return whole;
+        }
+        return null;
+    }
+
     /** One URI, in any of the schemes the wild uses. */
     static Node parseUri(String uri) {
         try {

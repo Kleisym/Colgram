@@ -5401,6 +5401,52 @@ def inject_hooks(repo_path):
                'org.colgram.singbox.ColgramVpnService',
                'AndroidManifest Colgram VPN Service')
 
+    # 67d. The share target that turns a bot-sent link into a stored subscription.
+    #
+    # A VPN subscription is bought in a bot and the bot sends the link into a chat. Without this the
+    # only route was: open settings, tap the row, paste the text by hand - and a paste that loses
+    # a character produces a profile that validates and carries nothing. Sharing the link from the
+    # chat is the flow the purchase actually takes, so it is the flow that has to work.
+    #
+    # The filter is on ACTION_SEND with the text MIME type, plus ACTION_VIEW on the schemes the
+    # parser understands, so both "share" from a chat and a tapped link have somewhere to land.
+    def subscription_share_injector(content):
+        if 'org.colgram.core.ColgramSubscriptionShareActivity' in content:
+            return content
+        match = re.search(r'<application\b[^>]*>', content)
+        if not match:
+            return content
+        activity = (
+            '\n        <activity android:name="org.colgram.core.ColgramSubscriptionShareActivity"'
+            ' android:exported="true"'
+            ' android:excludeFromRecents="true"'
+            ' android:noHistory="true"'
+            ' android:theme="@android:style/Theme.Translucent.NoTitleBar">'
+            '\n            <intent-filter>'
+            '\n                <action android:name="android.intent.action.SEND" />'
+            '\n                <category android:name="android.intent.category.DEFAULT" />'
+            '\n                <data android:mimeType="text/plain" />'
+            '\n            </intent-filter>'
+            '\n            <intent-filter>'
+            '\n                <action android:name="android.intent.action.VIEW" />'
+            '\n                <category android:name="android.intent.category.DEFAULT" />'
+            '\n                <category android:name="android.intent.category.BROWSABLE" />'
+            '\n                <data android:scheme="vless" />'
+            '\n                <data android:scheme="vmess" />'
+            '\n                <data android:scheme="trojan" />'
+            '\n                <data android:scheme="ss" />'
+            '\n                <data android:scheme="hysteria" />'
+            '\n                <data android:scheme="hysteria2" />'
+            '\n                <data android:scheme="hy2" />'
+            '\n            </intent-filter>'
+            '\n        </activity>'
+        )
+        return content[:match.end()] + activity + content[match.end():]
+
+    patch_file(bypass_manifest, subscription_share_injector,
+               'org.colgram.core.ColgramSubscriptionShareActivity',
+               'AndroidManifest Colgram Subscription Share Target')
+
     # 68. ConnectionsManager.java -> an IPv6-only route, for networks that block IPv4 Telegram.
     #
     # Measured on the network Colgram is developed against: every Telegram DC address is dropped
@@ -5762,6 +5808,7 @@ def inject_singbox_device_test_support(repo_path, root_dir):
     destination_dir = os.path.join(
         module_dir, "src", "androidTest", "java", "org", "colgram", "singbox")
     for name in ("ColgramDeviceRouteCaptureDeviceTest.java",
+                 "ColgramSubscriptionShareDeviceTest.java",
                  "ColgramTunInboundDeviceTest.java",
                  "ColgramProfileDeviceTest.java",
                  "ColgramSubscriptionStoreDeviceTest.java",
@@ -5811,6 +5858,27 @@ def inject_core_device_test_support(repo_path, root_dir):
         os.makedirs(destination_dir, exist_ok=True)
         shutil.copy2(source, os.path.join(destination_dir, name))
     print(" [+] core device tests are mirrored from tracked templates")
+
+
+def inject_subscription_share_activity(repo_path, root_dir):
+    """Install the share target that turns a bot-sent link into a stored subscription.
+
+    It lives in the app module rather than in colgram-core because it is an Activity and
+    colgram-core compiles before TMessagesProj against a bare android.jar. The tracked template and
+    this copy are what keep a fresh clone able to receive a subscription at all.
+    """
+    template = os.path.join(root_dir, "scripts", "templates",
+                            "ColgramSubscriptionShareActivity.java")
+    if not os.path.isfile(template):
+        PATCH_MISSES.append("subscription share activity template")
+        print(" [!] FATAL: subscription share activity template is missing")
+        return
+    destination_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                                   "org", "colgram", "core")
+    os.makedirs(destination_dir, exist_ok=True)
+    shutil.copy2(template, os.path.join(destination_dir,
+                                       "ColgramSubscriptionShareActivity.java"))
+    print(" [+] subscription share target is installed")
 
 
 def download_official_binaries(repo_path):
@@ -6865,6 +6933,7 @@ def main():
     inject_warp_device_test_support(target_repo, root_dir)
     inject_singbox_device_test_support(target_repo, root_dir)
     inject_core_device_test_support(target_repo, root_dir)
+    inject_subscription_share_activity(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
     download_official_binaries(target_repo)
     inject_hooks(target_repo)

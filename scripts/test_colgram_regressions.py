@@ -1041,6 +1041,38 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_a_subscription_link_shared_from_a_chat_reaches_the_tunnel(self):
+        # The goal says a subscription bought in a bot works on the phone, and the bot sends a link.
+        # The only route from that link to a tunnel was: open settings, tap the row, paste the text
+        # by hand. That is not the purchase flow, it is a chore with a silent failure mode - a
+        # paste that loses one character produces a profile that validates and carries nothing,
+        # which is exactly the class of bug this suite keeps finding.
+        #
+        # So there is a share target now, for ACTION_SEND on text and ACTION_VIEW on the schemes
+        # the parser understands. Both matter: sharing from a chat is what a user actually does,
+        # and a tapped link has to have somewhere to land.
+        template = ROOT / "scripts/templates/ColgramSubscriptionShareActivity.java"
+        self.assertTrue(template.is_file(), "the share target has no tracked template")
+        share = template.read_text(encoding="utf-8")
+        self.assertIn("EXTRA_TEXT", share)
+        self.assertIn("ColgramSubscriptionStore.save", share)
+        # And report a refusal rather than closing as if it had worked.
+        self.assertIn("не принята", share)
+        installed = ROOT / ("Telegram-Src/TMessagesProj/src/main/java/org/colgram/core"
+                            "/ColgramSubscriptionShareActivity.java")
+        self.assertTrue(installed.exists(), "the share target is not installed in the app module")
+        self.assertEqual(share, installed.read_text(encoding="utf-8"),
+                         "the share target has drifted from its tracked template")
+        patcher = (ROOT / "scripts/apply-patches.py").read_text(encoding="utf-8")
+        self.assertIn("android.intent.action.SEND", patcher)
+        manifest = (ROOT / "Telegram-Src/TMessagesProj/src/main/AndroidManifest.xml").read_text(
+            encoding="utf-8")
+        self.assertIn("ColgramSubscriptionShareActivity", manifest)
+        self.assertIn("android.intent.action.VIEW", manifest)
+        subscription = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                        "/ColgramSubscription.java").read_text(encoding="utf-8")
+        self.assertIn("public static boolean looksLikeSubscription", subscription)
+
     def test_the_tun_names_its_default_routes_because_auto_route_alone_captures_nothing(self):
         # auto_route on its own gave the engine the tunnel addresses and no routes at all, measured
         # on the device by running the real engine and recording what it asked Android for:
