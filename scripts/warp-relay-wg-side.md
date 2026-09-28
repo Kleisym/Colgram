@@ -150,3 +150,20 @@ TCP through relay: 64B, QR bit=1
 relay moves bytes correctly end to end in the two shapes it offers - and it deliberately says
 nothing about WARP, because the endpoint on the far side here is a resolver, not Cloudflare's
 WireGuard ingress. The distinction is the whole point of the table above.
+
+### The join assertion that had never been in a compiling build
+
+Worth recording because it is the same failure mode one level up. The device test gained a UDP
+check on the relay path, and it was added without compiling it first: the assertion called a helper
+that takes Strings with an int, and the test module failed to compile 7 minutes 22 seconds into a
+run that had therefore executed **no tests at all**. The green results quoted for that class before
+this were green for a different reason - the new assertion was not in them.
+
+So the check now compares the datagram's **bytes** rather than its length, which is the stronger
+claim anyway: a relay answering with an error page of exactly 148 bytes would pass a length check,
+and an error page is precisely what this file exists to catch.
+
+The general form is the one this project keeps rediscovering. A test that is never executed and a
+test that is executed and passes look identical in a commit message, and so does a probe whose
+client could not read the answer and a probe the server refused. Compile it, run it, and read the
+output - in that order, every time.

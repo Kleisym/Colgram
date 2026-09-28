@@ -316,9 +316,14 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
                 // an int would not compile - which is a cheap way to find out a test was never
                 // actually run. The content matters more than the size anyway, since a relay that
                 // answered with an error page of the right length would pass a length check.
-                org.junit.Assert.assertArrayEquals(initiation,
-                        java.util.Arrays.copyOf(reply.getData(), 148),
-                        "the relay returned something other than the datagram it was given");
+                // Two-argument form: the three-argument assertArrayEquals overloads carry a delta
+                // and exist only for float and double, so passing a message to a byte[] version
+                // does not compile. Caught here rather than in a run, because a test module that
+                // does not compile reports a build failure that reads like a toolchain problem
+                // rather than the assertion it is.
+                org.junit.Assert.assertArrayEquals("the relay returned something other than the "
+                                + "datagram it was given",
+                        initiation, java.util.Arrays.copyOf(reply.getData(), 148));
                 Log.i(TAG, "a relay on the profile's port answers a 148-byte initiation over UDP");
             } finally {
                 client.close();
