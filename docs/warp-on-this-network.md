@@ -283,6 +283,40 @@ not rest on DNS either. But any attempt that starts by resolving a `cloudflarecl
 fail here for a reason that has nothing to do with the filtering this file is about, and that is
 worth knowing before someone spends a day on it.
 
+**And it is a host-side problem, not the app's.** The device resolves the same names correctly:
+
+```
+emulator-5554  ping api.cloudflareclient.com     -> 104.16.192.82   (the true address)
+emulator-5554  ping engage.cloudflareclient.com  -> 162.159.192.1
+```
+
+So this costs nothing in Colgram on a real phone, and it is one more reason the host-side numbers in
+this file have to be re-measured rather than trusted. The host resolver is not the phone's resolver,
+and after the tunnel finding above they are demonstrably different networks.
+
+### The port control, on the device
+
+```
+control: DNS over UDP -> answers
+162.159.192.1  53:silent  443:silent  2408:silent  500:silent  4500:silent  8443:silent  51820:silent
+162.159.192.1 answered 0/7 ports to a real DNS query, 53 included
+1.1.1.1:443 -> silent   (a host that certainly serves DNS, same port)
+stub check: the stub host is silent here, so it is not a usable control on this path
+```
+
+**0 of 7 on the phone as well, 53 included, while DNS answers.** So the finding holds on the device
+and is not an artefact of the host's tunnel: on this path, UDP to Cloudflare's WireGuard and MASQUE
+addresses does not arrive on any port, and the silence is about the path rather than about any one
+port being shut.
+
+The stub host is silent here, which is worth noting rather than glossing: `208.67.222.222` is
+reachable from the host and not from the device, so the shape check that catches a fixed 12-byte
+answer has no host to run against on this path. The check reports that it cannot run instead of
+quietly passing - a control that is unavailable is a different fact from a control that passed, and
+conflating them is how a gap becomes a claim.
+
+    python scripts/device-tests.py org.colgram.core.ColgramDeviceUdpPortTest
+
 ### The same mistake, for the third time in this project
 
 Counting a 31-byte stateless reset as a QUIC service. Counting a 12-byte stub on a Cisco resolver
