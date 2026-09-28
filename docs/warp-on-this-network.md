@@ -804,3 +804,56 @@ no second unfiltered route hiding on this block either. Every UDP port the clien
 the one transport that works is TCP 443, and on that transport the endpoint refuses Extended
 CONNECT for every client and the app has no MASQUE outbound to speak with anyway.
 
+## What the 400 actually says, and why it is not the network's doing
+
+A status code is not a reason. Reading the body of the 400 gives a sentence:
+
+```
+HTTP CONNECT is not supported | engage.cloudflareclient.com | Cloudflare
+```
+
+That arrives in 93-561 ms, with `content-type: text/html`, a `cf-ray` and `server: cloudflare` - an
+error page from the edge, not an HTTP/2 response from a tunnel backend. So the 400 that the whole
+HTTP/2 route was resting on was never a MASQUE refusal at all: **Cloudflare's edge does not
+implement the CONNECT method**, and it says so before any backend sees the request.
+
+Swept across two kinds of address - the MASQUE block and 1.1.1.1, Cloudflare's own resolver - and
+three vhosts, twelve requests, all of them:
+
+```
+engage.cloudflareclient.com        162.159.198.2  400  EDGE REFUSES THE METHOD
+engage.cloudflareclient.com        162.159.197.3  400  EDGE REFUSES THE METHOD
+engage.cloudflareclient.com        1.1.1.1         400  EDGE REFUSES THE METHOD
+connectivity.cloudflareclient.com 162.159.198.2  400  EDGE REFUSES THE METHOD
+cloudflare.com                     1.1.1.1         400  EDGE REFUSES THE METHOD
+cloudflare-dns.com                 1.1.1.1         400  EDGE REFUSES THE METHOD
+  (both /masque/udp/default/ and /masque/ip/default/ on each)
+```
+
+**The refusal is a property of the edge, not of the WARP virtual host.** That distinction is the
+whole point of sweeping `1.1.1.1` and `cloudflare.com` alongside the WARP names: a vhost-specific
+refusal would be something a different name fixes, and an edge-wide one is not. This is the second.
+
+Combined with `ENABLE_CONNECT_PROTOCOL` (0x08) being absent from a **complete** 18-byte SETTINGS
+frame on all six vhosts, the HTTP/2 route is closed at both ends: the server never offers the
+mechanism, and the edge never forwards the request that would use it. No credential changes that,
+and neither does a relay on a host with clean UDP - the request does not get far enough to reach
+the network at all.
+
+    python scripts/warp-connect-support.py
+
+### One thing worth recording about how that 0x08 was read
+
+The absence of 0x08 is the load-bearing measurement in that reasoning, so it is worth recording
+how it is read. HTTP/2 frame headers carry a **3-byte** length, and a single `recv` on a TCP
+connection can return a partial frame. Parsing whatever arrived drops every setting past the cut -
+and since 0x08 is the key being looked for, a truncated read reports "the server does not allow it"
+when the server in fact said nothing about it. The first version of this probe did read once. The
+probes now loop until the announced length is satisfied, and the frame measures 18 bytes with keys
+3, 4 and 5, arriving whole on all six vhosts. The absence is real, and it survived being checked.
+
+This is the same class of bug as the 403s and the QUIC silence: a measurement that cannot tell
+"the server said no" from "my client did not read the answer" produces silence, and silence reads
+as a block. Three of this file's earlier conclusions were wrong for exactly that reason, and the
+fourth was saved by reading the body of the error instead of its status code.
+
