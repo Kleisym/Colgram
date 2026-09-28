@@ -5594,6 +5594,25 @@ def sync_singbox_module(repo_path, root_dir):
         print("     Drop libbox.so per ABI into vendor/colgram-singbox/src/main/jniLibs/ first.")
         PATCH_MISSES.append("Colgram sing-box engine (libbox.so)")
 
+    # Registering the module in settings.gradle is only half of it: a project nothing depends on
+    # is never built, and the app would ship with a subscription row and no engine. The dependency
+    # is what puts libbox.so in the APK and our classes on the classpath.
+    project_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
+    if not os.path.isfile(project_gradle):
+        PATCH_MISSES.append("Colgram sing-box build.gradle dependency")
+        return
+    with open(project_gradle, "r", encoding="utf-8") as gradle_file:
+        gradle_text = gradle_file.read()
+    if "project(':colgram-singbox')" not in gradle_text:
+        anchor = "    implementation project(':colgram-wireguard')"
+        if anchor not in gradle_text:
+            PATCH_MISSES.append("Colgram sing-box build.gradle anchor")
+            return
+        gradle_text = gradle_text.replace(
+            anchor, anchor + "\n    implementation project(':colgram-singbox')", 1)
+        with open(project_gradle, "w", encoding="utf-8") as gradle_file:
+            gradle_file.write(gradle_text)
+
 
 def inject_warp_device_test_support(repo_path, root_dir):
     """Keep the account-free on-device WARP integration test reproducible."""
