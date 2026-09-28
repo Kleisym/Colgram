@@ -3,7 +3,7 @@
 Everything below was measured from the device or the app, not inferred. A verdict here means a
 measurement produced it; a claim without one is marked as such.
 
-## The block is external and total
+## The block is external, and port-specific
 
 Measured on the device, and re-measured from the host on the same network:
 
@@ -11,10 +11,36 @@ Measured on the device, and re-measured from the host on the same network:
 |---|---|
 | UDP DNS, 6 resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9, 77.88.8.8, 208.67.222.222, 94.140.14.14) | **all 6 answer, 64B** |
 | UDP to all 16 Cloudflare WireGuard ingresses (ports 2408, 500, 1701, 4500), a real message-initiation | **0 of 16 answer** |
+| **UDP 443/QUIC on the same addresses** | **answers** |
 | AmneziaWG, extended ranges, junk packets, S1/S2/S5/S6 | no reproducible response |
 
 UDP itself is not broken — six independent resolvers answer from the same host, immediately before
 the sweep. Cloudflare's WireGuard ingress specifically does not answer.
+
+### The block is not "all Cloudflare UDP" — and that correction matters
+
+An earlier version of this file said the whole of Cloudflare's UDP was filtered. That was wider than
+the evidence supported. Sweeping the ports rather than only the four WARP advertises found:
+
+```
+python scripts/warp-port-sweep.py
+
+162.159.192.1
+    2408 silent     WARP / WireGuard (the registered ingress)
+    ...
+    443  ANSWERED   QUIC / HTTP3 - not WireGuard, but the same edge over UDP
+...
+answered 2, silent 62
+```
+
+Two of sixty-four probes answered, **both on 443/udp, on Cloudflare addresses whose WireGuard
+ports are all silent.** So Cloudflare's edge *is* reachable by UDP from this network; what is
+filtered is the WireGuard service on it. Those are different problems, and only the first is
+something a different transport could work around.
+
+**What it does not do is make WARP work.** WARP speaks WireGuard, not QUIC. An open 443 cannot carry
+a WireGuard handshake, so this narrows the diagnosis without opening a route. It does mean the
+relay conclusion survives a sharper test than the one it was originally based on.
 
 Reproduce:
 

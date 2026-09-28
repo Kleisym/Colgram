@@ -1041,6 +1041,25 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_warp_probes_sweep_ports_rather_than_assuming_a_blanket_block(self):
+        # "All Cloudflare UDP is filtered" was the standing claim and it was too wide. Sweeping the
+        # ports found 443/udp answering on the same addresses whose WireGuard ports are all silent,
+        # so the block is port-specific and Cloudflare's edge IS reachable by UDP here; only the
+        # WireGuard service on it is filtered. That is a narrower and more useful diagnosis, and
+        # it is the kind of claim that silently rots if the probe only ever looks at the four ports
+        # WARP advertises - so the sweep is pinned here rather than left to one manual run.
+        sweep = ROOT / "scripts/warp-port-sweep.py"
+        self.assertTrue(sweep.is_file(), "there is no port sweep to correct the blanket claim with")
+        body = sweep.read_text(encoding="utf-8")
+        for port in (2408, 500, 1701, 4500, 443):
+            self.assertIn(str(port), body, "the sweep does not cover port " + str(port))
+        # And it must be able to tell the two situations apart, or it cannot correct anything.
+        self.assertIn("quic_open", body)
+        self.assertIn("wireguard_open", body)
+        self.assertIn("control_dns", body)
+        notes = (ROOT / "docs/warp-on-this-network.md").read_text(encoding="utf-8")
+        self.assertIn("port-specific", notes.lower())
+
     def test_every_protocol_the_goal_names_is_asked_of_the_engine(self):
         # The goal names seven protocols. The parser had all seven, but the ENGINE acceptance test
         # covered six - VMess was missing entirely, so a VMess subscription could parse, produce a
