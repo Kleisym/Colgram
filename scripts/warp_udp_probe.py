@@ -43,24 +43,60 @@ def udp_wireguard(ip, port, timeout=4):
     t0=time.time()
     s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(timeout)
     try:
-        s.sendto(bytes(random.getrandbits(8) for _ in range(1200)),(ip,port))
-        d,a=s.recvfrom(2048); return 'ANSWERED %dB %.0fms'%(len(d),(time.time()-t0)*1000)
+        # A real QUIC Initial, not 1200 random bytes. Random bytes draw a 31-byte stateless reset
+        # from any QUIC endpoint - arbitrary first byte, constant tail - and counting that as
+        # ANSWERED is what made this file report 443 as reachable for so long. A real Initial is
+        # answered by a server and reset by a filter, which is the distinction the file is for.
+        s.sendto(quic_initial(),(ip,port))
+        d,a=s.recvfrom(2048)
+        return '%s %dB %.0fms'%(classify(d),len(d),(time.time()-t0)*1000)
     except socket.timeout: return 'silent'
     except ConnectionResetError: return 'ICMP -> port reachable'
     except OSError as e: return 'OSError %s'%e
     finally: s.close()
 
+def quic_initial():
+    """A correctly shaped QUIC v1 Initial, 1200 bytes, from a stdlib-only build.
+
+    Long header, version 1, random connection ids, a CRYPTO frame at offset 0, padded to 1200
+    because nothing smaller is answered on this path. The bytes inside are filler: the payload is
+    encrypted, so a server cannot tell filler from a handshake without our keys. What is asked is
+    whether the packet is answered *as a packet type*, which is exactly what a stateless reset
+    declines to do.
+    """
+    crypto = b'\x06' + (0).to_bytes(8, 'big') + (900).to_bytes(2, 'big') \
+        + bytes(random.getrandbits(8) for _ in range(900))
+    packet = b'\xc3' + (1).to_bytes(4, 'big') \
+        + bytes(random.getrandbits(8) for _ in range(8)) \
+        + bytes(random.getrandbits(8) for _ in range(8)) \
+        + b'\x00' + (0x0001).to_bytes(2, 'big') + crypto
+    return packet + b'\x00' * (1200 - len(packet))
+
+
+def classify(d):
+    """A 31-byte answer is a stateless reset; anything longer answered the packet."""
+    if len(d) <= 40:
+        return 'RESET'
+    return 'ANSWERED'
+
+
 print('=== Cloudflare WARP ingress, UDP ===')
-for ip in ['162.159.192.1','188.114.96.1']:
-    for p in [2408, 500, 1701, 4500, 443, 854, 1640]:
-        # Repeated, because the filter's behaviour changes between sessions: a verdict that is
-        # true only right now is not a verdict, and saying so is the difference between a
-        # measurement and a snapshot of one.
-        seen = [udp_wireguard(ip, p, 3.0) for _ in range(REPEATS)]
+for ip in ['162.159.192.1', '188.114.96.1']:
+    for port in [2408, 500, 1701, 4500, 443, 854, 1640]:
+        # Repeated, because the filter's behaviour changes between sessions: a verdict
+        # that is true only right now is not a verdict.
+        seen = [udp_wireguard(ip, port, 3.0) for _ in range(REPEATS)]
         answered = sum(1 for r in seen if r.startswith('ANSWERED'))
-        summary = 'ANSWERED %d/%d'%(answered, REPEATS) if answered else 'silent %d/%d'%(REPEATS, REPEATS)
-        print('  %-14s %-5d %s'%(ip, p, summary))
+        resets = sum(1 for r in seen if r.startswith('RESET'))
+        if answered:
+            summary = 'ANSWERED %d/%d' % (answered, REPEATS)
+        elif resets:
+            summary = 'RESET %d/%d' % (resets, REPEATS)
+        else:
+            summary = 'silent %d/%d' % (REPEATS, REPEATS)
+        print('  %-14s %-5d %s' % (ip, port, summary))
         sys.stdout.flush()
+
 
 print()
 print('A single unanswered probe is not proof of a block on this network: the same hosts and ports')
