@@ -230,11 +230,17 @@ open, not speaking QUIC on them.
   ports that answered at all: none
 ```
 
-Sixteen ports, **including 53**, with a query six resolvers answer elsewhere in the same second. So
-UDP does not reach that address on any port tested, and the silence is about the path rather than
-about 2408 being singled out. The honest statement is narrower and stronger than "2408 is
-filtered": **UDP to Cloudflare's WireGuard and MASQUE addresses does not arrive at all**, while UDP
-to resolvers does, and TCP 443 to those same Cloudflare addresses completes TLS 1.3 with h2.
+Sixteen ports, with a query six resolvers answer elsewhere in the same second. So no port on that
+address answered, and the silence is about the path rather than about 2408 being singled out.
+
+**"Including 53" was wrong, and the way it was wrong matters more than the conclusion it supported.**
+53 on a Cloudflare WireGuard ingress does not run DNS, so a DNS query there is silence from an
+absent service - not evidence about the port. The control that makes the sweep meaningful is the
+*same* query to `1.1.1.1:53`, which does answer; a port where nothing is listening and a port that
+is filtered look identical until you know which is which, and on this one it was a service that was
+never there. The statement that survives is narrower: **no service on Cloudflare's WireGuard or
+MASQUE addresses answers**, while UDP to resolvers and to NTP servers does, and TCP 443 to those
+same Cloudflare addresses completes TLS 1.3 with h2.
 
 The relay's case does not rest on which port is shut, and now does not have to.
 
