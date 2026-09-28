@@ -51,6 +51,31 @@ public final class ColgramWarpDeviceIntegrationTest {
                 "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
                 toHex(rfc7748Public));
         invoke(configClass, "init", new Class<?>[]{Context.class}, context);
+        // The engine must be set up before anything is asked of it, or the first call walks into
+        // a nil and takes the process with it: Libbox.touch() is an EMPTY method in this binding
+        // (every generated class calls it from its static initialiser, which is where the belief
+        // that it initialises the engine comes from), so Libbox.setup(SetupOptions) is the call
+        // that does the work. ColgramVpnService does this in ensureEngineSetUp(); the test drives
+        // the tunnel directly, so it has to do the same or it crashes the instrumentation process
+        // and reports nothing. Measured on the device, with the Go runtime naming the fault:
+        //   panic: nil pointer dereference at CommandServer.StartOrReloadService
+        java.io.File base = new java.io.File(context.getCacheDir(), "libbox");
+        //noinspection ResultOfMethodCallIgnored
+        base.mkdirs();
+        java.io.File temp = new java.io.File(base, "tmp");
+        //noinspection ResultOfMethodCallIgnored
+        temp.mkdirs();
+        Class<?> setupOptions = Class.forName("io.nekohasekai.libbox.SetupOptions");
+        Object options = setupOptions.getConstructor().newInstance();
+        setupOptions.getMethod("setBasePath", String.class).invoke(options, base.getAbsolutePath());
+        setupOptions.getMethod("setWorkingPath", String.class)
+                .invoke(options, new java.io.File(base, "work").getAbsolutePath());
+        setupOptions.getMethod("setTempPath", String.class).invoke(options, temp.getAbsolutePath());
+        setupOptions.getMethod("setCrashReportSource", String.class).invoke(options, "colgram");
+        setupOptions.getMethod("setDebug", boolean.class).invoke(options, false);
+        Class.forName("io.nekohasekai.libbox.Libbox").getMethod("setup", setupOptions)
+                .invoke(null, options);
+        Log.i(TAG, "the engine was initialised before the tunnel was asked for");
         invoke(tunnelClass, "bringDown", new Class<?>[]{Context.class}, context);
         invoke(configClass, "setWarpEnabled", new Class<?>[]{boolean.class}, false);
 
@@ -160,8 +185,19 @@ public final class ColgramWarpDeviceIntegrationTest {
             Log.i(TAG, "MEASURED warpOn=" + warpOn + " connected="
                     + invoke(tunnelClass, "isConnected", new Class<?>[]{})
                     + " lastFailure=" + lastFailure + " trace=" + trace);
-            assertTrue("the tunnel must come up rather than hang half-open, or the switch is a lie",
-                    (Boolean) invoke(tunnelClass, "isUp", new Class<?>[]{}));
+            // What matters is that the two outcomes are distinguishable, and that a dead route is
+            // not left looking alive. On a filtered network the honest end state is fail-closed:
+            // isUp() false AND a named reason. The earlier version asserted isUp() here, which
+            // contradicts the fail-closed path it had just praised - the test broke out of the
+            // loop precisely because the tunnel had correctly gone down, and then failed for it.
+            boolean up = (Boolean) invoke(tunnelClass, "isUp", new Class<?>[]{});
+            String reason = (String) invoke(tunnelClass, "lastFailureReason", new Class<?>[]{});
+            if (warpOn) {
+                assertTrue("WARP answered, so the tunnel must be reported up", up);
+            } else {
+                assertTrue("a route that carries nothing must not be left looking alive", !up);
+                assertNotNull("a dead route must say why, or the row just says "off"", reason);
+            }
             if (!warpOn) {
                 Log.i(TAG, "WARP carried no traffic. That is the network, not the app: measured"
                         + " from the host, 0 of 16 Cloudflare WireGuard ingresses answer a real"

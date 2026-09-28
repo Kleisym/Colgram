@@ -1091,6 +1091,25 @@ public final class DialogRefreshSequencerHarness {
             self.assertIn(setter, service, "the engine is initialised without " + setter)
         self.assertLess(service.index("ensureEngineSetUp();"), service.index("server.startOrReloadService(profilePath"))
 
+    def test_the_command_server_is_started_before_anything_is_reloaded_on_it(self):
+        # startOrReloadService reaches straight for the running service the Go side keeps behind
+        # the server, and with no start() in front that field is a nil it never created. Measured
+        # on the device, twice, as a panic inside CommandServer.StartOrReloadService at
+        # command_server.go:221 - which survived BOTH the engine setup and passing a real
+        # OverrideOptions, so neither was the missing piece. It took all three.
+        #
+        # The override argument matters for the same reason: the Go side reads fields off it
+        # without a nil check, and the Java class has no setters, so a default-constructed
+        # instance is the only way to express "no overrides" from this side.
+        service = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                   "/ColgramVpnService.java").read_text(encoding="utf-8")
+        self.assertIn("server.start();", service)
+        self.assertLess(service.index("server.start();"),
+                        service.index("server.startOrReloadService(profilePath"))
+        self.assertIn("new io.nekohasekai.libbox.OverrideOptions()", service)
+        self.assertNotIn("startOrReloadService(profilePath, null)", service,
+                         "a nil override panics the Go side; it must be a real instance")
+
     def test_the_warp_integration_test_measures_instead_of_asserting_what_it_cannot_know(self):
         """The only end-to-end WARP check has to stay runnable on a blocked network.
 

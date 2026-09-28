@@ -113,7 +113,20 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             server = new CommandServer(new Handler(), platform);
         }
         startForegroundCompat();
-        server.startOrReloadService(profilePath, null);
+        // start() before startOrReloadService(). The Go side keeps the running service behind the
+        // server, and startOrReloadService reaches straight for it: with no start() in front, the
+        // first call dereferences a nil it never created. Measured on the device, twice, as
+        // "panic: invalid memory address or nil pointer dereference" inside
+        // CommandServer.StartOrReloadService at command_server.go:221 - which survived both the
+        // engine setup and passing real OverrideOptions, so neither was the missing piece.
+        server.start();
+        // A real OverrideOptions rather than null. The Go side reads fields off the override
+        // argument without a nil check - measured on the device, a nil there panics with an
+        // invalid memory address inside CommandServer.StartOrReloadService at
+        // command_server.go:221, and takes the whole process with it. The Java class has no
+        // setters, so a default-constructed instance is the only way to say "no overrides" from
+        // this side, and its defaults are exactly that.
+        server.startOrReloadService(profilePath, new io.nekohasekai.libbox.OverrideOptions());
         Log.i(TAG, "tunnel starting with profile " + profilePath);
     }
 
@@ -363,7 +376,10 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         @Override
         public void serviceReload() {
             try {
-                if (server != null) server.startOrReloadService(profilePath, null);
+            if (server != null) {
+                server.start();
+                server.startOrReloadService(profilePath, new io.nekohasekai.libbox.OverrideOptions());
+            }
             } catch (Throwable t) {
                 Log.e(TAG, "reload failed", t);
             }
