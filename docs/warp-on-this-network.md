@@ -704,6 +704,11 @@ something that recognised them and declined.
 
 ### …and that reading was wrong, twenty minutes later
 
+> **Everything from the heading above to the table at the end of this section is wrong.** It is kept
+> only so the mistake stays visible: a conclusion that sounded like the deepest finding in the
+> project, drawn from a control that was not a control. The measurement that replaced it is the
+> aioquic one at the end of this file, where a client that could have succeeded did not.
+
 The sentence above is the clearest example in this file of a conclusion drawn from a control that
 was not a control. The host used for it, `216.239.35.0`, answers NTP and nothing else - so a
 WireGuard packet to it being silent says the **server** declined it, not that a filter did. Six
