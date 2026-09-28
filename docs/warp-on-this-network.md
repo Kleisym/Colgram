@@ -92,6 +92,68 @@ probe still proves nothing, because the filter's behaviour has been observed cha
 sessions. What changed here is not that the network is now silent - it is that the probe is asking
 a question whose answer means what it says.
 
+## The control nobody ran: is QUIC blocked, or just Cloudflare?
+
+Every measurement above was aimed at Cloudflare. That is the one thing a diagnostic about
+Cloudflare's filtering should never do, because "Cloudflare's UDP is filtered here" cannot be told
+apart from "QUIC is filtered here" - and those two call for opposite responses. The first is a
+provider filter something might route around. The second is a property of the path that no amount
+of transport work gets past.
+
+So: the same real 1200-byte QUIC Initial, four unrelated providers, two paths.
+
+```
+route to 162.159.198.2 uses interface: VPNUS
+
+control: DNS over UDP
+  default route          DNS 1.1.1.1:53   answered 1/2
+  bound to 192.168.0.4   DNS 1.1.1.1:53   answered 2/2
+
+Google               default   udp/443  answered 0/2
+Google               bound     udp/443  answered 0/2
+Facebook             default   udp/443  answered 0/2
+Facebook             bound     udp/443  answered 0/2
+Cloudflare resolver  default   udp/443  answered 0/2
+Cloudflare resolver  bound     udp/443  answered 0/2
+Google DNS           default   udp/443  answered 0/2
+Google DNS           bound     udp/443  answered 0/2
+```
+
+**0 of 16, while DNS answers on the same sockets.** The block is not Cloudflare's. It is QUIC as
+such, on this path, and that is why every transport attempt above failed at the same place for the
+same reason - and why none of them could have succeeded by being cleverer.
+
+    python scripts/warp-quic-block-scope.py --ethernet 192.168.0.4
+
+## And the measurements were describing a tunnel, not the connection
+
+The second path in that run exists because of something in Cloudflare's own log, which listed
+`Radmin VPN; 26.226.94.158` among the network interfaces and sent me looking:
+
+```
+VPNUS  (WireGuard Tunnel, C:\Program Files\VPNUS\service\vpnus-service.exe)
+  0.0.0.0/1    ->  100.127.255.1   metric 0
+  128.0.0.0/1  ->  100.127.255.1   metric 0
+
+Find-NetRoute -RemoteIPAddress 162.159.198.2  ->  VPNUS, 128.0.0.0/1, metric 0
+tracert -d 162.159.198.2                     ->  1 hop, 11 ms
+egress                                          ->  5.230.5.13
+```
+
+One hop to a Cloudflare address and a metric-0 default split means the packets never touched the
+home router. **Every host-side measurement in this file described that tunnel.** Worse, the tunnel
+is the thing providing the working TCP 443 at all - bound to the Ethernet address, TCP 443 to both
+Cloudflare ingresses times out at 8 seconds, while unbound it completes TLS 1.3 with h2 in about
+110 ms.
+
+So the user's own connection is *more* restricted than anything measured here, and the measurements
+were not measuring it. That is a limit on the whole file, stated here rather than discovered later.
+The device results in it are the ones that describe a phone's own path.
+
+Nothing was changed to obtain any of this. The tunnel was left running, the service was not
+restarted, and the bypass is a per-socket bind to `192.168.0.4` - which is also what proves the
+second path exists at all, since a bound DNS query answers while a bound QUIC Initial does not.
+
 ### The block is not "all Cloudflare UDP" — and that correction matters
 
 An earlier version of this file said the whole of Cloudflare's UDP was filtered. That was wider than
