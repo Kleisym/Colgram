@@ -41,16 +41,32 @@ public final class ColgramProxyAutonomyDeviceTest {
     public void setUp() {
         context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        savedProxyEnabled = prefs.getString("proxy_enabled", null);
-        savedServer = prefs.getString("proxy_server", null);
-        savedPort = prefs.getString("proxy_port", null);
-        savedManuallyDisabled = prefs.getString("colgram_proxy_manually_disabled", null);
+        // Not getString: proxy_enabled is a BOOLEAN in the app - putBoolean is what writes it - and
+        // SharedPreferencesImpl.getString throws ClassCastException on a Boolean, not returns
+        // null. This only surfaced once another test wrote that key first, which is exactly the
+        // kind of order dependence a test that saves and restores state should not have.
+        savedProxyEnabled = String.valueOf(prefs.getBoolean("proxy_enabled", false));
+        savedServer = stringOrNull("proxy_server");
+        savedPort = stringOrNull("proxy_port");
+        savedManuallyDisabled = stringOrNull("colgram_proxy_manually_disabled");
+    }
+
+    /** A preference's value as a string, or null when unset or stored as another type. */
+    private String stringOrNull(String key) {
+        try {
+            return prefs.getString(key, null);
+        } catch (ClassCastException storedAsSomethingElse) {
+            return null;
+        }
     }
 
     @After
     public void tearDown() {
         SharedPreferences.Editor editor = prefs.edit();
-        restore(editor, "proxy_enabled", savedProxyEnabled);
+        // Back to a BOOLEAN, which is what the app reads. Restoring it as the String "true"
+        // would satisfy this test's own save/restore and then break the next reader with a
+        // ClassCastException - the same trap, one step later.
+        editor.putBoolean("proxy_enabled", Boolean.parseBoolean(savedProxyEnabled));
         restore(editor, "proxy_server", savedServer);
         restore(editor, "proxy_port", savedPort);
         restore(editor, "colgram_proxy_manually_disabled", savedManuallyDisabled);
