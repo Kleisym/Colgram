@@ -154,6 +154,34 @@ where small payloads demonstrably work; the relay then originates the WireGuard 
 network without this filter. Judging the relay on the strength of the UDP result alone would have
 dismissed the only viable route on the basis of a measurement about a different protocol.
 
+### The relay is built, and it is proven to bridge
+
+`scripts/warp-relay-server.py` is the server side: it accepts length-prefixed frames over TCP and
+forwards each as one UDP datagram to Cloudflare's WireGuard endpoint, returning whatever comes
+back. It is deliberately trivial - WireGuard authenticates every packet cryptographically, so a
+relay that mangled traffic could not produce a working tunnel, only a broken one. The tunnel either
+works end to end or does not, and there is no way for this to quietly weaken WireGuard's guarantees.
+
+Run on a box that can reach Cloudflare's WireGuard ports:
+
+```
+python scripts/warp-relay-server.py --keygen
+python scripts/warp-relay-server.py --listen 0.0.0.0:51820 --endpoint 162.159.192.1:2408
+```
+
+Then long-press the WARP row in Colgram and give it that address, port and the relay's public key.
+A relay terminates the handshake, so both the peer key and the endpoint are the relay's - Colgram
+already swaps both together, and there is a test for it.
+
+**Proven, in two halves.** Run here against `1.1.1.1:443`, which answers, the relay returns a
+frame in under a second, so the bridge itself works. Run here against `162.159.192.1:2408`, which
+is filtered, it times out, which is the network rather than the code and is the same result every
+WARP probe gives from this machine.
+
+That is the honest boundary: everything up to Cloudflare's UDP path is built and measured. What is
+missing is a machine whose UDP is not filtered, and until there is one, "WARP works" would be a
+claim rather than a result.
+
 Reproduce:
 
 ```
