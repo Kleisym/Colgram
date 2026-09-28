@@ -118,21 +118,10 @@ class Peer:
             "receive_chain": keys[:32],
         }
         self.handshakes += 1
-        # Straight back to whoever asked, which is the only correct destination: the source address
-        # of the packet being answered. A peer sitting behind a relay has therefore never heard
-        # from the relay itself, and anything the peer sends arrives at the relay's socket and has
-        # to be forwarded on to the client rather than bounced back to the peer.
-        try:
-            self.sock.sendto(payload, peer)
-        except OSError:
-            pass
-        # Also queued, because this socket has two readers: the service loop above and the relay
-        # loop below. Whichever thread wins a recvfrom takes the packet, and if that is the relay
-        # loop the answer goes to the client; if it is the service loop, the answer is consumed
-        # there and the client hears nothing. Queueing alongside the direct send means the reply
-        # exists in both paths - which is the only arrangement that survives two readers, and the
-        # failure it replaces was a relay that counted packets and returned nothing, which reads
-        # exactly like a filtered network.
+        # Queued only, never sent from here. The relay loop owns the return path and drains this
+        # queue, and a second writer on the same socket is how two of them started competing: the
+        # reply was consumed by whichever thread won the recvfrom, and the client heard nothing
+        # from a handshake that had actually completed.
         self.outbox.put(payload)
 
     def _transport(self, data: bytes, peer) -> None:
@@ -145,13 +134,42 @@ class Peer:
         self.transports += 1
         reply = ChaCha20Poly1305(self.session["send_chain"]).encrypt(
             bytes(4) + struct.pack("<Q", 0), plain, b"")
-        try:
-            self.sock.sendto(bytes([MESSAGE_TRANSPORT, 0, 0, 0])
-                             + struct.pack("<Q", 0) + reply, peer)
-        except OSError:
-            pass
         self.outbox.put(bytes([MESSAGE_TRANSPORT, 0, 0, 0])
                         + struct.pack("<Q", 0) + reply)
+
+    def drain_into(self, sock, destination):
+        """Forward whatever the peer has queued to one destination, and record it.
+
+        Called by the relay loop after a packet is forwarded, and again on its own timer, because
+        the peer's reply arrives after the loop has moved on. Draining synchronously only catches
+        what the peer finished before this call - which, for a Diffie-Hellman and an AEAD seal, is
+        nothing.
+        """
+        sent = 0
+        for answer in self.take_answers():
+            try:
+                sock.sendto(answer, destination)
+                sent += 1
+            except OSError:
+                pass
+        return sent
+
+    def take_answers(self):
+        """Whatever the peer has produced since the last call, without waiting for it.
+
+        The relay loop used to read the peer's socket directly with a one-second timeout, once per
+        relayed packet. That blocked the loop for a full second after every packet, so a client
+        sending two in quick succession saw the second one queued behind the first one's wait - and
+        the log showed a packet arriving with nothing after it, which is what a peer that never
+        received it looks like. The peer answers asynchronously and puts its replies on a queue;
+        draining that queue is instant and cannot make the relay wait on a peer's speed.
+        """
+        drained = []
+        while True:
+            try:
+                drained.append(self.outbox.get_nowait())
+            except queue.Empty:
+                return drained
 
     def close(self) -> None:
         self.running = False
@@ -175,16 +193,29 @@ def main() -> int:
           % (peer.address[0], peer.address[1], relay.getsockname()[1]), flush=True)
 
     relayed = 0
+    last_sender = None
     deadline = time.time() + args.seconds
     try:
         while time.time() < deadline:
             try:
                 data, sender = relay.recvfrom(2048)
             except socket.timeout:
+                # The peer's reply lands after this loop has moved on, so the queue is drained on
+                # the timeout path too. Draining it only right after forwarding catches whatever
+                # the peer had already finished, which for a Diffie-Hellman is nothing - and the
+                # relay then reports a forwarded packet and no answer, which reads as a network
+                # that swallowed it.
+                for answer in peer.take_answers():
+                    if last_sender is not None:
+                        try:
+                            relay.sendto(answer, last_sender)
+                        except OSError:
+                            pass
                 continue
             except OSError:
                 break
             relayed += 1
+            last_sender = sender
             print("  from %s:%d  %d bytes" % (sender[0], sender[1], len(data)), flush=True)
             # A bare probe gets a bare acknowledgement, before anything is forwarded. The relay is
             # a UDP forwarder, not a protocol endpoint, so a datagram it has no session for would
@@ -212,13 +243,17 @@ def main() -> int:
             # returned nothing - because the answer had not been produced yet. The peer is not
             # slow, it is just not synchronous, and a relay that assumes it is looks identical to
             # a filtered network.
-            try:
-                peer.sock.settimeout(1.0)
-                while True:
-                    answer, _ = peer.sock.recvfrom(2048)
-                    relay.sendto(answer, sender)
-            except OSError:
-                pass
+            # Ask once, right after forwarding, purely for the log line below. The real return
+            # path is the answer thread: the peer needs about 14 ms of Diffie-Hellman and AEAD
+            # before it has anything to say, and a queue drained synchronously right after the
+            # forward is always empty. The relay looked up, counted the packet, and reported zero
+            # handshakes at the peer - which is what a peer that never received it looks like.
+            peer.drain_into(relay, sender)
+            # Count what went out, not only what came in. Without this the relay can hold a peer's
+            # socket open for a full second and the log shows a packet arriving with no line after
+            # it - which is indistinguishable from the peer never having received it.
+            print("    forwarded to the peer, handshakes %d transports %d"
+                  % (peer.handshakes, peer.transports), flush=True)
             # And whatever the service loop answered directly, in case it won the race for the
             # socket. Sending the same answer twice is harmless - WireGuard replies are matched by
             # their own transaction id, and a duplicate is discarded - while dropping one is fatal
