@@ -2062,3 +2062,45 @@ asserting only the address would have let exactly that through.
 And the setting has to be reversible. An app left pointing at a relay that is not there is worse
 than one that never had it, and that is checked too rather than assumed from the setter's name.
 
+## The bug this finally found: "up" is a flag, not a tunnel
+
+Every relay test until this one had Python on both ends - a peer implementing WireGuard, the relay
+in front of it, and a client driving the protocol itself. That proves the relay forwards bytes
+faithfully. It says nothing about whether **the code that ships** can use it, because the production
+path is a sing-box `wireguard` endpoint inside a profile, and a profile is a shape: it validates, it
+starts, it installs routes.
+
+So the shipping engine was started against a live relay with a live peer behind it. And this is what
+came back:
+
+```
+relay peer key 945656we... at 10.0.2.2:51823
+the profile names the relay: true
+the engine reported the tunnel up: true
+
+the relay's own log, over the same period:
+  LISTENING 51823
+  PEER_PUBLIC_KEY 945656we...
+  - nothing else, not one packet
+```
+
+**The app believed the tunnel was up, and not a single byte reached the relay.** Two facts that look
+identical in the settings screen and mean opposite things.
+
+The cause is right there in the class, and it has been there all along:
+
+```java
+public static boolean isUp()      { return up; }        // a flag set when the engine starts
+/** True only after the embedded backend reports actual bytes from the WARP peer. */
+public static boolean isConnected() { return up && connected; }
+```
+
+The honest method already existed, with a comment describing exactly this. The test was reading
+`isUp`, which is the flag. That is the failure this project has been chasing since the first silent
+profile, and it survived every byte-level and protocol-level check because **all of them were on the
+other side of it**: the relay was right, the packet format was right, the key schedule was right, and
+the app was still reporting a tunnel that carried nothing.
+
+The test now waits for `isConnected` and says plainly that a profile naming the relay being handed to
+the engine is not a tunnel - it is a shape.
+

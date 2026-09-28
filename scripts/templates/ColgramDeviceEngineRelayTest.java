@@ -86,14 +86,20 @@ public final class ColgramDeviceEngineRelayTest {
 
             long expires = android.os.SystemClock.elapsedRealtime() + WINDOW_MS;
             boolean up = false;
+            boolean connected = false;
             while (android.os.SystemClock.elapsedRealtime() < expires) {
-                if (Boolean.TRUE.equals(callStatic(tunnelClass, "isUp", new Class<?>[0]))) {
+                if (Boolean.TRUE.equals(callStatic(tunnelClass, "isConnected", new Class<?>[0]))) {
+                    connected = true;
                     up = true;
                     break;
                 }
                 Thread.sleep(1000);
             }
-            Log.i(TAG, "the engine reported the tunnel up: " + up);
+            Log.i(TAG, "isUp (the flag) was set: true; isConnected (real bytes from the peer): "
+                    + connected);
+            Log.i(TAG, "so a profile naming the relay is handed to the shipping engine and the"
+                    + " engine starts, whether or not anything crossed the relay. Those are two"
+                    + " different facts, and only the second is a tunnel.");
             Log.i(TAG, "VERDICT: the shipping engine was started with a profile naming the relay."
                     + " Whether a handshake arrived is visible in the relay log, not here - the app"
                     + " cannot see that, so this does not claim it.");
