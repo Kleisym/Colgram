@@ -203,6 +203,12 @@ public final class ColgramDeviceRelayWireGuardTest {
         } catch (Exception e) {
             Log.w(TAG, "the exchange could not be run: " + e.getClass().getSimpleName()
                     + " - " + e.getMessage());
+            // A swallowed exception here reads as a pass. The test's name says the exchange
+            // crossed; if the transport half never ran, it did not, and BLAKE2s not being on the
+            // platform is a fact about this test rather than about the relay. Failing is the only
+            // way that stays visible - a green run that measured half of what it claims is the
+            // exact failure this project has been correcting all along.
+            throw new AssertionError("the transport half of the exchange never ran: " + e, e);
         } finally {
             client.close();
         }
@@ -294,12 +300,129 @@ public final class ColgramDeviceRelayWireGuardTest {
     }
 
     private static byte[] hashlibLikeIdentifier() {
-        try {
-            java.security.MessageDigest blake = java.security.MessageDigest.getInstance("BLAKE2s-256");
-            return blake.digest("WireGuard v1 zx2c4 Jason@zx2c4.com".getBytes("UTF-8"));
-        } catch (Exception e) {
-            throw new IllegalStateException("BLAKE2s-256 is unavailable: " + e, e);
+        // BLAKE2s-256, implemented here because Android does not ship it: "BLAKE2s-256" is not in
+        // MessageDigest.getInstance on any API level this app supports, and neither is BouncyCastle
+        // on the classpath. Requesting it by name threw NoSuchAlgorithmException, which the test
+        // caught and reported as a log line - so a run that measured only the handshake came out
+        // green. The hash is small and specified, and having it here keeps the measurement whole.
+        // Checked against a known vector first. A hand-written hash that is subtly wrong produces a
+        // wrong chaining key, the peer derives different transport keys, and the packet is dropped
+        // in silence - which is this project's recurring false reading of a network problem. A
+        // vector turns that into a failure at the point of the mistake.
+        org.junit.Assert.assertEquals("BLAKE2s-256 is wrong, so every key below is wrong too",
+                "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9",
+                toHex(blake2s256(new byte[0])));
+        org.junit.Assert.assertEquals("BLAKE2s-256 disagrees on a non-empty input",
+                "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982",
+                toHex(blake2s256("abc".getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+        return blake2s256("WireGuard v1 zx2c4 Jason@zx2c4.com"
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder out = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            out.append(String.format("%02x", b & 0xFF));
         }
+        return out.toString();
+    }
+
+    private static final int[] BLAKE2S_IV = {
+            0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+            0x1F83D9AB, 0x5BE0CD19};
+    private static final byte[] BLAKE2S_SIGMA = {
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+            11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+            7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+            9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+            2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+            12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+            2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+            5, 2, 14, 11, 8, 12, 3, 0, 6, 15, 4, 7, 10, 1, 13, 9,
+            0, 15, 14, 5, 6, 11, 10, 4, 3, 1, 12, 7, 2, 13, 8, 9};
+
+    private static byte[] blake2s256(byte[] input) {
+        int[] h = BLAKE2S_IV.clone();
+        // Parameter block: digest length 32, no key, fanout and depth of one.
+        h[0] ^= 0x01010020;
+        int[] v = new int[16];
+        long counter = 0;
+        int at = 0;
+        do {
+            int[] block = new int[16];
+            int take = Math.min(64, input.length - at);
+            for (int i = 0; i < take; i += 4) {
+                int word = 0;
+                for (int k = 3; k >= 0; k--) {
+                    int index = at + i + k;
+                    word = (word << 8) | (index < input.length ? (input[index] & 0xFF) : 0);
+                }
+                block[i / 4] = word;
+            }
+            counter += 64;
+            boolean last = at + 64 >= input.length;
+            compress(h, block, (int) counter, last);
+            at += 64;
+        } while (at < input.length);
+        byte[] out = new byte[32];
+        for (int i = 0; i < 8; i++) {
+            out[i * 4] = (byte) (h[i] >>> 24);
+            out[i * 4 + 1] = (byte) (h[i] >>> 16);
+            out[i * 4 + 2] = (byte) (h[i] >>> 8);
+            out[i * 4 + 3] = (byte) h[i];
+        }
+        return out;
+    }
+
+    private static void compress(int[] h, int[] block, int counter, boolean last) {
+        int[] v = new int[16];
+        System.arraycopy(h, 0, v, 0, 8);
+        System.arraycopy(BLAKE2S_IV, 0, v, 8, 8);
+        v[12] ^= counter;
+        v[13] ^= counter >>> 32;
+        if (last) v[14] = ~v[14];
+        int[] m = block.clone();
+        for (int round = 0; round < 10; round++) {
+            int s0 = BLAKE2S_SIGMA[round * 16] & 0xFF;
+            int s1 = BLAKE2S_SIGMA[round * 16 + 1] & 0xFF;
+            int s2 = BLAKE2S_SIGMA[round * 16 + 2] & 0xFF;
+            int s3 = BLAKE2S_SIGMA[round * 16 + 3] & 0xFF;
+            int s4 = BLAKE2S_SIGMA[round * 16 + 4] & 0xFF;
+            int s5 = BLAKE2S_SIGMA[round * 16 + 5] & 0xFF;
+            int s6 = BLAKE2S_SIGMA[round * 16 + 6] & 0xFF;
+            int s7 = BLAKE2S_SIGMA[round * 16 + 7] & 0xFF;
+            int s8 = BLAKE2S_SIGMA[round * 16 + 8] & 0xFF;
+            int s9 = BLAKE2S_SIGMA[round * 16 + 9] & 0xFF;
+            int s10 = BLAKE2S_SIGMA[round * 16 + 10] & 0xFF;
+            int s11 = BLAKE2S_SIGMA[round * 16 + 11] & 0xFF;
+            int s12 = BLAKE2S_SIGMA[round * 16 + 12] & 0xFF;
+            int s13 = BLAKE2S_SIGMA[round * 16 + 13] & 0xFF;
+            int s14 = BLAKE2S_SIGMA[round * 16 + 14] & 0xFF;
+            int s15 = BLAKE2S_SIGMA[round * 16 + 15] & 0xFF;
+            g(v, 0, 4, 8, 12, m[s0], m[s1]);
+            g(v, 1, 5, 9, 13, m[s2], m[s3]);
+            g(v, 2, 6, 10, 14, m[s4], m[s5]);
+            g(v, 3, 7, 11, 15, m[s6], m[s7]);
+            g(v, 0, 5, 10, 15, m[s8], m[s9]);
+            g(v, 1, 6, 11, 12, m[s10], m[s11]);
+            g(v, 2, 7, 8, 13, m[s12], m[s13]);
+            g(v, 3, 4, 9, 14, m[s14], m[s15]);
+        }
+        for (int i = 0; i < 8; i++) {
+            h[i] ^= v[i] ^ v[i + 8];
+        }
+    }
+
+    private static void g(int[] v, int a, int b, int c, int d, int x, int y) {
+        v[a] = v[a] + v[b] + x;
+        v[d] = Integer.rotateRight(v[d] ^ v[a], 16);
+        v[c] = v[c] + v[d];
+        v[b] = Integer.rotateRight(v[b] ^ v[c], 12);
+        v[a] = v[a] + v[b] + y;
+        v[d] = Integer.rotateRight(v[d] ^ v[a], 8);
+        v[c] = v[c] + v[d];
+        v[b] = Integer.rotateRight(v[b] ^ v[c], 7);
     }
 
     private static byte[] mixKey(byte[] key, byte[] material) {
