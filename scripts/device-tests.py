@@ -43,6 +43,7 @@ DEVICE_TESTS = [
     "org.colgram.core.ColgramDeviceQuicScopeTest",
     "org.colgram.core.ColgramDeviceUdpPortTest",
     "org.colgram.core.ColgramDeviceRelayWireGuardTest",
+    "org.colgram.core.ColgramDeviceReachabilityTest",
     "org.colgram.core.ColgramDeviceWarpRegistrationTest",
     "org.colgram.core.ColgramDeviceSniFilterTest",
     "org.colgram.core.ColgramProxyAutonomyDeviceTest",
