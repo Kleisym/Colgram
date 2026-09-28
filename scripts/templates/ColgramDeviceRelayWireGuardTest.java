@@ -64,7 +64,7 @@ public final class ColgramDeviceRelayWireGuardTest {
     private static final int DEFAULT_PORT = 51823;
 
     @Test
-    public void aRealSizedExchangeCrossesFromTheDeviceToARelayOnThisHost() {
+    public void aRealSizedExchangeCrossesFromTheDeviceToARelayOnThisHost() throws Exception {
         String host = System.getProperty("colgram.relay.host", DEFAULT_HOST);
         int port = Integer.getInteger("colgram.relay.port", DEFAULT_PORT);
         Random random = new Random();
@@ -106,7 +106,12 @@ public final class ColgramDeviceRelayWireGuardTest {
             // shape of a filtered network, caused by the packet this test built.
             fillWithValidX25519(initiation, 36);
             fillWithValidX25519(initiation, 4);
-            org.junit.Assert.assertEquals(INITIATION_BYTES, initiation.length);
+                // Not assertEquals(int, int, String): that overload carries a delta and exists for
+                // long and double, so an int comparison with a message does not compile - the same
+                // trap that cost seven minutes earlier in this project, and caught here by
+                // compiling the test module on its own before running it.
+                org.junit.Assert.assertTrue("the initiation must be exactly " + INITIATION_BYTES
+                        + " bytes in WireGuard's field layout", initiation.length == INITIATION_BYTES);
 
             try {
                 client.send(new DatagramPacket(initiation, initiation.length,
@@ -114,9 +119,9 @@ public final class ColgramDeviceRelayWireGuardTest {
                 DatagramPacket response = new DatagramPacket(new byte[2048], 2048);
                 client.receive(response);
                 int first = response.getData()[response.getOffset()] & 0xff;
-                org.junit.Assert.assertEquals(MESSAGE_RESPONSE, first,
-                        "the far side did not answer with a message-response, so a handshake-sized"
-                        + " packet did not survive the hop intact");
+                org.junit.Assert.assertTrue("the far side answered with 0x" + Integer.toHexString(first)
+                        + " rather than a message-response, so a handshake-sized packet did not"
+                        + " survive the hop intact", first == MESSAGE_RESPONSE);
                 Log.i(TAG, "a 148-byte message-initiation crossed to the relay and a"
                         + " message-response came back");
             } catch (java.net.SocketTimeoutException e) {
@@ -137,8 +142,9 @@ public final class ColgramDeviceRelayWireGuardTest {
             try {
                 DatagramPacket echo = new DatagramPacket(new byte[2048], 2048);
                 client.receive(echo);
-                org.junit.Assert.assertEquals(PROBE_BYTES, echo.getLength(),
-                        "the far side's traffic did not survive the hop");
+                org.junit.Assert.assertTrue("the far side's traffic did not survive the hop:"
+                        + echo.getLength() + "B came back instead of " + PROBE_BYTES,
+                        echo.getLength() == PROBE_BYTES);
                 Log.i(TAG, "VERDICT: a 148-byte handshake-sized packet and a "
                         + PROBE_BYTES + "-byte transport packet both crossed from the device to a"
                         + " relay on this host and came back. The phone's half of the relay path"
