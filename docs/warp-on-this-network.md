@@ -38,6 +38,14 @@ ports are all silent.** So Cloudflare's edge *is* reachable by UDP from this net
 filtered is the WireGuard service on it. Those are different problems, and only the first is
 something a different transport could work around.
 
+Re-run against that one address alone, so the comparison cannot be an artefact of sweep order:
+
+```
+python scripts/warp-port-sweep.py --host 162.159.192.1
+
+answered 1, silent 15        # the one answer is 443
+```
+
 **What it does not do is make WARP work.** WARP speaks WireGuard, not QUIC. An open 443 cannot carry
 a WireGuard handshake, so this narrows the diagnosis without opening a route. It does mean the
 relay conclusion survives a sharper test than the one it was originally based on.
