@@ -240,6 +240,24 @@ The relay's case does not rest on which port is shut, and now does not have to.
 
     python scripts/warp-udp-port-reachability.py --host 162.159.192.1
 
+## The exact shape Colgram uses, driven end to end
+
+The relay tests reach it over UDP because that is the hop a sing-box `wireguard` endpoint can
+actually take - a point the join test made and the earlier byte tests did not. Running the real
+protocol implementation through it, in the same arrangement the app's profile describes:
+
+```
+sing-box wireguard endpoint  ->  relay UDP port  ->  real WireGuard peer
+
+handshake  -> True
+transport  -> True
+peer decrypted: 1
+```
+
+A real handshake and a real ChaCha20Poly1305 transport packet, through the relay, opened by a peer
+that holds the key only because the handshake established it. **This is the whole client half of the
+relay design, working**, and the only thing it does not include is the far side's own egress.
+
 ## The identity half, proven on the device
 
 Every transport result above describes what cannot get through. The other half - whether the phone
