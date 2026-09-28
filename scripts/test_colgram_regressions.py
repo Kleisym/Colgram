@@ -1067,6 +1067,17 @@ public final class DialogRefreshSequencerHarness {
         self.assertNotIn("while (up && failedEndpoints < endpointCount)", tunnel,
                          "a single pass gives up before a moving filter has settled")
 
+    def test_the_warp_device_test_outlasts_the_apps_own_patience(self):
+        # The test watched for 75 seconds while the app keeps retrying for five minutes. It therefore
+        # reported a verdict while the tunnel was still being given a fair chance - measuring the
+        # test's impatience rather than WARP, and making a slow route look dead for the same reason
+        # the old 32-second watchdog did.
+        source = (ROOT / "scripts/templates/ColgramWarpDeviceIntegrationTest.java").read_text(
+            encoding="utf-8")
+        self.assertIn("WARP_TRAFFIC_TIMEOUT_MS = 6L * 60L * 1000L", source,
+                      "the device test must outlast the app's five-minute patience window")
+        self.assertIn("MEASURED warpOn=", source)
+
     def test_the_warp_probe_repeats_because_this_filter_changes_over_time(self):
         # The same hosts, ports and payload sizes, minutes apart, gave INVERTED answers:
         #

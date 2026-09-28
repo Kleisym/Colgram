@@ -33,7 +33,16 @@ import java.nio.charset.StandardCharsets;
 public final class ColgramWarpDeviceIntegrationTest {
     private static final String TAG = "ColgramWarpDeviceTest";
     private static final long VPN_CONSENT_TIMEOUT_MS = 45_000L;
-    private static final long WARP_TRAFFIC_TIMEOUT_MS = 75_000L;
+    /**
+     * How long to watch for traffic.
+     *
+     * This has to outlast the app's own patience window, or the test stops watching while the app
+     * is still legitimately trying. The watchdog keeps retrying for five minutes because the filter
+     * on this network moves on a scale of minutes, and a test that gave up at 75 seconds was
+     * measuring its own impatience rather than WARP - it reported a verdict while the tunnel was
+     * still being given a fair chance to connect.
+     */
+    private static final long WARP_TRAFFIC_TIMEOUT_MS = 6L * 60L * 1000L;
 
     @Test
     public void registeredWireGuardProfileCarriesCloudflareWarpTraffic() throws Exception {
