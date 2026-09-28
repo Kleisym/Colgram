@@ -382,6 +382,36 @@ a port, and the httpx SNI override turning 200 into 403. The rule holds: **a too
 distinguish refused from filtered from broken cannot answer a question about filtering**, and the
 cheapest check is a live listener on the far end that counts what actually arrives.
 
+### …and with a control, the emulator turns out to reach the host after all
+
+The correction above removed the reason for believing the emulator would not talk to its host. With
+a destination that is **provably listening** on the host, the same probe says:
+
+```
+1.1.1.1:53        silent
+10.0.2.2:51823    silent     the host's relay port
+192.168.0.4:51823 silent     the host's LAN address
+10.0.2.2:51827    answered 9B    a known-live UDP echo on the host - the control
+8.8.8.8:53        silent
+```
+
+**The control answers and the relay port does not.** That is a real difference, produced by the same
+socket and the same code in the same run, and it inverts the conclusion of the previous section: the
+emulator does reach the host over UDP - the echo on the far end logged the arriving datagram, its
+first byte and all 1200 bytes of it.
+
+So what is actually true is narrower and more interesting than "the emulator cannot reach the host":
+
+  * the path from the device to a host-side UDP port **works**, and is proven by a live listener;
+  * the relay's own port is silent from the device while a plain echo on the same gateway address
+    is not.
+
+Those two facts differ by one thing: what the relay does with the packet. It forwards it to a peer,
+and that peer's answer is what has to come back. A relay that loses its own peer's reply looks
+exactly like a port that is not reached - which is the bug this file spent three commits fixing, and
+which a reachability probe cannot distinguish from a network. That is the argument for measuring
+the exchange end to end rather than the port, and for not concluding "blocked" from "silent".
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
