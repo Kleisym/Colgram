@@ -102,8 +102,13 @@ public final class ColgramDeviceRelayWireGuardTest {
             // padded(16) | padding(4). A packet of any other size is accepted by nothing, and
             // reads as a blocked network.
             byte[] initiation = new byte[INITIATION_BYTES];
-            initiation[0] = (byte) MESSAGE_INITIATION;
             random.nextBytes(initiation);
+            // Set the type AFTER the fill, not before. A byte written and then overwritten by
+            // nextBytes leaves the packet with a random first byte, so the relay classifies a
+            // handshake as a bare probe and answers RELAY-OK - the test then reads its own
+            // reachability marker back where it expected a message-response, and the failure says
+            // something about the network that is entirely about this line.
+            initiation[0] = (byte) MESSAGE_INITIATION;
             for (int i = 5; i < 21; i++) initiation[i] = (byte) (0xA0 + i);
             for (int i = 21; i < 37; i++) initiation[i] = (byte) (0x50 + i);
             // The sender's ephemeral MUST be a real X25519 point, not 16 arbitrary bytes. The
