@@ -443,6 +443,36 @@ turn this from a harness limitation into a measurement.
     adb -s emulator-5554 reverse --remove-all
     adb forward tcp:51823 tcp:51823        # TCP only; there is no UDP equivalent
 
+### …and the return path works, which makes the previous conclusion wrong again
+
+That section concluded the emulator is a one-way UDP path because the host saw the device's packet
+arrive from `127.0.0.1`, and reasoned that every reply must therefore go to a loopback port. The
+first half is measured; the second is not, and the relay now answers a marker from the device:
+
+```
+the device reached 10.0.2.2:51823 over UDP - 13B came back
+```
+
+So QEMU rewrites the source address the host *sees* and still routes the reply back to the device -
+the mapping is internal to it. Inferring "no return path" from "the source is loopback" was a step
+too far, and it is the same mistake as the rest of this file in a new place: reading a property of
+the observation as a property of the network.
+
+What is genuinely established, and what is not:
+
+| Link | State |
+|---|---|
+| device -> relay port, UDP | **works** - the relay logs both the 1200-byte marker and the 148-byte initiation |
+| relay -> device, bare probe | **works** - `RELAY-OK`, 13 bytes back |
+| relay -> device, after the peer answers | **not yet measured** - the initiation arrives at the relay and the log stops there |
+
+That last row is the one that matters, and the reason it is open is not the network: the relay's
+return path drains the peer's queue on its own timer, and a run has to be long enough for a
+Diffie-Hellman and an AEAD seal to finish between two polls. The peer answers in about 14 ms and the
+relay polls every 500 ms, so the delay should be small - but a relay that dies between the forward
+and the reply, as one did, produces exactly this signature, and separating the two takes a run where
+the relay stays up.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
