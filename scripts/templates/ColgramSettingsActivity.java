@@ -801,7 +801,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                 new org.telegram.ui.ActionBar.AlertDialog.Builder(getParentActivity());
         builder.setTitle("Релей для WARP");
         builder.setMessage("Нужен, если UDP Cloudflare заблокирован: релея держите сами, "
-                + "он принимает WireGuard по TCP и проксирует в Cloudflare.");
+                + "он принимает WireGuard по UDP и проксирует в Cloudflare. "
+                + "Запускайте его с ключом --udp-listen: порт отсюда должен быть UDP, "
+                + "иначе туннель не поднимется.");
         builder.setView(layout);
         builder.setPositiveButton("Сохранить", (d, w) -> {
             int portNumber = 0;

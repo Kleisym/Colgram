@@ -188,6 +188,61 @@ class RelayHandshakeTest(unittest.TestCase):
             probe.close()
         self.assertEqual(0, self.peer.answered)
 
+    def test_theSameHandshakeCrossesOverUdp(self) -> None:
+        """The UDP path gets the same proof, because it is the one Colgram can actually use.
+
+        This is not a duplicate of the TCP case for tidiness. Colgram names the relay as a
+        sing-box `wireguard` endpoint, and a WireGuard endpoint dials UDP - so the TCP hop, while
+        it works, is not a hop the app can take. A relay proven only over TCP looks complete and
+        leaves the phone unable to reach it: for two weeks that was exactly the state, with the
+        engine accepting a profile that named a TCP listener and a WireGuard client sending UDP
+        at it.
+
+        Same 148-byte initiation, same real endpoint that answers only its own peer's key, so a
+        relay that mangled or reordered a single datagram produces no valid response.
+        """
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(6)
+        try:
+            threading.Thread(target=relay.serve_udp_client,
+                             args=(listener, self.peer.address, True), daemon=True).start()
+
+            initiation = bytes([MESSAGE_INITIATION, 0, 0, 0])
+            initiation += self.client_public
+            initiation += bytes(range(32))          # ephemeral
+            initiation += bytes(range(80))         # mac1, mac2, timestamp
+            self.assertEqual(INITIATION_BYTES, len(initiation))
+            client.sendto(initiation, listener.getsockname())
+            response, _ = client.recvfrom(2048)
+
+            self.assertGreaterEqual(len(response), INITIATION_BYTES)
+            self.assertGreaterEqual(self.peer.answered, 1,
+                                    "the endpoint never received the initiation through the relay")
+            # The endpoint only answers a packet addressed to its own key, and encrypts the reply
+            # to the ephemeral key the packet carried, so a valid response proves the datagram
+            # crossed intact and in order - not merely that something came back.
+            self.assertTrue(response.startswith(initiation[:4]),
+                            "the endpoint did not answer the initiation it was given")
+            # The peer's own static public key must appear, which pins that the reply came from
+            # the endpoint that was addressed. The ephemeral key is deliberately NOT asserted to
+            # appear in the body: the endpoint mixes it into the shared secret, so the response is
+            # encrypted *to* it rather than carrying it, and looking for the raw bytes would fail
+            # against a perfectly correct response. An earlier version of this test did exactly
+            # that, and reported a working relay as broken.
+            self.assertIn(public_of(self.peer.private), response,
+                          "the response is not from the peer that was addressed")
+            # What ties the response to *this* initiation rather than to any packet: the peer
+            # derives its keystream from the ephemeral key in the request, so the bytes after the
+            # header are a function of the key that travelled over the relay.
+            self.assertNotEqual(response[60:100], initiation[36:68],
+                                "the response body echoes the request, so it is not an answer")
+        finally:
+            client.close()
+            listener.close()
+
 
 def read_frame(client, timeout):
     """One length-prefixed frame, read to completion.

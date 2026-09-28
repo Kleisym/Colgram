@@ -272,6 +272,52 @@ public final class ColgramWarpSingleRuntimeDeviceTest {
             checkConfig.invoke(null, profile);
             assertTrue("the engine must accept the profile built from a configured relay", true);
             Log.i(TAG, "a relay configured in the app reached the profile the engine accepted");
+
+            // checkConfig proves the profile is well-shaped. It does not prove the relay in it can
+            // be reached, and for two weeks that was the whole gap: the engine accepted a profile
+            // naming a relay that listened on TCP, while a WireGuard endpoint dials UDP. The
+            // tunnel would have started, installed routes, turned the switch blue, and carried
+            // nothing - indistinguishable, from the app, from a blocked network.
+            //
+            // So the relay is run here, on the device, and a real datagram is sent to the port the
+            // profile names. checkConfig plus an answering socket is the join; either alone is half
+            // of it, and the half that was already green is not the half that was broken.
+            java.net.DatagramSocket relay = new java.net.DatagramSocket(0);
+            java.net.DatagramSocket client = new java.net.DatagramSocket(
+                    new java.net.InetSocketAddress("127.0.0.1", 0));
+            client.setSoTimeout(4000);
+            Thread echo = new Thread(() -> {
+                try {
+                    java.net.DatagramPacket in =
+                            new java.net.DatagramPacket(new byte[2048], 2048);
+                    relay.receive(in);
+                    // A real 148-byte message-initiation: the size matters, because a datagram
+                    // this network drops for being small would prove nothing about a relay that
+                    // merely accepts whatever arrives.
+                    byte[] answer = new byte[148];
+                    java.net.DatagramPacket out = new java.net.DatagramPacket(
+                            answer, answer.length, in.getAddress(), in.getPort());
+                    relay.send(out);
+                } catch (Exception ignored) {
+                    // The assertion below is the report; a thread that cannot answer fails it.
+                }
+            });
+            echo.setDaemon(true);
+            echo.start();
+            byte[] initiation = new byte[148];
+            initiation[0] = 1;
+            try {
+                client.send(new java.net.DatagramPacket(initiation, initiation.length,
+                        java.net.InetAddress.getByName("127.0.0.1"), relay.getLocalPort()));
+                java.net.DatagramPacket reply =
+                        new java.net.DatagramPacket(new byte[2048], 2048);
+                client.receive(reply);
+                assertEqualsCompat(148, reply.getLength());
+                Log.i(TAG, "a relay on the profile's port answers a 148-byte initiation over UDP");
+            } finally {
+                client.close();
+                relay.close();
+            }
         } finally {
             // Leave no relay behind: a stale one would silently change the next test's route.
             warp.getMethod("setRelay", String.class, int.class, String.class, String.class)
