@@ -2037,3 +2037,28 @@ So the filter does not open, on either path, over the window observed - and the 
 sentence is exactly the window. It is a statement about twenty minutes, not a proof about the
 network, and it is the strongest claim this file can make about QUIC.
 
+## The last untested link: does a relay set in the app reach the engine at all
+
+Every relay result above was measured on a relay, and the join test used a relay on the same device
+as the profile. Nothing had checked the other half on a real phone: that **setting a relay in the
+running app** replaces Cloudflare's endpoint with the relay's, in the profile the engine is actually
+started with.
+
+Those are different claims, and the difference is the failure mode that produced most of this file's
+wrong readings - a relay that answers on a port while the profile never dials it looks identical
+from the relay's side. So the test drives the app's own `setRelay` and reads back what `warpProfile`
+would hand the engine:
+
+```
+relayed profile:  ... a name that includes relay.example.net, the relay's 51820, the relay's peer key,
+                         and no trace of Cloudflare's host
+restored profile: ... Cloudflare's own host and its own port are back
+```
+
+The peer's key matters as much as the address. A relay terminates the WireGuard handshake, so a
+relayed profile carrying Cloudflare's key fails in a way that is indistinguishable from a block - and
+asserting only the address would have let exactly that through.
+
+And the setting has to be reversible. An app left pointing at a relay that is not there is worse
+than one that never had it, and that is checked too rather than assumed from the setter's name.
+
