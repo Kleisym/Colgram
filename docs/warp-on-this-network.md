@@ -200,6 +200,55 @@ question is settled rather than open.
 
     python scripts/device-tests.py org.colgram.core.ColgramDeviceQuicScopeTest
 
+## The control for "2408 is silent": is the port shut, or does UDP not arrive?
+
+"2408 is silent" has been this project's constant for a long time, and it was read as "the
+WireGuard port is filtered". That needs a control, and it turns out the control was hiding in plain
+sight as a host that answered where nothing should have.
+
+**A host that answers on 443, and what it answers with.** `208.67.222.222` resolves to
+`dns.sse.cisco.com` and answers on 53, 5353 and 443 - three ports, which is already a hint that "443
+answers" says nothing about 443 running a service. Sent a real QUIC Initial:
+
+```
+12B  c30080810000000000000000
+
+six different Initials -> byte-identical answer every time
+```
+
+Parsed: long header, fixed bit set, version `0x00808100`, DCID length 0, SCID length 0. A QUIC
+server answers an Initial with an Initial or a Retry, and either carries a real version - `1`, or a
+version-negotiation list - with non-zero connection ids. `0x00808100` is not a QUIC version, and
+zero-length ids with an all-zero body is the shape of a stub. It is a resolver holding other ports
+open, not speaking QUIC on them.
+
+**The same sweep against Cloudflare, with a real DNS query on every port:**
+
+```
+162.159.192.1  udp/53 80 443 123 853 2408 500 1701 3478 4500 5353 8080 8443 5000 51820 65535
+                 all silent
+  ports that answered at all: none
+```
+
+Sixteen ports, **including 53**, with a query six resolvers answer elsewhere in the same second. So
+UDP does not reach that address on any port tested, and the silence is about the path rather than
+about 2408 being singled out. The honest statement is narrower and stronger than "2408 is
+filtered": **UDP to Cloudflare's WireGuard and MASQUE addresses does not arrive at all**, while UDP
+to resolvers does, and TCP 443 to those same Cloudflare addresses completes TLS 1.3 with h2.
+
+The relay's case does not rest on which port is shut, and now does not have to.
+
+    python scripts/warp-udp-port-reachability.py --host 162.159.192.1
+
+### The same mistake, for the third time in this project
+
+Counting a 31-byte stateless reset as a QUIC service. Counting a 12-byte stub on a Cisco resolver
+as an open QUIC port. And earlier, counting a 403 from an httpx `sni_hostname` override as
+Cloudflare declining a request. All three are the same failure: **something arrived, so a service
+must have answered it.** The reply has to be one the service could only have sent, and until that is
+checked, an answer is evidence that a path is open - which is much weaker than evidence that a
+service is running.
+
 ### The block is not "all Cloudflare UDP" — and that correction matters
 
 An earlier version of this file said the whole of Cloudflare's UDP was filtered. That was wider than
