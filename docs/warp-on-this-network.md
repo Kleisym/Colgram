@@ -1854,3 +1854,50 @@ This is the same class of bug as the 403s and the QUIC silence: a measurement th
 as a block. Three of this file's earlier conclusions were wrong for exactly that reason, and the
 fourth was saved by reading the body of the error instead of its status code.
 
+## The measurement this file was missing: QUIC, asked of a client that could have worked
+
+Every QUIC result above came from sending bytes at a port. **No QUIC endpoint was ever confirmed
+reachable from here** - so "QUIC is filtered" rested on a control that was itself unverified. Each
+host tried is silent whether the path drops QUIC or the destination does not serve it, and the file
+had been reading the second as the first for a long time.
+
+Two measurements, and the first one with something that could actually have succeeded.
+
+**On the host, with aioquic** - the QUIC implementation curl builds against, against four hosts
+that are known to serve QUIC:
+
+```
+www.google.com     ->  silent after 6.0s    a real QUIC deployment on udp/443
+cloudflare.com     ->  silent after 6.1s    the same edge that answers h2 on tcp/443
+www.facebook.com   ->  silent after 6.1s    a real QUIC deployment on udp/443
+dns.google         ->  silent after 6.1s    a resolver that also speaks HTTP/3
+
+0 of 4 handshakes completed
+```
+
+**On the device, with a real Initial over a connected socket** - a host with no tunnel of its own:
+
+```
+142.250.74.174:443  silent   Google - a real QUIC deployment on udp/443
+104.16.132.229:443  silent   Cloudflare - the same edge that answers h2 on tcp/443
+157.240.1.35:443     silent   Facebook - a real QUIC deployment on udp/443
+control  1.1.1.1:53  18B     a resolver that always answers
+
+TOTAL 0/3 hosts sent something a QUIC server could have sent
+```
+
+**Both agree, and the control is inside the same run.** Two paths - one through a WireGuard
+tunnel, one with no tunnel on the device - and neither carries a QUIC handshake to a host that
+serves it every day, while a DNS query to the same socket gets 18 bytes back.
+
+So the claim this file has been making since "443 answers" is now, for the first time, about the
+path rather than about packets: **QUIC does not complete here, and the destinations are known to
+serve it.** Everything downstream - the MASQUE transport, the H2 fallback, the QUIC-in-TLS idea - is
+closed on a measured basis, and the relay over TCP remains the only route.
+
+Three API mistakes got there, each of which would have read as a result: a protocol factory called
+with keyword arguments the library never passes, a ConnectionTerminated field named `error` rather
+than `error_code`, and `send(byte[])`/`receive(byte[])` not existing on the API level this app
+compiles against - so the device half would have stayed unrun while the host's said QUIC is
+filtered.
+
