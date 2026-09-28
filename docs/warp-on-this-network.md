@@ -621,6 +621,120 @@ read the interface, and if it is the tunnel, the probe is not independent. A sec
 that is really the first one again is the most dangerous kind of null result, because it looks like
 a control passing.
 
+## What the filter actually matches, found by testing a protocol that is not QUIC
+
+Everything above concluded "UDP to Cloudflare does not arrive". That is true, and it is not what the
+filter is doing - it was never tested against a UDP protocol that is *not* QUIC on the same hosts.
+
+NTP, on the LAN link, bound to `192.168.0.4` so the tunnel is not involved:
+
+```
+216.239.35.0    udp/123   48B
+216.239.35.4    udp/123   48B
+162.159.192.1   udp/123   silent
+77.88.8.8       udp/123   silent
+8.8.8.8         udp/123   silent
+216.239.35.1    udp/123   silent     (not an NTP server - correct, and it is silent)
+```
+
+So UDP does cross the LAN link, to real NTP servers. The silence on Cloudflare's addresses is about
+Cloudflare, not about UDP.
+
+**And then the decisive one** - the same host, the same port, two different protocols:
+
+```
+216.239.35.0:123   an NTP request        48B  first=0x1c
+216.239.35.0:123   a QUIC Initial        silent
+216.239.35.0:123   an NTP request again  48B  first=0x1c
+```
+
+**The filter matches QUIC, not the address and not the port.** It inspects enough of the datagram to
+recognise a QUIC Initial - which is visible in the first byte's long-header form and the version
+field, both in cleartext - and drops those, while other UDP to the very same host and port passes.
+That is not a port allowlist, not a provider block, and not a path that "does not arrive". It is a
+protocol filter with a specific target, and the distinction matters for what could still work:
+
+  * a transport that does **not** look like QUIC on the wire is not what is being dropped, so a
+    WireGuard initiation - which has no long header and no version - is being matched by something
+    else, or by the same filter widened to the ports it wants shut;
+  * and the earlier "0 of 7 ports including 53" was measured with a **DNS-shaped** payload on most
+    ports, which is why 53 looked filtered when the real control says it is not.
+
+That last point is a correction to this file's own conclusion, and it is the same error one level
+down from everything else in it: **a payload that the destination does not answer tells you about
+the destination, not about the port.** 53 on a Cloudflare address does not run DNS, so its silence
+never meant 53 was filtered - and the table that leaned on it was reading a service where there was
+none.
+
+## And it *looked* aimed at WireGuard, which turned out to be wrong
+
+If the filter recognises QUIC by its cleartext header, does it also recognise a WireGuard initiation?
+Same host, same port, three payloads:
+
+```
+216.239.35.0:123   an NTP request              48B
+216.239.35.0:123   a WireGuard-shaped 148B     silent
+216.239.35.0:123   an NTP request again        48B
+```
+
+**The NTP request passes, the WireGuard packet does not, to the same host on the same port.** So the
+filter is not "UDP is throttled" and not "this provider is blocked": it recognises WireGuard's own
+shape - type 1, reserved zero, two 32-byte keys - and drops it, while leaving other UDP alone.
+
+That is the sharpest statement of the problem this whole file has been circling:
+
+> The block is **signature-based and protocol-specific**. It is not a port allowlist, not a
+> provider block, and not a path where UDP does not arrive. It lets DNS and NTP through to the very
+> same address and port that a WireGuard initiation is dropped on.
+
+Which is the first finding in this project that says something the relay does **not** already imply.
+If the filter is a signature on the packet, a relay that only forwards WireGuard is forwarding the
+one thing being dropped - so the far side has to originate something that is *not* WireGuard, or the
+relay has to re-frame it, and both are new work rather than a matter of finding more open ports.
+
+It also explains every odd result above without any of them being a tool error: the 148-byte probe
+and the 1200-byte QUIC Initial are both recognised, and the sizes that "answered" were answers from
+something that recognised them and declined.
+
+### …and that reading was wrong, twenty minutes later
+
+The sentence above is the clearest example in this file of a conclusion drawn from a control that
+was not a control. The host used for it, `216.239.35.0`, answers NTP and nothing else - so a
+WireGuard packet to it being silent says the **server** declined it, not that a filter did. Six
+payloads to the same host on the same port, which is the test that settles it:
+
+```
+216.239.35.0:123   an NTP request        48B
+216.239.35.0:123   1200 zero bytes        silent
+216.239.35.0:123   148 zero bytes         silent
+216.239.35.0:123   4 bytes                silent
+216.239.35.0:123   1000 bytes             silent
+216.239.35.0:123   64 bytes               silent
+```
+
+**A UDP server that answers its own protocol and nothing else.** There is no protocol filter here at
+all, and "it is aimed at WireGuard" is not supported by anything.
+
+So the NTP observation survives in a much weaker form, and it is worth keeping for what it does
+establish: **UDP does cross the LAN link.** A resolver answers on 53 and an NTP server answers on
+123, both bound to `192.168.0.4`, so the earlier statement that "UDP does not arrive" was too
+strong - it is true of the Cloudflare addresses, not of the path. The port table that concluded
+"0 of 7 including 53" was sending DNS-shaped payloads to hosts that do not run DNS, and reading
+their silence as a filtered port.
+
+**What survives about the filter, and what does not:**
+
+| claim | status |
+|---|---|
+| UDP reaches the LAN link, unmetered by protocol | **measured** - DNS on 53, NTP on 123 |
+| QUIC gets no answer from Google, Facebook or Cloudflare | **measured** - 0 of 16 |
+| the filter recognises QUIC by its header | **not measured** - no QUIC server was reachable to compare against |
+| the filter is aimed at WireGuard | **withdrawn** - the control was a server that only answers NTP |
+
+The row that was withdrawn is the one that had felt like the deepest finding of the project. It is
+also the exact shape of the mistake this file has now documented six times: a reply, or a silence,
+read as a fact about the network when it was a fact about the probe.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
