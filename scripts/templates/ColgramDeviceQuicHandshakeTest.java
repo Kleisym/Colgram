@@ -194,7 +194,12 @@ public final class ColgramDeviceQuicHandshakeTest {
      * number's low bits plus the first byte's low four.
      */
     private static byte[] maskHeader(byte[] packet, byte[] iv, byte[] key, byte[] dcid) throws Exception {
-        byte[] ivCopy = iv.clone();
+        // The sample is 16 bytes taken at offset 4, so the working buffer is the 12-byte IV with
+        // four more bytes after it - not the IV itself. Writing the 12-byte IV and then copying 12
+        // bytes in at offset 3 overflows it, and an ArrayIndexOutOfBoundsException in the header
+        // protection is one more failure that would have been reported as "no reply".
+        byte[] ivCopy = new byte[iv.length + 4];
+        System.arraycopy(iv, 0, ivCopy, 0, iv.length);
         System.arraycopy(packet, 4, ivCopy, 3, 12);
         Cipher cipher = Cipher.getInstance("AES/ECB/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"));
