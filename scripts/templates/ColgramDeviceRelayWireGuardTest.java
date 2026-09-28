@@ -360,9 +360,15 @@ public final class ColgramDeviceRelayWireGuardTest {
                 }
                 block[i / 4] = word;
             }
-            counter += 64;
+            // The counter t is how many bytes have been compressed BEFORE this block, so it is
+            // incremented after the compression, not before. Adding 64 first puts t=64 on a
+            // three-byte input, where BLAKE2s puts t=0 - and the vector assertion caught it as
+            // d296b05d... instead of 69217a30... . A hash that is wrong in one counter produces a
+            // wrong chaining key, the peer derives different transport keys, and the packet is
+            // dropped in silence, which is what this whole file keeps having to undo.
             boolean last = at + 64 >= input.length;
             compress(h, block, (int) counter, last);
+            counter += 64;
             at += 64;
         } while (at < input.length);
         byte[] out = new byte[32];
