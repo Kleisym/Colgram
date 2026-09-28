@@ -533,6 +533,42 @@ HKDF**, which is worse than no implementation: it produces a *wrong* key rather 
 wrong key produces exactly the same silence as a filtered network. Every layer of this file has come
 down to the same thing - a client that cannot tell "refused" from "my own output is wrong".
 
+### …and then it turned out the transport half cannot be measured on a phone at all
+
+Encrypting the transport packet needs a key derived through **BLAKE2s**, and Android does not ship
+it: `BLAKE2s-256` is not in `MessageDigest.getInstance` on any API level this app supports, and
+there is no BouncyCastle on the classpath. A hand-written BLAKE2s was tried and removed, and it is
+worth recording what it got wrong, because it is the exact failure this file keeps documenting:
+
+```
+sigma table:   112 entries where 160 are required
+block counter: advanced before the compression instead of after, so a 3-byte input carried t=64
+```
+
+Both produce a *wrong hash*, not an error. A wrong hash means a wrong chaining key; a wrong chaining
+key means the peer derives different transport keys; different transport keys mean the packet is
+dropped in silence, which reads as a filtered network. A vector assertion caught the second one and
+the first was caught by counting the table.
+
+So the test is renamed `aRealHandshakeCrossesFromTheDeviceToARelayOnThisHost` and measures the
+handshake, which is the half only a phone can do. The transport half is measured on the host, where
+the hash is `hashlib`, by `scripts/test_warp_real_wireguard.py`.
+
+**What the renamed test says when it passes:**
+
+```
+the device reached 10.0.2.2:51823 over UDP - 13B came back
+a 148-byte message-initiation crossed to the relay and a message-response came back
+VERDICT: a real 148-byte handshake crossed from the device to a relay on this host and a
+         message-response came back. The transport half needs a key the phone cannot derive -
+         Android has no BLAKE2s - and is measured on the host.
+```
+
+It had been called `aRealSizedExchange...` - a name promising a measurement it did not make. A name
+that overstates what ran is how a green result came to report a handshake while the transport had
+never executed, and it is the same failure as every other one here wearing a different hat: something
+answered, and it was taken to mean more than it did.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
