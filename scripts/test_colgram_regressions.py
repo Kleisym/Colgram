@@ -1041,6 +1041,40 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_built_profiles_carry_a_tun_or_the_phone_is_never_routed(self):
+        """A valid profile with no TUN is a green switch over an inert tunnel.
+
+        The subscription profile carried only a local mixed inbound on 127.0.0.1. That is a SOCKS
+        port for something on the device to dial deliberately - it captures nothing by itself.
+        sing-box hands the operating system its addresses and routes through
+        PlatformInterface.openTun, and it only does that for a `tun` inbound. Without one there is
+        no openTun call, no descriptor and no routes installed, so the service starts, the switch
+        turns blue, and every byte the phone sends goes out directly exactly as before. Nothing in
+        the app can tell that apart from a working tunnel, and the profile validated perfectly,
+        which is why every earlier test missed it.
+
+        auto_route is the field that claims the traffic, and the name is this engine's own: its
+        published schema has no route_address key at all, so a profile written against that older
+        shape is refused by name.
+        """
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        subscription = (core / "ColgramProfileBuilder.java").read_text(encoding="utf-8")
+        warp = (core / "ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        for name, source in (("subscription", subscription), ("WARP", warp)):
+            self.assertIn('.put("type", "tun")', source,
+                          f"the {name} profile has no tun inbound, so it captures nothing")
+            self.assertIn('auto_route', source,
+                          f"the {name} tun must claim the device's routes")
+            self.assertIn('strict_route', source,
+                          f"the {name} tun must not let traffic escape around the tunnel")
+        # And the device test that checks the built profiles, not hand-written ones.
+        installed = ROOT / ("Telegram-Src/TMessagesProj_AppTests/src/androidTest/java/org/colgram"
+                            "/singbox/ColgramTunInboundDeviceTest.java")
+        self.assertTrue(installed.exists(), "the tun inbound device test is not installed")
+        body = installed.read_text(encoding="utf-8")
+        self.assertIn("theRealSubscriptionProfileCarriesATunThatClaimsTheDevice", body)
+        self.assertIn("aProfileWithNoTunIsNotADeviceWideTunnel", body)
+
     def test_warp_can_be_pointed_at_a_relay_when_cloudflare_udp_is_dark(self):
         """The only way WARP works where Cloudflare UDP is dropped.
 

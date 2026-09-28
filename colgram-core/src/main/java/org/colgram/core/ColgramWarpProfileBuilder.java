@@ -169,10 +169,26 @@ public final class ColgramWarpProfileBuilder {
      * openTun, and a second inbound on the same profile would only compete for the port.
      */
     private static JSONArray inbounds() throws Exception {
-        return new JSONArray().put(new JSONObject()
+        JSONArray inbounds = new JSONArray();
+        inbounds.put(new JSONObject()
+                .put("type", "tun")
+                .put("tag", "tun-in")
+                .put("interface_name", "colgram0")
+                .put("address", new JSONArray()
+                        .put("172.19.0.1/30")
+                        .put("fdfe:dcba:9876::1/126"))
+                .put("mtu", 9000)
+                // A WARP route is a full-device route, and this is the field that makes the
+                // operating system hand the device's traffic to it. Without a tun inbound the
+                // endpoint is configured perfectly and the phone still talks to the network
+                // directly - a green switch over an inert tunnel.
+                .put("auto_route", true)
+                .put("strict_route", true));
+        inbounds.put(new JSONObject()
                 .put("type", "mixed")
                 .put("tag", "mixed-in")
                 .put("listen", "127.0.0.1")
                 .put("listen_port", 2080));
+        return inbounds;
     }
 }

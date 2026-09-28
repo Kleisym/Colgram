@@ -223,11 +223,46 @@ public final class ColgramProfileBuilder {
     }
 
     private static JSONArray inbounds() throws Exception {
-        return new JSONArray().put(new JSONObject()
+        JSONArray inbounds = new JSONArray();
+        inbounds.put(tunInbound());
+        inbounds.put(new JSONObject()
                 .put("type", "mixed")
                 .put("tag", "mixed-in")
                 .put("listen", "127.0.0.1")
                 .put("listen_port", MIXED_INBOUND_PORT));
+        return inbounds;
+    }
+
+    /**
+     * The TUN that makes the subscription cover the whole phone.
+     *
+     * This was missing, and its absence is the difference between a VPN and a local SOCKS port.
+     * sing-box hands the operating system the addresses and routes it wants captured through
+     * PlatformInterface.openTun, and it only does that for a `tun` inbound. Without one there is no
+     * openTun call, no file descriptor and no routes installed: the service starts, the switch
+     * turns blue, and every byte the phone sends goes out directly exactly as before. Nothing in
+     * the app can tell that apart from a working tunnel.
+     *
+     * auto_route is what claims the traffic, and the field names come from the engine's own
+     * published schema rather than from documentation - this engine version has no route_address
+     * key at all, so a profile written against that older shape would be refused by name.
+     */
+    private static JSONObject tunInbound() throws Exception {
+        return new JSONObject()
+                .put("type", "tun")
+                .put("tag", "tun-in")
+                // A fixed name so the interface is recognisable in `ip addr` when diagnosing.
+                .put("interface_name", "colgram0")
+                .put("address", new JSONArray()
+                        .put("172.19.0.1/30")
+                        .put("fdfe:dcba:9876::1/126"))
+                .put("mtu", 9000)
+                // The whole point: every route the device has goes into the tunnel.
+                .put("auto_route", true)
+                // strict_route stops traffic escaping around the tunnel via the physical
+                // interface, which is what makes "covers the whole phone" true rather than
+                // "usually covers the phone".
+                .put("strict_route", true);
     }
 
     /**
