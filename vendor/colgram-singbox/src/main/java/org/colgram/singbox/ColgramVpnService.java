@@ -89,9 +89,22 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     }
 
     private void bringUp() throws Exception {
-        // touch() is the binding's initialiser: it runs Seq.touch() and the native _init(). There
-        // is no init() to call, and calling nothing leaves the engine uninitialised.
-        io.nekohasekai.libbox.Libbox.touch();
+        // The engine has to be set up before it is asked to do anything. Libbox.touch() looks like
+        // it does this - it is called from every generated class's static initialiser, which is
+        // where that impression comes from - but in this binding it is an EMPTY method:
+        //
+        //     public static void touch() { }
+        //
+        // So the service was starting an engine that had never been given a working directory, a
+        // temp path or a platform context, and the first real call walked into a nil. Measured on
+        // the device, with the Go runtime naming it:
+        //
+        //   panic: runtime error: invalid memory address or nil pointer dereference
+        //   libbox.(*CommandServer).StartOrReloadService ... command_server.go:221
+        //
+        // setup() is the call that actually initialises it, and it must happen exactly once per
+        // process - the engine keeps global state, so a second setup is not merely redundant.
+        ensureEngineSetUp();
         if (platform == null) {
             platform = new ColgramPlatformInterface(this);
             platform.setConfigurator(this);
@@ -102,6 +115,41 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         startForegroundCompat();
         server.startOrReloadService(profilePath, null);
         Log.i(TAG, "tunnel starting with profile " + profilePath);
+    }
+
+    /**
+     * Initialise the engine once per process.
+     *
+     * Guarded rather than done in a static initialiser because it needs a Context for the paths,
+     * and because doing it twice is at best wasteful and at worst a second global state machine.
+     */
+    private static volatile boolean engineSetUp = false;
+
+    private static synchronized void ensureEngineSetUp() throws Exception {
+        if (engineSetUp) return;
+        java.io.File base = new java.io.File(android.os.Environment.getDataDirectory(),
+                "org.colgram.messenger/libbox");
+        // The engine writes its working state here; a path it cannot create is a start that dies
+        // with the same nil dereference one layer deeper, so it is created explicitly.
+        if (!base.exists() && !base.mkdirs()) {
+            Log.w(TAG, "could not create the engine working directory " + base);
+        }
+        java.io.File temp = new java.io.File(base, "tmp");
+        if (!temp.exists() && !temp.mkdirs()) {
+            Log.w(TAG, "could not create the engine temp directory " + temp);
+        }
+        io.nekohasekai.libbox.SetupOptions options = new io.nekohasekai.libbox.SetupOptions();
+        options.setBasePath(base.getAbsolutePath());
+        options.setWorkingPath(new java.io.File(base, "work").getAbsolutePath());
+        options.setTempPath(temp.getAbsolutePath());
+        // A stable identity in the trace, so a bug report says which app sent it.
+        options.setCrashReportSource("colgram");
+        options.setAppVersion("colgram");
+        options.setAppMarketingVersion("colgram");
+        options.setDebug(false);
+        io.nekohasekai.libbox.Libbox.setup(options);
+        engineSetUp = true;
+        Log.i(TAG, "the engine is initialised, working in " + base.getAbsolutePath());
     }
 
     private void startForegroundCompat() {

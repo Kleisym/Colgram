@@ -62,6 +62,41 @@ public final class ColgramTunnelDeviceTest {
         // Build the service and hand it a TunOptions-free path first: if the engine cannot even
         // be started with a valid profile, that is Colgram's bug and it must not be reported as
         // a network problem.
+        //
+        // The engine has to be set up before anything is asked of it. Libbox.touch() is the method
+        // that looks like it does this - every generated class calls it from its static initialiser,
+        // which is where the impression comes from - but in this binding it is EMPTY:
+        //
+        //     public static void touch() { }
+        //
+        // Without Libbox.setup() the first real call walks into a nil. Measured on the device, with
+        // the Go runtime naming it:
+        //
+        //   panic: runtime error: invalid memory address or nil pointer dereference
+        //   libbox.(*CommandServer).StartOrReloadService ... command_server.go:221
+        //
+        // That is the same crash the VPN service hit, and it took the whole instrumentation process
+        // with it - a test that kills the process it runs in cannot report anything.
+        java.io.File base = new java.io.File(context.getCacheDir(), "libbox");
+        //noinspection ResultOfMethodCallIgnored
+        base.mkdirs();
+        java.io.File temp = new java.io.File(base, "tmp");
+        //noinspection ResultOfMethodCallIgnored
+        temp.mkdirs();
+        Class<?> setupOptions = Class.forName("io.nekohasekai.libbox.SetupOptions");
+        Object options = setupOptions.getConstructor().newInstance();
+        setupOptions.getMethod("setBasePath", String.class)
+                .invoke(options, base.getAbsolutePath());
+        setupOptions.getMethod("setWorkingPath", String.class)
+                .invoke(options, new java.io.File(base, "work").getAbsolutePath());
+        setupOptions.getMethod("setTempPath", String.class)
+                .invoke(options, temp.getAbsolutePath());
+        setupOptions.getMethod("setCrashReportSource", String.class).invoke(options, "colgram");
+        setupOptions.getMethod("setDebug", boolean.class).invoke(options, false);
+        Class.forName("io.nekohasekai.libbox.Libbox")
+                .getMethod("setup", setupOptions).invoke(null, options);
+        Log.i(TAG, "the engine was initialised before it was asked to do anything");
+
         Class<?> service = Class.forName("org.colgram.singbox.ColgramVpnService");
         Object platform = Class.forName("org.colgram.singbox.ColgramPlatformInterface")
                 .getConstructor(Context.class).newInstance(context);

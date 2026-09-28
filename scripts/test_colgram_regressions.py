@@ -1075,6 +1075,22 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("theRealSubscriptionProfileCarriesATunThatClaimsTheDevice", body)
         self.assertIn("aProfileWithNoTunIsNotADeviceWideTunnel", body)
 
+    def test_the_engine_is_set_up_before_anything_is_asked_of_it(self):
+        # Libbox.touch() is called from every generated class static initialiser, which is where
+        # the belief that it initialises the engine comes from. Its body is empty, so the service
+        # and the tunnel test drove an engine with no working directory, no temp path and no
+        # platform context, and the first real call walked into a nil. The Go runtime named it on
+        # the device: panic, invalid memory address, at CommandServer.StartOrReloadService in
+        # command_server.go:221. That took the whole process down, so a test could not report it
+        # and the tunnel silently never started. Libbox.setup(SetupOptions) is the call that works.
+        service = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                   "/ColgramVpnService.java").read_text(encoding="utf-8")
+        self.assertIn("ensureEngineSetUp", service)
+        self.assertIn("Libbox.setup(options)", service)
+        for setter in ("setBasePath", "setWorkingPath", "setTempPath"):
+            self.assertIn(setter, service, "the engine is initialised without " + setter)
+        self.assertLess(service.index("ensureEngineSetUp();"), service.index("server.startOrReloadService(profilePath"))
+
     def test_the_warp_integration_test_measures_instead_of_asserting_what_it_cannot_know(self):
         """The only end-to-end WARP check has to stay runnable on a blocked network.
 

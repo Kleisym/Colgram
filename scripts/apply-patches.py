@@ -5681,6 +5681,32 @@ def inject_warp_device_test_support(repo_path, root_dir):
         return
     with open(base_manifest, "r", encoding="utf-8") as source:
         manifest_content = source.read()
+
+    # The AppTests module is a STANDALONE app, so it does not inherit the app's manifest. The
+    # generated debug manifest is therefore the only place the VPN service's permissions can come
+    # from, and it was carrying neither of them - measured on the device: the package had zero
+    # FOREGROUND_SERVICE_SPECIAL_USE, so startForeground(type=specialUse) threw and the process
+    # died with signal 6 the instant the tunnel came up. BIND_VPN_SERVICE is the other half: a
+    # VpnService the system will not let bind is a tunnel that can never carry a byte.
+    vpn_permissions = [
+        'android.permission.FOREGROUND_SERVICE',
+        'android.permission.FOREGROUND_SERVICE_SPECIAL_USE',
+        'android.permission.BIND_VPN_SERVICE',
+    ]
+    if "<application" in manifest_content:
+        app_at = manifest_content.index("<application")
+        for permission in vpn_permissions:
+            if f'android:name="{permission}"' in manifest_content:
+                continue
+            declaration = f'    <uses-permission android:name="{permission}" />\n'
+            manifest_content = manifest_content[:app_at] + declaration + manifest_content[app_at:]
+            app_at += len(declaration)
+    if "PROPERTY_SPECIAL_USE_FGS_SUBJECT" not in manifest_content:
+        app_end = manifest_content.rfind("</application>")
+        if app_end >= 0:
+            subject = ('    <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"'
+                       ' android:value="Colgram VPN tunnel" />\n')
+            manifest_content = manifest_content[:app_end] + subject + manifest_content[app_end:]
     activity_marker = "org.colgram.core.ColgramVpnConsentHostActivity"
     if activity_marker not in manifest_content:
         app_end = manifest_content.rfind("</application>")
