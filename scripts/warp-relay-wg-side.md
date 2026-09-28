@@ -167,3 +167,31 @@ The general form is the one this project keeps rediscovering. A test that is nev
 test that is executed and passes look identical in a commit message, and so does a probe whose
 client could not read the answer and a probe the server refused. Compile it, run it, and read the
 output - in that order, every time.
+
+### One socket, and the client that stopped being answered
+
+The UDP listener kept a single upstream socket and treated "whoever spoke last" as the client.
+That reads as a reasonable simplification until two things are measured:
+
+```
+client A sends  -> answered
+client B sends  -> answered
+client A sends  -> silent          (the response went to B)
+
+three clients at once:  1 of 3 answered
+```
+
+Each client now owns its upstream socket, so a reply is matched to the request that caused it, and
+replies are drained per client on a short timeout so one busy peer cannot hold another's answer
+past its retransmit window. Three simultaneous clients get **3 of 3**; the same three against the
+pre-fix function get **1 of 3**.
+
+The cap is 32 concurrent clients, and an unknown source beyond that is dropped rather than served.
+A WireGuard endpoint is one client, so anything past a few dozen is an address sweep - and a relay
+that answers everyone who finds the port is an open relay, which is a worse outcome than one that
+refuses a stranger.
+
+Why this matters for WARP specifically: the symptom is a tunnel that works, then dies when the
+endpoint rotates or a second device connects. Endpoint rotation is a normal WireGuard event, and a
+relay that fails on it looks exactly like the network being unreliable - which is the conclusion
+this whole file keeps having to disprove.
