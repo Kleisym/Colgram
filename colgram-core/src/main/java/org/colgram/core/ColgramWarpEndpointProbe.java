@@ -36,7 +36,17 @@ public final class ColgramWarpEndpointProbe {
             // A WireGuard-sized, initiation-shaped datagram. The content cannot make Cloudflare
             // reply, because it is not a valid handshake for this identity - only the exchange is
             // being measured, which is what separates a filtered port from a working one.
-            byte[] payload = new byte[148];
+            // 1200 bytes, NOT a 148-byte initiation, and that is the whole point of this method.
+            //
+            // Measured on this network: a UDP datagram under ~1200 bytes gets no answer on ANY
+            // port, while a 1200-byte one gets a QUIC reply on 443. A WireGuard initiation is 148
+            // bytes - below that floor - so probing with one cannot distinguish a filtered port
+            // from a live one. It would report "silent" for a perfectly open endpoint, and the
+            // watchdog would then tear down a tunnel that was about to work.
+            //
+            // What is lost is precision about the protocol; what is gained is the ability to tell
+            // "filtered" from "reachable", which is the only question this method is asked.
+            byte[] payload = new byte[1200];
             payload[0] = 1;
             socket.send(new DatagramPacket(payload, payload.length,
                     InetAddress.getByName(host), port));

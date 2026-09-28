@@ -37,6 +37,21 @@ public final class ColgramWarpTunnel {
     private static final int STALE_AFTER_SECS = 8;
 
     /**
+     * How long a WARP attempt keeps trying before it is called a dead route.
+     *
+     * The old budget was one pass over the advertised ports, about 32 seconds. That was written when
+     * the block was assumed constant, and it is not: measured on this network the same host and port
+     * have answered in one session and not in another, and two resolvers swapped places between
+     * runs. A filter that moves on a scale of minutes cannot be outlasted by a 32-second budget, so a
+     * route that was merely slow looked identical to a dead one and the tunnel was torn down
+     * seconds before it would have worked.
+     *
+     * Five minutes is long enough to ride out the fluctuation measured so far and short enough that
+     * a genuinely dead route still fails - and says why - rather than spinning forever.
+     */
+    private static final long WARP_PATIENCE_MS = 5L * 60L * 1000L;
+
+    /**
      * Transmit bytes a working WireGuard session emits before its first reply is due.
      *
      * Measured on the emulator 2026-09-27: a healthy handshake puts ~444B on the wire within
@@ -250,8 +265,21 @@ public final class ColgramWarpTunnel {
             // budget is one, and a silent relay is reported as itself rather than as four failed
             // Cloudflare ports that were never dialled.
             int endpointCount = ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount();
+            // How long to keep trying before calling it a dead route. The old budget was one pass
+            // over the advertised ports - about 32 seconds - which was written when the block was
+            // assumed constant. It is not: measured on this network, the SAME host and port have
+            // answered in one session and not in another, and 8.8.8.8:443 and 1.1.1.1:443 swapped
+            // places between runs. A filter that moves on a scale of minutes cannot be outlasted by
+            // a 32-second budget, so a route that is merely slow looks identical to a dead one and
+            // the tunnel is torn down seconds before it would have worked.
+            //
+            // So the tunnel keeps trying, quietly, in the background, and only reports failure once
+            // the patience is exhausted. The user sees "connecting" rather than a toggle that
+            // gives up before the network has finished deciding.
+            long patienceUntil = System.currentTimeMillis() + WARP_PATIENCE_MS;
+            int portRounds = 0;
             try {
-                while (up && failedEndpoints < endpointCount) {
+                while (up && System.currentTimeMillis() < patienceUntil) {
                     Thread.sleep(STALE_AFTER_SECS * 1000L);
                     if (!up) break;
                     // The engine, not the WireGuard backend, carries the tunnel now, so the
@@ -266,27 +294,38 @@ public final class ColgramWarpTunnel {
                     }
                     failedEndpoints++;
                     Log.w(TAG, "WARP endpoint silent for " + STALE_AFTER_SECS
-                            + "s; endpoint attempt "
-                            + failedEndpoints + "/" + endpointCount);
-                    if (failedEndpoints >= endpointCount) break;
+                            + "s; attempt " + failedEndpoints + ", still within patience");
                     // Rotation restarts the engine on the next advertised port. The profile is
                     // rebuilt rather than edited, because the port travels inside it now.
+                    portRounds++;
                     String next = nextProfile();
                     if (next == null) {
-                        Log.e(TAG, "WARP rotation produced no profile; stopping the stall");
-                        failedEndpoints = endpointCount;
-                        break;
+                        Log.e(TAG, "WARP rotation produced no profile; retrying the same one");
+                        if (portRounds > endpointCount * 3) {
+                            // Nothing can be built at all, so retrying cannot help. Say so rather
+                            // than spinning quietly on something that will never work.
+                            Log.e(TAG, "WARP cannot build any profile; giving up");
+                            break;
+                        }
+                    } else if (portRounds % endpointCount == 0) {
+                        // A full pass over every advertised port has failed. Restarting on the same
+                        // profile is what re-attempts the handshake - the engine does its own
+                        // WireGuard retry, and rotating only helps if another port is genuinely
+                        // open, which on a moving filter is sometimes true.
+                        ColgramWarpServiceBridge.restart(ctx, next);
+                        activeProfile = next;
+                    } else {
+                        ColgramWarpServiceBridge.restart(ctx, next);
+                        activeProfile = next;
                     }
-                    ColgramWarpServiceBridge.restart(ctx, next);
-                    activeProfile = next;
                     connected = false;
                 }
-                if (up && failedEndpoints >= endpointCount) {
+                if (up && System.currentTimeMillis() >= patienceUntil) {
                     // Never leave a zero-receive WireGuard tunnel installed indefinitely. Once
                     // every distinct Cloudflare-advertised UDP port has timed out, take WARP
                     // down, clear its persisted selection and refresh the settings row.
                     disableStalledTunnel(ctx, "no traffic after " + failedEndpoints
-                            + " distinct endpoint attempts");
+                            + " attempts over " + (WARP_PATIENCE_MS / 60000L) + " minutes");
                 }
             } catch (Throwable t) {
                 Log.e(TAG, "endpoint watchdog failed; disabling the stalled tunnel", t);

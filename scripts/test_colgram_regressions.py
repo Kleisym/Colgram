@@ -1041,6 +1041,32 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_warp_client_probes_above_the_size_floor_and_does_not_give_up_in_32s(self):
+        # Two defects in the app's own WARP path, both found by measuring rather than reading.
+        #
+        # First: ColgramWarpEndpointProbe sent a 148-byte datagram - a real initiation - and this
+        # network does not answer anything under ~1200 bytes on any port. So the probe reported
+        # "silent" for a port that was actually open, and the watchdog then tore down a tunnel that
+        # was about to work. The payload is 1200 now: it loses precision about the protocol, and
+        # gains the ability to tell "filtered" from "reachable", which is the only question asked.
+        #
+        # Second: the watchdog gave a dead route one pass over the advertised ports - about 32
+        # seconds. The filter here is not constant; the same host and port have answered in one
+        # session and not in another. A 32-second budget cannot outlast a filter that moves over
+        # minutes, so a slow route looked exactly like a dead one.
+        core = ROOT / "colgram-core/src/main/java/org/colgram/core"
+        probe = (core / "ColgramWarpEndpointProbe.java").read_text(encoding="utf-8")
+        self.assertIn("new byte[1200]", probe,
+                      "a 148-byte probe sits below the size floor and cannot see a live port")
+        self.assertNotIn("new byte[148]", probe)
+        tunnel = (core / "ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        self.assertIn("WARP_PATIENCE_MS", tunnel)
+        self.assertIn("patienceUntil", tunnel)
+        # The loop has to be bounded by the patience, not by one pass over the ports.
+        self.assertIn("System.currentTimeMillis() < patienceUntil", tunnel)
+        self.assertNotIn("while (up && failedEndpoints < endpointCount)", tunnel,
+                         "a single pass gives up before a moving filter has settled")
+
     def test_the_warp_probe_repeats_because_this_filter_changes_over_time(self):
         # The same hosts, ports and payload sizes, minutes apart, gave INVERTED answers:
         #
@@ -1538,10 +1564,13 @@ public final class DialogRefreshSequencerHarness {
         manager = PROXY.read_text(encoding="utf-8")
         self.assertIn("private static final int STALE_AFTER_SECS = 8;", tunnel)
         self.assertIn("ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
-        self.assertIn("while (up && failedEndpoints < endpointCount)", tunnel)
-        self.assertIn("if (failedEndpoints >= endpointCount) break;", tunnel)
-        self.assertIn("if (up && failedEndpoints >= endpointCount)", tunnel)
-        self.assertIn("distinct endpoint attempts", tunnel)
+        # The budget is TIME now, not one pass over the ports. The filter on this network is not
+        # constant - the same host and port have answered in one session and not in another - and a
+        # single pass is about 32 seconds, which cannot outlast a filter that moves over minutes.
+        # So the loop is bounded by the patience, and the failure is reported once that is spent.
+        self.assertIn("while (up && System.currentTimeMillis() < patienceUntil)", tunnel)
+        self.assertIn("if (up && System.currentTimeMillis() >= patienceUntil)", tunnel)
+        self.assertIn("WARP_PATIENCE_MS", tunnel)
         self.assertIn('if (next == null) {', tunnel)
         self.assertIn('disableStalledTunnel(ctx, "endpoint watchdog failed")', tunnel)
         self.assertIn("private static void disableStalledTunnel(Context ctx, String reason)", tunnel)
@@ -1809,7 +1838,9 @@ public final class DialogRefreshSequencerHarness {
         # the user sees did not: a route that carries nothing is named, and the toggle is dropped
         # rather than left lit.
         self.assertIn("ColgramWarpEndpointProbe.answers", tunnel)
-        self.assertIn("failedEndpoints = endpointCount;", tunnel)
+        # The budget is the patience window rather than a pass over the ports: the filter moves, and
+        # a fixed pass count called a merely-slow route dead.
+        self.assertIn("patienceUntil", tunnel)
         self.assertIn("no traffic after ", tunnel)
 
         # Both surfaces report the reason rather than reverting to a bare "off".
