@@ -697,3 +697,83 @@ remembered:
 With both in place, all five MASQUE addresses serve a genuine `warp=off` trace, which is the first
 honest signal that the endpoint is alive and the earlier 403s were manufactured locally.
 
+### Correction: the filter is a word list, not just `masque`
+
+The table above reads as a rule about one word, and a wider sweep shows it is a list. Same address,
+same port, only the first label changed:
+
+| server_name | result | time |
+|---|---|---|
+| `example.com` | OK | 281 ms |
+| `nomask.com` | OK | 399 ms |
+| `api.cloudflareclient.com` | OK | 161 ms |
+| `api.example.com` | FAIL | 2192 ms |
+| `engage.example.com` | FAIL | 2306 ms |
+| `update.example.com` | FAIL | 2529 ms |
+| `device.example.com` | FAIL | 3513 ms |
+| `update.cloudflareclient.com` | FAIL | 2192 ms |
+| `device.cloudflareclient.com` | FAIL | 2768 ms |
+| `www.cloudflareclient.com` | FAIL | 2176 ms |
+| `u.cloudflareclient.com` | FAIL | 2362 ms |
+| `masquerade-ok.com` | FAIL | 2505 ms |
+| `www.example.com` | OK | 191 ms |
+
+So the marked substrings include `masque`, `mqs`, `api`, `engage`, `update`, `device`, `www` and
+`u` - matched inside longer names, case-insensitively, in any domain, with no relation to
+Cloudflare required. `masquerade-ok.com` fails, which is the clearest statement that this is a
+substring match and not a word or label match.
+
+What is **not** claimed is the size of that list. A sweep finds members; it does not enumerate
+them, and a client that picked an unlisted name as a disguise would be relying on a word the
+filter may add tomorrow. That is a reason to treat name-disguise as fragile even where it is not
+reliable, rather than a scheme to build on.
+
+The delay is the filter's own and it is consistent: every blocked name above sits between 2.1 s and
+2.8 s before the EOF, every permitted one between 114 ms and 569 ms. That gap is wide enough to tell
+the two apart at a glance in a log, which is the cheapest diagnostic available for "is this name
+being filtered".
+
+### The same filter, measured on the phone
+
+The host result does not carry over by itself - the emulator sits behind QEMU user-mode NAT, and its
+TCP behaviour has already proven to be an artefact of the sandbox rather than the network. So the
+split was measured on the device, to `162.159.198.2:443`, changing only `server_name`:
+
+```
+BLOCKED   consumer-masque.cloudflareclient.com  FAIL  2317 ms
+BLOCKED   masque.cloudflareclient.com           FAIL  2343 ms
+BLOCKED   masque.example.com                    FAIL  2220 ms
+BLOCKED   mqs.cloudflareclient.com              FAIL  2308 ms
+BLOCKED   notmasque.com                          FAIL  2231 ms
+PERMITTED engage.cloudflareclient.com           OK h2  395 ms
+PERMITTED connectivity.cloudflareclient.com     OK h2  288 ms
+PERMITTED cloudflareclient.com                  OK h2  269 ms
+
+blocked 0/5 got through   permitted 3/3 completed TLS with h2
+```
+
+Identical to the host, including the shape of the delay: 2.2-2.3 s to fail against 269-395 ms to
+succeed. So the filter follows the `server_name` on the phone's path too, and a permitted name
+negotiates HTTP/2 on the WARP endpoint from the device as well as from the host.
+
+    python scripts/device-tests.py org.colgram.core.ColgramDeviceSniFilterTest
+
+### What is left is credentials, and what is *not* left is a client
+
+Two measured facts close off the routes that would have needed this transport:
+
+  * **`ENABLE_CONNECT_PROTOCOL` (0x08) is absent** from the server's SETTINGS on 162.159.198.2,
+    .1 and 162.159.197.3 - the only three settings keys returned are 3, 4 and 5. Without 0x08,
+    Extended CONNECT is unavailable to *any* client, so `:protocol=connect-ip` is refused with 400
+    whatever the name, and a relay on an unfiltered host could not use it either. That is a
+    property of the endpoint, not of the network.
+  * **`libbox.so` has no MASQUE outbound.** Strings for `option.Hysteria2Masquerade` are Hysteria2's
+    own feature; there is no `option.Masque` or `transport.Masque`, and the `/.well-known/masque/udp/`
+    and `http3: server didn't enable Extended CONNECT` strings in the binary come from the bundled
+    Chromium QUIC stack, not from sing-box. So even a reachable, permitted MASQUE endpoint would
+    have nothing in Colgram to speak it with - it would need new code, not configuration.
+
+The relay over TCP remains the only route to the WireGuard ingress, and it is built and proven.
+Reaching Cloudflare's edge over TCP 443 under a name the filter does not match is real, and it is
+not WARP.
+
