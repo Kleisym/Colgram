@@ -75,3 +75,15 @@ controls available here, so the relayed path is verified only as far as the engi
 profile and the app wiring it up — not as an open tunnel with traffic on it.
 
 The next honest step is an end-to-end measurement against a real relay, not another config claim.
+
+## The local SOCKS bridge, for completeness
+
+Unrelated to WARP but part of the same bypass machinery, and fixed in the same pass: the loopback
+SOCKS5 endpoint used to answer `host unreachable` to every UDP ASSOCIATE. That is not a degraded
+route, it is no route — and the user-visible symptom is a connection that cannot be established with
+nothing in the log saying why. It now serves RFC 1928 ASSOCIATE: loopback BND address (never
+`0.0.0.0`, which reaches nothing while looking like a dropped association), one upstream socket per
+destination with a reader so replies actually come back, and a header length derived from the
+address form so a domain name's own length byte is not guessed at.
+
+It still only carries Telegram addresses. That is the listener's purpose, not a limitation to fix.
