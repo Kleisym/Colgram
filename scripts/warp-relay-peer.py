@@ -186,6 +186,17 @@ def main() -> int:
                 break
             relayed += 1
             print("  from %s:%d  %d bytes" % (sender[0], sender[1], len(data)), flush=True)
+            # A bare probe gets a bare acknowledgement, before anything is forwarded. The relay is
+            # a UDP forwarder, not a protocol endpoint, so a datagram it has no session for would
+            # otherwise draw no reply at all - and a client waiting on that reply concludes the port
+            # is unreachable, which is a statement about the relay's design rather than about the
+            # network. Echoing costs one datagram and makes reachability a question with an answer.
+            if not data or data[0] not in (MESSAGE_INITIATION, MESSAGE_TRANSPORT):
+                try:
+                    relay.sendto(b"RELAY-OK:" + str(len(data)).encode(), sender)
+                    continue
+                except OSError:
+                    pass
             try:
                 relay.sendto(data, peer.address)
             except OSError:
