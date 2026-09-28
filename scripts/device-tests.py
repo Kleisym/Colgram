@@ -136,7 +136,11 @@ def main() -> int:
 
     # The UTP result stream drops on this emulator, but the tests are finished by the time
     # gradle exits, so the device log is the only trustworthy result.
-    deadline = time.time() + 120
+    # Long enough for a test that legitimately takes minutes. The WARP integration test drives the
+    # real Android VPN consent dialog and then waits out a 75s traffic window, so a 120s deadline
+    # gave up while it was still working and reported "no device results were produced" - which
+    # reads as a broken suite rather than a test that had not finished yet.
+    deadline = time.time() + 420
     log = None
     while time.time() < deadline:
         log = newest_log(since=started)

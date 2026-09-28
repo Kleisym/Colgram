@@ -196,7 +196,7 @@ public final class ColgramWarpDeviceIntegrationTest {
                 assertTrue("WARP answered, so the tunnel must be reported up", up);
             } else {
                 assertTrue("a route that carries nothing must not be left looking alive", !up);
-                assertNotNull("a dead route must say why, or the row just says "off"", reason);
+                assertNotNull("a dead route must say why, or the row just reads as off", reason);
             }
             if (!warpOn) {
                 Log.i(TAG, "WARP carried no traffic. That is the network, not the app: measured"
