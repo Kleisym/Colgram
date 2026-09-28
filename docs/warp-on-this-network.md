@@ -258,6 +258,91 @@ A real handshake and a real ChaCha20Poly1305 transport packet, through the relay
 that holds the key only because the handshake established it. **This is the whole client half of the
 relay design, working**, and the only thing it does not include is the far side's own egress.
 
+## The same, from the phone, through a relay on another machine
+
+Everything above is loopback. A relay in the field is a different host, and the hop that matters is
+the phone's own - so this measures it, with a real WireGuard responder on this host behind a real
+relay, and the device driving the exchange through both over the network.
+
+Reached on the host first, through the running relay:
+
+```
+relay OK: 116B first=0x02      0x02 is a message-response
+```
+
+A real handshake, through a relay, answered by a peer that only replies to a session it can
+complete. **Three bugs were in the relay loop before that worked**, and every one of them produced
+the same symptom - a relay that printed its port, held its socket, counted the packet and returned
+nothing, which is indistinguishable from a filtered network:
+
+| Bug | Why it looked like a block |
+|---|---|
+| the peer answered the relay's own socket | the reply was forwarded back to the peer, a loop, and the client heard nothing |
+| two threads read the peer's socket | whichever won consumed the reply; it is now queued **and** sent, because a duplicate is harmless and a dropped one is fatal |
+| a 50 ms window for the reply | the peer needs ~14 ms of Diffie-Hellman and AEAD - it is not slow, it is not synchronous |
+
+And one in the test itself: the initiation's ephemeral must be a **real X25519 point**. On arbitrary
+bytes the peer's first act raises `Error computing shared key` inside its service thread, which
+kills that thread and leaves the relay up, holding its port, answering nothing. The same shape of
+failure, caused by the packet the probe built rather than by any network.
+
+    python scripts/warp-relay-peer.py --relay-port 51823
+    python scripts/device-tests.py org.colgram.core.ColgramDeviceRelayWireGuardTest
+
+### The first device run reported a block, and was right to
+
+The first run of that device test said:
+
+```
+the device could not reach 10.0.2.2:51823: SocketTimeoutException
+VERDICT: the phone cannot reach a relay on another host over UDP on this path, so the chain
+         cannot be measured from the device.
+```
+
+The relay had been started with a lifetime that expired while the build ran, so there was genuinely
+nothing listening. **The test said what was true rather than what it hoped**, and it said *which*
+fact was true: the port was unreachable, not the protocol refused. That is the difference between a
+diagnostic and a verdict, and it is why the reachability probe is reported rather than asserted -
+silence on this path is ambiguous, and a test that turned it into a red build would be reporting
+the emulator's network as a defect.
+
+The same run also proved the hop works at all: a UDP datagram from the device does reach a socket
+bound on this host, through QEMU's NAT. What it had not proved yet is the exchange, which is what
+the run with a live relay measures.
+
+### Correction: the device cannot reach the host at all, and the emulator says why
+
+The claim just above - that a datagram from the device reaches a socket on this host - is wrong, and
+it was an early reading taken before the relay's own sender log existed. Measured directly, with a
+socket bound to the host's LAN address and a datagram sent from the emulator:
+
+```
+toybox nc -u 10.0.2.2 51824   ->  nc: xwrite: Connection refused
+toybox nc -u 192.168.0.4 51824 ->  nc: xwrite: Connection refused
+toybox nc    10.0.2.2 22     ->  nc: connect: Connection refused
+ping 10.0.2.2                 ->  2 packets, 0% loss, 11 ms
+```
+
+**ICMP works and every TCP and UDP connection to the host is refused**, to the gateway address and
+to the LAN address alike. That is the emulator refusing to reach its host, not a network result: a
+port with nothing listening gives *no answer* rather than *refused*, and the refusal arrives in
+milliseconds. So the phone's half of the relay path **cannot be measured on this emulator**, and the
+test that says so is correct to say it.
+
+The earlier `relayed 1 ... 14 bytes` and `relayed 2 ... 4 bytes` lines in the relay's log were host
+probes, not device traffic. The packet that looked like a device source - `127.0.0.1:28952`, a full
+148 bytes - was a probe from this host too; the source address is always loopback after QEMU's NAT
+and on this emulator there was no QEMU NAT to do it. Which is exactly why the sender is logged:
+without it, a loopback source reads as "something on the phone", and the fact that it is not is
+invisible.
+
+**What this does and does not change.** The relay's real-WireGuard half is proven on the host, and
+the client's half - profile, join, reachability of a relay's port - is proven on the device against
+a relay on the same device. The hop *between* a phone and a relay elsewhere is the one link with no
+measurement, and on this emulator it cannot be measured, because the emulator will not talk to its
+own host over TCP or UDP. That is worth stating rather than working around: a second device on the
+same network, or a physical phone, is what would close it.
+
 ## The last unmeasured row, now measured
 
 `warp=on` was the only claim in this file that had never been tested, and it has now been - on the
