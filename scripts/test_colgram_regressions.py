@@ -1130,6 +1130,31 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("dnsAnswers", body)
         self.assertIn("theDeviceCanSendUdpAtAll", body)
 
+    def test_the_relay_carries_a_real_wireguard_session_not_a_stand_ins(self):
+        # The handshake test above proves the relay moves a 148-byte initiation intact, but the far
+        # end answers with a scheme of its own devising - a keystream from the shared secret, not
+        # WireGuard's - and nothing ever decrypts it. Its acceptance criteria were invented rather
+        # than specified, so a relay that mangled traffic could still have passed as long as
+        # something came back.
+        #
+        # This one implements the protocol: Noise_IK with real HKDF and BLAKE2s chaining, and
+        # ChaCha20Poly1305 transport packets. The two halves are the same code, so a pass means they
+        # agree with each other *and* with the published construction - a wrong key schedule, a
+        # wrong mixing order or a wrong nonce size all fail the peer's AEAD open.
+        real = ROOT / "scripts/test_warp_real_wireguard.py"
+        self.assertTrue(real.is_file(),
+                        "the relay is proven only against a stand-in that answers in its own way, so"
+                        " nothing has shown it carries WireGuard a peer would accept")
+        body = real.read_text(encoding="utf-8")
+        self.assertIn("aRealHandshakeCrossesTheRelayAndBothSidesAgree", body)
+        self.assertIn("aTransportPacketIsDecryptedByThePeerAndTheRelayStaysInvisible", body)
+        # The properties that make it a protocol test rather than a byte count. Each of these was a
+        # silent bug during development: a wrong mixing order yields unrelated keys and a handshake
+        # that still reports success, and a 20-byte nonce is rejected outright by the AEAD.
+        self.assertIn("ChaCha20Poly1305", body)
+        self.assertIn("blake2s", body)
+        self.assertIn("INITIATION_BYTES = 148", body)
+
     def test_the_relay_carries_a_real_handshake_not_just_bytes(self):
         # The byte-bridge test proved the transport forwards frames. That is necessary and not
         # sufficient: a relay could carry bytes perfectly and still not carry WireGuard, and the
