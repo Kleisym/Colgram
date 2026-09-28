@@ -32,6 +32,7 @@ DEVICE_TESTS = [
     "org.colgram.singbox.ColgramProfileDeviceTest",
     "org.colgram.singbox.ColgramSubscriptionStoreDeviceTest",
     "org.colgram.singbox.ColgramTunnelDeviceTest",
+    "org.colgram.singbox.ColgramTunInboundDeviceTest",
     "org.colgram.singbox.ColgramWarpSingleRuntimeDeviceTest",
     "org.colgram.singbox.LibboxPresenceDeviceTest",
     "org.colgram.core.ColgramCallProxyDeviceTest",
