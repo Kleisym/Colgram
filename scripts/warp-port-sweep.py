@@ -77,12 +77,28 @@ def probe(host: str, port: int) -> bool:
     stays silent unless it is filtering - so "answered" and "silent" are both informative.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Bounded on the SEND as well as the receive. A connected-less UDP socket can block in sendto
+    # when the route or the local send buffer stalls, and settimeout does not cover that - which
+    # is how a sixteen-port sweep managed to hang for fifteen minutes with no output at all. A
+    # probe that can hang is worse than one that reports "silent", because it produces no verdict
+    # whatsoever rather than a wrong one.
     sock.settimeout(TIMEOUT)
+    sock.setblocking(False)
     try:
         sock.sendto(b"\x00" * 1200, (host, port))
-        sock.recvfrom(2048)
-        return True
     except OSError:
+        sock.close()
+        return False
+    deadline = time.time() + TIMEOUT
+    try:
+        while time.time() < deadline:
+            try:
+                sock.recvfrom(2048)
+                return True
+            except BlockingIOError:
+                time.sleep(0.05)
+            except OSError:
+                return False
         return False
     finally:
         sock.close()
