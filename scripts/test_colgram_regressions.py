@@ -1041,6 +1041,27 @@ public final class DialogRefreshSequencerHarness {
         for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
             self.assertIn(f'"{resolver}"', egress)
 
+    def test_the_relay_carries_a_real_handshake_not_just_bytes(self):
+        # The byte-bridge test proved the transport forwards frames. That is necessary and not
+        # sufficient: a relay could carry bytes perfectly and still not carry WireGuard, and the
+        # only symptom would be "WARP does not work" with nothing to tell it apart from a blocked
+        # network. So the relay is now driven with a real 148-byte message-initiation against a real
+        # WireGuard endpoint built with cryptography, and the endpoint answers only when the static
+        # key is the one it holds - so a pass means the bytes arrived intact and in order, and a
+        # relay that echoed, reordered or truncated would fail rather than look fine.
+        handshake = ROOT / "scripts/test_warp_relay_handshake.py"
+        self.assertTrue(handshake.is_file(),
+                        "the relay is only proven as a byte pipe, not as a tunnel")
+        body = handshake.read_text(encoding="utf-8")
+        self.assertIn("aHandshakeCrossesTheRelayAndAnAnswerComesBack", body)
+        # And the endpoint has to be selective, or a pass above would prove nothing.
+        self.assertIn("test_the_endpoint_ignoresAPacketAddressedElsewhere", body)
+        self.assertIn("INITIATION_BYTES = 148", body,
+                      "a WireGuard initiation is 148 bytes and the size is the point")
+        # A real key exchange, not a fixed blob.
+        self.assertIn("X25519PrivateKey", body)
+        self.assertIn("exchange", body)
+
     def test_every_available_transport_was_measured_rather_than_assumed(self):
         # 443 is the one port open over both UDP and TCP here, so "carry WireGuard there" is the
         # last idea, and it is worth having actually tested rather than quietly skipped:

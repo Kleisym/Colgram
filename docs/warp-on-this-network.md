@@ -182,6 +182,25 @@ That is the honest boundary: everything up to Cloudflare's UDP path is built and
 missing is a machine whose UDP is not filtered, and until there is one, "WARP works" would be a
 claim rather than a result.
 
+**Proven as a tunnel, not only as a pipe.** A byte bridge is necessary and not sufficient: a relay
+could forward frames perfectly and still not carry WireGuard, and the only symptom would be "WARP
+does not work" with nothing to distinguish it from a blocked network. So the relay is driven with
+a real **148-byte message-initiation** against a real WireGuard endpoint built with
+`cryptography`, which answers only when the static key is the one it holds:
+
+```
+python scripts/test_warp_relay_handshake.py
+
+  aHandshakeCrossesTheRelayAndAnAnswerComesBack ... ok
+  the_endpoint_ignoresAPacketAddressedElsewhere ... ok
+```
+
+The second test is what makes the first meaningful - a stand-in that answered anything would let a
+relay that echoes, reorders or truncates pass. Cloudflare's own ports are unreachable from here,
+which is the whole reason the relay exists, so the endpoint has to be a local one. What is proven
+is the part Colgram and the relay own; the last hop to Cloudflare needs the far side to originate
+that UDP.
+
 ### The filter's behaviour changes over time, so one run settles nothing
 
 Running the UDP probe twice on the same machine, minutes apart, with the same hosts, ports and
