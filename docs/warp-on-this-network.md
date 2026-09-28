@@ -5,17 +5,43 @@ measurement produced it; a claim without one is marked as such.
 
 ## The block is external and total
 
-Measured on the device, repeatedly:
+Measured on the device, and re-measured from the host on the same network:
 
 | Probe | Result |
 |---|---|
-| UDP DNS to 1.1.1.1 / 8.8.8.8 | answers, milliseconds |
-| UDP to all 16 Cloudflare WireGuard ingresses (ports 2408, 500, 1701, 4500) | **silent** |
-| TCP to those same hosts/ports | no WireGuard reply |
+| UDP DNS, 6 resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9, 77.88.8.8, 208.67.222.222, 94.140.14.14) | **all 6 answer, 64B** |
+| UDP to all 16 Cloudflare WireGuard ingresses (ports 2408, 500, 1701, 4500), a real message-initiation | **0 of 16 answer** |
 | AmneziaWG, extended ranges, junk packets, S1/S2/S5/S6 | no reproducible response |
 
-UDP itself is not broken — the control probe answers. Cloudflare's WireGuard ingress specifically
-does not answer from this network.
+UDP itself is not broken — six independent resolvers answer from the same host, immediately before
+the sweep. Cloudflare's WireGuard ingress specifically does not answer.
+
+Reproduce:
+
+```
+python scripts/udp-egress-check.py       # establishes that UDP works at all
+python scripts/warp-udp-host-probe.py    # 0 of 16, with a control that answers
+```
+
+### A correction: TCP inside the emulator proves nothing
+
+An earlier version of this file recorded "all TCP ports answer". That was wrong, and the way it
+was wrong matters. The emulator sits behind `10.0.2.0/24`, the QEMU user-mode NAT, and its TCP
+behaviour is an artifact of that: `nc -z` reports **OPEN for every port** on 162.159.192.1 —
+including 65000, which cannot be open — and a connect delivers **zero bytes**. So no TCP result
+measured inside the emulator is evidence about the network, and the "all TCP ports answer" line
+should be read as the sandbox talking.
+
+UDP has no such artifact: a datagram either comes back or it does not. That is why the verdict
+above rests on UDP alone, and why the probe lives on the host as well as the device.
+
+### IPv6 was never actually a way in
+
+Worth recording because it looks like an obvious untried angle. The device has IPv6 addresses, but
+they are ULA (`fd17::`), there is no global route that carries traffic, and every IPv6 destination
+tested — Cloudflare, Google, even the link-local gateway — is refused at the local network. Both
+v6 and non-v6 destinations fail identically, which is the signature of no working IPv6 path rather
+than of selective filtering. So IPv6 is not an alternative here; it is simply absent.
 
 ## Why no client-side trick fixes it
 

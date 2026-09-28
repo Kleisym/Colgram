@@ -1013,6 +1013,34 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("anAssociateHandshakeReturnsAReachableUdpPort", body)
         self.assertIn("theHeaderLengthFollowsTheAddressForm", body)
 
+    def test_the_warp_probes_cannot_claim_a_verdict_without_a_working_control(self):
+        """A filtered-destination probe with a broken control proves nothing.
+
+        The host-side WARP probe was written with a hand-typed DNS header that was one byte too
+        long. Every resolver silently dropped it, the control reported "UDP egress is broken",
+        and the script refused to give a verdict - correctly, but for the wrong reason. An earlier
+        version returned SILENT as a control result and the run looked like a network finding.
+        The control is now built from labels rather than typed as a byte string, and the egress
+        check sweeps six resolvers so one bad one cannot decide the whole question.
+        """
+        probe = (ROOT / "scripts/warp-udp-host-probe.py").read_text(encoding="utf-8")
+        # Built from labels, not a hand-written header.
+        self.assertIn('for part in "cloudflare.com".split(".")', probe)
+        # And it must refuse to answer at all when the control is silent, rather than reporting the
+        # filtered destinations as a finding.
+        self.assertIn("UDP egress is broken here", probe)
+        self.assertIn("if not control:", probe)
+        self.assertLess(probe.index("if not control:"), probe.index("answered, silent"))
+        # The sweep needs a real initiation, not a random datagram: a responder that is listening
+        # and not filtering answers a correctly shaped one.
+        self.assertIn("def wireguard_initiation()", probe)
+        self.assertIn("struct.pack(\"<IB\", 1, 0)", probe)
+
+        egress = (ROOT / "scripts/udp-egress-check.py").read_text(encoding="utf-8")
+        # More than one control, so a single filtered resolver cannot invalidate the reading.
+        for resolver in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
+            self.assertIn(f'"{resolver}"', egress)
+
     def test_warp_can_be_pointed_at_a_relay_when_cloudflare_udp_is_dark(self):
         """The only way WARP works where Cloudflare UDP is dropped.
 
