@@ -105,11 +105,18 @@ public final class ColgramWarpTunnel {
         // front of it. The settings row already says "через релей" for a configured relay, so a
         // profile that quietly dialled Cloudflare anyway would be the app disagreeing with its own
         // UI - and the user would have no way to tell which one was true.
-        String host = relayEndpoint();
+        //
+        // The address and the key are decided together, from hasUsableRelay(), and never
+        // separately. Asking hasRelay() for the address while asking hasUsableRelay() for the key
+        // produces exactly the broken combination: the relay's address carrying Cloudflare's peer
+        // key, which the relay rejects, and which reads from the outside as a relay that simply
+        // does not work. Measured on the device as a profile that named the relay and did not
+        // carry its key.
+        boolean viaRelay = ColgramWarp.hasUsableRelay();
+        String host = viaRelay ? ColgramWarp.relayAddress() : ColgramWarp.endpointHost();
         if (host == null || host.trim().isEmpty()) {
             throw new Exception("нет адреса сервера WARP");
         }
-        boolean viaRelay = ColgramWarp.hasRelay();
         int port = viaRelay ? ColgramWarp.relayPort() : ColgramWarp.currentEndpointPort();
         String[] parts = addresses.split(",");
         return ColgramWarpProfileBuilder.build(priv, parts[0].trim(),
@@ -117,12 +124,6 @@ public final class ColgramWarpTunnel {
                 ColgramWarp.reservedHex(), host, port, null,
                 viaRelay ? ColgramWarp.relayPublicKey() : null,
                 viaRelay ? ColgramWarp.relayPresharedKey() : null);
-    }
-
-    /** The relay's address when one is configured, otherwise Cloudflare's own ingress. */
-    private static String relayEndpoint() {
-        String relay = ColgramWarp.relayAddress();
-        return relay != null && !relay.trim().isEmpty() ? relay : ColgramWarp.endpointHost();
     }
 
     /** The same profile on the next advertised port, for rotation. */
@@ -134,10 +135,11 @@ public final class ColgramWarpTunnel {
             String[] parts = addresses.split(",");
             // A relay has one fixed port, so rotating Cloudflare's ports through it would only
             // produce profiles that cannot connect. The relay path is left alone.
-            boolean viaRelay = ColgramWarp.hasRelay();
+            boolean viaRelay = ColgramWarp.hasUsableRelay();
             return ColgramWarpProfileBuilder.build(priv, parts[0].trim(),
                     parts.length > 1 ? parts[1].trim() : null,
-                    ColgramWarp.reservedHex(), relayEndpoint(),
+                    ColgramWarp.reservedHex(),
+                    viaRelay ? ColgramWarp.relayAddress() : ColgramWarp.endpointHost(),
                     viaRelay ? ColgramWarp.relayPort() : ColgramWarp.nextEndpointPort(), null,
                     viaRelay ? ColgramWarp.relayPublicKey() : null,
                     viaRelay ? ColgramWarp.relayPresharedKey() : null);
@@ -264,7 +266,7 @@ public final class ColgramWarpTunnel {
             // A relay has a single fixed endpoint, so there is nothing to rotate through: the
             // budget is one, and a silent relay is reported as itself rather than as four failed
             // Cloudflare ports that were never dialled.
-            int endpointCount = ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount();
+            int endpointCount = ColgramWarp.hasUsableRelay() ? 1 : ColgramWarp.endpointPortCount();
             // How long to keep trying before calling it a dead route. The old budget was one pass
             // over the advertised ports - about 32 seconds - which was written when the block was
             // assumed constant. It is not: measured on this network, the SAME host and port have
@@ -282,17 +284,38 @@ public final class ColgramWarpTunnel {
                 while (up && System.currentTimeMillis() < patienceUntil) {
                     Thread.sleep(STALE_AFTER_SECS * 1000L);
                     if (!up) break;
-                    // The engine, not the WireGuard backend, carries the tunnel now, so the
-                    // rotation decision has to come from something answerable without loading
-                    // libwg-go.so. Reachability is measured directly instead.
-                    if (ColgramWarpEndpointProbe.answers(ColgramWarp.endpointHost(),
-                            ColgramWarp.currentEndpointPort())) {
+                    // The endpoint to judge is the one the profile actually names. With a relay
+                    // configured that is the relay, and Cloudflare's host is not in the path at all:
+                    // the probe dialed engage.cloudflareclient.com:2408, got UnknownHostException
+                    // because the tunnel it had just built no longer resolved that name, and then
+                    // reported the tunnel silent. It was measuring a host the tunnel does not use,
+                    // through a tunnel that had just been pointed somewhere else.
+                    //
+                    // Worse, the answer also drove a restart, so a probe that cannot succeed was
+                    // tearing down the session it was supposed to be evaluating. Measured on the
+                    // device: three restarts inside one measurement window, handshakes 0.
+                    String judgedHost = ColgramWarp.hasUsableRelay()
+                            ? ColgramWarp.relayAddress()
+                            : ColgramWarp.endpointHost();
+                    int judgedPort = ColgramWarp.hasUsableRelay()
+                            ? ColgramWarp.relayPort()
+                            : ColgramWarp.currentEndpointPort();
+                    if (ColgramWarpEndpointProbe.answers(judgedHost, judgedPort)) {
                         connected = true;
                         Log.i(TAG, "WARP endpoint answered; keeping it");
                         ColgramProxyManager.notifyProxySettingsChanged();
                         break;
                     }
                     failedEndpoints++;
+                    // A relay has one fixed endpoint, so there is nothing to rotate through: the
+                    // engine's own WireGuard retry is the only retry there is, and restarting it
+                    // resets a handshake that is in flight.
+                    if (ColgramWarp.hasUsableRelay()) {
+                        Log.w(TAG, "the relay stayed silent for " + STALE_AFTER_SECS
+                                + "s; attempt " + failedEndpoints
+                                + ", leaving the engine to retry its own handshake");
+                        continue;
+                    }
                     Log.w(TAG, "WARP endpoint silent for " + STALE_AFTER_SECS
                             + "s; attempt " + failedEndpoints + ", still within patience");
                     // Rotation restarts the engine on the next advertised port. The profile is

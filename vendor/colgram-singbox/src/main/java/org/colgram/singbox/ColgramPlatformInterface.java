@@ -4,8 +4,6 @@ import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
-import java.io.FileDescriptor;
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
@@ -69,9 +67,14 @@ public final class ColgramPlatformInterface implements PlatformInterface {
         }
         try {
             ParcelFileDescriptor descriptor = target.open(options);
-            if (descriptor == null) return -1;
+            if (descriptor == null) {
+                Log.e(TAG, "openTun: the platform returned no descriptor");
+                return -1;
+            }
             tun = descriptor;
-            return rawFd(descriptor.getFileDescriptor());
+            int fd = rawFd(descriptor);
+            Log.i(TAG, "openTun: descriptor held here, fd " + fd);
+            return fd;
         } catch (Throwable t) {
             Log.e(TAG, "cannot open the tun device", t);
             return -1;
@@ -81,15 +84,25 @@ public final class ColgramPlatformInterface implements PlatformInterface {
     /**
      * The integer behind a FileDescriptor.
      *
-     * Android exposes no public accessor, and the engine needs the int because it hands the
-     * value straight to the syscall layer as a TUN fd. Reflecting the one field is the same thing
-     * every VpnService integration does; failing loudly beats handing over a wrapped descriptor
-     * the Go side cannot use.
+     * <p>ParcelFileDescriptor.getFd(), not a reflected FileDescriptor.fd. The reflection is a
+     * long-standing habit from the days when the field was the only way in, and it is simply
+     * wrong now: on Android 15 there is no such field to find, and the failure is not a clean one.
+     * openTun() returned -1, the engine was handed a bad file descriptor, and the tunnel died with
+     *
+     * <pre>configure tun interface: query tun name: failed to get name of TUN device:
+     * bad file descriptor</pre>
+     *
+     * <p>which names the TUN device and says nothing at all about the missing field that caused it.
+     * Measured on the device (API 35), after the VPN consent was granted and establish() finally
+     * returned a real descriptor:
+     *
+     * <pre>java.lang.NoSuchFieldException: No field fd in class java.io.FileDescriptor
+     * at ColgramPlatformInterface.rawFd(ColgramPlatformInterface.java:90)</pre>
+     *
+     * <p>getFd() has been public since API 1, so there was never a reason to reach past it.
      */
-    private static int rawFd(FileDescriptor descriptor) throws Exception {
-        Field field = FileDescriptor.class.getDeclaredField("fd");
-        field.setAccessible(true);
-        return field.getInt(descriptor);
+    private static int rawFd(ParcelFileDescriptor descriptor) {
+        return descriptor.getFd();
     }
 
     @Override
@@ -315,9 +328,48 @@ public final class ColgramPlatformInterface implements PlatformInterface {
     @Override
     public ConnectionOwner findConnectionOwner(int uid, String processName, int protocol,
                                               String sourceAddress, int destinationPort) {
-        // Per-app routing needs a process table. Without one there is no honest answer, and
-        // inventing one would send a user's traffic down an outbound they never chose.
-        return null;
+        // A real owner, not null, and the distinction is not a style preference.
+        //
+        // Per-app routing needs a process table, and without one there is no honest answer about
+        // WHICH app a connection belongs to - so the fields that name a process stay empty, and the
+        // uid is carried through because Android does hand that to us. The engine then has a valid
+        // object to read and no per-app rule matches, which is the correct outcome for a phone.
+        //
+        // Returning null was a crash, measured on the device with a real packet in the TUN:
+        //   panic: runtime error: invalid memory address or nil pointer dereference
+        //   libbox.(*platformInterfaceWrapper).FindConnectionOwner service.go:226
+        //   route.(*platformSearcher).FindProcessInfo platform_searcher.go:44
+        //   route.(*Router).prepareMatchMetadata route.go:546
+        // The Go side dereferences the return value without a nil check, so "no answer" here has to
+        // be a valid object, not an absent one. This is the first time the engine got far enough to
+        // route a packet and then died on us - everything before it failed earlier and more visibly.
+        ConnectionOwner owner = new ConnectionOwner();
+        try {
+            owner.setUserId(uid);
+            if (processName != null && !processName.isEmpty()) {
+                owner.setProcessPath(processName);
+            }
+            // An empty package-name iterator, not a null one: the same wrapper dereferences this too.
+            owner.setAndroidPackageNames(new StringIterator() {
+                @Override
+                public boolean hasNext() {
+                    return false;
+                }
+
+                @Override
+                public int len() {
+                    return 0;
+                }
+
+                @Override
+                public String next() {
+                    throw new java.util.NoSuchElementException("no package names on a phone");
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "cannot describe the connection owner for uid " + uid + ": " + t);
+        }
+        return owner;
     }
 
     @Override

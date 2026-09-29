@@ -308,7 +308,14 @@ public final class ColgramWarp {
             putOrRemove(editor, KEY_RELAY_PUBLIC_KEY, publicKey);
             putOrRemove(editor, KEY_RELAY_PRESHARED_KEY, presharedKey);
         }
-        editor.apply();
+        // commit(), not apply(). apply() returns before the write has landed, and everything this
+        // method enables reads the values back immediately: the profile builder calls relayPublicKey()
+        // to pin the peer. With apply() the read can beat the write, the profile goes out carrying
+        // Cloudflare's peer key while naming the relay's address, and the relay rejects the
+        // handshake - which is indistinguishable, from the outside, from a relay that is simply
+        // broken. Measured on the device, as a profile that named the relay and then failed the
+        // assertion that it carries the relay's key.
+        editor.commit();
         // The port list is cached; a relay has to take effect on the next start.
         portCache = null;
         return true;
@@ -324,6 +331,22 @@ public final class ColgramWarp {
 
     public static boolean hasRelay() {
         return relayAddress() != null;
+    }
+
+    /**
+     * A relay is only usable when its WireGuard key is here too.
+     *
+     * <p>{@link #hasRelay()} asks about the address alone, which is enough to decide that traffic
+     * should go somewhere other than Cloudflare. It is NOT enough to build a profile that connects:
+     * the peer has to be pinned to the relay's own public key, and with that key missing the builder
+     * falls back to the well-known Cloudflare one, producing a profile that names the relay and can
+     * never complete a handshake with it. So anything that decides whether to build a relay profile
+     * asks this instead, and a half-configured relay is treated as no relay rather than as a broken
+     * one.
+     */
+    public static boolean hasUsableRelay() {
+        String key = relayPublicKey();
+        return hasRelay() && key != null && !key.trim().isEmpty();
     }
 
     public static String relayAddress() {

@@ -51,7 +51,60 @@ LABEL_MAC1 = b"mac1----"
 MESSAGE_INITIATION = 1
 MESSAGE_RESPONSE = 2
 MESSAGE_TRANSPORT = 4
+MESSAGE_PADDING = 3
 INITIATION_BYTES = 148
+
+
+def message_name(data: bytes) -> str:
+    """What this datagram claims to be, and whether its length agrees.
+
+    The length is the part that matters. A WireGuard initiation is exactly 148 bytes, and a peer
+    that only accepts that length will silently discard anything else - so a 1200-byte packet
+    arriving where an initiation was expected is a padded message, not a broken network, and the
+    two are indistinguishable from the counters alone. Measured on the device: three 1200-byte
+    packets forwarded, handshakes 0, and nothing in the log saying why.
+    """
+    if not data:
+        return "empty"
+    kind = data[0]
+    names = {MESSAGE_INITIATION: "initiation", MESSAGE_RESPONSE: "response",
+             MESSAGE_PADDING: "padding", MESSAGE_TRANSPORT: "transport"}
+    name = names.get(kind, "type %d" % kind)
+    if kind == MESSAGE_INITIATION:
+        # The 32 bytes at offset 36 are the initiator's ephemeral public key, and X25519 will refuse
+        # them outright if they are not a point on the curve: ValueError: Error computing shared key.
+        # That error names the arithmetic, not the offset, so the offset is printed here - a parser
+        # reading the wrong slice fails the same way as a genuine malformed key, and the two are not
+        # distinguishable from the traceback alone.
+        # The tail is read too. A sender that pads puts zeros after a complete 148B handshake; a
+        # sender that misread a field puts real bytes there instead. Same length, different fault,
+        # and the length alone cannot tell them apart.
+        # A zeroed slice is the finding. An X25519 public key is never 000000..., so a zero run at a
+        # fixed offset means the message is not laid out the way this parser assumes - which is a
+        # different fault from a malformed key, and the traceback for both is the same
+        # ValueError: Error computing shared key. So the head is printed, and the first non-zero run
+        # is located: a sender that encrypts its payload puts the readable part at the front.
+        # A type byte followed by zeros is not a padded handshake, it is a header with no body - and
+        # saying so is the point. The first 12 bytes as hex, and where the first run of non-zero
+        # bytes starts, locate a payload that has been moved rather than merely shortened.
+        head = data[:INITIATION_BYTES]
+        nonzero = [i for i, b in enumerate(head) if b]
+        detail = ("head = %s | %d non-zero of first %dB"
+                  % (head[:12].hex(), len(nonzero), INITIATION_BYTES))
+        if nonzero and max(nonzero) - min(nonzero) < 8 and min(nonzero) > 8:
+            detail += " | payload starts at %d, not 4" % min(nonzero)
+        if len(data) != INITIATION_BYTES:
+            tail = data[INITIATION_BYTES:]
+            zero_tail = all(b == 0 for b in tail)
+            return ("%s in a %dB envelope, not %dB - %s; %s" % (
+                name, len(data), INITIATION_BYTES,
+                "zeros after a complete %dB message, so the sender padded it" % INITIATION_BYTES
+                if zero_tail else
+                "%d non-zero bytes after %dB, so the first %dB are not a complete message" % (
+                    sum(1 for b in tail if b), INITIATION_BYTES, INITIATION_BYTES),
+                detail))
+        return "%s (%dB) %s" % (name, len(data), detail)
+    return "%s (%dB)" % (name, len(data))
 
 
 def public_of(private: X25519PrivateKey) -> bytes:
@@ -93,12 +146,50 @@ class Peer:
                 continue
             if not data:
                 continue
-            if data[0] == MESSAGE_INITIATION and len(data) == INITIATION_BYTES:
-                self._handshake(data, peer)
+            # Dumped here rather than in _handshake, because this is where a packet that will not be
+            # recognised still has to be recorded. A 1200-byte datagram that is not a WireGuard
+            # message at all - a message-type byte and 1199 zeros - has to be readable in full to be
+            # diagnosed at all, and _handshake is only reached for packets that already look like a
+            # handshake. Measured on the device: the engine's first bytes off the wire after the
+            # routing rule was fixed, and the question "what is actually in it" had no answer until
+            # the bytes were kept before any parsing.
+            try:
+                import os
+                dump = os.environ.get("WARP_DUMP", "")
+                if dump:
+                    with open(dump, "ab") as handle:
+                        handle.write(b"---- %d bytes ----\n" % len(data))
+                        handle.write(data.hex().encode())
+                        handle.write(b"\n")
+            except OSError:
+                pass
+            if data[0] == MESSAGE_INITIATION and len(data) >= INITIATION_BYTES:
+                # At least INITIATION_BYTES, not exactly. WireGuard permits a message to be padded
+                # to a multiple of 4, and a sender that pads a 148-byte initiation to the path MTU
+                # produces exactly that: a complete handshake followed by zeros. Requiring the exact
+                # length discarded real handshakes - measured on the device, the relay reported
+                # "zeros after a complete 148B message, so the sender padded it", relayed the
+                # packet, and counted zero handshakes, which is a peer bug and not a client one.
+                # A message shorter than 148B is truncated and cannot be parsed, so it is refused.
+                self._handshake(data[:INITIATION_BYTES], peer)
             elif data[0] == MESSAGE_TRANSPORT and self.session:
                 self._transport(data, peer)
 
     def _handshake(self, data: bytes, peer) -> None:
+        # Dumped raw, because the summary line and the bytes have been telling different stories:
+        # the summary said the tail after 148 bytes was zeros while the head printed as all zeros
+        # too, which cannot both describe a complete handshake. A file is the only way to settle a
+        # question about bytes without re-deciding the format every time.
+        try:
+            import os
+            dump = os.environ.get("WARP_DUMP", "")
+            if dump:
+                with open(dump, "ab") as handle:
+                    handle.write(b"---- %d bytes ----\n" % len(data))
+                    handle.write(data.hex().encode())
+                    handle.write(b"\n")
+        except OSError:
+            pass
         sender_static = data[4:36]
         ephemeral = X25519PublicKey.from_public_bytes(data[36:68])
         shared = self.static_private.exchange(ephemeral)
@@ -224,7 +315,15 @@ def main() -> int:
                 break
             relayed += 1
             last_sender = sender
-            print("  from %s:%d  %d bytes" % (sender[0], sender[1], len(data)), flush=True)
+            line = "  from %s:%d  %s" % (sender[0], sender[1], message_name(data))
+            print(line, flush=True)
+            tally = os.environ.get("WARP_TALLY", "")
+            if tally:
+                try:
+                    with open(tally, "a") as handle:
+                        handle.write("%s:%d %d\n" % (sender[0], sender[1], len(data)))
+                except OSError:
+                    pass
             # A bare probe gets a bare acknowledgement, before anything is forwarded. The relay is
             # a UDP forwarder, not a protocol endpoint, so a datagram it has no session for would
             # otherwise draw no reply at all - and a client waiting on that reply concludes the port

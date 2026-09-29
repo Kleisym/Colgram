@@ -104,7 +104,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         //
         // setup() is the call that actually initialises it, and it must happen exactly once per
         // process - the engine keeps global state, so a second setup is not merely redundant.
-        ensureEngineSetUp();
+        ensureEngineSetUp(this);
         if (platform == null) {
             platform = new ColgramPlatformInterface(this);
             platform.setConfigurator(this);
@@ -126,8 +126,33 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         // command_server.go:221, and takes the whole process with it. The Java class has no
         // setters, so a default-constructed instance is the only way to say "no overrides" from
         // this side, and its defaults are exactly that.
-        server.startOrReloadService(profilePath, new io.nekohasekai.libbox.OverrideOptions());
+        // startOrReloadService takes the profile CONTENT, not a path to it. Handed a path it hands
+        // that path straight to the JSON decoder, which names the first character it cannot read:
+        //
+        //   start or reload service: decode config: invalid character '/' looking for beginning of
+        //   comment: row 1, column 2
+        //
+        // The leading slash of "/data/user/0/..." is exactly that character and exactly that
+        // position, so the engine never saw the profile at all - and the tunnel reported itself up
+        // anyway, because the flag is set by the caller. Measured on the device against the real
+        // engine, on every single start.
+        server.startOrReloadService(readProfile(profilePath), new io.nekohasekai.libbox.OverrideOptions());
         Log.i(TAG, "tunnel starting with profile " + profilePath);
+    }
+
+    /**
+     * The profile's bytes, as text.
+     *
+     * <p>Read here rather than passed by path, because the engine parses what it is given as the
+     * config itself. A missing or unreadable file is a start that fails with a reason, not one that
+     * hands a filesystem path to a JSON decoder and reports a character offset in it.
+     */
+    private static String readProfile(String path) throws java.io.IOException {
+        byte[] raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
+        String profile = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
+        String head = profile.length() > 80 ? profile.substring(0, 80) : profile;
+        Log.i(TAG, "the profile is " + profile.length() + "B and starts: " + head);
+        return profile;
     }
 
     /**
@@ -138,10 +163,22 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
      */
     private static volatile boolean engineSetUp = false;
 
-    private static synchronized void ensureEngineSetUp() throws Exception {
+    private static synchronized void ensureEngineSetUp(android.content.Context context)
+            throws Exception {
         if (engineSetUp) return;
-        java.io.File base = new java.io.File(android.os.Environment.getDataDirectory(),
-                "org.colgram.messenger/libbox");
+        // Inside the app's own storage, not a hand-built path under /data. The engine writes its
+        // working state here, and a path the app cannot create is a start that dies one layer deeper
+        // - measured on the device as:
+        //   could not create the engine working directory /data/org.colgram.messenger/libbox
+        //   go.Universe$proxyerror: open .../work/CrashReport-colgram.log: no such file or directory
+        // and then the tunnel reported itself up with nothing behind it, because the flag is set by
+        // the caller rather than by the engine having started.
+        //
+        // /data/<something> is writable only by the app that owns <something>. This package is
+        // org.colgram.messenger, so its private directory is already that - but /data/org.colgram.
+        // messenger is not a path an app may create, and getFilesDir() is both correct by
+        // construction and readable by the engine under the same uid.
+        java.io.File base = new java.io.File(context.getFilesDir(), "libbox");
         // The engine writes its working state here; a path it cannot create is a start that dies
         // with the same nil dereference one layer deeper, so it is created explicitly.
         if (!base.exists() && !base.mkdirs()) {
@@ -284,6 +321,30 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             if (prefix == null || prefix.address() == null) continue;
             builder.addRoute(prefix.address(), prefix.prefix());
         }
+        // The routes the tunnel must NOT capture, handed to the operating system rather than kept
+        // inside the engine.
+        //
+        // This is what keeps a tunnel from swallowing its own handshake. route_exclude_address on
+        // the inbound tells the engine which traffic it should not expect from the interface, but on
+        // Android the routing table is built here, from TunOptions - and these two iterators were
+        // never read. So the exclusion existed in the profile, was accepted by the engine, and then
+        // did nothing: the OS still handed every packet, including the engine's own WireGuard
+        // packets to its endpoint, to the interface it was trying to build.
+        //
+        // Measured on the device: the tunnel started cleanly and the relay was reached by a bare
+        // datagram while it was up, and became unreachable again the moment traffic existed to carry
+        // (SocketTimeoutException: the device does not reach the relay). The endpoint has to leave
+        // by the physical interface, and on Android that is Builder.excludeRoute(IpPrefix) - read
+        // off the platform stub, because there is no addDisallowedRoute on VpnService.Builder and
+        // compiling against one fails the build rather than misbehaving quietly at runtime.
+        for (RoutePrefix prefix : drain(options.getInet4RouteExcludeAddress())) {
+            if (prefix == null || prefix.address() == null) continue;
+            excludeRoute(builder, prefix);
+        }
+        for (RoutePrefix prefix : drain(options.getInet6RouteExcludeAddress())) {
+            if (prefix == null || prefix.address() == null) continue;
+            excludeRoute(builder, prefix);
+        }
         for (String server : drainStrings(options.getDNSServerAddress())) {
             if (server != null && !server.isEmpty()) builder.addDnsServer(server);
         }
@@ -295,7 +356,17 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         }
         try {
             ParcelFileDescriptor descriptor = builder.establish();
-            if (descriptor == null) Log.e(TAG, "establish() returned no descriptor");
+            if (descriptor == null) {
+                Log.e(TAG, "establish() returned no descriptor");
+            } else {
+                // The descriptor existing and the interface existing are different facts, and only
+                // the second one is a tunnel. Measured on the device: the tunnel started with no
+                // error, and no tun interface existed afterwards - not colgram0, not tun0, nothing.
+                // So the outcome is stated here rather than left to be inferred from the absence of
+                // a later error, because a silent tun is the whole failure mode this exists to end.
+                Log.i(TAG, "establish() returned a descriptor, fd "
+                        + descriptor.getFd());
+            }
             return descriptor;
         } catch (Throwable t) {
             Log.e(TAG, "establish failed", t);
@@ -315,6 +386,27 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             // A package that was uninstalled between the profile being written and the tunnel
             // starting is not a reason to refuse the whole tunnel.
             Log.i(TAG, "cannot apply " + name + ": " + t.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * One route the tunnel must not capture.
+     *
+     * <p>{@code Builder.excludeRoute(IpPrefix)} takes an {@code IpPrefix} rather than a
+     * (String, int) pair, so the prefix is built here. A failure is logged and skipped rather than
+     * fatal: an exclusion the platform refuses costs this tunnel its endpoint, and a tunnel that
+     * refuses to start costs the user everything. Either way it is said out loud, because the
+     * alternative is a tunnel that looks up and carries nothing.
+     */
+    private static void excludeRoute(Builder builder, RoutePrefix prefix) {
+        try {
+            java.net.InetAddress address = java.net.InetAddress.getByName(prefix.address());
+            builder.excludeRoute(new android.net.IpPrefix(address, prefix.prefix()));
+            Log.i(TAG, "the endpoint " + prefix.address() + "/" + prefix.prefix()
+                    + " stays off the tunnel, so the handshake has a way out");
+        } catch (Throwable t) {
+            Log.e(TAG, "cannot exclude route " + prefix.address() + "/" + prefix.prefix()
+                    + "; the tunnel will swallow its own handshake", t);
         }
     }
 
@@ -378,7 +470,9 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             try {
             if (server != null) {
                 server.start();
-                server.startOrReloadService(profilePath, new io.nekohasekai.libbox.OverrideOptions());
+                // The content, for the same reason bringUp() reads the file: a path here is handed
+                // to the JSON decoder and comes back as an offset in a filesystem path.
+                server.startOrReloadService(readProfile(profilePath), new io.nekohasekai.libbox.OverrideOptions());
             }
             } catch (Throwable t) {
                 Log.e(TAG, "reload failed", t);

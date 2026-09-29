@@ -1,10 +1,16 @@
 package org.colgram.core;
 
 import android.content.Context;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.SystemClock;
 import android.util.Log;
 
+import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
+import androidx.test.uiautomator.By;
+import androidx.test.uiautomator.UiDevice;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -39,6 +45,7 @@ public final class ColgramDeviceEngineRelayTest {
     private static final String RELAY_HOST = "10.0.2.2";
     private static final int RELAY_PORT = 51823;
     private static final long WINDOW_MS = 45_000L;
+    private static final long VPN_CONSENT_TIMEOUT_MS = 45_000L;
 
     @Test
     public void theShippingEngineIsStartedWithAProfileNamingTheRelay() throws Exception {
@@ -75,12 +82,64 @@ public final class ColgramDeviceEngineRelayTest {
             // which fails to compile with "cannot be applied to given types".
             String profile = (String) callStatic(tunnelClass, "warpProfile", new Class<?>[0]);
             Log.i(TAG, "the profile names the relay: " + profile.contains(RELAY_HOST));
+            // The whole profile, on disk rather than in the log. Every field that could shape a
+            // WireGuard message on the wire - mtu, padding, batch, workers, fragment - is decided
+            // here, and a 1200-byte "initiation" is a shape problem rather than a network one. It
+            // has to be readable in full: logcat drops the tail of a long line, and the fields that
+            // matter are all at the end of this string.
+            // The app's external files dir: readable by the harness, and it outlives the cache.
+            // /data/local/tmp is refused to the app by SELinux - FileNotFoundException: EACCES,
+            // measured - and the cache is wiped at teardown, which is exactly when the file is
+            // still needed. Both destinations have now been tried and both failed differently.
+            java.io.File profileDump = new java.io.File(
+                    context.getExternalFilesDir(null), "colgram-relay-profile.json");
+            //noinspection ResultOfMethodCallIgnored
+            profileDump.getParentFile().mkdirs();
+            try {
+                java.io.FileOutputStream profileOut =
+                        new java.io.FileOutputStream(profileDump);
+                profileOut.write(profile.getBytes("UTF-8"));
+                profileOut.close();
+                Log.i(TAG, "the profile is written to " + profileDump.getAbsolutePath()
+                        + ", " + profile.length() + "B");
+            } catch (Throwable dumpFailed) {
+                // Diagnostics only. Failing the test here would hide the real verdict behind a
+                // file it could not write - which is exactly what EACCES on /data/local/tmp did.
+                Log.w(TAG, "could not dump the profile: " + dumpFailed);
+            }
             org.junit.Assert.assertTrue("the profile does not name the relay",
                     profile.contains(RELAY_HOST));
-            org.junit.Assert.assertTrue("the profile does not carry the peer key",
-                    profile.contains(relayKey));
+            // Parsed, not substring-matched on the raw text. Android's org.json escapes "/" as
+            // "\/", and about half of all base64 WireGuard keys contain one - so a key that IS in
+            // the profile reads as absent, and a relay that works is reported as one that does not.
+            // The failure is worse than useless: it looks like a relay fault, and the actual cause
+            // is the test's own string comparison. Seen on the device with the key
+            // ...QI/QPaQV9ESo= - the same test passed with a key that happened to contain no slash.
+            String pinnedKey = pinnedPeerKey(profile);
+            Log.i(TAG, "the profile pins the peer key: " + pinnedKey);
+            org.junit.Assert.assertEquals("the profile does not pin the relay's own peer key",
+                    relayKey, pinnedKey);
+            // No mac1 assertion here, and the reason is worth more than the assertion was. The engine
+            // has no such field - it refused one by name, on the device:
+            //   endpoints[0].peers[0].mac1: json: unknown field "mac1"
+            // and the empty handshake on the wire is not caused by its absence. Four implementations
+            // in this session produced four different digests for one 74-byte input they all agreed on
+            // byte for byte, which is what BLAKE2s does when the digest length is a parameter rather
+            // than a truncation. So the value was never verifiable offline, and the peer - a real
+            // WireGuard endpoint on the other side of this relay - is the only authority on it.
 
             callStatic(tunnelClass, "bringDown", new Class<?>[]{Context.class}, context);
+            // Android's VPN consent, taken before the tunnel is asked for anything. Without it
+            // builder.establish() returns null, the engine gets a bad file descriptor, and the
+            // tunnel dies one line later with a message about a TUN device that has nothing to do
+            // with the relay. Measured on the device:
+            //   establish() returned no descriptor
+            //   configure tun interface: query tun name: failed to get name of TUN device:
+            //   bad file descriptor
+            // appops does not stand in for this: the grant is per-VpnService.prepare() intent, and
+            // setting ACTIVATE_VPN by hand left establish() returning null. The prompt has to be
+            // answered, which is what the working integration test already does.
+            grantVpnConsent(context);
             callStatic(configClass, "setWarpEnabled", new Class<?>[]{boolean.class}, true);
             callStatic(tunnelClass, "bringUp", new Class<?>[]{Context.class}, context);
 
@@ -88,6 +147,15 @@ public final class ColgramDeviceEngineRelayTest {
             boolean up = false;
             boolean connected = false;
             while (android.os.SystemClock.elapsedRealtime() < expires) {
+                // Traffic, because a WireGuard endpoint is lazy: it sends an initiation when it has
+                // a packet to send and stays silent otherwise. Starting the tunnel and waiting
+                // produces no handshake at all, which reads as a blocked network and is not one -
+                // the engine was never asked to carry anything. A plain HTTP request to a literal
+                // address gives it something: the request is routed into the TUN, and carrying it
+                // requires a handshake with the relay. The endpoint's own address is excluded from
+                // the tunnel's routes (route_exclude_address), so the handshake leaves by wlan0
+                // instead of being fed back into the interface it is trying to build.
+                driveTrafficThrough(context);
                 if (Boolean.TRUE.equals(callStatic(tunnelClass, "isConnected", new Class<?>[0]))) {
                     connected = true;
                     up = true;
@@ -136,6 +204,90 @@ public final class ColgramDeviceEngineRelayTest {
     }
 
     /**
+     * Answer Android's VPN consent prompt, if it is still unanswered.
+     *
+     * <p>A foreground game or overlay can cover the dialog and make UiAutomator tap the wrong
+     * window, so the foreground is handed to the launcher first. A foreground activity is required
+     * to show the prompt at all - which is why this is not simply {@code appops}: the grant is made
+     * per prepare() intent and the system dialog is the only thing that answers it.
+     */
+    private static void grantVpnConsent(Context context) throws Exception {
+        UiDevice device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation());
+        device.pressHome();
+        Intent consent = VpnService.prepare(context);
+        if (consent == null) {
+            Log.i(TAG, "VPN consent was already granted");
+            return;
+        }
+        Log.i(TAG, "Requesting foreground Android VPN consent: " + consent.toUri(0));
+        try (ActivityScenario<ColgramVpnConsentHostActivity> scenario =
+                     ActivityScenario.launch(ColgramVpnConsentHostActivity.class)) {
+            scenario.onActivity(ColgramVpnConsentHostActivity::requestVpnConsent);
+            long expires = SystemClock.elapsedRealtime() + VPN_CONSENT_TIMEOUT_MS;
+            while (VpnService.prepare(context) != null
+                    && SystemClock.elapsedRealtime() < expires) {
+                if (clickFirstVisible(device, "OK", "ОК", "Allow", "Разрешить", "Разрешить VPN")) {
+                    SystemClock.sleep(750L);
+                    continue;
+                }
+                SystemClock.sleep(300L);
+            }
+        }
+        if (VpnService.prepare(context) != null) {
+            throw new AssertionError("system VPN consent timed out; the TUN can never be"
+                    + " established without it, and the engine's "
+                    + "'bad file descriptor' is a symptom of exactly this");
+        }
+        Log.i(TAG, "VPN consent granted; establish() can return a descriptor now");
+    }
+
+    private static boolean clickFirstVisible(UiDevice device, String... labels) {
+        for (String label : labels) {
+            androidx.test.uiautomator.UiObject2 button = device.findObject(By.text(label));
+            if (button == null) {
+                button = device.findObject(By.desc(label));
+            }
+            if (button != null && button.isEnabled()) {
+                Log.i(TAG, "Accepting visible VPN consent action: " + label);
+                button.click();
+                return true;
+            }
+        }
+        androidx.test.uiautomator.UiObject2 positive =
+                device.findObject(By.res("android", "button1"));
+        if (positive != null && positive.isEnabled()) {
+            Log.i(TAG, "Accepting Android VPN consent positive button");
+            positive.click();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The public_key the profile actually pins, read out of the parsed config.
+     *
+     * <p>The profile is JSON, and JSON escaping is not identity: a "/" inside a base64 key is
+     * written "\/" by Android's org.json, and "/" appears in roughly half of all base64 keys.
+     * Comparing the raw text with the raw key therefore fails for a key that is present, which is
+     * how a working relay gets reported as broken. Parsing and reading the field answers the
+     * question that was actually being asked.
+     */
+    private static String pinnedPeerKey(String profile) throws Exception {
+        org.json.JSONObject root = new org.json.JSONObject(profile);
+        org.json.JSONArray endpoints = root.optJSONArray("endpoints");
+        if (endpoints == null) return null;
+        for (int i = 0; i < endpoints.length(); i++) {
+            org.json.JSONArray peers = endpoints.getJSONObject(i).optJSONArray("peers");
+            if (peers == null) continue;
+            for (int j = 0; j < peers.length(); j++) {
+                String key = peers.getJSONObject(j).optString("public_key", null);
+                if (key != null && !key.isEmpty()) return key;
+            }
+        }
+        return null;
+    }
+
+    /**
      * The peer public key, from a file the harness pushed onto the device.
      *
      * <p>Read with DataInputStream rather than java.nio.file, which is not on every API level this
@@ -164,6 +316,36 @@ public final class ColgramDeviceEngineRelayTest {
             return "answered " + reply.getLength() + "B";
         } catch (Exception e) {
             return e.getClass().getSimpleName() + " - the device does not reach the relay";
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+    }
+
+    /**
+     * One request through the tunnel, ignoring every outcome.
+     *
+     * <p>Whether it succeeds is not the question here. A refusal, a timeout, or a 403 all mean the
+     * same thing for this test, which is that the engine had traffic to carry and therefore had to
+     * negotiate a session first. The answer, if there is one, arrives in the relay log.
+     *
+     * <p>A literal address rather than a name so no DNS is needed: a resolver that cannot answer
+     * would leave the tunnel with nothing to carry, and the test would be measuring DNS instead of
+     * WireGuard.
+     */
+    private static void driveTrafficThrough(Context context) {
+        java.net.DatagramSocket socket = null;
+        try {
+            // A UDP send to a literal address. No reply is expected or awaited - the datagram only
+            // has to enter the tunnel, which is what forces the handshake.
+            socket = new java.net.DatagramSocket(new java.net.InetSocketAddress(0));
+            socket.setSoTimeout(500);
+            byte[] payload = "colgram-warp-tunnel-probe".getBytes("UTF-8");
+            socket.send(new java.net.DatagramPacket(payload, payload.length,
+                    java.net.InetAddress.getByName("1.1.1.1"), 53));
+        } catch (Throwable ignored) {
+            // Nothing to do. The point is the packet entering the tunnel, not the answer.
         } finally {
             if (socket != null) {
                 socket.close();

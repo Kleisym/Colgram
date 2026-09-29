@@ -1481,7 +1481,260 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("Libbox.setup(options)", service)
         for setter in ("setBasePath", "setWorkingPath", "setTempPath"):
             self.assertIn(setter, service, "the engine is initialised without " + setter)
-        self.assertLess(service.index("ensureEngineSetUp();"), service.index("server.startOrReloadService(profilePath"))
+        self.assertLess(service.index("ensureEngineSetUp(this);"),
+                        service.index("server.startOrReloadService(readProfile(profilePath)"))
+
+    def test_the_engine_works_inside_the_apps_own_storage(self):
+        # The working directory used to be hand-built as /data/<package>/libbox. Only the app that
+        # owns <package> may create that, and an app may not create one under /data at all, so the
+        # engine had no working directory and no temp path to write its state into. Measured on the
+        # device, with the real APK engine against a live relay:
+        #   could not create the engine working directory /data/org.colgram.messenger/libbox
+        #   go.Universe$proxyerror: open .../work/CrashReport-colgram.log: no such file or directory
+        # The tunnel still reported itself up, because the flag is set by the caller rather than by
+        # the engine having started - which is why the toggle looked connected and carried nothing.
+        # getFilesDir() is the app's own storage by construction and is readable by the engine
+        # under the same uid.
+        service = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                   "/ColgramVpnService.java").read_text(encoding="utf-8")
+        self.assertIn("context.getFilesDir()", service)
+        self.assertNotIn("android.os.Environment.getDataDirectory()", service)
+        self.assertNotIn('"org.colgram.messenger/libbox"', service)
+        # The context has to reach the setup, so the call cannot be the no-argument one any more.
+        self.assertIn("ensureEngineSetUp(android.content.Context context)", service)
+
+    def test_the_engine_is_handed_the_profile_and_not_the_path_to_it(self):
+        # startOrReloadService takes the profile CONTENT. Handed a path, it hands that path to the
+        # JSON decoder, which reports the first character it cannot read - and for
+        # "/data/user/0/..." that is the leading slash, at row 1 column 2. Measured on the device
+        # against the real engine, on every start:
+        #   start or reload service: decode config: invalid character '/' looking for beginning
+        #   of comment: row 1, column 2
+        # The engine never saw the profile, and the tunnel still reported itself up, because the
+        # flag is set by the caller. Both call sites have to read the file.
+        service = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                   "/ColgramVpnService.java").read_text(encoding="utf-8")
+        self.assertIn("readProfile(profilePath)", service)
+        self.assertNotIn("startOrReloadService(profilePath,", service)
+
+    def test_a_relay_write_is_visible_to_the_profile_builder_that_reads_it_back(self):
+        # setRelay() persists with apply() and returns. Everything it enables then reads the values
+        # back immediately - the profile builder calls relayPublicKey() to pin the peer - so the
+        # read can beat the write. The profile then goes out naming the relay while carrying
+        # Cloudflare's peer key, and the relay rejects the handshake. Measured on the device as a
+        # profile that named the relay and did not carry its key.
+        warp = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramWarp.java").read_text(encoding="utf-8")
+        start = warp.index("public static boolean setRelay(")
+        set_relay = warp[start:warp.index("\n    }", start)]
+        self.assertIn("editor.commit();", set_relay)
+        self.assertNotIn("editor.apply();", set_relay)
+        # And a relay is only usable once its own key is stored, so a half-configured one is
+        # treated as no relay rather than as a broken relay.
+        self.assertIn("public static boolean hasUsableRelay()", warp)
+
+    def test_the_relay_address_and_the_relay_key_come_from_one_decision(self):
+        # They were asked separately: hasRelay() for the address, hasUsableRelay() for the key. That
+        # builds the one combination that can never work - the relay's address carrying Cloudflare's
+        # peer key, which the relay rejects - and it reads from the outside as a relay that is simply
+        # broken. Measured on the device: a profile that named the relay and did not carry its key.
+        # So hasUsableRelay() decides both, in the same expression.
+        tunnel = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                  "/ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        self.assertIn("boolean viaRelay = ColgramWarp.hasUsableRelay();", tunnel)
+        self.assertIn("viaRelay ? ColgramWarp.relayAddress() : ColgramWarp.endpointHost()", tunnel)
+        # hasRelay() alone must not choose an endpoint anywhere in the tunnel builder.
+        build = tunnel[tunnel.index("private static String warpProfile()"):]
+        build = build[:build.index("private static synchronized Object backend")]
+        self.assertNotIn("ColgramWarp.hasRelay()", build)
+
+    def test_the_relay_key_is_read_from_the_parsed_profile_not_the_raw_text(self):
+        # A "/" inside a base64 WireGuard key is written "\/" by Android's org.json, and about half
+        # of all base64 keys contain one. Comparing the profile's raw text against the raw key
+        # therefore reports a key that IS present as absent - which reads as a dead relay when the
+        # relay is fine. It cost a real diagnosis: the same test passed with a key that happened to
+        # contain no slash, and failed on every key that did.
+        test = (ROOT / "scripts/templates/ColgramDeviceEngineRelayTest.java").read_text(encoding="utf-8")
+        self.assertNotIn("profile.contains(relayKey)", test)
+        self.assertIn("pinnedPeerKey(profile)", test)
+
+    def test_the_tun_fd_comes_from_the_public_api_not_a_reflected_field(self):
+        # rawFd() reflected FileDescriptor.fd, which is how the value was reached in the days when
+        # it was the only way in. There is no such field on Android 15, and the failure is a badly
+        # misleading one: openTun() returned -1, so the engine was handed a bad descriptor and named
+        # the TUN device, which has nothing to do with the missing field. Measured on the device
+        # (API 35), with consent granted and establish() returning a real descriptor:
+        #   java.lang.NoSuchFieldException: No field fd in class java.io.FileDescriptor
+        #   configure tun interface: query tun name: bad file descriptor
+        # ParcelFileDescriptor.getFd() is public since API 1, so there was never a reason to reach
+        # past it.
+        platform = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                    "/ColgramPlatformInterface.java").read_text(encoding="utf-8")
+        self.assertIn("private static int rawFd(ParcelFileDescriptor descriptor)", platform)
+        self.assertIn("return descriptor.getFd();", platform)
+        self.assertNotIn('getDeclaredField("fd")', platform)
+
+    def test_the_connection_owner_is_an_object_and_not_a_null(self):
+        # findConnectionOwner returned null to mean "no process table, this is a phone". The Go
+        # side dereferences that return value without a nil check, so the honest answer crashed the
+        # process the first time a real packet arrived in the TUN:
+        #   panic: runtime error: invalid memory address or nil pointer dereference
+        #   libbox.(*platformInterfaceWrapper).FindConnectionOwner service.go:226
+        #   route.(*platformSearcher).FindProcessInfo platform_searcher.go:44
+        #   route.(*Router).prepareMatchMetadata route.go:546
+        # "No answer" has to be a valid object that matches no per-app rule, not an absent one.
+        platform = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                    "/ColgramPlatformInterface.java").read_text(encoding="utf-8")
+        start = platform.index("public ConnectionOwner findConnectionOwner(")
+        body = platform[start:platform.index("\n    }", start)]
+        self.assertIn("new ConnectionOwner()", body)
+        self.assertIn("setAndroidPackageNames", body)
+        # The method must not return null on any path, so there is no bare return at all.
+        self.assertNotIn("return null;", body)
+
+    def test_the_tunnel_does_not_swallow_its_own_handshake(self):
+        # route_address 0.0.0.0/0 with strict_route hands the device's traffic to the tunnel -
+        # including the tunnel's own WireGuard packets to its own endpoint. The engine then sends
+        # the handshake into the interface it is trying to build, and the peer never sees an
+        # initiation. Measured on the device against a live relay: the bare datagram probe timed out
+        # (SocketTimeoutException: the device does not reach the relay) while the relay had been
+        # answering all along, and the tunnel ate the reply. route_exclude_address is a field of this
+        # engine version, read out of the schema it generates rather than assumed.
+        builder = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                   "/ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        # The engine declares it: RouteExcludeAddress json:"route_exclude_address,omitempty", with
+        # an ampersand marking the field as an embedded struct. A listing that does not allow that
+        # ampersand reports the field as absent - which is how it was read here, removed, and the
+        # removal measured as a regression: with the exclusion gone the relay became unreachable the
+        # moment there was traffic to carry. With it, the same probe answers in under a second.
+        self.assertIn('put("route_exclude_address"', builder)
+        self.assertIn("onlyIfLiteralIp(endpoint)", builder)
+        # A hostname is not excludable - a route excludes addresses - so it must not be passed as
+        # one, or the engine would reject a name where it expects a prefix.
+        self.assertIn("private static String onlyIfLiteralIp(String host)", builder)
+        # A prefix, not a bare address. The engine rejected the bare form by name and by value:
+        #   inbounds[0].route_exclude_address: netip.ParsePrefix("10.0.2.2"): no '/'
+
+    def test_the_relay_test_asks_the_tunnel_to_carry_something(self):
+        # A WireGuard endpoint is lazy: it sends an initiation when it has a packet to send and
+        # stays silent otherwise. Starting the tunnel and waiting produces no handshake at all,
+        # which reads as a blocked network and is not one - the engine was never asked to carry
+        # anything. Measured on the device: tunnel up, exclusion working, relay reached by a bare
+        # datagram, and handshakes 0, because nothing had entered the TUN.
+        test = (ROOT / "scripts/templates/ColgramDeviceEngineRelayTest.java").read_text(encoding="utf-8")
+        self.assertIn("driveTrafficThrough(context)", test)
+        self.assertIn("private static void driveTrafficThrough(Context context)", test)
+        # Inside the wait loop, not after it - the handshake has to be provoked while it is open.
+        wait = test[test.index("long expires ="):test.index("isUp (the flag)")]
+        self.assertIn("driveTrafficThrough(context)", wait)
+
+    def test_the_excluded_routes_reach_the_operating_system_not_just_the_engine(self):
+        # route_exclude_address reaches the engine, but on Android the routing table is built in the
+        # service from TunOptions - and getInet4RouteExcludeAddress / getInet6RouteExcludeAddress were
+        # never read. So the exclusion existed in the profile, was accepted, and did nothing: the OS
+        # kept handing the engine's own WireGuard packets to the interface the engine was building.
+        # Measured on the device: tunnel starts, relay reachable by a bare datagram while idle, and
+        # unreachable the moment there is traffic to carry.
+        service = (ROOT / "vendor/colgram-singbox/src/main/java/org/colgram/singbox"
+                   "/ColgramVpnService.java").read_text(encoding="utf-8")
+        self.assertIn("options.getInet4RouteExcludeAddress()", service)
+        self.assertIn("options.getInet6RouteExcludeAddress()", service)
+        # excludeRoute(IpPrefix) - read off the platform stub. VpnService.Builder has no
+        # addDisallowedRoute, and compiling against one fails the build rather than failing a test.
+        self.assertIn("builder.excludeRoute(new android.net.IpPrefix(", service)
+        # The name survives in a comment explaining why it is wrong, so the assertion is on the
+        # call, not on the word.
+        self.assertNotIn("builder.addDisallowedRoute(", service)
+
+    def test_the_watchdog_judges_the_endpoint_the_profile_actually_names(self):
+        # The probe dialled Cloudflare's host while the profile named a relay, and the tunnel it had
+        # just built no longer resolved that name - UnknownHostException, then "the WARP endpoint
+        # is silent", about a host that was never in the path. Worse, the answer drove a restart, so
+        # a probe that could not succeed was tearing down the session it was evaluating. Measured on
+        # the device: three engine restarts inside one measurement window, handshakes 0.
+        tunnel = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                  "/ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        self.assertIn("String judgedHost = ColgramWarp.hasUsableRelay()", tunnel)
+        self.assertIn("ColgramWarp.relayAddress()", tunnel)
+        self.assertIn("judgedPort", tunnel)
+        # A relay has one fixed endpoint, so the loop must not rotate it.
+        self.assertIn("leaving the engine to retry its own handshake", tunnel)
+
+    def test_the_tun_mtu_matches_the_endpoint_mtu(self):
+        # The TUN advertised 9000 while the endpoint is configured for 1280, so the engine padded
+        # its WireGuard messages up to the interface MTU. A padded initiation is not an initiation:
+        # a real one is exactly 148 bytes, and the peer accepts only that length. Measured on the
+        # device against a live relay: three 1200-byte packets forwarded, handshakes 0, and nothing
+        # in the log naming the shape - which is why the relay now prints what it received.
+        builder = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                   "/ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        self.assertIn("private static final int MTU = 1280;", builder)
+        self.assertNotIn('.put("mtu", 9000)', builder)
+        relay = (ROOT / "scripts/warp-relay-peer.py").read_text(encoding="utf-8")
+        self.assertIn("def message_name(data: bytes)", relay)
+        self.assertIn("def message_name(data: bytes)", relay)
+        self.assertIn("not %dB - %s", relay)
+        # The tail is what separates real padding from a misread field: zeros after a complete
+        # 148-byte message is padding, and non-zero bytes there are not.
+        self.assertIn("so the sender padded it", relay)
+
+    def test_the_blake2s_sweep_survives_as_evidence_of_how_the_counter_was_pinned(self):
+        # The mac1 path is gone - the engine has no such field - but the sweep that pinned the byte
+        # counter is how that was established, and it still answers a question anyone reading this
+        # will ask: which of the four candidate rules is the specification. Deleting it with the code
+        # would leave the answer as a comment, which is the form it was in before it was swept.
+        import importlib.util
+        import hashlib
+
+        spec = importlib.util.spec_from_file_location(
+            "pin", ROOT / "scripts/pin-blake2s-counter.py")
+        pin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pin)
+        rule = lambda offset, length: min(offset + 64, length)  # noqa: E731 - a local test rule
+        for length in [0, 1, 2, 3, 55, 56, 63, 64, 65, 74, 100, 127, 128, 129, 200, 256]:
+            data = bytes((ord("A") + i % 26) for i in range(length))
+            self.assertEqual(
+                pin.digest(data, 16, rule).hex(),
+                hashlib.blake2s(data, digest_size=16).hexdigest(),
+                "the byte counter is wrong at %d bytes" % length,
+            )
+
+    def test_the_profile_carries_no_mac1_because_this_engine_has_no_such_field(self):
+        # The engine rejected it by name, on the device, with a profile that was otherwise valid:
+        #   endpoints[0].peers[0].mac1: json: unknown field "mac1"
+        # Its own binary lists the peer fields it decodes - address, port, public_key, pre_shared_key,
+        # allowed_ips, reserved, persistent_keepalive_interval - and mac1 is not among them. So this
+        # engine computes the cookie itself, and a profile may not carry one.
+        #
+        # Worth recording because the empty handshake looks exactly like a missing cookie: the
+        # datagram on the wire was a message-type byte followed by 147 zeros, a header with no body.
+        # It is not that. Adding the field cost a build cycle and the handshake is still empty, which
+        # is the useful part of knowing it.
+        builder = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                   "/ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        self.assertNotIn('put("mac1"', builder)
+        self.assertNotIn("blake2s", builder)
+        # The refusal is quoted where the field would have gone, so the next person does not try it
+        # again on the strength of a plausible-looking gap.
+        self.assertIn('unknown field "mac1"', builder)
+
+    def test_the_route_rule_names_the_endpoint_and_not_a_direct_outbound(self):
+        # The profile declared a wireguard endpoint tagged "warp" and then routed every packet to an
+        # outbound tagged "direct". Nothing anywhere named the endpoint's tag, so the tunnel came up,
+        # installed its routes, and had nothing to carry - the endpoint was never dialled, no
+        # handshake was ever attempted, and the relay saw no packets at all. Measured on the device
+        # with a live relay: isConnected=false, the relay silent, and no error anywhere, because
+        # nothing had failed. A full-device tunnel that routes nothing looks exactly like a working
+        # one from the settings screen and from the engine's own log.
+        builder = (ROOT / "colgram-core/src/main/java/org/colgram/core"
+                   "/ColgramWarpProfileBuilder.java").read_text(encoding="utf-8")
+        start = builder.index("JSONArray rules = new JSONArray();")
+        end = builder.index("JSONObject root = new JSONObject();", start)
+        rules = builder[start:end]
+        self.assertIn('.put("outbound", "warp")', rules)
+        self.assertNotIn('.put("outbound", "direct")', rules)
+        # The tag has to match the endpoint's, or the rule names something that does not exist and the
+        # engine refuses the config rather than carrying it.
+        self.assertIn('.put("tag", "warp")', builder)
 
     def test_the_command_server_is_started_before_anything_is_reloaded_on_it(self):
         # startOrReloadService reaches straight for the running service the Go side keeps behind
@@ -1497,7 +1750,7 @@ public final class DialogRefreshSequencerHarness {
                    "/ColgramVpnService.java").read_text(encoding="utf-8")
         self.assertIn("server.start();", service)
         self.assertLess(service.index("server.start();"),
-                        service.index("server.startOrReloadService(profilePath"))
+                        service.index("server.startOrReloadService(readProfile(profilePath)"))
         self.assertIn("new io.nekohasekai.libbox.OverrideOptions()", service)
         self.assertNotIn("startOrReloadService(profilePath, null)", service,
                          "a nil override panics the Go side; it must be a real instance")
@@ -1771,7 +2024,7 @@ public final class DialogRefreshSequencerHarness {
         tunnel = WARP_TUNNEL.read_text(encoding="utf-8")
         manager = PROXY.read_text(encoding="utf-8")
         self.assertIn("private static final int STALE_AFTER_SECS = 8;", tunnel)
-        self.assertIn("ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
+        self.assertIn("ColgramWarp.hasUsableRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
         # The budget is TIME now, not one pass over the ports. The filter on this network is not
         # constant - the same host and port have answered in one session and not in another - and a
         # single pass is about 32 seconds, which cannot outlast a filter that moves over minutes.
@@ -1913,13 +2166,16 @@ public final class DialogRefreshSequencerHarness {
         self.assertIn("relayKey", builder)
         self.assertIn("pre_shared_key", builder)
         # The tunnel must actually consult the configured relay rather than always dialling
-        # Cloudflare's own ingress.
-        self.assertIn("ColgramWarp.hasRelay()", tunnel)
+        # Cloudflare's own ingress - and it has to consult the USABLE form, not the address alone.
+        # An address without a key builds a profile naming the relay while pinning Cloudflare's
+        # peer key against it, which the relay rejects: measured on the device as a profile that
+        # named the relay and failed the assertion that it carries the relay's key.
+        self.assertIn("ColgramWarp.hasUsableRelay()", tunnel)
         self.assertIn("ColgramWarp.relayAddress()", tunnel)
         self.assertIn("ColgramWarp.relayPublicKey()", tunnel)
         # A relay has one fixed port, so rotating Cloudflare's ports through it would only build
         # profiles that cannot connect.
-        self.assertIn("ColgramWarp.hasRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
+        self.assertIn("ColgramWarp.hasUsableRelay() ? 1 : ColgramWarp.endpointPortCount()", tunnel)
 
     def test_the_singbox_device_tests_are_mirrored_like_the_rest(self):
         """Three engine tests existed only in the ignored tree, so a clone lost them.
