@@ -1487,6 +1487,18 @@ func measureWith(cfg Config) (string, error) {
 				}
 				stopRelay()
 			}
+
+		// The HTTP/2 carrier, on the same registration and through the same capsule stream the app's
+		// session uses. It is asked last because where UDP is not filtered QUIC is the carrier the
+		// official client prefers - but a verdict from here is a verdict from the carrier the tunnel is
+		// actually running on, which a QUIC measurement on a network that filters it can never be.
+		if body, err := traceOverH2(srcIP, cert); err == nil && WarpOn(body) {
+			return body, nil
+		} else if err != nil {
+			fmt.Println("  h2 carrier    :", err)
+			androidLog(fmt.Sprintf("colgram_masque: h2 carrier failed: %v", err))
+			bridgeErr = errString(err)
+		}
 		}
 		return "", fmt.Errorf("no edge route answered: %s", bridgeErr)
 	}
@@ -1745,6 +1757,115 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 		}
 	}
 	fmt.Printf("ip packets      : sent=%d recv=%d\n", c.sent, c.recv)
+	return body.String(), nil
+}
+
+// traceOverH2 fetches Cloudflare's trace through the HTTP/2 carrier and returns the body.
+//
+// It runs the real thing rather than a separate implementation of it: the same handshake, the same
+// request shape, the same capsule framing and the same peer state machine the app's session uses, so
+// `warp=on` here means `warp=on` on the tunnel that is actually up. A measurement path of its own would
+// be a second thing to keep in step with the first, and the last version of that diverged so far that it
+// reported a network that could not route as one with no carrier at all.
+func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
+	defer cancel()
+
+	addr := net.JoinHostPort(edgeH2IP, edgeH2Port)
+	stream, err := openH2Session(ctx, cert, addr)
+	if err != nil {
+		return "", err
+	}
+	tun := &tunnel{srcIP: srcIP, stream: stream}
+
+	// The pump has to exist before the peer opens: the SYN goes out as a capsule and nothing comes back
+	// unless someone is already reading the return path.
+	go func() {
+		for {
+			data, err := stream.ReceiveDatagram(ctx)
+			if err != nil {
+				return
+			}
+			if len(data) < 20 {
+				continue
+			}
+			if !isBareIPv4(data) {
+				if len(data) >= 21 && data[0] == 0x00 {
+					data = data[1:]
+				}
+			}
+			if len(data) < 20 || data[0]>>4 != 4 {
+				continue
+			}
+			atomic.AddInt64(&tun.recvCapsules, 1)
+			tun.dispatch(data)
+		}
+	}()
+
+	ips, err := resolve(traceHost)
+	if err != nil || len(ips) == 0 {
+		return "", fmt.Errorf("resolve %s: %v", traceHost, err)
+	}
+	var dst net.IP
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			dst = v4
+			break
+		}
+	}
+	if dst == nil {
+		return "", fmt.Errorf("no IPv4 for %s", traceHost)
+	}
+
+	peer := newTunnelConn(tun, srcIP, dst, 51500, 443)
+	tun.peers = append(tun.peers, peer)
+	if err := peer.open(); err != nil {
+		return "", fmt.Errorf("tcp open through the tunnel: %w (sent=%d recv=%d)",
+			err, peer.sent, peer.recv)
+	}
+
+	inner := tls.Client(peer, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         traceHost,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err := inner.SetDeadline(time.Now().Add(45 * time.Second)); err != nil {
+		return "", err
+	}
+	if err := inner.Handshake(); err != nil {
+		return "", fmt.Errorf("tls inside tunnel: %w (sent=%d recv=%d)", err, peer.sent, peer.recv)
+	}
+
+	req := strings.Join([]string{
+		"GET " + tracePath + " HTTP/1.1",
+		"Host: " + traceHost,
+		"User-Agent: colgram-warp-on",
+		"Accept: */*",
+		"Connection: close",
+		"", "",
+	}, crlf)
+	if _, err := io.WriteString(inner, req); err != nil {
+		return "", fmt.Errorf("write request: %w", err)
+	}
+
+	body := &bytes.Buffer{}
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		inner.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := inner.Read(buf)
+		if n > 0 {
+			body.Write(buf[:n])
+			if bytes.Contains(body.Bytes(), []byte("warp=")) {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	androidLog(fmt.Sprintf("colgram_masque: h2 trace sent=%d recv=%d bytes=%d",
+		peer.sent, peer.recv, body.Len()))
 	return body.String(), nil
 }
 
@@ -2440,6 +2561,11 @@ func colgram_masque_trace() *C.char {
 	// Reuses the measurement path rather than duplicating it: the trace is fetched inside a fresh MASQUE
 	// session and the verdict is whatever Cloudflare wrote in it. A separate implementation would be a
 	// second thing to keep in step with the first.
+	//
+	// The QUIC path is tried first and is still the carrier the official client prefers. Where UDP to the
+	// edge is filtered - which is the case on every network this was measured on - it cannot return a
+	// verdict at all, so the HTTP/2 carrier is asked next. The order matches the one the session uses, so
+	// the verdict reported here is the verdict the tunnel the app is running would produce.
 	return colgram_masque_measure(nil, nil, nil, nil)
 }
 

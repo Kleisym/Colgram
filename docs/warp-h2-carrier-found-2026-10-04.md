@@ -264,6 +264,32 @@ carriers differ, and the code that reads them differs accordingly.
 Three separate places had the same assumption written into them: the probe's reader, the shipped
 reader, and the pump. All three are now checked against the packet's own header instead.
 
+## warp=on, from inside Colgram, on the phone
+
+    ColgramWarpVerdict: trace bytes=506
+    ColgramWarpVerdict:   CF-RAY: a4567eb52d65b031-ORD
+    ColgramWarpVerdict:   ip=104.28.227.110
+    ColgramWarpVerdict:   h=connectivity.cloudflareclient.com
+    ColgramWarpVerdict:   uag=colgram-warp-on
+    ColgramWarpVerdict:   colo=ORD
+    ColgramWarpVerdict:   http=http/1.1
+    ColgramWarpVerdict:   loc=US
+    ColgramWarpVerdict:   tls=TLSv1.3
+    ColgramWarpVerdict:   kex=X25519MLKEM768
+    ColgramWarpVerdict:   warp=on
+    ColgramWarpVerdict:   gateway=off
+
+That is Cloudflare's own string, fetched through a tunnel the app opened, on the device, over MASQUE on
+HTTP/2 - the carrier the QUIC path cannot reach on this network at all. The user agent is the one this
+client sends, so the request that produced it went through the code in this repository and not through
+anything else.
+
+Getting here needed one more thing: the trace measurement had been running only the QUIC carrier, so the
+verdict was unreachable on exactly the networks where the HTTP/2 fallback matters. It now tries QUIC first
+and then the same HTTP/2 carrier the session uses, in that order, and returns whichever answers. A separate
+measurement path is how the previous version of this diverged from the tunnel until the two disagreed
+about what the network could do.
+
 ## The tunnel opens on the device
 
 `ColgramMasqueOnDeviceTest` opens a session through the public Java face on the phone and reads back what
