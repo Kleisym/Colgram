@@ -2179,7 +2179,18 @@ func resolve(host string) ([]net.IP, error) {
 	var lastErr error
 	for _, e := range dohEndpoints {
 		ips, err := resolveVia(e, host)
-		if err == nil && len(ips) > 0 {
+		// A resolver that answers is not the same as a resolver that answers correctly. Measured here:
+		// when the Cloudflare and Google entries in this list were cut, the AdGuard entry answered - and
+		// returned 94.140.14.14 for api.cloudflareclient.com, which is not a Cloudflare address at all.
+		// The enrolment then completed against it and the API answered 400:
+		//
+		//   register: Post "https://api.cloudflareclient.com/v0a4471/reg": 400
+		//
+		// So an answer is checked against the range the host is actually served from before it is used, and
+		// an answer from outside that range is treated as a failed resolver rather than as the address.
+		// Without the check this is a silent substitution by whichever resolver happens to be reachable,
+		// which is the same attack the system resolver performs and the reason this list exists.
+		if err == nil && len(ips) > 0 && plausible(host, ips) {
 			return ips, nil
 		}
 		if err != nil {
@@ -2213,6 +2224,59 @@ var dohEndpoints = []dohEndpoint{
 	{"8.8.8.8", "dns.google", "dns.google"},
 	{"8.8.4.4", "dns.google", "dns.google"},
 	{"94.140.14.14", "adguard-dns.com", "adguard-dns.com"},
+}
+
+// servedFrom pins the range each of these hosts is actually served from, so an answer that comes back
+// from outside it is a substituted resolver rather than a moved service.
+//
+// The values are Cloudflare's own published ranges, checked against what the resolvers above return:
+//
+//   api.cloudflareclient.com        104.16.24.84   104.16.192.82
+//   engage.cloudflareclient.com     162.159.192.x
+//   www.cloudflare.com              104.16.x / 172.64.x
+//   connectivity.cloudflareclient.com 162.159.138.x
+//
+// A host not listed here is not checked, because an unknown host has no range to check against and a
+// guess would be worse than the answer it replaced.
+var servedFrom = map[string][]string{
+	apiHost:          {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
+	"engage.cloudflareclient.com": {"162.158.0.0/15", "162.159.0.0/16"},
+	"connectivity.cloudflareclient.com": {"162.158.0.0/15", "162.159.0.0/16"},
+	"www.cloudflare.com": {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
+}
+
+// plausible reports whether every answer falls inside a range the host is served from.
+func plausible(host string, ips []net.IP) bool {
+	nets, ok := servedFrom[host]
+	if !ok {
+		return true
+	}
+	var parsed []*net.IPNet
+	for _, cidr := range nets {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		parsed = append(parsed, n)
+	}
+	if len(parsed) == 0 {
+		return true
+	}
+	for _, ip := range ips {
+		inside := false
+		for _, n := range parsed {
+			if n.Contains(ip) {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			androidLog(fmt.Sprintf("colgram_masque: resolver answered %s with %s, which is not a "+
+				"range it is served from; treating the resolver as failed", host, ip))
+			return false
+		}
+	}
+	return true
 }
 
 func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
@@ -2516,6 +2580,23 @@ peer := newTunnelConn(s.tun, s.tun.srcIP, mustAddr(s.addr).IP,
 
 func (s *longSession) pump(ctx context.Context) {
 	for {
+		// The session can be closed underneath this goroutine - closeSession cancels the context and
+		// closes the carrier while the read below is in flight - and a receive on a stream that was torn
+		// down at the same moment faults in the scheduler rather than returning an error:
+		//
+		//   fatal error: unexpected signal during runtime execution
+		//   [signal SIGSEGV: segmentation violation code=0x80]
+		//   runtime.selectgo
+		//
+		// The check before the read narrows the window; it does not close it, because the context can be
+		// cancelled between the check and the receive. What closes it is the deadline the carrier already
+		// sets on every read - the read returns, the loop notices the context, and the goroutine leaves
+		// rather than touching a stream that no longer exists.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		data, err := s.tun.stream.ReceiveDatagram(ctx)
 		if err != nil {
 			return

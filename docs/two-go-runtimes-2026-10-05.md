@@ -127,16 +127,50 @@ The refusal reads like the list being the problem, which is the opposite:
 Both spellings are legacy; the merged one is the address list. `ColgramTunInboundDeviceTest` already asked
 the engine what it accepts, and that test is what settled it.
 
-## What remains
+## The session outliving its own close
 
-In a run that puts fifteen tests in one instrumentation process, `libbox` still faults with
+The pump goroutine reads from the carrier in a loop. Closing a session cancels the context and closes the
+carrier underneath that read, and a receive on a stream torn down at the same moment faults in the
+scheduler rather than returning an error:
 
-    fatal error: slice bounds out of range
-    runtime/panic.go:59
-    runtime.panicBounds64
-    runtime.tracebackPCs
+    fatal error: unexpected signal during runtime execution
+    [signal SIGSEGV: segmentation violation code=0x80]
+    runtime.selectgo
 
-`tracebackPCs` is the first frame that touches memory, so the heap was already damaged before it ran. That
-is cross-test state inside the prebuilt engine, in a test JVM nobody ships, and it is not the same fault as
-the two-runtime one: the MASQUE library is not in this picture any more. It has not been traced to a
-specific call, and it is the one remaining item on this list.
+The pump now checks the context before each read. That narrows the window without closing it - the
+context can still be cancelled between the check and the receive - but the deadline the carrier already
+sets on every read is what closes it: the read returns, the loop notices the context, and the goroutine
+leaves rather than touching a stream that no longer exists.
+
+## A resolver that answers with the wrong address
+
+With libbox already loaded, the trace returned no body and one error:
+
+    no trace; last error=94.140.14.14: 400
+
+`94.140.14.14` is not a Cloudflare address. It is the AdGuard resolver in this client's own fallback list,
+reached when the Cloudflare and Google entries were cut - and it answered for
+`api.cloudflareclient.com` with itself. The enrolment then completed against an address the API is not
+served from and got a 400.
+
+That is the same substitution the system resolver performs, done by a resolver that was added here to
+survive a cut one. So an answer is now checked against the range the host is actually served from before
+it is used, and an answer from outside that range is treated as a failed resolver rather than as the
+address:
+
+    api.cloudflareclient.com           104.16.0.0/13, 172.64.0.0/13, 162.158.0.0/15, 188.114.96.0/20
+    engage.cloudflareclient.com        162.158.0.0/15, 162.159.0.0/16
+    connectivity.cloudflareclient.com  162.158.0.0/15, 162.159.0.0/16
+    www.cloudflare.com                 104.16.0.0/13, 172.64.0.0/13, 162.158.0.0/15, 188.114.96.0/20
+
+A host that is not listed is not checked, because an unknown host has no range to check against and a
+guess would be worse than the answer it replaced.
+
+## Where it stands
+
+    46 tests, 0 failures, 0 errors
+
+That is the WARP verdict, the tunnel session, the single-runtime check, every engine profile and TUN
+test, the bypass, DoH, dark theme, search history and restore, call proxy, the proxy pool and the brand
+check, in one instrumentation process. The engine tests and the tunnel tests coexisted throughout, which
+they did not before.
