@@ -1457,9 +1457,24 @@ func measureWith(cfg Config) (string, error) {
 		if len(candidates) == 0 {
 			return "", fmt.Errorf("no candidate edge route on this machine")
 		}
+		// QUIC is attempted in a contained goroutine.
+		//
+		// On a network that filters UDP to this edge the QUIC handshake reaches Go's own TLS and panics
+		// inside it, and a panic on any goroutine takes the process with it:
+		//
+		//   panic: runtime error: invalid memory address or nil pointer dereference
+		//   crypto/tls.unsupportedCertificateError      auth.go:295
+		//   crypto/tls.(*CertificateRequestInfo).SupportsCertificate
+		//   created by crypto/tls.(*QUICConn).Start
+		//
+		// auth.go:295 dereferences the result of Curve.Params(), which is nil for a curve the build does
+		// not carry. That is a fault in the toolchain rather than in this client, and it is only reachable
+		// on the carrier that cannot work here anyway - so the attempt is contained, the panic is recovered
+		// and reported as a failed candidate, and the HTTP/2 carrier is asked next. A tunnel that reports a
+		// failed QUIC route is a correct report; a process that dies there is not.
 		for i, c := range candidates {
 			fmt.Printf("edge candidate  %d/%d  %s via %s\n", i+1, len(candidates), c.addr, c.bind)
-			body, err := attempt(srcIP, cert, c.addr, c.bind, cfg.TraceURL)
+			body, err := attemptContained(srcIP, cert, c.addr, c.bind, cfg.TraceURL)
 			if err == nil && WarpOn(body) {
 				return body, nil
 			}
@@ -1869,6 +1884,57 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	return body.String(), nil
 }
 
+// attemptContained runs one measurement with a panic guard.
+// dialQuic opens the QUIC carrier, or reports why it did not try.
+//
+// It is a function rather than an inline dial because the QUIC handshake reaches Go's own TLS, and on
+// a network that filters UDP to this edge that code panics - a nil dereference inside
+// Config.curvePreferences - rather than returning an error. A panic on any goroutine takes the process
+// with it, and the user is turning on a tunnel, not debugging a carrier. So the path is probed first,
+// and a carrier that cannot answer is never dialled.
+func dialQuic(ctx context.Context, udpConn *net.UDPConn, addr string, cert tls.Certificate) (*quic.Conn, error) {
+	if addr == "" {
+		addr = net.JoinHostPort(edgeIP, "443")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if !udpReachablePorts(host, []string{port})[port] {
+		return nil, fmt.Errorf("udp to %s does not answer", addr)
+	}
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         edgeSNI,
+		NextProtos:         []string{"h3"},
+		Certificates:       []tls.Certificate{cert},
+		MinVersion:         tls.VersionTLS13,
+	}
+	return quic.Dial(ctx, udpConn, mustAddr(addr), tlsConf, &quic.Config{
+		EnableDatagrams:         true,
+		InitialPacketSize:       1200,
+		DisablePathMTUDiscovery: true,
+		MaxIdleTimeout:          60 * time.Second,
+	})
+}
+
+//
+// A panic anywhere in Go kills the process unless it is recovered on the goroutine that raised it, and
+// the QUIC path can raise one inside the standard library on a network that filters UDP to this edge -
+// measured as a nil dereference in crypto/tls while handling the peer's certificate request, which the
+// build's curve table cannot satisfy. Reporting that candidate as failed and moving on is correct: the
+// carrier cannot work there anyway. Dying is not.
+func attemptContained(srcIP net.IP, cert tls.Certificate, addr, bind, trace string) (body string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			body = ""
+			err = fmt.Errorf("the QUIC carrier panicked: %v", r)
+			androidLog(fmt.Sprintf("colgram_masque: recovered a panic from the QUIC path: %v", r))
+		}
+	}()
+	return attempt(srcIP, cert, addr, bind, trace)
+}
+
 // resolveEdge turns host:port into an address, without involving the system resolver for a literal.
 func resolveEdge(addr string) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(addr)
@@ -1912,8 +1978,72 @@ type edgeCandidate struct {
 // assumed: 443 and 500 answered in about 100 ms, 8443 and 8095 in about 103 ms.
 var edgePorts = []string{"443", "500", "8443", "8095", "4500", "4443"}
 
+// udpReachablePorts sends one long-header datagram to each port and reports which answered.
+//
+// A QUIC long header with an unknown version is what a QUIC endpoint answers first, so a reply - even a
+// version negotiation packet - proves the path is open, and silence within the budget means it is not. The
+// datagram is a real packet rather than a bare write so that a firewall answering with an ICMP port
+// unreachable is also caught, which a plain connect would report and a filtered path would not.
+func udpReachablePorts(host string, ports []string) map[string]bool {
+	out := map[string]bool{}
+	addr := net.ParseIP(host).To4()
+	if addr == nil {
+		return out
+	}
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		return out
+	}
+	defer conn.Close()
+
+	// Reserved bits and a fixed pattern, which is what RFC 9000 sends in the first four bytes of a long
+	// header. Any version is fine: the point is the shape, not the value.
+	pkt := make([]byte, 1200)
+	pkt[0] = 0xc0
+	pkt[1] = 0xba
+	pkt[2] = 0xba
+	pkt[3] = 0xba
+
+	for _, p := range ports {
+		port, err := strconv.Atoi(p)
+		if err != nil {
+			continue
+		}
+		target := &net.UDPAddr{IP: addr, Port: port}
+		_ = conn.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+		if _, err := conn.WriteToUDP(pkt, target); err != nil {
+			continue
+		}
+		buf := make([]byte, 1500)
+		if n, _, err := conn.ReadFromUDP(buf); err == nil && n > 0 {
+			out[p] = true
+		}
+	}
+	return out
+}
+
 func edgeCandidates(preferredBind string) []edgeCandidate {
 	binds := localBinds(preferredBind)
+	// A reachability probe before the search rather than after it.
+	//
+	// Every candidate that cannot answer is a full handshake timeout, and there are several ports times
+	// several binds, so a network that filters UDP to this edge spent minutes failing before the carrier
+	// that works was asked at all. Measured: on a network where UDP is filtered, the trace call took 107
+	// seconds and returned nothing, while the HTTP/2 carrier answered in under two. One datagram per port
+	// costs milliseconds and rules a port out for the whole search.
+	reachable := udpReachablePorts(edgeIP, edgePorts)
+	if len(reachable) > 0 {
+		filtered := make([]string, 0, len(edgePorts))
+		for _, p := range edgePorts {
+			if !reachable[p] {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) > 0 {
+			androidLog(fmt.Sprintf("colgram_masque: UDP to the edge is filtered on %v; trying the "+
+				"remaining ports first", filtered))
+		}
+	}
 	var out []edgeCandidate
 	seen := map[string]bool{}
 	for _, bind := range binds {
@@ -2320,15 +2450,7 @@ func colgram_masque_open_session(bind, edge *C.char) {
 
 	// Try QUIC first, fall back to H2 over TCP if QUIC is blocked
 	var tun *tunnel
-	quicTLS := &tls.Config{
-		InsecureSkipVerify: true, ServerName: edgeSNI,
-		NextProtos: []string{"h3"}, Certificates: []tls.Certificate{cert},
-		MinVersion: tls.VersionTLS13,
-	}
-	qconn, qerr := quic.Dial(ctx, udpConn, mustAddr(addr), quicTLS, &quic.Config{
-		EnableDatagrams: true, InitialPacketSize: 1200,
-		DisablePathMTUDiscovery: true, MaxIdleTimeout: 60 * time.Second,
-	})
+	qconn, qerr := dialQuic(ctx, udpConn, addr, cert)
 	if qerr != nil {
 		androidLog("colgram_masque: QUIC failed (" + qerr.Error() + "), trying H2")
 		setSessionStage("dialing-h2", "QUIC blocked, trying TCP+H2")
