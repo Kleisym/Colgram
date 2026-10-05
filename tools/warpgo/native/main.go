@@ -102,9 +102,9 @@ const (
 // This exists because of a measured property of the device's network, not a preference. UDP 443 is
 // filtered there while TCP 443 and UDP 53 both answer:
 //
-//     1.1.1.1:53          ANSWERED 64 bytes in 103ms
-//     1.1.1.1:54          no answer in 3001ms
-//     162.159.198.2:443   no answer in 3001ms
+//	1.1.1.1:53          ANSWERED 64 bytes in 103ms
+//	1.1.1.1:54          no answer in 3001ms
+//	162.159.198.2:443   no answer in 3001ms
 //
 // A filter on the destination port, with DNS carved out. MASQUE needs a bidirectional UDP flow to
 // the edge, and none of the ports the edge answers on is 53. A SOCKS5 relay that already carries
@@ -358,11 +358,11 @@ func socksAddrForAttempt() string {
 // bytes and comes back every time, and a data segment of 1140 comes back never - not refused, not reset,
 // simply no reply and no inbound packet of any kind after it:
 //
-//     outbound 40 bytes,   flags 0x002, seq 1                    <- SYN      inbound 44
-//     outbound 40 bytes,   flags 0x010, seq 2                    <- ACK      inbound 44
-//     outbound 1140 bytes, flags 0x018, seq 2  payload 1100     <- data     nothing
-//     outbound 465 bytes,  flags 0x018, seq 1102 payload 425     <- data     nothing
-//     tls inside tunnel: i/o timeout (sent=9 recv=2)
+//	outbound 40 bytes,   flags 0x002, seq 1                    <- SYN      inbound 44
+//	outbound 40 bytes,   flags 0x010, seq 2                    <- ACK      inbound 44
+//	outbound 1140 bytes, flags 0x018, seq 2  payload 1100     <- data     nothing
+//	outbound 465 bytes,  flags 0x018, seq 1102 payload 425     <- data     nothing
+//	tls inside tunnel: i/o timeout (sent=9 recv=2)
 //
 // The largest packet measured crossing this edge in either direction, in a session that returned
 // warp=on, is 466. So the segment is sized to sit under what the carrier has actually been seen to
@@ -475,11 +475,11 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 
 // synOptions are the TCP options this side offers on its SYN and repeats on every later segment.
 //
-//   MSS 1240              the largest segment that fits the 1200-byte packet this carrier has been
-//                          measured to carry, less the two headers
-//   SACK permitted        selective acknowledgement, which the edge answers acknowledging
-//   timestamps            required by window scaling and by most middleboxes' path MTU heuristics
-//   window scale 7        128-byte windows, which is what a tunnel of this shape can carry
+//	MSS 1240              the largest segment that fits the 1200-byte packet this carrier has been
+//	                       measured to carry, less the two headers
+//	SACK permitted        selective acknowledgement, which the edge answers acknowledging
+//	timestamps            required by window scaling and by most middleboxes' path MTU heuristics
+//	window scale 7        128-byte windows, which is what a tunnel of this shape can carry
 //
 // They repeat after the handshake because the header length is part of the stream layout the peer
 // negotiated. A flow that starts with a 40-byte header and continues with a 20-byte one is a different
@@ -812,8 +812,8 @@ func (c *tunnelConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: c.dstIP, Po
 // then everything above it does not. A TLS handshake run on this connection waited forever, because the
 // only deadline it had was on a socket that ignores it:
 //
-//   h2 peer open, sent=7 recv=2
-//   ... nothing for the caller's whole 180 second budget
+//	h2 peer open, sent=7 recv=2
+//	... nothing for the caller's whole 180 second budget
 //
 // So a tunnel that had opened, and had already proved it carries packets, was reported as a tunnel
 // that does not work. The read side checks the deadline between packets, which is the granularity a
@@ -1432,6 +1432,11 @@ type tunnel struct {
 	// equally healthy whether it carries one packet or none, and the one thing that matters about a
 	// tunnel - whether the far side answers - is exactly the thing they cannot show.
 	recvCapsules int64
+	// peerInbound and orphanInbound split what came back by whether a peer claimed it. A tunnel that
+	// receives packets and drops them at the port match is a different fault from one that receives
+	// nothing, and the two are indistinguishable from the outside.
+	peerInbound   int64
+	orphanInbound int64
 }
 
 func (t *tunnel) sendIP(raw []byte) {
@@ -1483,16 +1488,25 @@ func appendVarint(b []byte, v uint64) []byte {
 
 func (t *tunnel) dispatch(ip []byte) {
 	if len(ip) < 40 || ip[9] != 6 {
+		androidLog(fmt.Sprintf("colgram_masque: inbound packet of %d bytes discarded: proto %d", len(ip), ip[9]))
 		return
 	}
 	// Inbound packets carry the far side's port as source and ours as destination.
 	sport := binary.BigEndian.Uint16(ip[20:22])
 	dport := binary.BigEndian.Uint16(ip[22:24])
+	// Every inbound packet is counted and named before any peer matching is attempted. A packet for a port
+	// no peer claims is not noise - it is the edge talking about a flow this client has not modelled, and
+	// it is the only way to tell a RST about the flow from a RST about something else.
+	atomic.AddInt64(&t.orphanInbound, 1)
 	for _, p := range t.peers {
 		if p.dstPort == sport && p.srcPort == dport {
+			atomic.AddInt64(&t.peerInbound, 1)
 			p.feed(ip)
+			return
 		}
 	}
+	androidLog(fmt.Sprintf("colgram_masque: inbound %d -> %d matched no peer (orphans=%d peers=%d)",
+		sport, dport, atomic.LoadInt64(&t.orphanInbound), len(t.peers)))
 }
 
 func randomID() string {
@@ -2220,7 +2234,6 @@ func (tt *traceTunnel) pump() {
 	}
 }
 
-//
 // It runs the real thing rather than a separate implementation of it: the same handshake, the same
 // request shape, the same capsule framing and the same peer state machine the app's session uses, so
 // `warp=on` here means `warp=on` on the tunnel that is actually up. A measurement path of its own would
@@ -2278,6 +2291,23 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 			err, peer.sent, peer.recv)
 	}
 	androidLog(fmt.Sprintf("colgram_masque: h2 peer open, sent=%d recv=%d", peer.sent, peer.recv))
+
+	// The discriminating probe, sent before anything is negotiated over the flow.
+	//
+	// A TCP port that is closed answers a segment carrying data with a RST, and it does that without being
+	// spoken to first - it needs no handshake, no window, no options. So one segment to a closed port on a
+	// host that is known to answer separates the two things that are otherwise identical from here:
+	//
+	//   nothing comes back at all  -> the edge is not forwarding this flow, whatever is in it
+	//   a RST comes back          -> the edge is forwarding, and the fault is in the content
+	//
+	// It goes out with the same options and the same header as everything else on this flow, so a RST that
+	// does come back cannot be blamed on a different segment layout.
+	probePeer := newTunnelConn(tun, srcIP, net.ParseIP("104.16.123.96").To4(), 40010, 9)
+	probePeer.ack = probePeer.synSeq + 1
+	probePeer.seq = probePeer.synSeq + 1
+	probePeer.emit([]byte("probe"), 0x18)
+	androidLog("colgram_masque: probe sent: one data segment to 104.16.123.96:9, a closed port")
 
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
@@ -2362,7 +2392,6 @@ func dialQuic(ctx context.Context, udpConn *net.UDPConn, addr string, cert tls.C
 	})
 }
 
-//
 // A panic anywhere in Go kills the process unless it is recovered on the goroutine that raised it, and
 // the QUIC path can raise one inside the standard library on a network that filters UDP to this edge -
 // measured as a nil dereference in crypto/tls while handling the peer's certificate request, which the
@@ -2408,7 +2437,6 @@ func errString(err error) string {
 // the reason for each showed one line and left the rest unmeasurable. The bridge in jni_bridge.c exists
 // for exactly this and was never called from here, which is why several rounds of measurement of this
 // client produced no log lines at all.
-//
 func androidLog(msg string) {
 	msg = strings.TrimRight(msg, "\n")
 	cLine := C.CString(msg)
@@ -2835,10 +2863,10 @@ var dohEndpoints = []dohEndpoint{
 //
 // The values are Cloudflare's own published ranges, checked against what the resolvers above return:
 //
-//   api.cloudflareclient.com        104.16.24.84   104.16.192.82
-//   engage.cloudflareclient.com     162.159.192.x
-//   www.cloudflare.com              104.16.x / 172.64.x
-//   connectivity.cloudflareclient.com 162.159.138.x
+//	api.cloudflareclient.com        104.16.24.84   104.16.192.82
+//	engage.cloudflareclient.com     162.159.192.x
+//	www.cloudflare.com              104.16.x / 172.64.x
+//	connectivity.cloudflareclient.com 162.159.138.x
 //
 // A host not listed here is not checked, because an unknown host has no range to check against and a
 // guess would be worse than the answer it replaced.
