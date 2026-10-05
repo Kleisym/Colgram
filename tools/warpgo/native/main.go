@@ -2155,6 +2155,12 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 	fmt.Println("trace target    :", traceHost, dst.String())
 
 	c := newTunnelConn(tun, srcIP, dst, 51500, 443)
+	// No options on this flow. Measured: a flow that negotiates a 40-byte header is discarded by the edge
+	// after the handshake completes, and a flow with a constant 20-byte header is answered - six packets
+	// back on the same tunnel, in the same session, for the same destination and account. The tunnel
+	// terminates the flow at the edge and the edge sends its own segments, so a negotiated option set here
+	// changes the header length of packets it matches against a stream it set up differently.
+	c.noOptions = true
 	tun.peers = append(tun.peers, c)
 	if err := c.open(); err != nil {
 		fmt.Printf("tcp open failed: %v (sent=%d recv=%d)\n", err, c.sent, c.recv)
@@ -2291,6 +2297,12 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	}
 
 	peer := newTunnelConn(tun, srcIP, dst, 51500, 443)
+	// No options, and measured rather than assumed: on this carrier a flow that negotiates a 40-byte
+	// header is discarded after the handshake completes, and a flow with a constant 20-byte header is
+	// answered - six packets back on the same tunnel, for the same destination and account. The tunnel is
+	// terminated at the edge and the edge sends its own segments, so a negotiated option set here changes
+	// the header length of packets it matches against a stream it laid out differently.
+	peer.noOptions = true
 	tun.peers = append(tun.peers, peer)
 	if err := peer.open(); err != nil {
 		androidLog(fmt.Sprintf("colgram_masque: h2 peer open failed: %v (sent=%d recv=%d)",
@@ -2300,48 +2312,27 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	}
 	androidLog(fmt.Sprintf("colgram_masque: h2 peer open, sent=%d recv=%d", peer.sent, peer.recv))
 
-	// The discriminating probe, sent before anything is negotiated over the flow.
-	//
-	// A TCP port that is closed answers a segment carrying data with a RST, and it does that without being
-	// spoken to first - it needs no handshake, no window, no options. So one segment to a closed port on a
-	// host that is known to answer separates the two things that are otherwise identical from here:
-	//
-	//   nothing comes back at all  -> the edge is not forwarding this flow, whatever is in it
-	//   a RST comes back          -> the edge is forwarding, and the fault is in the content
-	//
-	// It goes out with the same options and the same header as everything else on this flow, so a RST that
-	// does come back cannot be blamed on a different segment layout.
-	probePeer := newTunnelConn(tun, srcIP, net.ParseIP("104.16.123.96").To4(), 40010, 9)
-	probePeer.ack = probePeer.synSeq + 1
-	probePeer.seq = probePeer.synSeq + 1
-	probePeer.emit([]byte("probe"), 0x18)
-	androidLog("colgram_masque: probe sent: one data segment to 104.16.123.96:9, a closed port")
-
-	// The same bytes again, on a flow whose handshake never negotiates anything.
-	//
-	// The probe above came back at 45 bytes with no options, because a peer that never completed a
-	// handshake has none to carry - and it was answered. The ClientHello flow was not, and the only thing
-	// structurally different between them is the negotiated 40-byte header. So this opens a second flow to
-	// the same destination with a constant 20-byte header from the first packet onward - SYN with no
-	// options, data with no options - and sends the same payload over it.
-	//
-	// If that is answered, the options are what the edge objects to. If it is not, the fault is in the
-	// handshake rather than in what follows it, and the probe has already shown the carrier is fine.
-	bare := newTunnelConn(tun, srcIP, dst.To4(), 40011, 443)
-	bare.noOptions = true
-	if err := bare.open(); err != nil {
-		androidLog(fmt.Sprintf("colgram_masque: bare flow did not open: %v", err))
-	} else {
-		androidLog(fmt.Sprintf("colgram_masque: bare flow open, sent=%d recv=%d; sending the same payload",
-			bare.sent, bare.recv))
-		bare.emit([]byte("probe"), 0x18)
-		androidLog("colgram_masque: bare flow data sent")
-	}
-
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         traceHost,
 		MinVersion:         tls.VersionTLS12,
+		// An empty root pool, named explicitly.
+		//
+		// InsecureSkipVerify already means no chain is built, but Go initialises the system root pool the
+		// first time any certificate is verified anywhere in the process, and on this device that parse
+		// panics on one of the 145 files in /system/etc/security/cacerts:
+		//
+		//   panic: runtime error: slice bounds out of range [16:5260]
+		//   encoding/pem.Decode
+		//   crypto/x509.(*CertPool).AppendCertsFromPEM
+		//   crypto/x509.loadSystemRoots
+		//
+		// A panic on any goroutine takes the process, and it fired while reading a trace from a tunnel
+		// whose own certificate is deliberately not verified. The certificate that matters here is the
+		// edge's, and that is verified by the enrolled public key rather than by a public authority list,
+		// so the platform roots are never consulted and never need to be parsed.
+		RootCAs:   x509.NewCertPool(),
+		ClientCAs: nil,
 	})
 	if err := inner.SetDeadline(time.Now().Add(45 * time.Second)); err != nil {
 		return "", err
