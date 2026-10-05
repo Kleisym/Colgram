@@ -907,6 +907,26 @@ func (c *tunnelConn) feed(ip []byte) {
 		c.mu.Unlock()
 		return
 	}
+	// Every segment the far side sends advances what this side acknowledges - payload or not.
+	//
+	// The acknowledgement was only moved when a segment carried payload, so a bare ACK left it where the
+	// handshake had put it. That number is then frozen into every packet for the rest of the flow:
+	//
+	//   WRITE 0x018  76 bytes  seq=110508361  ack=3085367042
+	//   WRITE 0x018  76 bytes  seq=110508437  ack=3085367042
+	//   WRITE 0x018  76 bytes  seq=110508513  ack=3085367042
+	//   WRITE 0x018 1100 bytes seq=110508665  ack=3085367042
+	//
+	// Four data segments and a ClientHello, every one claiming to have received nothing since the
+	// SYN-ACK. The edge acknowledged them - it sent eight bare ACKs whose own sequence numbers advanced
+	// in order - and then stopped, because a peer whose window never moves has told it that nothing it
+	// sends is being received:
+	//
+	//   plaintext trace returned 0 bytes, sent=15 recv=7
+	//
+	// That is the last thing that had to be wrong for the edge to carry traffic and this client to see
+	// nothing: the packets were well formed, the capsules were well framed, and the acknowledgement the
+	// far side reads off every one of them said it had heard nothing at all.
 	if len(payload) > 0 {
 		c.ack = seq + uint32(len(payload))
 		c.inbuf = append(c.inbuf, payload...)
@@ -920,6 +940,15 @@ func (c *tunnelConn) feed(ip []byte) {
 		//
 		// `sent` rising and `recv` frozen is that: the ClientHello left and the server's reply never did,
 		// because nothing told the server its window was open. TCP has no other way to say so.
+		c.emit(nil, 0x10)
+	} else {
+		// A bare ACK still moves the window. TCP's acknowledgement is cumulative: acknowledging a segment
+		// with no data acknowledges every byte before it, so `seq` alone is the next byte this side expects.
+		//
+		// Segments carrying the SYN or the FIN each consume one sequence number, which is why the handshake
+		// branch adds one and this one does not - a payload-free ACK with neither flag is exactly the next
+		// byte expected, and adding one here would acknowledge a byte that has not arrived.
+		c.ack = seq
 		c.emit(nil, 0x10)
 	}
 	// RST must not be acknowledged. Replying to it is what made the edge re-open the flow with a
