@@ -415,6 +415,25 @@ func socksAddrForAttempt() string {
 // session, the request shape, the capsule framing and the resolver are byte-identical to it.
 const maxDatagramPayload = 1100
 
+// segmentCap reports the largest TCP payload this tunnel will put in one segment.
+//
+// It is a variable rather than a constant because the size is the one thing about the data path that has
+// never been separated by measurement from the content of what is sent. The reference client never puts
+// more than 76 bytes in a segment - its own log holds a 76-byte GET and nothing larger - while this client
+// sends a TLS ClientHello as 1100 and 425. Every run that carried came from one that happened to put a
+// small segment out first; every run that stalled sent the large one first and nothing came back.
+//
+// WARP_TRACE_IP and this are read the same way and for the same reason: a question that needs one build per
+// answer is a question that does not get asked enough times to mean anything.
+func segmentCap() int {
+	if override := os.Getenv("WARP_SEGMENT_CAP"); override != "" {
+		if n, err := strconv.Atoi(override); err == nil && n > 0 && n <= maxDatagramPayload {
+			return n
+		}
+	}
+	return maxDatagramPayload
+}
+
 // tunnelConn is a net.Conn whose bytes travel as Connect-IP capsules inside the MASQUE stream.
 // Everything above it - the TLS client, the HTTP request - is an ordinary library.
 type tunnelConn struct {
@@ -1057,10 +1076,11 @@ func (c *tunnelConn) Write(b []byte) (int, error) {
 	// in one, so the write is split across datagrams and the far side reassembles it as a TCP
 	// stream. Segmentation here is what a TUN device does.
 	total := 0
+	cap := segmentCap()
 	for len(b) > 0 {
 		n := len(b)
-		if n > maxDatagramPayload {
-			n = maxDatagramPayload
+		if n > cap {
+			n = cap
 		}
 		c.emit(b[:n], 0x18)
 		c.seq += uint32(n)
