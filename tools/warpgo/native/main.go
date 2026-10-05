@@ -609,6 +609,202 @@ func synSeqOf(c *tunnelConn) uint32 {
 	return c.synSeq
 }
 
+// udpConn is a net.PacketConn over the same capsules, carrying protocol 17 rather than 6.
+//
+// It exists because of what the reference client was measured to put through this carrier. In a session
+// that returned warp=on, every packet it wrote was UDP to port 53:
+//
+//	WRITE UDP 45675->53 len=51
+//	WRITE UDP 58069->53 len=51
+//
+//	UDP frames: 2
+//	TCP frames: 0
+//
+// Not one TCP segment in a session that carried traffic. This client wrote a TCP SYN, had it answered,
+// wrote an ACK, had that answered, wrote a ClientHello - and read every one of those measurements as the
+// edge declining to forward. It has never written protocol 17 into the nine-byte header where the protocol
+// number lives, so it has never asked the carrier for the thing the carrier was carrying.
+//
+// There is no handshake and no state: a datagram is a packet, a reply is matched on its four-tuple, and a
+// flow that has not heard in a while is dropped rather than reaped, because UDP has no FIN to reap on and
+// the tunnel's own lifetime is what ends these.
+type udpConn struct {
+	tun   *tunnel
+	local net.IP
+	// port is the source port this side uses, and pairs a datagram with its reply by the same number the
+	// far side sees.
+	port uint16
+
+	mu         sync.Mutex
+	cond       *sync.Cond
+	closed     bool
+	readErr    error
+	pending    [][]byte
+	remoteIP   net.IP
+	remotePort uint16
+}
+
+func newUDPConn(tun *tunnel, local net.IP) *udpConn {
+	u := &udpConn{tun: tun, local: local, port: ephemeralPort()}
+	u.cond = sync.NewCond(&u.mu)
+	return u
+}
+
+// udpProbeThroughTunnel sends one DNS query through the tunnel and returns the answer as text.
+//
+// It is the whole of the question "does the carrier carry a datagram", asked with the same packet the
+// reference client was measured sending: a 51-byte DNS query to port 53 for connectivity.cloudflareclient.com.
+// An answer comes back through the same flow and the tunnel is carrying UDP; silence is the carrier not
+// carrying it, which is a fact about the edge rather than about this client.
+func udpProbeThroughTunnel(u *udpConn, name string) string {
+	msg := buildDNSQuery(name)
+	dst := &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53}
+	if _, err := u.WriteTo(msg, dst); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: UDP query through the tunnel could not be written: %v", err))
+		return ""
+	}
+	buf := make([]byte, 1500)
+	done := make(chan int, 1)
+	go func() {
+		n, _, err := u.ReadFrom(buf)
+		if err != nil {
+			done <- 0
+			return
+		}
+		done <- n
+	}()
+	select {
+	case n := <-done:
+		if n == 0 {
+			return ""
+		}
+		return string(buf[:n])
+	case <-time.After(8 * time.Second):
+		return ""
+	}
+}
+
+// buildDNSQuery makes the query the reference client was captured sending: header, one question, no
+// additional records.
+func buildDNSQuery(name string) []byte {
+	msg := make([]byte, 12, 12+1+len(name)+1+4)
+	binary.BigEndian.PutUint16(msg[0:2], 0x1234) // query id
+	binary.BigEndian.PutUint16(msg[2:4], 0x0100) // recursion desired
+	binary.BigEndian.PutUint16(msg[4:6], 1)      // one question
+	msg = append(msg, 0, 0, 1, 0, 1)             // A, IN
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		msg = append(msg, byte(len(label)))
+		msg = append(msg, label...)
+	}
+	msg = append(msg, 0)
+	msg = append(msg, 0, 1, 0, 1)
+	return msg
+}
+
+// ipv4UDP builds a datagram packet: the header this file already builds, with protocol 17 in it and the
+// eight-byte UDP header and payload behind it.
+func ipv4UDP(src, dst net.IP, srcPort, dstPort uint16, payload []byte) []byte {
+	hdr := make([]byte, 20)
+	hdr[0] = 0x45
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(20+8+len(payload)))
+	// Identification zero, Don't Fragment set, TTL 63 - the header the reference client sends, read off
+	// its own capture rather than assumed.
+	binary.BigEndian.PutUint16(hdr[6:8], 0x4000)
+	hdr[8] = 63
+	hdr[9] = 17 // UDP. This is the byte the carrier was never asked to carry.
+	copy(hdr[12:16], src.To4())
+	copy(hdr[16:20], dst.To4())
+	binary.BigEndian.PutUint16(hdr[10:12], checksum(hdr))
+
+	udp := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint16(udp[0:2], srcPort)
+	binary.BigEndian.PutUint16(udp[2:4], dstPort)
+	binary.BigEndian.PutUint16(udp[4:6], uint16(8+len(payload)))
+	// The checksum is optional over IPv4 and a real stack leaves it zero on a request. The reference
+	// client's captured queries begin 4e 45 01 00 and 40 35 01 00 at the payload, so the header is four
+	// bytes of zero before the query id and flags - which is what an unset checksum looks like.
+	copy(udp[8:], payload)
+
+	pseudo := make([]byte, 0, 12+len(udp))
+	pseudo = append(pseudo, src.To4()...)
+	pseudo = append(pseudo, dst.To4()...)
+	pseudo = append(pseudo, 0, 17)
+	length := make([]byte, 2)
+	binary.BigEndian.PutUint16(length, uint16(len(udp)))
+	pseudo = append(pseudo, length...)
+	binary.BigEndian.PutUint16(udp[6:8], checksum(append(pseudo, udp...)))
+
+	return append(hdr, udp...)
+}
+
+func (u *udpConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	cp, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("udp over the tunnel: %v is not a UDP address", addr)
+	}
+	pkt := ipv4UDP(u.local, cp.IP.To4(), u.port, uint16(cp.Port), b)
+	androidLog(fmt.Sprintf("colgram_masque: UDP out %d bytes, tunnel %d->%d proto 17, %d of payload",
+		len(pkt), u.port, cp.Port, len(b)))
+	u.tun.sendIP(pkt)
+	return len(b), nil
+}
+
+func (u *udpConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for len(u.pending) == 0 && !u.closed {
+		u.cond.Wait()
+	}
+	if u.closed && len(u.pending) == 0 {
+		return 0, nil, net.ErrClosed
+	}
+	data := u.pending[0]
+	u.pending = u.pending[1:]
+	addr := &net.UDPAddr{IP: u.remoteIP, Port: int(u.remotePort)}
+	n := copy(b, data)
+	return n, addr, nil
+}
+
+func (u *udpConn) Close() error {
+	u.mu.Lock()
+	u.closed = true
+	u.cond.Broadcast()
+	u.mu.Unlock()
+	return nil
+}
+
+func (u *udpConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: u.local, Port: int(u.port)} }
+func (u *udpConn) SetDeadline(t time.Time) error      { return nil }
+func (u *udpConn) SetReadDeadline(t time.Time) error  { return nil }
+func (u *udpConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// feed hands an inbound datagram to whichever flow it belongs to, by the four-tuple rather than by a
+// port alone: two flows to the same destination from the same source port are one flow to the far side.
+func (u *udpConn) feed(ip []byte) {
+	if len(ip) < 28 || ip[9] != 17 {
+		return
+	}
+	hl := int(ip[0]&0x0f) * 4
+	if hl+8 > len(ip) {
+		return
+	}
+	udp := ip[hl:]
+	dstPort := binary.BigEndian.Uint16(udp[2:4])
+	if dstPort != u.port {
+		return
+	}
+	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return
+	}
+	u.remotePort = binary.BigEndian.Uint16(udp[0:2])
+	u.remoteIP = net.IPv4(ip[16], ip[17], ip[18], ip[19])
+	u.pending = append(u.pending, append([]byte(nil), udp[8:]...))
+	u.cond.Signal()
+	u.mu.Unlock()
+}
+
 // payloadLenOf reports the TCP payload length in a packet, or -1 when the header offset is unreadable.
 // It exists so the inbound path can say how much arrived rather than only that something did.
 func payloadLenOf(ip []byte) int {
@@ -2157,11 +2353,16 @@ func shapeByName(name string) connectVariant {
 }
 
 type tunnel struct {
-	conn         *quic.Conn
-	h3           *http3.ClientConn
-	stream       capsuleStream
-	srcIP        net.IP
-	peers        []*tunnelConn
+	conn   *quic.Conn
+	h3     *http3.ClientConn
+	stream capsuleStream
+	srcIP  net.IP
+	peers  []*tunnelConn
+	// udp is the tunnel's datagram flow. One per tunnel rather than one per tuple: a client behind it sends
+	// its own source ports, and the flow this holds is the one the tunnel address is known on the far side
+	// by. Nil until something asks for it, so a tunnel that only carries TCP carries nothing extra.
+	udpMu        sync.Mutex
+	udp          *udpConn
 	sentCapsules int
 	// recvCapsules counts what came back. Without it the session statistics report a tunnel that is
 	// equally healthy whether it carries one packet or none, and the one thing that matters about a
@@ -2263,6 +2464,33 @@ func appendVarint(b []byte, v uint64) []byte {
 }
 
 func (t *tunnel) dispatch(ip []byte) {
+	if len(ip) < 20 {
+		return
+	}
+	// Protocol 17 goes to the UDP flow, and it is here because it was never here before.
+	//
+	// The reference client, in a session that returned warp=on on this carrier, wrote two packets and both
+	// were UDP to port 53:
+	//
+	//     WRITE UDP 45675->53 len=51
+	//     WRITE UDP 58069->53 len=51
+	//     UDP frames: 2   TCP frames: 0
+	//
+	// This function discarded everything that was not protocol 6, so a tunnel that was asked to carry UDP
+	// was answered by silence - and every TCP measurement made against it was being read as the edge
+	// declining to forward, when what it declined was a protocol it had never been sent here.
+	if ip[9] == 17 {
+		t.udpMu.Lock()
+		u := t.udp
+		t.udpMu.Unlock()
+		if u == nil {
+			androidLog("colgram_masque: inbound UDP dropped: no UDP flow on this tunnel")
+			return
+		}
+		atomic.AddInt64(&t.peerInbound, 1)
+		u.feed(ip)
+		return
+	}
 	if len(ip) < 40 || ip[9] != 6 {
 		androidLog(fmt.Sprintf("colgram_masque: inbound packet of %d bytes discarded: proto %d", len(ip), ip[9]))
 		return
@@ -3285,6 +3513,28 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 		sessionMu.Unlock()
 	}
 	tun := reuse.tun
+
+	// The tunnel's UDP flow, opened before anything else asks it to resolve.
+	//
+	// This is the path the reference client uses on this carrier and the one this client never had: its
+	// two frames in a session that returned warp=on were UDP to port 53, and every name this client resolved
+	// went over DoH on the host's own sockets while the tunnel carried TCP and nothing else. A tunnel whose
+	// own resolver leaves by the tunnel is a tunnel that can carry a request the carrier will forward, and
+	// this is the first point in this file where one is put on the wire.
+	tun.udpMu.Lock()
+	if tun.udp == nil {
+		tun.udp = newUDPConn(tun, srcIP)
+	}
+	udp := tun.udp
+	tun.udpMu.Unlock()
+
+	// One query through the tunnel, to say whether the carrier carries a datagram at all. The reference
+	// client's queries were 51 bytes to port 53, which is a DNS query for connectivity.cloudflareclient.com,
+	// and this sends the same shape.
+	if answered := udpProbeThroughTunnel(udp, traceHost); len(answered) > 0 {
+		androidLog(fmt.Sprintf("colgram_masque: the tunnel carried a DNS query for %s and got %d bytes back: % x",
+			traceHost, len(answered), head(answered, 24)))
+	}
 
 	ips, err := resolve(traceHost)
 	if err != nil || len(ips) == 0 {
