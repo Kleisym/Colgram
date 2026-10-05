@@ -867,9 +867,22 @@ func (c *tunnelConn) feed(ip []byte) {
 
 	c.mu.Lock()
 	c.recv++
-	if payload := payloadLenOf(ip); payload >= 0 {
+	if plen := payloadLenOf(ip); plen >= 0 {
 		androidLog(fmt.Sprintf("colgram_masque: inbound %d bytes, %d of payload, flags 0x%03x, seq %d ack %d",
-			len(ip), payload, flags, seq, binary.BigEndian.Uint32(tcp[8:12])))
+			len(ip), plen, flags, seq, binary.BigEndian.Uint32(tcp[8:12])))
+		// The first bytes of the first segment that carries data, on a flow that has already
+		// completed its handshake.
+		//
+		// This is the last thing that has not been read off the wire. Everything before it is accounted
+		// for - the capsule length equals the IP total length equals the bytes present, both checksums fold
+		// to zero, the flow opens, the edge acknowledges the SYN - and then the edge reads a ClientHello,
+		// acknowledges the segment it arrived in, and forwards nothing. Whether the ServerHello is on the
+		// wire at all is what separates a fault in consuming it from a fault in asking for it, and that is
+		// one line of output rather than another argument.
+		if len(payload) > 0 && c.synned {
+			androidLog(fmt.Sprintf("colgram_masque: first data on the flow is %d bytes: % x ...",
+				len(payload), head(payload, 24)))
+		}
 	}
 
 	if flags&0x02 != 0 {
