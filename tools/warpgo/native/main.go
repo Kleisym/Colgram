@@ -48,6 +48,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -338,7 +339,14 @@ func h2Trace() *os.File {
 	if h2TraceFile == "" {
 		h2TraceFile = os.Getenv("COLGRAM_H2_TRACE")
 		if h2TraceFile == "" {
-			return nil
+			// On a device there is no environment to read: a c-shared library snapshots the environment when
+			// it is loaded and the app that loads it never had one to give. So the transcript is named by a
+			// file in the process's own temporary directory instead, which needs nothing but the process.
+			//
+			// It matters because the device is where the verdict has to hold and the host is where the fault
+			// can be found quickly - and the two disagree. A tunnel that carries on one and not the other is
+			// either a device fault or a network fault, and the frames say which.
+			h2TraceFile = filepath.Join(os.TempDir(), "colgram-h2-trace.txt")
 		}
 	}
 	f, err := os.OpenFile(h2TraceFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -351,9 +359,6 @@ func h2Trace() *os.File {
 // h2TraceWrite appends one line to the transcript in the reference client's own format, so the two logs
 // can be read side by side rather than translated between them.
 func h2TraceWrite(dir string, b []byte) {
-	if !strings.HasPrefix(os.Getenv("COLGRAM_H2_TRACE"), "") || os.Getenv("COLGRAM_H2_TRACE") == "" {
-		return
-	}
 	f := h2Trace()
 	if f == nil {
 		return
