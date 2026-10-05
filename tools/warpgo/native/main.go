@@ -2312,6 +2312,32 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	}
 	androidLog(fmt.Sprintf("colgram_masque: h2 peer open, sent=%d recv=%d", peer.sent, peer.recv))
 
+	// Size, the last variable the answered flow and the silent one have not had separated.
+	//
+	// A five-byte segment on a flow that had been opened and answered with six packets back. A ClientHello
+	// of 1705 bytes, split into four 440-byte segments, on the flow beside it, answered with nothing. Both are
+	// bare 20-byte-header flows to port 443 on the same tunnel in the same second, so everything else about
+	// them is already equal - the carrier, the capsule, the handshake, the destination address.
+	//
+	// So the payload goes out again at five sizes on a fresh flow each time. The largest that still comes
+	// back is the largest segment this edge will carry, and everything above it is what has to be
+	// negotiated or fragmented differently.
+	for _, size := range []int{5, 100, 200, 400} {
+		flow := newTunnelConn(tun, srcIP, dst.To4(), uint16(40100+size%97), 443)
+		flow.noOptions = true
+		if err := flow.open(); err != nil {
+			androidLog(fmt.Sprintf("colgram_masque: size probe %d did not open: %v", size, err))
+			continue
+		}
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = 'x'
+		}
+		flow.emit(payload, 0x18)
+		androidLog(fmt.Sprintf("colgram_masque: size probe %d bytes sent, source port %d",
+			size, 40100+size%97))
+	}
+
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         traceHost,
@@ -3225,6 +3251,10 @@ func (s *longSession) openPeer() error {
 	s.bindSrcPort++
 	peer := newTunnelConn(s.tun, s.tun.srcIP, mustAddr(s.addr).IP,
 		uint16(40000+s.bindSrcPort), 443)
+	// No options, for the reason measured on the measurement path: this edge forwards a flow with a
+	// constant 20-byte header - six packets came back for one - and discards a flow that negotiated a
+	// 40-byte one, after completing the handshake and then answering nothing at all.
+	peer.noOptions = true
 	s.tun.peers = append(s.tun.peers, peer)
 	s.peer = peer
 	return peer.open()
