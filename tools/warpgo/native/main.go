@@ -1786,9 +1786,31 @@ func (cs *h2CapsuleStream) ReceiveDatagram(ctx context.Context) ([]byte, error) 
 				cs.h2.credit(len(payload))
 				cs.buf = append(cs.buf, payload...)
 			}
-			// Take a whole packet off the stream, if one has arrived whole.
-			if pkt, rest, ok := nextInboundPacket(cs.buf); ok {
+			// Take whole packets off the stream until one is actually ready.
+			//
+			// A control capsule is a whole unit that happens not to be an IP packet, and it must be consumed
+			// and discarded here rather than returned: a caller that cannot tell it from a packet will treat
+			// it as one. That is what happened, and it is why the edge was demonstrably forwarding traffic
+			// while the tunnel received none - every packet this client sent after the handshake was read by
+			// a pump that had already spent the capsule header as a failed packet:
+			//
+			//   H2 READ 11 bytes:  00 00 02 00 00 00 00 01 00 3c           <- capsule header alone
+			//   H2 READ 69 bytes:  ... 45 00 00 3c ...                     <- the 60-byte packet, in the next frame
+			//
+			// The header returned first with ok true, the caller kept it, its length check failed, and the
+			// packet that followed was discarded for having no header. So the loop runs until it has a packet
+			// to hand up, skipping control capsules and waiting for a partial one.
+			for {
+				pkt, rest, ok := nextInboundPacket(cs.buf)
+				if !ok {
+					break
+				}
 				cs.buf = rest
+				if pkt == nil {
+					// A control capsule: consumed, not delivered.
+					androidLog(fmt.Sprintf("colgram_masque: skipped a %d-byte control capsule", len(rest)))
+					continue
+				}
 				return pkt, nil
 			}
 		case 0x8: // WINDOW_UPDATE
@@ -2895,13 +2917,17 @@ func (tt *traceTunnel) pump() {
 		if err != nil {
 			return
 		}
-		if len(data) < 20 {
-			continue
-		}
-		if !isBareIPv4(data) && len(data) >= 21 && data[0] == 0x00 {
-			data = data[1:]
-		}
+		// No framing is stripped here. ReceiveDatagram returns whole IP packets and nothing else - it takes
+		// the capsule header off, waits for the packet behind it, and discards control capsules - so a
+		// second strip in this pump is the packet losing its first two bytes.
+		//
+		// That is not a theoretical reading. It was written to serve the QUIC carrier, where a datagram
+		// genuinely does begin with a type byte, and it was left in place when the HTTP/2 carrier arrived
+		// with its own framing. The QUIC path still strips a leading zero; the two carriers differ and the
+		// code that reads them has to as well.
 		if len(data) < 20 || data[0]>>4 != 4 {
+			androidLog(fmt.Sprintf("colgram_masque: inbound %d bytes is not an IPv4 packet (first byte %02x)",
+				len(data), data[0]))
 			continue
 		}
 		atomic.AddInt64(&tt.tun.recvCapsules, 1)
@@ -4012,21 +4038,21 @@ func (s *longSession) pump(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		// The reply is a bare IP packet. This used to require a leading zero byte and hand the rest of the
-		// buffer to the peer, which is the same mistake the capsule reader had: the byte that was being
-		// stripped is the IP version nibble, so a genuine reply lost its first byte and never parsed as a
-		// TCP segment. The packet's own header is the check.
+		// The reply is a whole IP packet, already unframed. This used to require a leading zero byte and hand
+		// the rest of the buffer to the peer, which was the same mistake the capsule reader had twice: the
+		// byte being stripped is the IP version nibble, so a genuine reply lost its first byte and never
+		// parsed as a TCP segment.
+		//
+		// It then grew a second strip, for a capsule header, on the same reasoning - and that one was worse,
+		// because on the HTTP/2 carrier there is no header left on a packet this method returns, so the
+		// check below and the strip above fought each other over the same two bytes.
 		if len(data) < 20 {
 			continue
 		}
 		atomic.AddInt64(&s.tun.recvCapsules, 1)
-		if !isBareIPv4(data) {
-			// A capsule did arrive - a peer is allowed to send one - so take the packet out from behind it.
-			if len(data) >= 21 && data[0] == 0x00 {
-				data = data[1:]
-			}
-		}
 		if len(data) < 20 || data[0]>>4 != 4 {
+			androidLog(fmt.Sprintf("colgram_masque: inbound %d bytes is not an IPv4 packet (first byte %02x)",
+				len(data), data[0]))
 			continue
 		}
 		if s.peer != nil {
