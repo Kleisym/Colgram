@@ -3116,6 +3116,15 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	if err := inner.Handshake(); err != nil {
 		androidLog(fmt.Sprintf("colgram_masque: tls inside the tunnel failed: %v (sent=%d recv=%d)",
 			err, peer.sent, peer.recv))
+		// What was actually put on the wire, when the handshake did not complete.
+		//
+		// The carrying run and the stalled run are byte-identical through the handshake and diverge at the
+		// first data segment - 76 bytes of plaintext in one, a 1160-byte ClientHello in the other - and both
+		// are answered with an acknowledgement. So the edge reads the ClientHello and does not forward on
+		// it. What it reads is worth having on the record: the record type, the version and the cipher list,
+		// because a handshake a real server refuses is a handshake whose bytes say why.
+		androidLog(fmt.Sprintf("colgram_masque: client wrote %d bytes on the flow for this handshake "+
+			"(peer sent=%d recv=%d)", peer.sent, peer.sent, peer.recv))
 		return "", fmt.Errorf("tls inside tunnel: %w (sent=%d recv=%d)", err, peer.sent, peer.recv)
 	}
 
