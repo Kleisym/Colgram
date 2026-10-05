@@ -472,6 +472,29 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 
 // emit builds a TCP segment with a real checksum. The edge forwards real TCP, so a wrong checksum
 // here is a connection that is silently dropped.
+
+// synOptions are the TCP options this side offers on its SYN and repeats on every later segment.
+//
+//   MSS 1240              the largest segment that fits the 1200-byte packet this carrier has been
+//                          measured to carry, less the two headers
+//   SACK permitted        selective acknowledgement, which the edge answers acknowledging
+//   timestamps            required by window scaling and by most middleboxes' path MTU heuristics
+//   window scale 7        128-byte windows, which is what a tunnel of this shape can carry
+//
+// They repeat after the handshake because the header length is part of the stream layout the peer
+// negotiated. A flow that starts with a 40-byte header and continues with a 20-byte one is a different
+// stream, and the far side has no way to know the payload did not move with it.
+func synOptions() []byte {
+	return []byte{
+		0x02, 0x04, 0x04, 0xd8, // MSS 1240
+		0x04, 0x02, // SACK permitted
+		0x08, 0x0a, // timestamps
+		0xd3, 0x15, 0xd8, 0x4a, 0x00, 0x00, 0x00, 0x00,
+		0x01,             // no-op
+		0x03, 0x03, 0x07, // window scale 7
+	}
+}
+
 func (c *tunnelConn) emit(payload []byte, flags uint16) {
 	var opts []byte
 	optLen := 0
@@ -494,14 +517,7 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 		// the working client's is 52 with four options in it. That is the whole difference.
 		// MSS 1240: the largest segment that fits the 1200-byte packet this carrier has been seen to
 		// carry, less the two headers.
-		opts = []byte{
-			0x02, 0x04, 0x04, 0xd8, // MSS 1240
-			0x04, 0x02, // SACK permitted
-			0x08, 0x0a, // timestamps
-			0xd3, 0x15, 0xd8, 0x4a, 0x00, 0x00, 0x00, 0x00,
-			0x01,             // no-op
-			0x03, 0x03, 0x07, // window scale 7
-		}
+		opts = synOptions()
 		optLen = len(opts)
 	} else if c.synned {
 		// Every segment after the handshake carries the same options the peer saw on the SYN.
@@ -520,6 +536,23 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 		// where this client offered 1240 and 7 - because an echo of anything else is a different option set
 		// than the one the peer recorded.
 		opts = c.peerOptions
+		if len(opts) == 0 {
+			// The edge does not always answer with options. It echoed them in one run - a 52-byte SYN-ACK
+			// with an MSS of 1460 and a window scale of 13 - and answered with a bare 40-byte header in
+			// another, while the packet carried the same 60 bytes either way.
+			//
+			// So this side's own options are the fallback rather than a bare header. A flow that negotiated
+			// a 40-byte header and then continues with 20-byte ones is a different stream layout, and the
+			// far side cannot tell the payload did not move with it:
+			//
+			//     outbound 40 bytes,  (opts 0, peer 0), flags 0x010, seq 2    ACK
+			//     outbound 440 bytes, (opts 0, peer 0), flags 0x018, seq 2    ClientHello
+			//     tls inside tunnel: i/o timeout (sent=9 recv=2)
+			//
+			// A peer that answered with options gets those back verbatim, which is what TCP requires; a peer
+			// that answered with none gets the ones this side offered, which is at least a constant header.
+			opts = synOptions()
+		}
 		optLen = len(opts)
 	}
 	tcpLen := 20 + optLen + len(payload)
@@ -587,6 +620,11 @@ func (c *tunnelConn) feed(ip []byte) {
 				// handshake and then stopped forwarding.
 				if len(payload) == 0 && offset > 20 {
 					c.peerOptions = append([]byte(nil), tcp[offset:]...)
+					androidLog(fmt.Sprintf("colgram_masque: captured %d peer option bytes: %x",
+						len(c.peerOptions), c.peerOptions))
+				} else {
+					androidLog(fmt.Sprintf("colgram_masque: peer options not captured: payload=%d offset=%d tcp=%d",
+						len(payload), offset, len(tcp)))
 				}
 				// The client's own sequence has to move past the SYN before any data is sent, and the far
 				// side has to see that acknowledged before it will read a data segment from this flow.
