@@ -1,0 +1,19 @@
+session address : 172.16.0.2
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.137.65
+tcp handshake   : established through the tunnel
+tls handshake   : complete, alpn= 
+request         : GET /cdn-cgi/trace
+ip packets      : sent=22 recv=15
+datagram recv stopped: context canceled
+status          : HTTP/1.1 200 OK
+  warp   = on
+  ip     = 104.28.244.74
+  loc    = RU
+  colo   = FRA
+  kex    = X25519MLKEM768
+  tls    = TLSv1.3
+  http   = http/1.1
+  sni    = plaintext
+
+VERDICT: warp=on -- the request travelled through the WARP tunnel

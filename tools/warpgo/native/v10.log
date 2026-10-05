@@ -1,0 +1,3 @@
+# warpverdict
+# [warpverdict]
+vet.exe: .\main.go:902:2: declared and not used: ctx

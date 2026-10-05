@@ -1,0 +1,644 @@
+advertising     : 10.0.2.2
+socks5 front 0.0.0.0:15118 -> udp 127.0.0.1:14514
+front: session from 127.0.0.1:58928, udp bound to 26.226.94.158:41097, advertised 26.226.94.158
+udp associate on 10.0.2.2:41097
+front: raw 1210 bytes 00000001a29fc60201bbc40000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc90000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcb0000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcd0000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc40000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc30000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc40000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc60000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbce0000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcf0000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:58995, udp bound to 26.226.94.158:39263, advertised 26.226.94.158
+udp associate on 10.0.2.2:39263
+front: raw 1210 bytes 00000001a29fc60201f4c6000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c1000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4cf000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4ca000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c7000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c6000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c7000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4cd000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c9000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c6000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:14930, udp bound to 26.226.94.158:26233, advertised 26.226.94.158
+udp associate on 10.0.2.2:26233
+front: raw 1210 bytes 00000001a29fc60220fbc30000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc10000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcd0000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcd0000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc90000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc00000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcd0000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbce0000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbca0000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc40000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:14935, udp bound to 26.226.94.158:33950, advertised 26.226.94.158
+udp associate on 10.0.2.2:33950
+front: raw 1210 bytes 00000001a29fc6021f9fc5000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc0000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc7000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc6000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc8000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc9000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fca000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc3000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc6000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fca000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:14954, udp bound to 26.226.94.158:5374, advertised 26.226.94.158
+udp associate on 10.0.2.2:5374
+front: raw 2420 bytes 00000001a29fc6021194c4000000010d
+front: forwarding 2410 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c9000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194ce000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c3000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c3000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c5000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c3000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c8000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c2000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: relayed back 92 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:39711, udp bound to 26.226.94.158:12090, advertised 26.226.94.158
+udp associate on 10.0.2.2:12090
+front: raw 1210 bytes 00000001a29fc602115bc4000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bcf000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc2000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc5000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bcd000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc8000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc4000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bcb000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bcb000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc0000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: relayed back 90 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:51156, udp bound to 26.226.94.158:33292, advertised 26.226.94.158
+udp associate on 10.0.2.2:33292
+front: raw 1210 bytes 00000001a29fc60201bbcc0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcb0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbce0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbce0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc30000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcf0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbce0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc20000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcc0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcb0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:51160, udp bound to 26.226.94.158:23263, advertised 26.226.94.158
+udp associate on 10.0.2.2:23263
+front: raw 1210 bytes 00000001a29fc60201f4cb0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4cf0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4ca0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c70000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c00000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4ca0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c50000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c50000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c00000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c30000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:51192, udp bound to 26.226.94.158:35127, advertised 26.226.94.158
+udp associate on 10.0.2.2:35127
+front: raw 1210 bytes 00000001a29fc60220fbc4000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc9000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcc000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbca000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc3000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcc000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc2000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcd000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc0000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc0000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:57280, udp bound to 26.226.94.158:36786, advertised 26.226.94.158
+udp associate on 10.0.2.2:36786
+front: raw 1210 bytes 00000001a29fc6021f9fcf0000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fcc0000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc60000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc00000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc90000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc40000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc10000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc70000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fcc0000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc60000000113
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: relayed back 98 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:45813, udp bound to 26.226.94.158:1963, advertised 26.226.94.158
+udp associate on 10.0.2.2:1963
+front: raw 2420 bytes 00000001a29fc6021194c70000000110
+front: forwarding 2410 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c40000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194cd0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194cb0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194ca0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194cc0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c40000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c00000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194cc0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:45895, udp bound to 26.226.94.158:18746, advertised 26.226.94.158
+udp associate on 10.0.2.2:18746
+front: raw 1210 bytes 00000001a29fc602115bc70000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc00000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc30000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bca0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc00000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc20000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bcc0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc50000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bce0000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bc20000000110
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: relayed back 95 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:14999, udp bound to 26.226.94.158:16787, advertised 26.226.94.158
+udp associate on 10.0.2.2:16787
+front: raw 1210 bytes 00000001a29fc60201bbc90000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc80000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc70000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbcd0000000112
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc30000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbce0000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbca0000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc50000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 97 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc80000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 930 bytes from 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:15020, udp bound to 26.226.94.158:49493, advertised 26.226.94.158
+udp associate on 10.0.2.2:49493
+front: raw 1210 bytes 00000001a29fc60201f4c6000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4cd000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4cf000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4cf000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c6000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c7000000010e
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 930 bytes from 127.0.0.1:14514
+front: relayed back 50 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c40000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c50000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 93 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c00000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 925 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c80000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 495 bytes 00000001a29fc60201f4e40000000114
+front: forwarding 485 bytes to 127.0.0.1:14514
+front: raw 168 bytes 00000001a29fc60201f4480152a8be96
+front: forwarding 158 bytes to 127.0.0.1:14514
+front: relayed back 51 bytes from 127.0.0.1:14514
+front: relayed back 1360 bytes from 127.0.0.1:14514
+front: relayed back 59 bytes from 127.0.0.1:14514
+front: relayed back 54 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 48 bytes from 127.0.0.1:14514
+front: raw 56 bytes 00000001a29fc60201f44a0106beb9e4
+front: forwarding 46 bytes to 127.0.0.1:14514
+front: raw 110 bytes 00000001a29fc60201f4540106beb9e4
+front: forwarding 100 bytes to 127.0.0.1:14514
+front: relayed back 63 bytes from 127.0.0.1:14514
+front: raw 190 bytes 00000001a29fc60201f4460106beb9e4
+front: forwarding 180 bytes to 127.0.0.1:14514
+front: relayed back 29 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 127 bytes from 127.0.0.1:14514
+front: raw 54 bytes 00000001a29fc60201f45a0106beb9e4
+front: forwarding 44 bytes to 127.0.0.1:14514
+front: raw 56 bytes 00000001a29fc60201f45a0106beb9e4
+front: forwarding 46 bytes to 127.0.0.1:14514
+front: raw 55 bytes 00000001a29fc60201f4420106beb9e4
+front: forwarding 45 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f45c0106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f4470106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f4450106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f4440106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f45c0106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 116 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f4400106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60201f45e0106beb9e4
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 55 bytes 00000001a29fc60201f4510106beb9e4
+front: forwarding 45 bytes to 127.0.0.1:14514
+front: raw 1194 bytes 00000001a29fc60201f44b0106beb9e4
+front: forwarding 1184 bytes to 127.0.0.1:14514
+front: raw 519 bytes 00000001a29fc60201f4410106beb9e4
+front: forwarding 509 bytes to 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 108 bytes from 127.0.0.1:14514
+front: relayed back 1180 bytes from 127.0.0.1:14514
+front: relayed back 1180 bytes from 127.0.0.1:14514
+front: relayed back 1180 bytes from 127.0.0.1:14514
+front: relayed back 812 bytes from 127.0.0.1:14514
+front: raw 56 bytes 00000001a29fc60201f4560106beb9e4
+front: forwarding 46 bytes to 127.0.0.1:14514
+front: raw 242 bytes 00000001a29fc60201f44d0106beb9e4
+front: forwarding 232 bytes to 127.0.0.1:14514
+front: session ended: EOF
+front: session from 127.0.0.1:15067, udp bound to 26.226.94.158:63424, advertised 26.226.94.158
+udp associate on 10.0.2.2:63424
+front: raw 1210 bytes 00000001a29fc60220fbcb0000000111
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc10000000111
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc70000000111
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc70000000111
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 96 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc60000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc00000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 96 bytes from 127.0.0.1:14514
+front: relayed back 96 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbcc0000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 927 bytes from 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc00000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 432 bytes 00000001a29fc60220fbe80000000114
+front: forwarding 422 bytes to 127.0.0.1:14514
+front: raw 63 bytes 00000001a29fc60220fb5a01ee3d1af6
+front: forwarding 53 bytes to 127.0.0.1:14514
+front: relayed back 51 bytes from 127.0.0.1:14514
+front: relayed back 1360 bytes from 127.0.0.1:14514
+front: relayed back 59 bytes from 127.0.0.1:14514
+front: relayed back 54 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 24 bytes from 127.0.0.1:14514
+front: relayed back 48 bytes from 127.0.0.1:14514
+front: raw 56 bytes 00000001a29fc60220fb5001210c0be6
+front: forwarding 46 bytes to 127.0.0.1:14514
+front: raw 169 bytes 00000001a29fc60220fb4401210c0be6
+front: forwarding 159 bytes to 127.0.0.1:14514
+front: raw 168 bytes 00000001a29fc60220fb4d01210c0be6
+front: forwarding 158 bytes to 127.0.0.1:14514
+front: relayed back 63 bytes from 127.0.0.1:14514
+front: raw 68 bytes 00000001a29fc60220fb5e01210c0be6
+front: forwarding 58 bytes to 127.0.0.1:14514
+front: relayed back 1360 bytes from 127.0.0.1:14514
+front: raw 55 bytes 00000001a29fc60220fb5301210c0be6
+front: forwarding 45 bytes to 127.0.0.1:14514
+front: relayed back 25 bytes from 127.0.0.1:14514
+front: relayed back 127 bytes from 127.0.0.1:14514
+front: raw 56 bytes 00000001a29fc60220fb5101210c0be6
+front: forwarding 46 bytes to 127.0.0.1:14514
+front: raw 55 bytes 00000001a29fc60220fb4e01210c0be6
+front: forwarding 45 bytes to 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60220fb5901210c0be6
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 186 bytes 00000001a29fc60220fb4201210c0be6
+front: forwarding 176 bytes to 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60220fb5c01210c0be6
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60220fb5101210c0be6
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 67 bytes from 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60220fb4501210c0be6
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: raw 1194 bytes 00000001a29fc60220fb4301210c0be6
+front: forwarding 1184 bytes to 127.0.0.1:14514
+front: raw 519 bytes 00000001a29fc60220fb5f01210c0be6
+front: forwarding 509 bytes to 127.0.0.1:14514
+front: raw 55 bytes 00000001a29fc60220fb5b01210c0be6
+front: forwarding 45 bytes to 127.0.0.1:14514
+front: relayed back 25 bytes from 127.0.0.1:14514
+front: relayed back 67 bytes from 127.0.0.1:14514
+front: relayed back 25 bytes from 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60220fb5201210c0be6
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: relayed back 25 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 63 bytes from 127.0.0.1:14514
+front: relayed back 63 bytes from 127.0.0.1:14514
+front: relayed back 1180 bytes from 127.0.0.1:14514
+front: relayed back 1180 bytes from 127.0.0.1:14514
+front: relayed back 1180 bytes from 127.0.0.1:14514
+front: relayed back 599 bytes from 127.0.0.1:14514
+front: relayed back 230 bytes from 127.0.0.1:14514
+front: raw 55 bytes 00000001a29fc60220fb5001210c0be6
+front: forwarding 45 bytes to 127.0.0.1:14514
+front: raw 93 bytes 00000001a29fc60220fb5201210c0be6
+front: forwarding 83 bytes to 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 23 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 930 bytes from 127.0.0.1:14514
+front: relayed back 50 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 1200 bytes from 127.0.0.1:14514
+front: relayed back 599 bytes from 127.0.0.1:14514
+front: relayed back 599 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 930 bytes from 127.0.0.1:14514
+front: relayed back 50 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 27 bytes from 127.0.0.1:14514
+front: relayed back 599 bytes from 127.0.0.1:14514
+front: session from 127.0.0.1:15613, udp bound to 26.226.94.158:37835, advertised 26.226.94.158
+udp associate on 10.0.2.2:37835
+front: session ended: EOF
+front: session ended: EOF
+front: session from 127.0.0.1:20264, udp bound to 26.226.94.158:33397, advertised 26.226.94.158
+udp associate on 10.0.2.2:33397

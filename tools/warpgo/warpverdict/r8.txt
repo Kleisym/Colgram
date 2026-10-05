@@ -1,0 +1,11 @@
+session address : 172.16.0.2
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.137.65
+SYN bytes: 450000284321000040065fbcac100002a29f8941c92c01bb00000001000000005002faf012160000
+SYN bytes: 450000284321000040065fbcac100002a29f8941c92c01bb00000002000000005002faf012150000
+SYN bytes: 450000284321000040065fbcac100002a29f8941c92c01bb00000002000000005002faf012150000
+SYN bytes: 450000284321000040065fbcac100002a29f8941c92c01bb00000002000000005002faf012150000
+SYN bytes: 450000284321000040065fbcac100002a29f8941c92c01bb00000002000000005002faf012150000
+tcp open failed: tcp handshake through the tunnel did not complete (sent=5 recv=0)
+datagram recv stopped: context canceled
+error           : tcp handshake through the tunnel did not complete

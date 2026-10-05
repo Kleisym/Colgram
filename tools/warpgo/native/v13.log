@@ -1,0 +1,3 @@
+# warpverdict
+# [warpverdict]
+vet.exe: .\main.go:1416:25: cannot use socksOverride (variable of type string) as *_Ctype_char value in argument to (_Cfunc_GoString)

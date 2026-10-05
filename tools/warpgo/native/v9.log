@@ -1,0 +1,3 @@
+# warpverdict
+# [warpverdict]
+vet.exe: .\main.go:894:61: undefined: cfg

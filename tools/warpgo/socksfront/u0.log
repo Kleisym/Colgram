@@ -1,0 +1,56 @@
+advertising     : 10.0.2.2
+socks5 front 0.0.0.0:15115 -> udp 127.0.0.1:14514
+front: session from 127.0.0.1:2091, udp bound to 26.226.94.158:9131, advertised 26.226.94.158
+udp associate on 10.0.2.2:9131
+front: raw 1210 bytes 00000001a29fc60201bbca0000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201bbc80000000108
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 87 bytes from 127.0.0.1:14514
+front: reply to client 127.0.0.1:2091 failed: write udp4 26.226.94.158:9131->127.0.0.1:2091: wsasendto: The requested address is not valid in its context.
+front: session ended: read tcp4 127.0.0.1:15115->127.0.0.1:2091: use of closed network connection
+front: session from 127.0.0.1:2094, udp bound to 26.226.94.158:9134, advertised 26.226.94.158
+udp associate on 10.0.2.2:9134
+front: raw 1210 bytes 00000001a29fc60201f4cd0000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60201f4c20000000109
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 88 bytes from 127.0.0.1:14514
+front: reply to client 127.0.0.1:2094 failed: write udp4 26.226.94.158:9134->127.0.0.1:2094: wsasendto: The requested address is not valid in its context.
+front: session ended: read tcp4 127.0.0.1:15115->127.0.0.1:2094: use of closed network connection
+front: session from 127.0.0.1:2095, udp bound to 26.226.94.158:9136, advertised 26.226.94.158
+udp associate on 10.0.2.2:9136
+front: raw 1210 bytes 00000001a29fc60220fbcf0000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc60220fbc10000000114
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 99 bytes from 127.0.0.1:14514
+front: reply to client 127.0.0.1:2095 failed: write udp4 26.226.94.158:9136->127.0.0.1:2095: wsasendto: The requested address is not valid in its context.
+front: session ended: read tcp4 127.0.0.1:15115->127.0.0.1:2095: use of closed network connection
+front: session from 127.0.0.1:2096, udp bound to 26.226.94.158:9138, advertised 26.226.94.158
+udp associate on 10.0.2.2:9138
+front: raw 1210 bytes 00000001a29fc6021f9fc3000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021f9fc5000000010a
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 89 bytes from 127.0.0.1:14514
+front: reply to client 127.0.0.1:2096 failed: write udp4 26.226.94.158:9138->127.0.0.1:2096: wsasendto: The requested address is not valid in its context.
+front: session ended: read tcp4 127.0.0.1:15115->127.0.0.1:2096: use of closed network connection
+front: session from 127.0.0.1:2097, udp bound to 26.226.94.158:9140, advertised 26.226.94.158
+udp associate on 10.0.2.2:9140
+front: raw 1210 bytes 00000001a29fc6021194ce000000010c
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc6021194c3000000010c
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 91 bytes from 127.0.0.1:14514
+front: reply to client 127.0.0.1:2097 failed: write udp4 26.226.94.158:9140->127.0.0.1:2097: wsasendto: The requested address is not valid in its context.
+front: session ended: read tcp4 127.0.0.1:15115->127.0.0.1:2097: use of closed network connection
+front: session from 127.0.0.1:2098, udp bound to 26.226.94.158:9142, advertised 26.226.94.158
+udp associate on 10.0.2.2:9142
+front: raw 1210 bytes 00000001a29fc602115bc0000000010c
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: raw 1210 bytes 00000001a29fc602115bca000000010c
+front: forwarding 1200 bytes to 127.0.0.1:14514
+front: relayed back 91 bytes from 127.0.0.1:14514
+front: reply to client 127.0.0.1:2098 failed: write udp4 26.226.94.158:9142->127.0.0.1:2098: wsasendto: The requested address is not valid in its context.
+front: session ended: read tcp4 127.0.0.1:15115->127.0.0.1:2098: use of closed network connection

@@ -1,0 +1,19 @@
+session address : 172.16.0.2
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.137.65
+datagram 1: 45 bytes head=004500002c000040
+datagram 2: 41 bytes head=0045000028000040
+in: SYN|ACK seq=1397172792, handshake complete
+in: flags=0x014 payload=0 seq=0
+datagram 3: 45 bytes head=004500002c000040
+tcp handshake   : established through the tunnel
+in: repeated SYN|ACK seq=1397963733, ACK sent with seq=2
+in: repeated SYN|ACK seq=1397963733, ACK sent with seq=1527
+in: flags=0x004 payload=0 seq=1397172793
+in: flags=0x004 payload=0 seq=1397172793
+in: flags=0x010 payload=0 seq=1397963734
+in: flags=0x010 payload=0 seq=1397963734
+in: flags=0x018 payload=316 seq=1397963734
+in: FIN payload=0 seq=1397964050
+datagram recv stopped: context canceled
+error           : tls inside tunnel: tls: first record does not look like a TLS handshake

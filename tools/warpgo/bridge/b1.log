@@ -1,0 +1,65 @@
+bridge 0.0.0.0:15150 -> udp 162.159.198.2:443
+advertise      : 10.0.2.2
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+session: bind reply 10.0.2.2:50523: listen udp4 10.0.2.2:50523: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:16538: bound 0.0.0.0:50523, egress :0, reply on 10.0.2.2:50523
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up 10 pkts / 12010 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:16538 ended: EOF
+session: bind reply 10.0.2.2:50527: listen udp4 10.0.2.2:50527: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:16552: bound 0.0.0.0:50527, egress :0, reply on 10.0.2.2:50527
+up 20 pkts / 24020 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:16552 ended: EOF
+session: bind reply 10.0.2.2:28297: listen udp4 10.0.2.2:28297: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:16559: bound 0.0.0.0:28297, egress :0, reply on 10.0.2.2:28297
+up 30 pkts / 36030 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:16559 ended: EOF
+session: bind reply 10.0.2.2:55618: listen udp4 10.0.2.2:55618: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:16569: bound 0.0.0.0:55618, egress :0, reply on 10.0.2.2:55618
+up 40 pkts / 48040 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:16569 ended: EOF
+session: bind reply 10.0.2.2:10922: listen udp4 10.0.2.2:10922: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:20638: bound 0.0.0.0:10922, egress :0, reply on 10.0.2.2:10922
+up 50 pkts / 60050 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:20638 ended: EOF
+session: bind reply 10.0.2.2:10925: listen udp4 10.0.2.2:10925: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:20642: bound 0.0.0.0:10925, egress :0, reply on 10.0.2.2:10925
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:20642 ended: EOF
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0

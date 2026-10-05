@@ -1,0 +1,13 @@
+registrar on 127.0.0.1:8791
+POST /v0a4471/reg attempt 1: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF
+POST /v0a4471/reg attempt 2: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF
+POST /v0a4471/reg attempt 3: Post "https://api.cloudflareclient.com/v0a4471/reg": read tcp 192.168.0.4:53885->104.16.24.84:443: wsarecv: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.
+POST /v0a4471/reg attempt 4: Post "https://api.cloudflareclient.com/v0a4471/reg": read tcp 192.168.0.4:53950->104.16.192.82:443: wsarecv: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.
+POST /v0a4471/reg attempt 5: Post "https://api.cloudflareclient.com/v0a4471/reg": read tcp 192.168.0.4:53991->104.16.24.84:443: wsarecv: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.
+POST /v0a4471/reg attempt 6: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF
+POST /v0a4471/reg attempt 7: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF
+POST /v0a4471/reg attempt 8: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF
+POST /v0a4471/reg attempt 9: Post "https://api.cloudflareclient.com/v0a4471/reg": read tcp 192.168.0.4:54089->104.16.24.84:443: wsarecv: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.
+POST /v0a4471/reg attempt 10: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF
+POST /v0a4471/reg attempt 11: Post "https://api.cloudflareclient.com/v0a4471/reg": read tcp 192.168.0.4:54144->104.16.24.84:443: wsarecv: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.
+POST /v0a4471/reg attempt 12: Post "https://api.cloudflareclient.com/v0a4471/reg": EOF

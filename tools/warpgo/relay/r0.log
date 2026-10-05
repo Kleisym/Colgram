@@ -1,0 +1,39 @@
+relay listening: 127.0.0.1:14512
+upstream       : 162.159.198.2:443
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+relay: upstream session opened
+relay: first upstream datagram from 127.0.0.1:7798, 1200 bytes, head c80000000109b4ab2fe55e8a5c6ee70000449d08f7f3889f
+relay: first upstream datagram from 127.0.0.1:7798, 1200 bytes, head c20000000109b4ab2fe55e8a5c6ee70000449d36b80de583
+up 8 pkts / 9600 bytes   down 8 pkts / 704 bytes
+up 18 pkts / 21600 bytes   down 18 pkts / 1634 bytes
+up 28 pkts / 33600 bytes   down 28 pkts / 2574 bytes
+up 38 pkts / 45600 bytes   down 38 pkts / 3444 bytes
+up 46 pkts / 55200 bytes   down 46 pkts / 4220 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes
+up 56 pkts / 67200 bytes   down 56 pkts / 5100 bytes

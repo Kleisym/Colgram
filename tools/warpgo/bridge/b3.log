@@ -1,0 +1,39 @@
+bridge 0.0.0.0:15150 -> udp 162.159.198.2:443
+advertise      : 10.0.2.2
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+session 127.0.0.1:62997: egress 192.168.0.4:0, advertise 10.0.2.2:8868
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up 10 pkts / 12010 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:62997 ended: EOF
+session 127.0.0.1:63000: egress 192.168.0.4:0, advertise 10.0.2.2:8869
+up 20 pkts / 24020 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:63000 ended: EOF
+session 127.0.0.1:63005: egress 192.168.0.4:0, advertise 10.0.2.2:8872
+up 30 pkts / 36030 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:63005 ended: EOF
+session 127.0.0.1:63012: egress 192.168.0.4:0, advertise 10.0.2.2:8873
+up 40 pkts / 48040 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:63012 ended: EOF
+session 127.0.0.1:63017: egress 192.168.0.4:0, advertise 10.0.2.2:58230
+up 50 pkts / 60050 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:63017 ended: EOF
+session 127.0.0.1:63037: egress 192.168.0.4:0, advertise 10.0.2.2:48905
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:63037 ended: EOF
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0

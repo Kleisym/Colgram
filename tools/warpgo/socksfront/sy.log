@@ -1,0 +1,4 @@
+socks5 front 0.0.0.0:15097 -> udp 127.0.0.1:14505
+udp associate on 127.0.0.1:15097
+front: unknown address type 0x00 in 35 bytes
+front: session ended: EOF

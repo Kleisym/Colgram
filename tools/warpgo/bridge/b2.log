@@ -1,0 +1,221 @@
+bridge 0.0.0.0:15150 -> udp 162.159.198.2:443
+advertise      : 10.0.2.2
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes   sessions 0
+session: bind reply 10.0.2.2:27525: listen udp4 10.0.2.2:27525: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:62736: bound 0.0.0.0:27525, egress 192.168.0.4:0, reply on 10.0.2.2:27525
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+up 2 pkts / 2402 bytes   down 0 pkts / 0 bytes   sessions 1
+up: 1201 bytes to 162.159.198.2:443
+up: 1201 bytes to 162.159.198.2:443
+session 127.0.0.1:62736 ended: EOF
+session: bind reply 10.0.2.2:27527: listen udp4 10.0.2.2:27527: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:62739: bound 0.0.0.0:27527, egress 192.168.0.4:0, reply on 10.0.2.2:27527
+up 12 pkts / 14412 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:62739 ended: EOF
+session: bind reply 10.0.2.2:27530: listen udp4 10.0.2.2:27530: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:62757: bound 0.0.0.0:27530, egress 192.168.0.4:0, reply on 10.0.2.2:27530
+up 22 pkts / 26422 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:62757 ended: EOF
+session: bind reply 10.0.2.2:27532: listen udp4 10.0.2.2:27532: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:62759: bound 0.0.0.0:27532, egress 192.168.0.4:0, reply on 10.0.2.2:27532
+up 32 pkts / 38432 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:62759 ended: EOF
+session: bind reply 10.0.2.2:27534: listen udp4 10.0.2.2:27534: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:62761: bound 0.0.0.0:27534, egress 192.168.0.4:0, reply on 10.0.2.2:27534
+up 42 pkts / 50442 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:62761 ended: EOF
+session: bind reply 10.0.2.2:18033: listen udp4 10.0.2.2:18033: bind: The requested address is not valid in its context., wildcard
+session 127.0.0.1:42980: bound 0.0.0.0:18033, egress 192.168.0.4:0, reply on 10.0.2.2:18033
+up 52 pkts / 62452 bytes   down 0 pkts / 0 bytes   sessions 1
+session 127.0.0.1:42980 ended: EOF
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0
+up 60 pkts / 72060 bytes   down 0 pkts / 0 bytes   sessions 0

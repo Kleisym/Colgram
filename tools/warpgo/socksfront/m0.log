@@ -1,0 +1,32 @@
+advertising     : 10.0.2.2
+socks5 front 0.0.0.0:15111 -> udp 127.0.0.1:14511
+front: session from 127.0.0.1:3339, udp bound to 26.226.94.158:50440, advertised 26.226.94.158
+udp associate on 10.0.2.2:50440
+front: raw 1210 bytes 00000001a29fc60201bbc9000000010d
+front: forwarding 1200 bytes to 127.0.0.1:14511
+front: write failed: write udp4 26.226.94.158:50440->127.0.0.1:14511: wsasendto: The requested address is not valid in its context.
+front: session from 127.0.0.1:3342, udp bound to 26.226.94.158:19396, advertised 26.226.94.158
+udp associate on 10.0.2.2:19396
+front: raw 2420 bytes 00000001a29fc60201f4c7000000010c
+front: forwarding 2410 bytes to 127.0.0.1:14511
+front: write failed: write udp4 26.226.94.158:19396->127.0.0.1:14511: wsasendto: The requested address is not valid in its context.
+front: session from 127.0.0.1:3360, udp bound to 26.226.94.158:62755, advertised 26.226.94.158
+udp associate on 10.0.2.2:62755
+front: raw 1210 bytes 00000001a29fc60220fbc00000000111
+front: forwarding 1200 bytes to 127.0.0.1:14511
+front: write failed: write udp4 26.226.94.158:62755->127.0.0.1:14511: wsasendto: The requested address is not valid in its context.
+front: session from 127.0.0.1:3449, udp bound to 26.226.94.158:6320, advertised 26.226.94.158
+udp associate on 10.0.2.2:6320
+front: raw 1210 bytes 00000001a29fc6021f9fc8000000010c
+front: forwarding 1200 bytes to 127.0.0.1:14511
+front: write failed: write udp4 26.226.94.158:6320->127.0.0.1:14511: wsasendto: The requested address is not valid in its context.
+front: session from 127.0.0.1:3537, udp bound to 26.226.94.158:7758, advertised 26.226.94.158
+udp associate on 10.0.2.2:7758
+front: raw 1210 bytes 00000001a29fc6021194cd000000010b
+front: forwarding 1200 bytes to 127.0.0.1:14511
+front: write failed: write udp4 26.226.94.158:7758->127.0.0.1:14511: wsasendto: The requested address is not valid in its context.
+front: session from 127.0.0.1:3580, udp bound to 26.226.94.158:52945, advertised 26.226.94.158
+udp associate on 10.0.2.2:52945
+front: raw 1210 bytes 00000001a29fc602115bc30000000108
+front: forwarding 1200 bytes to 127.0.0.1:14511
+front: write failed: write udp4 26.226.94.158:52945->127.0.0.1:14511: wsasendto: The requested address is not valid in its context.

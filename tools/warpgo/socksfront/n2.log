@@ -1,0 +1,7 @@
+socks5 front 0.0.0.0:15094 -> udp 127.0.0.1:14504
+udp associate on 127.0.0.1:15094
+udp associate on 127.0.0.1:15094
+udp associate on 127.0.0.1:15094
+udp associate on 127.0.0.1:15094
+udp associate on 127.0.0.1:15094
+udp associate on 127.0.0.1:15094

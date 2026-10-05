@@ -1,0 +1,10 @@
+session address : 172.16.0.2
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.137.65
+datagram 1: 45 bytes head=004500002c000040
+datagram 2: 41 bytes head=0045000028000040
+in: SYN|ACK seq=866391666, handshake complete
+in: RST flags=0x014
+tcp handshake   : established through the tunnel
+datagram recv stopped: context canceled
+error           : tls inside tunnel: EOF

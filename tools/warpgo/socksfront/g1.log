@@ -1,0 +1,131 @@
+socks5 front 0.0.0.0:15100 -> udp 127.0.0.1:14505
+udp associate on 127.0.0.1:55738
+front: session ended: EOF
+udp associate on 127.0.0.1:7706
+front: raw 1210 bytes 00000001a29fc60201bbc4000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbc1000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbc5000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbcc000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbc1000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbca000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbc0000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbc0000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbc6000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201bbcf000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: session ended: EOF
+udp associate on 127.0.0.1:7716
+front: raw 1210 bytes 00000001a29fc60201f4c7000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4ca000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4c7000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4c9000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4c6000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4c5000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4ce000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4c3000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4c0000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60201f4ca000000010e
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: session ended: EOF
+udp associate on 127.0.0.1:7734
+front: raw 1210 bytes 00000001a29fc60220fbcb0000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbc10000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbce0000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbc40000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbc30000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbcd0000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbcd0000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbc30000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbcf0000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc60220fbc20000000113
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: session ended: EOF
+udp associate on 127.0.0.1:7744
+front: raw 2420 bytes 00000001a29fc6021f9fcd000000010c
+front: forwarding 2411 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fc4000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fca000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fc8000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fc6000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fcf000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fc7000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fc5000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021f9fc8000000010c
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: session ended: EOF
+udp associate on 127.0.0.1:7780
+front: raw 2420 bytes 00000001a29fc6021194ca0000000108
+front: forwarding 2411 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194cb0000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c90000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c40000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c60000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c20000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c80000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c10000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc6021194c50000000108
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: session ended: EOF
+udp associate on 127.0.0.1:7796
+front: raw 1210 bytes 00000001a29fc602115bcc0000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bc00000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bc30000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bcd0000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bc80000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bc10000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bce0000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bc50000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bc80000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: raw 1210 bytes 00000001a29fc602115bca0000000111
+front: forwarding 1201 bytes to 127.0.0.1:14505
+front: session ended: EOF

@@ -1,0 +1,2 @@
+# edgescan
+.\main.go:51:38: cannot use local.String() (value of type string) as *net.UDPAddr value in argument to net.ListenUDP

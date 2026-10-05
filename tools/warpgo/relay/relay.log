@@ -1,0 +1,32 @@
+relay listening: 127.0.0.1:14500
+upstream       : 162.159.198.2:443
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 15 pkts / 8244 bytes   down 17 pkts / 6286 bytes
+up 45 pkts / 13720 bytes   down 30 pkts / 6957 bytes
+up 48 pkts / 13846 bytes   down 32 pkts / 7001 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes
+up 49 pkts / 13890 bytes   down 34 pkts / 7045 bytes

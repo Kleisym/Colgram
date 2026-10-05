@@ -1,0 +1,3 @@
+# warpverdict
+# [warpverdict]
+vet.exe: .\main.go:191:31: cannot use s.partner (variable of interface type net.Addr) as *net.UDPAddr value in argument to s.udp.WriteToUDP: need type assertion

@@ -1,0 +1,60 @@
+measureWith: env WARP_SOCKS="" WARP_RELAY=""
+session address : 172.16.0.2
+edge candidate  1/6  162.159.198.2:443 via 10.0.2.15
+attempt entered for 162.159.198.2:443 bind 10.0.2.15 socks 
+socks5 udp: dialling 10.0.2.2:15150
+masque over socks5: 10.0.2.2:15150
+2026/09/30 21:53:42 connection doesn't allow setting of receive buffer size. Not a *net.UDPConn?. See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+socks read 109 bytes, type=1, payload=99
+socks read 109 bytes, type=1, payload=99
+socks read 1210 bytes, type=1, payload=1200
+socks read 1210 bytes, type=1, payload=1200
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.137.65
+tcp handshake   : established through the tunnel
+tls handshake   : complete, alpn= 
+request         : GET /cdn-cgi/trace
+ip packets      : sent=23 recv=15
+datagram recv stopped: context canceled
+library : /data/local/uq/apkso2/libcolgrammasque.so
+version : colgram-masque/1
+socks   : 10.0.2.2:15150
+HTTP/1.1 200 OK
+
+Date: Wed, 30 Sep 2026 21:53:45 GMT
+
+Content-Type: text/plain
+
+Content-Length: 240
+
+Connection: close
+
+If-Modified-Since: off
+
+Expires: Thu, 01 Jan 1970 00:00:01 GMT
+
+Access-Control-Allow-Origin: *
+
+Server: cloudflare
+
+CF-RAY: a43676560b83d8e7-FRA
+
+
+
+fl=933f85
+h=connectivity.cloudflareclient.com
+ip=104.28.244.74
+ts=1790805225.000
+visit_scheme=https
+uag=colgram-warp-on
+colo=FRA
+sliver=050-tier1
+http=http/1.1
+loc=RU
+tls=TLSv1.3
+sni=plaintext
+warp=on
+gateway=off
+rbi=off
+kex=X25519MLKEM768
+

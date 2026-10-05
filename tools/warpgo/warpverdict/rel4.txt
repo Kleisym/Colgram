@@ -1,0 +1,56 @@
+session address : 172.16.0.2
+edge            : 127.0.0.1:14500 (relayed)
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.137.65
+out: flags=0x002 seq=1 ack=0 sport=51500 dport=443
+out: flags=0x002 seq=1 ack=0 sport=51500 dport=443
+out: flags=0x002 seq=1 ack=0 sport=51500 dport=443
+datagram 1: 45 bytes head=004500002c000040
+datagram 2: 45 bytes head=004500002c000040
+out: flags=0x010 seq=2 ack=2288050755 sport=51500 dport=443
+in: SYN|ACK seq=2288050754, handshake complete
+out: flags=0x010 seq=2 ack=2288050755 sport=51500 dport=443
+in: repeated SYN|ACK seq=2288050754, ACK sent with seq=2
+tcp handshake   : established through the tunnel
+datagram 3: 41 bytes head=0045000028d6f040
+in: flags=0x010 payload=0 seq=2288050755
+out: flags=0x010 seq=1527 ack=2288050755 sport=51500 dport=443
+in: flags=0x010 payload=0 seq=2288050755
+out: flags=0x010 seq=1527 ack=2288050755 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288050755
+out: flags=0x010 seq=1527 ack=2288051291 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288051291
+out: flags=0x010 seq=1527 ack=2288051827 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288051827
+out: flags=0x010 seq=1527 ack=2288052363 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288052363
+out: flags=0x010 seq=1527 ack=2288052899 sport=51500 dport=443
+in: flags=0x018 payload=536 seq=2288052899
+out: flags=0x010 seq=1527 ack=2288053435 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288053435
+out: flags=0x010 seq=1527 ack=2288053971 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288053971
+out: flags=0x010 seq=1527 ack=2288054507 sport=51500 dport=443
+in: flags=0x018 payload=166 seq=2288054507
+out: flags=0x010 seq=1527 ack=2288054673 sport=51500 dport=443
+tls handshake   : complete, alpn= 
+request         : GET /cdn-cgi/trace
+in: flags=0x010 payload=0 seq=2288054673
+out: flags=0x010 seq=1746 ack=2288054673 sport=51500 dport=443
+in: flags=0x010 payload=536 seq=2288054673
+out: flags=0x010 seq=1746 ack=2288055209 sport=51500 dport=443
+in: flags=0x018 payload=19 seq=2288055209
+out: flags=0x010 seq=1746 ack=2288055228 sport=51500 dport=443
+ip packets      : sent=22 recv=15
+datagram recv stopped: context canceled
+status          : HTTP/1.1 200 OK
+  warp   = on
+  ip     = 104.28.244.74
+  loc    = RU
+  colo   = FRA
+  kex    = X25519MLKEM768
+  tls    = TLSv1.3
+  http   = http/1.1
+  sni    = plaintext
+
+VERDICT: warp=on -- the request travelled through the WARP tunnel

@@ -1,0 +1,19 @@
+relay listening: 127.0.0.1:14508
+upstream       : 162.159.198.2:443
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+relay: upstream session opened
+relay: first upstream datagram from 127.0.0.1:60464, 1200 bytes, head c30000000112f11c24705591857e22717b3c69aaff785c71
+relay: first upstream datagram from 127.0.0.1:60464, 1200 bytes, head c60000000112f11c24705591857e22717b3c69aaff785c71
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes
+up 42 pkts / 13301 bytes   down 36 pkts / 11035 bytes

@@ -1,0 +1,29 @@
+# runtime/cgo
+gcc_clearenv.c:16:2: error: call to undeclared function 'clearenv'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+gcc_clearenv.c:16:2: note: did you mean 'clearerr'?
+C:/Users/virsu/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20251202-ucrt-x86_64/include/stdio.h:542:16: note: 'clearerr' declared here
+# runtime/cgo
+gcc_linux_amd64.c:57:2: error: unknown type name 'sigset_t'; did you mean '_sigset_t'?
+C:/Users/virsu/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20251202-ucrt-x86_64/include/sys/types.h:104:28: note: '_sigset_t' declared here
+gcc_linux_amd64.c:62:2: error: call to undeclared function 'sigfillset'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+# runtime/cgo
+gcc_mmap.c:10:10: fatal error: 'sys/mman.h' file not found
+# runtime/cgo
+gcc_setenv.c:16:2: error: call to undeclared function 'setenv'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+gcc_setenv.c:16:2: note: did you mean 'getenv'?
+C:/Users/virsu/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20251202-ucrt-x86_64/include/stdlib.h:333:17: note: 'getenv' declared here
+gcc_setenv.c:25:2: error: call to undeclared function 'unsetenv'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+# runtime/cgo
+gcc_sigaction.c:39:19: error: variable has incomplete type 'struct sigaction'
+gcc_sigaction.c:39:9: note: forward declaration of 'struct sigaction'
+gcc_sigaction.c:40:19: error: variable has incomplete type 'struct sigaction'
+gcc_sigaction.c:39:9: note: forward declaration of 'struct sigaction'
+gcc_sigaction.c:49:22: error: use of undeclared identifier 'SA_SIGINFO'
+gcc_sigaction.c:50:37: error: unknown type name 'siginfo_t'
+gcc_sigaction.c:54:3: error: call to undeclared function 'sigemptyset'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+gcc_sigaction.c:57:5: error: call to undeclared function 'sigaddset'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+gcc_sigaction.c:63:8: error: call to undeclared function 'sigaction'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+gcc_sigaction.c:71:25: error: use of undeclared identifier 'SA_SIGINFO'
+gcc_sigaction.c:78:8: error: call to undeclared function 'sigismember'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+# runtime/cgo
+linux_syscall.c:11:10: fatal error: 'grp.h' file not found

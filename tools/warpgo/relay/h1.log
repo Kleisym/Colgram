@@ -1,0 +1,51 @@
+relay listening: 127.0.0.1:14506
+upstream       : 162.159.198.2:443
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+relay: new session from 127.0.0.1:9476 (1 total)
+up 8 pkts / 9608 bytes   down 0 pkts / 0 bytes
+relay: new session from 127.0.0.1:9478 (2 total)
+up 16 pkts / 19216 bytes   down 0 pkts / 0 bytes
+relay: new session from 127.0.0.1:9480 (3 total)
+up 26 pkts / 31226 bytes   down 0 pkts / 0 bytes
+relay: new session from 127.0.0.1:2242 (4 total)
+up 34 pkts / 40834 bytes   down 0 pkts / 0 bytes
+relay: new session from 127.0.0.1:25524 (5 total)
+up 44 pkts / 52844 bytes   down 0 pkts / 0 bytes
+relay: new session from 127.0.0.1:25965 (6 total)
+up 54 pkts / 64854 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes
+up 56 pkts / 67256 bytes   down 0 pkts / 0 bytes

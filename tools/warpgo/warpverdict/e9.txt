@@ -1,0 +1,227 @@
+2026/09/30 12:53:47 Increased receive buffer size to 7168 kiB
+2026/09/30 12:53:47 Increased send buffer size to 7168 kiB
+2026/09/30 12:53:47 Setting DF for IPv4 and IPv6.
+2026/09/30 12:53:47 client Starting new connection to consumer-masque.cloudflareclient.com (192.168.0.4:62173 -> 162.159.198.2:443), source connection ID (empty), destination connection ID f64ad1a3625843c60fdc48, version v1
+2026/09/30 12:53:47 client Not doing 0-RTT. Has sealer: false, has params: false
+2026/09/30 12:53:47 client -> Sending packet 0 (1350 bytes) for connection f64ad1a3625843c60fdc48, Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: f64ad1a3625843c60fdc48, SrcConnectionID: (empty), Token: (empty), PacketNumber: 0, PacketNumberLen: 2, Length: 1329, Version: v1}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 0, Data length: 78, Offset + Data length: 78}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 96, Data length: 1224, Offset + Data length: 1320}
+2026/09/30 12:53:47 client -> Sending packet 1 (1350 bytes) for connection f64ad1a3625843c60fdc48, Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: f64ad1a3625843c60fdc48, SrcConnectionID: (empty), Token: (empty), PacketNumber: 1, PacketNumberLen: 2, Length: 1329, Version: v1}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 78, Data length: 18, Offset + Data length: 96}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 1320, Data length: 223, Offset + Data length: 1543}
+2026/09/30 12:53:47 client 	updated RTT: 95.4638ms (σ: 47.7319ms)
+2026/09/30 12:53:47 client <- Received Retry:
+2026/09/30 12:53:47 client 	Long Header{Type: Retry, DestConnectionID: (empty), SrcConnectionID: 01e93660c5e59524c6e8e0614be59524c660618b, Token: 0xe0b82ace23cb1d74fa9872445004ce0a99415cdd45a04304c1d9422002a9d3f59e2e4091f64ad1a3625843c60fdc48, Version: v1}
+2026/09/30 12:53:47 client Switching destination connection ID to: 01e93660c5e59524c6e8e0614be59524c660618b
+2026/09/30 12:53:47 client Ignoring Retry, since a Retry was already received.
+2026/09/30 12:53:47 client -> Sending packet 2 (1350 bytes) for connection f64ad1a3625843c60fdc48, Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: 01e93660c5e59524c6e8e0614be59524c660618b, SrcConnectionID: (empty), Token: 0xe0b82ace23cb1d74fa9872445004ce0a99415cdd45a04304c1d9422002a9d3f59e2e4091f64ad1a3625843c60fdc48, PacketNumber: 2, PacketNumberLen: 2, Length: 1273, Version: v1}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 96, Data length: 1168, Offset + Data length: 1264}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 0, Data length: 78, Offset + Data length: 78}
+2026/09/30 12:53:47 client -> Sending packet 3 (1350 bytes) for connection f64ad1a3625843c60fdc48, Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: 01e93660c5e59524c6e8e0614be59524c660618b, SrcConnectionID: (empty), Token: 0xe0b82ace23cb1d74fa9872445004ce0a99415cdd45a04304c1d9422002a9d3f59e2e4091f64ad1a3625843c60fdc48, PacketNumber: 3, PacketNumberLen: 2, Length: 1273, Version: v1}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 1264, Data length: 56, Offset + Data length: 1320}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 1320, Data length: 223, Offset + Data length: 1543}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 78, Data length: 18, Offset + Data length: 96}
+2026/09/30 12:53:47 client Parsed a coalesced packet. Part 1: 52 bytes. Remaining: 1148 bytes.
+2026/09/30 12:53:47 client <- Reading packet 0 (52 bytes) for connection (empty), Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: (empty), SrcConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, Token: (empty), PacketNumber: 0, PacketNumberLen: 1, Length: 22, Version: v1}
+2026/09/30 12:53:47 client Received first packet. Switching destination connection ID to: 012de310fb2220fcc72c3511752220fcc7a8f608
+2026/09/30 12:53:47 client 	<- &wire.AckFrame{LargestAcked: 2, LowestAcked: 2, DelayTime: 48µs}
+2026/09/30 12:53:47 client 	newly acked packets (1): [2]
+2026/09/30 12:53:47 client 	updated RTT: 95.198ms (σ: 36.327ms)
+2026/09/30 12:53:47 client Queueing packet (1148 bytes) for later decryption
+2026/09/30 12:53:47 client Parsed a coalesced packet. Part 1: 112 bytes. Remaining: 1088 bytes.
+2026/09/30 12:53:47 client <- Reading packet 1 (112 bytes) for connection (empty), Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: (empty), SrcConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, Token: (empty), PacketNumber: 1, PacketNumberLen: 1, Length: 82, Version: v1}
+2026/09/30 12:53:47 client 	<- &wire.AckFrame{LargestAcked: 3, LowestAcked: 2, DelayTime: 88µs}
+2026/09/30 12:53:47 client 	newly acked packets (1): [3]
+2026/09/30 12:53:47 client 	updated RTT: 94.9ms (σ: 27.84ms)
+2026/09/30 12:53:47 client 	<- &wire.CryptoFrame{Offset: 0, Data length: 56, Offset + Data length: 56}
+2026/09/30 12:53:47 client Queueing packet (1088 bytes) for later decryption
+2026/09/30 12:53:47 client -> Sending packet 4 (1350 bytes) for connection f64ad1a3625843c60fdc48, Initial
+2026/09/30 12:53:47 client 	Long Header{Type: Initial, DestConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, SrcConnectionID: (empty), Token: 0xe0b82ace23cb1d74fa9872445004ce0a99415cdd45a04304c1d9422002a9d3f59e2e4091f64ad1a3625843c60fdc48, PacketNumber: 4, PacketNumberLen: 2, Length: 1273, Version: v1}
+2026/09/30 12:53:47 client 	-> &wire.AckFrame{LargestAcked: 1, LowestAcked: 0, DelayTime: 0s}
+2026/09/30 12:53:47 client 	-> &wire.CryptoFrame{Offset: 1543, Data length: 356, Offset + Data length: 1899}
+2026/09/30 12:53:48 client Parsed a coalesced packet. Part 1: 179 bytes. Remaining: 1021 bytes.
+2026/09/30 12:53:48 client <- Reading packet 2 (179 bytes) for connection (empty), Initial
+2026/09/30 12:53:48 client 	Long Header{Type: Initial, DestConnectionID: (empty), SrcConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, Token: (empty), PacketNumber: 2, PacketNumberLen: 1, Length: 149, Version: v1}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 4, LowestAcked: 4, DelayTime: 344µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [4]
+2026/09/30 12:53:48 client 	updated RTT: 94.589ms (σ: 21.501ms)
+2026/09/30 12:53:48 client 	<- &wire.CryptoFrame{Offset: 56, Data length: 123, Offset + Data length: 179}
+2026/09/30 12:53:48 client Installed Handshake Write keys (using TLS_AES_128_GCM_SHA256)
+2026/09/30 12:53:48 client Installed Handshake Read keys (using TLS_AES_128_GCM_SHA256)
+2026/09/30 12:53:48 client Queueing packet (1021 bytes) for later decryption
+2026/09/30 12:53:48 client -> Sending packet 5 (1350 bytes) for connection f64ad1a3625843c60fdc48, Initial
+2026/09/30 12:53:48 client 	Long Header{Type: Initial, DestConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, SrcConnectionID: (empty), Token: 0xe0b82ace23cb1d74fa9872445004ce0a99415cdd45a04304c1d9422002a9d3f59e2e4091f64ad1a3625843c60fdc48, PacketNumber: 5, PacketNumberLen: 2, Length: 1273, Version: v1}
+2026/09/30 12:53:48 client 	-> &wire.AckFrame{LargestAcked: 2, LowestAcked: 0, DelayTime: 0s}
+2026/09/30 12:53:48 client Queueing packet (1148 bytes) for later decryption
+2026/09/30 12:53:48 client Queueing packet (1088 bytes) for later decryption
+2026/09/30 12:53:48 client <- Reading packet 3 (921 bytes) for connection (empty), Handshake
+2026/09/30 12:53:48 client 	Long Header{Type: Handshake, DestConnectionID: (empty), SrcConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, PacketNumber: 3, PacketNumberLen: 1, Length: 892, Version: v1}
+2026/09/30 12:53:48 client 	<- &wire.CryptoFrame{Offset: 0, Data length: 871, Offset + Data length: 871}
+2026/09/30 12:53:48 client Installed 1-RTT Write keys (using TLS_AES_128_GCM_SHA256)
+2026/09/30 12:53:48 client Installed 1-RTT Read keys (using TLS_AES_128_GCM_SHA256)
+2026/09/30 12:53:48 client Processed Transport Parameters: &wire.TransportParameters{OriginalDestinationConnectionID: f64ad1a3625843c60fdc48, InitialSourceConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, RetrySourceConnectionID: 01e93660c5e59524c6e8e0614be59524c660618b, InitialMaxStreamDataBidiLocal: 1000000, InitialMaxStreamDataBidiRemote: 1000000, InitialMaxStreamDataUni: 1000000, InitialMaxData: 10000000, MaxBidiStreamNum: 25000, MaxUniStreamNum: 100, MaxIdleTimeout: 56s, AckDelayExponent: 3, MaxAckDelay: 25ms, ActiveConnectionIDLimit: 2, MaxDatagramFrameSize: 65536, EnableResetStreamAt: false}
+2026/09/30 12:53:48 client -> Sending packet 0 (424 bytes) for connection f64ad1a3625843c60fdc48, Handshake
+2026/09/30 12:53:48 client 	Long Header{Type: Handshake, DestConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, SrcConnectionID: (empty), PacketNumber: 0, PacketNumberLen: 2, Length: 395, Version: v1}
+2026/09/30 12:53:48 client 	-> &wire.AckFrame{LargestAcked: 3, LowestAcked: 3, DelayTime: 0s}
+2026/09/30 12:53:48 client 	-> &wire.CryptoFrame{Offset: 0, Data length: 368, Offset + Data length: 368}
+2026/09/30 12:53:48 client Dropping Initial keys.
+2026/09/30 12:53:48 client Dropping 1RTT packet (1021 bytes) for which we couldn't unpack the header. Error: not a QUIC packet
+2026/09/30 12:53:48 client Dropping 1RTT packet (1148 bytes) for which we couldn't unpack the header. Error: not a QUIC packet
+2026/09/30 12:53:48 client Dropping 1RTT packet (1088 bytes) for which we couldn't unpack the header. Error: not a QUIC packet
+2026/09/30 12:53:48 client -> Sending packet 0 (173 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, PacketNumber: 0, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.StreamFrame{StreamID: 2, Fin: false, Offset: 0, Data length: 12, Offset + Data length: 12}
+2026/09/30 12:53:48 client 	-> &wire.StreamFrame{StreamID: 0, Fin: false, Offset: 0, Data length: 117, Offset + Data length: 117}
+2026/09/30 12:53:48 client <- Reading packet 4 (51 bytes) for connection (empty), Handshake
+2026/09/30 12:53:48 client 	Long Header{Type: Handshake, DestConnectionID: (empty), SrcConnectionID: 012de310fb2220fcc72c3511752220fcc7a8f608, PacketNumber: 4, PacketNumberLen: 1, Length: 22, Version: v1}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 0, LowestAcked: 0, DelayTime: 136µs}
+2026/09/30 12:53:48 client Peer doesn't await address validation any longer.
+2026/09/30 12:53:48 client 	newly acked packets (1): [0]
+2026/09/30 12:53:48 client 	updated RTT: 94.456ms (σ: 16.391ms)
+2026/09/30 12:53:48 client Canceling loss detection timer.
+2026/09/30 12:53:48 client <- Reading packet 11 (48 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 11, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.StreamFrame{StreamID: 15, Fin: true, Offset: 1, Data length: 25, Offset + Data length: 26}
+2026/09/30 12:53:48 client 	Setting ACK timer to max ack delay: 25ms
+2026/09/30 12:53:48 client <- Reading packet 5 (1360 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 5, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.PingFrame{}
+2026/09/30 12:53:48 client 	Queueing ACK because packet 2 packets were received after the last ACK (using initial threshold: 2).
+2026/09/30 12:53:48 client <- Reading packet 6 (59 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 6, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.NewConnectionIDFrame{SequenceNumber: 1, RetirePriorTo: 0, ConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, StatelessResetToken: 0x44c6f9b4a92098e34996aa39315f9876}
+2026/09/30 12:53:48 client 	<- &wire.HandshakeDoneFrame{}
+2026/09/30 12:53:48 client Dropping Handshake keys.
+2026/09/30 12:53:48 client <- Reading packet 7 (54 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 7, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.StreamFrame{StreamID: 3, Fin: false, Offset: 0, Data length: 31, Offset + Data length: 31}
+2026/09/30 12:53:48 client <- Reading packet 8 (24 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 8, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.StreamFrame{StreamID: 7, Fin: false, Offset: 0, Data length: 1, Offset + Data length: 1}
+2026/09/30 12:53:48 client <- Reading packet 9 (24 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 9, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.StreamFrame{StreamID: 11, Fin: false, Offset: 0, Data length: 1, Offset + Data length: 1}
+2026/09/30 12:53:48 client <- Reading packet 10 (24 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 10, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.StreamFrame{StreamID: 15, Fin: false, Offset: 0, Data length: 1, Offset + Data length: 1}
+2026/09/30 12:53:48 client Loss detection alarm for 1-RTT fired in PTO mode. PTO count: 1
+2026/09/30 12:53:48 client -> Sending packet 2 (188 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 2, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.AckFrame{LargestAcked: 11, LowestAcked: 5, DelayTime: 5.4071ms}
+2026/09/30 12:53:48 client 	-> &wire.StopSendingFrame{StreamID:15, ErrorCode:0x103}
+2026/09/30 12:53:48 client 	-> &wire.RetireConnectionIDFrame{SequenceNumber: 0}
+2026/09/30 12:53:48 client 	-> &wire.MaxStreamsFrame{Type: uni, MaxStreamNum: 101}
+2026/09/30 12:53:48 client 	-> &wire.StreamFrame{StreamID: 2, Fin: false, Offset: 0, Data length: 12, Offset + Data length: 12}
+2026/09/30 12:53:48 client 	-> &wire.StreamFrame{StreamID: 0, Fin: false, Offset: 0, Data length: 117, Offset + Data length: 117}
+2026/09/30 12:53:48 client -> Sending packet 3 (182 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 3, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.MaxStreamsFrame{Type: uni, MaxStreamNum: 101}
+2026/09/30 12:53:48 client 	-> &wire.StopSendingFrame{StreamID:15, ErrorCode:0x103}
+2026/09/30 12:53:48 client 	-> &wire.RetireConnectionIDFrame{SequenceNumber: 0}
+2026/09/30 12:53:48 client 	-> &wire.StreamFrame{StreamID: 2, Fin: false, Offset: 0, Data length: 12, Offset + Data length: 12}
+2026/09/30 12:53:48 client 	-> &wire.StreamFrame{StreamID: 0, Fin: false, Offset: 0, Data length: 117, Offset + Data length: 117}
+2026/09/30 12:53:48 client <- Reading packet 12 (68 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 12, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 2, LowestAcked: 2, DelayTime: 88µs}
+2026/09/30 12:53:48 client 	<- &wire.NewConnectionIDFrame{SequenceNumber: 2, RetirePriorTo: 1, ConnectionID: 01b7dad78ef0a8c3b0b60cd600f0a8c3b0f32ed9, StatelessResetToken: 0x9bbc0b3d68601446a49f2e53f53ba21f}
+2026/09/30 12:53:48 client 	<- &wire.ResetStreamFrame{StreamID: 15, ErrorCode: 0x103, FinalSize: 26}
+2026/09/30 12:53:48 client 	Setting ACK timer to max ack delay: 25ms
+2026/09/30 12:53:48 client <- Reading packet 13 (128 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 13, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.StreamFrame{StreamID: 0, Fin: false, Offset: 0, Data length: 105, Offset + Data length: 105}
+2026/09/30 12:53:48 client 	Queueing ACK because packet 2 packets were received after the last ACK (using initial threshold: 2).
+2026/09/30 12:53:48 client <- Reading packet 14 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 14, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 3, LowestAcked: 2, DelayTime: 24µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [3]
+2026/09/30 12:53:48 client 	updated RTT: 94.369ms (σ: 12.467ms)
+2026/09/30 12:53:48 client Canceling loss detection timer.
+2026/09/30 12:53:48 client -> Sending packet 4 (91 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 4, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.AckFrame{LargestAcked: 14, LowestAcked: 5, DelayTime: 11.524ms}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x16, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 5 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 5, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x16, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 6 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 6, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 7 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 7, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 8 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 8, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 9 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 9, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client <- Reading packet 15 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 15, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 4, LowestAcked: 4, DelayTime: 24µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [4]
+2026/09/30 12:53:48 client 	Ignoring all packets below 15.
+2026/09/30 12:53:48 client 	updated RTT: 94.589ms (σ: 9.791ms)
+2026/09/30 12:53:48 client <- Reading packet 16 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 16, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 5, LowestAcked: 4, DelayTime: 8µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [5]
+2026/09/30 12:53:48 client 	updated RTT: 94.946ms (σ: 8.058ms)
+2026/09/30 12:53:48 client <- Reading packet 17 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 17, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 6, LowestAcked: 4, DelayTime: 16µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [6]
+2026/09/30 12:53:48 client 	updated RTT: 95.328ms (σ: 6.809ms)
+2026/09/30 12:53:48 client <- Reading packet 18 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 18, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 7, LowestAcked: 4, DelayTime: 8µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [7]
+2026/09/30 12:53:48 client 	updated RTT: 95.798ms (σ: 6.046ms)
+2026/09/30 12:53:48 client -> Sending packet 10 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 10, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 11 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 11, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client <- Reading packet 19 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 19, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 8, LowestAcked: 4, DelayTime: 8µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [8]
+2026/09/30 12:53:48 client 	updated RTT: 96.002ms (σ: 4.943ms)
+2026/09/30 12:53:48 client <- Reading packet 20 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 20, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 9, LowestAcked: 4, DelayTime: 16µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [9]
+2026/09/30 12:53:48 client 	updated RTT: 96.278ms (σ: 4.261ms)
+2026/09/30 12:53:48 client -> Sending packet 12 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 12, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client -> Sending packet 13 (85 bytes) for connection f64ad1a3625843c60fdc48, 1-RTT (ECN: ECN unsupported)
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: 01350d0fa7046dd4d234db0e29046dd4d297c882, PacketNumber: 13, PacketNumberLen: 2, KeyPhase: 0}
+2026/09/30 12:53:48 client 	-> &wire.DatagramFrame{DataLenPresent:true, Data:[]uint8{0x0, 0x0, 0x0, 0x28, 0x45, 0x0, 0x0, 0x28, 0x43, 0x21, 0x0, 0x0, 0x40, 0x6, 0x5f, 0xbc, 0xac, 0x10, 0x0, 0x2, 0xa2, 0x9f, 0x89, 0x41, 0xc9, 0x2c, 0x1, 0xbb, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x50, 0x2, 0xfa, 0xf0, 0x12, 0x15, 0x0, 0x0}}
+2026/09/30 12:53:48 client <- Reading packet 21 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 21, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 10, LowestAcked: 4, DelayTime: 16µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [10]
+2026/09/30 12:53:48 client 	updated RTT: 96.178ms (σ: 3.394ms)
+2026/09/30 12:53:48 client <- Reading packet 22 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 22, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 11, LowestAcked: 4, DelayTime: 8µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [11]
+2026/09/30 12:53:48 client 	updated RTT: 96.092ms (σ: 2.717ms)
+2026/09/30 12:53:48 client <- Reading packet 23 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 23, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 12, LowestAcked: 4, DelayTime: 16µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [12]
+2026/09/30 12:53:48 client 	updated RTT: 95.821ms (σ: 2.579ms)
+2026/09/30 12:53:48 client <- Reading packet 24 (23 bytes) for connection (empty), 1-RTT
+2026/09/30 12:53:48 client 	Short Header{DestConnectionID: (empty), PacketNumber: 24, PacketNumberLen: 1, KeyPhase: 0}
+2026/09/30 12:53:48 client 	<- &wire.AckFrame{LargestAcked: 13, LowestAcked: 4, DelayTime: 16µs}
+2026/09/30 12:53:48 client 	newly acked packets (1): [13]
+2026/09/30 12:53:48 client 	updated RTT: 95.584ms (σ: 2.407ms)
+2026/09/30 12:53:48 client Canceling loss detection timer.

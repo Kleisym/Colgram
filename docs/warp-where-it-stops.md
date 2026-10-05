@@ -1,6 +1,14 @@
 
 # Where WARP stops, and what that was established from
 
+> **Superseded.** This file describes the state of WARP when it ran as a sing-box endpoint, and its
+> opening conclusion - that WARP does not work on this build - is no longer true. WARP now runs on
+> `libwg-go` in the same process and a real WireGuard packet leaves the device, measured on the
+> device. Read `warp-what-is-true-now.md` for the current state, what was measured to get there, and
+> which conclusions here were later disproved. This file is kept because several of those wrong
+> conclusions are the reason the fix was hard to find, and deleting the record of them would make the
+> same mistake easier to repeat.
+
 Cloudflare WARP does not work on this build. It is not a claim of impossibility: it is a statement of
 the last point on the path that has been measured, with the evidence for it, and the list of things
 that have been ruled out along the way.

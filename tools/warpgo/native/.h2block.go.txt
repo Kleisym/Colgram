@@ -1,0 +1,273 @@
+type h2raw struct {
+	conn   net.Conn
+	br     *bufio.Reader
+	wmu    sync.Mutex
+	sid    uint32
+	inflow int32
+}
+
+func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, error) {
+	var d net.Dialer
+	raw, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tc := tls.Client(raw, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         edgeSNI,
+		NextProtos:         []string{"h2"},
+		Certificates:       []tls.Certificate{cert},
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err := tc.HandshakeContext(ctx); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if got := tc.ConnectionState().NegotiatedProtocol; got != "h2" {
+		// An empty ALPN here is not a wrong carrier. This edge demands the client certificate during
+		// the handshake and only then decides, and a certificate it accepts is answered with no protocol
+		// list at all even though it speaks h2 - measured against this exact address. The MASQUE
+		// request that follows is what decides whether the carrier is usable, so the check is left to it.
+		fmt.Printf("  negotiated %q after presenting the certificate\n", got)
+	}
+	c := &h2raw{conn: tc, br: bufio.NewReader(tc), sid: 1, inflow: 65536}
+	// The connection preface, then our own SETTINGS carrying ENABLE_CONNECT_PROTOCOL so the edge can
+	// see the client supports it even though it never tells us that it does.
+	settings := frameH2(0x4, 0, 0, h2setting(0x8, 1))
+	if _, err := c.conn.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...)); err != nil {
+		tc.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// readFrame reads one frame header plus payload.
+func (c *h2raw) readFrame() (typ, flags byte, stream uint32, payload []byte, err error) {
+	var head [9]byte
+	if _, err = io.ReadFull(c.br, head[:]); err != nil {
+		return
+	}
+	ln := int(head[0])<<16 | int(head[1])<<8 | int(head[2])
+	typ, flags = head[3], head[4]
+	stream = uint32(head[5])<<24 | uint32(head[6])<<16 | uint32(head[7])<<8 | uint32(head[8])
+	if ln > 0 {
+		payload = make([]byte, ln)
+		_, err = io.ReadFull(c.br, payload)
+	}
+	return
+}
+
+// awaitSettings reads until the peer's SETTINGS have arrived and reports whether it enabled the
+// extended CONNECT.
+func (c *h2raw) awaitSettings(ctx context.Context) (bool, error) {
+	for {
+		if err := c.conn.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+			return false, err
+		}
+		typ, _, _, payload, err := c.readFrame()
+		if err != nil {
+			return false, err
+		}
+		switch typ {
+		case 0x4: // SETTINGS
+			if len(payload)%6 != 0 {
+				return false, fmt.Errorf("settings payload is not a multiple of six")
+			}
+			allowed := false
+			for i := 0; i+6 <= len(payload); i += 6 {
+				id := uint16(payload[i])<<8 | uint16(payload[i+1])
+				val := uint32(payload[i+2])<<24 | uint32(payload[i+3])<<16 | uint32(payload[i+4])<<8 | uint32(payload[i+5])
+				switch id {
+				case 0x8:
+					allowed = val == 1
+				case 0x3:
+					c.inflow = int32(val)
+				}
+			}
+			// Acknowledge, or the edge treats the connection as unresponsive.
+			if _, err := c.conn.Write(frameH2(0x4, 0x1, 0, nil)); err != nil {
+				return false, err
+			}
+			return allowed, nil
+		case 0x7: // GOAWAY
+			return false, fmt.Errorf("GOAWAY before settings: %x", payload)
+		case 0x1, 0x2: // HEADERS, PRIORITY - ignore before our stream exists
+		case 0x8: // WINDOW_UPDATE
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+	}
+}
+
+// shape selects among the request shapes this edge has been asked to accept. The point of having
+// more than one is that "400" is the edge refusing the request rather than the carrier dropping it,
+// and each shape rules out a different way of writing the request wrong.
+type shape struct {
+	authority string
+	path      string
+	proto     string
+	withProto bool
+}
+
+var shapes = []shape{
+	{authority: connectAuth, path: "/", proto: "cf-connect-ip", withProto: true},
+}
+
+// connectVariant names one way of writing the extended CONNECT. The edge answers a header block it
+// does not accept with a stream reset carrying PROTOCOL_ERROR rather than a status, so the only way to
+// find the shape it wants is to send each one and read the verdict.
+type connectVariant struct {
+	name      string
+	withProto bool // :protocol pseudo-header
+	protoHdr  bool // cf-connect-proto header
+	capsule   bool // capsule-protocol header
+	authority string
+	path      string
+	scheme    string
+	endStream bool
+}
+
+func variants() []connectVariant {
+	auth := connectAuth
+	return []connectVariant{
+		// This one is a transcription of what the working client puts on the wire, field for field: a
+		// plain CONNECT with no :scheme and no :path, an authority carrying the default port, and the
+		// protocol named in the cf-connect-proto header alone. Every other variant here adds something
+		// RFC 8441 asks for and this edge does not want, which is what a stream reset means.
+		{name: "reference client shape", withProto: false, protoHdr: true, capsule: false, authority: auth + ":443", path: "", scheme: ""},
+		{name: "protocol+cf-connect-proto", withProto: true, protoHdr: true, capsule: true, authority: auth, path: "/", scheme: "https"},
+		{name: "protocol only", withProto: true, protoHdr: false, capsule: false, authority: auth, path: "/", scheme: "https"},
+		{name: "cf-connect-proto only", withProto: false, protoHdr: true, capsule: true, authority: auth, path: "/", scheme: "https"},
+		{name: "no scheme or path", withProto: true, protoHdr: true, capsule: true, authority: auth, path: "", scheme: ""},
+		{name: "authority with port", withProto: true, protoHdr: true, capsule: true, authority: auth + ":443", path: "/", scheme: "https"},
+		{name: "end stream set", withProto: true, protoHdr: true, capsule: true, authority: auth, path: "/", scheme: "https", endStream: true},
+	}
+}
+
+// sendConnect writes the extended CONNECT on stream 1 and reads the response headers, without
+// END_STREAM: the capsule stream needs this side of the stream to stay open for the tunnel's life.
+func (c *h2raw) sendConnect(ctx context.Context, v connectVariant) (int, map[string]string, error) {
+	var block bytes.Buffer
+	enc := hpack.NewEncoder(&block)
+	// :method, :scheme and :path are literal-without-indexing against the static table names, and each
+	// is followed by its value. Sending the name index alone would leave the value to be read out of
+	// the next byte, which is how a well-formed-looking header block decodes into nonsense.
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "CONNECT"})
+	if v.scheme != "" {
+		enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: v.scheme})
+	}
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: v.authority})
+	if v.path != "" {
+		enc.WriteField(hpack.HeaderField{Name: ":path", Value: v.path})
+	}
+	// The protocol name travels in the regular header cf-connect-proto rather than in the :protocol
+	// pseudo-header, which is what the working client writes and what this edge is measured against.
+	// Both are offered because the two readings are incompatible and only the edge can say which it
+	// takes - a peer that reads RFC 8441 exactly ignores cf-connect-proto, and one that reads the
+	// header form has no use for the pseudo-header.
+	if v.withProto {
+		enc.WriteField(hpack.HeaderField{Name: ":protocol", Value: "cf-connect-ip"})
+	}
+	if v.protoHdr {
+		enc.WriteField(hpack.HeaderField{Name: "cf-connect-proto", Value: "cf-connect-ip"})
+	}
+	if v.capsule {
+		enc.WriteField(hpack.HeaderField{Name: "capsule-protocol", Value: "?1"})
+	}
+	if v.name != "reference client shape" {
+		enc.WriteField(hpack.HeaderField{Name: "pq-enabled", Value: "false"})
+	}
+
+	c.sid = 1
+	blockBytes := block.Bytes()
+	// The block is printed before it goes out. A PROTOCOL_ERROR from this edge is a statement about the
+	// bytes that were sent, so being able to read them back is the difference between fixing the
+	// encoding and guessing at it.
+	fmt.Printf("  HEADERS block (%d bytes): %x\n", len(blockBytes), blockBytes)
+	flags := byte(0x4) // END_HEADERS
+	if v.endStream {
+		flags |= 0x1
+	}
+	if _, err := c.conn.Write(frameH2(0x1, flags, c.sid, blockBytes)); err != nil {
+		return 0, nil, err
+	}
+	for {
+		if err := c.conn.SetReadDeadline(time.Now().Add(25 * time.Second)); err != nil {
+			return 0, nil, err
+		}
+		typ, _, stream, payload, err := c.readFrame()
+		if err != nil {
+			return 0, nil, err
+		}
+		switch typ {
+		case 0x1: // HEADERS
+			if stream != c.sid {
+				continue
+			}
+			d := hpack.NewDecoder(4096, nil)
+			fields, err := d.DecodeFull(payload)
+			if err != nil {
+				return 0, nil, fmt.Errorf("header decode: %w", err)
+			}
+			h := map[string]string{}
+			for _, f := range fields {
+				if f.Name == ":status" {
+					h[f.Name] = f.Value
+				} else {
+					h[f.Name] = f.Value
+				}
+			}
+			status := 0
+			fmt.Sscanf(h[":status"], "%d", &status)
+			return status, h, nil
+		case 0x3: // RST_STREAM
+			var code uint32
+			if len(payload) >= 4 {
+				code = binary.BigEndian.Uint32(payload)
+			}
+			return 0, nil, fmt.Errorf("RST_STREAM stream=%d code=%d", stream, code)
+		case 0x7: // GOAWAY
+			return 0, nil, fmt.Errorf("GOAWAY: %x", payload)
+		}
+	}
+}
+
+// writeData writes a DATA frame on the tunnel stream.
+func (c *h2raw) writeData(b []byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_, err := c.conn.Write(frameH2(0x0, 0, c.sid, b))
+	return err
+}
+
+func frameH2(typ, flags byte, stream uint32, payload []byte) []byte {
+	out := make([]byte, 9, 9+len(payload))
+	ln := len(payload)
+	out[0], out[1], out[2] = byte(ln>>16), byte(ln>>8), byte(ln)
+	out[3], out[4] = typ, flags
+	out[5], out[6], out[7], out[8] = byte(stream>>24), byte(stream>>16), byte(stream>>8), byte(stream)
+	return append(out, payload...)
+}
+
+// answerPing echoes a PING. Not answering one is not fatal but the edge may stop sending, and the
+// frame log here would then show silence rather than an answer, which reads like a tunnel that carries
+// nothing.
+func (c *h2raw) answerPing(payload []byte) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.conn.Write(frameH2(0x6, 0x1, 0, payload))
+}
+
+func head(b []byte, n int) []byte {
+	if len(b) < n {
+		n = len(b)
+	}
+	return b[:n]
+}
+
+func h2setting(id uint16, v uint32) []byte {
+	b := make([]byte, 6)
+	binary.BigEndian.PutUint16(b, id)
+	binary.BigEndian.PutUint32(b[2:], v)
+	return b

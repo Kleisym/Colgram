@@ -1,0 +1,9 @@
+session address : 172.16.0.2
+CONNECT status  : 200 OK
+trace target    : connectivity.cloudflareclient.com 162.159.138.65
+datagram 1: 45 bytes head=004500002c000040
+datagram 2: 41 bytes head=0045000028000040
+datagram 3: 45 bytes head=004500002c000040
+tcp open failed: tcp handshake through the tunnel did not complete (sent=5 recv=0)
+datagram recv stopped: context canceled
+error           : tcp handshake through the tunnel did not complete

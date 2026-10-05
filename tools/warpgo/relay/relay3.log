@@ -1,0 +1,11 @@
+relay listening: 127.0.0.1:14500
+upstream       : 162.159.198.2:443
+egress bind    : 192.168.0.4
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 0 pkts / 0 bytes   down 0 pkts / 0 bytes
+up 41 pkts / 13223 bytes   down 46 pkts / 11196 bytes
+up 41 pkts / 13223 bytes   down 46 pkts / 11196 bytes
+up 41 pkts / 13223 bytes   down 46 pkts / 11196 bytes
+up 41 pkts / 13223 bytes   down 46 pkts / 11196 bytes
+up 41 pkts / 13223 bytes   down 46 pkts / 11196 bytes
+up 41 pkts / 13223 bytes   down 46 pkts / 11196 bytes
