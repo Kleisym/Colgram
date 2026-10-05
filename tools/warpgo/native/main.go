@@ -351,9 +351,24 @@ func socksAddrForAttempt() string {
 	return os.Getenv("WARP_SOCKS")
 }
 
-// maxDatagramPayload leaves room for the IP and TCP headers inside one Connect-IP capsule. The
-// edge's own packets come back at 1200 bytes, so a capsule is sized to fit inside that.
-const maxDatagramPayload = 1100
+// maxDatagramPayload is the largest TCP segment this tunnel sends in one capsule.
+//
+// It was 1100, on the assumption that anything under the 1200-byte QUIC initial size would be
+// carried. Measured on this edge that assumption is wrong in a specific way: a handshake segment is 40
+// bytes and comes back every time, and a data segment of 1140 comes back never - not refused, not reset,
+// simply no reply and no inbound packet of any kind after it:
+//
+//     outbound 40 bytes,   flags 0x002, seq 1                    <- SYN      inbound 44
+//     outbound 40 bytes,   flags 0x010, seq 2                    <- ACK      inbound 44
+//     outbound 1140 bytes, flags 0x018, seq 2  payload 1100     <- data     nothing
+//     outbound 465 bytes,  flags 0x018, seq 1102 payload 425     <- data     nothing
+//     tls inside tunnel: i/o timeout (sent=9 recv=2)
+//
+// The largest packet measured crossing this edge in either direction, in a session that returned
+// warp=on, is 466. So the segment is sized to sit under what the carrier has actually been seen to
+// carry rather than under what the protocol permits. A TLS ClientHello is a few hundred bytes and
+// arrives in three or four segments instead of two, which costs a round trip and nothing else.
+const maxDatagramPayload = 400
 
 // tunnelConn is a net.Conn whose bytes travel as Connect-IP capsules inside the MASQUE stream.
 // Everything above it - the TLS client, the HTTP request - is an ordinary library.
@@ -363,6 +378,10 @@ type tunnelConn struct {
 	dstIP   net.IP
 	srcPort uint16
 	dstPort uint16
+	// synSeq is the sequence number the SYN went out with. The far side acknowledges exactly one byte of
+	// it, and the client's own counter has to be sitting at synSeq+1 when it does - otherwise the data that
+	// follows is sent from a sequence the far side has not acknowledged and never leaves the handshake.
+	synSeq uint32
 	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
@@ -412,6 +431,27 @@ func checksum(b []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// synSeqOf returns the sequence number this flow's SYN was sent with, which is the one that has to be
+// acknowledged after the SYN-ACK arrives. The counter moves on when the SYN goes out, so the original is
+// kept rather than reconstructed.
+func synSeqOf(c *tunnelConn) uint32 {
+	return c.synSeq
+}
+
+// payloadLenOf reports the TCP payload length in a packet, or -1 when the header offset is unreadable.
+// It exists so the inbound path can say how much arrived rather than only that something did.
+func payloadLenOf(ip []byte) int {
+	if len(ip) < 20+20 {
+		return -1
+	}
+	tcp := ip[20:]
+	off := int(tcp[12]>>4) * 4
+	if off < 20 || off > len(tcp) {
+		return -1
+	}
+	return len(tcp) - off
+}
+
 func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 	hdr := make([]byte, 20)
 	// Version 4 in the high nibble, header length 5 words in the low one.
@@ -451,6 +491,8 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 
 	c.sent++
 	c.tun.sendIP(ipv4Packet(c.srcIP, c.dstIP, seg))
+	androidLog(fmt.Sprintf("colgram_masque: outbound %d bytes, flags 0x%03x, seq %d ack %d, payload %d",
+		len(seg)+20, flags, c.seq, c.ack, len(payload)))
 }
 
 func (c *tunnelConn) feed(ip []byte) {
@@ -469,12 +511,37 @@ func (c *tunnelConn) feed(ip []byte) {
 
 	c.mu.Lock()
 	c.recv++
+	if payload := payloadLenOf(ip); payload >= 0 {
+		androidLog(fmt.Sprintf("colgram_masque: inbound %d bytes, %d of payload, flags 0x%03x, seq %d ack %d",
+			len(ip), payload, flags, seq, binary.BigEndian.Uint32(tcp[8:12])))
+	}
 
 	if flags&0x02 != 0 {
 		if flags&0x10 != 0 {
 			if !c.synned {
 				// First handshake: the far side's SYN is acknowledged, and the flow becomes usable.
 				c.ack = seq + 1
+				// The client's own sequence has to move past the SYN before any data is sent, and the far
+				// side has to see that acknowledged before it will read a data segment from this flow.
+				//
+				// It did not, and everything after follows from that. The edge answered the SYN with
+				//
+				//     inbound 44 bytes, 0 of payload, flags 0x012, ack 2
+				//
+				// acknowledging one byte of ours - correct - and then never answered anything again, no
+				// matter how much was sent:
+				//
+				//     h2 peer open, sent=7 recv=2
+				//     tls inside tunnel: i/o timeout (sent=9 recv=2)
+				//
+				// `sent` rising and `recv` frozen at exactly two - the SYN-ACK, twice - is a connection that
+				// never left the handshake, so its receive window is still closed to data. No data segment is
+				// wrong; there is no flow to carry one yet.
+				c.seq = synSeqOf(c) + 1
+				// And the sequence is corrected before the ACK goes out, not after it. Sending first and
+				// correcting afterwards means the acknowledgement carries the number the SYN was sent with
+				// rather than the one after it, which is a sequence the far side has already consumed - so it
+				// treats the ACK as out of window and the flow never opens.
 				c.emit(nil, 0x10)
 				c.synned = true
 				c.wakeReader()
@@ -529,7 +596,9 @@ func (c *tunnelConn) open() error {
 	// A SYN retransmission must repeat the original sequence number. Incrementing between sends
 	// makes the far side see two different connections and answer with RST.
 	synSeq := c.seq
+	c.synSeq = synSeq
 	c.emit(nil, 0x02)
+	c.seq = synSeq + 1
 
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
