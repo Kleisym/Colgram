@@ -3172,6 +3172,31 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 		InsecureSkipVerify: true,
 		ServerName:         traceHost,
 		MinVersion:         tls.VersionTLS12,
+		// Classical key exchange only, and this is the whole reason the verdict was unreachable.
+		//
+		// Go 1.26 offers a hybrid post-quantum group by default - X25519MLKEM768 - which puts a 1216-byte
+		// key share in the ClientHello. The handshake this client sends over the tunnel is 1525 bytes and
+		// goes out as two segments:
+		//
+		//   outbound 1160 bytes (opts 20), flags 0x018, payload 1100    ClientHello part 1
+		//   outbound  485 bytes (opts 20), flags 0x018, payload  425    ClientHello part 2
+		//
+		// A carrying run on the same carrier, on the same identity, in the same second, sent 76 bytes and
+		// came back with 414 of the origin's answer. The one difference that separated them was the size and
+		// shape of the first data payload:
+		//
+		//   carrying   WRITE DATA len=148   capsule=136    76 bytes, plaintext
+		//   stalled    WRITE DATA len=1172  capsule=1160   1100 bytes, TLS ClientHello
+		//
+		// Both were acknowledged. Only one was forwarded on. A tunnel that terminates TCP at its edge is
+		// forwarding the segment, not the stream, and a handshake that has to be reassembled from two
+		// segments behind a proxy is a shape the origin has never answered for in one that works.
+		//
+		// With the hybrid group excluded the ClientHello is a few hundred bytes: one segment, and the shape a
+		// client actually sends. The forward secrecy is the same - X25519 is still a group neither side
+		// knows in advance - and it is what the reference client offers too: its own negotiated handshake,
+		// recorded in the trace it returned, reads kex=X25519 and not X25519MLKEM768.
+		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521},
 		// An empty root pool, named explicitly.
 		//
 		// InsecureSkipVerify already means no chain is built, but Go initialises the system root pool the
