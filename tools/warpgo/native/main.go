@@ -554,7 +554,12 @@ func (c *tunnelConn) recvWindow() uint16 {
 	if scale <= 0 {
 		scale = 128
 	}
-	const capacity = 25 * 1024
+	// 193 units of 128 is 24704 bytes, which is what the reference client puts on its SYN. A SYN is the
+	// one segment where a large window costs nothing - nothing has been sent yet and nothing has to be
+	// buffered - and it is what tells the far side how much it may send before this side has to grow a
+	// buffer it does not have. This client's SYN offered 200 units, about 25 KB, so every flow began with
+	// the far side's first burst already larger than the window agreed for it.
+	const capacity = 24704
 	free := capacity - len(c.inbuf)
 	if free < 4096 {
 		free = 4096
