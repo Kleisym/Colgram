@@ -942,7 +942,11 @@ func (c *tunnelConn) feed(ip []byte) {
 
 	c.mu.Lock()
 	c.recv++
-	if plen := payloadLenOf(ip); plen >= 0 {
+	// Reported for every segment, not only for the ones payloadLenOf can measure. The gate used to be
+	// `plen >= 0`, and it meant a segment whose payload could not be measured produced no line at all -
+	// which is how the ClientHello this client sends, the one thing never compared against a working
+	// client, went unrecorded while the segments around it were logged normally.
+	if plen := payloadLenOf(ip); true {
 		androidLog(fmt.Sprintf("colgram_masque: inbound %d bytes, %d of payload, flags 0x%03x, seq %d ack %d",
 			len(ip), plen, flags, seq, binary.BigEndian.Uint32(tcp[8:12])))
 		// The first bytes of the first segment that carries data, on a flow that has already
@@ -957,6 +961,39 @@ func (c *tunnelConn) feed(ip []byte) {
 		if len(payload) > 0 && c.synned {
 			androidLog(fmt.Sprintf("colgram_masque: first data on the flow is %d bytes: % x ...",
 				len(payload), head(payload, 24)))
+			// The ClientHello read out of the record, because the one thing never compared against a
+			// working client is this handshake in full: the reference never sends one through this
+			// carrier, so its bytes have never been on the record here and the record length, the cipher
+			// list and the extensions are all unknown quantities that a tunnel terminating TCP may read.
+			//
+			// Parsed here rather than from a transcript because the transcript is truncated on the way out
+			// and a ClientHello is a few hundred bytes - the first thing to be cut.
+			if len(payload) > 5 && payload[0] == 0x16 {
+				rlen := int(binary.BigEndian.Uint16(payload[3:5]))
+				end := 5 + rlen
+				if end > len(payload) {
+					end = len(payload)
+				}
+				hs := payload[5:end]
+				if len(hs) > 40 && hs[0] == 0x01 {
+					sid := int(hs[43])
+					off := 44 + sid
+					if off+2 <= len(hs) {
+						cs := int(binary.BigEndian.Uint16(hs[off : off+2]))
+						androidLog(fmt.Sprintf("colgram_masque: ClientHello is %d bytes, session id %d, "+
+							"%d cipher suites (%.0f bytes of list)", len(hs), sid, cs/2, float64(cs)))
+						j := off + 2 + cs
+						if j+2 <= len(hs) {
+							cm := int(binary.BigEndian.Uint16(hs[j : j+2]))
+							j += 2 + cm
+						}
+						if j+2 <= len(hs) {
+							el := int(binary.BigEndian.Uint16(hs[j : j+2]))
+							androidLog(fmt.Sprintf("colgram_masque: ClientHello carries %d bytes of extensions", el))
+						}
+					}
+				}
+			}
 		}
 	}
 
