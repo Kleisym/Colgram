@@ -2182,7 +2182,87 @@ func enrolmentAge() time.Time {
 // enrolFresh performs a full registration: a new P-256 key, a new device, a PATCH enrol and a fresh
 // bare certificate. It is the part that talks to the API, and it is only called when no enrolment is
 // cached.
+//
+// enrolFromFile is the other half: it takes an enrolment made by another run of this client and rebuilds
+// the certificate from its key, so a measurement can name the identity rather than making a new one.
+func enrolFromFile(path string) (net.IP, tls.Certificate, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, tls.Certificate{}, fmt.Errorf("load enrolment: %w", err)
+	}
+	text := string(raw)
+	grab := func(prefix string) string {
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, prefix) {
+				return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			}
+		}
+		return ""
+	}
+	keyPEM := strings.ReplaceAll(grab("COLGRAM_KEY"), `\n`, "\n")
+	if keyPEM == "" {
+		return nil, tls.Certificate{}, fmt.Errorf("load enrolment: no COLGRAM_KEY line in %s", path)
+	}
+	addr := grab("COLGRAM_ADDRESS")
+	if addr == "" {
+		addr = "172.16.0.2"
+	}
+	der := bareCertDER(keyPEM)
+	if der == nil {
+		return nil, tls.Certificate{}, fmt.Errorf("load enrolment: the key in %s did not parse as a "+
+			"P-256 private key", path)
+	}
+	pair, err := tls.X509KeyPair(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		[]byte(keyPEM))
+	if err != nil {
+		return nil, tls.Certificate{}, fmt.Errorf("load enrolment: %w", err)
+	}
+	androidLog(fmt.Sprintf("colgram_masque: using the enrolment in %s, tunnel address %s", path, addr))
+	return net.ParseIP(addr).To4(), pair, nil
+}
+
+// bareCertDER mints the certificate the edge accepts for an already-enrolled key: empty subject, no
+// extensions, signed against an empty parent, exactly as a fresh registration produces.
+func bareCertDER(keyPEM string) []byte {
+	blk, _ := pem.Decode([]byte(keyPEM))
+	if blk == nil {
+		return nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+	if err != nil {
+		return nil
+	}
+	key, ok := parsed.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(0),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}, &x509.Certificate{}, &key.PublicKey, key)
+	if err != nil {
+		return nil
+	}
+	return der
+}
+
 func enrolFresh() (net.IP, tls.Certificate, error) {
+	// An enrolment made elsewhere, when one is named.
+	//
+	// The two roles are swapped rather than reasoned about. This client registering and then running its own
+	// TLS has stalled at the first ClientHello while the reference client, handed this client's credentials,
+	// returned warp=on - so either the identity or the client is at fault and neither run separates them.
+	// Pointing this client at the reference client's own enrolment puts the same identity on both, which
+	// answers it in one run: if this client carries with the reference's enrolment, the identity was the
+	// difference; if it stalls, the client is.
+	//
+	// The file is what this client writes when WARP_DUMP_CREDENTIALS names one, plus the tunnel address the
+	// registration returned - which is why the dump carries the address rather than only the key.
+	if path := os.Getenv("WARP_LOAD_CREDENTIALS"); path != "" {
+		return enrolFromFile(path)
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, tls.Certificate{}, err
@@ -2378,8 +2458,8 @@ func enrolFresh() (net.IP, tls.Certificate, error) {
 	// Written to stderr rather than through androidLog, because androidLog is also the device log and this
 	// belongs in the host's own output where a run can read it back.
 	if dump := os.Getenv("WARP_DUMP_CREDENTIALS"); dump != "" {
-		fmt.Fprintf(os.Stderr, "COLGRAM_CREDENTIALS id=%s token=%s\nCOLGRAM_KEY %s\n", id, token,
-			strings.ReplaceAll(string(keyPEM), "\n", "\\n"))
+		fmt.Fprintf(os.Stderr, "COLGRAM_CREDENTIALS id=%s token=%s\nCOLGRAM_ADDRESS %s\nCOLGRAM_KEY %s\n",
+			id, token, addr, strings.ReplaceAll(string(keyPEM), "\n", "\\n"))
 	}
 	return net.ParseIP(addr).To4(), pair, nil
 }
