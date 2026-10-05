@@ -1680,33 +1680,6 @@ func nextInboundPacket(buf []byte) (packet, rest []byte, ok bool) {
 		return nil, buf, false
 	}
 	header := typeLen + lenLen
-	// The context ID, and then the rest of what this carrier puts in front of a packet.
-	//
-	// Measured off the reference client's own frame log, on the two sizes it received:
-	//
-	//   payload 63 bytes,  52-byte packet
-	//     00 34 00 00 34 00 00 00 00 01 | 45 00 00 34 ...
-	//     |  |  |  |  |  |  |  |  |  |  `-- IP version 4, at offset ELEVEN
-	//
-	//   payload 478 bytes, 466-byte packet
-	//     00 41 d2 00 01 d2 00 00 00 00 00 01 | 45 00 01 d2 ...
-	//     |  |  |  |  |  |  |  |  |  |  `-- again at offset eleven
-	//
-	// So the header is eleven bytes for both, and only the first three of them were being counted:
-	// type, length, and nothing else. The packet this reader returned began `34 00 00 34`, which is the
-	// middle of an IP header, and every check after that either rejected it or, worse, passed a shifted
-	// packet to the TCP state machine.
-	//
-	// The nine bytes are a context ID and a length in a wider form, and which they are does not matter -
-	// what matters is that the packet begins where the IP header says it does. So the header is walked to
-	// the packet rather than counted from the front: the declared length says how long the packet is, and
-	// the IP header inside it says where the capsule ends.
-	if typeVal == 0 {
-		if _, consumed, ok := packetAfterContext(buf[:minInt(len(buf), typeLen+lenLen+16)]); ok &&
-			consumed <= len(buf) {
-			header = consumed
-		}
-	}
 	// Only the datagram capsule carries an IP packet. Anything else on this stream is a control message
 	// this client has no use for, and it is skipped by its own declared length rather than guessed at.
 	if typeVal != 0 {
@@ -1721,41 +1694,6 @@ func nextInboundPacket(buf []byte) (packet, rest []byte, ok bool) {
 		return nil, buf, false
 	}
 	return buf[header:total], buf[total:], true
-}
-
-// minInt is the smaller of two ints, named so the header walk above reads as arithmetic.
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// packetAfterContext finds where the IP packet starts inside a framed capsule, and how many bytes the
-// capsule header took to say so.
-//
-// The packet is found by its own header rather than by counting the capsule's, because the two disagree:
-// this carrier writes eleven bytes in front of a packet and its own length field describes only three of
-// them. A version nibble of four is the test - a bare packet starts `45 00`, and nothing else in a capsule
-// header does - and the packet's own total-length field then says how long it is, which is what the caller
-// uses to take it off the stream.
-func packetAfterContext(buf []byte) (packet []byte, consumed int, ok bool) {
-	for i := 1; i+2 <= len(buf) && i < 24; i++ {
-		if buf[i]>>4 != 4 {
-			continue
-		}
-		hl := int(buf[i]&0x0f) * 4
-		if hl < 20 || hl > 60 || i+hl+2 > len(buf) {
-			continue
-		}
-		total := int(binary.BigEndian.Uint16(buf[i+2 : i+4]))
-		if total < hl || i+total > len(buf) {
-			// The length may not have arrived yet; a longer header is still possible, so keep looking.
-			continue
-		}
-		return buf[i : i+total], i + total, true
-	}
-	return nil, 0, false
 }
 
 // readCapsuleVarint reads a QUIC varint and returns the value with how many bytes it took.
@@ -2932,18 +2870,6 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 	}
 	if dst == nil {
 		return "", fmt.Errorf("no IPv4 for %s", traceHost)
-	}
-	// A named destination, so the two addresses this host resolves to can be told apart.
-	//
-	// The host and the device resolve the same name to different addresses - 162.159.137.65 and
-	// 162.159.138.65 - and they behave differently on it: the host gets the origin's answer back and the
-	// device gets the handshake and nothing after it. Both are inside the range the host is documented to
-	// be served from and both are in the same /24, so "the address is not in range" is not available as an
-	// explanation and the address has to be chosen rather than taken.
-	if forced := os.Getenv("WARP_TRACE_IP"); forced != "" {
-		if v4 := net.ParseIP(forced).To4(); v4 != nil {
-			dst = v4
-		}
 	}
 	fmt.Println("trace target    :", traceHost, dst.String())
 
