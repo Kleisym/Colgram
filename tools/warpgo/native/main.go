@@ -450,6 +450,9 @@ type tunnelConn struct {
 	// the handshake. Echoing the peer's own values rather than this side's is what TCP requires and what
 	// the edge expects: it answered MSS 1460 and window scale 13 where this client offered 1240 and 7.
 	peerOptions []byte
+	// peerScale is the window scale the peer said it would apply, read off its SYN-ACK and used to write
+	// this side's window in the units the peer will read. Zero until the peer answers.
+	peerScale int
 	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
@@ -527,14 +530,30 @@ func ephemeralPort() uint16 {
 	return 51500
 }
 
-// recvWindow reports the receive window this flow is offering, in the units a window scale of 7 multiplies.
+// recvWindow reports the receive window this flow is offering, in the units its window scale multiplies.
 //
 // It is the buffer this side has, less what is already sitting in it, clamped to the 16-bit field and to
 // the scale, so a far side is told what can genuinely be delivered right now rather than a number chosen
-// once. The reference client's own window moves the same way - 24704 on the SYN and 4096 on the first data
-// segment - which is what a stack does when the far side has not yet acknowledged anything.
+// once.
+//
+// The scale is the peer's, not this side's. This client advertised a scale of 7 on its SYN and read the
+// edge's answer of 13, and then divided its buffer by 128 - its own scale - while the edge was multiplying
+// by 8192 - the scale it had said it would use. The window that went out on the first data segment was 200
+// units, which the edge read as 1.6 megabytes against a buffer that had 200 units to give, and where the
+// reference offers 4096 bytes:
+//
+//	reference   SYN win=24704   (193 units at scale 128)   data win=4096   (4096 bytes unscaled)
+//	this client SYN win=200     (25 KB at scale 128)      data win=200     (1.6 MB at scale 8192)
+//
+// A peer whose window is four times larger than the buffer behind it invites a probe rather than a
+// response, and the edge answers the SYN-ACK's window by closing this one's. The window is written in the
+// units the SYN that negotiated it asked for, which is what makes it mean what it says to the reader.
 func (c *tunnelConn) recvWindow() uint16 {
-	const scale = 128 // the window scale this client advertises
+	// The scale in force for this flow: the peer's, once it has answered, and this side's own until then.
+	scale := c.peerScale
+	if scale <= 0 {
+		scale = 128
+	}
 	const capacity = 25 * 1024
 	free := capacity - len(c.inbuf)
 	if free < 1024 {
@@ -655,7 +674,7 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 // stream, and the far side has no way to know the payload did not move with it.
 func synOptions() []byte {
 	now := uint32(time.Since(processStart) / time.Millisecond)
-	return []byte{
+	opts := []byte{
 		0x02, 0x04, 0x04, 0xd8, // MSS 1240
 		0x04, 0x02, // SACK permitted
 		0x08, 0x0a, // timestamps
@@ -663,6 +682,35 @@ func synOptions() []byte {
 		0x00, 0x00, 0x00, 0x00, // TSecr, replaced with the peer's TSval once it has sent one
 		0x01,             // no-op
 		0x03, 0x03, 0x07, // window scale 7
+	}
+	return opts
+}
+
+// dataOptions are the options a segment carries once the handshake is done: timestamps, and nothing else.
+//
+// MSS, SACK permitted and window scale are only meaningful on a SYN - RFC 9293 section 3.2 says the window
+// scale option may appear in a SYN and in a SYN/ACK and nowhere else, and a real stack does not repeat
+// them. This client did repeat them, because the peer option capture takes everything between the fixed
+// header and the data offset and is then echoed verbatim on every segment for the rest of the flow:
+//
+//	c.peerOptions = append([]byte(nil), tcp[20:offset]...)
+//
+// On this edge that capture is twenty bytes - MSS 1460, SACK permitted, timestamps, window scale 13 - and
+// twenty bytes went out in front of every data segment, where the reference sends twelve:
+//
+//	reference   doff=32  options: 01 01 08 0a ea e8 5f 8f 8b 43 33 17   NOP NOP timestamps
+//	this client doff=40  options: 02 04 05 b4 04 02 08 0a ... 01 03 03 0d  MSS SACK timestamps NOP wscale
+//
+// Eight bytes is the whole difference between a segment the edge forwards and one it reads,
+// acknowledges and drops, and nothing above this layer can see it: the packet is well formed, the
+// checksums fold to zero, and the acknowledgement arrives either way.
+func dataOptions() []byte {
+	now := uint32(time.Since(processStart) / time.Millisecond)
+	return []byte{
+		0x01, 0x01, // two no-ops, so the timestamps land on a four-byte boundary
+		0x08, 0x0a, // timestamps
+		byte(now >> 24), byte(now >> 16), byte(now >> 8), byte(now),
+		0x00, 0x00, 0x00, 0x00, // TSecr, replaced with the peer's TSval
 	}
 }
 
@@ -705,7 +753,11 @@ func stampEcho(opts, peer []byte) []byte {
 	return opts
 }
 
-// optionValue returns the four value bytes of a TCP option of the given kind, or nil.
+// optionValue returns the value bytes of a TCP option of the given kind, or nil.
+//
+// The length is not fixed at four, which is what made the window scale unreadable: that option is three
+// bytes - kind, length, one byte of value - and a reader that insists on four returns nothing for it, so
+// the scale stayed at zero and every window this client wrote went out in the wrong units.
 func optionValue(opts []byte, kind byte) []byte {
 	for i := 0; i+2 <= len(opts); {
 		k := opts[i]
@@ -721,10 +773,15 @@ func optionValue(opts []byte, kind byte) []byte {
 			return nil
 		}
 		if k == kind {
-			if length >= 10 {
+			if length < 3 {
+				return nil
+			}
+			// Timestamps are four value bytes; a window scale is one. Everything between the header
+			// and the end of the option is its value.
+			if length >= 6 {
 				return opts[i+2 : i+6]
 			}
-			return nil
+			return opts[i+2 : i+length]
 		}
 		i += length
 	}
@@ -775,8 +832,21 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 		// The values echoed are the peer's, read off its SYN-ACK - it answered MSS 1460 and window scale 13
 		// where this client offered 1240 and 7 - because an echo of anything else is a different option set
 		// than the one the peer recorded.
-		opts = c.peerOptions
-		if len(opts) == 0 {
+		// Timestamps only, on every segment after the handshake.
+		//
+		// The peer's option block is not echoed verbatim. That was the fault: this capture takes everything
+		// between the fixed header and the data offset, which on this edge's SYN-ACK is MSS 1460, SACK
+		// permitted, timestamps and window scale 13, and twenty bytes then went out in front of every data
+		// segment where the reference sends twelve:
+		//
+		//   reference   doff=32  01 01 08 0a ea e8 5f 8f 8b 43 33 17   NOP NOP timestamps
+		//   this client doff=40  02 04 05 b4 04 02 08 0a ... 01 03 03 0d  MSS SACK timestamps NOP wscale
+		//
+		// MSS and window scale belong to the handshake; RFC 9293 section 3.2 puts the window scale option in
+		// a SYN and in a SYN/ACK and nowhere else, and a real stack does not repeat them. Eight bytes is the
+		// whole difference between a segment the edge forwards and one it reads, acknowledges and drops.
+		opts = dataOptions()
+		if len(c.peerOptions) == 0 {
 			// The edge does not always answer with options. It echoed them in one run - a 52-byte SYN-ACK
 			// with an MSS of 1460 and a window scale of 13 - and answered with a bare 40-byte header in
 			// another, while the packet carried the same 60 bytes either way.
@@ -791,7 +861,7 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 			//
 			// A peer that answered with options gets those back verbatim, which is what TCP requires; a peer
 			// that answered with none gets the ones this side offered, which is at least a constant header.
-			opts = synOptions()
+			opts = dataOptions()
 		}
 		// This side's own clock advances on every segment and its echo field carries the peer's TSval.
 		// A constant pair, or an echo of zero, tells the peer the flow received nothing - and the peer's
@@ -903,6 +973,12 @@ func (c *tunnelConn) feed(ip []byte) {
 					// The options are bounded by the data offset, which is the field that says where the
 					// header ends: offset-20 bytes of them, and nothing beyond.
 					c.peerOptions = append([]byte(nil), tcp[20:offset]...)
+					// The window scale the peer said it will apply, so this side's window is written in the
+					// units the peer reads rather than the units it offered.
+					if ws := optionValue(c.peerOptions, 3); ws != nil && len(ws) > 0 {
+						c.peerScale = int(ws[0])
+						androidLog(fmt.Sprintf("colgram_masque: peer window scale is %d", c.peerScale))
+					}
 					androidLog(fmt.Sprintf("colgram_masque: captured %d peer option bytes: %x",
 						len(c.peerOptions), c.peerOptions))
 				} else {
