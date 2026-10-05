@@ -542,8 +542,8 @@ func ephemeralPort() uint16 {
 // units, which the edge read as 1.6 megabytes against a buffer that had 200 units to give, and where the
 // reference offers 4096 bytes:
 //
-//	reference   SYN win=24704   (193 units at scale 128)   data win=4096   (4096 bytes unscaled)
-//	this client SYN win=200     (25 KB at scale 128)      data win=200     (1.6 MB at scale 8192)
+//	reference   SYN win=24704   (193 units at scale 128)   data win=4096   (4096 bytes, unscaled)
+//	this client SYN win=200     (25 KB at scale 128)      data win=1969   (16 MB at scale 8192)
 //
 // A peer whose window is four times larger than the buffer behind it invites a probe rather than a
 // response, and the edge answers the SYN-ACK's window by closing this one's. The window is written in the
@@ -556,12 +556,12 @@ func (c *tunnelConn) recvWindow() uint16 {
 	}
 	const capacity = 25 * 1024
 	free := capacity - len(c.inbuf)
-	if free < 1024 {
-		free = 1024
+	if free < 4096 {
+		free = 4096
 	}
 	units := free / scale
-	if units < 16 {
-		units = 16
+	if units < 32 {
+		units = 32
 	}
 	if units > 65535 {
 		units = 65535
