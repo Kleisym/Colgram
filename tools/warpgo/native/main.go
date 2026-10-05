@@ -434,6 +434,20 @@ func segmentCap() int {
 	return maxDatagramPayload
 }
 
+// segmentSplit reports a size to cut every payload into, or zero to write each one whole.
+//
+// Named beside segmentCap for the same reason and with the same argument: the size of what this client
+// sends has been the one variable never separated from what it sends, and this separates it without a
+// build per value.
+func segmentSplit() int {
+	if v := os.Getenv("WARP_SEGMENT_SPLIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
 // tunnelConn is a net.Conn whose bytes travel as Connect-IP capsules inside the MASQUE stream.
 // Everything above it - the TLS client, the HTTP request - is an ordinary library.
 type tunnelConn struct {
@@ -1227,6 +1241,29 @@ func (c *tunnelConn) Write(b []byte) (int, error) {
 	// in one, so the write is split across datagrams and the far side reassembles it as a TCP
 	// stream. Segmentation here is what a TUN device does.
 	total := 0
+	// A TLS ClientHello is one record, and this writes it as one segment. A real stack does the same -
+	// the record goes out whole in one segment and the peer answers it whole - but this is the one payload
+	// shape on this carrier that has never been seen coming back, and the carrying run on the same carrier
+	// with the same client sent 76 bytes.
+	//
+	// So the segmentation is made a variable rather than left fixed, because a question that needs a build
+	// per answer is a question that does not get asked enough times to mean anything. What the edge does
+	// with a payload split across segments is a fact about the edge, and this is the only way to find it.
+	if split := segmentSplit(); split > 0 && len(b) > split {
+		for off := 0; off < len(b); off += split {
+			n := split
+			if off+n > len(b) {
+				n = len(b) - off
+			}
+			c.emit(b[off:off+n], 0x18)
+			c.seq += uint32(n)
+			total += n
+			// A segment boundary inside a stream this carrier terminates is a decision the far side makes
+			// on the wire, so it is given a moment to arrive before the next segment is written.
+			time.Sleep(2 * time.Millisecond)
+		}
+		return total, nil
+	}
 	cap := segmentCap()
 	for len(b) > 0 {
 		n := len(b)
