@@ -83,8 +83,8 @@ const (
 	// Certificate verification is off for these calls, deliberately and only for these: the
 	// certificate presented belongs to the mask, not to the host being addressed.
 	apiSNIMask = "1.1.1.1"
-	edgeIP  = "162.159.198.2"
-	edgeSNI = "consumer-masque.cloudflareclient.com"
+	edgeIP     = "162.159.198.2"
+	edgeSNI    = "consumer-masque.cloudflareclient.com"
 	// connectAuth is the :authority the edge compares against its URI template. A request naming
 	// anything else is refused, so it is a constant rather than derived from anything at runtime.
 	connectAuth = "cloudflareaccess.com"
@@ -111,10 +111,10 @@ const (
 // TCP to a working egress can carry this datagram, so the tunnel stops depending on this device
 // reaching UDP 443 itself.
 type socksUDPConn struct {
-	ctrl net.Conn
-	relay net.Addr
+	ctrl    net.Conn
+	relay   net.Addr
 	partner net.Addr
-	buf   []byte
+	buf     []byte
 	// The datagram socket, per RFC 1928 section 7.
 	//
 	// A real SOCKS5 UDP client opens a UDP socket and sends its datagrams to the address the relay
@@ -237,7 +237,7 @@ func (s *socksUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	udp := addr.(*net.UDPAddr)
 	pkt := make([]byte, 0, 4+4+2+len(b))
 	pkt = append(pkt, 0x00, 0x00, 0x00) // RSV(2) + FRAG(1)
-	pkt = append(pkt, 0x01)              // ATYP: IPv4
+	pkt = append(pkt, 0x01)             // ATYP: IPv4
 	pkt = append(pkt, udp.IP.To4()...)
 	pkt = append(pkt, byte(udp.Port>>8), byte(udp.Port))
 	pkt = append(pkt, b...)
@@ -390,11 +390,11 @@ type tunnelConn struct {
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
 	writeDeadline time.Time
-	seq     uint32
-	ack     uint32
+	seq           uint32
+	ack           uint32
 
-	mu     sync.Mutex
-	cond   *sync.Cond
+	mu   sync.Mutex
+	cond *sync.Cond
 	// wake is what a reader selects on, and what feed and the close paths close. A sync.Cond has no timed
 	// wait, so a deadline on a packet stream has to be honoured by waking the reader - and a timer goroutine
 	// that broadcasts into a Cond races the reader that is about to wait on it. That race wrote to the heap
@@ -404,13 +404,13 @@ type tunnelConn struct {
 	//
 	// A channel carries its own wake-up, so there is nothing to race. A stale close is harmless because the
 	// reader replaces the channel when it takes one.
-	wake   chan struct{}
-	inbuf  []byte
-	eof    bool
-	synned bool
-	closed bool
-	sent   int
-	recv   int
+	wake     chan struct{}
+	inbuf    []byte
+	eof      bool
+	synned   bool
+	closed   bool
+	sent     int
+	recv     int
 	attempts int
 }
 
@@ -499,7 +499,7 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 			0x04, 0x02, // SACK permitted
 			0x08, 0x0a, // timestamps
 			0xd3, 0x15, 0xd8, 0x4a, 0x00, 0x00, 0x00, 0x00,
-			0x01,       // no-op
+			0x01,             // no-op
 			0x03, 0x03, 0x07, // window scale 7
 		}
 		optLen = len(opts)
@@ -710,7 +710,7 @@ func (c *tunnelConn) Read(b []byte) (int, error) {
 		// which is the heap being written by something other than the allocator. A channel select carries
 		// its own wake-up, so there is nothing to race. The packet boundary is the granularity it offers
 		// anyway - a packet arrives as a whole capsule - so a short poll costs nothing that matters.
-		if !c.waitFor(250 * time.Millisecond) && len(c.inbuf) == 0 && !c.eof {
+		if !c.waitFor(250*time.Millisecond) && len(c.inbuf) == 0 && !c.eof {
 			if c.readExpired() {
 				return 0, os.ErrDeadlineExceeded
 			}
@@ -767,6 +767,7 @@ func (c *tunnelConn) Close() error {
 
 func (c *tunnelConn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: c.srcIP, Port: int(c.srcPort)} }
 func (c *tunnelConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: c.dstIP, Port: int(c.dstPort)} }
+
 // Deadlines are honoured here rather than ignored.
 //
 // They were no-ops, which reads as harmless because the TCP handshake above has its own timeout - and
@@ -829,7 +830,6 @@ func (c *tunnelConn) writeExpired() bool {
 	return !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline)
 }
 
-
 // ---------------------------------------------------------------------------
 // capsuleStream abstracts H3 datagrams and H2 capsule framing.
 // ---------------------------------------------------------------------------
@@ -856,7 +856,9 @@ type h3Stream struct{ s *http3.RequestStream }
 func (h *h3Stream) SendDatagram(b []byte) error {
 	return h.s.SendDatagram(append([]byte{0x00}, b...))
 }
-func (h *h3Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) { return h.s.ReceiveDatagram(ctx) }
+func (h *h3Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	return h.s.ReceiveDatagram(ctx)
+}
 
 type h2raw struct {
 	conn   net.Conn
@@ -888,7 +890,7 @@ func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, 
 		// the handshake and only then decides, and a certificate it accepts is answered with no protocol
 		// list at all even though it speaks h2 - measured against this exact address. The MASQUE
 		// request that follows is what decides whether the carrier is usable, so the check is left to it.
-			androidLog(fmt.Sprintf("colgram_masque: edge ALPN %q after presenting the certificate", got))
+		androidLog(fmt.Sprintf("colgram_masque: edge ALPN %q after presenting the certificate", got))
 	}
 	c := &h2raw{conn: tc, br: bufio.NewReader(tc), sid: 1, inflow: 65536}
 	// The connection preface, then our own SETTINGS carrying ENABLE_CONNECT_PROTOCOL so the edge can
@@ -988,17 +990,17 @@ var shapes = []shape{
 // does not accept with a stream reset carrying PROTOCOL_ERROR rather than a status, so the only way to
 // find the shape it wants is to send each one and read the verdict.
 type connectVariant struct {
-	name      string
-	withProto bool // :protocol pseudo-header
-	protoHdr  bool // cf-connect-proto header
-	capsule   bool // capsule-protocol header
-	pq        bool // pq-enabled header
-	encoding  bool // accept-encoding header
+	name           string
+	withProto      bool // :protocol pseudo-header
+	protoHdr       bool // cf-connect-proto header
+	capsule        bool // capsule-protocol header
+	pq             bool // pq-enabled header
+	encoding       bool // accept-encoding header
 	authorityFirst bool // :authority before :method
-	authority string
-	path      string
-	scheme    string
-	endStream bool
+	authority      string
+	path           string
+	scheme         string
+	endStream      bool
 }
 
 func variants() []connectVariant {
@@ -1381,13 +1383,12 @@ func shapeByName(name string) connectVariant {
 	return variants()[0]
 }
 
-
 type tunnel struct {
-	conn   *quic.Conn
-	h3     *http3.ClientConn
-	stream capsuleStream
-	srcIP  net.IP
-	peers  []*tunnelConn
+	conn         *quic.Conn
+	h3           *http3.ClientConn
+	stream       capsuleStream
+	srcIP        net.IP
+	peers        []*tunnelConn
 	sentCapsules int
 	// recvCapsules counts what came back. Without it the session statistics report a tunnel that is
 	// equally healthy whether it carries one packet or none, and the one thing that matters about a
@@ -1571,7 +1572,7 @@ func enrol() (net.IP, tls.Certificate, error) {
 		return nil, tls.Certificate{}, fmt.Errorf("register: response carried no id/token")
 	}
 	if _, err := call("PATCH", "/"+apiVer+"/reg/"+id, token, map[string]any{
-		"key": base64.StdEncoding.EncodeToString(spki),
+		"key":      base64.StdEncoding.EncodeToString(spki),
 		"key_type": "secp256r1", "tun_type": "masque"}); err != nil {
 		return nil, tls.Certificate{}, fmt.Errorf("enrol: %w", err)
 	}
@@ -1961,7 +1962,7 @@ func attempt(srcIP net.IP, cert tls.Certificate, addr, bind, trace string) (stri
 		}
 		defer relayConn.Close()
 		fmt.Println("masque over socks5:", proxy)
-	return measureOverRelay(srcIP, cert, edgeAddr, relayConn)
+		return measureOverRelay(srcIP, cert, edgeAddr, relayConn)
 	}
 	udpConn, err := net.ListenUDP("udp4", local)
 	if err != nil {
@@ -2394,7 +2395,6 @@ type edgeCandidate struct {
 // assumed: 443 and 500 answered in about 100 ms, 8443 and 8095 in about 103 ms.
 var edgePorts = []string{"443", "500", "8443", "8095", "4500", "4443"}
 
-
 // newUdpCarrier opens whatever carries the tunnel's UDP: a SOCKS associate when a front is named, and
 // a plain socket otherwise. It is the one place that choice is made, so the reachability probe and the
 // handshake cannot end up on different paths.
@@ -2686,7 +2686,7 @@ func readVarint(b []byte) (uint64, int) {
 		if len(b) < 8 {
 			return 0, 0
 		}
-		v := uint64(b[0]&0x0f)
+		v := uint64(b[0] & 0x0f)
 		for i := 1; i < 8; i++ {
 			v = v<<8 | uint64(b[i])
 		}
@@ -2805,10 +2805,10 @@ var dohEndpoints = []dohEndpoint{
 // A host not listed here is not checked, because an unknown host has no range to check against and a
 // guess would be worse than the answer it replaced.
 var servedFrom = map[string][]string{
-	apiHost:          {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
-	"engage.cloudflareclient.com": {"162.158.0.0/15", "162.159.0.0/16"},
+	apiHost:                             {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
+	"engage.cloudflareclient.com":       {"162.158.0.0/15", "162.159.0.0/16"},
 	"connectivity.cloudflareclient.com": {"162.158.0.0/15", "162.159.0.0/16"},
-	"www.cloudflare.com": {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
+	"www.cloudflare.com":                {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
 }
 
 // plausible reports whether every answer falls inside a range the host is served from.
@@ -2862,7 +2862,7 @@ func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
 				ServerName: e.verifyName,
 				// The pinned IP and the verified name differ, so the library needs to be told
 				// which dial target belongs to which name.
-				InsecureSkipVerify: false,
+				InsecureSkipVerify:    false,
 				VerifyPeerCertificate: nil,
 			},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -2887,7 +2887,7 @@ func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
-answers, _ := out["Answer"].([]any)
+	answers, _ := out["Answer"].([]any)
 	var ips []net.IP
 	for _, a := range answers {
 		rec, ok := a.(map[string]any)
@@ -3112,9 +3112,9 @@ func colgram_masque_open_session(bind, edge *C.char) {
 	}
 
 	s := &longSession{
-		tun:  tun,
-		addr: addr,
-		bind: C.GoString(bind),
+		tun:    tun,
+		addr:   addr,
+		bind:   C.GoString(bind),
 		cancel: cancel,
 	}
 	// The pump has to exist before a peer opens: the SYN goes out as a capsule, and nothing comes
@@ -3137,7 +3137,7 @@ func (s *longSession) openPeer() error {
 	// Distinct source ports per run, so a long-lived tunnel does not collide with the measurement
 	// path or with a previous tunnel the OS has not reaped yet.
 	s.bindSrcPort++
-peer := newTunnelConn(s.tun, s.tun.srcIP, mustAddr(s.addr).IP,
+	peer := newTunnelConn(s.tun, s.tun.srcIP, mustAddr(s.addr).IP,
 		uint16(40000+s.bindSrcPort), 443)
 	s.tun.peers = append(s.tun.peers, peer)
 	s.peer = peer
@@ -3337,4 +3337,3 @@ func colgram_masque_trace() *C.char {
 	// the verdict reported here is the verdict the tunnel the app is running would produce.
 	return colgram_masque_measure(nil, nil, nil, nil)
 }
-
