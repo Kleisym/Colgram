@@ -1002,12 +1002,32 @@ func (c *tunnelConn) feed(ip []byte) {
 				// never left the handshake, so its receive window is still closed to data. No data segment is
 				// wrong; there is no flow to carry one yet.
 				c.seq = synSeqOf(c) + 1
+				// The flow is usable from this segment onward, and the segment itself must say so.
+				//
+				// c.synned is set after this ACK goes out, so the emit below sees a flow that has not finished
+				// its handshake and the SYN branch decides its options - on a packet that is not a SYN, so it
+				// takes the else-if, sees flags&0x02 clear, and writes a bare 20-byte header:
+				//
+				//   SYN   flags=0x002  doff=40   win=200
+				//   ACK   flags=0x010  doff=20   win=1969   <- bare, no options at all
+				//   ACK   flags=0x010  doff=32   win=1969
+				//
+				// A flow that starts on a 40-byte header, drops to 20 and comes back to 32 is three different
+				// stream layouts, and the edge terminates TCP: it forwards a segment whose header length it has
+				// already agreed to, and this one is not the length it agreed to. The reference never sends a
+				// bare header - its ACK after the SYN-ACK is already doff=32:
+				//
+				//   reference  SYN doff=40 -> ACK doff=32 -> DATA doff=32
+				//   this client SYN doff=40 -> ACK doff=20 -> ACK doff=32 -> DATA doff=32
+				//
+				// The flag is set before the ACK so that this segment carries the same option block as every
+				// segment after it.
+				c.synned = true
 				// And the sequence is corrected before the ACK goes out, not after it. Sending first and
 				// correcting afterwards means the acknowledgement carries the number the SYN was sent with
 				// rather than the one after it, which is a sequence the far side has already consumed - so it
 				// treats the ACK as out of window and the flow never opens.
 				c.emit(nil, 0x10)
-				c.synned = true
 				c.wakeReader()
 			} else {
 				// A second SYN|ACK after the flow is up is answered with a bare ACK carrying our
