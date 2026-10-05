@@ -19,6 +19,12 @@ package main
 #cgo CFLAGS: -I${SRCDIR} -IC:/Colgram/tools/jdk17/jdk-17.0.20.1+1/include -IC:/Colgram/tools/jdk17/jdk-17.0.20.1+1/include/win32
 #include <stdlib.h>
 #include <jni.h>
+
+// colgram_masque_emit is the plain C logger in jni_bridge.c: it forwards a line to android/log_print,
+// which is the only sink on a device a reader can see. It is deliberately a different name from the JNI
+// entry point below, because cgo generates that one from the //export and a second declaration of it
+// here is a conflicting-types error.
+extern void colgram_masque_emit(const char *line);
 */
 import "C"
 
@@ -357,11 +363,25 @@ type tunnelConn struct {
 	dstIP   net.IP
 	srcPort uint16
 	dstPort uint16
+	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
+	// to, so the time is carried here and consulted when the next packet would otherwise wait.
+	readDeadline  time.Time
+	writeDeadline time.Time
 	seq     uint32
 	ack     uint32
 
 	mu     sync.Mutex
 	cond   *sync.Cond
+	// wake is what a reader selects on, and what feed and the close paths close. A sync.Cond has no timed
+	// wait, so a deadline on a packet stream has to be honoured by waking the reader - and a timer goroutine
+	// that broadcasts into a Cond races the reader that is about to wait on it. That race wrote to the heap
+	// from outside the allocator:
+	//
+	//   fatal error: mspan.sweep: bad span state
+	//
+	// A channel carries its own wake-up, so there is nothing to race. A stale close is harmless because the
+	// reader replaces the channel when it takes one.
+	wake   chan struct{}
 	inbuf  []byte
 	eof    bool
 	synned bool
@@ -374,7 +394,7 @@ type tunnelConn struct {
 func newTunnelConn(tun *tunnel, srcIP, dstIP net.IP, srcPort, dstPort uint16) *tunnelConn {
 	c := &tunnelConn{tun: tun, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort,
 		dstPort: dstPort, seq: 1}
-	c.cond = sync.NewCond(&c.mu)
+	c.wake = make(chan struct{})
 	return c
 }
 
@@ -457,7 +477,7 @@ func (c *tunnelConn) feed(ip []byte) {
 				c.ack = seq + 1
 				c.emit(nil, 0x10)
 				c.synned = true
-				c.cond.Broadcast()
+				c.wakeReader()
 			} else {
 				// A second SYN|ACK after the flow is up is answered with a bare ACK carrying our
 				// current sequence number. Answering it with another SYN, or with an ACK whose
@@ -472,12 +492,23 @@ func (c *tunnelConn) feed(ip []byte) {
 	if len(payload) > 0 {
 		c.ack = seq + uint32(len(payload))
 		c.inbuf = append(c.inbuf, payload...)
+		// Acknowledge what arrived.
+		//
+		// The buffer was filled and nothing was sent back, so the far side kept its own send window
+		// closed and the flow stalled after the handshake:
+		//
+		//   h2 peer open, sent=7 recv=2      SYN out, SYN-ACK in, ACK out
+		//   tls inside tunnel: i/o timeout    ClientHello out, nothing back, ever
+		//
+		// `sent` rising and `recv` frozen is that: the ClientHello left and the server's reply never did,
+		// because nothing told the server its window was open. TCP has no other way to say so.
+		c.emit(nil, 0x10)
 	}
 	// RST must not be acknowledged. Replying to it is what made the edge re-open the flow with a
 	// fresh SYN, which in turn tore down the session mid-handshake.
 	if flags&0x04 != 0 {
 		c.eof = true
-		c.cond.Broadcast()
+		c.wakeReader()
 		c.mu.Unlock()
 		return
 	}
@@ -485,12 +516,12 @@ func (c *tunnelConn) feed(ip []byte) {
 		c.ack = seq + uint32(len(payload)) + 1
 		c.emit(nil, 0x11)
 		c.eof = true
-		c.cond.Broadcast()
+		c.wakeReader()
 		c.mu.Unlock()
 		return
 	}
 	c.emit(nil, 0x10)
-	c.cond.Broadcast()
+	c.wakeReader()
 	c.mu.Unlock()
 }
 
@@ -529,7 +560,25 @@ func (c *tunnelConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for len(c.inbuf) == 0 && !c.eof {
-		c.cond.Wait()
+		if c.readExpired() {
+			return 0, os.ErrDeadlineExceeded
+		}
+		// A channel rather than the condition variable. sync.Cond has no timed wait, so a deadline on a
+		// stream that carries packets - rather than a socket that carries bytes - has to be honoured by
+		// waking the reader somehow, and a timer goroutine that broadcast into a Cond races the reader
+		// that is about to wait on it. The consequence of getting that wrong was not a missed wake-up but a
+		// corrupted runtime:
+		//
+		//   fatal error: mspan.sweep: bad span state
+		//
+		// which is the heap being written by something other than the allocator. A channel select carries
+		// its own wake-up, so there is nothing to race. The packet boundary is the granularity it offers
+		// anyway - a packet arrives as a whole capsule - so a short poll costs nothing that matters.
+		if !c.waitFor(250 * time.Millisecond) && len(c.inbuf) == 0 && !c.eof {
+			if c.readExpired() {
+				return 0, os.ErrDeadlineExceeded
+			}
+		}
 	}
 	if len(c.inbuf) == 0 && c.eof {
 		return 0, io.EOF
@@ -544,6 +593,10 @@ func (c *tunnelConn) Write(b []byte) (int, error) {
 	if c.closed {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
+	}
+	if c.writeExpired() {
+		c.mu.Unlock()
+		return 0, os.ErrDeadlineExceeded
 	}
 	c.mu.Unlock()
 	// A QUIC datagram carries one capsule and has a hard size limit. A TLS ClientHello does not fit
@@ -578,9 +631,67 @@ func (c *tunnelConn) Close() error {
 
 func (c *tunnelConn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: c.srcIP, Port: int(c.srcPort)} }
 func (c *tunnelConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: c.dstIP, Port: int(c.dstPort)} }
-func (c *tunnelConn) SetDeadline(t time.Time) error      { return nil }
-func (c *tunnelConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *tunnelConn) SetWriteDeadline(t time.Time) error { return nil }
+// Deadlines are honoured here rather than ignored.
+//
+// They were no-ops, which reads as harmless because the TCP handshake above has its own timeout - and
+// then everything above it does not. A TLS handshake run on this connection waited forever, because the
+// only deadline it had was on a socket that ignores it:
+//
+//   h2 peer open, sent=7 recv=2
+//   ... nothing for the caller's whole 180 second budget
+//
+// So a tunnel that had opened, and had already proved it carries packets, was reported as a tunnel
+// that does not work. The read side checks the deadline between packets, which is the granularity a
+// capsule stream has, and the write side checks it before handing a packet to the carrier.
+func (c *tunnelConn) SetDeadline(t time.Time) error {
+	c.readDeadline = t
+	c.writeDeadline = t
+	return nil
+}
+
+func (c *tunnelConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline = t
+	return nil
+}
+
+func (c *tunnelConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline = t
+	return nil
+}
+
+func (c *tunnelConn) readExpired() bool {
+	return !c.readDeadline.IsZero() && time.Now().After(c.readDeadline)
+}
+
+// waitFor blocks until the peer feeds the connection, the stream ends, or the interval elapses. It is
+// called with the lock held and returns with it still held, which is what the read loop needs.
+//
+// The wake is a channel closed by feed, so there is no timer goroutine and nothing that can signal a
+// condition variable a reader has not reached yet.
+func (c *tunnelConn) waitFor(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-c.wake:
+		c.wake = make(chan struct{})
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// wakeReader releases anyone waiting on the connection. Called with the lock held, which is where every
+// state change happens, and safe to call when nobody is waiting: the channel is closed and the next
+// reader takes a fresh one.
+func (c *tunnelConn) wakeReader() {
+	if c.wake != nil {
+		close(c.wake)
+	}
+}
+
+func (c *tunnelConn) writeExpired() bool {
+	return !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline)
+}
 
 
 // ---------------------------------------------------------------------------
@@ -601,7 +712,14 @@ var (
 
 type h3Stream struct{ s *http3.RequestStream }
 
-func (h *h3Stream) SendDatagram(b []byte) error                         { return h.s.SendDatagram(b) }
+// SendDatagram adds the type byte this carrier's framing needs and nothing else.
+//
+// The HTTP/3 datagram form is a single zero byte in front of the packet, and the packet is handed here
+// without one because each carrier frames its own - see tunnel.sendIP. Writing the byte here rather than
+// at the call site is what stops the two carriers from disagreeing about who wraps.
+func (h *h3Stream) SendDatagram(b []byte) error {
+	return h.s.SendDatagram(append([]byte{0x00}, b...))
+}
 func (h *h3Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) { return h.s.ReceiveDatagram(ctx) }
 
 type h2raw struct {
@@ -860,6 +978,25 @@ func (c *h2raw) writeData(b []byte) error {
 	return err
 }
 
+// credit returns flow-control credit for bytes the client has taken off the stream.
+//
+// Both windows are raised: the stream's, which is what the capsules travel in, and the connection's,
+// because a stream cannot be credited past the connection that carries it. Only the stream needs it
+// once data is flowing, and only the connection needs it at the start - but the edge's initial connection
+// window is the smaller of the two, so both are kept open.
+func (c *h2raw) credit(n int) {
+	if n <= 0 {
+		return
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	var inc [4]byte
+	binary.BigEndian.PutUint32(inc[:], uint32(n))
+	// Stream 0 is the connection; anything else is the tunnel stream.
+	c.conn.Write(frameH2(0x8, 0, 0, inc[:]))
+	c.conn.Write(frameH2(0x8, 0, c.sid, inc[:]))
+}
+
 func frameH2(typ, flags byte, stream uint32, payload []byte) []byte {
 	out := make([]byte, 9, 9+len(payload))
 	ln := len(payload)
@@ -971,8 +1108,22 @@ func (cs *h2CapsuleStream) ReceiveDatagram(ctx context.Context) ([]byte, error) 
 			// shifted by two, so a tunnel that opened and accepted capsules delivered nothing upstream.
 			// The header is its own check, so it is made rather than assumed.
 			if isBareIPv4(payload) {
+				// Credit the bytes back.
+				//
+				// An HTTP/2 stream has a flow-control window, and this client opened it at the default 65535
+				// and never raised it. Every packet the edge sends narrows it, and once it reaches zero the
+				// edge stops sending - silently, because a flow-control stall is not an error it reports:
+				//
+				//   h2 peer open, sent=7 recv=2          <- SYN, SYN-ACK
+				//   tls inside tunnel: i/o timeout       <- the ClientHello never comes back
+				//
+				// The handshake completes and nothing larger than one packet follows, which is what a drained
+				// window looks like from here. The credit is returned per packet, and the connection-level
+				// window too, so the edge is never waiting on this side.
+				cs.h2.credit(len(payload))
 				return payload, nil
 			}
+			cs.h2.credit(len(payload))
 			return payload, nil
 		case 0x8: // WINDOW_UPDATE
 			continue
@@ -1035,6 +1186,14 @@ func negotiateH2Shape(ctx context.Context, edgeAddr string, cert tls.Certificate
 
 	var lastErr error
 	for _, v := range variants() {
+		// A connection per shape, back to back, is what a rate limiter sees. The edge answered the first
+		// shape every time on a cold network and refused the second with a TCP RST, which reads as
+		// "connection refused" against the address that was answering a moment earlier - and the only
+		// thing that made it intermittent was the order the shapes happened to be tried in.
+		//
+		// So: the accepted shape is remembered across calls (below), and the shapes are spaced. The first
+		// call in a process still costs one connection per shape, and that is now the only place it does.
+		time.Sleep(400 * time.Millisecond)
 		probe, err := dialH2Raw(ctx, edgeAddr, cert)
 		if err != nil {
 			lastErr = err
@@ -1089,14 +1248,29 @@ func (t *tunnel) sendIP(raw []byte) {
 	if t.stream == nil {
 		return
 	}
-	// Connect-IP as this edge speaks it: a single 0x00 type byte followed by the whole IP packet.
-	// A generalised capsule carrying a context id and an explicit length is dropped here. That is
-	// measured, not assumed: the shorter form is the one that returns traffic.
+	// The packet goes to the carrier unwrapped, because the carrier is what frames it.
+	//
+	// This used to prepend a single 0x00 here and let each carrier add its own header. On the QUIC
+	// carrier that is the datagram form and it was right. On the HTTP/2 carrier the header is already
+	// two bytes - type and length - so the packet left wrapped twice, in a form the edge does not read, and
+	// the SYN-ACK never came back. The trace through the tunnel failed with sent=5 recv=0 while the same
+	// carrier opened and carried traffic from the session path, which is what pointed at the framing and
+	// not at the carrier.
+	//
+	// The two forms, for the record:
+	//   QUIC/HTTP3   00 <IP packet>
+	//   HTTP/2       00 <len> <IP packet>
 	if len(raw) < 20 || raw[0]>>4 != 4 {
+		androidLog(fmt.Sprintf("colgram_masque: dropped an outbound packet of %d bytes (first byte %02x)",
+			len(raw), func() byte {
+				if len(raw) > 0 {
+					return raw[0]
+				}
+				return 0
+			}()))
 		return
 	}
-	capsule := append([]byte{0x00}, raw...)
-	if err := t.stream.SendDatagram(capsule); err != nil {
+	if err := t.stream.SendDatagram(raw); err != nil {
 		fmt.Println("send datagram failed:", err)
 		return
 	}
@@ -1457,6 +1631,46 @@ func measureWith(cfg Config) (string, error) {
 		if len(candidates) == 0 {
 			return "", fmt.Errorf("no candidate edge route on this machine")
 		}
+
+		// Where UDP to the edge does not answer at all, the HTTP/2 carrier is asked first rather than
+		// last.
+		//
+		// The search above opens a connection per candidate, and it opens them back to back: one per
+		// bind times six ports. The edge stops accepting new ones part way through, so whatever is asked
+		// afterwards is measured against a source address that has just been rate-limited - including the
+		// carrier that does work here. Measured as
+		//
+		//   no edge route answered: dial tcp 162.159.198.2:443: connect: connection refused
+		//
+		// against an address that answered a second earlier. Asking it first costs one connection and
+		// removes the question.
+		if !udpAnswers(edgeIP, socksAddrFor(cfg)) {
+			androidLog("colgram_masque: UDP to the edge is filtered; the HTTP/2 carrier is asked first")
+			if body, err := traceOverH2(srcIP, cert); err == nil && WarpOn(body) {
+				return body, nil
+			} else if err != nil {
+				fmt.Println("  h2 first      :", err)
+				androidLog(fmt.Sprintf("colgram_masque: h2 carrier failed: %v", err))
+				bridgeErr = errString(err)
+			}
+			// No QUIC search. One handshake attempt already answered whether that carrier works, and the
+			// search is six more candidates times a five second timeout each - which is where the whole
+			// 180 second budget went on a network that filters UDP:
+			//
+			//   h2 carrier failed: RST_STREAM stream=1 code=1
+			//   edge 162.159.198.2:500 via 10.0.2.15 failed: quic dial: timeout
+			//   ... five more ...
+			//
+			// Every one of those is a fact already established by the probe that got here. Spending the
+			// caller's budget rediscovering it is what made a carrier that opens look like one that does
+			// not - the run timed out after the tunnel had already answered.
+			if body, err := traceOverH2(srcIP, cert); err == nil && WarpOn(body) {
+				return body, nil
+			} else if err != nil {
+				androidLog(fmt.Sprintf("colgram_masque: h2 carrier failed again: %v", err))
+			}
+			return "", fmt.Errorf("no edge route answered: %s", bridgeErr)
+		}
 		// QUIC is attempted in a contained goroutine.
 		//
 		// On a network that filters UDP to this edge the QUIC handshake reaches Go's own TLS and panics
@@ -1502,18 +1716,26 @@ func measureWith(cfg Config) (string, error) {
 				}
 				stopRelay()
 			}
+		}
 
 		// The HTTP/2 carrier, on the same registration and through the same capsule stream the app's
-		// session uses. It is asked last because where UDP is not filtered QUIC is the carrier the
-		// official client prefers - but a verdict from here is a verdict from the carrier the tunnel is
-		// actually running on, which a QUIC measurement on a network that filters it can never be.
+		// session uses.
+		//
+		// It is asked here rather than earlier because where UDP is not filtered QUIC is the carrier the
+		// official client prefers. It is asked in this process rather than before the QUIC search for a
+		// concrete reason: the search opens a connection per candidate, and by the time it is over the edge
+		// is refusing new ones from this address - so the carrier that would have worked is asked when it
+		// can no longer be reached. Measured as
+		//
+		//   no edge route answered: dial tcp 162.159.198.2:443: connect: connection refused
+		//
+		// against an address that had answered a second earlier.
 		if body, err := traceOverH2(srcIP, cert); err == nil && WarpOn(body) {
 			return body, nil
 		} else if err != nil {
 			fmt.Println("  h2 carrier    :", err)
 			androidLog(fmt.Sprintf("colgram_masque: h2 carrier failed: %v", err))
 			bridgeErr = errString(err)
-		}
 		}
 		return "", fmt.Errorf("no edge route answered: %s", bridgeErr)
 	}
@@ -1776,6 +1998,38 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 }
 
 // traceOverH2 fetches Cloudflare's trace through the HTTP/2 carrier and returns the body.
+// traceTunnel is the carrier a trace is read through, kept for the life of the process so a second read
+// does not have to be accepted by the edge again.
+type traceTunnel struct {
+	ctx context.Context
+	tun *tunnel
+}
+
+// traceSession is the tunnel the last trace read opened, or nil.
+var traceSession *traceTunnel
+
+// pump reads the return path for the duration of the context. It has to exist before a peer opens: the
+// SYN goes out as a capsule and nothing comes back unless someone is already reading.
+func (tt *traceTunnel) pump() {
+	for {
+		data, err := tt.tun.stream.ReceiveDatagram(tt.ctx)
+		if err != nil {
+			return
+		}
+		if len(data) < 20 {
+			continue
+		}
+		if !isBareIPv4(data) && len(data) >= 21 && data[0] == 0x00 {
+			data = data[1:]
+		}
+		if len(data) < 20 || data[0]>>4 != 4 {
+			continue
+		}
+		atomic.AddInt64(&tt.tun.recvCapsules, 1)
+		tt.tun.dispatch(data)
+	}
+}
+
 //
 // It runs the real thing rather than a separate implementation of it: the same handshake, the same
 // request shape, the same capsule framing and the same peer state machine the app's session uses, so
@@ -1785,37 +2039,30 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
-
-	addr := net.JoinHostPort(edgeH2IP, edgeH2Port)
-	stream, err := openH2Session(ctx, cert, addr)
-	if err != nil {
-		return "", err
-	}
-	tun := &tunnel{srcIP: srcIP, stream: stream}
-
-	// The pump has to exist before the peer opens: the SYN goes out as a capsule and nothing comes back
-	// unless someone is already reading the return path.
-	go func() {
-		for {
-			data, err := stream.ReceiveDatagram(ctx)
-			if err != nil {
-				return
-			}
-			if len(data) < 20 {
-				continue
-			}
-			if !isBareIPv4(data) {
-				if len(data) >= 21 && data[0] == 0x00 {
-					data = data[1:]
-				}
-			}
-			if len(data) < 20 || data[0]>>4 != 4 {
-				continue
-			}
-			atomic.AddInt64(&tun.recvCapsules, 1)
-			tun.dispatch(data)
+	// The carrier refuses new connections from an address that has just opened several. The shape
+	// negotiation opens one per shape and then a second for the tunnel it keeps, and a caller that asks
+	// twice in one process - which the integration test does - is refused the second time:
+	//
+	//   h2 carrier 162.159.198.2:443 accepts shape "reference client shape"
+	//   h2 carrier failed: dial tcp 162.159.198.2:443: connect: connection refused
+	//
+	// The tunnel that answered is still open, so the second request reuses it rather than dialling again.
+	// A measurement that reuses the tunnel it is measuring measures that tunnel, which is the point.
+	sessionMu.Lock()
+	reuse := traceSession
+	sessionMu.Unlock()
+	if reuse == nil || reuse.ctx.Err() != nil {
+		stream, err := openH2Session(ctx, cert, net.JoinHostPort(edgeH2IP, edgeH2Port))
+		if err != nil {
+			return "", err
 		}
-	}()
+		reuse = &traceTunnel{ctx: ctx, tun: &tunnel{srcIP: srcIP, stream: stream}}
+		go reuse.pump()
+		sessionMu.Lock()
+		traceSession = reuse
+		sessionMu.Unlock()
+	}
+	tun := reuse.tun
 
 	ips, err := resolve(traceHost)
 	if err != nil || len(ips) == 0 {
@@ -1835,9 +2082,12 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	peer := newTunnelConn(tun, srcIP, dst, 51500, 443)
 	tun.peers = append(tun.peers, peer)
 	if err := peer.open(); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: h2 peer open failed: %v (sent=%d recv=%d)",
+			err, peer.sent, peer.recv))
 		return "", fmt.Errorf("tcp open through the tunnel: %w (sent=%d recv=%d)",
 			err, peer.sent, peer.recv)
 	}
+	androidLog(fmt.Sprintf("colgram_masque: h2 peer open, sent=%d recv=%d", peer.sent, peer.recv))
 
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
@@ -1848,6 +2098,8 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 		return "", err
 	}
 	if err := inner.Handshake(); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: tls inside the tunnel failed: %v (sent=%d recv=%d)",
+			err, peer.sent, peer.recv))
 		return "", fmt.Errorf("tls inside tunnel: %w (sent=%d recv=%d)", err, peer.sent, peer.recv)
 	}
 
@@ -1900,7 +2152,9 @@ func dialQuic(ctx context.Context, udpConn *net.UDPConn, addr string, cert tls.C
 	if err != nil {
 		return nil, err
 	}
-	if !udpReachablePorts(host, []string{port})[port] {
+	// Probed through the front when one is named, for the same reason the candidate search does it: a
+	// probe on a different egress answers about a path the handshake will not take.
+	if !udpReachablePorts(host, []string{port}, socksAddrFor(Config{}))[port] {
 		return nil, fmt.Errorf("udp to %s does not answer", addr)
 	}
 	tlsConf := &tls.Config{
@@ -1958,7 +2212,18 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// androidLog writes a transport decision to the Android log as well as stderr.
+//
+// Stderr alone is invisible on a device: nothing reads it, so a run that tried four things and reported
+// the reason for each showed one line and left the rest unmeasurable. The bridge in jni_bridge.c exists
+// for exactly this and was never called from here, which is why several rounds of measurement of this
+// client produced no log lines at all.
+//
 func androidLog(msg string) {
+	msg = strings.TrimRight(msg, "\n")
+	cLine := C.CString(msg)
+	C.colgram_masque_emit(cLine)
+	C.free(unsafe.Pointer(cLine))
 	fmt.Fprintln(os.Stderr, msg)
 }
 
@@ -1978,23 +2243,85 @@ type edgeCandidate struct {
 // assumed: 443 and 500 answered in about 100 ms, 8443 and 8095 in about 103 ms.
 var edgePorts = []string{"443", "500", "8443", "8095", "4500", "4443"}
 
+
+// newUdpCarrier opens whatever carries the tunnel's UDP: a SOCKS associate when a front is named, and
+// a plain socket otherwise. It is the one place that choice is made, so the reachability probe and the
+// handshake cannot end up on different paths.
+func newUdpCarrier(socks string) (net.PacketConn, error) {
+	if socks != "" {
+		return dialSocks5UDP(socks)
+	}
+	return net.ListenUDP("udp4", &net.UDPAddr{})
+}
+
 // udpReachablePorts sends one long-header datagram to each port and reports which answered.
 //
 // A QUIC long header with an unknown version is what a QUIC endpoint answers first, so a reply - even a
 // version negotiation packet - proves the path is open, and silence within the budget means it is not. The
 // datagram is a real packet rather than a bare write so that a firewall answering with an ICMP port
 // unreachable is also caught, which a plain connect would report and a filtered path would not.
-func udpReachablePorts(host string, ports []string) map[string]bool {
+func udpReachablePorts(host string, ports []string, socks string) map[string]bool {
 	out := map[string]bool{}
 	addr := net.ParseIP(host).To4()
 	if addr == nil {
 		return out
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
-	if err != nil {
-		return out
+
+	// With a front named, the probe rides it. The datagram has to travel the path the handshake will
+	// travel, and the front is a UDP associate that terminates locally and opens its own upstream socket -
+	// so a probe sent straight out reaches a different egress, on a different source port, and answers
+	// about a different path than the one the tunnel uses.
+	var relay *socksUDPConn
+	var raw net.PacketConn
+	var err error
+	if socks != "" {
+		relay, err = dialSocks5UDP(socks)
+		if err != nil {
+			androidLog(fmt.Sprintf("colgram_masque: reachability probe could not use the front %s: %v",
+				socks, err))
+			return out
+		}
+		defer relay.Close()
+	} else {
+		raw, err = net.ListenUDP("udp4", &net.UDPAddr{})
+		if err != nil {
+			return out
+		}
+		defer raw.Close()
 	}
-	defer conn.Close()
+
+	send := func(b []byte, to *net.UDPAddr) error {
+		if relay != nil {
+			_, err := relay.WriteTo(b, to)
+			return err
+		}
+		_, err := raw.WriteTo(b, to)
+		return err
+	}
+	recv := func(b []byte) (int, error) {
+		if relay != nil {
+			n, _, err := relay.ReadFrom(b)
+			return n, err
+		}
+		n, _, err := raw.ReadFrom(b)
+		return n, err
+	}
+	setDeadline := func(t time.Time) {
+		if relay != nil {
+			// The associate's own reads go through its control socket; the deadline that matters is on the
+			// session, and a stale one would let a filtered port read the previous port's reply.
+			_ = t
+			return
+		}
+		_ = raw.SetReadDeadline(t)
+	}
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil && relay == nil {
+		return out
+	} else if conn != nil {
+		conn.Close()
+	}
 
 	// Reserved bits and a fixed pattern, which is what RFC 9000 sends in the first four bytes of a long
 	// header. Any version is fine: the point is the shape, not the value.
@@ -2010,16 +2337,76 @@ func udpReachablePorts(host string, ports []string) map[string]bool {
 			continue
 		}
 		target := &net.UDPAddr{IP: addr, Port: port}
-		_ = conn.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
-		if _, err := conn.WriteToUDP(pkt, target); err != nil {
+		setDeadline(time.Now().Add(400 * time.Millisecond))
+		if err := send(pkt, target); err != nil {
 			continue
 		}
 		buf := make([]byte, 1500)
-		if n, _, err := conn.ReadFromUDP(buf); err == nil && n > 0 {
+		if n, err := recv(buf); err == nil && n > 0 {
 			out[p] = true
 		}
 	}
 	return out
+}
+
+// udpAnswers reports whether any port on the edge answers a datagram at all, which is the only question
+// the carrier choice turns on: one answered port means QUIC is worth trying, none means every candidate
+// will time out and the other carrier should go first.
+func udpAnswers(host string, socks string) bool {
+	// Whether a datagram comes back is not the question. It has to be a QUIC endpoint's answer to a QUIC
+	// long header, because anything less is answered by something that is not the tunnel's carrier.
+	//
+	// Measured on the device: five of six ports answered the probe - a version negotiation packet from
+	// whatever is on the other end - and every one of them then timed out through a real handshake:
+	//
+	//   UDP reachability on 162.159.198.2: map[4443:true 4500:true 500:true 8095:true 8443:true]
+	//   edge 162.159.198.2:500  via 10.0.2.15 failed: quic dial: timeout: no recent network activity
+	//   edge 162.159.198.2:8443 via 10.0.2.15 failed: quic dial: timeout: no recent network activity
+	//   edge 162.159.198.2:8095 via 10.0.2.15 failed: quic dial: timeout: no recent network activity
+	//   edge 162.159.198.2:4500 via 10.0.2.15 failed: quic dial: timeout: no recent network activity
+	//   edge 162.159.198.2:4443 via 10.0.2.15 failed: quic dial: timeout: no recent network activity
+	//   edge 162.159.198.2:443  via 10.0.2.15 failed: quic dial: timeout: no recent network activity
+	//
+	// Six handshakes at five seconds each is the whole 180 second budget, spent before the carrier that
+	// works is reached - and the repeated connections are what made the edge start refusing new ones.
+	//
+	// So the test is one handshake attempt on the port the registration names, and no more: a version
+	// negotiation packet proves something is listening, a handshake proves it is the tunnel.
+	probe, err := dialQuicOnce(host, socks)
+	if err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: no QUIC handshake on %s: %v", host, err))
+		return false
+	}
+	probe.CloseWithError(0, "probe")
+	return true
+}
+
+// dialQuicOnce attempts exactly one QUIC handshake and reports what came of it. It exists to answer a
+// yes-or-no question - is the QUIC carrier usable at all - without paying for a whole session's worth of
+// attempts, and it is bounded so a filtered path costs a second rather than the caller's whole budget.
+func dialQuicOnce(host, socks string) (*quic.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := newUdpCarrier(socks)
+	if err != nil {
+		return nil, err
+	}
+	addr := &net.UDPAddr{IP: net.ParseIP(host).To4(), Port: 443}
+	// No client certificate: the handshake is only asked whether it completes, and the certificate is
+	// what the previous probe's crash was about.
+	conf := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         edgeSNI,
+		NextProtos:         []string{"h3"},
+		MinVersion:         tls.VersionTLS13,
+	}
+	return quic.Dial(ctx, conn, addr, conf, &quic.Config{
+		EnableDatagrams:         true,
+		InitialPacketSize:       1200,
+		DisablePathMTUDiscovery: true,
+		MaxIdleTimeout:          5 * time.Second,
+	})
 }
 
 func edgeCandidates(preferredBind string) []edgeCandidate {
@@ -2031,17 +2418,37 @@ func edgeCandidates(preferredBind string) []edgeCandidate {
 	// that works was asked at all. Measured: on a network where UDP is filtered, the trace call took 107
 	// seconds and returned nothing, while the HTTP/2 carrier answered in under two. One datagram per port
 	// costs milliseconds and rules a port out for the whole search.
-	reachable := udpReachablePorts(edgeIP, edgePorts)
+	// The probe goes through the same front the handshake will, or it proves nothing. A direct socket
+	// can answer where the front cannot and the other way round, and on this network the front is what
+	// both the probe and the tunnel actually use - the device binds its egress through it, so a probe
+	// that went direct would be measuring a path nothing else takes.
+	reachable := udpReachablePorts(edgeIP, edgePorts, socksAddrFor(Config{}))
+	androidLog(fmt.Sprintf("colgram_masque: UDP reachability on %s through front %q: %v",
+		edgeIP, socksAddrFor(Config{}), reachable))
 	if len(reachable) > 0 {
+		// The ports that do not answer are dropped from the search, not merely reported. Each one costs a
+		// full handshake timeout, and with a SOCKS front in front of them the timeout is the front's: the
+		// datagram goes out through the associate and comes back as an EOF five seconds later, so a port
+		// the probe already ruled out was being paid for again on every attempt.
+		//
+		// Measured with the in-app front up and UDP filtered to this edge: six ports, five seconds each,
+		// a different source port every time, and no verdict - which is the 180 second timeout the
+		// integration test reported. The probe exists to make that unpayable.
 		filtered := make([]string, 0, len(edgePorts))
+		var usable []string
 		for _, p := range edgePorts {
-			if !reachable[p] {
+			if reachable[p] {
+				usable = append(usable, p)
+			} else {
 				filtered = append(filtered, p)
 			}
 		}
 		if len(filtered) > 0 {
 			androidLog(fmt.Sprintf("colgram_masque: UDP to the edge is filtered on %v; trying the "+
 				"remaining ports first", filtered))
+		}
+		if len(usable) > 0 {
+			edgePorts = append(append([]string{}, usable...), filtered...)
 		}
 	}
 	var out []edgeCandidate
@@ -2178,6 +2585,7 @@ func main() {
 func resolve(host string) ([]net.IP, error) {
 	var lastErr error
 	for _, e := range dohEndpoints {
+		lastErr = fmt.Errorf("no DoH endpoint answered for %s", host)
 		ips, err := resolveVia(e, host)
 		// A resolver that answers is not the same as a resolver that answers correctly. Measured here:
 		// when the Cloudflare and Google entries in this list were cut, the AdGuard entry answered - and
@@ -2191,7 +2599,14 @@ func resolve(host string) ([]net.IP, error) {
 		// Without the check this is a silent substitution by whichever resolver happens to be reachable,
 		// which is the same attack the system resolver performs and the reason this list exists.
 		if err == nil && len(ips) > 0 && plausible(host, ips) {
+			androidLog(fmt.Sprintf("colgram_masque: resolved %s through %s: %v", host, e.ip, ips))
 			return ips, nil
+		}
+		if err != nil {
+			androidLog(fmt.Sprintf("colgram_masque: resolver %s did not answer for %s: %v", e.ip, host, err))
+		} else {
+			androidLog(fmt.Sprintf("colgram_masque: resolver %s answered for %s with %v, "+
+				"which is not a range it is served from", e.ip, host, ips))
 		}
 		if err != nil {
 			lastErr = err
