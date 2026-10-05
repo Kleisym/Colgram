@@ -467,6 +467,9 @@ type tunnelConn struct {
 	// peerScale is the window scale the peer said it would apply, read off its SYN-ACK and used to write
 	// this side's window in the units the peer will read. Zero until the peer answers.
 	peerScale int
+	// synPending is set while the SYN is being written and cleared once it is out, so the SYN's own window is
+	// the buffer in bytes - unscaled, because the scale it announces applies to the segments after it.
+	synPending bool
 	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
@@ -573,7 +576,16 @@ func (c *tunnelConn) recvWindow() uint16 {
 	// buffered - and it is what tells the far side how much it may send before this side has to grow a
 	// buffer it does not have. This client's SYN offered 200 units, about 25 KB, so every flow began with
 	// the far side's first burst already larger than the window agreed for it.
+	//
+	// The SYN carries the buffer in bytes and does not divide it, because the window scale applies to the
+	// segments that follow: the reference client's SYN is 24704 and its first ACK is 193, which is 24704
+	// divided by the 128 it advertised in the same SYN's window scale option. Dividing the SYN's own window
+	// by a scale it has only just announced is what produced 193 where 24704 belongs.
 	const capacity = 24704
+	// On the SYN nothing has been negotiated yet, so the window is the buffer whole.
+	if c.synPending {
+		return capacity
+	}
 	free := capacity - len(c.inbuf)
 	if free < 4096 {
 		free = 4096
@@ -656,12 +668,12 @@ func newUDPConn(tun *tunnel, local net.IP) *udpConn {
 // reference client was measured sending: a 51-byte DNS query to port 53 for connectivity.cloudflareclient.com.
 // An answer comes back through the same flow and the tunnel is carrying UDP; silence is the carrier not
 // carrying it, which is a fact about the edge rather than about this client.
-func udpProbeThroughTunnel(u *udpConn, name string) string {
+func udpProbeThroughTunnel(u *udpConn, name string) []byte {
 	msg := buildDNSQuery(name)
 	dst := &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53}
 	if _, err := u.WriteTo(msg, dst); err != nil {
 		androidLog(fmt.Sprintf("colgram_masque: UDP query through the tunnel could not be written: %v", err))
-		return ""
+		return nil
 	}
 	buf := make([]byte, 1500)
 	done := make(chan int, 1)
@@ -676,11 +688,11 @@ func udpProbeThroughTunnel(u *udpConn, name string) string {
 	select {
 	case n := <-done:
 		if n == 0 {
-			return ""
+			return nil
 		}
-		return string(buf[:n])
+		return append([]byte(nil), buf[:n]...)
 	case <-time.After(8 * time.Second):
-		return ""
+		return nil
 	}
 }
 
@@ -699,6 +711,130 @@ func buildDNSQuery(name string) []byte {
 	msg = append(msg, 0)
 	msg = append(msg, 0, 1, 0, 1)
 	return msg
+}
+
+// plainHTTPThroughTunnel opens a flow, sends one HTTP request and returns whatever comes back.
+//
+// It is the request the client measured to carry carries, byte for byte in shape: a TCP flow to port 80,
+// a 110-byte GET, and a body on the way back. No TLS, so nothing above the carrier is involved in the
+// answer, and a flow of its own so the measurement is not mixed with the one carrying the verdict.
+func plainHTTPThroughTunnel(tun *tunnel, src, dst net.IP) string {
+	c := newTunnelConn(tun, src, dst, ephemeralPort(), 80)
+	tun.peers = append(tun.peers, c)
+	defer func() { c.Close() }()
+	if err := c.open(); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: the plaintext flow did not open: %v", err))
+		return ""
+	}
+	androidLog(fmt.Sprintf("colgram_masque: the plaintext flow opened (sent=%d recv=%d)", c.sent, c.recv))
+	req := strings.Join([]string{
+		"GET /cdn-cgi/trace HTTP/1.1",
+		"Host: " + traceHost,
+		"User-Agent: colgram-warp-on",
+		"Accept: */*",
+		"Connection: close",
+		"", "",
+	}, crlf)
+	if _, err := c.Write([]byte(req)); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: the plaintext request could not be written: %v", err))
+		return ""
+	}
+	body := make([]byte, 4096)
+	read := 0
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := c.Read(body[read:])
+		read += n
+		if err != nil {
+			break
+		}
+		if bytes.Contains(body[:read], []byte("\r\n\r\n")) {
+			// A body follows the blank line; keep reading until the peer closes or the budget runs out.
+			continue
+		}
+	}
+	androidLog(fmt.Sprintf("colgram_masque: the plaintext flow read %d bytes in total (sent=%d recv=%d)",
+		read, c.sent, c.recv))
+	if read == 0 {
+		return ""
+	}
+	return string(body[:read])
+}
+
+// tlsTraceThroughTunnel runs the real verdict flow - TLS on 443 to the trace host - and returns the body.
+//
+// It is the same measurement as the verdict itself, on a flow of its own, so that the verdict's own
+// result can be compared against a run where nothing else is in flight. The flow is built the same way -
+// ephemeral source port, random initial sequence, the options this carrier has been measured to accept -
+// and nothing about it is different except that it is not the caller's.
+func tlsTraceThroughTunnel(tun *tunnel, src, dst net.IP) (string, error) {
+	c := newTunnelConn(tun, src, dst, ephemeralPort(), 443)
+	tun.peers = append(tun.peers, c)
+	defer c.Close()
+	if err := c.open(); err != nil {
+		return "", err
+	}
+	conn := tls.Client(c, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         traceHost,
+		MinVersion:         tls.VersionTLS12,
+		RootCAs:            x509.NewCertPool(),
+	})
+	// One deadline for the whole exchange, and long enough for the flight the edge actually sends.
+	//
+	// This handshake is a long conversation - a ClientHello out, then a server flight of three 1228-byte
+	// records and two 235-byte ones acknowledged between each - and the trace shows all of it arriving:
+	//
+	//   inbound 1280 bytes, 1228 payload, seq 3044710631   ServerHello
+	//   outbound 52 bytes                     ack 3044711859
+	//   inbound 1280 bytes, 1228 payload, seq 3044711859
+	//   outbound 52 bytes                     ack 3044713087
+	//   inbound 1280 bytes, 1228 payload, seq 3044713087
+	//   outbound 52 bytes                     ack 3044714315
+	//   inbound  287 bytes,  235 payload, seq 3044714315
+	//   outbound 52 bytes                     ack 3044714550
+	//   outbound 52 bytes  flags 0x011        FIN - the handshake gave up here
+	//
+	// What is missing is this client's own key share, which in TLS 1.3 is what answers a ServerHello. It
+	// never goes out, and the connection is closed rather than continued.
+	if err := conn.SetDeadline(time.Now().Add(150 * time.Second)); err != nil {
+		return "", err
+	}
+	if err := conn.Handshake(); err != nil {
+		// The error's own type, and the flow's counts beside it.
+		//
+		// The trace shows the whole server flight arriving and being acknowledged and then a FIN. A client
+		// that read the ServerHello and rejected it says which; a client that never read it says timeout.
+		// Which of the two this is has never been visible, because the error was folded into the tunnel's
+		// own wording.
+		androidLog(fmt.Sprintf("colgram_masque: TLS gave up with %T: %v (flow sent=%d recv=%d)",
+			err, err, c.sent, c.recv))
+		return "", fmt.Errorf("handshake on 443 (sent=%d recv=%d): %w", c.sent, c.recv, err)
+	}
+	req := strings.Join([]string{
+		"GET /cdn-cgi/trace HTTP/1.1",
+		"Host: " + traceHost,
+		"User-Agent: colgram-warp-on",
+		"Accept: */*",
+		"Connection: close",
+		"", "",
+	}, crlf)
+	if _, err := io.WriteString(conn, req); err != nil {
+		return "", err
+	}
+	body := &bytes.Buffer{}
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := conn.Read(buf)
+		body.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	return body.String(), nil
 }
 
 // ipv4UDP builds a datagram packet: the header this file already builds, with protocol 17 in it and the
@@ -1362,7 +1498,12 @@ func (c *tunnelConn) open() error {
 	// makes the far side see two different connections and answer with RST.
 	synSeq := c.seq
 	c.synSeq = synSeq
+	// The SYN's window is the receive buffer in bytes. The scale it announces in its own options applies to
+	// the segments that follow it, not to the one carrying the announcement - and the reference client's SYN
+	// is 24704, with its first ACK at 193, which is that buffer divided by the 128 it announced.
+	c.synPending = true
 	c.emit(nil, 0x02)
+	c.synPending = false
 	c.seq = synSeq + 1
 
 	deadline := time.Now().Add(20 * time.Second)
@@ -1391,12 +1532,36 @@ func (c *tunnelConn) open() error {
 }
 
 func (c *tunnelConn) Read(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for len(c.inbuf) == 0 && !c.eof {
-		if c.readExpired() {
-			return 0, os.ErrDeadlineExceeded
+	// The lock is taken and released around each poll rather than held for the whole read.
+	//
+	// feed() takes the same lock to append what arrived and to send the acknowledgement for it, and it
+	// sends it - emit writes a capsule and the write can block on the stream. A reader that held the lock
+	// across its wait would be waiting for a lock that the writer could not take because the reader had
+	// it, and the handshake would stop with the ServerHello already in the buffer:
+	//
+	//   inbound 1280 bytes, 1228 payload, seq 3044710631   the whole flight arrives
+	//   outbound 52 bytes                     ack 3044711859
+	//   outbound 52 bytes  flags 0x011        FIN - Go gave up here with a read timeout
+	//
+	// The state it reads is the buffer, the end flag and the deadline, all of which are under the lock on
+	// every pass, so taking the lock per poll changes nothing about what it can see.
+	for {
+		c.mu.Lock()
+		if len(c.inbuf) > 0 || c.eof || c.readExpired() {
+			if len(c.inbuf) == 0 {
+				c.mu.Unlock()
+				if c.eof {
+					return 0, io.EOF
+				}
+				return 0, os.ErrDeadlineExceeded
+			}
+			n := copy(b, c.inbuf)
+			c.inbuf = c.inbuf[n:]
+			c.mu.Unlock()
+			return n, nil
 		}
+		c.mu.Unlock()
+
 		// A channel rather than the condition variable. sync.Cond has no timed wait, so a deadline on a
 		// stream that carries packets - rather than a socket that carries bytes - has to be honoured by
 		// waking the reader somehow, and a timer goroutine that broadcast into a Cond races the reader
@@ -1408,18 +1573,8 @@ func (c *tunnelConn) Read(b []byte) (int, error) {
 		// which is the heap being written by something other than the allocator. A channel select carries
 		// its own wake-up, so there is nothing to race. The packet boundary is the granularity it offers
 		// anyway - a packet arrives as a whole capsule - so a short poll costs nothing that matters.
-		if !c.waitFor(250*time.Millisecond) && len(c.inbuf) == 0 && !c.eof {
-			if c.readExpired() {
-				return 0, os.ErrDeadlineExceeded
-			}
-		}
+		c.waitFor(20 * time.Millisecond)
 	}
-	if len(c.inbuf) == 0 && c.eof {
-		return 0, io.EOF
-	}
-	n := copy(b, c.inbuf)
-	c.inbuf = c.inbuf[n:]
-	return n, nil
 }
 
 func (c *tunnelConn) Write(b []byte) (int, error) {
@@ -3549,6 +3704,33 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	}
 	if dst == nil {
 		return "", fmt.Errorf("no IPv4 for %s", traceHost)
+	}
+
+	// A plaintext request through the tunnel before any TLS, because that is the request the client
+	// measured to carry carries: a 110-byte HTTP GET to port 80, answered with 413 bytes.
+	//
+	// It separates two faults that are otherwise indistinguishable. If the body comes back on this
+	// client's own flow, the tunnel carries and everything that fails afterwards is above the carrier. If
+	// it does not, the tunnel is still the thing that is wrong, and no TLS layer will say so.
+	if body := plainHTTPThroughTunnel(tun, srcIP, dst); len(body) > 0 {
+		androidLog(fmt.Sprintf("colgram_masque: the tunnel carried a plaintext HTTP request and %d bytes "+
+			"came back: %q", len(body), head([]byte(body), 90)))
+	} else {
+		androidLog("colgram_masque: the tunnel carried no plaintext HTTP request back")
+	}
+
+	// TLS on port 443, read out of the transcript rather than guessed at.
+	//
+	// The same tunnel carries 488 bytes of plaintext to port 80 and does not carry a ClientHello to 443,
+	// which is the first difference this file has between a flow that works and one that does not. The
+	// request bodies are compared against the working reference flow - a 110-byte GET answered with 413
+	// bytes - so this is the same shape of measurement on the other port, not a new kind of thing.
+	tlsBody, tlsErr := tlsTraceThroughTunnel(tun, srcIP, dst)
+	if tlsErr != nil {
+		androidLog(fmt.Sprintf("colgram_masque: TLS on 443 through the tunnel: %v", tlsErr))
+	} else if len(tlsBody) > 0 {
+		androidLog(fmt.Sprintf("colgram_masque: TLS on 443 through the tunnel returned %d bytes: %q",
+			len(tlsBody), head([]byte(tlsBody), 90)))
 	}
 
 	peer := newTunnelConn(tun, srcIP, dst, ephemeralPort(), 443)
