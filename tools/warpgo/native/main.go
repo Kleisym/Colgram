@@ -3063,54 +3063,6 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	// host's reply came back through the same stream, so this carrier does route, for this identity, on
 	// this network - and it does it without TLS being involved at any point.
 	//
-	// So a plaintext request separates the two things that TLS adds at once: whether the tunnel carries
-	// data at all, and whether the edge objects to the payload. A silent plaintext request means the first;
-	// a 400 and a silent ClientHello means the second.
-	plain := strings.Join([]string{
-		"GET /cdn-cgi/trace HTTP/1.1",
-		"Host: www.cloudflare.com",
-		"Connection: close",
-		"", "",
-	}, crlf)
-	plainBody := make([]byte, 2048)
-	plainRead := 0
-	// Repeated on one flow over half a minute rather than sent once.
-	//
-	// If the edge provisions an identity asynchronously after enrolment - which is what would explain a
-	// handshake that completes and a payload that never arrives - then the answer changes with the age of
-	// the enrolment, and one attempt one second after registering cannot see it. The enrolment is now
-	// cached for the life of the process, so this measures the same identity at four ages rather than four
-	// different ones, which is the only way the age is the variable.
-	//
-	// The request itself is the reference client's own, byte for byte, and it is the one request measured to
-	// come back through this carrier:
-	//
-	//   GET /cdn-cgi/trace HTTP/1.1 / Host: www.cloudflare.com / Connection: close
-	//   -> HTTP/1.1 400 Bad Request ... this port does not serve HTTP.
-	//
-	// The 400 is the answer that matters. It proves the edge took the flow out to the real host and the
-	// host's reply came back through the same stream, with no TLS involved anywhere - so a silent plaintext
-	// request is not about TLS, and the carrier does route on this network.
-	for attempt := 0; attempt < 4 && plainRead == 0; attempt++ {
-		if _, err := peer.Write([]byte(plain)); err != nil {
-			androidLog(fmt.Sprintf("colgram_masque: plaintext trace write failed: %v", err))
-		}
-		readUntil := time.Now().Add(8 * time.Second)
-		for time.Now().Before(readUntil) && plainRead == 0 {
-			peer.SetReadDeadline(time.Now().Add(2 * time.Second))
-			n, err := peer.Read(plainBody[plainRead:])
-			plainRead += n
-			if err != nil {
-				break
-			}
-		}
-		androidLog(fmt.Sprintf("colgram_masque: plaintext attempt %d, enrolment age %s, %d bytes back "+
-			"(sent=%d recv=%d)", attempt+1,
-			time.Since(enrolmentAge()).Truncate(time.Second), plainRead, peer.sent, peer.recv))
-	}
-	androidLog(fmt.Sprintf("colgram_masque: plaintext trace returned %d bytes, sent=%d recv=%d: %q",
-		plainRead, peer.sent, peer.recv, head(plainBody[:plainRead], 120)))
-
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         traceHost,
