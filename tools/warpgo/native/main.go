@@ -329,6 +329,39 @@ func (s *socksUDPConn) SetWriteDeadline(t time.Time) error { return s.ctrl.SetWr
 
 var crlf = string([]byte{13, 10})
 
+// h2TraceFile is the transcript's destination, named once so every frame of one connection lands in one
+// place and can be read in order against the reference client's own log.
+var h2TraceFile string
+
+// h2Trace opens the transcript, once per process.
+func h2Trace() *os.File {
+	if h2TraceFile == "" {
+		h2TraceFile = os.Getenv("COLGRAM_H2_TRACE")
+		if h2TraceFile == "" {
+			return nil
+		}
+	}
+	f, err := os.OpenFile(h2TraceFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+// h2TraceWrite appends one line to the transcript in the reference client's own format, so the two logs
+// can be read side by side rather than translated between them.
+func h2TraceWrite(dir string, b []byte) {
+	if !strings.HasPrefix(os.Getenv("COLGRAM_H2_TRACE"), "") || os.Getenv("COLGRAM_H2_TRACE") == "" {
+		return
+	}
+	f := h2Trace()
+	if f == nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(fmt.Sprintf("H2 %s %d bytes: %x\n", dir, len(b), b))
+}
+
 // socksOverride is set by the JNI layer before the measurement runs, because a c-shared library
 // cannot see environment variables exported after it was loaded. Measured, not assumed: the same
 // process printed WARP_SOCKS="" while a shell in the same invocation printed the value.
@@ -422,10 +455,75 @@ type tunnelConn struct {
 }
 
 func newTunnelConn(tun *tunnel, srcIP, dstIP net.IP, srcPort, dstPort uint16) *tunnelConn {
+	// A random initial sequence number, and one seeded per flow rather than per process.
+	//
+	// Every SYN this client sent went out with sequence 1, and the reference client's did not:
+	//
+	//   this client    outbound 60 bytes (opts 20), flags 0x002, seq 1 ack 0
+	//   reference      tcp sport=53735 dport=443 seq=410236364 ack=0
+	//
+	// A sequence number of 1 on every flow from every run is not a sequence number, it is a constant, and
+	// RFC 9293 requires the initial one to be chosen so that it does not predict the sequence numbers of a
+	// later connection to the same destination. An edge that tracks flows per identity has seen this
+	// client's flows collide on a sequence space before, and a fixed low sequence is what a filter looks
+	// for when it wants to recognise a tunnel rather than a host - it is the same shape of thing as the fixed
+	// source port below.
+	//
+	// It is drawn per flow so two flows on one tunnel cannot collide either, which is the case that matters
+	// when the measurement opens a flow beside the one carrying traffic.
+	var seed [4]byte
+	if _, err := rand.Read(seed[:]); err == nil {
+		isn := binary.BigEndian.Uint32(seed[:]) & 0x7fffffff
+		c := &tunnelConn{tun: tun, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort,
+			dstPort: dstPort, seq: isn}
+		c.wake = make(chan struct{})
+		return c
+	}
 	c := &tunnelConn{tun: tun, srcIP: srcIP, dstIP: dstIP, srcPort: srcPort,
 		dstPort: dstPort, seq: 1}
 	c.wake = make(chan struct{})
 	return c
+}
+
+// ephemeralPort returns a source port in the range a host assigns to an outgoing connection.
+//
+// 51500 was hardcoded here and it is visible: every flow this client opens on the tunnel has carried the
+// same source port, on every run, for every destination. The reference client drew one from the ephemeral
+// range and it stayed the same for the life of the flow - which is the second half of the requirement. A
+// tunnel's flows are all outgoing connections from one identity to one edge, so a fixed port across all of
+// them is a far stronger signal than a fixed port on one host, where an epoch is behind it anyway.
+//
+// The range is 49152-65535, which is IANA's dynamic/private range on both Linux and Android, and the port
+// is drawn once per flow and then held - which is what `newTunnelConn` receives.
+func ephemeralPort() uint16 {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return uint16(49152 + binary.BigEndian.Uint16(b[:])%16384)
+	}
+	return 51500
+}
+
+// recvWindow reports the receive window this flow is offering, in the units a window scale of 7 multiplies.
+//
+// It is the buffer this side has, less what is already sitting in it, clamped to the 16-bit field and to
+// the scale, so a far side is told what can genuinely be delivered right now rather than a number chosen
+// once. The reference client's own window moves the same way - 24704 on the SYN and 4096 on the first data
+// segment - which is what a stack does when the far side has not yet acknowledged anything.
+func (c *tunnelConn) recvWindow() uint16 {
+	const scale = 128 // the window scale this client advertises
+	const capacity = 25 * 1024
+	free := capacity - len(c.inbuf)
+	if free < 1024 {
+		free = 1024
+	}
+	units := free / scale
+	if units < 16 {
+		units = 16
+	}
+	if units > 65535 {
+		units = 65535
+	}
+	return uint16(units)
 }
 
 func checksum(b []byte) uint16 {
@@ -468,7 +566,20 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 	// Version 4 in the high nibble, header length 5 words in the low one.
 	hdr[0] = 0x45
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(20+len(payload)))
-	binary.BigEndian.PutUint16(hdr[4:6], 0x4321)
+	// Identification zero.
+	//
+	// The reference client writes 0x0000 here and it writes 0x0000 on its data segments too, so the whole
+	// flow it carried went out with no IP identification at all:
+	//
+	//   SYN    45 00 00 3c 00 00 40 00 3f 06   id = 0x0000, flfrag = 0x4000
+	//   data   45 00 00 80 00 00 40 00 3f 06   id = 0x0000, flfrag = 0x4000
+	//
+	// This client wrote 0x4321 - a constant, on every packet, for every flow. It is a valid value for a
+	// host that does not set Don't Fragment, but this one does set it, and the two together are the shape
+	// of a packet that has been assembled by something rather than by a stack: a real stack either
+	// fragments and needs identification, or sets DF and has no use for it. Matched, because the point of
+	// this field was never to be interesting.
+	binary.BigEndian.PutUint16(hdr[4:6], 0)
 	// Don't Fragment, on every packet.
 	//
 	// The reference client sets it on everything it sends, and it was the one field this client's packets
@@ -493,7 +604,10 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 	// 0x4000 is the Don't Fragment bit: the high bit of the flags byte, which is bits 6 and 7 of the 16-bit
 	// flags-and-fragment-offset field with the low 13 bits - the fragment offset - left at zero.
 	binary.BigEndian.PutUint16(hdr[6:8], 0x4000)
-	hdr[8] = 64
+	// TTL 63, which is what the reference client sends on everything it originates - SYN and data alike.
+	// A real Linux host decrements from 64, so 63 is a stack's initial value minus one hop, and it is what
+	// this carrier is measured to carry. 64 was the value here.
+	hdr[8] = 63
 	hdr[9] = 6
 	copy(hdr[12:16], src.To4())
 	copy(hdr[16:20], dst.To4())
@@ -682,7 +796,25 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 	// Data offset lives in the high nibble of the first byte, the flags in the next nine bits.
 	seg[12] = byte((20+optLen)/4)<<4 | byte(flags>>8)
 	seg[13] = byte(flags)
-	binary.BigEndian.PutUint16(seg[14:16], 64240)
+	// A window that is actually the one this flow has, rather than a constant.
+	//
+	// 64240 was written on every segment of every flow, which is 250 scale units advertised alongside a
+	// window scale of 7 - so the far side was told to multiply 64240 by 128, about 8 MB, and to keep that
+	// window open for the life of the flow. The reference client advertises what it has:
+	//
+	//   SYN     win=24704
+	//   data    win=4096
+	//
+	// 24704 is 193 units at a scale of 128, so the SYN offers about 3.2 MB and then the first data segment
+	// offers 4096 - the far side has sent nothing it has acknowledged yet, so there is nothing more to
+	// offer. A tunnel that terminates TCP at its edge forwards on the segment, and a far side whose peer
+	// has advertised a window it cannot fill is a peer sending into a buffer nobody is draining - which is
+	// the same silence this whole fault has looked like from the outside.
+	//
+	// So the window is the unacknowledged-receive buffer this side actually has, and it is computed rather
+	// than invented: the receive buffer less what is already sitting in it unread.
+	window := c.recvWindow()
+	binary.BigEndian.PutUint16(seg[14:16], window)
 	if optLen > 0 {
 		copy(seg[20:], opts)
 	}
@@ -1087,6 +1219,19 @@ func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, 
 	settingsPayload = append(settingsPayload, h2setting(0x6, 10485760)...) // MAX_HEADER_LIST_SIZE
 	settingsPayload = append(settingsPayload, h2setting(0x8, 1)...)        // ENABLE_CONNECT_PROTOCOL
 	settings := frameH2(0x4, 0, 0, settingsPayload)
+	// Every byte this carrier is sent, hex, when COLGRAM_H2_TRACE names a file.
+	//
+	// The reference client's own log has every frame it wrote and read, and the only way to use that log
+	// against this client is to produce the same thing from this client - a hex transcript of the same
+	// conversation, taken from the code under test rather than from what it was supposed to do.
+	//
+	// It is off by default and it is not a debug aid left in by accident: a carrier that accepts a request
+	// with status 200, answers a SYN-ACK, and then forwards no data is indistinguishable from a correct one
+	// at every layer this client can see. The bytes are the layer below that.
+	trace := h2Trace()
+	if trace != nil {
+		trace.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...))
+	}
 	if _, err := c.conn.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...)); err != nil {
 		tc.Close()
 		return nil, err
@@ -1100,6 +1245,7 @@ func (c *h2raw) readFrame() (typ, flags byte, stream uint32, payload []byte, err
 	if _, err = io.ReadFull(c.br, head[:]); err != nil {
 		return
 	}
+	whole := make([]byte, 0, 9)
 	ln := int(head[0])<<16 | int(head[1])<<8 | int(head[2])
 	typ, flags = head[3], head[4]
 	stream = uint32(head[5])<<24 | uint32(head[6])<<16 | uint32(head[7])<<8 | uint32(head[8])
@@ -1107,6 +1253,8 @@ func (c *h2raw) readFrame() (typ, flags byte, stream uint32, payload []byte, err
 		payload = make([]byte, ln)
 		_, err = io.ReadFull(c.br, payload)
 	}
+	whole = append(append(whole, head[:]...), payload...)
+	h2TraceWrite("READ", whole)
 	return
 }
 
@@ -1402,7 +1550,9 @@ func frameH2(typ, flags byte, stream uint32, payload []byte) []byte {
 	out[0], out[1], out[2] = byte(ln>>16), byte(ln>>8), byte(ln)
 	out[3], out[4] = typ, flags
 	out[5], out[6], out[7], out[8] = byte(stream>>24), byte(stream>>16), byte(stream>>8), byte(stream)
-	return append(out, payload...)
+	whole := append(out, payload...)
+	h2TraceWrite("WRITE", whole)
+	return whole
 }
 
 // answerPing echoes a PING. Not answering one is not fatal but the edge may stop sending, and the
@@ -1581,6 +1731,19 @@ func (cs *h2CapsuleStream) SendDatagram(data []byte) error {
 	// header begins at offset two. Two forms this edge does not take were both measured: a single zero
 	// byte with no length, and the generalised form carrying a context id. The context id is what it
 	// refuses, and refusing it looks exactly like a carrier that routes nothing.
+	//
+	// It goes out as DATA on the tunnel stream, which is where the edge reads it from:
+	//
+	//   reference client, SendDatagram:
+	//     frame = quicvarint.Append(frame, 0)                  capsule type
+	//     frame = quicvarint.Append(frame, len(payload))         capsule length
+	//     frame = append(frame, payload...)                     the IP packet
+	//     s.requestBody.Write(frame)
+	//
+	// which on that client is the CONNECT request's own body, and here is written as a DATA frame on the
+	// same stream. Both are the same bytes in the same order in the same stream; the difference is only
+	// which half of the request carried them, and this carrier accepts the request either way - status 200,
+	// SYN-ACK answered - so the difference cannot be in the header block.
 	var header []byte
 	header = appendVarint(header, 0)
 	header = appendVarint(header, uint64(len(data)))
@@ -1785,15 +1948,56 @@ func (t *tunnel) sendIP(raw []byte) {
 }
 
 func appendVarint(b []byte, v uint64) []byte {
+	// RFC 9000 variable-length integers, not the pre-RFC draft encoding this function used to write.
+	//
+	// The width is in the top TWO bits of the first byte:
+	//
+	//   00xxxxxx  1 byte    0..63
+	//   01xxxxxx  2 bytes   0..16383
+	//   10xxxxxx  4 bytes   0..2^30-1
+	//   11xxxxxx  8 bytes
+	//
+	// and this function set the width bit to 0x80 for four bytes and 0xC0 for eight. Those are the draft
+	// encoding, where the prefix was the top ONE bit. Every capsule this client sends over HTTP/2 is framed
+	// through this function, so the edge read a length that is not a length:
+	//
+	//   mine:     00 c8 88 45 00 00 88 ...     capsule length written as 0xc8 0x88
+	//   expected: 40 c8 45 00 00 88 ...         capsule length 200, two bytes, 0x40 prefix
+	//
+	// A 60-byte packet is under 64 so its length is one byte and is unaffected - which is why every SYN,
+	// the only thing the edge ever answered, went out correctly - and every segment larger than that had a
+	// length the edge could not read. The flow opened and the handshake completed and then nothing this
+	// client sent was a packet the edge could parse:
+	//
+	//   h2 peer open, sent=7 recv=2
+	//   plaintext trace returned 0 bytes, sent=12 recv=3: ""
+	//
+	// and the plaintext probe, which is 76 bytes of payload and therefore a two-byte length, was refused by
+	// the same one-byte mistake. Read off this client's own HTTP/2 transcript, against the reference
+	// client's frame log for the same conversation:
+	//
+	//   mine:  DATA  62 bytes: 00 3c 45 00 00 3c ...   length 60, one byte, correct
+	//          DATA 139 bytes: 00 c8 88 45 00 ...      length 200 written as c8 88, wrong
+	//   ref:   DATA  62 bytes: 00 3c 45 00 00 3c ...   the same 60-byte SYN, identical
+	//          DATA 131 bytes: 00 40 80 45 00 ...      length 128 written as 40 80, correct
 	switch {
 	case v < 1<<6:
 		return append(b, byte(v))
 	case v < 1<<14:
-		return append(b, byte(v|0x4000>>8), byte(v))
+		// 0x4000>>8 is 0x40, but `v|0x40` sets bits in the LOW byte, not the high one. The prefix has
+		// to go into the top two bits of the FIRST byte, and the value into the remaining six there and
+		// eight in the second:
+		//
+		//   v=76    v|0x40      = 0x4c 0x4c     <- what this wrote: the length doubled into the prefix
+		//   RFC     v>>8 | 0x40 = 0x40 0x4c     <- what a receiver reads
+		//
+		// The two-byte case is where every packet this tunnel sends lands, because 63 bytes is the largest
+		// that fits one byte and a 20-byte IP header plus a 40-byte TCP header plus options is already 60.
+		return append(b, byte(v>>8)|0x40, byte(v))
 	case v < 1<<30:
-		return append(b, byte(v|0x80000000>>24), byte(v>>16), byte(v>>8), byte(v))
+		return append(b, byte(v>>24)|0x80, byte(v>>16), byte(v>>8), byte(v))
 	default:
-		return append(b, byte(v|0xc000000000000000>>56), byte(v>>48), byte(v>>40),
+		return append(b, byte(v>>56)|0xC0, byte(v>>48), byte(v>>40),
 			byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 	}
 }
@@ -1841,7 +2045,72 @@ func atoiOr(s string, fallback int) int {
 	return n
 }
 
-func enrol() (net.IP, tls.Certificate, error) {
+// enrolOnce registers a device, enrols a key and mints the certificate, or returns the one already made.
+//
+// It used to enrol on every call, and that is one of the two differences left between this client and the
+// reference client that returned warp=on. The reference ran one enrolment for its whole session and then
+// carried traffic over it; this one enrolled, opened a tunnel one second later, failed, and enrolled again
+// on the next attempt - so every measurement was of a tunnel opened immediately after a fresh enrolment,
+// which is exactly the case an edge that needs a moment to provision an identity would refuse to route.
+//
+// The result is cached for the life of the process, so the second and later attempts run on the same
+// identity as the first, and the attempt that follows a failure is no longer confounded by a new one.
+// A cache hit is logged with the age of the enrolment, because "it did not work either" and "it was the
+// same enrolment as the one that did not work" are different facts and only the timestamp tells them
+// apart.
+func enrolOnce() (net.IP, tls.Certificate, error) {
+	enrolMu.Lock()
+	if enrolDone != nil {
+		ip, cert := enrolDone.ip, enrolDone.cert
+		age := time.Since(enrolDone.at).Truncate(time.Second)
+		enrolMu.Unlock()
+		androidLog(fmt.Sprintf("colgram_masque: reusing the enrolment made %s ago, tunnel address %s",
+			age, ip))
+		return ip, cert, nil
+	}
+	enrolMu.Unlock()
+
+	start := time.Now()
+	ip, cert, err := enrolFresh()
+	if err != nil {
+		return nil, tls.Certificate{}, err
+	}
+	enrolMu.Lock()
+	if enrolDone == nil {
+		enrolDone = &enrolment{ip: ip, cert: cert, at: start}
+	}
+	enrolMu.Unlock()
+	androidLog(fmt.Sprintf("colgram_masque: registered and enrolled in %s, tunnel address %s",
+		time.Since(start).Truncate(time.Millisecond), ip))
+	return ip, cert, nil
+}
+
+// enrolment is one registered device, its tunnel address and the certificate the edge accepts.
+type enrolment struct {
+	ip   net.IP
+	cert tls.Certificate
+	at   time.Time
+}
+
+var (
+	enrolMu   sync.Mutex
+	enrolDone *enrolment
+)
+
+// enrolmentAge reports when the current enrolment was made, or zero when there is none.
+func enrolmentAge() time.Time {
+	enrolMu.Lock()
+	defer enrolMu.Unlock()
+	if enrolDone == nil {
+		return time.Time{}
+	}
+	return enrolDone.at
+}
+
+// enrolFresh performs a full registration: a new P-256 key, a new device, a PATCH enrol and a fresh
+// bare certificate. It is the part that talks to the API, and it is only called when no enrolment is
+// cached.
+func enrolFresh() (net.IP, tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, tls.Certificate{}, err
@@ -1924,9 +2193,28 @@ func enrol() (net.IP, tls.Certificate, error) {
 
 	reg, err := call("POST", "/"+apiVer+"/reg", "", map[string]any{
 		"fcm_token": "", "install_id": "", "tos": "2024-06-01T00:00:00.000Z",
-		"model": "PC", "type": "Android", "serial_number": randomID(),
-		"locale": "en_US", "region": "US", "warp_enabled": true,
-		"key": base64.StdEncoding.EncodeToString(scalar)})
+		"model": "PC", "serial_number": randomID(),
+		"locale": "en_US", "os_version": "",
+		// Registered as a WireGuard device, exactly as the Android app and the reference client both do.
+		//
+		// This client registered as MASQUE directly - `key_type: secp256r1, tunnel_type: masque` in the
+		// registration POST itself - and the reference client, which returns warp=on, registers as WireGuard
+		// and only then PATCHes itself to masque:
+		//
+		//   reference, models.Registration:  KeyType: KeyTypeWg  TunType: TunTypeWg   (curve25519, wireguard)
+		//   reference, models.DeviceUpdate:   KeyType: secp256r1 TunType: masque      (the PATCH)
+		//
+		// The registration is what the account is provisioned against, so a device that arrives claiming to
+		// be a MASQUE device has an account provisioned differently from one that arrives as WireGuard and is
+		// then switched. That difference is invisible from inside the tunnel - the handshake still completes
+		// and the data still does not arrive - and it is the largest remaining difference between this client
+		// and one that works, so it is matched rather than argued about.
+		//
+		// The key sent here is a throwaway, exactly as it is in the reference: its only purpose is to make the
+		// registration well-formed. The P-256 key that actually carries the tunnel is enrolled in the PATCH
+		// below, in SPKI form, because that is the form the API reads back as a public key.
+		"key":      base64.StdEncoding.EncodeToString(scalar),
+		"key_type": "curve25519", "tunnel_type": "wireguard"})
 	if err != nil {
 		return nil, tls.Certificate{}, fmt.Errorf("register: %w", err)
 	}
@@ -1939,6 +2227,19 @@ func enrol() (net.IP, tls.Certificate, error) {
 		"key":      base64.StdEncoding.EncodeToString(spki),
 		"key_type": "secp256r1", "tun_type": "masque"}); err != nil {
 		return nil, tls.Certificate{}, fmt.Errorf("enrol: %w", err)
+	}
+	// Read the account back after enrolling, and log what it says.
+	//
+	// The reference client calls GetAccount before it connects, and the answer is what says whether the
+	// edge will route for this identity: a licence bound and `warp_plus: true` is a provisioned account, and
+	// one without is a registered device with nothing behind it. A tunnel that gets a handshake and no data
+	// is what an unprovisioned identity looks like from inside the tunnel, so this is read on every run
+	// rather than assumed from the fact that the PATCH returned 200.
+	if acct, aerr := call("GET", "/"+apiVer+"/reg/"+id+"/account", token, nil); aerr == nil {
+		androidLog(fmt.Sprintf("colgram_masque: account %s licence=%s warp_plus=%v quota=%v",
+			acct["account_type"], acct["license"], acct["warp_plus"], acct["quota"]))
+	} else {
+		androidLog(fmt.Sprintf("colgram_masque: account read-back failed: %v", aerr))
 	}
 
 	addr := "172.16.0.2"
@@ -1955,12 +2256,35 @@ func enrol() (net.IP, tls.Certificate, error) {
 	// The edge expects a certificate with an empty subject and no extensions. Anything else is
 	// refused, and the refusal looks like an unexplained handshake reset.
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: big.NewInt(0),
 		Subject:      pkix.Name{},
-		NotBefore:    time.Now().Add(-time.Hour),
+		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	// Self-signed against an EMPTY parent, not against the template itself.
+	//
+	// The reference client signs with an empty certificate as the issuer:
+	//
+	//   x509.CreateCertificate(rand.Reader, &x509.Certificate{
+	//       SerialNumber: big.NewInt(0), NotBefore: time.Now(), NotAfter: time.Now().Add(24h),
+	//   }, &x509.Certificate{}, &privKey.PublicKey, privKey)
+	//
+	// and this client signed with the template as its own issuer, which is what Go does for a normal
+	// self-signed certificate: it fills in issuer from subject and adds the basic-constraints extension
+	// marking the certificate a CA. Two different certificates, then, with the same key and the same
+	// subject - one that says it is a certificate authority and one that does not.
+	//
+	// The edge decides whether to route for an identity from the key this certificate carries, and it
+	// parses the certificate strictly enough to have refused this one in a way that looks exactly like a
+	// carrier that routes nothing:
+	//
+	//   h2 peer open, sent=7 recv=2            <- the handshake completes, on the certificate it accepted
+	//   plaintext trace returned 0 bytes       <- and no data is ever forwarded for it
+	//
+	// The account itself is known good: the reference client, handed this client's own registration
+	// credentials, returns warp=on through this same edge on this same network - so the enrolment, the key,
+	// the address and the licence are all right, and what is left is this certificate and the carrier.
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, &x509.Certificate{}, &key.PublicKey, key)
 	if err != nil {
 		return nil, tls.Certificate{}, fmt.Errorf("certificate: %w", err)
 	}
@@ -1970,6 +2294,20 @@ func enrol() (net.IP, tls.Certificate, error) {
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, tls.Certificate{}, err
+	}
+	// The enrolment's own credentials, in the form another client can be pointed at.
+	//
+	// This is what makes the carrier separable from the identity. The reference client is known to carry
+	// traffic through this edge; if it does so with the credentials this client just registered, then the
+	// registration is the fault. If it does not, the registration is sound and the carrier handshake in
+	// this file is. One of those is a fact and the other is a guess, and this line is what lets the other
+	// client be asked.
+	//
+	// Written to stderr rather than through androidLog, because androidLog is also the device log and this
+	// belongs in the host's own output where a run can read it back.
+	if dump := os.Getenv("WARP_DUMP_CREDENTIALS"); dump != "" {
+		fmt.Fprintf(os.Stderr, "COLGRAM_CREDENTIALS id=%s token=%s\nCOLGRAM_KEY %s\n", id, token,
+			strings.ReplaceAll(string(keyPEM), "\n", "\\n"))
 	}
 	return net.ParseIP(addr).To4(), pair, nil
 }
@@ -2134,7 +2472,7 @@ func measure() (string, error) {
 func measureWith(cfg Config) (string, error) {
 	fmt.Printf("measureWith: env WARP_SOCKS=%q WARP_RELAY=%q\n",
 		os.Getenv("WARP_SOCKS"), os.Getenv("WARP_RELAY"))
-	srcIP, cert, err := enrol()
+	srcIP, cert, err := enrolOnce()
 	if err != nil {
 		return "", err
 	}
@@ -2483,7 +2821,7 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 	}
 	fmt.Println("trace target    :", traceHost, dst.String())
 
-	c := newTunnelConn(tun, srcIP, dst, 51500, 443)
+	c := newTunnelConn(tun, srcIP, dst, ephemeralPort(), 443)
 	tun.peers = append(tun.peers, c)
 	if err := c.open(); err != nil {
 		fmt.Printf("tcp open failed: %v (sent=%d recv=%d)\n", err, c.sent, c.recv)
@@ -2619,7 +2957,7 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 		return "", fmt.Errorf("no IPv4 for %s", traceHost)
 	}
 
-	peer := newTunnelConn(tun, srcIP, dst, 51500, 443)
+	peer := newTunnelConn(tun, srcIP, dst, ephemeralPort(), 443)
 	// TCP options on the SYN, which is what the reference client sends and what this edge carries.
 	//
 	// The bare-header conclusion this replaces was drawn from a run of its own, on this machine, against
@@ -2683,19 +3021,41 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 		"Connection: close",
 		"", "",
 	}, crlf)
-	if _, err := peer.Write([]byte(plain)); err != nil {
-		androidLog(fmt.Sprintf("colgram_masque: plaintext trace write failed: %v", err))
-	}
 	plainBody := make([]byte, 2048)
 	plainRead := 0
-	deadlinePlain := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadlinePlain) && plainRead < len(plainBody) {
-		peer.SetReadDeadline(time.Now().Add(2 * time.Second))
-		n, err := peer.Read(plainBody[plainRead:])
-		plainRead += n
-		if err != nil {
-			break
+	// Repeated on one flow over half a minute rather than sent once.
+	//
+	// If the edge provisions an identity asynchronously after enrolment - which is what would explain a
+	// handshake that completes and a payload that never arrives - then the answer changes with the age of
+	// the enrolment, and one attempt one second after registering cannot see it. The enrolment is now
+	// cached for the life of the process, so this measures the same identity at four ages rather than four
+	// different ones, which is the only way the age is the variable.
+	//
+	// The request itself is the reference client's own, byte for byte, and it is the one request measured to
+	// come back through this carrier:
+	//
+	//   GET /cdn-cgi/trace HTTP/1.1 / Host: www.cloudflare.com / Connection: close
+	//   -> HTTP/1.1 400 Bad Request ... this port does not serve HTTP.
+	//
+	// The 400 is the answer that matters. It proves the edge took the flow out to the real host and the
+	// host's reply came back through the same stream, with no TLS involved anywhere - so a silent plaintext
+	// request is not about TLS, and the carrier does route on this network.
+	for attempt := 0; attempt < 4 && plainRead == 0; attempt++ {
+		if _, err := peer.Write([]byte(plain)); err != nil {
+			androidLog(fmt.Sprintf("colgram_masque: plaintext trace write failed: %v", err))
 		}
+		readUntil := time.Now().Add(8 * time.Second)
+		for time.Now().Before(readUntil) && plainRead == 0 {
+			peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, err := peer.Read(plainBody[plainRead:])
+			plainRead += n
+			if err != nil {
+				break
+			}
+		}
+		androidLog(fmt.Sprintf("colgram_masque: plaintext attempt %d, enrolment age %s, %d bytes back "+
+			"(sent=%d recv=%d)", attempt+1,
+			time.Since(enrolmentAge()).Truncate(time.Second), plainRead, peer.sent, peer.recv))
 	}
 	androidLog(fmt.Sprintf("colgram_masque: plaintext trace returned %d bytes, sent=%d recv=%d: %q",
 		plainRead, peer.sent, peer.recv, head(plainBody[:plainRead], 120)))
@@ -2852,6 +3212,17 @@ func androidLog(msg string) {
 	C.free(unsafe.Pointer(cLine))
 	fmt.Fprintln(os.Stderr, msg)
 }
+
+// logHostSink is where a host build sends what androidLog sends to the platform log.
+//
+// The point of the split is isolation. Everything above this line - the registration, the carrier, the
+// capsule framing, the TCP state machine - is the same code on a phone and on this machine, and the one
+// thing that is not is the device it runs on and the network under it. A fault that reproduces on the host
+// is in the client, and one that does not is in the device or the network, and saying which is worth more
+// than another round of device builds because it takes minutes rather than half an hour.
+//
+// It is empty here and a no-op on the device, where the real sink is the JNI bridge above.
+func logHostSink(string) {}
 
 // edgeCandidate is one (address, local bind) pair to try.
 //
@@ -3521,7 +3892,7 @@ func colgram_masque_open_session(bind, edge *C.char) {
 	sessionMu.Unlock()
 
 	setSessionStage("enrolling", "")
-	srcIP, cert, err := enrol()
+	srcIP, cert, err := enrolOnce()
 	if err != nil {
 		lastExchangeErr = err.Error()
 		setSessionStage("failed", err.Error())
