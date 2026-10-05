@@ -960,6 +960,13 @@ func (c *tunnelConn) readExpired() bool {
 func (c *tunnelConn) waitFor(d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
+	// A wake that arrived with no reader waiting leaves no channel behind - wakeReader clears it so a
+	// later wake cannot close a closed channel - so a reader that arrives afterwards has nothing to select
+	// on. It creates its own, and that is correct: the packet that woke the absent reader is already in
+	// the buffer this loop is about to look at, so waiting on a fresh channel cannot miss it.
+	if c.wake == nil {
+		c.wake = make(chan struct{})
+	}
 	select {
 	case <-c.wake:
 		c.wake = make(chan struct{})
@@ -975,6 +982,24 @@ func (c *tunnelConn) waitFor(d time.Duration) bool {
 func (c *tunnelConn) wakeReader() {
 	if c.wake != nil {
 		close(c.wake)
+		// Cleared here, not left to the reader.
+		//
+		// The reader replaces the channel when it wakes, but a wake that arrives while nobody is waiting
+		// leaves the closed one in place - and the next wakeReader closes it again:
+		//
+		//	panic: close of closed channel
+		//		C:/Colgram/tools/warpgo/native/main.go:977
+		//		C:/Colgram/tools/warpgo/native/main.go:810 +0x78a
+		//
+		// Two packets arriving back to back is enough, and it is reached from ordinary traffic rather than
+		// from teardown: feed() calls wakeReader once for the payload it buffered and once more on the way
+		// out for the ACK it sent. A peer that answers a segment and then the FIN that follows it two
+		// microseconds later does it, and a panic on any goroutine takes the whole process with it - which is
+		// what turning WARP off used to do before the close path was fixed.
+		//
+		// Clearing here rather than in the reader also makes a wake that arrives with no reader waiting a
+		// no-op rather than a bomb, which is the whole reason this helper exists.
+		c.wake = nil
 	}
 }
 
