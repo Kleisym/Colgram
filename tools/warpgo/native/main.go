@@ -469,23 +469,62 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 // emit builds a TCP segment with a real checksum. The edge forwards real TCP, so a wrong checksum
 // here is a connection that is silently dropped.
 func (c *tunnelConn) emit(payload []byte, flags uint16) {
-	pseudo := make([]byte, 0, 12+len(payload))
+	var opts []byte
+	optLen := 0
+	if flags&0x02 != 0 && !c.synned {
+		// The TCP options the handshake is negotiated with, and only on the SYN.
+		//
+		// A SYN with no options is a valid packet and the edge answers it - four SYN-ACKs came back, one per
+		// retransmission. But nothing after that is ever forwarded, and the reason is in the packets a
+		// working client sends on the same carrier:
+		//
+		//     SYN      MSS 1240, SACK permitted, timestamps, window scale 7
+		//     SYN-ACK  MSS 1460, SACK permitted, timestamps, window scale 13
+		//
+		// The edge answers with an MSS and a window scale, which it only does when the SYN left room for
+		// them. With a 20-byte header and no options the flow is never given a segment size, so the first
+		// segment of a ClientHello - which is larger than the default - has nowhere to go and the flow stalls
+		// with the handshake complete and recv frozen at two.
+		//
+		// The client's own SYN-ACK for this flow came back 44 bytes, echoing a SYN that carried nothing, and
+		// the working client's is 52 with four options in it. That is the whole difference.
+		// MSS 1240: the largest segment that fits the 1200-byte packet this carrier has been seen to
+		// carry, less the two headers.
+		opts = []byte{
+			0x02, 0x04, 0x04, 0xd8, // MSS 1240
+			0x04, 0x02, // SACK permitted
+			0x08, 0x0a, // timestamps
+			0xd3, 0x15, 0xd8, 0x4a, 0x00, 0x00, 0x00, 0x00,
+			0x01,       // no-op
+			0x03, 0x03, 0x07, // window scale 7
+		}
+		optLen = len(opts)
+	}
+	tcpLen := 20 + optLen + len(payload)
+
+	pseudo := make([]byte, 0, 12+tcpLen)
 	pseudo = append(pseudo, c.srcIP.To4()...)
 	pseudo = append(pseudo, c.dstIP.To4()...)
 	pseudo = append(pseudo, 0, 6)
 	length := make([]byte, 2)
-	binary.BigEndian.PutUint16(length, uint16(20+len(payload)))
+	// The pseudo-header length is the whole TCP segment, options included. With options added to the
+	// header and left out of this field the checksum is computed over the wrong span and the edge drops
+	// every packet that carries them - which is the same silence the missing options produced.
+	binary.BigEndian.PutUint16(length, uint16(tcpLen))
 	pseudo = append(pseudo, length...)
 
-	seg := make([]byte, 20, 20+len(payload))
+	seg := make([]byte, 20+optLen, 20+optLen+len(payload))
 	binary.BigEndian.PutUint16(seg[0:2], c.srcPort)
 	binary.BigEndian.PutUint16(seg[2:4], c.dstPort)
 	binary.BigEndian.PutUint32(seg[4:8], c.seq)
 	binary.BigEndian.PutUint32(seg[8:12], c.ack)
 	// Data offset lives in the high nibble of the first byte, the flags in the next nine bits.
-	seg[12] = 5<<4 | byte(flags>>8)
+	seg[12] = byte((20+optLen)/4)<<4 | byte(flags>>8)
 	seg[13] = byte(flags)
 	binary.BigEndian.PutUint16(seg[14:16], 64240)
+	if optLen > 0 {
+		copy(seg[20:], opts)
+	}
 	seg = append(seg, payload...)
 	binary.BigEndian.PutUint16(seg[16:18], checksum(append(pseudo, seg...)))
 
@@ -926,6 +965,8 @@ type connectVariant struct {
 	protoHdr  bool // cf-connect-proto header
 	capsule   bool // capsule-protocol header
 	pq        bool // pq-enabled header
+	encoding  bool // accept-encoding header
+	authorityFirst bool // :authority before :method
 	authority string
 	path      string
 	scheme    string
@@ -935,11 +976,24 @@ type connectVariant struct {
 func variants() []connectVariant {
 	auth := connectAuth
 	return []connectVariant{
-		// This one is a transcription of what the working client puts on the wire, field for field: a
-		// plain CONNECT with no :scheme and no :path, an authority carrying the default port, and the
-		// protocol named in the cf-connect-proto header alone. Every other variant here adds something
-		// RFC 8441 asks for and this edge does not want, which is what a stream reset means.
-		{name: "reference client shape", withProto: false, protoHdr: true, capsule: false, authority: auth + ":443", path: "", scheme: ""},
+		// The one this edge answers 200 to, transcribed field for field from a client that was measured
+		// carrying traffic over this carrier:
+		//
+		//     :authority: cloudflareaccess.com:443
+		//     :method: CONNECT
+		//     cf-connect-proto: cf-connect-ip
+		//     pq-enabled: false
+		//     accept-encoding: gzip
+		//
+		// No :scheme and no :path - this edge resets the stream for :protocol, and the two regular headers
+		// are present in every sample that worked. It is first because it is the one that answers, and
+		// because a run that walks the rest first is a run that spends its whole budget being reset:
+		//
+		//     edge ALPN "" after presenting the certificate      x 7
+		//     h2 carrier failed: RST_STREAM stream=1 code=1
+		//
+		// is seven connections to an edge that was refusing new ones.
+		{name: "measured shape", withProto: false, protoHdr: true, capsule: false, pq: true, encoding: true, authorityFirst: true, authority: auth + ":443", path: "", scheme: ""},
 		{name: "protocol+cf-connect-proto", withProto: true, protoHdr: true, capsule: true, authority: auth, path: "/", scheme: "https"},
 		{name: "protocol only", withProto: true, protoHdr: false, capsule: false, authority: auth, path: "/", scheme: "https"},
 		{name: "cf-connect-proto only", withProto: false, protoHdr: true, capsule: true, authority: auth, path: "/", scheme: "https"},
