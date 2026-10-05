@@ -386,6 +386,9 @@ type tunnelConn struct {
 	// the handshake. Echoing the peer's own values rather than this side's is what TCP requires and what
 	// the edge expects: it answered MSS 1460 and window scale 13 where this client offered 1240 and 7.
 	peerOptions []byte
+	// noOptions marks a flow that negotiates nothing: a constant 20-byte header from the SYN onward. It
+	// exists as a control against the options, not as a setting anything would use.
+	noOptions bool
 	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
@@ -498,7 +501,12 @@ func synOptions() []byte {
 func (c *tunnelConn) emit(payload []byte, flags uint16) {
 	var opts []byte
 	optLen := 0
-	if flags&0x02 != 0 && !c.synned {
+	if c.noOptions {
+		// This flow never negotiates anything: a constant 20-byte header from the first packet onward.
+		// It exists to separate two faults that look identical from the outside - an edge that objects to
+		// TCP options, and an edge that objects to the handshake - by carrying the same payload over a flow
+		// with none of them.
+	} else if flags&0x02 != 0 && !c.synned {
 		// The TCP options the handshake is negotiated with, and only on the SYN.
 		//
 		// A SYN with no options is a valid packet and the edge answers it - four SYN-ACKs came back, one per
@@ -2308,6 +2316,27 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	probePeer.seq = probePeer.synSeq + 1
 	probePeer.emit([]byte("probe"), 0x18)
 	androidLog("colgram_masque: probe sent: one data segment to 104.16.123.96:9, a closed port")
+
+	// The same bytes again, on a flow whose handshake never negotiates anything.
+	//
+	// The probe above came back at 45 bytes with no options, because a peer that never completed a
+	// handshake has none to carry - and it was answered. The ClientHello flow was not, and the only thing
+	// structurally different between them is the negotiated 40-byte header. So this opens a second flow to
+	// the same destination with a constant 20-byte header from the first packet onward - SYN with no
+	// options, data with no options - and sends the same payload over it.
+	//
+	// If that is answered, the options are what the edge objects to. If it is not, the fault is in the
+	// handshake rather than in what follows it, and the probe has already shown the carrier is fine.
+	bare := newTunnelConn(tun, srcIP, dst.To4(), 40011, 443)
+	bare.noOptions = true
+	if err := bare.open(); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: bare flow did not open: %v", err))
+	} else {
+		androidLog(fmt.Sprintf("colgram_masque: bare flow open, sent=%d recv=%d; sending the same payload",
+			bare.sent, bare.recv))
+		bare.emit([]byte("probe"), 0x18)
+		androidLog("colgram_masque: bare flow data sent")
+	}
 
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
