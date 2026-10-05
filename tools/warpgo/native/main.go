@@ -382,6 +382,10 @@ type tunnelConn struct {
 	// it, and the client's own counter has to be sitting at synSeq+1 when it does - otherwise the data that
 	// follows is sent from a sequence the far side has not acknowledged and never leaves the handshake.
 	synSeq uint32
+	// peerOptions are the options the far side sent on its SYN-ACK, echoed back on every segment after
+	// the handshake. Echoing the peer's own values rather than this side's is what TCP requires and what
+	// the edge expects: it answered MSS 1460 and window scale 13 where this client offered 1240 and 7.
+	peerOptions []byte
 	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
@@ -499,6 +503,24 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 			0x03, 0x03, 0x07, // window scale 7
 		}
 		optLen = len(opts)
+	} else if c.synned {
+		// Every segment after the handshake carries the same options the peer saw on the SYN.
+		//
+		// The options were only on the SYN in an earlier version, and the flow died on the very next
+		// packet. The SYN now goes out at 60 bytes and the edge answers at 60, and then:
+		//
+		//     outbound 40 bytes,  flags 0x010, seq 2    ACK          <- 20-byte header
+		//     outbound 440 bytes, flags 0x018, seq 2    ClientHello  <- 20-byte header
+		//     tls inside tunnel: i/o timeout (sent=11 recv=2)
+		//
+		// The handshake negotiated a 40-byte header and then the stream changed to 20 bytes one byte later.
+		// The far side has no way to know the payload did not move with it, and the flow stops.
+		//
+		// The values echoed are the peer's, read off its SYN-ACK - it answered MSS 1460 and window scale 13
+		// where this client offered 1240 and 7 - because an echo of anything else is a different option set
+		// than the one the peer recorded.
+		opts = c.peerOptions
+		optLen = len(opts)
 	}
 	tcpLen := 20 + optLen + len(payload)
 
@@ -530,8 +552,8 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 
 	c.sent++
 	c.tun.sendIP(ipv4Packet(c.srcIP, c.dstIP, seg))
-	androidLog(fmt.Sprintf("colgram_masque: outbound %d bytes, flags 0x%03x, seq %d ack %d, payload %d",
-		len(seg)+20, flags, c.seq, c.ack, len(payload)))
+	androidLog(fmt.Sprintf("colgram_masque: outbound %d bytes (opts %d, peer %d), flags 0x%03x, seq %d ack %d, payload %d",
+		len(seg)+20, optLen, len(c.peerOptions), flags, c.seq, c.ack, len(payload)))
 }
 
 func (c *tunnelConn) feed(ip []byte) {
@@ -560,6 +582,12 @@ func (c *tunnelConn) feed(ip []byte) {
 			if !c.synned {
 				// First handshake: the far side's SYN is acknowledged, and the flow becomes usable.
 				c.ack = seq + 1
+				// Its options are recorded here and echoed on every segment after this one. Dropping them
+				// changes the header length one byte into the stream, which is why the flow completed its
+				// handshake and then stopped forwarding.
+				if len(payload) == 0 && offset > 20 {
+					c.peerOptions = append([]byte(nil), tcp[offset:]...)
+				}
 				// The client's own sequence has to move past the SYN before any data is sent, and the far
 				// side has to see that acknowledged before it will read a data segment from this flow.
 				//
