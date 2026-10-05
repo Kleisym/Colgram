@@ -1228,10 +1228,6 @@ func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, 
 	// It is off by default and it is not a debug aid left in by accident: a carrier that accepts a request
 	// with status 200, answers a SYN-ACK, and then forwards no data is indistinguishable from a correct one
 	// at every layer this client can see. The bytes are the layer below that.
-	trace := h2Trace()
-	if trace != nil {
-		trace.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...))
-	}
 	if _, err := c.conn.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...)); err != nil {
 		tc.Close()
 		return nil, err
