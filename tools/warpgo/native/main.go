@@ -368,7 +368,14 @@ func socksAddrForAttempt() string {
 // warp=on, is 466. So the segment is sized to sit under what the carrier has actually been seen to
 // carry rather than under what the protocol permits. A TLS ClientHello is a few hundred bytes and
 // arrives in three or four segments instead of two, which costs a round trip and nothing else.
-const maxDatagramPayload = 400
+//
+// It is back at 1100 because that is the value the `warp=on` run used, and lowering it was a change made
+// on the strength of a note about the largest packet seen crossing the edge - a note that the same run
+// contradicts, since a session that returned `warp=on` carried a 1100-byte payload segment. A segment
+// size that has been measured in the direction that works outranks one inferred from a stall that was
+// measured under other conditions. Nothing else on the trace path differs from that run: the HTTP/2
+// session, the request shape, the capsule framing and the resolver are byte-identical to it.
+const maxDatagramPayload = 1100
 
 // tunnelConn is a net.Conn whose bytes travel as Connect-IP capsules inside the MASQUE stream.
 // Everything above it - the TLS client, the HTTP request - is an ordinary library.
@@ -386,9 +393,6 @@ type tunnelConn struct {
 	// the handshake. Echoing the peer's own values rather than this side's is what TCP requires and what
 	// the edge expects: it answered MSS 1460 and window scale 13 where this client offered 1240 and 7.
 	peerOptions []byte
-	// noOptions marks a flow that negotiates nothing: a constant 20-byte header from the SYN onward. It
-	// exists as a control against the options, not as a setting anything would use.
-	noOptions bool
 	// Deadlines are checked on the packet boundary. A capsule stream has no socket to hand a deadline
 	// to, so the time is carried here and consulted when the next packet would otherwise wait.
 	readDeadline  time.Time
@@ -465,6 +469,30 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 	hdr[0] = 0x45
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(20+len(payload)))
 	binary.BigEndian.PutUint16(hdr[4:6], 0x4321)
+	// Don't Fragment, on every packet.
+	//
+	// The reference client sets it on everything it sends, and it was the one field this client's packets
+	// did not have. Off its own capture, on the carrier that returned warp=on:
+	//
+	//   SYN    45 00 00 3c 00 00 40 00 3f 06 ...   flags/fragment = 0x4000
+	//   data   45 00 00 80 00 00 40 00 3f 06 ...   flags/fragment = 0x4000, still set
+	//
+	// and this client was writing 0x0000 into those two bytes on every packet, which is "may fragment"
+	// with a zero fragment offset - a packet an edge is free to split or to drop. A tunnel of this shape
+	// cannot have its segments fragmented: the payload is a capsule, and a capsule cut in half is two
+	// pieces the edge cannot reassemble, because nothing in Connect-IP carries a fragment reassembly key.
+	//
+	// That is the same reasoning the MSS option is already making, one layer down. A peer that forwards on
+	// the segment rather than on the byte stream, which a tunnel terminating TCP at its edge does, has no
+	// way to put a fragmented capsule back together - so it declines to forward one, silently, and the flow
+	// that carried the SYN goes quiet exactly where this one goes quiet:
+	//
+	//   h2 peer open, sent=7 recv=2
+	//   plaintext trace returned 0 bytes, sent=8 recv=2: ""
+	//
+	// 0x4000 is the Don't Fragment bit: the high bit of the flags byte, which is bits 6 and 7 of the 16-bit
+	// flags-and-fragment-offset field with the low 13 bits - the fragment offset - left at zero.
+	binary.BigEndian.PutUint16(hdr[6:8], 0x4000)
 	hdr[8] = 64
 	hdr[9] = 6
 	copy(hdr[12:16], src.To4())
@@ -488,25 +516,91 @@ func ipv4Packet(src, dst net.IP, payload []byte) []byte {
 // negotiated. A flow that starts with a 40-byte header and continues with a 20-byte one is a different
 // stream, and the far side has no way to know the payload did not move with it.
 func synOptions() []byte {
+	now := uint32(time.Since(processStart) / time.Millisecond)
 	return []byte{
 		0x02, 0x04, 0x04, 0xd8, // MSS 1240
 		0x04, 0x02, // SACK permitted
 		0x08, 0x0a, // timestamps
-		0xd3, 0x15, 0xd8, 0x4a, 0x00, 0x00, 0x00, 0x00,
+		byte(now >> 24), byte(now >> 16), byte(now >> 8), byte(now),
+		0x00, 0x00, 0x00, 0x00, // TSecr, replaced with the peer's TSval once it has sent one
 		0x01,             // no-op
 		0x03, 0x03, 0x07, // window scale 7
 	}
 }
 
+// stampEcho writes this flow's own clock into the timestamp option's echo field.
+//
+// The reference client's option block is not constant across the flow. Off its own capture:
+//
+//	SYN    08 0a ea e8 58 37 00 00 00 00    TSval 0xeae85837, TSecr 0
+//	data   08 0a ea e8 5f 8f 8b 43 33 17    TSval 0xeae85f8f, TSecr 0x8b433317
+//
+// TSval advances with the clock and TSecr becomes the TSval the edge sent on its SYN-ACK. So the echo is
+// not decoration: it is how each side proves to the other that the segment it is acknowledging is one it
+// actually received, and an echo of zero on every segment after the handshake says this flow received
+// nothing - which is precisely the state the edge was in when it stopped answering.
+func stampEcho(opts, peer []byte) []byte {
+	ts := optionValue(peer, 8)
+	if ts == nil || opts == nil {
+		return opts
+	}
+	// Walk this side's options to the timestamp block and overwrite its echo half.
+	for i := 0; i+2 <= len(opts); {
+		kind := opts[i]
+		if kind == 0 {
+			break
+		}
+		if kind == 1 {
+			i++
+			continue
+		}
+		length := int(opts[i+1])
+		if length < 2 || i+length > len(opts) {
+			break
+		}
+		if kind == 8 && length >= 10 {
+			copy(opts[i+6:i+10], ts)
+			return opts
+		}
+		i += length
+	}
+	return opts
+}
+
+// optionValue returns the four value bytes of a TCP option of the given kind, or nil.
+func optionValue(opts []byte, kind byte) []byte {
+	for i := 0; i+2 <= len(opts); {
+		k := opts[i]
+		if k == 0 {
+			return nil
+		}
+		if k == 1 {
+			i++
+			continue
+		}
+		length := int(opts[i+1])
+		if length < 2 || i+length > len(opts) {
+			return nil
+		}
+		if k == kind {
+			if length >= 10 {
+				return opts[i+2 : i+6]
+			}
+			return nil
+		}
+		i += length
+	}
+	return nil
+}
+
+// processStart anchors the timestamp option's clock. TCP timestamps are milliseconds from an arbitrary
+// but monotonic origin, and uptime is what this device exposes without asking for permission.
+var processStart = time.Now()
+
 func (c *tunnelConn) emit(payload []byte, flags uint16) {
 	var opts []byte
 	optLen := 0
-	if c.noOptions {
-		// This flow never negotiates anything: a constant 20-byte header from the first packet onward.
-		// It exists to separate two faults that look identical from the outside - an edge that objects to
-		// TCP options, and an edge that objects to the handshake - by carrying the same payload over a flow
-		// with none of them.
-	} else if flags&0x02 != 0 && !c.synned {
+	if flags&0x02 != 0 && !c.synned {
 		// The TCP options the handshake is negotiated with, and only on the SYN.
 		//
 		// A SYN with no options is a valid packet and the edge answers it - four SYN-ACKs came back, one per
@@ -561,6 +655,10 @@ func (c *tunnelConn) emit(payload []byte, flags uint16) {
 			// that answered with none gets the ones this side offered, which is at least a constant header.
 			opts = synOptions()
 		}
+		// This side's own clock advances on every segment and its echo field carries the peer's TSval.
+		// A constant pair, or an echo of zero, tells the peer the flow received nothing - and the peer's
+		// reply to a flow it believes received nothing is silence.
+		opts = stampEcho(opts, c.peerOptions)
 		optLen = len(opts)
 	}
 	tcpLen := 20 + optLen + len(payload)
@@ -627,7 +725,15 @@ func (c *tunnelConn) feed(ip []byte) {
 				// changes the header length one byte into the stream, which is why the flow completed its
 				// handshake and then stopped forwarding.
 				if len(payload) == 0 && offset > 20 {
-					c.peerOptions = append([]byte(nil), tcp[offset:]...)
+					// Only the option bytes, not everything from the option offset to the end of the
+					// buffer. `tcp[offset:]` reads past the options into whatever else arrived in the
+					// same capsule - and on this edge that is a segment carrying payload, so the copy taken
+					// was 20 option bytes followed by a live sequence and a payload, and echoing that back
+					// on every segment afterwards puts a wrong-length header in front of real data.
+					//
+					// The options are bounded by the data offset, which is the field that says where the
+					// header ends: offset-20 bytes of them, and nothing beyond.
+					c.peerOptions = append([]byte(nil), tcp[20:offset]...)
 					androidLog(fmt.Sprintf("colgram_masque: captured %d peer option bytes: %x",
 						len(c.peerOptions), c.peerOptions))
 				} else {
@@ -912,6 +1018,10 @@ type h2raw struct {
 	wmu    sync.Mutex
 	sid    uint32
 	inflow int32
+	// maxFrame is the MAX_FRAME_SIZE this client advertised in its own SETTINGS. The edge sizes the DATA
+	// frames it sends against what the client declared, and a frame this client sends larger than that
+	// declaration is a protocol error rather than a slow write, so the two are held to one number.
+	maxFrame int
 }
 
 func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, error) {
@@ -938,7 +1048,7 @@ func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, 
 		// request that follows is what decides whether the carrier is usable, so the check is left to it.
 		androidLog(fmt.Sprintf("colgram_masque: edge ALPN %q after presenting the certificate", got))
 	}
-	c := &h2raw{conn: tc, br: bufio.NewReader(tc), sid: 1, inflow: 65536}
+	c := &h2raw{conn: tc, br: bufio.NewReader(tc), sid: 1, inflow: 65536, maxFrame: 16384}
 	// The connection preface, then our own SETTINGS carrying ENABLE_CONNECT_PROTOCOL so the edge can
 	// see the client supports it even though it never tells us that it does.
 	// The settings a client that carries traffic over this carrier sends, transcribed from the bytes it
@@ -992,16 +1102,36 @@ func (c *h2raw) awaitSettings(ctx context.Context) (bool, error) {
 				return false, fmt.Errorf("settings payload is not a multiple of six")
 			}
 			allowed := false
+			var seen []string
 			for i := 0; i+6 <= len(payload); i += 6 {
 				id := uint16(payload[i])<<8 | uint16(payload[i+1])
 				val := uint32(payload[i+2])<<24 | uint32(payload[i+3])<<16 | uint32(payload[i+4])<<8 | uint32(payload[i+5])
+				seen = append(seen, fmt.Sprintf("0x%x=%d", id, val))
 				switch id {
 				case 0x8:
 					allowed = val == 1
 				case 0x3:
 					c.inflow = int32(val)
+				case 0x4:
+					// The edge's INITIAL_WINDOW_SIZE, which is the ceiling on what it will accept in DATA on
+					// the tunnel stream before it sends a WINDOW_UPDATE. This client tracks no outbound
+					// window at all, so the number is reported rather than enforced - and reporting it is
+					// what says whether a tunnel that stalls after its handshake completed ever had credit to
+					// carry the payload that stalled it.
+					androidLog(fmt.Sprintf("colgram_masque: edge SETTINGS INITIAL_WINDOW_SIZE %d", val))
+				case 0x5:
+					androidLog(fmt.Sprintf("colgram_masque: edge SETTINGS MAX_FRAME_SIZE %d", val))
 				}
 			}
+			// Every setting the edge sends, by name. A tunnel that answers a SYN and then discards every
+			// segment after the handshake is a tunnel whose carrier refused one of the conditions the
+			// tunnel needs, and the SETTINGS frame is the only place those conditions are stated. The two
+			// that decide this: MAX_CONCURRENT_STREAMS (0x3), which caps how many CONNECT streams the edge
+			// will carry at once - and this client opens a negotiation connection per request shape before it
+			// opens the tunnel, so a cap of 1 would leave the tunnel stream with nothing to run on - and
+			// ENABLE_CONNECT_PROTOCOL (0x8), which is what makes an extended CONNECT legal at all.
+			androidLog(fmt.Sprintf("colgram_masque: edge SETTINGS %v (connect_protocol=%v)",
+				seen, allowed))
 			// Acknowledge, or the edge treats the connection as unresponsive.
 			if _, err := c.conn.Write(frameH2(0x4, 0x1, 0, nil)); err != nil {
 				return false, err
@@ -1119,6 +1249,37 @@ func (c *h2raw) sendConnect(ctx context.Context, v connectVariant) (int, map[str
 		enc.WriteField(hpack.HeaderField{Name: "pq-enabled", Value: "false"})
 	}
 	enc.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "gzip"})
+	// The request body is a stream of capsules, and the header that says so is what makes the edge read
+	// it as one. The working client builds the request with an io.Pipe and sets ContentLength to -1:
+	//
+	//	req.ContentLength = -1
+	//	req, _ := http.NewRequestWithContext(ctx, http.MethodConnect, u.String(), pr)
+	//	req.Host = authorityFromURL(u)
+	//
+	// which Go's http2 client writes as a header block with no content-length at all, and then writes the
+	// capsules into that body as they are produced. Nothing here differs in what the tunnel sends - the
+	// capsule is still type 0, a length, and the IP packet - so the shape of the request was measured to be
+	// acceptable while the way the body is carried was not.
+	//
+	// What that difference does to the edge is the whole fault. Written as DATA frames after the headers,
+	// each capsule is a separate message the edge can accept and then route nothing for:
+	//
+	//	h2 peer open, sent=7 recv=2          SYN out, SYN-ACK in, ACK out - the flow opens
+	//	outbound 1140 bytes (opts 0), flags 0x018, seq 2   payload 1100   ClientHello out
+	//	outbound 465 bytes  (opts 0), flags 0x018, seq 1102 payload 425   the rest out
+	//	72-byte probe on the handshake flow, sent=8 recv=2
+	//	h2 carrier failed: tls inside tunnel: i/o timeout (sent=9 recv=2)
+	//
+	// The handshake completes and nothing after it is ever answered, and a probe one byte into the same
+	// flow changes nothing - so the packets are not being rejected for their size, their options or their
+	// checksums. They are arriving on a stream the edge is holding open without reading the body of, which
+	// is what a CONNECT whose body was declared finished looks like from here.
+	if !v.endStream {
+		// Declared absent rather than zero: a zero-length body is a body that is finished, and this one
+		// must not be.
+	} else {
+		enc.WriteField(hpack.HeaderField{Name: "content-length", Value: "0"})
+	}
 
 	c.sid = 1
 	flags := byte(0x4) // END_HEADERS
@@ -1173,6 +1334,20 @@ func (c *h2raw) sendConnect(ctx context.Context, v connectVariant) (int, map[str
 func (c *h2raw) writeData(b []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	// Split on the frame size this client advertised. The edge is given MAX_FRAME_SIZE in our SETTINGS and
+	// will not send a DATA frame larger than it, but a frame larger than what we advertised is a protocol
+	// error, and one that ends the tunnel rather than stalling it - so a capsule is written whole here
+	// because the declared size (16384) is larger than any packet this tunnel builds (1140 at the most).
+	//
+	// MAX_FRAME_SIZE is 16384. A tunnel packet is an IPv4 header, a TCP header and a segment, capped at
+	// maxDatagramPayload, and the capsule header is two bytes in front of it. The largest this client can
+	// produce is therefore 20+20+1100+2 = 1142, well inside the declared frame size, and it is checked here
+	// rather than assumed - a segment cap raised past the frame size would take the tunnel down on every
+	// write instead of on the one that is too large.
+	if c.maxFrame > 0 && len(b) > c.maxFrame {
+		return fmt.Errorf("capsule of %d bytes exceeds the %d-byte frame size this client advertised",
+			len(b), c.maxFrame)
+	}
 	_, err := c.conn.Write(frameH2(0x0, 0, c.sid, b))
 	return err
 }
@@ -1244,6 +1419,99 @@ func isBareIPv4(b []byte) bool {
 	return int(binary.BigEndian.Uint16(b[2:4])) == len(b)
 }
 
+// nextInboundPacket takes one whole IP packet off the front of a tunnel stream's byte stream, in either
+// of the two shapes the edge has been measured to send, and returns what is left.
+//
+// Both shapes are real, and which one is in use is decided per call by the buffer itself rather than by a
+// setting, because the same edge sends both:
+//
+//	framed   00 3c 45 00 00 3c ...      a QUIC varint capsule type and length, then the packet. The
+//	                                   header is two bytes for a type under 64 and a length under 64,
+//	                                   which is every packet this tunnel sends.
+//	bare     45 00 00 3c 77 3e ...      the packet with nothing in front of it, which is what arrived on
+//	                                   the frames of the session that returned warp=on.
+//
+// The two cannot be confused by accident: a bare packet starts with 0x45 in the version/IHL byte, so as a
+// varint that reads as a type of 5 with a second byte that would be the start of its length - and a framed
+// packet starts with 0x00, which is no IP version at all. Each is checked on its own terms and the buffer
+// says which it is holding.
+//
+// A partial packet is left alone and more is asked for. That is the whole reason this is here: the edge
+// split a capsule header from its packet across two DATA frames, and reading a frame at a time returned the
+// header alone, then the packet with its first two bytes already gone.
+func nextInboundPacket(buf []byte) (packet, rest []byte, ok bool) {
+	if len(buf) < 2 {
+		return nil, buf, false
+	}
+
+	// Bare: the version nibble is the whole test, and the total length inside the header says how much the
+	// packet is. A framed packet cannot reach here - its first byte is a varint type, and 4 is not the only
+	// thing that could follow, so the total-length check is what makes this safe.
+	if buf[0]>>4 == 4 {
+		if len(buf) < 20 {
+			return nil, buf, false
+		}
+		hl := int(buf[0]&0x0f) * 4
+		if hl < 20 || hl > 60 || len(buf) < hl {
+			return nil, buf, false
+		}
+		total := int(binary.BigEndian.Uint16(buf[2:4]))
+		if total < hl {
+			return nil, buf, false
+		}
+		if len(buf) < total {
+			return nil, buf, false
+		}
+		return buf[:total], buf[total:], true
+	}
+
+	// Framed: capsule type, then payload length, both QUIC varints.
+	typeVal, typeLen, typeOK := readCapsuleVarint(buf)
+	if !typeOK {
+		return nil, buf, false
+	}
+	lenVal, lenLen, lenOK := readCapsuleVarint(buf[typeLen:])
+	if !lenOK {
+		return nil, buf, false
+	}
+	header := typeLen + lenLen
+	// Only the datagram capsule carries an IP packet. Anything else on this stream is a control message
+	// this client has no use for, and it is skipped by its own declared length rather than guessed at.
+	if typeVal != 0 {
+		total := header + int(lenVal)
+		if total > len(buf) {
+			return nil, buf, false
+		}
+		return nil, buf[total:], true
+	}
+	total := header + int(lenVal)
+	if total > len(buf) {
+		return nil, buf, false
+	}
+	return buf[header:total], buf[total:], true
+}
+
+// readCapsuleVarint reads a QUIC varint and returns the value with how many bytes it took.
+//
+// Named apart from readVarint below, which is the older pre-RFC encoding that file already had: that one
+// reads 0x40 as a two-byte value while RFC 9000 reserves the top two bits as a length, so 0x40 is a
+// one-byte value of 64. A capsule length is written by the edge under RFC 9000, so it is read that way.
+func readCapsuleVarint(b []byte) (value uint64, size int, ok bool) {
+	if len(b) == 0 {
+		return 0, 0, false
+	}
+	prefix := b[0] >> 6
+	size = 1 << prefix
+	if len(b) < size {
+		return 0, 0, false
+	}
+	value = uint64(b[0] & 0x3f)
+	for i := 1; i < size; i++ {
+		value = value<<8 | uint64(b[i])
+	}
+	return value, size, true
+}
+
 // h2CapsuleStream adapts the hand-framed HTTP/2 tunnel to the same capsuleStream the QUIC path uses,
 // so every other part of this file - the IP/TCP peer state machine, the dispatch, the statistics -
 // works unchanged on either carrier.
@@ -1258,6 +1526,28 @@ func isBareIPv4(b []byte) bool {
 // PROTOCOL_ERROR for :protocol and wants cf-connect-proto instead, which is what its own client sends.
 type h2CapsuleStream struct {
 	h2 *h2raw
+	// buf is the tunnel stream's byte stream, reassembled across DATA frames.
+	//
+	// A DATA frame is not a packet. The edge is free to split the stream wherever it likes, and it splits
+	// it: the capsule header and the packet that follows arrive in separate frames, because the reference
+	// client's own capture shows exactly that -
+	//
+	//   H2 READ 80 bytes:  00 00 02 00 00 00 00 01 00 3c 00 3c 00 00 00 00 00 01
+	//                     45 00 00 3c 00 00 40 00 40 06 ab 39 68 10 7b 60 ac 10 00 02 ...
+	//                     ^^ a 60-byte DATA frame carrying nothing but the two capsule bytes 00 3c
+	//
+	//   H2 READ 72 bytes:  00 00 02 00 00 00 00 01 00 34 00 34 00 00 00 00 00 01
+	//                     45 00 00 34 77 3e 40 00 40 06 34 03 68 10 7b 60 ac 10 00 02 ...
+	//                     ^^ the next frame carries the 52-byte packet, unframed
+	//
+	// Reading one frame and handing it up as a packet therefore returns a two-byte buffer the first time
+	// and a packet with its header already consumed the second. Both fail every check the reader makes, so
+	// a tunnel that the edge is carrying traffic through returns nothing - which is the state this path was
+	// in, with `recv` frozen on the handshake:
+	//
+	//   h2 peer open, sent=7 recv=2
+	//   h2 carrier failed: tls inside tunnel: i/o timeout (sent=9 recv=2)
+	buf []byte
 }
 
 func (cs *h2CapsuleStream) SendDatagram(data []byte) error {
@@ -1297,33 +1587,22 @@ func (cs *h2CapsuleStream) ReceiveDatagram(ctx context.Context) ([]byte, error) 
 					return nil, io.EOF
 				}
 			}
-			if len(payload) == 0 {
-				continue
-			}
-			// The reply is a bare IP packet with nothing in front of it. Measured: every DATA frame on the
-			// tunnel stream of a session that returned warp=on began with the IP version nibble, and the
-			// total-length field inside the header matched the frame length. Stripping a capsule here read
-			// the version byte as a capsule type and the IHL byte as a length and returned the packet
-			// shifted by two, so a tunnel that opened and accepted capsules delivered nothing upstream.
-			// The header is its own check, so it is made rather than assumed.
-			if isBareIPv4(payload) {
+			if len(payload) > 0 {
 				// Credit the bytes back.
 				//
 				// An HTTP/2 stream has a flow-control window, and this client opened it at the default 65535
 				// and never raised it. Every packet the edge sends narrows it, and once it reaches zero the
-				// edge stops sending - silently, because a flow-control stall is not an error it reports:
-				//
-				//   h2 peer open, sent=7 recv=2          <- SYN, SYN-ACK
-				//   tls inside tunnel: i/o timeout       <- the ClientHello never comes back
-				//
-				// The handshake completes and nothing larger than one packet follows, which is what a drained
-				// window looks like from here. The credit is returned per packet, and the connection-level
-				// window too, so the edge is never waiting on this side.
+				// edge stops sending - silently, because a flow-control stall is not an error it reports. The
+				// credit is returned per frame, and for the connection as well as the stream, because a
+				// stream cannot be credited past the connection that carries it.
 				cs.h2.credit(len(payload))
-				return payload, nil
+				cs.buf = append(cs.buf, payload...)
 			}
-			cs.h2.credit(len(payload))
-			return payload, nil
+			// Take a whole packet off the stream, if one has arrived whole.
+			if pkt, rest, ok := nextInboundPacket(cs.buf); ok {
+				cs.buf = rest
+				return pkt, nil
+			}
 		case 0x8: // WINDOW_UPDATE
 			continue
 		case 0x6: // PING
@@ -1909,6 +2188,31 @@ func measureWith(cfg Config) (string, error) {
 				androidLog(fmt.Sprintf("colgram_masque: edge %s via %s failed: %v", c.addr, c.bind, err))
 			}
 			bridgeErr = errString(err)
+			// One handshake is enough to rule the QUIC carrier out on this network.
+			//
+			// The candidates are six ports times every local bind, and on a network that filters UDP to
+			// this edge they all fail the same way - a handshake that never completes. Measured:
+			//
+			//   edge 162.159.198.2:500  via 10.0.2.15 failed: tcp handshake through the tunnel did not complete
+			//   edge 162.159.198.2:8443 via 10.0.2.15 failed: tcp handshake through the tunnel did not complete
+			//   edge 162.159.198.2:8095 via 10.0.2.15 failed: tcp handshake through the tunnel did not complete
+			//   edge 162.159.198.2:4500 via 10.0.2.15 failed: tcp handshake through the tunnel did not complete
+			//   edge 162.159.198.2:4443 via 10.0.2.15 failed: tcp handshake through the tunnel did not complete
+			//   edge 162.159.198.2:443  via 10.0.2.15 failed: tcp handshake through the tunnel did not complete
+			//
+			// Twenty-two seconds each, so two and a half minutes before the HTTP/2 carrier - the one that
+			// actually carries this tunnel - is asked at all. Six failures in a row, all identical, on one
+			// edge, is one fact rather than six: the carrier is not reachable from here. So the search
+			// stops on the second failure, which is what distinguishes a filtered path from a port that is
+			// merely closed, and the remaining time goes to the carrier that can work.
+			//
+			// A different network keeps the whole search: the carriers are ranked so a port that answers is
+			// tried before one that does not, and the break only fires on two consecutive handshake failures.
+			if i >= 1 {
+				androidLog(fmt.Sprintf("colgram_masque: %d QUIC candidates failed identically; this network "+
+					"cannot reach the QUIC carrier, and the HTTP/2 carrier is asked instead", i+1))
+				break
+			}
 		}
 		// Every direct route is dead. Try leaving through the in-app relay, which binds its own
 		// upstream socket to an egress the edge does answer.
@@ -2155,12 +2459,6 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 	fmt.Println("trace target    :", traceHost, dst.String())
 
 	c := newTunnelConn(tun, srcIP, dst, 51500, 443)
-	// No options on this flow. Measured: a flow that negotiates a 40-byte header is discarded by the edge
-	// after the handshake completes, and a flow with a constant 20-byte header is answered - six packets
-	// back on the same tunnel, in the same session, for the same destination and account. The tunnel
-	// terminates the flow at the edge and the edge sends its own segments, so a negotiated option set here
-	// changes the header length of packets it matches against a stream it set up differently.
-	c.noOptions = true
 	tun.peers = append(tun.peers, c)
 	if err := c.open(); err != nil {
 		fmt.Printf("tcp open failed: %v (sent=%d recv=%d)\n", err, c.sent, c.recv)
@@ -2297,12 +2595,33 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	}
 
 	peer := newTunnelConn(tun, srcIP, dst, 51500, 443)
-	// No options, and measured rather than assumed: on this carrier a flow that negotiates a 40-byte
-	// header is discarded after the handshake completes, and a flow with a constant 20-byte header is
-	// answered - six packets back on the same tunnel, for the same destination and account. The tunnel is
-	// terminated at the edge and the edge sends its own segments, so a negotiated option set here changes
-	// the header length of packets it matches against a stream it laid out differently.
-	peer.noOptions = true
+	// TCP options on the SYN, which is what the reference client sends and what this edge carries.
+	//
+	// The bare-header conclusion this replaces was drawn from a run of its own, on this machine, against
+	// this edge - and it was wrong, and the working client's own SYN is the counter-example:
+	//
+	//   H2 WRITE 71 bytes: ... 00 3c 45 00 00 3c 00 00 40 00 3f 06 ac 39 ac 10 00 02
+	//                        68 10 7b 60 d1 e7 01 bb 18 73 b5 cc 00 00 00 00 a0 02 60
+	//                        80 73 d6 00 00 02 04 04 d8 04 02 08 0a ea e8 58 37 00 00 00
+	//                        00 01 03 03 07
+	//
+	// Decoded: a 62-byte capsule wrapping a 40-byte TCP header, and the 20 bytes after it are
+	//
+	//   02 04 04 d8   MSS 1240
+	//   04 02         SACK permitted
+	//   08 0a ...     timestamps, TSval 0xeae85837, TSecr 0
+	//   01            NOP
+	//   03 03 07      window scale 7
+	//
+	// which is byte for byte what synOptions() returns. So the options were never the fault; the flow that
+	// was reported as answered without them was answered by the edge's own SYN-ACK, which the handshake
+	// completes on regardless - and a flow that completes its handshake and then goes silent looks the same
+	// from here whether the options are wrong or the data is. The 72-byte probe is what told the two apart,
+	// and it is a data segment, not a SYN:
+	//
+	//   72-byte probe on the handshake flow, sent=8 recv=2     with a 20-byte header, on a 20-byte flow
+	//
+	// Everything before that probe measured the SYN, which the edge answers either way.
 	tun.peers = append(tun.peers, peer)
 	if err := peer.open(); err != nil {
 		androidLog(fmt.Sprintf("colgram_masque: h2 peer open failed: %v (sent=%d recv=%d)",
@@ -2312,31 +2631,49 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	}
 	androidLog(fmt.Sprintf("colgram_masque: h2 peer open, sent=%d recv=%d", peer.sent, peer.recv))
 
-	// Size, the last variable the answered flow and the silent one have not had separated.
+	// The reference client's own request, sent here in plaintext before any TLS, because it is the one
+	// request measured to come back through this carrier:
 	//
-	// A five-byte segment on a flow that had been opened and answered with six packets back. A ClientHello
-	// of 1705 bytes, split into four 440-byte segments, on the flow beside it, answered with nothing. Both are
-	// bare 20-byte-header flows to port 443 on the same tunnel in the same second, so everything else about
-	// them is already equal - the carrier, the capsule, the handshake, the destination address.
+	//   H2 WRITE 140 bytes: ... 45 00 00 80 ... 18 01 00 05 8f 40 00 00 01 01 08 0a ea e8 5f 8f
+	//                      8b 43 33 17 47 45 54 20 2f 63 64 6e 2d 63 67 69 2f 74 72 61 63 65 20
+	//                      48 54 54 50 2f 31 2e 31 0d 0a 48 6f 73 74 3a 20 77 77 77 2e 63 6c 6f
+	//                      75 64 66 6c 61 72 65 2e 63 6f 6d 0d 0a 43 6f 6e 6e 65 63 74 69 6f 6e
+	//                      3a 20 63 6c 6f 73 65 0d 0a 0d 0a
 	//
-	// So the payload goes out again at five sizes on a fresh flow each time. The largest that still comes
-	// back is the largest segment this edge will carry, and everything above it is what has to be
-	// negotiated or fragmented differently.
-	for _, size := range []int{5, 100, 200, 400} {
-		flow := newTunnelConn(tun, srcIP, dst.To4(), uint16(40100+size%97), 443)
-		flow.noOptions = true
-		if err := flow.open(); err != nil {
-			androidLog(fmt.Sprintf("colgram_masque: size probe %d did not open: %v", size, err))
-			continue
-		}
-		payload := make([]byte, size)
-		for i := range payload {
-			payload[i] = 'x'
-		}
-		flow.emit(payload, 0x18)
-		androidLog(fmt.Sprintf("colgram_masque: size probe %d bytes sent, source port %d",
-			size, 40100+size%97))
+	//   GET /cdn-cgi/trace HTTP/1.1 / Host: www.cloudflare.com / Connection: close
+	//
+	//   H2 READ 487 bytes: ... HTTP/1.1 400 Bad Request ... <html> ... The plain HTTP request was sent
+	//   to HTTPS port/<title>400 Bad Request</h1> ... this port does not serve HTTP.
+	//
+	// The 400 is the answer that matters. It proves the edge took the flow out to the real host and the
+	// host's reply came back through the same stream, so this carrier does route, for this identity, on
+	// this network - and it does it without TLS being involved at any point.
+	//
+	// So a plaintext request separates the two things that TLS adds at once: whether the tunnel carries
+	// data at all, and whether the edge objects to the payload. A silent plaintext request means the first;
+	// a 400 and a silent ClientHello means the second.
+	plain := strings.Join([]string{
+		"GET /cdn-cgi/trace HTTP/1.1",
+		"Host: www.cloudflare.com",
+		"Connection: close",
+		"", "",
+	}, crlf)
+	if _, err := peer.Write([]byte(plain)); err != nil {
+		androidLog(fmt.Sprintf("colgram_masque: plaintext trace write failed: %v", err))
 	}
+	plainBody := make([]byte, 2048)
+	plainRead := 0
+	deadlinePlain := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadlinePlain) && plainRead < len(plainBody) {
+		peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := peer.Read(plainBody[plainRead:])
+		plainRead += n
+		if err != nil {
+			break
+		}
+	}
+	androidLog(fmt.Sprintf("colgram_masque: plaintext trace returned %d bytes, sent=%d recv=%d: %q",
+		plainRead, peer.sent, peer.recv, head(plainBody[:plainRead], 120)))
 
 	inner := tls.Client(peer, &tls.Config{
 		InsecureSkipVerify: true,
@@ -3251,10 +3588,6 @@ func (s *longSession) openPeer() error {
 	s.bindSrcPort++
 	peer := newTunnelConn(s.tun, s.tun.srcIP, mustAddr(s.addr).IP,
 		uint16(40000+s.bindSrcPort), 443)
-	// No options, for the reason measured on the measurement path: this edge forwards a flow with a
-	// constant 20-byte header - six packets came back for one - and discards a flow that negotiated a
-	// 40-byte one, after completing the handshake and then answering nothing at all.
-	peer.noOptions = true
 	s.tun.peers = append(s.tun.peers, peer)
 	s.peer = peer
 	return peer.open()
