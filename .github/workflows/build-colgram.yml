@@ -164,6 +164,9 @@ jobs:
             echo "::error::COLGRAM_KEYSTORE_B64 is not set. Refusing to publish a build with a throwaway signing key."
             exit 1
           fi
+          # Length only. A base64 keystore is a fixed size, so this distinguishes a truncated
+          # secret from an intact one without printing anything that could be reconstructed.
+          echo "secret length: $(printf '%s' "$KEYSTORE_B64" | wc -c) bytes"
           # Strip CR and LF before decoding. A secret carried across a Windows editor or a copy
           # through a web form can arrive with either, and while GNU base64 ignores newlines, the
           # 76-column wrapping some tools produce also inserts them mid-stream where a decoder
