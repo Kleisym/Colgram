@@ -1,4 +1,4 @@
-# --- Secrets: never commit these ---
+
 *.txt.token
 gfpat.txt
 .env
@@ -63,16 +63,6 @@ tools/warpgo/**/*.out
 vendor/libbox-binding/
 vendor/colgram-singbox/src/main/jniLibs/
 
-# --- Tooling scratch ---
-.workbuddy-ai/tmp/
-
-# Local agent state: memory logs, caches, session scratch. Not project source.
-.workbuddy-ai/
-
-# --- Local agent tooling state (not project source) ---
-.agents/
-.openclaw/
-.opencode/
 
 # Anti-spam userbot runtime state. The vendored .py modules under
 # colgram-core/src/main/assets/antispam/ are source and ARE tracked; anything the userbot
