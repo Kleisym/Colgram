@@ -6950,13 +6950,20 @@ def main():
         target_repo,
         os.path.join(root_dir, "vendor", "colgram-wireguard"),
     )
+    # download_official_binaries is what ADDS the in-tree WireGuard dependency line, and
+    # sync_singbox_module anchors the sing-box dependency onto that same line. Running the sync
+    # first meant it looked for an anchor a pristine checkout does not have yet, recorded
+    # "Colgram sing-box build.gradle anchor" as a miss, and failed the run - on the first pass
+    # only, so a second pass over the same tree succeeded and made it look intermittent. The
+    # sing-box engine therefore never reached the APK, which left the subscription row able to
+    # promise a VPN it could not start. Order the two the only way that works on a fresh clone.
+    download_official_binaries(target_repo)
     sync_singbox_module(target_repo, root_dir)
     inject_warp_device_test_support(target_repo, root_dir)
     inject_singbox_device_test_support(target_repo, root_dir)
     inject_core_device_test_support(target_repo, root_dir)
     inject_subscription_share_activity(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
-    download_official_binaries(target_repo)
     inject_hooks(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]
