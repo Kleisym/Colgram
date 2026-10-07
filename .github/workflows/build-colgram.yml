@@ -201,6 +201,7 @@ jobs:
           
           if [ -n "$UNSIGNED_APK" ] && [ -f "$UNSIGNED_APK" ]; then
             $APKSIGNER sign --ks colgram.keystore \
+              --ks-type PKCS12 \
               --ks-pass "pass:$KEYSTORE_PASS" \
               --key-pass "pass:$KEY_PASS" \
               --ks-key-alias "$KEY_ALIAS" \
