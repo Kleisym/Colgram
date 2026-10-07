@@ -165,6 +165,15 @@ jobs:
             exit 1
           fi
           printf '%s' "$KEYSTORE_B64" | base64 -d > colgram.keystore
+          # Length and round-trip check before signing, so a truncated or mis-encoded secret says
+          # what is actually wrong instead of surfacing as an apksigner error about a keystore that
+          # never arrived. The size is printed, never the value.
+          echo "keystore bytes: $(stat -c%s colgram.keystore)"
+          if ! keytool -list -keystore colgram.keystore -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
+            echo "::error::The decoded keystore is not readable with COLGRAM_KEYSTORE_PASS."
+            echo "::error::secret length was ${#KEYSTORE_B64} characters, decoded to $(stat -c%s colgram.keystore) bytes."
+            exit 1
+          fi
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
           echo "Using apksigner at: $APKSIGNER"
           
