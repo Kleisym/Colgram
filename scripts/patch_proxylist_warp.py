@@ -183,7 +183,17 @@ def apply(repo_path):
         "    // Colgram: WARP toggle row, mutually exclusive with the regular proxy.\n"
         "    private int warpRow = -1;\n"
         "    private int warpDetailRow = -1;\n"
-        "    private static final int REQ_WARP_CONSENT = 9182;",
+        "    private static final int REQ_WARP_CONSENT = 9182;\n"
+        "    /**\n"
+        "     * True while a WARP start is in flight, before the persisted flag says anything.\n"
+        "     *\n"
+        "     * <p>The flag is written on the tap, not after bringUp() succeeds, because the tunnel\n"
+        "     * takes seconds to open a session and a background proxy verdict landing in that\n"
+        "     * window would tear down the tunnel the user asked for. Until it is up there is\n"
+        "     * therefore no flag to read, and the row has to read this instead - otherwise the switch\n"
+        "     * renders off under the finger and looks dead.\n"
+        "     */\n"
+        "    private boolean warpStartPending;",
         "fields")
 
     # --- E2. updateRows: calls+warp rows right under the proxy switch -----------

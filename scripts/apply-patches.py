@@ -3497,7 +3497,16 @@ def inject_hooks(repo_path):
         patch_file(
             intro_file,
             'LocaleController.getString(R.string.Page1Message),',
-            'ru ? "Быстрый, приватный и свободный мессенджер" : "A fast, private and free messenger",',
+            # The locale test is declared here rather than assumed. The replacement used to read
+            # a bare `ru ? ...`, which only compiled because a hand-edited build had a local `ru`
+            # in scope - a fresh clone had no such variable and javac failed with
+            # 'cannot find symbol: variable ru' at IntroActivity.java:144, taking the whole
+            # release with it. Inline is the only correct home for it: this expression is the one
+            # place that needs the answer.
+            '(LocaleController.getInstance().getCurrentLocaleInfo() != null\n'
+            '                        && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName))\n'
+            '                ? "Быстрый, приватный и свободный мессенджер"\n'
+            '                : "A fast, private and free messenger",',
             "IntroActivity Set Subtitle to Colgram"
         )
         # "IntroActivity Show Colgram Red Airplane" REMOVED as obsolete.
@@ -3567,6 +3576,37 @@ def inject_hooks(repo_path):
             '<string name="AppNameBeta">Telegram Beta</string>',
             '<string name="AppNameBeta">Colgram Beta</string>',
             "strings.xml AppNameBeta -> Colgram Beta"
+        )
+
+        # The anti-delete marker in ChatMessageCell reads R.string.ColgramDeletedMessage, but the
+        # string was never declared anywhere - it only ever existed in a locally built APK, where
+        # a previous incremental build had the resource merged in from a tree nobody could
+        # reproduce. On a clean checkout javac stopped the whole release with
+        #
+        #   ChatMessageCell.java:18532: error: cannot find symbol
+        #       String deletedLabel = getString(R.string.ColgramDeletedMessage);
+        #       symbol: variable ColgramDeletedMessage
+        #
+        # The code was right and the resource was missing, which is the worst order for it: the
+        # feature worked everywhere it had been run and failed only where it was built fresh.
+        # Declared here, next to the branding it belongs with, in both languages.
+        def inject_colgram_strings(content):
+            if 'ColgramDeletedMessage' in content:
+                return content
+            addition = (
+                '\n    <!-- Colgram: label on a message retained by the anti-delete vault. -->\n'
+                '    <string name="ColgramDeletedMessage">Deleted</string>'
+            )
+            marker = '</resources>'
+            if marker not in content:
+                return content
+            return content.replace(marker, addition + '\n' + marker, 1)
+
+        patch_file(
+            strings_xml,
+            inject_colgram_strings,
+            '<string name="ColgramDeletedMessage">Deleted</string>',
+            "strings.xml Declares ColgramDeletedMessage"
         )
 
         # The same rebranding was never applied to the Russian resources, so the launcher said
