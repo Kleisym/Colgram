@@ -142,26 +142,25 @@ jobs:
           KEYSTORE_PASS: ${{ secrets.COLGRAM_KEYSTORE_PASS }}
           KEY_ALIAS: ${{ secrets.COLGRAM_KEY_ALIAS }}
         run: |
-          echo "::group::signing material"
-          echo "secret length   : $(printf '%s' "$KEYSTORE_B64" | wc -c) bytes"
-          echo "password length : $(printf '%s' "$KEYSTORE_PASS" | wc -c) bytes"
-          echo "alias           : '$KEY_ALIAS'"
+          # Written as annotations, not log lines: a workflow log is not retrievable from the API
+          # once the run is over on every network tried here, while an annotation comes back with
+          # /check-runs/{id}/annotations and always can be.
+          echo "::notice title=signing secret::length $(printf '%s' "$KEYSTORE_B64" | wc -c) bytes, password $(printf '%s' "$KEYSTORE_PASS" | wc -c) bytes, alias '$KEY_ALIAS'"
           if printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > /tmp/ks.probe 2>/dev/null; then
             SIZE=$(stat -c%s /tmp/ks.probe)
             MAGIC=$(head -c 2 /tmp/ks.probe | od -An -tx1 | tr -d ' \n')
-            echo "decodes to      : $SIZE bytes, first bytes ${MAG}"
+            echo "::notice title=signing decode::OK, $SIZE bytes, first bytes ${MAG}"
             if keytool -list -keystore /tmp/ks.probe -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
-              echo "opens with the stored password: yes"
+              echo "::notice title=signing open::opens with the stored password, default type"
             elif keytool -list -keystore /tmp/ks.probe -storetype PKCS12 -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
-              echo "opens as PKCS12 only: yes"
+              echo "::notice title=signing open::opens as PKCS12 only, so the default type is wrong"
             else
-              echo "opens at all    : NO"
+              echo "::error title=signing open::the keystore does not open with the stored password"
             fi
           else
-            echo "decodes         : NO - base64 rejected the value"
+            echo "::error title=signing decode::base64 rejected the secret"
           fi
           rm -f /tmp/ks.probe
-          echo "::endgroup::"
 
       - name: Sign APK (Production / Self-Signed)
         # The secrets come in through env, not through ${{ }} interpolation.
