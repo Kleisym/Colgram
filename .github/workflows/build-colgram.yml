@@ -133,6 +133,22 @@ jobs:
           exit $status
 
       - name: Sign APK (Production / Self-Signed)
+        # The secrets come in through env, not through ${{ }} interpolation.
+        #
+        # GitHub substitutes ${{ }} into the run script itself, and a 5 KB base64 blob does not
+        # survive that: the runner executed
+        #
+        #   echo "***" | base64 -d > colgram.keystore
+        #   base64: invalid input
+        #
+        # - the log masks the value, and the masked form is what actually reached the shell.
+        # env: passes the value to the process untouched; only echo of it is masked, which is
+        # what masking is for.
+        env:
+          KEYSTORE_B64: ${{ secrets.COLGRAM_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.COLGRAM_KEYSTORE_PASS }}
+          KEY_PASS: ${{ secrets.COLGRAM_KEY_PASS }}
+          KEY_ALIAS: ${{ secrets.COLGRAM_KEY_ALIAS }}
         run: |
           # The signing identity MUST be constant across releases. It used to be generated
           # fresh here with `keytool -genkey`, so every run produced a DIFFERENT certificate -
@@ -144,11 +160,11 @@ jobs:
           # The keystore is now a repository secret, base64-encoded. Set it once with:
           #   base64 -w0 colgram.keystore   # paste into secret COLGRAM_KEYSTORE_B64
           # and keep the alias/password secrets alongside it.
-          if [ -z "${{ secrets.COLGRAM_KEYSTORE_B64 }}" ]; then
+          if [ -z "$KEYSTORE_B64" ]; then
             echo "::error::COLGRAM_KEYSTORE_B64 is not set. Refusing to publish a build with a throwaway signing key."
             exit 1
           fi
-          echo "${{ secrets.COLGRAM_KEYSTORE_B64 }}" | base64 -d > colgram.keystore
+          printf '%s' "$KEYSTORE_B64" | base64 -d > colgram.keystore
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
           echo "Using apksigner at: $APKSIGNER"
           
@@ -164,9 +180,9 @@ jobs:
           
           if [ -n "$UNSIGNED_APK" ] && [ -f "$UNSIGNED_APK" ]; then
             $APKSIGNER sign --ks colgram.keystore \
-              --ks-pass "pass:${{ secrets.COLGRAM_KEYSTORE_PASS }}" \
-              --key-pass "pass:${{ secrets.COLGRAM_KEY_PASS }}" \
-              --ks-key-alias "${{ secrets.COLGRAM_KEY_ALIAS }}" \
+              --ks-pass "pass:$KEYSTORE_PASS" \
+              --key-pass "pass:$KEY_PASS" \
+              --ks-key-alias "$KEY_ALIAS" \
               --out colgram-signed-release.apk "$UNSIGNED_APK"
             rm -f colgram.keystore
             # Fail the release if the certificate drifted: a silent identity change is the
