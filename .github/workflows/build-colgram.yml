@@ -81,6 +81,12 @@ jobs:
         run: |
           python3 scripts/verify-privacy.py Telegram-Src
 
+      - name: Build Colgram APK
+        run: |
+          cd Telegram-Src
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --build-cache --parallel -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled"
+
       - name: Audit the built APK for trackers
         # The source audit above cannot catch what it does not look at. Firebase reached every
         # release for the same reason: it is contributed by the google-services Gradle plugin
@@ -125,12 +131,6 @@ jobs:
           done
           rm -rf /tmp/dexaudit
           exit $status
-
-      - name: Build Colgram APK
-        run: |
-          cd Telegram-Src
-          chmod +x gradlew
-          ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --build-cache --parallel -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled"
 
       - name: Sign APK (Production / Self-Signed)
         run: |
