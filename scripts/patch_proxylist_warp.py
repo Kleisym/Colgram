@@ -316,9 +316,12 @@ def apply(repo_path):
     # 12.10.6, whereas the calls branch is not.
     old_bind = """                    } else if (position == rotationRow) {
                         checkCell.setTextAndCheck(getString(R.string.UseProxyRotation), SharedConfig.proxyRotationEnabled, true);"""
-    new_bind = """                    } else if (position == callsRow) {
-                        checkCell.setTextAndCheck(getString(R.string.UseProxyForCalls), useProxyForCalls, false);
-                    } else if (position == warpRow) {
+    # The calls branch is deliberately NOT re-created here. It used to sit above the WARP branch
+    # in this replacement, which meant the patch wrote `position == callsRow` and
+    # `useProxyForCalls` into a file where upstream has deleted both - javac then stopped the
+    # release with six errors, and the row it was adding could never have rendered. Upstream 12.10.6
+    # has no calls UI at all, so the branch is gone rather than relocated.
+    new_bind = """                    } else if (position == warpRow) {
                         // A start in flight is not yet in the persisted flag, so it has to be
                         // considered here or the switch would read "off" while it is coming up.
                         boolean warpPending = warpStartPending;
