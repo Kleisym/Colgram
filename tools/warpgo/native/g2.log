@@ -1,3 +1,0 @@
-# warpverdict
-# [warpverdict]
-vet.exe: .\main.go:1452:24: undefined: atomic

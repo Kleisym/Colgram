@@ -1,3 +1,0 @@
-# warpverdict
-# [warpverdict]
-vet.exe: .\main.go:82:15: undefined: strconv

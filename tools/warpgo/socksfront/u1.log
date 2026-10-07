@@ -1,4 +1,0 @@
-advertising     : 10.0.2.2
-socks5 front 0.0.0.0:15105 -> udp 127.0.0.1:14509
-udp associate on 127.0.0.1:15105
-front: session ended: EOF

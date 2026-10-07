@@ -1,3 +1,0 @@
-# warpverdict
-# [warpverdict]
-vet.exe: .\main.go:204:12: assignment mismatch: 2 variables but s.udp.ReadFromUDP returns 3 values

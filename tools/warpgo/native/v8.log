@@ -1,3 +1,0 @@
-# warpverdict
-# [warpverdict]
-vet.exe: .\main.go:160:15: undefined: binary.BigAppend

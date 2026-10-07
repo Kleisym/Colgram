@@ -36,6 +36,33 @@ Telegram-Src/
 # --- Android SDK provisioned locally (not part of the repo) ---
 .android-sdk/
 
+# --- Toolchain provisioned locally ---
+#
+# These are the binaries a build runs against, not the build's output. They are provisioned
+# per machine (JDK 17, the Android NDK, the Go toolchain) and total about 2.8 GB, which is more
+# than GitHub's 100 MB per-file ceiling once compressed and several times over the practical
+# limit for a repository. scripts/gradle-preflight.sh checks for them at build time, so a fresh
+# clone plus the provisioning step is a working build without them ever being versioned.
+tools/jdk17/
+tools/ndk/
+tools/go/
+tools/gocache/
+tools/gopath/
+
+# Go build output from building libcolgrammasque.so. The .so files that ship in the APK are
+# committed under colgram-core/src/main/jniLibs/; these are the intermediates on the way there.
+tools/warpgo/**/*.exe
+tools/warpgo/**/*.zip
+tools/warpgo/**/*.bak
+tools/warpgo/**/*.log
+tools/warpgo/**/*.err
+tools/warpgo/**/*.out
+
+# --- Vendored native libraries ---
+# These are fetched per platform by the vendor sync, not authored here.
+vendor/libbox-binding/
+vendor/colgram-singbox/src/main/jniLibs/
+
 # --- Tooling scratch ---
 .workbuddy-ai/tmp/
 

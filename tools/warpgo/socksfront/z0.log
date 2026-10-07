@@ -1,4 +1,0 @@
-advertising     : 10.0.2.2
-socks5 front 0.0.0.0:15120 -> udp 127.0.0.1:14514
-front: session from 127.0.0.1:24628, udp bound to 26.226.94.158:63155, advertised 26.226.94.158
-udp associate on 10.0.2.2:63155

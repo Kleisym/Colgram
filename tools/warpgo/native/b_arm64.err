@@ -1,2 +1,0 @@
-# net
-C:\Users\virsu\go\pkg\mod\golang.org\toolchain@v0.0.1-go1.26.0.windows-amd64\src\net\cgo_resnew.go:20:76: cannot use _Ctype_socklen_t(len(b)) (value of uint32 type _Ctype_socklen_t) as _Ctype_size_t value in argument to (_C2func_getnameinfo)

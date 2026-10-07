@@ -1,7 +1,0 @@
-socks5 front 127.0.0.1:15090 -> udp 127.0.0.1:14503
-udp associate on 127.0.0.1:15090
-udp associate on 127.0.0.1:15090
-udp associate on 127.0.0.1:15090
-udp associate on 127.0.0.1:15090
-udp associate on 127.0.0.1:15090
-udp associate on 127.0.0.1:15090

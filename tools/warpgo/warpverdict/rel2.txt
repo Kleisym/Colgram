@@ -1,3 +1,0 @@
-session address : 172.16.0.2
-edge            : 127.0.0.1:14500 (relayed)
-error           : quic dial: timeout: no recent network activity

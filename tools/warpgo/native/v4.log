@@ -1,2 +1,0 @@
-main.go:1275:2: the cancel function is not used on all paths (possible context leak)
-main.go:1326:1: this return statement may be reached without using the cancel var defined on line 1275

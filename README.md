@@ -12,8 +12,10 @@
 - Вырезаны системные разрешения на чтение состояния телефона (`READ_PHONE_STATE`), `android_id` и GSF ID.
 
 ### 2. Соединение без VPN (Censorship Circumvention)
-- Встроенный пул **MTProto Proxy с Fake-TLS** (`ee...`), маскирующийся под обращения к CDN Google, Cloudflare и Microsoft.
-- `ColgramProxyManager` автоматически измеряет задержку нод и держит активное соединение внутри процесса приложения.
+- **Собственный транспорт**: локальный SOCKS5 на `127.0.0.1:9876` с адаптивной десинхронизацией TCP и переписыванием FakeTLS ClientHello в браузерный отпечаток. Никаких чужих серверов в цепочке.
+- **Cloudflare WARP** встроен как MASQUE-клиент на Go (`libcolgrammasque.so`, три ABI), работает в отдельном процессе `:colgram_masque`. Измерено: `warp=on colo=FRA kex=X25519`.
+- **Пул MTProto-прокси** с проверкой нативным хендшейком, карантином мёртвых нод и ротацией.
+- **DoH-резолвер** для обхода DNS-блокировок.
 - Никаких сторонних VPN-приложений или иконок в шторке Android.
 
 ### 3. Изоляция файлов (Storage Sandbox)
@@ -41,31 +43,59 @@
 ## 📁 Структура проекта
 
 ```
-c:\Colgram\
-├── .github/
-│   └── workflows/
-│       └── build-colgram.yml        # Автоматический CI/CD сборщик релизов
-├── colgram-core/                     # Изолированное ядро безопасности
-│   └── src/main/java/org/colgram/core/
-│       ├── ColgramConfig.java        # Управление настройками и флагами
-│       ├── ColgramCloak.java         # Спуфер железа и параметров MTProto
-│       ├── ColgramDatabase.java      # SQLite-хранилище удаленных сообщений и правок
-│       ├── ColgramProxyManager.java  # Менеджер Fake-TLS прокси и авто-пинга
-│       ├── ColgramStorageSandbox.java# Изоляция файловой системы
-│       └── ColgramHookHandler.java   # Шлюз хуков из официального кода Telegram
+c:\Colgram\├── Telegram-Src/                     # Сборка Gradle
+│   ├── TMessagesProj/                # Основной модуль (UI + патчи Telegram)
+│   ├── colgram-core/                 # Изолированное ядро
+│   │   └── src/main/java/org/colgram/core/
+│   │       ├── ColgramConfig.java          # Настройки и флаги
+│   │       ├── ColgramCloak.java           # Спуфер желера и параметров MTProto
+│   │       ├── ColgramDatabase.java        # SQLite-хранилище удалённых сообщений
+│   │       ├── ColgramProxyManager.java    # Пул прокси, ротация, применение маршрута
+│   │       ├── ColgramDpiBypass.java       # Локальный SOCKS5 с десинхронизацией TCP
+│   │       ├── ColgramTlsMimic.java        # Переписывание FakeTLS ClientHello
+│   │       ├── ColgramMasqueVpnService.java # WARP/MASQUE в отдельном процессе
+│   │       ├── ColgramStorageSandbox.java  # Изоляция файловой системы
+│   │       └── ColgramHookHandler.java     # Шлюз хуков из кода Telegram
+│   ├── colgram-singbox/              # libbox: VLESS, Hysteria, Shadowsocks
+│   ├── colgram-wireguard/            # WireGuard-бэкенд
+│   └── TMessagesProj_AppTests/       # Инструментальные тесты (77 классов)
+├── vendor/                           # colgram-singbox, colgram-wireguard, libbox-binding
 ├── patches/                          # Хирургические патчи для Telegram-FOSS
 │   ├── 001-strip-trackers.patch      # Вырезание аналитики и сервисов
 │   ├── 002-connections-cloak.patch   # Хук в ConnectionsManager (спуфинг)
 │   ├── 003-messages-anti-delete.patch# Хук в MessagesController (анти-удаление)
-│   ├── 004-ui-deleted-messages.patch # Отрисовка удаленных сообщений в UI
-│   └── 005-storage-sandbox.patch     # Перенаправление путей сохранения
+│   ├── 004-ui-deleted-messages.patch # Отрисовка удалённых сообщений в UI
+│   ├── 005-storage-sandbox.patch     # Перенаправление путей сохранения
+│   └── 006…009                       # Ghost-режим, флаг-секрет, меню, медиаблокировка
+├── tools/                            # Toolchain и нативный MASQUE-клиент
+│   ├── jdk17/  ndk/  go/             # JDK 17, Android NDK, Go toolchain
+│   ├── warpgo/native/main.go         # MASQUE-клиент Cloudflare WARP
+│   └── buildh2.ps1                   # Сборка libcolgrammasque.so под три ABI
 ├── scripts/
-│   ├── apply-patches.py              # Скрипт наложения патчей и внедрения ядра
-│   └── verify-privacy.py             # Аудитор приватности и отсутствия трекеров
+│   ├── apply-patches.py              # Наложение патчей и внедрение ядра
+│   ├── build-local.sh                # Локальная сборка
+│   ├── device-tests.py               # Прогон тестов на устройстве
+│   └── verify-privacy.py             # Аудитор приватности
+├── docs/                             # Исследования, архитектура, трекер багов
 └── README.md
 ```
 
 ---
+
+## 📚 Документация
+
+Всё исследование, измерения и история решений лежат в `docs/`:
+
+| Файл | О чём |
+|---|---|
+| [`RESEARCH.md`](docs/RESEARCH.md) | Обзор: WARP-транспорт, обход блокировок, прокси-система, поиск, тема, плагины |
+| [`WARP-RESEARCH.md`](docs/WARP-RESEARCH.md) | Хронология MASQUE: от WireGuard до HTTP/2-носителя, с измерениями |
+| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Модули, процессная модель, команды сборки, список тестов |
+| [`BUGS.md`](docs/BUGS.md) | Трекер: 20 дефектов, 15 закрыты |
+| [`CHANGELOG.md`](docs/CHANGELOG.md) | Что вошло в сборку |
+| [`FIXES-2026-10-06-evening.md`](docs/FIXES-2026-10-06-evening.md) | Шесть правок с измерениями до и после |
+| [`rebrand-strings.md`](docs/rebrand-strings.md) | Правило замены Telegram → Colgram в ресурсах |
+| [`CLEANUP-2026-10-07.md`](docs/CLEANUP-2026-10-07.md) | Что и почему было удалено из репозитория |
 
 ## 🚀 Как собрать
 

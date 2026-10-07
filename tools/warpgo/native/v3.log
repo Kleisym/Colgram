@@ -1,3 +1,0 @@
-# warpverdict
-# [warpverdict]
-vet.exe: .\main.go:1368:6: s.tun.sendIP(packet) (no value) used as value

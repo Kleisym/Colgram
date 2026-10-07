@@ -720,7 +720,7 @@ func buildDNSQuery(name string) []byte {
 // answer, and a flow of its own so the measurement is not mixed with the one carrying the verdict.
 func plainHTTPThroughTunnel(tun *tunnel, src, dst net.IP) string {
 	c := newTunnelConn(tun, src, dst, ephemeralPort(), 80)
-	tun.peers = append(tun.peers, c)
+	tun.addPeer(c)
 	defer func() { c.Close() }()
 	if err := c.open(); err != nil {
 		androidLog(fmt.Sprintf("colgram_masque: the plaintext flow did not open: %v", err))
@@ -770,7 +770,7 @@ func plainHTTPThroughTunnel(tun *tunnel, src, dst net.IP) string {
 // and nothing about it is different except that it is not the caller's.
 func tlsTraceThroughTunnel(tun *tunnel, src, dst net.IP) (string, error) {
 	c := newTunnelConn(tun, src, dst, ephemeralPort(), 443)
-	tun.peers = append(tun.peers, c)
+	tun.addPeer(c)
 	defer c.Close()
 	if err := c.open(); err != nil {
 		return "", err
@@ -1532,6 +1532,7 @@ func (c *tunnelConn) open() error {
 }
 
 func (c *tunnelConn) Read(b []byte) (int, error) {
+	poll := 5 * time.Millisecond
 	// The lock is taken and released around each poll rather than held for the whole read.
 	//
 	// feed() takes the same lock to append what arrived and to send the acknowledgement for it, and it
@@ -1573,7 +1574,28 @@ func (c *tunnelConn) Read(b []byte) (int, error) {
 		// which is the heap being written by something other than the allocator. A channel select carries
 		// its own wake-up, so there is nothing to race. The packet boundary is the granularity it offers
 		// anyway - a packet arrives as a whole capsule - so a short poll costs nothing that matters.
-		c.waitFor(20 * time.Millisecond)
+		// Poll, but back off. The poll is what lets a reader notice a deadline without a timer goroutine,
+		// and 20 ms was chosen so that a fast handshake is not slowed by it - but a poll this tight on a
+		// connection with a large receive buffer keeps a goroutine runnable almost continuously, and a Go
+		// runtime that grows a stack on a busy goroutine is a runtime that has to copy it. In a full suite,
+		// with several flows open at once on a device with the memory the test APK leaves it:
+		//
+		//   fatal error: unknown caller pc
+		//   runtime.copystack(...)
+		//   runtime.newstack()
+		//   runtime.morestack()
+		//
+		// The first poll after a wait is short, because a handshake is waiting on the next packet; the next
+		// are longer, because nothing is arriving and a reader that wakes twenty thousand times a second is
+		// a reader that costs more than the flow it is waiting on.
+		if !c.waitFor(poll) {
+			poll *= 2
+			if poll > 200*time.Millisecond {
+				poll = 200 * time.Millisecond
+			}
+		} else {
+			poll = 5 * time.Millisecond
+		}
 	}
 }
 
@@ -2512,7 +2534,13 @@ type tunnel struct {
 	h3     *http3.ClientConn
 	stream capsuleStream
 	srcIP  net.IP
-	peers  []*tunnelConn
+	// peersMu guards peers. The slice was appended to from the goroutine that opens a flow and read
+	// from the return-path pump with nothing between them, so the header itself was being written by one
+	// goroutine while another was reading it - and teardown then set it to nil underneath both. An
+	// append that reallocates while a reader holds the old header is how a process dies with no stack
+	// that names anything, which is what the repeated toggle produced.
+	peersMu sync.Mutex
+	peers   []*tunnelConn
 	// udp is the tunnel's datagram flow. One per tunnel rather than one per tuple: a client behind it sends
 	// its own source ports, and the flow this holds is the one the tunnel address is known on the far side
 	// by. Nil until something asks for it, so a tunnel that only carries TCP carries nothing extra.
@@ -2528,6 +2556,46 @@ type tunnel struct {
 	// nothing, and the two are indistinguishable from the outside.
 	peerInbound   int64
 	orphanInbound int64
+}
+
+// close releases everything a tunnel owns: both carriers, the datagram flow and the peers appended
+// to it. A tunnel is closed rather than dropped, because dropping one leaves a TCP connection to the
+// edge, a goroutine parked in ReceiveDatagram and a UDP socket all running - and a repeated toggle
+// is exactly what produces those in a loop.
+func (t *tunnel) close() {
+	if t == nil {
+		return
+	}
+	if t.conn != nil {
+		t.conn.CloseWithError(0, "closing")
+	}
+	if cs, ok := t.stream.(*h2CapsuleStream); ok && cs.h2 != nil && cs.h2.conn != nil {
+		cs.h2.conn.Close()
+	}
+	t.udpMu.Lock()
+	u := t.udp
+	t.udp = nil
+	t.udpMu.Unlock()
+	if u != nil {
+		u.Close()
+	}
+	t.peersMu.Lock()
+	t.peers = nil
+	t.peersMu.Unlock()
+}
+
+// addPeer registers a flow on the tunnel, and is the only way a peer is ever added.
+func (t *tunnel) addPeer(p *tunnelConn) {
+	t.peersMu.Lock()
+	t.peers = append(t.peers, p)
+	t.peersMu.Unlock()
+}
+
+// peerCount is how many flows the tunnel is carrying.
+func (t *tunnel) peerCount() int {
+	t.peersMu.Lock()
+	defer t.peersMu.Unlock()
+	return len(t.peers)
 }
 
 func (t *tunnel) sendIP(raw []byte) {
@@ -2657,15 +2725,19 @@ func (t *tunnel) dispatch(ip []byte) {
 	// no peer claims is not noise - it is the edge talking about a flow this client has not modelled, and
 	// it is the only way to tell a RST about the flow from a RST about something else.
 	atomic.AddInt64(&t.orphanInbound, 1)
+	t.peersMu.Lock()
 	for _, p := range t.peers {
 		if p.dstPort == sport && p.srcPort == dport {
 			atomic.AddInt64(&t.peerInbound, 1)
 			p.feed(ip)
+			t.peersMu.Unlock()
 			return
 		}
 	}
+	count := len(t.peers)
+	t.peersMu.Unlock()
 	androidLog(fmt.Sprintf("colgram_masque: inbound %d -> %d matched no peer (orphans=%d peers=%d)",
-		sport, dport, atomic.LoadInt64(&t.orphanInbound), len(t.peers)))
+		sport, dport, atomic.LoadInt64(&t.orphanInbound), count))
 }
 
 func randomID() string {
@@ -3545,7 +3617,7 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 	fmt.Println("trace target    :", traceHost, dst.String())
 
 	c := newTunnelConn(tun, srcIP, dst, ephemeralPort(), 443)
-	tun.peers = append(tun.peers, c)
+	tun.addPeer(c)
 	if err := c.open(); err != nil {
 		fmt.Printf("tcp open failed: %v (sent=%d recv=%d)\n", err, c.sent, c.recv)
 		return "", err
@@ -3605,6 +3677,41 @@ func measureOverRelay(srcIP net.IP, cert tls.Certificate, edgeAddr *net.UDPAddr,
 type traceTunnel struct {
 	ctx context.Context
 	tun *tunnel
+	// cancel belongs to the tunnel, not to the call that happened to open it. The tunnel is cached in
+	// traceSession and reused by the next call, and a context cancelled when the opener returned takes
+	// the carrier connection down with it - which left every later call finding a dead context over a
+	// live stream, discarding the reuse it came for and opening a second tunnel.
+	cancel context.CancelFunc
+}
+
+// close tears the tunnel down: the carrier connection, the return-path reader and the tunnel's own
+// datagram socket. Every one of those is a live goroutine or a live socket, and a tunnel that is
+// replaced rather than closed leaves all of them running for the life of the process.
+//
+// This is the churn defect, and it was the second one this file has had in the same place. The first
+// leaked the UDP flow; that was fixed and the crash moved from the second bring-up to the third. What
+// survived that fix was the trace tunnel, because nothing ever closed it either: measure() ran, and on
+// a filtered network it calls traceOverH2 twice - once for the attempt and once more to say whether the
+// carrier answered - so five rounds of the churn test opened ten tunnels and closed none of them, each
+// with its own TCP connection to the edge, its own reader goroutine parked in ReceiveDatagram, its own
+// UDP socket and its own appended peers. Ten connections from one address is also what the edge stops
+// accepting, so the run got slower as it went and then died on the pile.
+//
+//   ColgramWarpMasque: bringing up: bind=10.0.2.15 edge=default
+//   ColgramWarpMasque: warp=on via ORD from 104.28.227.110
+//   ColgramWarpTunnel: WARP tunnel down, and the VPN slot is free again
+//   ColgramWarpMasque: bringing up: bind=10.0.2.15 edge=default
+//   Zygote: Process 13350 exited due to signal 11 (Segmentation fault)
+func (tt *traceTunnel) close() {
+	if tt == nil {
+		return
+	}
+	if tt.cancel != nil {
+		tt.cancel()
+	}
+	if tt.tun != nil {
+		tt.tun.close()
+	}
 }
 
 // traceSession is the tunnel the last trace read opened, or nil.
@@ -3642,8 +3749,6 @@ func (tt *traceTunnel) pump() {
 // be a second thing to keep in step with the first, and the last version of that diverged so far that it
 // reported a network that could not route as one with no carrier at all.
 func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
-	defer cancel()
 	// The carrier refuses new connections from an address that has just opened several. The shape
 	// negotiation opens one per shape and then a second for the tunnel it keeps, and a caller that asks
 	// twice in one process - which the integration test does - is refused the second time:
@@ -3654,14 +3759,33 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	// The tunnel that answered is still open, so the second request reuses it rather than dialling again.
 	// A measurement that reuses the tunnel it is measuring measures that tunnel, which is the point.
 	sessionMu.Lock()
-	reuse := traceSession
+	previous := traceSession
+	traceSession = nil
 	sessionMu.Unlock()
+	// Reuse only a tunnel that is demonstrably alive: a live context over a closed stream is not a
+	// tunnel, and picking it up is what the segfault was. The check is the context, because that is
+	// what a closed carrier cancels.
+	reuse := previous
 	if reuse == nil || reuse.ctx.Err() != nil {
+		reuse = nil
+	}
+	if reuse == nil {
+		// Whatever the cache held is closed rather than overwritten. An address that has ten half-open
+		// carrier connections on it gets refused by the edge, so the leak was not only memory: it was
+		// the reason a fifth toggle had nothing left to dial.
+		if previous != nil {
+			previous.close()
+		}
+		// The tunnel's context is its own, and its deadline covers the carrier rather than this call. A
+		// context cancelled by a deferred return took the cached tunnel with it, so the next call found
+		// a dead context over a live stream and opened a second tunnel every time.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		stream, err := openH2Session(ctx, cert, net.JoinHostPort(edgeH2IP, edgeH2Port))
 		if err != nil {
+			cancel()
 			return "", err
 		}
-		reuse = &traceTunnel{ctx: ctx, tun: &tunnel{srcIP: srcIP, stream: stream}}
+		reuse = &traceTunnel{ctx: ctx, tun: &tunnel{srcIP: srcIP, stream: stream}, cancel: cancel}
 		go reuse.pump()
 		sessionMu.Lock()
 		traceSession = reuse
@@ -3761,7 +3885,7 @@ func traceOverH2(srcIP net.IP, cert tls.Certificate) (string, error) {
 	//   72-byte probe on the handshake flow, sent=8 recv=2     with a 20-byte header, on a 20-byte flow
 	//
 	// Everything before that probe measured the SYN, which the edge answers either way.
-	tun.peers = append(tun.peers, peer)
+	tun.addPeer(peer)
 	if err := peer.open(); err != nil {
 		androidLog(fmt.Sprintf("colgram_masque: h2 peer open failed: %v (sent=%d recv=%d)",
 			err, peer.sent, peer.recv))
@@ -4746,7 +4870,7 @@ func (s *longSession) openPeer() error {
 	s.bindSrcPort++
 	peer := newTunnelConn(s.tun, s.tun.srcIP, mustAddr(s.addr).IP,
 		uint16(40000+s.bindSrcPort), 443)
-	s.tun.peers = append(s.tun.peers, peer)
+	s.tun.addPeer(peer)
 	s.peer = peer
 	return peer.open()
 }
@@ -4834,6 +4958,12 @@ func colgram_masque_exchange(packet []byte, bind, edge *C.char) []byte {
 
 //export colgram_masque_close_session
 func colgram_masque_close_session() {
+	// The same lock the measurement takes, so a teardown can never close a tunnel a measurement is
+	// still using. It could before, and the two overlapped on every toggle that timed out: bringUp gives
+	// up at 180s while its worker is still in measureWith, the caller reports a failure and tears down,
+	// and the worker goes on to publish a traceSession over a carrier that has just been closed under it.
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	sessionMu.Lock()
 	s := session
 	session = nil
@@ -4841,19 +4971,47 @@ func colgram_masque_close_session() {
 	if s == nil || s.tun == nil {
 		return
 	}
+	// The cached trace tunnel goes with the session. It is a global that a later run reuses when its
+	// context is still live, and a tunnel that was closed here is exactly the one it must not pick up: the
+	// carrier connection underneath it is gone, so the reuse finds a live context over a dead stream and the
+	// third bring-up dies on it.
+	//
+	//   ColgramWarpMasque: bringing up: bind=10.0.2.15 edge=default
+	//   ColgramWarpMasque: warp=on via ORD from 104.28.227.110
+	//   ColgramWarpTunnel: WARP tunnel down, and the VPN slot is free again
+	//   ColgramWarpMasque: bringing up: bind=10.0.2.15 edge=default
+	//   Zygote: Process 13350 exited due to signal 11 (Segmentation fault)
+	sessionMu.Lock()
+	stale := traceSession
+	if stale != nil && stale.tun == s.tun {
+		traceSession = nil
+		stale = nil
+	}
+	sessionMu.Unlock()
+	// A trace tunnel the session did not own is closed here too. The churn path opens one per attempt
+	// and this is the only place the app says "stop", so leaving it behind is what made the next
+	// toggle find the previous run's carrier still attached.
+	if stale != nil {
+		stale.close()
+	}
 	// Both carriers have to be torn down, not just the QUIC one. This checked tun.conn only, and on the
 	// HTTP/2 carrier that field is nil by construction - so closing a tunnel that had come up over
 	// TCP dereferenced nothing and killed the process with SIGABRT. The app calls close on every toggle
 	// and on every service stop, so this was reachable from ordinary use and not only from a test.
-	if s.tun.conn != nil {
-		s.tun.conn.CloseWithError(0, "closing")
-	}
 	if s.cancel != nil {
 		s.cancel()
 	}
-	if cs, ok := s.tun.stream.(*h2CapsuleStream); ok && cs.h2 != nil {
-		cs.h2.conn.Close()
-	}
+	// The UDP flow goes with them. It holds its own socket and a goroutine parked in a condition
+	// variable, and neither was being released when a tunnel went down - so the second bring-up found a
+	// tunnel that still had the first one's datagram socket and reader attached, and the process died on it:
+	//
+	//   ColgramWarpMasque: bringing up: bind=10.0.2.15 edge=default
+	//   ColgramMasque: reusing the enrolment made 36s ago, tunnel address 172.16.0.2
+	//   Zygote: Process 12571 exited due to signal 11 (Segmentation fault)
+	//
+	// The app calls this on every toggle, so it is the reported symptom in its own right: a tunnel that comes
+	// up, goes down, and then kills the process the next time it is asked to come up.
+	s.tun.close()
 }
 
 // lastReplyLen carries the size of the buffer the most recent exchange_slice handed back.
