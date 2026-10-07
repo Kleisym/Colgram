@@ -1,0 +1,45 @@
+apply plugin: 'com.android.library'
+
+// The sing-box engine, as a gomobile binding. It carries every protocol Colgram needs - vless,
+// vmess, trojan, shadowsocks, hysteria, hysteria2, tuic, anytls, socks, wireguard - plus Reality,
+// so none of that cryptography is hand-written here.
+//
+// The library is 77MB per ABI. It is fetched at build time and unpacked into jniLibs, so a
+// network failure fails the build loudly instead of becoming an UnsatisfiedLinkError on a phone.
+def libboxVersion = '1.14.2'
+def libboxArtifact = "SFA-${libboxVersion}-universal.apk"
+def libboxUrl = "https://github.com/SagerNet/sing-box/releases/download/v${libboxVersion}/${libboxArtifact}"
+def libboxDir = file("${buildDir}/libbox")
+
+configurations { libbox }
+
+dependencies {
+    libbox "com.github.SagerNet:sing-box-android:${libboxVersion}@apk"
+    implementation 'androidx.annotation:annotation:1.8.1'
+}
+
+android {
+    namespace 'org.colgram.singbox'
+    compileSdkVersion 36
+
+    defaultConfig {
+        minSdkVersion 24
+        targetSdkVersion 35
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            // The gomobile binding was recovered by decompiling the shipped APK, which also
+            // produced every unrelated class of the host app under defpackage. Only the four of
+            // those that go/Seq actually imports live here, so the module does not drag 8000
+            // files that belong to another application.
+            java.srcDirs = ['src/main/java']
+            java.exclude '**/defpackage/**'
+        }
+    }
+}

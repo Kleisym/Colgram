@@ -11,6 +11,9 @@ local.properties
 # --- Build output ---
 __pycache__/
 *.pyc
+build/
+.gradle/
+.kotlin/
 scripts/error_log.txt
 scripts/build_*.log
 scripts/*.log
@@ -59,9 +62,14 @@ tools/warpgo/**/*.err
 tools/warpgo/**/*.out
 
 # --- Vendored native libraries ---
-# These are fetched per platform by the vendor sync, not authored here.
-vendor/libbox-binding/
-vendor/colgram-singbox/src/main/jniLibs/
+#
+# NOT ignored, and the reason is worth stating because the opposite looks harmless.
+# colgram-core/src/main/jniLibs/ holds libcolgrammasque.so and libcolgramcrash.so - the
+# MASQUE transport and the crash guard - and apply-patches.py mirrors colgram-core/ into
+# the build tree from the copy at the repo root. A rule here would strip those .so files
+# from a fresh clone, so every CI build would publish an APK whose WARP toggle is dead and
+# whose crashes are silent. Same for vendor/libbox-binding/, which the vendor sync writes
+# into the tree the build reads.
 
 # --- Tooling scratch ---
 .workbuddy-ai/tmp/

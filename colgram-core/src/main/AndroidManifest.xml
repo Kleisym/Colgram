@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.colgram.core">
+
+    <!--
+      Nothing to declare here.
+
+      This file used to register ColgramSettingsActivity and ColgramPluginsActivity as
+      activities. Both are BaseFragment subclasses in org.telegram.ui, not Activities, so any
+      launch of them died immediately. First with ClassNotFoundException, because they were named
+      as ".ColgramSettingsActivity", which resolved against this module's package
+      org.colgram.core instead of org.telegram.ui. Then, once the name was repointed at the real
+      package, with a "cannot be cast to android.app.Activity" ClassCastException. They are reached the normal way, from
+      SettingsActivity via presentSettingFragment(new ColgramSettingsActivity()), which is why
+      the in-app path always worked and only a direct component launch ever failed.
+
+      Do not re-add them as components.
+    -->
+
+</manifest>

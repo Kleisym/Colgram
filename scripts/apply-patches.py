@@ -1334,30 +1334,29 @@ def inject_hooks(repo_path):
         # stock list like everything else. He asked for Colgram to stop being a separate surface
         # with its own header; the rows keep their names, the foreign section wrapper goes.
         def settings_merge_injector(content):
-            marker = ('R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));\n'
-                      '\n'
-                      '        items.add(SettingCell.Factory.of(101,')
-            if marker in content:
+            # Both shapes below are matched as shapes, not as byte sequences.
+            #
+            # The two-line marker and the three-line anchor were both written with LF while the
+            # checkout carries CRLF on Windows, so a literal match held on one platform and not the
+            # other. The injector then fell through, returned its input unchanged, and patch_file
+            # reported a miss - fatal by design - which is how every build died on a tree whose
+            # Colgram rows were already sitting exactly where this edit wants them.
+            merged_pattern = re.compile(
+                r'R\.string\.SettingsLanguage\),\s*LocaleController\.getCurrentLanguageName\(\)\)\);'
+                r'\s*items\.add\(SettingCell\.Factory\.of\(101,')
+            if merged_pattern.search(content):
                 return content
-            anchor = ('        items.add(UItem.asShadow(null));\n'
-                      '        items.add(UItem.asHeader("Colgram"));\n'
-                      '        items.add(SettingCell.Factory.of(101,')
-            if anchor not in content:
+            # The shadow plus the branded header is the shape this edit removes.
+            header_pattern = re.compile(
+                r'        items\.add\(UItem\.asShadow\(null\)\);\s*'
+                r'        items\.add\(UItem\.asHeader\("Colgram"\)\);\s*'
+                r'        items\.add\(SettingCell\.Factory\.of\(101,')
+            if not header_pattern.search(content):
                 return content
-            return content.replace(
-                anchor,
-                '        items.add(SettingCell.Factory.of(101,', 1)
+            return header_pattern.sub(
+                '        items.add(SettingCell.Factory.of(101,', content, count=1)
 
-        patch_file(
-            os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
-                         "org", "telegram", "ui", "SettingsActivity.java"),
-            settings_merge_injector,
-            'R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));\n'
-            '\n'
-            '        items.add(SettingCell.Factory.of(101,',
-            "SettingsActivity Merges Colgram Rows Into Stock List"
-        )
-
+        
 
     # 49. UserConfig.java -> more accounts. HARD CAP 5, imposed by the native library.
     #
@@ -2724,6 +2723,21 @@ def inject_hooks(repo_path):
             return content.replace(target, inject, 1)
 
         patch_file(settings_activity, settings_items_injector, "items.add(SettingCell.Factory.of(101", "SettingsActivity Inject Native Colgram Section in List")
+        # Must run after the call above: that is the patch that writes the "Colgram" header,
+        # and this is the one that removes it. It used to be emitted ~1400 lines earlier, so
+        # on a pristine checkout there was nothing to merge yet, the anchor missed, and a miss
+        # is fatal by design - the build died on a tree that was already correct. Order was
+        # the entire defect.
+        patch_file(
+            os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
+                         "org", "telegram", "ui", "SettingsActivity.java"),
+            settings_merge_injector,
+            'R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));\n'
+            '\n'
+            '        items.add(SettingCell.Factory.of(101,',
+            "SettingsActivity Merges Colgram Rows Into Stock List"
+        )
+
 
         def settings_clicks_injector(content):
             target = """            case 10:
@@ -3008,7 +3022,12 @@ def inject_hooks(repo_path):
             "ChatMessageCell Anti-Delete Fade State"
         )
 
-        cell_bind_target = "        long deleteDialogId = messageObject.getDialogId();"
+        # The anchor was `long deleteDialogId = messageObject.getDialogId();`, which upstream
+        # 12.10.6 renamed. The line that snapshots the destroy date for this very cell is in the
+        # same bind block and survived - and it is the better anchor anyway, because it is the
+        # statement that establishes which message the cell is currently showing, which is exactly
+        # what the anti-delete marker has to be keyed to.
+        cell_bind_target = "            lastDeleteDate = messageObject.messageOwner.destroyTime;"
         cell_bind_replacement = '''        long deleteDialogId = messageObject.getDialogId();
         int deleteMessageId = messageObject.getId();
         boolean antiDeleteMarked = org.colgram.core.ColgramConfig.isAntiDeleteHighlightEnabled()
@@ -3030,7 +3049,8 @@ def inject_hooks(repo_path):
             } else {
                 setAlpha(antiDeleteMarked ? 0.62f : 1f);
             }
-        }'''
+        }
+        lastDeleteDate = messageObject.messageOwner.destroyTime;'''
         patch_file(
             chat_cell,
             cell_bind_target,
@@ -3239,8 +3259,6 @@ def inject_hooks(repo_path):
             "public boolean isPremium() {\n        if (true) return true;",
             "UserConfig Unlock Client-Side Premium"
         )
-
-
 
 
     # 34. BuildVars.java -> Official Telegram Android credentials & disable SafetyNet check
@@ -3846,41 +3864,18 @@ def inject_hooks(repo_path):
         }"""
         patch_file(change_bio, cbio_guard_target, cbio_guard_replacement, "ChangeBioActivity Bot Guard Before UserFull Null Check")
 
-        # The original bot hook is now unreachable (the guard above returns first), but it
-        # also referenced a bot-only path that is already handled. Replace it so we do not
-        # leave a dead duplicate whose callback dereferences userFull.
-        cbio_target = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
-        if (currentName.equals(newName)) {
-            finishFragment();
-            return;
-        }
-        final TLRPC.User currentUser = UserConfig.getInstance(currentAccount).getCurrentUser();
-        if (currentUser != null && currentUser.bot) {
-            org.colgram.core.ColgramBotSync.updateBotDescription(getParentActivity(), currentAccount, newName, () -> {
-                userFull.about = newName;
-                NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, currentUser.id, userFull);
-                finishFragment();
-            });
-            return;
-        }"""
-        cbio_replacement = """        final String newName = firstNameField.getText().toString().replace("\\n", "");
-        if (currentName.equals(newName)) {
-            finishFragment();
-            return;
-        }
-        final TLRPC.User currentUser = UserConfig.getInstance(currentAccount).getCurrentUser();
-        if (currentUser != null && currentUser.bot) {
-            // Unreachable in practice (handled above), kept as a defensive fallback.
-            org.colgram.core.ColgramBotSync.updateBotDescription(getParentActivity(), currentAccount, newName, () -> {
-                if (userFull != null) {
-                    userFull.about = newName;
-                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, currentUser.id, userFull);
-                }
-                finishFragment();
-            });
-            return;
-        }"""
-        patch_file(change_bio, cbio_target, cbio_replacement, "ChangeBioActivity Bot Description Null-Safe Callback")
+        # Nothing follows this one, deliberately.
+        #
+        # It used to rewrite a bot branch that dereferenced userFull without a null check. That
+        # branch no longer exists anywhere: not in upstream 12.10.6 (which has the plain
+        # updateProfile path) and not in the guard above, which returns for a bot before reaching
+        # it. The anchor only ever matched a tree produced by an older patcher that has since been
+        # rewritten, so on every current run it was a guaranteed miss - and because a miss is fatal,
+        # it failed the whole job over dead text.
+        #
+        # The behaviour it protected now belongs to the guard, which routes a bot to the Bot API
+        # and already null-checks userFull in its own callback.
+
 
     # 47b. Bot profile editing uses MTProto bots.setBotInfo through the active
     # Telegram transport. Bot API HTTPS can be blocked independently of MTProto.
@@ -5650,12 +5645,22 @@ def sync_singbox_module(repo_path, root_dir):
     with open(project_gradle, "r", encoding="utf-8") as gradle_file:
         gradle_text = gradle_file.read()
     if "project(':colgram-singbox')" not in gradle_text:
-        anchor = "    implementation project(':colgram-wireguard')"
-        if anchor not in gradle_text:
+        # Matched as a shape rather than as a literal line: the checkout carries CRLF on Windows
+        # and LF on the Linux runner, and a literal match held on one and not the other - so the
+        # anchor missed, the run was failed, and the sing-box engine never reached the APK. That is
+        # what left the subscription row able to promise a VPN it could not start.
+        anchor_pattern = re.compile(
+            r'^[ \t]*implementation[ \t]+project\(\s*["\']:colgram-wireguard["\'][ \t]*\)[ \t]*\r?$',
+            re.MULTILINE)
+        anchor_match = anchor_pattern.search(gradle_text)
+        if anchor_match is None:
             PATCH_MISSES.append("Colgram sing-box build.gradle anchor")
             return
-        gradle_text = gradle_text.replace(
-            anchor, anchor + "\n    implementation project(':colgram-singbox')", 1)
+        gradle_text = (
+            gradle_text[:anchor_match.start()]
+            + anchor_match.group(0).rstrip("\r")
+            + "\n    implementation project(':colgram-singbox')"
+            + gradle_text[anchor_match.end():])
         with open(project_gradle, "w", encoding="utf-8") as gradle_file:
             gradle_file.write(gradle_text)
 
