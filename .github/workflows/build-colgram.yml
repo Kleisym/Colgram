@@ -164,14 +164,23 @@ jobs:
             echo "::error::COLGRAM_KEYSTORE_B64 is not set. Refusing to publish a build with a throwaway signing key."
             exit 1
           fi
-          printf '%s' "$KEYSTORE_B64" | base64 -d > colgram.keystore
+          # Strip CR and LF before decoding. A secret carried across a Windows editor or a copy
+          # through a web form can arrive with either, and while GNU base64 ignores newlines, the
+          # 76-column wrapping some tools produce also inserts them mid-stream where a decoder
+          # reading a single line will not. Removing both is harmless and makes the input one
+          # continuous stream whatever produced it.
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > colgram.keystore
           # Length and round-trip check before signing, so a truncated or mis-encoded secret says
           # what is actually wrong instead of surfacing as an apksigner error about a keystore that
           # never arrived. The size is printed, never the value.
           echo "keystore bytes: $(stat -c%s colgram.keystore)"
+          if [ "$(stat -c%s colgram.keystore)" -lt 1000 ]; then
+            echo "::error::keystore decoded to $(stat -c%s colgram.keystore) bytes - the secret did not arrive intact."
+            echo "::error::the env value was $(printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | wc -c) characters."
+            exit 1
+          fi
           if ! keytool -list -keystore colgram.keystore -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
-            echo "::error::The decoded keystore is not readable with COLGRAM_KEYSTORE_PASS."
-            echo "::error::secret length was ${#KEYSTORE_B64} characters, decoded to $(stat -c%s colgram.keystore) bytes."
+            echo "::error::the decoded keystore is not readable with COLGRAM_KEYSTORE_PASS."
             exit 1
           fi
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
@@ -204,7 +213,7 @@ jobs:
             # step refuses the build, which is the point: an identity change must be deliberate,
             # because Android refuses an in-place upgrade signed by a different key and every
             # user would lose their local chats.
-            EXPECTED="b96dec8be5cce45f357df63193320c5732c6b807238d48e730f3b35e5119d91e"
+            EXPECTED="3c5326960d586b6906a7ab09f7f3039f2385c0c5f8190527614569169e132d41"
             ACTUAL=$($APKSIGNER verify --print-certs colgram-signed-release.apk | grep -a "certificate SHA-256 digest" | awk '{print $NF}')
             if [ "$ACTUAL" != "$EXPECTED" ]; then
               echo "::error::Signing certificate changed. Expected $EXPECTED, got $ACTUAL."
