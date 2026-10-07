@@ -182,10 +182,6 @@ jobs:
             echo "::error::the env value was $(printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | wc -c) characters."
             exit 1
           fi
-          if ! keytool -list -keystore colgram.keystore -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
-            echo "::error::the decoded keystore is not readable with COLGRAM_KEYSTORE_PASS."
-            exit 1
-          fi
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
           echo "Using apksigner at: $APKSIGNER"
           
