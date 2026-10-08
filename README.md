@@ -96,6 +96,9 @@ c:\Colgram\├── Telegram-Src/                     # Сборка Gradle
 | [`FIXES-2026-10-06-evening.md`](docs/FIXES-2026-10-06-evening.md) | Шесть правок с измерениями до и после |
 | [`rebrand-strings.md`](docs/rebrand-strings.md) | Правило замены Telegram → Colgram в ресурсах |
 | [`CLEANUP-2026-10-07.md`](docs/CLEANUP-2026-10-07.md) | Что и почему было удалено из репозитория |
+| [`CI-ANCHORS-2026-10-07.md`](docs/CI-ANCHORS-2026-10-07.md) | Почему патч перестал применяться к upstream 12.10.6 и что с этим сделано |
+| [`CI-SIGNING-2026-10-07.md`](docs/CI-SIGNING-2026-10-07.md) | Двенадцать прогонов подписи: четыре ложные гипотезы, пятая ложная, шестая верная |
+| [`CI-SIGNING-2026-10-08.md`](docs/CI-SIGNING-2026-10-08.md) | Окончательная причина: секрет был зашифрован вместе с JSON-обёрткой |
 
 ## 🚀 Как собрать
 

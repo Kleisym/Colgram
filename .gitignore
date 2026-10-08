@@ -6,6 +6,12 @@ gfpat.txt
 secrets/
 *.keystore
 *.jks
+*.p12
+*.pfx
+*.pem
+*.der
+*.cer
+*.key
 local.properties
 
 # --- Build output ---
