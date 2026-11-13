@@ -7010,6 +7010,20 @@ def inject_masque_process_isolation(repo_path):
     patch_file(path, inject, None, "ApplicationLoader isolated MASQUE process")
 
 
+def remove_measurement_components(content):
+    if 'xmlns:tools=' not in content:
+        content = content.replace('<manifest', '<manifest xmlns:tools="http://schemas.android.com/tools"', 1)
+    for tag, name in (("receiver", "com.google.android.gms.measurement.AppMeasurementReceiver"),
+                      ("service", "com.google.android.gms.measurement.AppMeasurementService"),
+                      ("service", "com.google.android.gms.measurement.AppMeasurementJobService")):
+        pattern = r'<' + tag + r'\b(?=[^>]*android:name="' + re.escape(name) + r'")[^>]*(?:/\s*>|>[\s\S]*?</' + tag + r'\s*>)'
+        node = '<' + tag + ' android:name="' + name + '" tools:node="remove" />'
+        content, count = re.subn(pattern, node, content)
+        if count == 0 and '</application>' in content:
+            content = content.replace('</application>', '    ' + node + '\n    </application>', 1)
+    return content
+
+
 def normalize_variant_application_label(content):
     def normalize(match):
         return re.sub(r'android:label="[^"]*"', 'android:label="Colgram"', match.group(0))
@@ -7025,7 +7039,7 @@ def normalize_variant_manifests(repo_path):
             path = os.path.join(root, name)
             with open(path, "r", encoding="utf-8") as source:
                 text = source.read()
-            fixed = normalize_variant_application_label(text)
+            fixed = remove_measurement_components(normalize_variant_application_label(text))
             if fixed != text:
                 with open(path, "w", encoding="utf-8") as target:
                     target.write(fixed)

@@ -46,5 +46,12 @@ class BuildPackagesTest(unittest.TestCase):
         self.assertIn('android:theme="@style/App"', fixed)
         self.assertEqual(fixed, patcher.normalize_variant_application_label(fixed))
 
+    def test_disabled_measurement_declarations_are_removed_from_overlay(self):
+        source = '<manifest><application><receiver android:name="com.google.android.gms.measurement.AppMeasurementReceiver" android:enabled="false"><intent-filter /></receiver></application></manifest>'
+        fixed = patcher.remove_measurement_components(source)
+        self.assertIn('tools:node="remove"', fixed)
+        self.assertNotIn('android:enabled="false"', fixed)
+        self.assertEqual(fixed, patcher.remove_measurement_components(fixed))
+
 
 if __name__ == "__main__": unittest.main()
