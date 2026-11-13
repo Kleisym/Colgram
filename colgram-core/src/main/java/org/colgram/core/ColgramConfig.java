@@ -66,7 +66,6 @@ public class ColgramConfig {
     public static void init(Context context) {
         if (prefs == null && context != null) {
             prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            migrateAutomaticProxyFallbackOn();
         }
         // The WARP row's gate asks whether the MASQUE client exists without loading it, and needs a
         // Context to answer from the package. ColgramConfig.init is the one initialiser every entry
@@ -74,19 +73,6 @@ public class ColgramConfig {
         if (context != null) {
             ColgramMasqueNative.setProbeContext(context.getApplicationContext());
         }
-    }
-
-    /**
-     * The stored `auto_proxy_enabled=false` on existing installs came from an earlier
-     * one-time migration of ours, not from the user's hand - and on the field it stranded
-     * the app on the dead local route ("Подключение прокси..." forever, fallback disabled).
-     * Flip it on once, exactly like it was once flipped off; a user who wants it off can
-     * still switch it off and this will not run again.
-     */
-    private static void migrateAutomaticProxyFallbackOn() {
-        if (prefs == null || prefs.getBoolean("auto_proxy_on_migrated_v2", false)) return;
-        prefs.edit().putBoolean(KEY_AUTO_PROXY, true)
-                .putBoolean("auto_proxy_on_migrated_v2", true).apply();
     }
 
     // --- Cloaking ---

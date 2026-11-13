@@ -42,6 +42,7 @@ public final class ColgramHttp {
     private static final int FAST_CONNECT_TIMEOUT_MS = 1800;
     private static final int FAST_READ_TIMEOUT_MS = 2800;
     private static final int MAX_FAST_RELAY_ATTEMPTS = 2;
+    private static final int MAX_FEED_BYTES = 1024 * 1024;
     /** How many relay candidates one request is allowed to walk before giving up. */
     private static final int MAX_RELAY_ATTEMPTS = 4;
 
@@ -128,8 +129,9 @@ public final class ColgramHttp {
             if (relay == null || relay.rttMs < 0) continue;
             if (connectAttempts++ >= 1) break;
             try {
-                Response response = openViaConnect(urlStr, relay.host, relay.port, null, null,
-                        FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS);
+                Response response = openFastConnection(urlStr, new Proxy(
+                        relay.socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP,
+                        new InetSocketAddress(relay.host, relay.port)));
                 if (response.code >= 200 && response.code < 300) return response;
                 attempts.add(relay.key() + " -> HTTP " + response.code);
             } catch (Throwable t) {
@@ -153,14 +155,8 @@ public final class ColgramHttp {
             conn.setRequestProperty("Accept", "application/json");
             int code = conn.getResponseCode();
             InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
-            StringBuilder body = new StringBuilder();
-            if (stream != null) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, Charset.forName("UTF-8")))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) body.append(line).append('\n');
-                }
-            }
-            if (code >= 200 && code < 300) return new Response(code, body.toString());
+            String body = readBounded(stream);
+            if (code >= 200 && code < 300) return new Response(code, body);
             attempts.add("реле-адрес: HTTP " + code);
         } catch (Throwable t) {
             attempts.add("реле-адрес: " + reason(t));
@@ -171,14 +167,14 @@ public final class ColgramHttp {
     }
 
     private static Response openFast(String urlStr, ColgramProxyManager.ProxyItem relay) throws Exception {
-        URL url = new URL(urlStr);
-        HttpURLConnection conn;
-        if (relay == null) {
-            conn = (HttpURLConnection) url.openConnection();
-        } else {
-            conn = (HttpURLConnection) url.openConnection(new Proxy(Proxy.Type.SOCKS,
-                    new InetSocketAddress(relay.address, relay.port)));
-        }
+        Proxy proxy = relay == null ? Proxy.NO_PROXY : new Proxy(Proxy.Type.SOCKS,
+                new InetSocketAddress(relay.address, relay.port));
+        return openFastConnection(urlStr, proxy);
+    }
+
+    private static Response openFastConnection(String urlStr, Proxy proxy) throws Exception {
+        // Standard HTTP framing handles chunked responses without returning chunk headers as data.
+        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection(proxy);
         try {
             conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
@@ -186,17 +182,15 @@ public final class ColgramHttp {
             conn.setRequestProperty("Accept", "application/json");
             int code = conn.getResponseCode();
             InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
-            StringBuilder body = new StringBuilder();
-            if (stream != null) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, Charset.forName("UTF-8")))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) body.append(line).append('\n');
-                }
-            }
-            return new Response(code, body.toString());
+            String body = readBounded(stream);
+            return new Response(code, body);
         } finally {
             conn.disconnect();
         }
+    }
+
+    private static String readBounded(InputStream stream) throws IOException {
+        return ColgramProxyPolicy.readBounded(stream, MAX_FEED_BYTES);
     }
 
     /** POST a JSON body, with the same relay fallback as GET. */

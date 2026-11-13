@@ -61,15 +61,15 @@ public class ColgramProxyManager {
         public final String secret;
         public final int type; // 0 = SOCKS5, 1 = MTProto, 2 = WEB (wss:// bridge, no port)
         /** -1 never checked, -2 checked and not working, otherwise RTT in ms. */
-        public int pingMs = -1;
+        public volatile int pingMs = -1;
         /**
          * Only ever set by a real protocol check (Telegram's native checkProxy). It used to be
          * assigned {@code true} to the whole hardcoded list without any check at all, which made
          * "Pool: 8 alive" a fiction and let the rotator prefer nodes that had never answered.
          */
-        public boolean isAvailable = false;
+        public volatile boolean isAvailable = false;
         /** SystemClock.elapsedRealtime() of the last protocol check; 0 = never checked. */
-        public long lastCheckAt = 0L;
+        public volatile long lastCheckAt = 0L;
         /** Times Telegram's native layer failed a connection while this entry was applied. */
         int nativeFailures = 0;
         /** Times the protocol probe said "dead". Enough of these and the entry leaves the pool. */
@@ -140,7 +140,8 @@ public class ColgramProxyManager {
         }
 
         public ProxyItem(String address, int port, String secret, int type) {
-            this.address = address;
+            String normalized = type == 2 ? null : ColgramProxyPolicy.normalizeHost(address);
+            this.address = normalized == null ? address : normalized;
             this.port = port;
             this.secret = secret != null ? secret : "";
             this.type = type;
@@ -209,6 +210,9 @@ public class ColgramProxyManager {
     private static volatile ProxyItem currentActiveProxy = null;
     private static volatile Context appContext = null;
     private static final AtomicBoolean initialized = new AtomicBoolean(false);
+    private static final AtomicBoolean fetchingSources = new AtomicBoolean(false);
+    private static volatile long lastSourceFetchAt;
+    private static volatile int sourceRound;
     private static final AtomicBoolean networkCallbackRegistered = new AtomicBoolean(false);
     private static volatile ConnectivityManager.NetworkCallback networkCallback;
 
@@ -244,57 +248,39 @@ public class ColgramProxyManager {
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
     };
     private static final String[] PROXY_SOURCES_SOCKS = {
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
-        "https://raw.githubusercontent.com/mzyui/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
-        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
         "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt",
-        "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt",
-        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
-        "https://raw.githubusercontent.com/casals-ar/proxy-list/main/socks5",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
         "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
         "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
-        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
-        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
-        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
         "https://proxyspace.pro/socks5.txt",
-        "https://mtpro.xyz/api/?type=socks5",
+        "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/socks5/data.txt",
+        "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/HEAD/socks5_all.txt"
     };
 
     /** Reachable public tunnels let us test and, if needed, chain a Telegram proxy. */
     private static final String[] RELAY_SOURCES_HTTP = {
+        "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
-        "https://raw.githubusercontent.com/mzyui/proxy-list/main/http.txt",
-        "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/http.txt",
-        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
         "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/http.txt",
-        "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
-        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
-        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
         "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
-        "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
-        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
-        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
-        "https://proxyspace.pro/http.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+        "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/proxies/http.txt",
+        "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/http/data.txt",
+        "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/HEAD/http_all.txt",
+        "https://raw.githubusercontent.com/sakha1370/OpenRay/HEAD/output/kind/http.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/HEAD/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/HEAD/proxies/http.txt"
     };
-    private static final String[] RELAY_SOURCES_SOCKS = {
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
-        "https://raw.githubusercontent.com/mzyui/proxy-list/main/socks5.txt",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
-        "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt",
-        "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt",
-        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
-        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
-        "https://proxyspace.pro/socks5.txt",
-    };
+    private static final String[] RELAY_SOURCES_SOCKS = PROXY_SOURCES_SOCKS;
     private static final int MAX_RELAYS = 16;
     private static final int MAX_STARTUP_MTPROTO_FEEDS = 3;
     private static final int MAX_STARTUP_JSON_FEEDS = 2;
@@ -624,10 +610,10 @@ public class ColgramProxyManager {
             }
         }
 
-        // 4. Background — refresh public candidate feeds and native protocol verdicts.
-        executor.execute(() -> {
+        // Optional source discovery waits until the first screen and cached route are ready.
+        ColgramOptimizer.scheduleAfterStartup(() -> {
             try {
-                fetchAndVerifyAllSources();
+                if (ColgramConfig.isBuiltinProxyEnabled()) fetchAndVerifyAllSources();
             } catch (Throwable t) {
                 Log.e(TAG, "Initial proxy fetch error", t);
             }
@@ -2396,7 +2382,7 @@ public static void reportProxyFailure() {
         for (ProxyItem p : new ArrayList<>(verifiedPool)) {
             if (p.equals(skip)) continue;
             if (p.isLocalDpi() && !localBypassUsable()) continue;
-            if (p.isAvailable && p.nativeVerified) {
+            if (p.isAvailable && p.nativeVerified && p.nextEligibleAt <= SystemClock.elapsedRealtime()) {
                 if (best == null || betterCandidate(p, best)) best = p;
             }
         }
@@ -2409,13 +2395,24 @@ public static void reportProxyFailure() {
      * beats one that merely accepted a socket: "found a working proxy but never connects" was the
      * rotator offering TCP-open nodes that had never spoken MTProto.
      */
+    private static ColgramProxyPolicy.State rankingState(ProxyItem item) {
+        return new ColgramProxyPolicy.State(item.nativeVerified, item.isAvailable, item.pingMs,
+                item.tcpMs, item.nextEligibleAt, item.address, item.port, item.type);
+    }
+
     private static boolean betterCandidate(ProxyItem a, ProxyItem b) {
-        if (a.nativeVerified != b.nativeVerified) return a.nativeVerified;
-        if ((a.type == 2) != (b.type == 2)) return a.type == 2;
-        if (a.fakeTls != b.fakeTls) return a.fakeTls;
-        if (a.pingMs < 0) return false;
-        if (b.pingMs < 0) return true;
-        return a.pingMs < b.pingMs;
+        int comparison = ColgramProxyPolicy.compare(rankingState(a), rankingState(b), SystemClock.elapsedRealtime());
+        return comparison < 0 || (comparison == 0 && a.secret.compareTo(b.secret) < 0);
+    }
+
+    private static void sortCandidates(List<ProxyItem> candidates) {
+        final long now = SystemClock.elapsedRealtime();
+        final java.util.IdentityHashMap<ProxyItem, ColgramProxyPolicy.State> states = new java.util.IdentityHashMap<>();
+        for (ProxyItem item : candidates) states.put(item, rankingState(item));
+        candidates.sort((a, b) -> {
+            int comparison = ColgramProxyPolicy.compare(states.get(a), states.get(b), now);
+            return comparison != 0 ? comparison : a.secret.compareTo(b.secret);
+        });
     }
 
     /** Next protocol-verified entry after {@code currentIndex}. */
@@ -2433,34 +2430,44 @@ public static void reportProxyFailure() {
 
     /** Harvest public routes, then let Telegram verify candidates before any auto-connect. */
     private static void fetchAndVerifyAllSources() {
-        final int before = verifiedPool.size();
-        fetchSourceFeedsConcurrently();
-        harvestRelays();
-        Log.i(TAG, "proxy harvest: " + before + " -> " + verifiedPool.size()
-                + " Telegram candidates; reachable relays=" + getRelayCount());
-        mainHandler.post(() -> {
-            startProber();
-            publishPoolToStock();
-            sweepFast(null);
-        });
+        if (!fetchingSources.compareAndSet(false, true)) return;
+        try {
+            long now = SystemClock.elapsedRealtime();
+            if (lastSourceFetchAt != 0 && now - lastSourceFetchAt < 60_000L) return;
+            lastSourceFetchAt = now;
+            if (appContext != null) {
+                SharedPreferences prefs = appContext.getSharedPreferences("colgram_sources", Context.MODE_PRIVATE);
+                sourceRound = prefs.getInt("round", 0);
+                prefs.edit().putInt("round", sourceRound == Integer.MAX_VALUE ? 0 : sourceRound + 1).apply();
+            }
+            final int before = verifiedPool.size();
+            fetchSourceFeedsConcurrently();
+            harvestRelays();
+            Log.i(TAG, "proxy harvest: " + before + " -> " + verifiedPool.size()
+                    + " Telegram candidates; reachable relays=" + getRelayCount());
+            mainHandler.post(() -> {
+                startProber();
+                publishPoolToStock();
+                sweepFast(null);
+            });
+        } finally {
+            fetchingSources.set(false);
+        }
     }
 
     /** Downloads and parses every feed concurrently, then returns before the reachability sweep. */
     private static void fetchSourceFeedsConcurrently() {
         final List<Runnable> tasks = new ArrayList<>();
-        int mtprotoFeeds = 0;
-        for (final String url : PROXY_SOURCES_MTPROTO_LINKS) {
-            if (mtprotoFeeds++ >= MAX_STARTUP_MTPROTO_FEEDS) break;
+        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_MTPROTO_LINKS.length, MAX_STARTUP_MTPROTO_FEEDS, sourceRound)) {
+            final String url = PROXY_SOURCES_MTPROTO_LINKS[index];
             tasks.add(() -> fetchProxiesLinkList(url, 24));
         }
-        int jsonFeeds = 0;
-        for (final String url : PROXY_SOURCES_MTPROTO_JSON) {
-            if (jsonFeeds++ >= MAX_STARTUP_JSON_FEEDS) break;
+        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_MTPROTO_JSON.length, MAX_STARTUP_JSON_FEEDS, sourceRound)) {
+            final String url = PROXY_SOURCES_MTPROTO_JSON[index];
             tasks.add(() -> fetchProxiesJson(url, 30));
         }
-        int socksFeeds = 0;
-        for (final String url : PROXY_SOURCES_SOCKS) {
-            if (socksFeeds++ >= MAX_STARTUP_SOCKS_FEEDS) break;
+        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_SOCKS.length, MAX_STARTUP_SOCKS_FEEDS, sourceRound)) {
+            final String url = PROXY_SOURCES_SOCKS[index];
             tasks.add(() -> fetchSocksList(url, 24));
         }
         runSourceFetchTasks(tasks, "proxy feed");
@@ -2525,18 +2532,14 @@ public static void reportProxyFailure() {
     private static void harvestRelays() {
         final List<List<ColgramProxyChain.Relay>> foundBySource = new ArrayList<>();
         final List<Runnable> tasks = new ArrayList<>();
-        int httpFeedCount = 0;
-        for (String url : RELAY_SOURCES_HTTP) {
-            if (httpFeedCount++ >= MAX_STARTUP_RELAY_FEEDS) break;
-            final String feed = url;
+        for (int index : ColgramProxyPolicy.feedIndices(RELAY_SOURCES_HTTP.length, MAX_STARTUP_RELAY_FEEDS, sourceRound)) {
+            final String feed = RELAY_SOURCES_HTTP[index];
             final List<ColgramProxyChain.Relay> source = new ArrayList<>();
             foundBySource.add(source);
             tasks.add(() -> collectRelayFeed(feed, false, source));
         }
-        int socksFeedCount = 0;
-        for (String url : RELAY_SOURCES_SOCKS) {
-            if (socksFeedCount++ >= MAX_STARTUP_RELAY_FEEDS) break;
-            final String feed = url;
+        for (int index : ColgramProxyPolicy.feedIndices(RELAY_SOURCES_SOCKS.length, MAX_STARTUP_RELAY_FEEDS, sourceRound)) {
+            final String feed = RELAY_SOURCES_SOCKS[index];
             final List<ColgramProxyChain.Relay> source = new ArrayList<>();
             foundBySource.add(source);
             tasks.add(() -> collectRelayFeed(feed, true, source));
@@ -2591,7 +2594,7 @@ public static void reportProxyFailure() {
     private static void collectRelayFeed(String url, boolean socks, List<ColgramProxyChain.Relay> found) {
         try {
             List<ColgramProxyChain.Relay> source = new ArrayList<>();
-            collectRelays(httpGet(url), socks, source);
+            collectRelays(httpGet(url), socks, source, url.contains("/zloi-user/hideip.me/"));
             synchronized (found) {
                 found.addAll(source);
             }
@@ -2755,19 +2758,19 @@ public static void reportProxyFailure() {
     }
 
     /** Parses host:port lines out of a relay list. */
-    private static void collectRelays(String body, boolean socks, List<ColgramProxyChain.Relay> out) {
+    private static void collectRelays(String body, boolean socks, List<ColgramProxyChain.Relay> out, boolean countryColumn) {
         if (body == null) return;
         for (String line : body.split("\\r?\\n")) {
-            line = line.trim();
-            int colon = line.lastIndexOf(':');
-            if (colon <= 0 || colon == line.length() - 1) continue;
-            String host = line.substring(0, colon);
-            if (host.isEmpty() || host.indexOf(' ') >= 0) continue;
-            try {
-                int port = Integer.parseInt(line.substring(colon + 1));
-                if (port > 0 && port < 65536) out.add(new ColgramProxyChain.Relay(host, port, socks));
-            } catch (NumberFormatException ignored) {
+            ColgramProxyPolicy.Endpoint endpoint = ColgramProxyPolicy.parseEndpoint(line, socks ? "socks5" : "http", countryColumn);
+            if (endpoint == null) continue;
+            boolean duplicate = false;
+            for (ColgramProxyChain.Relay existing : out) {
+                if (existing.host.equals(endpoint.host) && existing.port == endpoint.port && existing.socks == socks) {
+                    duplicate = true;
+                    break;
+                }
             }
+            if (!duplicate) out.add(new ColgramProxyChain.Relay(endpoint.host, endpoint.port, socks));
             if (out.size() >= MAX_RELAYS * 2) return;
         }
     }
@@ -2815,7 +2818,8 @@ public static void reportProxyFailure() {
      */
     private static boolean addCandidate(ProxyItem item) {
         if (item == null || item.address == null || item.address.isEmpty()) return false;
-        if (item.type != 2 && item.port <= 0) return false;
+        if (item.type != 2 && (item.port <= 0 || item.port > 65535
+                || ColgramProxyPolicy.normalizeHost(item.address) == null)) return false;
         // Remembered before the pool checks, so an endpoint rejected here is remembered too: a
         // candidate the app fetched and then dropped for capacity is not a proxy the user chose
         // either, and findSavedProxy() has to be able to tell the two apart.
@@ -3020,23 +3024,12 @@ public static void reportProxyFailure() {
             return;
         }
         if (body == null || body.isEmpty()) return;
-        // hideip.me and friends append country/uptime columns after the port; accept and ignore
-        // anything following the second colon. The line end must tolerate \r: CRLF lists
-        // matched ZERO lines when the anchor was plain "$", which starved the pool of SOCKS
-        // relays and cascaded into unreachable feeds for every other fetcher.
-        Pattern pattern = Pattern.compile("(?m)^\\s*([0-9a-zA-Z.\\-]+):(\\d{2,5})(?::|\\r?$)");
-        Matcher m = pattern.matcher(body);
         int added = 0;
-        Log.d(TAG, "socks body " + body.length() + "B head="
-                + body.substring(0, Math.min(80, body.length())).replace("\n", "|"));
-        while (m.find() && added < limit) {
-            int port;
-            try {
-                port = Integer.parseInt(m.group(2));
-            } catch (NumberFormatException e) {
-                continue;
-            }
-            if (addCandidate(new ProxyItem(m.group(1), port, "", 0))) added++;
+        for (String line : body.split("\\r?\\n")) {
+            ColgramProxyPolicy.Endpoint endpoint = ColgramProxyPolicy.parseEndpoint(line, "socks5",
+                    sourceUrl.contains("/zloi-user/hideip.me/"));
+            if (endpoint != null && addCandidate(new ProxyItem(endpoint.host, endpoint.port, "", 0))) added++;
+            if (added >= limit) break;
         }
         Log.i(TAG, "socks source " + sourceUrl + " added " + added);
     }
@@ -3069,7 +3062,7 @@ public static void reportProxyFailure() {
                 if (server.isEmpty() || port <= 0) continue;
                 if (secret != null) {
                     if (addCandidate(new ProxyItem(server, port, secret, 1))) added++;
-                } else if (obj.optString("type", "socks5").contains("socks")) {
+                } else if (obj.optString("type", "").equalsIgnoreCase("socks5")) {
                     if (addCandidate(new ProxyItem(server, port, "", 0))) added++;
                 }
             }
@@ -3764,13 +3757,7 @@ public static void reportProxyFailure() {
                 if (buildProxyListSettings(p) == null) continue;
                 publishable.add(p);
             }
-            publishable.sort((a, b) -> {
-                if (a.nativeVerified != b.nativeVerified) return a.nativeVerified ? -1 : 1;
-                if (a.isAvailable != b.isAvailable) return a.isAvailable ? -1 : 1;
-                int pa = a.pingMs > 0 ? a.pingMs : (a.tcpMs > 0 ? a.tcpMs : Integer.MAX_VALUE);
-                int pb = b.pingMs > 0 ? b.pingMs : (b.tcpMs > 0 ? b.tcpMs : Integer.MAX_VALUE);
-                return Integer.compare(pa, pb);
-            });
+            sortCandidates(publishable);
             for (ProxyItem p : publishable) {
                 if (published >= MAX_PUBLISHED_TO_STOCK) break;
                 Object settings = buildProxyListSettings(p);
@@ -4011,7 +3998,11 @@ public static void reportProxyFailure() {
     }
 
     public static ProxyItem getCurrentActiveProxy() { return currentActiveProxy; }
-    public static List<ProxyItem> getVerifiedPool() { return new ArrayList<>(verifiedPool); }
+    public static List<ProxyItem> getVerifiedPool() {
+        List<ProxyItem> result = new ArrayList<>(verifiedPool);
+        sortCandidates(result);
+        return result;
+    }
 
     /** Entries the native protocol checker actually confirmed working. */
     public static int getAliveCount() {
@@ -4109,14 +4100,9 @@ public static void reportProxyFailure() {
         // no user action behind it.
         for (ProxyItem p : new ArrayList<>(verifiedPool)) {
             if (p.isLocalDpi() || p.type == 2) continue;
-            if (p.nativeVerified && p.isAvailable) candidates.add(p);
+            if (p.nativeVerified && p.isAvailable && p.nextEligibleAt <= SystemClock.elapsedRealtime()) candidates.add(p);
         }
-        candidates.sort((a, b) -> {
-            long fa = a.lastCheckAt, fb = b.lastCheckAt;
-            if (fa != fb) return fa > fb ? -1 : 1;
-            return Integer.compare(a.pingMs > 0 ? a.pingMs : Integer.MAX_VALUE,
-                    b.pingMs > 0 ? b.pingMs : Integer.MAX_VALUE);
-        });
+        sortCandidates(candidates);
         for (ProxyItem p : candidates) {
             if (maxTcpChecks-- <= 0) break;
             if (testProxy(p.address, p.port, 1500) >= 0) return p;
@@ -4133,25 +4119,12 @@ public static void reportProxyFailure() {
      * @return false when no candidate survived a fresh TCP dial (nothing to enable)
      */
     public static boolean applyBestVerifiedNow() {
-        ProxyItem picked = pickVerifiedAliveNow(6);
+        ProxyItem picked = Looper.myLooper() == Looper.getMainLooper()
+                ? selectProxy(null) : pickVerifiedAliveNow(6);
         if (picked == null) {
-            // Best effort when no protocol-verified node is alive yet: dial-test TCP-alive
-            // candidates and apply the fastest. The prober keeps re-checking and the rotator
-            // replaces a node that lies - refusing to enable at all left the switch dead even
-            // with green "Доступен" rows on screen.
-            java.util.List<ProxyItem> cands = new ArrayList<>();
-            for (ProxyItem p : new ArrayList<>(verifiedPool)) {
-                if (p.isLocalDpi() || p.type == 2) continue;
-                if (p.failedVerdicts >= MAX_FAILED_VERDICTS) continue;
-                int rtt = p.tcpMs > 0 ? p.tcpMs : testProxy(p.address, p.port, 1500);
-                if (rtt > 0) cands.add(p);
-            }
-            cands.sort((a, b) -> Integer.compare(
-                    a.tcpMs > 0 ? a.tcpMs : Integer.MAX_VALUE,
-                    b.tcpMs > 0 ? b.tcpMs : Integer.MAX_VALUE));
-            if (!cands.isEmpty()) picked = cands.get(0);
+            checkPoolNow();
+            return false;
         }
-        if (picked == null) return false;
         picked.autoSelected = false;
         forceApplyProxy(picked);
         return true;
