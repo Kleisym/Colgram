@@ -1385,6 +1385,8 @@ public class ColgramProxyManager {
      * "обход без прокси" back into "сидеть на прокси" permanently.
      */
     private static void connectThroughBestNode() {
+        final long routeEpoch = ColgramRouteEpoch.snapshot();
+        if (!ColgramConfig.isAutoProxyEnabled() || isUserProxyDisabled()) return;
         if (ColgramConfig.isWarpEnabled()) {
             Log.i(TAG, "WARP was selected while candidates were being checked; skipping proxy auto-connect");
             return;
@@ -1444,9 +1446,13 @@ public class ColgramProxyManager {
             try {
                 // Multiple native verdicts can arrive before this runnable applies the first
                 // endpoint. Do not tear down a fresh connection for a slightly faster second.
+                if (!ColgramRouteEpoch.isCurrent(routeEpoch) || !ColgramConfig.isAutoProxyEnabled()
+                        || isUserProxyDisabled() || ColgramConfig.isWarpEnabled()) return;
                 ProxyItem routeInUse = currentActiveProxy;
                 if (routeInUse == null || shouldFallbackFromLocalDpi(routeInUse)) {
-                    forceApplyProxy(picked);
+                    ColgramRouteEpoch.runIfCurrent(routeEpoch, () -> {
+                        if (ColgramConfig.isAutoProxyEnabled() && !isUserProxyDisabled() && !ColgramConfig.isWarpEnabled()) forceApplyProxy(picked);
+                    });
                 } else {
                     Log.i(TAG, "verified fallback held; the active route is not a failed local DPI route");
                 }
@@ -2200,6 +2206,7 @@ public static void reportProxyFailure() {
      *              used when the user asks for a different node explicitly.
      */
     public static synchronized void switchToNextProxy(boolean force) {
+        final long routeEpoch = ColgramRouteEpoch.snapshot();
         Context rotateCtx = appContext;
         if (!force && ColgramConfig.isWarpEnabled()) {
             Log.i(TAG, "WARP is selected; background proxy rotation is suppressed");
@@ -2340,14 +2347,16 @@ public static void reportProxyFailure() {
         next.autoSelected = true;
 
         final ProxyItem target = next;
-        mainHandler.post(() -> {
+        mainHandler.post(() -> ColgramRouteEpoch.runIfCurrent(routeEpoch, () -> {
+            if (ColgramConfig.isWarpEnabled() || (!force && (isUserProxyDisabled()
+                    || (!ColgramConfig.isAutoProxyEnabled() && (appContext == null || !isProxyEnabled(appContext)))))) return;
             forceApplyProxy(target);
             if (appContext != null) {
                 try {
                     Toast.makeText(appContext, "Сеть: " + target.toString(), Toast.LENGTH_SHORT).show();
                 } catch (Throwable ignored) {}
             }
-        });
+        }));
     }
 
     /** The in-process 127.0.0.1 DPI-bypass entry, if the pool has one. */
@@ -3113,7 +3122,8 @@ public static void reportProxyFailure() {
             proxy.mimicActive = false;
         }
         if (proxy.chainRelay == null) return;
-        if (testProxy(proxy.address, proxy.port, 1200) >= 0) return;
+        // The background health check selected this relay. Never re-probe a
+        // blocked host from a UI route commit while cancellation waits on it.
         int port = ColgramProxyChain.open(proxy.address, proxy.port, proxy.chainRelay);
         if (port > 0) {
             proxy.chainPort = port;
@@ -3326,12 +3336,19 @@ public static void reportProxyFailure() {
 
     /** Keep Telegram's stock proxy switch and Colgram's live-route state in sync. */
     public static void onStockProxyToggle(boolean enabled) {
+        final long routeEpoch = ColgramRouteEpoch.next();
         Context ctx = appContext;
         if (ctx == null) return;
         // The latch belongs to the router, not to the app. A press on the stock switch is the one
         // thing that may hand Telegram's own rotator back: from here on, Telegram's checker is
         // what the user asked for. Turning the switch off re-arms the latch in disableProxy().
-        if (enabled) stockRotationPausedByColgram = false;
+        if (enabled) {
+            stockRotationPausedByColgram = false;
+            ColgramConfig.setWarpEnabled(false);
+            ColgramWarpTunnel.cancelPendingStart();
+            try { ctx.stopService(new android.content.Intent(ctx, Class.forName("org.colgram.singbox.ColgramVpnService"))); } catch (Throwable ignored) { }
+            executor.execute(() -> { if (ColgramRouteEpoch.isCurrent(routeEpoch)) ColgramWarpTunnel.bringDown(ctx); });
+        }
         setUserProxyDisabled(!enabled);
         if (!enabled) {
             ProxyItem active = currentActiveProxy;
@@ -3361,6 +3378,7 @@ public static void reportProxyFailure() {
     }
 
     public static synchronized void toggleProxy(final Context context) {
+        final long routeEpoch = ColgramRouteEpoch.next();
         Context ctx = context != null ? context.getApplicationContext() : appContext;
         if (ctx == null) return;
         boolean currentlyEnabled = isProxyEnabled(ctx) || hasActiveRouteForUi();
@@ -3413,7 +3431,8 @@ public static void reportProxyFailure() {
         // rather than in forceApplyProxy(), which is also called by background verification.
         if (ColgramConfig.isWarpEnabled()) {
             ColgramConfig.setWarpEnabled(false);
-            ColgramWarpTunnel.bringDown(ctx);
+            ColgramWarpTunnel.cancelPendingStart();
+            executor.execute(() -> { if (ColgramRouteEpoch.isCurrent(routeEpoch)) ColgramWarpTunnel.bringDown(ctx); });
         }
         setUserProxyDisabled(false);
         forceApplyProxy(target);
@@ -3525,14 +3544,18 @@ public static void reportProxyFailure() {
      * pointed at another. Persisting, running the listener and routing traffic through it are
      * three different things and all three have to agree.
      */
+    private static final java.util.concurrent.atomic.AtomicLong dpiRequestGeneration = new java.util.concurrent.atomic.AtomicLong();
+
     public static void setDpiBypassEnabled(Context context, boolean enabled) {
+        final long dpiRequest = dpiRequestGeneration.incrementAndGet();
+        final long routeEpoch = ColgramRouteEpoch.snapshot();
         ColgramConfig.setDpiBypassEnabled(enabled);
         if (!enabled) {
             ColgramDpiBypass.stop();
             ProxyItem active = currentActiveProxy;
             if (active != null && active.isLocalDpi()) {
                 disableProxy(context);
-                onStockProxyToggle(false);
+                setUserProxyDisabled(true);
             }
             toast("Локальный обход выключен");
             return;
@@ -3541,6 +3564,8 @@ public static void reportProxyFailure() {
         ColgramDpiBypass.startImmediately();
         executor.execute(() -> {
             boolean ready = ColgramDpiBypass.awaitReady(20000);
+            if (dpiRequestGeneration.get() != dpiRequest || !ColgramRouteEpoch.isCurrent(routeEpoch)
+                    || !ColgramConfig.isDpiBypassEnabled() || ColgramConfig.isWarpEnabled()) return;
             ProxyItem local = findLocalDpiProxy();
             if (!ready || local == null) {
                 Log.e(TAG, "desync bypass enabled but the listener never bound; leaving traffic alone");
@@ -3566,8 +3591,13 @@ public static void reportProxyFailure() {
                 toast("Обходчик ТСПУ работает; Telegram отвечает напрямую");
                 return;
             }
+            if (dpiRequestGeneration.get() != dpiRequest || !ColgramRouteEpoch.isCurrent(routeEpoch)
+                    || !ColgramConfig.isDpiBypassEnabled() || ColgramConfig.isWarpEnabled()) return;
             Log.i(TAG, "applying local desync route before judging Telegram reachability");
-            forceApplyProxy(local);
+            mainHandler.post(() -> ColgramRouteEpoch.runIfCurrent(routeEpoch, () -> {
+                if (dpiRequestGeneration.get() == dpiRequest && ColgramConfig.isDpiBypassEnabled()
+                        && !ColgramConfig.isWarpEnabled()) forceApplyProxy(local);
+            }));
             checkPoolNow();
             toast("Локальный обход включён; проверяю соединение");
         });

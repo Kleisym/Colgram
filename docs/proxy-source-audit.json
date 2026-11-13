@@ -1,0 +1,528 @@
+{
+  "checked_at_utc": "2026-11-13T11:36:52.545776+00:00",
+  "method": "Unauthenticated HTTPS catalog and bounded raw response fetches; no proxy dialing.",
+  "sources": [
+    {
+      "source": "https://github.com/Thordata/awesome-free-proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/proxies/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 98,
+          "address_like_lines": 98,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/proxies/https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 39,
+          "address_like_lines": 39,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/proxies/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 65,
+          "address_like_lines": 65,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/docs/data/socks5.json",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 1042,
+          "address_like_lines": 0,
+          "automatic_feed_candidate": false
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/ProxyScrape/free-proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/http/data.csv",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 511,
+          "address_like_lines": 0,
+          "automatic_feed_candidate": false
+        },
+        {
+          "url": "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/http/data.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 721,
+          "address_like_lines": 721,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/socks5/data.csv",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 513,
+          "address_like_lines": 0,
+          "automatic_feed_candidate": false
+        },
+        {
+          "url": "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/socks5/data.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 1147,
+          "address_like_lines": 1147,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/iplocate/free-proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/HEAD/protocols/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 646,
+          "address_like_lines": 646,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/HEAD/protocols/https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 35,
+          "address_like_lines": 35,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/iplocate/free-proxy-list/HEAD/protocols/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 642,
+          "address_like_lines": 642,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/proxifly/free-proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/HEAD/proxies/protocols/http/data.csv",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 1759,
+          "address_like_lines": 1758,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/HEAD/proxies/protocols/http/data.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 2547,
+          "address_like_lines": 2546,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/HEAD/proxies/protocols/socks5/data.csv",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 1636,
+          "address_like_lines": 1635,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/HEAD/proxies/protocols/socks5/data.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 2316,
+          "address_like_lines": 2315,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/TheSpeedX/PROXY-List",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/HEAD/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 2896,
+          "address_like_lines": 2896,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/HEAD/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 2258,
+          "address_like_lines": 2258,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/hproxy-com/free-proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/HEAD/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 2670,
+          "address_like_lines": 2670,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/HEAD/https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 2515,
+          "address_like_lines": 2515,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/HEAD/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 651,
+          "address_like_lines": 651,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/jibukeshi/proxy_share",
+      "catalog_status": 200,
+      "endpoints": [],
+      "classification": "subscription_or_custom_adapter"
+    },
+    {
+      "source": "https://github.com/narkhedesam/Proxy-List-Scrapper",
+      "catalog_status": 200,
+      "endpoints": [],
+      "classification": "subscription_or_custom_adapter"
+    },
+    {
+      "source": "https://github.com/VPSLabCloud/VPSLab-Free-Proxy-List",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/HEAD/http_all.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 1305,
+          "address_like_lines": 651,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/HEAD/http_ssl.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 337,
+          "address_like_lines": 167,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/HEAD/socks5_all.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 1913,
+          "address_like_lines": 955,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/saisuiu/Lionkings-Http-Proxys-Proxies",
+      "catalog_status": 200,
+      "endpoints": [],
+      "classification": "subscription_or_custom_adapter"
+    },
+    {
+      "source": "https://github.com/sakha1370/OpenRay",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/sakha1370/OpenRay/HEAD/output/kind/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 910,
+          "address_like_lines": 909,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/sakha1370/OpenRay/HEAD/output/kind/https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 21,
+          "address_like_lines": 0,
+          "automatic_feed_candidate": false
+        },
+        {
+          "url": "https://raw.githubusercontent.com/sakha1370/OpenRay/HEAD/output/kind/vless.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "subscription",
+          "sample_lines": 229,
+          "address_like_lines": 0,
+          "automatic_feed_candidate": false
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/Zaeem20/FREE_PROXIES_LIST",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/HEAD/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 116,
+          "address_like_lines": 116,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/HEAD/https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 315,
+          "address_like_lines": 315,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/HEAD/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 139,
+          "address_like_lines": 139,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/zloi-user/hideip.me",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/zloi-user/hideip.me/HEAD/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 238,
+          "address_like_lines": 238,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/zloi-user/hideip.me/HEAD/https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 966,
+          "address_like_lines": 966,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/zloi-user/hideip.me/HEAD/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 362,
+          "address_like_lines": 362,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/jetkai/proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/jetkai/proxy-list/HEAD/online-proxies/txt/proxies-http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 1801,
+          "address_like_lines": 1801,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/jetkai/proxy-list/HEAD/online-proxies/txt/proxies-https.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 2161,
+          "address_like_lines": 2161,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/jetkai/proxy-list/HEAD/online-proxies/txt/proxies-socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 405,
+          "address_like_lines": 405,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/jetkai/proxy-list/HEAD/archive/txt/proxies-socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 3477,
+          "address_like_lines": 3476,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/bq2015/FreeProxies",
+      "catalog_status": 200,
+      "endpoints": [],
+      "classification": "subscription_or_custom_adapter"
+    },
+    {
+      "source": "https://github.com/monosans/proxy-list",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/monosans/proxy-list/HEAD/proxies/http.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "http",
+          "sample_lines": 450,
+          "address_like_lines": 450,
+          "automatic_feed_candidate": true
+        },
+        {
+          "url": "https://raw.githubusercontent.com/monosans/proxy-list/HEAD/proxies/socks5.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "socks5",
+          "sample_lines": 66,
+          "address_like_lines": 66,
+          "automatic_feed_candidate": true
+        }
+      ],
+      "classification": "machine_readable"
+    },
+    {
+      "source": "https://github.com/mahdibland/V2RayAggregator",
+      "catalog_status": 200,
+      "endpoints": [
+        {
+          "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/HEAD/update/2210/v2ray.txt",
+          "status": 200,
+          "content_type": "text/plain",
+          "protocol_hint": "subscription",
+          "sample_lines": 75,
+          "address_like_lines": 0,
+          "automatic_feed_candidate": false
+        }
+      ],
+      "classification": "subscription_or_custom_adapter"
+    },
+    {
+      "source": "https://proxyscrape.com/free-proxy-list",
+      "catalog_status": 200,
+      "content_type": "text/html",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    },
+    {
+      "source": "https://best-proxies.ru/proxylist/free/",
+      "catalog_status": 503,
+      "content_type": "",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    },
+    {
+      "source": "https://geonode.com/free-proxy-list",
+      "catalog_status": 200,
+      "content_type": "text/html",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    },
+    {
+      "source": "https://2ip.io/ru/proxy/",
+      "catalog_status": 503,
+      "content_type": "",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    },
+    {
+      "source": "https://proxydb.net/",
+      "catalog_status": 200,
+      "content_type": "text/html",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    },
+    {
+      "source": "https://proxiware.com/free-proxy-list",
+      "catalog_status": 200,
+      "content_type": "text/html",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    },
+    {
+      "source": "https://nodemaven.com/free-proxy-list/",
+      "catalog_status": 200,
+      "content_type": "text/html",
+      "classification": "html_catalog_requires_api_or_adapter",
+      "endpoints": [],
+      "note": "HTML is not imported as a SOCKS5 list; catalog status does not prove proxy availability."
+    }
+  ]
+}

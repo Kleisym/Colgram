@@ -6791,18 +6791,32 @@ def configure_package_and_branding(repo_path):
                 try:
                     with open(path, "r", encoding="utf-8") as jf:
                         data = json.load(jf)
-                    clients = data.get("client", [])
-                    has_colgram = any(c.get("client_info", {}).get("android_client_info", {}).get("package_name") == "org.colgram.messenger" for c in clients)
-                    if not has_colgram and clients:
-                        new_client = copy.deepcopy(clients[0])
-                        new_client["client_info"]["android_client_info"]["package_name"] = "org.colgram.messenger"
-                        clients.append(new_client)
-                        data["client"] = clients
+                    if ensure_build_package_clients(data):
                         with open(path, "w", encoding="utf-8") as jf:
                             json.dump(data, jf, indent=2)
-                        print(f" [+] Added org.colgram.messenger to {path}")
+                        print(f" [+] Added release/debug build packages to {path}")
                 except Exception as e:
                     print(f" [!] Error patching {path}: {e}")
+
+def ensure_build_package_clients(data):
+    """Keep the inert build resources available for release and side-by-side debug."""
+    import copy
+    clients = data.get("client", [])
+    if not clients:
+        raise ValueError("GoogleServices JSON has no build resource template")
+    present = {c.get("client_info", {}).get("android_client_info", {}).get("package_name") for c in clients}
+    changed = False
+    for package in ("org.colgram.messenger", "org.colgram.messenger.web"):
+        if package in present:
+            continue
+        client = copy.deepcopy(clients[0])
+        client.setdefault("client_info", {}).setdefault("android_client_info", {})["package_name"] = package
+        clients.append(client)
+        present.add(package)
+        changed = True
+    data["client"] = clients
+    return changed
+
 
 def apply_custom_app_icon(repo_path, source_icon_path):
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -6971,6 +6985,52 @@ def apply_custom_app_icon(repo_path, source_icon_path):
         with open(night_styles, "w", encoding="utf-8") as f:
             f.write(n_content)
 
+def isolate_masque_process(content):
+    marker = "// Colgram: isolated MASQUE service bootstrap"
+    if marker in content:
+        return content
+    start = content.find("public void onCreate()")
+    anchor = content.find("super.onCreate();", start)
+    if start < 0 or anchor < 0:
+        raise ValueError("ApplicationLoader.onCreate/super anchor missing")
+    end = anchor + len("super.onCreate();")
+    guard = "\n\n        " + marker + "\n        if (org.colgram.core.ColgramProcess.isMasqueProcess(this)) return;"
+    return content[:end] + guard + content[end:]
+
+
+def inject_masque_process_isolation(repo_path):
+    path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java")
+    def inject(content):
+        if "// Colgram: isolated MASQUE service bootstrap" in content:
+            return CONVERGED
+        try:
+            return isolate_masque_process(content)
+        except ValueError:
+            return content
+    patch_file(path, inject, None, "ApplicationLoader isolated MASQUE process")
+
+
+def normalize_variant_application_label(content):
+    def normalize(match):
+        return re.sub(r'android:label="[^"]*"', 'android:label="Colgram"', match.group(0))
+    return re.sub(r'<application\b[^>]*>', normalize, content)
+
+
+def normalize_variant_manifests(repo_path):
+    config = os.path.join(repo_path, "TMessagesProj", "config")
+    for root, _, files in os.walk(config):
+        for name in files:
+            if not name.startswith("AndroidManifest") or not name.endswith(".xml"):
+                continue
+            path = os.path.join(root, name)
+            with open(path, "r", encoding="utf-8") as source:
+                text = source.read()
+            fixed = normalize_variant_application_label(text)
+            if fixed != text:
+                with open(path, "w", encoding="utf-8") as target:
+                    target.write(fixed)
+
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
@@ -7006,6 +7066,8 @@ def main():
     inject_subscription_share_activity(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
     inject_hooks(target_repo)
+    inject_masque_process_isolation(target_repo)
+    normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]
     stale = [m for m in ALLOWED_MISSES if m not in PATCH_MISSES]

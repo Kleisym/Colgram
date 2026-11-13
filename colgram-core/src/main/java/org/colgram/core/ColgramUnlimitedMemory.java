@@ -40,7 +40,14 @@ public final class ColgramUnlimitedMemory {
 
     /** Applied once at startup so a reboot cannot resurrect a pruning limit. */
     public static void restore(Context context) {
-        if (context == null || !ColgramConfig.isUnlimitedMemoryEnabled()) return;
-        apply(context, true);
+        if (context == null) return;
+        if (ColgramConfig.isUnlimitedMemoryEnabled()) {
+            apply(context, true);
+        } else if (!ColgramConfig.isUnlimitedMemoryConfigured()) {
+            // Earlier builds silently wrote unlimited as a default. Release only
+            // that sentinel; keep every explicitly chosen finite cache limit.
+            SharedPreferences prefs = context.getSharedPreferences("userconfing", Context.MODE_PRIVATE);
+            if (prefs.getInt(KEY_CACHE_LIMIT, 0) == Integer.MAX_VALUE) prefs.edit().remove(KEY_CACHE_LIMIT).apply();
+        }
     }
 }

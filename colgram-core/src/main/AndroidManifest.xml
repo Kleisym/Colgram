@@ -2,8 +2,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.colgram.core">
 
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <application>
+        <service
+            android:name="org.colgram.core.ColgramMasqueVpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:process=":colgram_masque"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"
+                android:value="User-selected encrypted WARP VPN tunnel" />
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+    </application>
+
     <!--
-      Nothing to declare here.
+      Settings fragments are not Android activities.
 
       This file used to register ColgramSettingsActivity and ColgramPluginsActivity as
       activities. Both are BaseFragment subclasses in org.telegram.ui, not Activities, so any

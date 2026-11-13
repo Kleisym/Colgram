@@ -1,0 +1,21 @@
+// Optional packaging filter. All library ABIs remain available in the source tree.
+gradle.beforeProject { project ->
+    project.plugins.withId('com.android.application') {
+        def requested = project.providers.gradleProperty('colgramAbis').orNull
+        if (requested) {
+            def abis = requested.split(',').collect { it.trim() }.findAll { it }
+            def supported = ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
+            if (abis.isEmpty() || !abis.every { supported.contains(it) }) {
+                throw new GradleException('colgramAbis contains an unsupported Android ABI')
+            }
+            project.extensions.getByName('androidComponents').finalizeDsl { android ->
+                android.defaultConfig.ndk.abiFilters.clear()
+                android.defaultConfig.ndk.abiFilters.addAll(abis)
+                android.productFlavors.each { flavor ->
+                    flavor.ndk.abiFilters.clear()
+                    flavor.ndk.abiFilters.addAll(abis)
+                }
+            }
+        }
+    }
+}

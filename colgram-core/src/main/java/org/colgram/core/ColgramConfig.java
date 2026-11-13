@@ -478,7 +478,7 @@ public class ColgramConfig {
     // readable by anyone who unpacks it - rotate it in @BotFather if the APK ever leaves
     // this machine.
     public static final String DEFAULT_BOT_TOKEN =
-            "8577879548:AAEQcAZDsjzUa6XN12ejoqGEvnUTUfpZuDc";
+            "";
 
     // --- WARP toggle state -------------------------------------------------------
     // The switch reflects the USER'S CHOICE, not the live tunnel state: the tunnel comes
@@ -625,8 +625,12 @@ public class ColgramConfig {
      * the integer maximum, so everything already viewed stays viewable, and it lives in the app's
      * own storage instead of the gallery, which is the "not cluttering the phone" half.
      */
+    public static boolean isUnlimitedMemoryConfigured() {
+        return prefs != null && prefs.contains(KEY_UNLIMITED_MEMORY);
+    }
+
     public static boolean isUnlimitedMemoryEnabled() {
-        return prefs == null || prefs.getBoolean(KEY_UNLIMITED_MEMORY, true);
+        return prefs != null && prefs.getBoolean(KEY_UNLIMITED_MEMORY, false);
     }
 
     public static void setUnlimitedMemoryEnabled(boolean enabled) {

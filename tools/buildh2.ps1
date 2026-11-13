@@ -1,45 +1,62 @@
-$env:GOTOOLCHAIN='auto'
-$env:NDK_ROOT='C:\Colgram\tools\ndk\android-ndk-r27c'
-$TC = "$env:NDK_ROOT\toolchains\llvm\prebuilt\windows-x86_64"
-$JDK = 'C:\Colgram\tools\jdk17\jdk-17.0.20.1+1\include'
-$env:GOPATH='C:\Colgram\tools\gopath'
-$env:GOCACHE='C:\Colgram\tools\gocache'
-$env:GOOS='android'
-$env:CGO_ENABLED='1'
-$env:CGO_LDFLAGS=''
-$src='C:\Colgram\tools\warpgo\native'
-Set-Location $src
-$abis = @(
-  @{arch='arm64'; pfx='aarch64-linux-android21'; name='arm64'; extra=''},
-  @{arch='386';   pfx='i686-linux-android21';   name='x86';   extra=''},
-  @{arch='amd64'; pfx='x86_64-linux-android21'; name='x86_64'; extra='-fdeclspec'}
+param(
+    [string]$NdkRoot = $env:ANDROID_NDK_HOME,
+    [string]$Go = 'go',
+    [string]$OutputRoot = ''
 )
-foreach ($a in $abis) {
-  $env:GOARCH = $a.arch
-  $env:CC = "$TC\bin\$($a.pfx)-clang.cmd"
-  $env:CGO_CFLAGS = "--sysroot=$TC\sysroot $($a.extra) -I$src\jniinc\linux -I$src\jniinc\win32 -I$JDK"
-  $out = "h2_$($a.name).so"
-  # Remove the previous library first.
-  #
-  # A failed `go build` does not clear its -o target, and this script went on to print that target's size
-  # as though it had just been produced:
-  #
-  #   # warpverdict
-  #   .\main.go:2627:41: cannot use string(...) as []byte value in argument to head
-  #   h2_x86_64.so 13225800        <- the build failed; that is the file from an hour earlier
-  #
-  # So a compile error read as a successful build of a library that was then staged into the APK and
-  # measured on the device, and every measurement was of the previous build. The failure is now a failure:
-  # the old file is deleted, the exit code is honoured, and a non-zero exit stops the script.
-  if (Test-Path $out) { Remove-Item $out -Force }
-  $err = & C:\Colgram\tools\go\bin\go.exe build -buildmode=c-shared -o $out . 2>&1
-  $code = $LASTEXITCODE
-  $err = $err |
-      Select-String -NotMatch '__stdcall|JNICALL|expanded from|jni.h|__declspec|JNIEXPORT|JNIIMPORT'
-  if ($err) { $err | Out-String }
-  if ($code -ne 0 -or -not (Test-Path $out)) {
-    "FAILED $out (go build exit $code)"
-    exit 1
-  }
-  "$out $((Get-Item $out).Length)"
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path -Parent $PSScriptRoot
+$source = Join-Path $PSScriptRoot 'warpgo\native'
+if (-not $NdkRoot) { $NdkRoot = $env:NDK_ROOT }
+if (-not $NdkRoot) {
+    $sdk = $env:ANDROID_HOME
+    if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+    if ($sdk) {
+        $available = Get-ChildItem -LiteralPath (Join-Path $sdk 'ndk') -Directory | Sort-Object { [version]$_.Name }
+        if ($available) { $NdkRoot = $available[-1].FullName }
+    }
+}
+if (-not $NdkRoot) { throw 'Set ANDROID_NDK_HOME/NDK_ROOT or pass -NdkRoot' }
+$toolchain = Join-Path $NdkRoot 'toolchains\llvm\prebuilt\windows-x86_64\bin'
+if (-not (Test-Path -LiteralPath $toolchain -PathType Container)) { throw "NDK toolchain missing: $toolchain" }
+if (-not $OutputRoot) { $OutputRoot = Join-Path $repo 'colgram-core\src\main\jniLibs' }
+$Go = (Get-Command $Go -ErrorAction Stop).Source
+$stage = Join-Path $source 'out'
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
+$abis = @(
+    @{ Arch = 'arm64'; Prefix = 'aarch64-linux-android24'; Abi = 'arm64-v8a' },
+    @{ Arch = '386'; Prefix = 'i686-linux-android24'; Abi = 'x86' },
+    @{ Arch = 'amd64'; Prefix = 'x86_64-linux-android24'; Abi = 'x86_64' }
+)
+$saved = @{}
+foreach ($name in @('GOOS','GOARCH','CGO_ENABLED','CC','CGO_CFLAGS','CGO_LDFLAGS','GOTOOLCHAIN')) {
+    $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
+Push-Location -LiteralPath $source
+try {
+    $env:GOOS = 'android'
+    $env:CGO_ENABLED = '1'
+    $env:CGO_CFLAGS = ''
+    $env:CGO_LDFLAGS = ''
+    $env:GOTOOLCHAIN = 'auto'
+    foreach ($abi in $abis) {
+        $env:GOARCH = $abi.Arch
+        $env:CC = Join-Path $toolchain ($abi.Prefix + '-clang.cmd')
+        if (-not (Test-Path -LiteralPath $env:CC -PathType Leaf)) { throw "Cross compiler missing: $env:CC" }
+        $target = Join-Path $stage ('libcolgrammasque-' + $abi.Abi + '.so')
+        & $Go build -trimpath -buildmode=c-shared -o $target .
+        if ($LASTEXITCODE -ne 0) { throw "Native build failed for $($abi.Abi), exit $LASTEXITCODE" }
+        $bytes = [IO.File]::ReadAllBytes($target)
+        if ($bytes.Length -lt 1024 -or $bytes[0] -ne 127 -or [Text.Encoding]::ASCII.GetString($bytes, 1, 3) -ne 'ELF') {
+            throw "Invalid ELF output for $($abi.Abi)"
+        }
+        $destination = Join-Path $OutputRoot $abi.Abi
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        $library = Join-Path $destination 'libcolgrammasque.so'
+        Copy-Item -LiteralPath $target -Destination $library -Force
+        $hash = (Get-FileHash -LiteralPath $library -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Output "NATIVE $($abi.Abi): PASS bytes=$($bytes.Length) sha256=$hash"
+    }
+} finally {
+    Pop-Location
+    foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
 }

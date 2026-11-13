@@ -36,6 +36,7 @@
 #include <jni.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /*
  * The Go client writes every transport decision to stderr, which nothing on Android reads. The
@@ -180,7 +181,9 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1exchange(JNIEnv *env,
     /* The length comes back out of band: the buffer is owned by C, so C is what has to know how
        much to release. A parsed integer rather than a second return value because the Go export
        can only return one pointer through the cgo //export path. */
-    long reply_len = strtol(colgram_masque_last_reply_len(), NULL, 10);
+    char *length_text = colgram_masque_last_reply_len();
+    long reply_len = length_text == NULL ? 0 : strtol(length_text, NULL, 10);
+    free(length_text);
     if (reply_len <= 0) {
         free(reply);
         return NULL;
@@ -208,4 +211,93 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1measure(JNIEnv *env, 
     free(cp);
     free(cr);
     return jni_take(env, out);
+}
+
+extern void *colgram_masque_receive_slice(void);
+extern char *colgram_masque_tunnel_address(void);
+
+JNIEXPORT jbyteArray JNICALL
+Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1receive(JNIEnv *env, jclass cls) {
+    (void)cls;
+    unsigned char *framed = (unsigned char *)colgram_masque_receive_slice();
+    if (framed == NULL) return NULL;
+    uint32_t length = (uint32_t)framed[0] | ((uint32_t)framed[1] << 8)
+        | ((uint32_t)framed[2] << 16) | ((uint32_t)framed[3] << 24);
+    if (length < 20 || length > 65535) { free(framed); return NULL; }
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)length);
+    if (out != NULL) (*env)->SetByteArrayRegion(env, out, 0, (jsize)length, (const jbyte *)(framed + 4));
+    free(framed);
+    return out;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1tunnel_1address(JNIEnv *env, jclass cls) {
+    (void)cls;
+    return jni_take(env, colgram_masque_tunnel_address());
+}
+
+#include <pthread.h>
+static JavaVM *vpn_vm;
+static jobject vpn_service;
+static jmethodID vpn_protect;
+static pthread_mutex_t vpn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+JNIEXPORT void JNICALL
+Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1set_1vpn(JNIEnv *env, jclass cls, jobject service) {
+    (void)cls;
+    pthread_mutex_lock(&vpn_lock);
+    if (vpn_service != NULL) (*env)->DeleteGlobalRef(env, vpn_service);
+    vpn_service = service == NULL ? NULL : (*env)->NewGlobalRef(env, service);
+    (*env)->GetJavaVM(env, &vpn_vm);
+    vpn_protect = NULL;
+    if (service != NULL) {
+        jclass type = (*env)->GetObjectClass(env, service);
+        vpn_protect = (*env)->GetMethodID(env, type, "protect", "(I)Z");
+        (*env)->DeleteLocalRef(env, type);
+    }
+    pthread_mutex_unlock(&vpn_lock);
+}
+
+int colgram_masque_protect_fd(int fd) {
+    pthread_mutex_lock(&vpn_lock);
+    JavaVM *vm = vpn_vm;
+    pthread_mutex_unlock(&vpn_lock);
+    if (vm == NULL) return 1; /* Standalone diagnostic, no installed VPN. */
+    JNIEnv *env = NULL;
+    int attached = 0;
+    jint state = (*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6);
+    if (state == JNI_EDETACHED) {
+        if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) return 0;
+        attached = 1;
+    } else if (state != JNI_OK) return 0;
+    pthread_mutex_lock(&vpn_lock);
+    jobject service = vpn_service == NULL ? NULL : (*env)->NewLocalRef(env, vpn_service);
+    jmethodID method = vpn_protect;
+    pthread_mutex_unlock(&vpn_lock);
+    int result = 0;
+    if (service != NULL && method != NULL) {
+        result = (*env)->CallBooleanMethod(env, service, method, (jint)fd) == JNI_TRUE;
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); result = 0; }
+        (*env)->DeleteLocalRef(env, service);
+    }
+    if (attached) (*vm)->DetachCurrentThread(vm);
+    return result;
+}
+
+extern void colgram_masque_open_owned(char *bind, char *edge, long long owner);
+extern void colgram_masque_close_owned(long long owner);
+
+JNIEXPORT void JNICALL
+Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1open_1owned(JNIEnv *env, jclass cls, jstring bind, jstring edge, jlong owner) {
+    (void)cls;
+    char *cb = jni_copy(env, bind);
+    char *ce = jni_copy(env, edge);
+    colgram_masque_open_owned(cb, ce, (long long)owner);
+    free(cb); free(ce);
+}
+
+JNIEXPORT void JNICALL
+Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1close_1owned(JNIEnv *env, jclass cls, jlong owner) {
+    (void)env; (void)cls;
+    colgram_masque_close_owned((long long)owner);
 }

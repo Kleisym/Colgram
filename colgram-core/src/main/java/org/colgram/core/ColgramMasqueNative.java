@@ -95,36 +95,48 @@ public final class ColgramMasqueNative {
      * <p>It answers from the packaged native libraries rather than from a load attempt, so a gate that
      * only needs to know whether the transport exists gets its answer and leaves the heap alone.
      */
+    private static Boolean packagedBackend;
+
     public static synchronized boolean isAvailableForProbe() {
-        if (loaded) {
-            return true;
-        }
-        // Ask the package manager, not the dynamic loader. The libraries are in the APK under
-        // lib/<abi>/libcolgrammasque.so, so this answers for every ABI the build ships and starts
-        // nothing - which is the entire point of the method.
+        if (loaded) return true;
+        if (packagedBackend != null) return packagedBackend;
         Context ctx = probeContext;
-        if (ctx == null) {
-            return false;
-        }
+        if (ctx == null) return false;
         try {
-            android.content.pm.ApplicationInfo info = ctx.getApplicationContext()
-                    .getApplicationInfo();
-            String sourceDir = info.sourceDir;
-            if (sourceDir == null) {
-                return false;
+            android.content.pm.ApplicationInfo info = ctx.getApplicationContext().getApplicationInfo();
+            boolean process64 = android.os.Process.is64Bit();
+            if (info.nativeLibraryDir != null) {
+                java.io.File library = new java.io.File(info.nativeLibraryDir, "libcolgrammasque.so");
+                if (library.isFile()) {
+                    try (java.io.FileInputStream input = new java.io.FileInputStream(library)) {
+                        byte[] header = new byte[5];
+                        if (input.read(header) == header.length && header[0] == 127 && header[1] == 'E'
+                                && header[2] == 'L' && header[3] == 'F' && header[4] == (process64 ? 2 : 1)) {
+                            packagedBackend = true;
+                            return true;
+                        }
+                    }
+                }
             }
-            java.io.File apk = new java.io.File(sourceDir);
-            java.util.zip.ZipFile zip = new java.util.zip.ZipFile(apk);
-            try {
-                return zip.getEntry("lib/x86_64/libcolgrammasque.so") != null
-                        || zip.getEntry("lib/arm64-v8a/libcolgrammasque.so") != null
-                        || zip.getEntry("lib/x86/libcolgrammasque.so") != null;
-            } finally {
-                zip.close();
+            java.util.List<String> paths = new java.util.ArrayList<>();
+            if (info.sourceDir != null) paths.add(info.sourceDir);
+            if (info.splitSourceDirs != null) java.util.Collections.addAll(paths, info.splitSourceDirs);
+            java.util.List<String> abis = ColgramAbiPolicy.compatible(android.os.Build.SUPPORTED_ABIS, process64);
+            for (String path : paths) {
+                try (java.util.zip.ZipFile apk = new java.util.zip.ZipFile(path)) {
+                    for (String abi : abis) {
+                        if (apk.getEntry("lib/" + abi + "/libcolgrammasque.so") != null) {
+                            packagedBackend = true;
+                            return true;
+                        }
+                    }
+                }
             }
-        } catch (Throwable t) {
-            return false;
+        } catch (java.io.IOException | RuntimeException error) {
+            Log.w(TAG, "Could not inspect packaged MASQUE backend", error);
         }
+        packagedBackend = false;
+        return false;
     }
 
     /** Set once by the app so a probe can answer without being handed a Context on every tap. */
@@ -208,6 +220,37 @@ public final class ColgramMasqueNative {
 
     /** Starts and keeps a session for the lifetime of the process. Safe to call more than once. */
     private static native void colgram_masque_open_session(String bind, String edge);
+
+    /** Full IP packets from the independent receive worker; native waits up to 250 ms. */
+    public static byte[] receiveIpPacket() {
+        if (!isLoadedInThisProcess()) return new byte[0];
+        return colgram_masque_receive();
+    }
+
+    public static String tunnelAddress() {
+        if (!isLoadedInThisProcess()) return "";
+        return colgram_masque_tunnel_address();
+    }
+
+    public static void setVpnService(android.net.VpnService service) {
+        if (!isAvailable()) throw new IllegalStateException(unavailableReason());
+        colgram_masque_set_vpn(service);
+    }
+
+    private static native void colgram_masque_set_vpn(android.net.VpnService service);
+    public static void openSessionOwned(String bind, String edge, long owner) {
+        if (!isAvailable()) throw new IllegalStateException(unavailableReason());
+        colgram_masque_open_owned(bind, edge, owner);
+    }
+
+    public static void closeSessionOwned(long owner) {
+        if (isLoadedInThisProcess()) colgram_masque_close_owned(owner);
+    }
+
+    private static native void colgram_masque_open_owned(String bind, String edge, long owner);
+    private static native void colgram_masque_close_owned(long owner);
+    private static native byte[] colgram_masque_receive();
+    private static native String colgram_masque_tunnel_address();
 
     /** Tears the long-lived session down. */
     private static native void colgram_masque_close_session();

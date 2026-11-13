@@ -73,6 +73,7 @@ public final class ColgramWarpTunnel {
     private static long lastSessionBytes = -1L;
     private static volatile boolean up;
     private static volatile boolean connected;
+    private static volatile boolean masqueSession;
     private static volatile long rxAtStart = -1;
     private static volatile boolean rotating;
     /** Why the last attempt died, shown to the user instead of a silent dead toggle. */
@@ -392,20 +393,28 @@ public final class ColgramWarpTunnel {
      * @throws IllegalStateException when the user declined the VPN dialog
      * @throws Exception for missing registration, missing backend or backend errors
      */
-    public static synchronized void bringUp(Context ctx) throws Exception {
+    public static void bringUp(Context ctx) throws Exception {
+        bringUp(ctx, ColgramRouteEpoch.snapshot());
+    }
+
+    public static void bringUp(Context ctx, long routeEpoch) throws Exception {
+        if (!ColgramRouteEpoch.isCurrent(routeEpoch)) throw new InterruptedException("Запуск WARP отменён");
         // MASQUE first, and it is not a preference. Every WireGuard edge address is silent on this
         // network - 162.159.192.1 and 162.159.198.2 on 443, 500, 4500, 4443, 8443 and 8095 answer
         // no initiation at all - while the same 162.159.198.2 answers a QUIC Initial with a Retry in
         // about 100 ms. So the protocol that reaches the edge here is MASQUE, and the transport
         // below is used only when the native client is genuinely unavailable.
         if (ColgramWarpMasqueTunnel.isAvailable(ctx)) {
-            ColgramWarpMasqueTunnel.bringUp(ctx);
-            up = true;
-            connected = true;
+            masqueSession = true;
+            ColgramWarpMasqueTunnel.bringUp(ctx, routeEpoch);
+            up = ColgramWarpMasqueTunnel.isUp();
+            connected = up;
+            if (!up) throw new IllegalStateException(ColgramWarpMasqueTunnel.failure());
             lastFailure = null;
             Log.i(TAG, "WARP up over MASQUE, verdict " + ColgramWarpMasqueTunnel.trace());
             return;
         }
+        masqueSession = false;
         bringUpWireGuard(ctx);
     }
 
@@ -472,8 +481,11 @@ public final class ColgramWarpTunnel {
                 + ":" + ColgramWarp.currentEndpointPort());
     }
 
-    public static synchronized void bringDown(Context ctx) {
+    public static void bringDown(Context ctx) {
+        cancelPendingStart();
         up = false;
+        connected = false;
+        masqueSession = false;
         rotating = false;
         // The device-wide switch is the fourth thing that has to go down with the tunnel.
         //
@@ -605,13 +617,19 @@ public final class ColgramWarpTunnel {
         }
     }
 
+    public static void cancelPendingStart() {
+        up = false;
+        connected = false;
+        ColgramWarpMasqueTunnel.cancelPendingStart();
+    }
+
     public static boolean isUp() {
-        return up;
+        return masqueSession ? ColgramWarpMasqueTunnel.isUp() : up;
     }
 
     /** True only after the embedded backend reports actual bytes from the WARP peer. */
     public static boolean isConnected() {
-        return up && connected;
+        return isUp() && (masqueSession || connected);
     }
 
     /**
@@ -621,7 +639,12 @@ public final class ColgramWarpTunnel {
      * never answer, and then quietly switch itself off. This is what the settings row and the
      * proxy screen show instead, so the failure is named at the moment it happens.
      */
+    public static String transportDescription() {
+        return masqueSession ? "MASQUE · TLS" : "WireGuard · UDP";
+    }
+
     public static String lastFailureReason() {
+        if (masqueSession && ColgramWarpMasqueTunnel.failure() != null) return ColgramWarpMasqueTunnel.failure();
         return lastFailure;
     }
 

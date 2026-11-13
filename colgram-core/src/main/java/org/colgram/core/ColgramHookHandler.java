@@ -18,7 +18,7 @@ public class ColgramHookHandler {
     private static Context appContext;
 
     public static void init(Context context) {
-        if (context == null) return;
+        if (context == null || ColgramProcess.isMasqueProcess(context)) return;
         try {
             appContext = context.getApplicationContext();
             ColgramOptimizer.optimizeStartup(appContext);
@@ -44,12 +44,16 @@ public class ColgramHookHandler {
             // WARP that was left on: re-establish it on every start (consent is already
             // granted system-wide after the first dialog; prepare() returns null then).
             if (ColgramConfig.isWarpEnabled()) {
+                final long restoreEpoch = ColgramRouteEpoch.snapshot();
                 new Thread(() -> {
+                    if (!ColgramRouteEpoch.isCurrent(restoreEpoch) || !ColgramConfig.isWarpEnabled()) return;
                     try {
-                        ColgramWarpTunnel.bringUp(appContext);
+                        ColgramWarpTunnel.bringUp(appContext, restoreEpoch);
                     } catch (Throwable t) {
-                        ColgramConfig.setWarpEnabled(false);
-                        ColgramProxyManager.notifyProxySettingsChanged();
+                        ColgramRouteEpoch.runIfCurrent(restoreEpoch, () -> {
+                            ColgramConfig.setWarpEnabled(false);
+                            ColgramProxyManager.notifyProxySettingsChanged();
+                        });
                         android.util.Log.w("ColgramHookHandler", "WARP restore failed: " + t.getMessage());
                     }
                 }, "colgram-warp-restore").start();
