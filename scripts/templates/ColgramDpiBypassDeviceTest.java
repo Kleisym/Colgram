@@ -65,23 +65,21 @@ public final class ColgramDpiBypassDeviceTest {
         android.util.Log.i("ColgramDpiBypassTest", "after startImmediately: running="
                 + bypass.getMethod("isRunning").invoke(null)
                 + " bound=" + bypass.getMethod("isBound").invoke(null)
-                + " accepts=" + accepts((Integer) bypass.getField("LOCAL_PORT").get(null)));
+                + " accepts=" + accepts((Integer) bypass.getMethod("activePort").invoke(null)));
         // The bind happens on a worker thread, so give it the same deadline awaitReady uses
         // before deciding anything. Reading isBound immediately after startImmediately races
         // the bind and reports a failure that has not happened yet.
         boolean ready = (Boolean) bypass.getMethod("awaitReady", long.class).invoke(null, 8000L);
         android.util.Log.i("ColgramDpiBypassTest", "after awaitReady: ready=" + ready
                 + " bound=" + bypass.getMethod("isBound").invoke(null)
-                + " accepts=" + accepts((Integer) bypass.getField("LOCAL_PORT").get(null)));
-        if (ready) {
-            return;
-        }
+                + " accepts=" + accepts((Integer) bypass.getMethod("activePort").invoke(null)));
+        assertTrue("the bypass must become ready within its own deadline", ready);
         assertTrue("the bypass must report itself bound",
                 (Boolean) bypass.getMethod("isBound").invoke(null));
         assertTrue("the bypass must become ready within its own deadline",
                 (Boolean) bypass.getMethod("awaitReady", long.class).invoke(null, 8000L));
 
-        int port = (Integer) bypass.getField("LOCAL_PORT").get(null);
+        int port = (Integer) bypass.getMethod("activePort").invoke(null);
         assertTrue("connect() to the bound bypass port is the only proof it is listening",
                 accepts(port));
     }
@@ -97,10 +95,10 @@ public final class ColgramDpiBypassDeviceTest {
         // A closed ServerSocket can still have its backlog handed to a connection that was
         // already queued, so one immediate retry can succeed against a listener that is gone.
         // What matters is that it stops accepting, not that the very next connect fails.
-        boolean stillAccepting = false;
-        for (int attempt = 0; attempt < 10 && !stillAccepting; attempt++) {
+        boolean stillAccepting = true;
+        for (int attempt = 0; attempt < 10 && stillAccepting; attempt++) {
             Thread.sleep(150L);
-            stillAccepting = accepts((Integer) bypass.getField("LOCAL_PORT").get(null));
+            stillAccepting = accepts((Integer) bypass.getMethod("activePort").invoke(null));
         }
         assertFalse("a stopped bypass must stop accepting connections within a second and a half",
                 stillAccepting);
@@ -118,7 +116,7 @@ public final class ColgramDpiBypassDeviceTest {
                 (Boolean) bypass.getMethod("restartIfDeadAndWait", long.class)
                         .invoke(null, 8000L));
         assertTrue("and the restarted listener must accept again",
-                accepts((Integer) bypass.getField("LOCAL_PORT").get(null)));
+                accepts((Integer) bypass.getMethod("activePort").invoke(null)));
     }
 
     private static boolean accepts(int port) {

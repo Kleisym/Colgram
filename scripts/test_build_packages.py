@@ -53,5 +53,12 @@ class BuildPackagesTest(unittest.TestCase):
         self.assertNotIn('android:enabled="false"', fixed)
         self.assertEqual(fixed, patcher.remove_measurement_components(fixed))
 
+    def test_device_tests_compile_against_the_real_colgram_modules(self):
+        source = "dependencies {\n implementation project(':TMessagesProj')\n}\n"
+        fixed = patcher.ensure_device_test_dependencies(source)
+        self.assertIn("androidTestImplementation project(':colgram-core')", fixed)
+        self.assertIn("androidTestImplementation project(':colgram-singbox')", fixed)
+        self.assertEqual(fixed, patcher.ensure_device_test_dependencies(fixed))
+
 
 if __name__ == "__main__": unittest.main()

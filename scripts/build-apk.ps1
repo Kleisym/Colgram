@@ -4,7 +4,7 @@ param(
     [string]$JavaHome = $env:JAVA_HOME,
     [string]$AndroidSdk = $env:ANDROID_HOME,
     [string]$Output = '',
-    [string]$BuildStamp = 'network-20261114'
+    [string]$BuildStamp = 'mumu-cloud-20261114'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -43,7 +43,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Colgram patch injection failed' }
     $arguments = @('-cp', 'gradle/wrapper/gradle-wrapper.jar', 'org.gradle.wrapper.GradleWrapperMain',
         '-I', (Join-Path $PSScriptRoot 'target-abis.gradle'), ':TMessagesProj_AppStandalone:assembleAfatDebug',
-        '--no-daemon', '--max-workers=2', '-Dorg.gradle.jvmargs=-Xmx3072m')
+        '--no-daemon', '--no-build-cache', '--max-workers=2', '-Dorg.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8')
     if ($Abi -ne 'universal') { $arguments += "-PcolgramAbis=$Abi" }
     Push-Location -LiteralPath $upstream
     try {

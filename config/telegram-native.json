@@ -1,0 +1,25 @@
+{
+  "telegram_version": "12.10.6",
+  "telegram_commit": "f2908b14133bbffbf7ab04f641ecb5bfaf533242",
+  "apk_url": "https://github.com/Kleisym/Colgram/releases/download/colgram-f2908b1-98/colgram-signed-release.apk",
+  "apk_sha256": "5753fce075af2099182fd4c245955523d9b4706acfa05f97d2b92a442d750383",
+  "entries": {
+    "lib/arm64-v8a/libtmessages.49.so": {
+      "sha256": "f61bde6cfbd7535559f9b3293a7a51be6dfc266339f17bed4491bd68bb5b2960",
+      "bytes": 19669752
+    },
+    "lib/armeabi-v7a/libtmessages.49.so": {
+      "sha256": "49fdc1b5616b1d1a0d33fe98c01be77fecd3d460444b92cf58ecb881c73d4b80",
+      "bytes": 16483280
+    },
+    "lib/x86/libtmessages.49.so": {
+      "sha256": "8ec72d845b8ef9ff41471e09fdc44823794a212836299fd8e7157c6657e8dfb6",
+      "bytes": 21660096
+    },
+    "lib/x86_64/libtmessages.49.so": {
+      "sha256": "ed4d5990c93f81497f535dc4a450b85551326f5a626d7d1ca05770d762b6f801",
+      "bytes": 21084864
+    }
+  },
+  "required_jni_descriptor": "(IJIIIZI)V"
+}

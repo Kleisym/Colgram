@@ -253,15 +253,7 @@ public class ColgramConfig {
     private static final String KEY_DPI_BYPASS_ENABLED = "dpi_bypass_enabled";
 
     public static boolean isDpiBypassEnabled() {
-        // Always on. The bypass is not an option - it is the layer the app connects through, so
-        // turning it off would leave traffic pointed at whatever the network filters, and there is
-        // no state where "off" is a route worth offering. The preference key is still read, so an
-        // install that once had it off is honoured by being corrected here rather than silently
-        // disagreeing with the row that claims the bypass is on.
-        if (prefs != null && !prefs.getBoolean(KEY_DPI_BYPASS_ENABLED, true)) {
-            prefs.edit().putBoolean(KEY_DPI_BYPASS_ENABLED, true).apply();
-        }
-        return true;
+        return prefs != null && prefs.getBoolean(KEY_DPI_BYPASS_ENABLED, false);
     }
 
     public static void setDpiBypassEnabled(boolean enabled) {
@@ -573,11 +565,11 @@ public class ColgramConfig {
      * address is reachable at all - on a network that drops every one of them it changes nothing.
      */
     public static boolean isDcRemapEnabled() {
-        return true;
+        return prefs != null && prefs.getBoolean(KEY_DC_REMAP, false);
     }
 
     public static void setDcRemapEnabled(boolean enabled) {
-        if (prefs != null) prefs.edit().putBoolean(KEY_DC_REMAP, true).apply();
+        if (prefs != null) prefs.edit().putBoolean(KEY_DC_REMAP, enabled).apply();
     }
 
     /**

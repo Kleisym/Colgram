@@ -1943,14 +1943,33 @@ public class ColgramProxyManager {
     /** How long a remembered verdict is trusted before the prober re-checks it. */
     private static final long REMEMBERED_VALID_MS = 60000L;
 
+    private static final java.util.Map<ProxyItem, Object> nativeProbeOwners =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
+
+    private static boolean finishNativeProbe(ProxyItem item, Object owner) {
+        synchronized (nativeProbeOwners) {
+            if (nativeProbeOwners.get(item) != owner) return false;
+            nativeProbeOwners.remove(item);
+            item.nativeProbeInFlight.set(false);
+            return true;
+        }
+    }
+
     private static boolean checkOne(final ProxyItem item, final AvailabilityHandler onResult) {
         if (!item.nativeProbeInFlight.compareAndSet(false, true)) return false;
+        final Object owner = new Object();
+        nativeProbeOwners.put(item, owner);
+        final Runnable timeout = () -> {
+            if (!finishNativeProbe(item, owner)) return;
+            item.pingMs = -2;
+            onResult.onResult(false);
+        };
         try {
             Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
             Class<?> rtdClass = Class.forName("org.telegram.tgnet.RequestTimeDelegate");
             final Object settings = buildProxySettings(item);
             if (settings == null) {
-                item.nativeProbeInFlight.set(false);
+                finishNativeProbe(item, owner);
                 return false;
             }
 
@@ -1962,7 +1981,8 @@ public class ColgramProxyManager {
                             final long time = (args == null || args.length == 0
                                     || !(args[0] instanceof Number)) ? -1L : ((Number) args[0]).longValue();
                             mainHandler.post(() -> {
-                                if (!item.nativeProbeInFlight.compareAndSet(true, false)) return;
+                                if (!finishNativeProbe(item, owner)) return;
+                                mainHandler.removeCallbacks(timeout);
                                 // Only the measurement belongs here; onVerdict owns the state it
                                 // feeds, so a verdict cannot be recorded one way by the probe and
                                 // another way by the caller.
@@ -1975,9 +1995,13 @@ public class ColgramProxyManager {
 
             Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, 0);
             cmClass.getMethod("checkProxy", settings.getClass(), rtdClass).invoke(cm, settings, delegate);
+            // Native checks can remain pending on a silent peer; every caller needs the
+            // same bounded failure, including mimic/private-route checks outside the sweeps.
+            mainHandler.postDelayed(timeout, NATIVE_CHECK_TIMEOUT_MS);
             return true;
         } catch (Throwable t) {
-            item.nativeProbeInFlight.set(false);
+            mainHandler.removeCallbacks(timeout);
+            finishNativeProbe(item, owner);
             Log.w(TAG, "native proxy check unavailable: " + t.getMessage());
             return false;
         }
@@ -2008,8 +2032,8 @@ public class ColgramProxyManager {
 
     private static Object buildProxySettings(ProxyItem item, boolean useEffectiveEndpoint) {
         try {
-            Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
-            Class<?> pstClass = Class.forName("org.telegram.proxy.ProxySettings$Type");
+            Class<?> psClass = Class.forName("org.telegram.utils.proxy.ProxySettings");
+            Class<?> pstClass = Class.forName("org.telegram.utils.proxy.ProxySettings$Type");
             String typeName = item.type == 2 ? "WEB" : (item.type == 1 ? "MTPROTO" : "SOCKS5");
             Object typeObj = Enum.valueOf((Class<Enum>) pstClass, typeName);
 
@@ -3266,7 +3290,7 @@ public static void reportProxyFailure() {
             boolean appliedThroughStockPath = false;
             boolean appliedThroughNativePath = false;
             try {
-                Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
+                Class<?> psClass = Class.forName("org.telegram.utils.proxy.ProxySettings");
                 Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
                 Object settings = buildProxySettings(proxy);
                 if (settings == null || !Boolean.TRUE.equals(psClass.getMethod("isValid").invoke(settings))) {
@@ -3566,31 +3590,17 @@ public static void reportProxyFailure() {
             boolean ready = ColgramDpiBypass.awaitReady(20000);
             if (dpiRequestGeneration.get() != dpiRequest || !ColgramRouteEpoch.isCurrent(routeEpoch)
                     || !ColgramConfig.isDpiBypassEnabled() || ColgramConfig.isWarpEnabled()) return;
-            ProxyItem local = findLocalDpiProxy();
-            if (!ready || local == null) {
+            ProxyItem existingLocal = findLocalDpiProxy();
+            final ProxyItem local = existingLocal != null ? existingLocal
+                    : new ProxyItem("127.0.0.1", ColgramDpiBypass.activePort(), "", 0);
+            if (!ready) {
                 Log.e(TAG, "desync bypass enabled but the listener never bound; leaving traffic alone");
                 mainHandler.post(() -> toast("Обходчик не смог поднять 127.0.0.1:"
                         + ColgramDpiBypass.activePort()));
                 return;
             }
-            // The listener exists either way - it is the app's permanent private route - but it does
-            // not get to TAKE the route when Telegram already answers directly.
-            //
-            // It used to be applied unconditionally here, which is what the notice button did on a
-            // perfectly open network:
-            //
-            //   00:32:26  Telegram answers directly; leaving traffic off the local desync hop
-            //   00:32:31  Applying proxy: 127.0.0.1:9876 (type=0)
-            //
-            // Two things had already established the direct route was fine, and the hop still won
-            // because nothing here asked again. The desync front only has something to defeat when
-            // the DC is filtered, so it is applied on that evidence and not on its own existence.
-            if (ColgramDcRemap.telegramDcProbe() >= 0) {
-                Log.i(TAG, "desync listener is up and Telegram answers directly; not taking the route");
-                checkPoolNow();
-                toast("Обходчик ТСПУ работает; Telegram отвечает напрямую");
-                return;
-            }
+            // A user selected this route explicitly. TCP accept is not MTProto health:
+            // filtered endpoints can complete SYN while dropping every protocol response.
             if (dpiRequestGeneration.get() != dpiRequest || !ColgramRouteEpoch.isCurrent(routeEpoch)
                     || !ColgramConfig.isDpiBypassEnabled() || ColgramConfig.isWarpEnabled()) return;
             Log.i(TAG, "applying local desync route before judging Telegram reachability");
@@ -3598,7 +3608,7 @@ public static void reportProxyFailure() {
                 if (dpiRequestGeneration.get() == dpiRequest && ColgramConfig.isDpiBypassEnabled()
                         && !ColgramConfig.isWarpEnabled()) forceApplyProxy(local);
             }));
-            checkPoolNow();
+            if (ColgramConfig.isBuiltinProxyEnabled() || ColgramConfig.isAutoProxyEnabled()) checkPoolNow();
             toast("Локальный обход включён; проверяю соединение");
         });
     }
@@ -3660,7 +3670,7 @@ public static void reportProxyFailure() {
             try {
                 Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
                 Method stockSet = cmClass.getMethod("setProxySettings", boolean.class,
-                        Class.forName("org.telegram.proxy.ProxySettings"));
+                        Class.forName("org.telegram.utils.proxy.ProxySettings"));
                 stockSet.invoke(null, false, null);
             } catch (Throwable t) {
                 Log.e(TAG, "disableProxy setProxySettings error", t);
@@ -3763,7 +3773,7 @@ public static void reportProxyFailure() {
             disableStockRotation(ctx);
             Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
             Class<?> piClass = Class.forName("org.telegram.messenger.SharedConfig$ProxyInfo");
-            Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
+            Class<?> psClass = Class.forName("org.telegram.utils.proxy.ProxySettings");
 
             scClass.getDeclaredMethod("loadProxyList").invoke(null);
             removeInternalLoopbackProxies(scClass);
@@ -3815,7 +3825,7 @@ public static void reportProxyFailure() {
             disableStockRotation(appContext);
             Class<?> scClass = Class.forName("org.telegram.messenger.SharedConfig");
             Class<?> piClass = Class.forName("org.telegram.messenger.SharedConfig$ProxyInfo");
-            Class<?> psClass = Class.forName("org.telegram.proxy.ProxySettings");
+            Class<?> psClass = Class.forName("org.telegram.utils.proxy.ProxySettings");
 
             Field loaded = scClass.getDeclaredField("proxyListLoaded");
             loaded.setAccessible(true);

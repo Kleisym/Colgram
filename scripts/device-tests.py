@@ -38,6 +38,8 @@ DEVICE_TESTS = [
     "org.colgram.singbox.LibboxPresenceDeviceTest",
     "org.colgram.core.ColgramCallProxyDeviceTest",
     "org.colgram.core.ColgramDpiBypassDeviceTest",
+    "org.colgram.core.ColgramDirectConnectionDeviceTest",
+    "org.colgram.core.ColgramOnboardingDeviceTest",
     "org.colgram.core.ColgramDeviceQuicInitialTest",
     "org.colgram.core.ColgramDeviceQuicAnatomyTest",
     "org.colgram.core.ColgramDeviceQuicScopeTest",

@@ -66,152 +66,114 @@ public class ColgramDpiBypass {
             new ColgramConnectFailureBackoff(CONNECT_FAILURE_BASE_DELAY_MS,
                     CONNECT_FAILURE_MAX_DELAY_MS);
 
+    private static long listenerGeneration;
+
     public static synchronized void start() {
         if (isRunning || startScheduled) return;
         startScheduled = true;
-
-        // Defer binding the local proxy socket out of the application-startup
-        // window. Telegram's native MTProto stack (libtmessages.so ->
-        // tgnet::ConnectionSocket) is still opening and closing its own sockets
-        // during the first seconds of the process; adding a ServerSocket plus a
-        // cached pool of worker sockets in that same window makes the two stacks
-        // race over the process-wide descriptor table. bionic's fdsan then kills
-        // the process with SIGABRT ("attempted to close file descriptor N ...
-        // owned by SocketImpl") inside libtmessages.49.so.
+        final long generation = ++listenerGeneration;
         deferredStart = new Thread(() -> {
             try {
                 Thread.sleep(START_DELAY_MS);
-            } catch (InterruptedException ie) {
+            } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return;
             }
-            startScheduled = false;
-            startNow();
+            synchronized (ColgramDpiBypass.class) {
+                if (generation != listenerGeneration || !startScheduled) return;
+                startScheduled = false;
+                deferredStart = null;
+                startNow();
+            }
         }, "colgram-dpi-deferred");
         deferredStart.setDaemon(true);
         deferredStart.start();
     }
 
-    /**
-     * Bind the listener without the internal deferral.
-     *
-     * The only caller that needs this is {@code ColgramProxyManager}, which already defers
-     * its entire activation block by its own delay. Calling {@link #start()} from there
-     * stacked the two delays SERIALLY — 10s in the manager plus another 8s here — so the
-     * listener did not exist until ~18s after launch. That is the "very slow to connect"
-     * complaint, and it also left {@code awaitReady()} only a ~7s margin on a 15s budget,
-     * so a slow device could time out and point Telegram at a closed port ("Недоступен").
-     *
-     * Safe to call directly because the caller has already paid the startup-delay cost and
-     * guarantees the native socket churn has settled.
-     */
+    /** An explicit request promotes a pending delayed start instead of waiting eight seconds. */
     public static synchronized void startImmediately() {
-        if (isRunning || startScheduled) return;
+        if (isRunning && bound) return;
+        if (deferredStart != null) deferredStart.interrupt();
+        deferredStart = null;
+        startScheduled = false;
         startNow();
     }
 
-    /** Binds the proxy listener immediately. Prefer start(), which defers safely. */
+    /** Bind and publish under the same lock as stop(); only accept runs asynchronously. */
     private static synchronized void startNow() {
-        // A listener that only sets isRunning and then fails to bind is worse than no listener at
-        // all: the flag says the bypass is up, every health check passes, and the one port the app
-        // routes through answers nothing. Measured on the device, where the port was already held:
-        //
-        //   01:31:20  E/ColgramDpiBypass: ColgramDpiBypass server error
-        //   01:31:20    Caused by: android.system.ErrnoException: bind failed: EADDRINUSE
-        //   01:31:41  W/ColgramDpiBypass: DPI listener not ready after 20000ms
-        //
-        // isRunning was left true by that failure, so startNow() returned early on every later call
-        // and the dead listener could never be rebuilt. isRunning now means "bound and accepting",
-        // and a bind failure clears it so the next attempt can actually try again.
-        if (isRunning && bound) return;
-
-        workerPool.execute(() -> {
+        if (isRunning && bound && serverSocket != null && !serverSocket.isClosed()) return;
+        final long generation = ++listenerGeneration;
+        ServerSocket candidate = null;
+        try {
+            candidate = new ServerSocket();
+            candidate.setReuseAddress(true);
             try {
-                ServerSocket socket = new ServerSocket();
-                socket.setReuseAddress(true);
-                try {
-                    socket.bind(new InetSocketAddress("127.0.0.1", LOCAL_PORT));
-                } catch (Exception bindFailure) {
-                    // The port is held by something this process did not let go of: another listener
-                    // of the same port, or a socket still closing from a previous pass. This retries by
-                    // binding a fresh port rather than by tearing the old listener down.
-                    //
-                    // The earlier version called stop() here, and that was the fault this replaced. stop()
-                    // clears isRunning and nulls serverSocket, both of which are the state the accept
-                    // loop below is about to set for this very socket - so the rebind succeeded and the
-                    // bookkeeping then described a listener that no longer existed. Worse, stop() is
-                    // synchronized on the same class monitor startNow holds, so the call could not
-                    // complete until the worker returned, which is the shape of a self-deadlock. On the
-                    // device this produced:
-                    //   EADDRINUSE: bind failed: Address already in use
-                    //   DPI listener not ready after 20000ms
-                    // with the port held and the bypass dead, which is the symptom reported as the
-                    // bypass not working.
-                    //
-                    // What the caller is told is the port it can actually reach, and the health check
-                    // reads the same field the accept loop writes.
-                    Log.w(TAG, "the bypass port is busy; releasing it and rebinding");
-                    closeQuietly(socket);
-                    int port = findFreePort();
-                    if (port <= 0) {
-                        bound = false;
-                        isRunning = false;
-                        Log.e(TAG, "no free loopback port for the bypass listener");
-                        return;
-                    }
-                    socket = new ServerSocket();
-                    socket.setReuseAddress(true);
-                    socket.bind(new InetSocketAddress("127.0.0.1", port));
-                    activePort = port;
-                    Log.i(TAG, "bypass listener moved to 127.0.0.1:" + port + " after EADDRINUSE on " + LOCAL_PORT);
-                }
-                serverSocket = socket;
-                bound = true;
-                isRunning = true;
-                Log.d(TAG, "ColgramDpiBypass started on 127.0.0.1:" + activePort);
-
-                while (isRunning) {
-                    try {
-                        // Accept on the local socket, not on the field. Reading the field meant a loop
-                        // started before a stop() could be handed the socket a later start installed,
-                        // so a stopped bypass went on accepting: stop() cleared the field, the next
-                        // start bound again, and this loop - still inside `while (isRunning)` from the
-                        // previous life - began serving the new socket on the old thread. That is what
-                        // left a listener accepting a second and a half after it was told to stop.
-                        Socket clientSocket = socket.accept();
-                        workerPool.execute(() -> handleClient(clientSocket));
-                    } catch (Exception e) {
-                        if (!isRunning) break;
-                    }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "ColgramDpiBypass server error", e);
-            } finally {
-                // The listener is gone either way: `isRunning` was cleared by stop(), or the
-                // accept loop threw out of the try. Clear `bound` so the health check sees a
-                // dead port rather than a stale "still accepting" flag.
-                bound = false;
+                candidate.bind(new InetSocketAddress("127.0.0.1", LOCAL_PORT));
+            } catch (java.net.BindException occupied) {
+                closeQuietly(candidate);
+                candidate = new ServerSocket();
+                candidate.setReuseAddress(true);
+                candidate.bind(new InetSocketAddress("127.0.0.1", 0));
             }
-        });
+            final ServerSocket listener = candidate;
+            serverSocket = listener;
+            activePort = listener.getLocalPort();
+            bound = true;
+            isRunning = true;
+            workerPool.execute(() -> acceptClients(listener, generation));
+            Log.d(TAG, "ColgramDpiBypass started on 127.0.0.1:" + activePort);
+        } catch (Exception failure) {
+            closeQuietly(candidate);
+            serverSocket = null;
+            activePort = LOCAL_PORT;
+            bound = false;
+            isRunning = false;
+            Log.e(TAG, "ColgramDpiBypass bind failed", failure);
+        }
+    }
+
+    private static synchronized boolean ownsListener(ServerSocket listener, long generation) {
+        return generation == listenerGeneration && serverSocket == listener && isRunning;
+    }
+
+    private static void acceptClients(ServerSocket listener, long generation) {
+        try {
+            while (ownsListener(listener, generation)) {
+                Socket client = listener.accept();
+                synchronized (ColgramDpiBypass.class) {
+                    if (!ownsListener(listener, generation)) {
+                        closeQuietly(client);
+                        break;
+                    }
+                    workerPool.execute(() -> handleClient(client));
+                }
+            }
+        } catch (Exception failure) {
+            if (ownsListener(listener, generation)) Log.w(TAG, "DPI accept loop stopped", failure);
+        } finally {
+            closeQuietly(listener);
+            synchronized (ColgramDpiBypass.class) {
+                // An old accept loop must never clear a newer listener's readiness.
+                if (serverSocket == listener && listenerGeneration == generation) {
+                    serverSocket = null;
+                    bound = false;
+                    isRunning = false;
+                    activePort = LOCAL_PORT;
+                }
+            }
+        }
     }
 
     public static synchronized void stop() {
+        ++listenerGeneration;
         isRunning = false;
-        startScheduled = false;
-        activePort = LOCAL_PORT;
-        if (deferredStart != null) {
-            deferredStart.interrupt();
-            deferredStart = null;
-        }
-        if (serverSocket != null) {
-            try {
-                serverSocket.close();
-            } catch (Exception ignored) {}
-            serverSocket = null;
-        }
-        // Clear `bound` too, or isBound() keeps reporting a listener that no longer exists
-        // and the health check in ColgramProxyManager never notices the port went dead.
         bound = false;
+        startScheduled = false;
+        if (deferredStart != null) deferredStart.interrupt();
+        deferredStart = null;
+        closeQuietly(serverSocket);
+        serverSocket = null;
+        activePort = LOCAL_PORT;
         Log.d(TAG, "ColgramDpiBypass stopped");
     }
 
@@ -297,8 +259,8 @@ public class ColgramDpiBypass {
      * @return true if the listener is accepting
      */
     public static boolean awaitReady(long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        while (SystemClock.elapsedRealtime() < deadline) {
             if (bound && serverSocket != null && !serverSocket.isClosed()) {
                 return true;
             }
@@ -459,7 +421,8 @@ public class ColgramDpiBypass {
                     targetSocket = connectWithBackoff(live, destPort);
                 }
             }
-            if (targetSocket == null && ColgramProxyManager.hasReachableRelays()) {
+            if (targetSocket == null && ColgramConfig.isAutoProxyEnabled()
+                    && ColgramProxyManager.hasReachableRelays()) {
                 // The listener is a local gateway, not a dead end. Direct dial and remap
                 // alternatives both refused: hand the connection to a reachable relay front.
                 // The relay is a stranger's machine, but it is the ONLY way a destination whose
@@ -897,6 +860,7 @@ public class ColgramDpiBypass {
                     }
                 } else if (firstPayload.length > 1) {
                     sendDesynced(dest, dout, firstPayload, firstPayload.length, strategy);
+                    toTargetBytes.addAndGet(firstPayload.length);
                 } else if (firstPayload.length == 1) {
                     dout.write(firstPayload, 0, 1);
                     dout.flush();

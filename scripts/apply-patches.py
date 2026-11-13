@@ -1227,50 +1227,15 @@ def inject_hooks(repo_path):
             "DialogsActivity Proxy Status Follows Runtime Route"
         )
         def header_proxy_updater(content):
-            target_replacement = """downloadsItem.setVisibility(View.GONE);
+            from onboarding_patches import patch_dialogs_network_menu
+            updated = patch_dialogs_network_menu(content)
+            return updated if updated != content else CONVERGED
 
-            org.telegram.ui.ActionBar.ActionBarMenuItem colgramProxyItem = menu.addItem(2, proxyDrawable);
-            if (colgramProxyItem != null) {
-                colgramProxyItem.setContentDescription(getString(R.string.ProxySettings));
-                colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity()));
-                colgramProxyItem.setOnLongClickListener(v -> {
-                    presentFragment(new ProxyListActivity());
-                    return true;
-                });
-            }
-
-            updateProxyButton(false, false);"""
-            if "org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity())" in content:
-                return content
-            if "colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));" in content:
-                return content.replace(
-                    "colgramProxyItem.setOnClickListener(v -> presentFragment(new ProxyListActivity()));",
-                    """colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity()));
-                colgramProxyItem.setOnLongClickListener(v -> {
-                    presentFragment(new ProxyListActivity());
-                    return true;
-                });"""
-                )
-            target = "downloadsItem.setVisibility(View.GONE);"
-            inject = """downloadsItem.setVisibility(View.GONE);
-
-            org.telegram.ui.ActionBar.ActionBarMenuItem colgramProxyItem = menu.addItem(2, proxyDrawable);
-            if (colgramProxyItem != null) {
-                colgramProxyItem.setContentDescription(getString(R.string.ProxySettings));
-                colgramProxyItem.setOnClickListener(v -> org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity()));
-                colgramProxyItem.setOnLongClickListener(v -> {
-                    presentFragment(new ProxyListActivity());
-                    return true;
-                });
-            }"""
-            if target in content:
-                return content.replace(target, inject, 1)
-            return content
         patch_file(
             dialogs_activity,
             header_proxy_updater,
-            "org.colgram.core.ColgramProxyManager.toggleProxy(getParentActivity())",
-            "DialogsActivity Header Proxy Button 1-Tap Toggle"
+            None,
+            "DialogsActivity Persistent Colgram Network Menu"
         )
 
         def options_menu_injector(content):
@@ -3438,23 +3403,19 @@ def inject_hooks(repo_path):
             return c.replace(target, inject, 1)
         patch_file(browser_file, browser_proxy_injector, "org.colgram.core.ColgramConfig.isProxyBrowserEnabled()", "Browser Force In-App Browser for Privacy")
 
-    # 37. LoginActivity.java -> Always visible Proxy Button
+    # 37. LoginActivity.java -> Persistent account-free network settings entry
     login_activity_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LoginActivity.java")
     if os.path.exists(login_activity_file):
+        def login_network_menu_updater(content):
+            from onboarding_patches import patch_login_network_menu
+            updated = patch_login_network_menu(content)
+            return updated if updated != content else CONVERGED
+
         patch_file(
             login_activity_file,
-            "showProxyButton(false, animated);",
-            "showProxyButton(true, animated);",
-            "LoginActivity Keep Proxy Button Always Visible"
-        )
-        patch_file(
-            login_activity_file,
-            "proxyButtonView.setOnClickListener(v -> presentFragment(new ProxyListActivity()));",
-            """proxyButtonView.setOnClickListener(v -> {
-            org.colgram.core.ColgramProxyManager.populateSharedConfigProxies();
-            presentFragment(new ProxyListActivity());
-        });""",
-            "LoginActivity Auto-Populate Proxy on Click"
+            login_network_menu_updater,
+            None,
+            "LoginActivity Persistent Colgram Network Menu"
         )
         patch_file(
             login_activity_file,
@@ -3509,17 +3470,18 @@ def inject_hooks(repo_path):
             '                : "A fast, private and free messenger",',
             "IntroActivity Set Subtitle to Colgram"
         )
-        # "IntroActivity Show Colgram Red Airplane" REMOVED as obsolete.
-        #
-        # It added an ImageView overlay on top of the native intro TextureView. The anchor no
-        # longer matches upstream, so it has not applied for a long time — and the intro still
-        # shows the Colgram plane, verified on device with no `colgramLogo` present anywhere in
-        # the built tree. The branding therefore comes from the splash/launcher assets written
-        # by prepare_branding and the native intro, not from this patch.
-        #
-        # It is deleted rather than re-anchored because re-anchoring it would draw a SECOND
-        # logo on top of the native one, and because the native view must never be hidden —
-        # see the invalid-surface abort documented below.
+        def intro_branding_menu_updater(content):
+            from onboarding_patches import patch_intro_branding_and_menu
+            updated = patch_intro_branding_and_menu(content)
+            return updated if updated != content else CONVERGED
+
+        patch_file(
+            intro_file,
+            intro_branding_menu_updater,
+            None,
+            "IntroActivity Native Colgram Artwork and Network Menu"
+        )
+        # Replace the GL texture itself; preserve the TextureView/EGL lifecycle.
         # NOTE: the day/night switcher used to be hidden here with
         # themeFrameLayout.setVisibility(View.GONE). That is deliberately NOT done any more.
         # The stock paragraph around this frame also carries the native intro surface; a
@@ -4139,6 +4101,13 @@ def inject_hooks(repo_path):
     except Exception as _e:
         print(" [!] proxylist warp patch failed: " + str(_e))
         PATCH_MISSES.append("ProxyListActivity WARP Row")
+
+    def proxy_cloud_branding(content):
+        from onboarding_patches import patch_proxy_cloud_branding
+        updated = patch_proxy_cloud_branding(content)
+        return updated if updated != content else CONVERGED
+    patch_file(os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProxyListActivity.java"),
+               proxy_cloud_branding, None, "ProxyListActivity Colgram Red Cloud Branding")
 
     # 49b. WebviewActivity.java -> Route the in-app browser through the local bypass listener
     #
@@ -5869,6 +5838,17 @@ def inject_singbox_device_test_support(repo_path, root_dir):
     print(" [+] sing-box device tests are mirrored from tracked templates")
 
 
+def ensure_device_test_dependencies(content):
+    required = ("androidTestImplementation project(':colgram-core')", "androidTestImplementation project(':colgram-singbox')")
+    missing = [line for line in required if line not in content]
+    if not missing:
+        return content
+    match = re.search(r'dependencies\s*\{', content)
+    if not match:
+        raise ValueError("Android test module has no dependencies block")
+    return content[:match.end()] + "\n    " + "\n    ".join(missing) + content[match.end():]
+
+
 def inject_core_device_test_support(repo_path, root_dir):
     """Mirror the org.colgram.core device tests into the generated test tree.
 
@@ -5883,10 +5863,20 @@ def inject_core_device_test_support(repo_path, root_dir):
         print(" [=] TMessagesProj_AppTests missing; skipping core device-test wiring")
         return
 
+    gradle_path = os.path.join(module_dir, "build.gradle")
+    with open(gradle_path, "r", encoding="utf-8") as source:
+        content = source.read()
+    fixed = ensure_device_test_dependencies(content)
+    if fixed != content:
+        with open(gradle_path, "w", encoding="utf-8") as target:
+            target.write(fixed)
+
     template_dir = os.path.join(root_dir, "scripts", "templates")
     destination_dir = os.path.join(
         module_dir, "src", "androidTest", "java", "org", "colgram", "core")
-    for name in ("ColgramSettingsRowsDeviceTest.java",
+    for name in ("ColgramDirectConnectionDeviceTest.java",
+        "ColgramOnboardingDeviceTest.java",
+                 "ColgramSettingsRowsDeviceTest.java",
                  "ColgramThemeContrastDeviceTest.java",
                  "ColgramCallProxyDeviceTest.java",
                  "ColgramDpiBypassDeviceTest.java",
@@ -6019,58 +6009,12 @@ def download_official_binaries(repo_path):
                     f.write(content)
                 print(f" [+] Added packagingOptions to {module}/build.gradle")
 
-    # 3. Download official APK with retries
-    has_so_files = os.path.exists(jni_libs_dir) and any(f.endswith('.so') for _, _, files in os.walk(jni_libs_dir) for f in files)
-    if has_so_files:
-        print(" [+] Precompiled native .so libraries already present in jniLibs, skipping download.")
-        return
+    # The source is version-pinned; a moving telegram.org APK can keep the same
+    # libtmessages.49.so name while changing RegisterNatives signatures and abort
+    # the process before any Java exception can be handled.
+    from native_bootstrap import ensure_native
+    ensure_native(repo_path)
 
-    success = False
-    for attempt in range(4):
-        try:
-            print(f" -> Downloading official Telegram APK (attempt {attempt+1}/4)...")
-            if os.path.exists(temp_apk):
-                os.remove(temp_apk)
-
-            # Try curl first
-            curl_res = subprocess.run(
-                ["curl", "-L", "--retry", "3", "--retry-delay", "2", "-s", "-o", temp_apk, apk_url],
-                capture_output=True
-            )
-            if curl_res.returncode != 0 or not os.path.exists(temp_apk) or os.path.getsize(temp_apk) < 30 * 1024 * 1024:
-                req = urllib.request.Request(apk_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=120) as resp, open(temp_apk, 'wb') as out_file:
-                    shutil.copyfileobj(resp, out_file)
-
-            if os.path.exists(temp_apk) and os.path.getsize(temp_apk) > 30 * 1024 * 1024:
-                with zipfile.ZipFile(temp_apk, 'r') as zip_ref:
-                    if os.path.exists(jni_libs_dir):
-                        shutil.rmtree(jni_libs_dir)
-                    os.makedirs(jni_libs_dir, exist_ok=True)
-
-                    for file_info in zip_ref.infolist():
-                        if file_info.filename.startswith("lib/"):
-                            if "liblanguage_id" in file_info.filename or not file_info.filename.endswith(".so"):
-                                continue
-                            rel_path = file_info.filename[len("lib/"):]
-                            target_file = os.path.join(jni_libs_dir, rel_path)
-                            os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                            with zip_ref.open(file_info) as src, open(target_file, 'wb') as dst:
-                                shutil.copyfileobj(src, dst)
-                    print(" [+] Successfully extracted prebuilt .so libraries to jniLibs!")
-                    success = True
-                    break
-            else:
-                print(f" [!] Attempt {attempt+1} produced small/invalid file.")
-        except Exception as e:
-            print(f" [!] Attempt {attempt+1} error: {e}")
-        finally:
-            if os.path.exists(temp_apk):
-                os.remove(temp_apk)
-
-    if not success:
-        print(" [!] FATAL: Failed to download official Telegram APK for native .so extraction.")
-        sys.exit(1)
 
 def inject_core(repo_path, core_source_dir):
     print("[*] Injecting colgram-core module into project...")
@@ -6910,6 +6854,8 @@ def apply_custom_app_icon(repo_path, source_icon_path):
             drawable_dir = os.path.join(res_dir, "drawable")
             os.makedirs(drawable_dir, exist_ok=True)
             shutil.copy2(splash_src, os.path.join(drawable_dir, "colgram_plane_splash.png"))
+            shutil.copy2(os.path.join(root_dir, "assets", "colgram_cloud_logo.xml"),
+                         os.path.join(drawable_dir, "colgram_cloud_logo.xml"))
 
             splash_bg_xml = os.path.join(drawable_dir, "colgram_splash_bg.xml")
             with open(splash_bg_xml, "w", encoding="utf-8") as f:
@@ -6920,7 +6866,7 @@ def apply_custom_app_icon(repo_path, source_icon_path):
         android:gravity="center"
         android:width="160dp"
         android:height="160dp"
-        android:drawable="@drawable/colgram_plane_splash" />
+        android:drawable="@drawable/colgram_cloud_logo" />
 </layer-list>
 ''')
 
@@ -6933,7 +6879,7 @@ def apply_custom_app_icon(repo_path, source_icon_path):
         android:gravity="center"
         android:width="160dp"
         android:height="160dp"
-        android:drawable="@drawable/colgram_plane_splash" />
+        android:drawable="@drawable/colgram_cloud_logo" />
 </layer-list>
 ''')
 
@@ -6972,7 +6918,7 @@ def apply_custom_app_icon(repo_path, source_icon_path):
             '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
         )
         with open(v31_styles, "w", encoding="utf-8") as f:
-            f.write(v31_content)
+            f.write(v31_content.replace("@drawable/colgram_plane_splash", "@drawable/colgram_cloud_logo"))
 
     night_styles = os.path.join(res_dir, "values-night", "styles.xml")
     if os.path.exists(night_styles):
@@ -6983,7 +6929,7 @@ def apply_custom_app_icon(repo_path, source_icon_path):
             '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
         )
         with open(night_styles, "w", encoding="utf-8") as f:
-            f.write(n_content)
+            f.write(n_content.replace("@drawable/colgram_plane_splash", "@drawable/colgram_cloud_logo"))
 
 def isolate_masque_process(content):
     marker = "// Colgram: isolated MASQUE service bootstrap"
