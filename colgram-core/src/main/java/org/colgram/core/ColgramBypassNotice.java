@@ -17,12 +17,8 @@ import android.util.Log;
  * reasonable conclusion is that the app is broken, not that the network is, and the one thing
  * that would help - connecting through a verified node - is buried in settings he has to find.
  *
- * A toast was the first attempt and it is the wrong shape: it fires once per session, disappears
- * in two seconds, and offers nothing to press. This is a notification that stays until the
- * connection comes back, says what was measured, and has a button that turns the bypass on.
- *
- * It never turns anything on by itself. He switched the proxy off by hand once and an automatic
- * switch back on was the complaint; the button is the consent.
+ * The local foundation is mandatory. This notice reports the measured failure and opens
+ * the app; it offers no ON/OFF control and never selects a public proxy by itself.
  */
 public final class ColgramBypassNotice {
 
@@ -37,7 +33,7 @@ public final class ColgramBypassNotice {
 
     private ColgramBypassNotice() {}
 
-    /** Tell the user the direct route is dead and offer the bypass. Safe to call repeatedly. */
+    /** Report the current direct-route failure without introducing another route switch. */
     public static void showBlocked(Context context, String diagnosis) {
         if (context == null) return;
         try {
@@ -64,8 +60,8 @@ public final class ColgramBypassNotice {
                     : new Notification.Builder(context);
             b.setContentTitle("Telegram недоступен напрямую")
                     .setStyle(new Notification.BigTextStyle().bigText(
-                            diagnosis + "\n\nОбход включится сам и будет сам переключаться на живую "
-                                    + "ноду, если она отвалится. Отключить — Настройки Colgram → Сеть."))
+                            diagnosis + "\n\nЛокальный слой всегда включён. "
+                                    + "Его состояние и доступные транспорты находятся в настройках подключения."))
                     .setSmallIcon(android.R.drawable.stat_notify_sync)
                     .setOngoing(true)
                     .setShowWhen(false)
@@ -75,10 +71,6 @@ public final class ColgramBypassNotice {
             if (open != null) {
                 b.setContentIntent(pending(context, 0, open));
             }
-            Intent enable = new Intent(ACTION_ENABLE_BYPASS).setPackage(context.getPackageName());
-            b.addAction(new Notification.Action.Builder(android.R.drawable.ic_popup_sync,
-                    "Включить обход", pending(context, 1, enable)).build());
-
             nm.notify(NOTIFICATION_ID, b.build());
             showing = true;
         } catch (Throwable t) {
@@ -86,7 +78,7 @@ public final class ColgramBypassNotice {
         }
     }
 
-    /** Remove it: the connection came back, or the user turned the bypass on himself. */
+    /** Clear the old diagnosis after a successful connection or an explicit recheck. */
     public static void clear(Context context) {
         if (context == null || !showing) return;
         showing = false;
@@ -111,7 +103,7 @@ public final class ColgramBypassNotice {
     private static PendingIntent pending(Context context, int requestCode, Intent intent) {
         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
-        return PendingIntent.getBroadcast(context, requestCode, intent, flags);
+        return PendingIntent.getActivity(context, requestCode, intent, flags);
     }
 
     private static NotificationManager notificationManager(Context context) {

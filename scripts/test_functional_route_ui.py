@@ -94,6 +94,14 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertIn('"Локальный слой всегда включён\\n" + dpiStatusLine()', source)
         self.assertIn("TextInfoPrivacyCell", source)
 
+    def test_blocked_notice_does_not_reintroduce_an_on_off_control(self):
+        source = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramBypassNotice.java").read_text(encoding="utf-8")
+        self.assertNotIn('"Включить обход"', source)
+        self.assertNotIn("Отключить —", source)
+        self.assertNotIn("b.addAction", source)
+        self.assertIn("Локальный слой всегда включён", source)
+        self.assertIn("PendingIntent.getActivity", source)
+
     def test_tap_sets_real_desired_state_before_async_start(self):
         for original in (self.pristine, self.existing):
             with self.subTest(pristine=original is self.pristine):
