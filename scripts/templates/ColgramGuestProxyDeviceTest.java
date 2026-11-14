@@ -140,7 +140,9 @@ public final class ColgramGuestProxyDeviceTest {
             }
             assertTrue("Native lanes were serialized instead of starting together", accepted.await(6, TimeUnit.SECONDS));
             if (failure.get() != null) throw new AssertionError("Parallel fixture failed", failure.get());
-            assertTrue("Parallel checks exceeded one shared timeout window", finished.await(7, TimeUnit.SECONDS));
+            // accept() normally completes immediately. Do not mistake its six-second
+            // upper bound for time that actually elapsed: the native deadline is 8s.
+            assertTrue("Parallel checks exceeded one shared timeout window", finished.await(11, TimeUnit.SECONDS));
             assertTrue("Parallel checks took serial-timeout duration", SystemClock.elapsedRealtime() - started < 13_000L);
             if (failure.get() != null) throw new AssertionError("Parallel verdict failed", failure.get());
             assertEquals(before, savedMainRoute(context));
