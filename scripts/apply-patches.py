@@ -5875,7 +5875,8 @@ def inject_core_device_test_support(repo_path, root_dir):
     destination_dir = os.path.join(
         module_dir, "src", "androidTest", "java", "org", "colgram", "core")
     for name in ("ColgramDirectConnectionDeviceTest.java",
-        "ColgramOnboardingDeviceTest.java",
+                 "ColgramDirectApiDeviceTest.java",
+                 "ColgramOnboardingDeviceTest.java",
                  "ColgramSettingsRowsDeviceTest.java",
                  "ColgramThemeContrastDeviceTest.java",
                  "ColgramCallProxyDeviceTest.java",

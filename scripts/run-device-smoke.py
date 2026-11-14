@@ -60,6 +60,13 @@ def main():
     run("logcat", "-c")
     command = prefix + ["shell", "am", "instrument", "-w", "-r", "-e", "class", args.classes, runner]
     metadata["command"] = command
+    # A blocked endpoint can flood Android's ring buffer before the suite finishes.
+    # Keep the actual early native verdicts rather than only the final few seconds.
+    live_log = (args.output / "logcat-live.txt").open("wb")
+    live_process = subprocess.Popen(prefix + ["logcat", "-v", "threadtime",
+        "ColgramDirectTest:I", "ColgramDirectApi:I", "ColgramOnboardingTest:I",
+        "ColgramProxyManager:I", "ColgramDpiBypass:I", "TestRunner:I", "AndroidRuntime:E", "*:S"],
+        stdout=live_log, stderr=subprocess.STDOUT)
     try:
         result = subprocess.run(command, capture_output=True, timeout=600)
         log = result.stdout + result.stderr
@@ -67,6 +74,14 @@ def main():
     except subprocess.TimeoutExpired as error:
         log = (error.stdout or b"") + (error.stderr or b"") + b"\nHOST_TIMEOUT\n"
         metadata["adb_exit"] = 124
+    finally:
+        live_process.terminate()
+        try:
+            live_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            live_process.kill()
+            live_process.wait()
+        live_log.close()
     output = args.output / "instrumentation.log"
     output.write_bytes(log)
     spec = importlib.util.spec_from_file_location("colgram_device_results", Path(__file__).with_name("device-tests.py"))
