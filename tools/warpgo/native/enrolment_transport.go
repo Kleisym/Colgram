@@ -80,6 +80,12 @@ func selectEnrolmentAPI(ctx context.Context, endpoint string, addresses []net.IP
 func probeEnrolmentAPI(ctx context.Context, endpoint, dialTarget string, tlsConfig *tls.Config,
 	dial enrolmentDial, http2 bool) apiProbeResult {
 	probeContext := ctx
+	protectedDial := dial
+	dial = func(ctx context.Context, network, target string) (net.Conn, error) {
+		conn, err := protectedDial(ctx, network, target)
+		if err != nil { return nil, err }
+		return &helloRecordConn{Conn: conn, host: tlsConfig.ServerName}, nil
+	}
 	var phase atomic.Uint32
 	transport := &http.Transport{
 		// Do not inherit an environment, Android or user proxy. No unpinned dial.

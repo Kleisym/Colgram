@@ -30,7 +30,7 @@ public final class ColgramControlledProxyDeviceTest {
             Thread.sleep(11_000L);
             CountDownLatch done = new CountDownLatch(1);
             AtomicReference<String> verdict = new AtomicReference<>();
-            assertTrue(ColgramGuestProxyProbe.check(context, "127.0.0.1", port, "", "", "", false,
+            assertTrue(ColgramGuestProxyProbe.checkThroughBase(context, "127.0.0.1", port, "", "", "", false,
                     (rtt, reason) -> { verdict.set(reason); done.countDown(); }));
             assertTrue(done.await(11, TimeUnit.SECONDS));
             Log.i("ColgramGuestProbe", "CONTROLLED_PROXY_RESULT=" + verdict.get()
@@ -39,6 +39,8 @@ public final class ColgramControlledProxyDeviceTest {
             assertEquals(before, routePrefs(context));
         } finally {
             ColgramConfig.setBuiltinProxyEnabled(savedCatalog);
+            assertTrue(context.getSharedPreferences("colgram_secure_config", Context.MODE_PRIVATE).edit()
+                    .putBoolean("builtin_proxy_enabled", savedCatalog).commit());
         }
     }
     private static Map<String, Object> routePrefs(Context context) {

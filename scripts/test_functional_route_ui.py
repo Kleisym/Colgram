@@ -126,7 +126,8 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertIn("colgramSubscription.toggle()", proxy)
             self.assertIn("colgramSubscription.confirmRemove()", proxy)
             self.assertIn("colgramSubscription.onActivityResult(requestCode, resultCode)", proxy)
-            self.assertIn("setDpiBypassEnabled(context, enabled)", proxy)
+            self.assertIn("recheckBypassListener()", proxy)
+            self.assertNotIn("ColgramDpiBypass.stop()", proxy)
             self.assertIn("getBackgroundProxyStatus()", proxy)
 
     def test_subscription_import_does_not_switch_route_and_consent_precedes_activation(self):

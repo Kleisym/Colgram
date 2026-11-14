@@ -3025,7 +3025,7 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 		return nil, tls.Certificate{}, newStartupError("register", "invalid", "response", nil)
 	}
 	updated, err := call("enrol", http.MethodPatch, "/"+apiVer+"/reg/"+id, token, map[string]any{
-		"key": base64.StdEncoding.EncodeToString(spki), "key_type": "secp256r1", "tun_type": "masque"})
+		"key": base64.StdEncoding.EncodeToString(spki), "key_type": "secp256r1", "tunnel_type": "masque"})
 	if err != nil {
 		return nil, tls.Certificate{}, err
 	}

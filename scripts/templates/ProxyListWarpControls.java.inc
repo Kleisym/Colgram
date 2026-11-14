@@ -76,8 +76,7 @@
     };
 
     private boolean colgramRemoteProxyEnabled() {
-        if (org.colgram.core.ColgramConfig.isDpiBypassEnabled()
-                || org.colgram.core.ColgramProxyManager.isDcRemapActive()) return false;
+        if (org.colgram.core.ColgramProxyManager.isDcRemapActive()) return false;
         org.colgram.core.ColgramProxyManager.ProxyItem active = org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
         return active == null ? org.colgram.core.ColgramProxyManager.isProxyEnabled(getContext()) : !active.isLocalDpi();
     }
@@ -86,7 +85,7 @@
         if (!org.colgram.core.ColgramConfig.isDpiBypassEnabled()) return ColgramSubscriptionControls.label("выключен", "Off");
         if (!org.colgram.core.ColgramDpiBypass.isBound()) return org.colgram.core.ColgramDpiBypass.upstreamStatus();
         org.colgram.core.ColgramProxyManager.ProxyItem active = org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
-        if (active == null || !active.isLocalDpi()) return ColgramSubscriptionControls.label("локальный маршрут не выбран", "Local route not applied");
+        if (active == null || !active.isLocalDpi()) return ColgramSubscriptionControls.label("всегда включён · поверх выбранный транспорт", "Always on · selected transport above it");
         if (org.colgram.core.ColgramDpiBypass.bytesFromTarget() > 0 && ConnectionsManager.getInstance(currentAccount).getConnectionState()
                 == ConnectionsManager.ConnectionStateConnected)
             return ColgramSubscriptionControls.label("подключён к Telegram", "Connected to Telegram");
@@ -94,22 +93,10 @@
     }
 
     private void colgramToggleDpi() {
-        android.content.Context context = getContext();
-        if (context == null) return;
-        final boolean enabled = !org.colgram.core.ColgramConfig.isDpiBypassEnabled();
-        if (enabled) {
-            colgramSubscription.stopForAlternativeRoute(context);
-            cancelWarpFromProxyScreen();
-            org.colgram.core.ColgramProxyManager.cancelProxySelection();
-            org.colgram.core.ColgramConfig.setAutoProxyEnabled(false);
-            org.colgram.core.ColgramConfig.setDcRemapEnabled(false);
-            org.colgram.core.ColgramConfig.setIpv6BypassEnabled(false);
-            if (org.colgram.core.ColgramProxyManager.isDcRemapActive()) org.colgram.core.ColgramProxyManager.applyDcRemap(false);
-            if (org.colgram.core.ColgramProxyManager.isProxyEnabled(context)) org.colgram.core.ColgramProxyManager.disableProxy(context);
-        } else {
-            org.colgram.core.ColgramRouteEpoch.next();
-        }
-        org.colgram.core.ColgramProxyManager.setDpiBypassEnabled(context, enabled);
+        org.colgram.core.ColgramProxyManager.recheckBypassListener();
+        android.widget.Toast.makeText(getContext(), ColgramSubscriptionControls.label(
+                "Локальный слой всегда включён. Проверяю его состояние.",
+                "The local base is always enabled. Checking its state."), android.widget.Toast.LENGTH_SHORT).show();
         refreshWarpState();
     }
 
@@ -202,10 +189,8 @@
             try {
                 ColgramSubscriptionControls.stopStoredProfile(context);
                 org.colgram.core.ColgramConfig.setAutoProxyEnabled(false);
-                org.colgram.core.ColgramConfig.setDpiBypassEnabled(false);
                 org.colgram.core.ColgramConfig.setDcRemapEnabled(false);
                 org.colgram.core.ColgramConfig.setIpv6BypassEnabled(false);
-                org.colgram.core.ColgramProxyManager.setDpiBypassEnabled(context, false);
                 org.colgram.core.ColgramProxyManager.applyDcRemap(false);
                 org.colgram.core.ColgramProxyManager.disableProxy(context);
                 if (!warpRequested(token)) return;

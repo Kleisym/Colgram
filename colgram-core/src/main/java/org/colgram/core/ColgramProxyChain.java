@@ -854,7 +854,7 @@ public final class ColgramProxyChain {
                 }
                 OutputStream out = upstream.getOutputStream();
                 if (ColgramTlsMimic.looksLikeClientHello(first)) {
-                    byte[] rewritten = ColgramTlsMimic.rewrite(first);
+                    byte[] rewritten = first; // byte-preserving base, never mutate TLS/FakeTLS handshake
                     java.util.Random rnd = new java.util.Random();
                     for (byte[] segment : ColgramTlsMimic.fragment(rewritten, rnd)) {
                         out.write(segment);

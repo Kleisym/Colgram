@@ -337,8 +337,7 @@ final class ColgramSubscriptionControls {
                     try {
                         ColgramRouteEpoch.runIfCurrent(token, () -> {
                             ColgramConfig.setAutoProxyEnabled(false);
-                            if (ColgramConfig.isDpiBypassEnabled() || ColgramDpiBypass.isRunning())
-                                ColgramProxyManager.setDpiBypassEnabled(context, false);
+                            ColgramProxyManager.ensureLocalBaseRoute(context);
                             ColgramConfig.setDcRemapEnabled(false);
                             ColgramConfig.setIpv6BypassEnabled(false);
                             if (ColgramProxyManager.isDcRemapActive()) ColgramProxyManager.applyDcRemap(false);

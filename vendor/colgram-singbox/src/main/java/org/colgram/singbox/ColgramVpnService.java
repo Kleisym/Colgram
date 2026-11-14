@@ -44,6 +44,8 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     private ColgramPlatformInterface platform;
     private String profilePath;
     private AppProfile appProfile;
+    private static volatile ColgramVpnService runningService;
+    private AutoCloseable localBaseUplink;
     private long generation = -1L;
     private volatile boolean tunEstablished;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -107,7 +109,11 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             pendingAppProfile.close();
             pendingAppProfile = null;
         }
-        if (!context.stopService(new Intent(context, ColgramVpnService.class))) controlState = "stopped";
+        ColgramVpnService target = runningService;
+        if (target != null) {
+            long requested = controlGeneration;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> target.stopOwnedGeneration(requested));
+        } else if (!context.stopService(new Intent(context, ColgramVpnService.class))) controlState = "stopped";
     }
 
     public static synchronized void stopProfile(Context context, String profilePath) {
@@ -116,6 +122,20 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     public static synchronized void stopProfile(Context context, String profilePath, long generation) {
         if (generation == controlGeneration) stopProfile(context, profilePath);
+    }
+
+    private void stopOwnedGeneration(long requested) {
+        synchronized (ColgramVpnService.class) {
+            if (requested != controlGeneration || runningService != this) return;
+        }
+        // Android keeps the VPN service bound until its TUN closes. Waiting for onDestroy
+        // to close that descriptor makes stopService and the binding wait on one another.
+        releaseResources();
+        synchronized (ColgramVpnService.class) {
+            if (requested != controlGeneration) return; // A newer start is already queued.
+            controlState = "stopped";
+            stopSelf();
+        }
     }
 
     private static final class AppProfile {
@@ -148,6 +168,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        runningService = this;
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
             // Compatibility with the legacy WARP bridge. A delayed WARP stop must not
@@ -260,6 +281,13 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         // engine, on every single start.
         tunEstablished = false;
         String config = appProfile == null ? readProfile(profilePath) : appProfile.json;
+        if (appProfile == null) {
+            // Reflection avoids reversing the core -> VPN module dependency.
+            Class<?> base = Class.forName("org.colgram.core.ColgramLocalBaseUplink");
+            if (localBaseUplink != null) localBaseUplink.close();
+            localBaseUplink = (AutoCloseable) base.getConstructor(android.net.VpnService.class).newInstance(this);
+            config = (String) base.getMethod("route", String.class).invoke(localBaseUplink, config);
+        }
         server.startOrReloadService(config, new io.nekohasekai.libbox.OverrideOptions());
     }
 
@@ -354,6 +382,11 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     private void releaseResources() {
         tunEstablished = false;
+        if (localBaseUplink != null) {
+            try { localBaseUplink.close(); } catch (Exception ignored) {}
+            localBaseUplink = null;
+        }
+        tunEstablished = false;
         if (server != null) {
             try {
                 server.closeService();
@@ -390,6 +423,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     @Override
     public void onDestroy() {
+        if (runningService == this) runningService = null;
         releaseResources();
         synchronized (ColgramVpnService.class) {
             if ("stopping".equals(controlState)) controlState = "stopped";

@@ -51,7 +51,7 @@ class ProxySelectionTest(unittest.TestCase):
         self.assertIn("finished.await(SOURCE_BATCH_TIMEOUT_MS, TimeUnit.MILLISECONDS)", self.source)
         self.assertIn("https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt", self.source)
         self.assertIn("https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt", self.source)
-        direct_fetch = method(self.source, "private static String httpGet(", "private static void fetchProxiesLinkList(")
+        direct_fetch = method(self.source, "private static String httpGet(", "private static int fetchProxiesLinkList(")
         self.assertIn("openConnection(java.net.Proxy.NO_PROXY)", direct_fetch)
         self.assertIn("setInstanceFollowRedirects(false)", direct_fetch)
         self.assertNotIn("ColgramHttp.getFast", direct_fetch)
@@ -97,14 +97,15 @@ class ProxySelectionTest(unittest.TestCase):
     def test_local_route_restore_is_independent_of_catalog_and_pinned_to_startup_epoch(self):
         restore = method(self.source, "private static void activateBuiltinProxyNow(long startupEpoch)", "// Optional source discovery")
         self.assertIn("ColgramRouteEpoch.runIfCurrent(startupEpoch", restore)
-        self.assertIn("setDpiBypassEnabled(", restore)
+        self.assertIn("ensureLocalBaseRoute(", restore)
         self.assertNotIn("isDirectDcReachable", restore)
-        self.assertLess(restore.index("setDpiBypassEnabled("), restore.index("isBuiltinProxyEnabled()"))
+        self.assertLess(restore.index("ensureLocalBaseRoute("), restore.index("isBuiltinProxyEnabled()"))
 
     def test_dpi_identity_is_captured_before_listener_is_reset(self):
         setter = method(self.source, "public static void setDpiBypassEnabled(Context context, boolean enabled)",
                         "public static void recheckBypassListener()")
-        self.assertLess(setter.index("active.isLocalDpi()"), setter.index("ColgramDpiBypass.stop()"))
+        self.assertIn("ensureLocalBaseRoute(context)", setter)
+        self.assertNotIn("ColgramDpiBypass.stop()", setter)
 
     def test_no_candidate_rotation_releases_dead_route(self):
         rotation = method(self.source, "void switchToNextProxy(boolean force)", "private static ProxyItem findLocalDpiProxy")

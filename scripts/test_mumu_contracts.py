@@ -21,14 +21,12 @@ def method(text, signature):
 
 
 class MuMuContractsTest(unittest.TestCase):
-    def test_direct_off_is_persisted_without_getter_side_effects(self):
-        text = source("ColgramConfig.java")
-        for getter, key in (("isDpiBypassEnabled", "KEY_DPI_BYPASS_ENABLED"), ("isDcRemapEnabled", "KEY_DC_REMAP")):
-            body = method(text, "public static boolean " + getter + "()")
-            self.assertIn("getBoolean(" + key + ", false)", body)
-            self.assertNotIn("prefs.edit()", body)
-            self.assertNotIn("return true;", body)
-        self.assertIn("putBoolean(KEY_DC_REMAP, enabled)", method(text, "public static void setDcRemapEnabled"))
+    def test_local_base_is_mandatory_while_dc_remap_stays_optional(self):
+        body = method(source("ColgramConfig.java"), "public static boolean isDpiBypassEnabled()")
+        self.assertIn("return true;", body)
+        self.assertNotIn("prefs.edit()", body)
+        body = method(source("ColgramConfig.java"), "public static boolean isDcRemapEnabled()")
+        self.assertIn("getBoolean(KEY_DC_REMAP, false)", body)
 
     def test_production_bridge_uses_the_pinned_upstream_class(self):
         text = source("ColgramProxyManager.java")
@@ -36,12 +34,13 @@ class MuMuContractsTest(unittest.TestCase):
         self.assertIn('"org.telegram.utils.proxy.ProxySettings"', text)
         self.assertIn('"org.telegram.utils.proxy.ProxySettings$Type"', text)
 
-    def test_an_explicit_local_route_is_not_suppressed_by_a_tcp_probe(self):
-        body = method(source("ColgramProxyManager.java"), "public static void setDpiBypassEnabled")
+    def test_the_local_base_is_attached_without_a_tcp_success_claim(self):
+        body = method(source("ColgramProxyManager.java"), "public static void ensureLocalBaseRoute")
         self.assertNotIn("telegramDcProbe()", body)
-        self.assertIn("awaitReady", body)
+        self.assertIn("isBound()", body)
         self.assertIn("forceApplyProxy(local)", body)
-        self.assertIn("ColgramRouteEpoch.runIfCurrent", body)
+        self.assertIn("!active.isLocalDpi()", body)
+        self.assertIn("protocol not yet verified", body)
 
     def test_private_path_only_uses_public_relays_after_opt_in(self):
         text = source("ColgramDpiBypass.java")

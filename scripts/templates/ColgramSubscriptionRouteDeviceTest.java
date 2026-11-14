@@ -68,7 +68,8 @@ public final class ColgramSubscriptionRouteDeviceTest {
         Assume.assumeTrue("Explicitly grant Android VPN permission on an idle disposable emulator first", VpnService.prepare(context) == null);
         Assume.assumeFalse("Keep an existing subscription untouched", ColgramSubscriptionStore.hasSubscription(context));
         Assume.assumeFalse("No other VPN may be displaced", activeVpn(context));
-        Assume.assumeFalse("No active Telegram proxy may be displaced", ColgramProxyManager.hasActiveRouteForUi());
+        Assume.assumeTrue("Keep a selected external proxy untouched",
+                ColgramProxyManager.getCurrentActiveProxy() == null || ColgramProxyManager.getCurrentActiveProxy().isLocalDpi());
         final String profile = ColgramSubscriptionStore.profileLocation(context);
         try (ServerSocket peer = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"))) {
             peer.setSoTimeout(12_000);
@@ -81,6 +82,16 @@ public final class ColgramSubscriptionRouteDeviceTest {
             String second = key("11111111-1111-4111-8111-111111111111", peer.getLocalPort(), "Fixture-two");
             assertEquals(2, ColgramSubscriptionStore.save(context, first + "\n" + second).total);
             assertEquals("Fixture-two", ColgramSubscriptionStore.select(context, 1).name);
+            // This app now has an always-on base: its unrelated background Telegram sockets
+            // must not consume the single-purpose VLESS peer's first accepted connection.
+            java.io.File fixtureProfile = new java.io.File(profile);
+            org.json.JSONObject config = new org.json.JSONObject(new String(java.nio.file.Files.readAllBytes(
+                    fixtureProfile.toPath()), StandardCharsets.UTF_8));
+            config.getJSONObject("route").put("rules", new org.json.JSONArray()
+                    .put(new org.json.JSONObject().put("ip_cidr", new org.json.JSONArray().put("192.0.2.23/32"))
+                            .put("action", "route").put("outbound", "selected"))
+                    .put(new org.json.JSONObject().put("action", "reject")));
+            java.nio.file.Files.write(fixtureProfile.toPath(), config.toString().getBytes(StandardCharsets.UTF_8));
             assertEquals("stopped", ColgramVpnService.status(profile));
             InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> ColgramVpnService.start(context, profile));
             long deadline = SystemClock.elapsedRealtime() + 9_000;
@@ -104,6 +115,7 @@ public final class ColgramSubscriptionRouteDeviceTest {
             long end = SystemClock.elapsedRealtime() + 5_000;
             while (SystemClock.elapsedRealtime() < end && activeVpn(context)) Thread.sleep(100);
             ColgramSubscriptionStore.clear(context);
+            assertTrue(context.getSharedPreferences("colgram_subscription", Context.MODE_PRIVATE).edit().clear().commit());
         }
         assertFalse("Fixture VPN is still routing", activeVpn(context));
         assertFalse("Fixture subscription survived cleanup", ColgramSubscriptionStore.hasSubscription(context));
@@ -127,7 +139,9 @@ public final class ColgramSubscriptionRouteDeviceTest {
             assertEquals(0x81, fixtureUuid[8] & 255);
             assertEquals(0, input.readUnsignedByte()); // no addon
             assertEquals(1, input.readUnsignedByte()); // TCP
-            assertEquals(41337, input.readUnsignedShort());
+            int targetPort = input.readUnsignedShort();
+            Log.i("ColgramSubRoute", "VLESS_FIXTURE_TARGET_PORT=" + targetPort);
+            assertEquals(41337, targetPort);
             assertEquals(1, input.readUnsignedByte()); // IPv4
             byte[] address = new byte[4];
             input.readFully(address);

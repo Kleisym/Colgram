@@ -26,6 +26,30 @@ public final class ColgramGuestProxyProbe {
 
     public interface Result { void complete(long timeMs, String reason); }
 
+    /** Use the same transparent local base for verification and for the selected live route. */
+    public static boolean checkThroughBase(Context context, String host, int port,
+                                           String user, String pass, String secret, boolean publicOnly,
+                                           Result result) {
+        if (result == null || host == null) return false;
+        // Public callers supply the numeric address pinned by their preflight; no DNS rebinding.
+        if (publicOnly) {
+            if (!(host.matches("[0-9.]+") || host.indexOf(':') >= 0)) return false;
+            try {
+                if (!ColgramProxyPolicy.isPublicAddress(java.net.InetAddress.getByName(host))) return false;
+            } catch (java.net.UnknownHostException invalid) { return false; }
+        }
+        final ColgramLocalTcpFront front;
+        try { front = new ColgramLocalTcpFront(host, port); }
+        catch (java.io.IOException | IllegalArgumentException unavailable) { return false; }
+        boolean started = check(context, "127.0.0.1", front.port(), user, pass, secret, false,
+                (time, reason) -> {
+                    try { result.complete(time, reason); }
+                    finally { front.close(); }
+                });
+        if (!started) front.close();
+        return started;
+    }
+
     public static synchronized boolean check(Context context, String host, int port,
                                              String user, String pass, String secret, boolean publicOnly,
                                              Result result) {

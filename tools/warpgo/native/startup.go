@@ -145,6 +145,7 @@ func callEnrolmentAPI(ctx context.Context, client *http.Client, endpoint, stage,
 }
 
 func setEnrolmentHeaders(req *http.Request, token string) {
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	req.Header.Set("User-Agent", "WARP for Android")
 	req.Header.Set("CF-Client-Version", "a-6.35-4471")
 	if token != "" {

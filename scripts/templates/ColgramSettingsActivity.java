@@ -347,21 +347,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                     ((TextCheckCell) view).setChecked(val);
                 }
             } else if (position == dpiBypassRow) {
-                // Persist + route + run, in one call. This row used to only start or stop the
-                // listener, so the choice was lost on restart and the toggle could show
-                // "running" while tgnet was not routed through it at all.
-                ColgramConfig.setAutoProxyEnabled(false);
-                ColgramConfig.setDcRemapEnabled(false);
-                ColgramConfig.setIpv6BypassEnabled(false);
-                ColgramProxyManager.applyDcRemap(false);
-                ColgramProxyManager.setDpiBypassEnabled(getContext(),
-                        !ColgramConfig.isDpiBypassEnabled());
-                if (view instanceof TextCheckCell) {
-                    ((TextCheckCell) view).setChecked(ColgramConfig.isDpiBypassEnabled());
-                }
-                // The listener binds on a background thread and the rows below describe it, so
-                // refresh the whole list rather than leaving a stale "выключено" next to a
-                // toggle that was just switched on.
+                ColgramProxyManager.recheckBypassListener();
                 listAdapter.notifyDataSetChanged();
             } else if (position == dohRow) {
                 boolean val = !ColgramConfig.isDohEnabled();

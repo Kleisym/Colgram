@@ -24,7 +24,7 @@ class RouteCancellationTest(unittest.TestCase):
     def test_delayed_public_and_dpi_routes_recheck_generation(self):
         s = (CORE / "ColgramProxyManager.java").read_text(encoding="utf-8")
         self.assertTrue("ColgramRouteEpoch.isCurrent(routeEpoch)" in s, "auto fallback can restore a cancelled route")
-        self.assertTrue("dpiRequestGeneration.get() != dpiRequest" in s, "late DPI probe ignores explicit off")
+        self.assertTrue("if (active != null && !active.isLocalDpi()) return" in s, "base watchdog replaces the selected overlay")
 
     def test_old_startup_restore_cannot_clear_new_request(self):
         s = (CORE / "ColgramHookHandler.java").read_text(encoding="utf-8")

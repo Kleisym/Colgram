@@ -238,26 +238,15 @@ public class ColgramConfig {
     }
 
     // --- Network & Proxies ---
-    /**
-     * Whether the in-process desync listener should run and carry Telegram's traffic.
-     *
-     * Defaults to OFF. It used to be effectively always-on, because a fresh install forced
-     * proxy_enabled=true and pinned the app to this listener. Measured against the real block
-     * that is the wrong default: the drop there is at IP level, so no amount of payload
-     * desync makes a dead route answer, and on an unblocked network the loopback hop is pure
-     * cost and an extra way to end up stuck on a port that never bound.
-     *
-     * The setting never existed at all before, so the toggle only started or stopped the
-     * listener for the current process and silently reverted on the next launch.
-     */
+    /** Mandatory local base; availability is reported separately from Telegram connectivity. */
     private static final String KEY_DPI_BYPASS_ENABLED = "dpi_bypass_enabled";
 
     public static boolean isDpiBypassEnabled() {
-        return prefs != null && prefs.getBoolean(KEY_DPI_BYPASS_ENABLED, false);
+        return true; // The local base is mandatory; old persisted false values do not disable it.
     }
 
     public static void setDpiBypassEnabled(boolean enabled) {
-        if (prefs != null) prefs.edit().putBoolean(KEY_DPI_BYPASS_ENABLED, enabled).apply();
+        if (prefs != null) prefs.edit().putBoolean(KEY_DPI_BYPASS_ENABLED, true).apply();
     }
 
     public static boolean isBuiltinProxyEnabled() {
