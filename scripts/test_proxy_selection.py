@@ -39,6 +39,8 @@ class ProxySelectionTest(unittest.TestCase):
         self.assertIn("new ProxyItem(pinnedAddress", selection)
         self.assertIn("readSelectionSocksByte", selection)
         self.assertIn("version == 5 && method == 0", selection)
+        self.assertIn("ColgramSocks5Codec.requestConnect", selection)
+        self.assertIn("ColgramTelegramDcAddresses.bootstrapIpv4()", selection)
         self.assertIn("if (!started && !selection.guestEligible", selection,
                       "native ping without an authenticated DC key competes with the isolated verdict")
 
@@ -54,7 +56,7 @@ class ProxySelectionTest(unittest.TestCase):
         self.assertNotIn("ColgramHttp.getFast", direct_fetch)
 
     def test_selection_distinguishes_transport_from_protocol(self):
-        for label in ("TCP: ", "Telegram: ", "Источники: ", "PROXY_DIAG "):
+        for label in ("TCP: ", "SOCKS5 CONNECT: ", "Telegram: ", "Источники: ", "PROXY_DIAG "):
             self.assertTrue(label in self.source, f"missing diagnosis label {label}")
 
     def test_public_feeds_can_replace_tcp_dead_unverified_entries(self):

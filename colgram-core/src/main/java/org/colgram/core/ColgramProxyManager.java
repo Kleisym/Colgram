@@ -3296,6 +3296,7 @@ public static void reportProxyFailure() {
         int tcpOpen;
         int socksAttempted;
         int socksReady;
+        int socksConnected;
         int protocolAnswered;
         int guestAttempts;
         boolean guestPending;
@@ -3406,11 +3407,13 @@ public static void reportProxyFailure() {
     private static final class SelectionTcpResult {
         final String address;
         final int rtt;
+        final boolean greeted;
         final boolean ready;
 
-        SelectionTcpResult(String address, int rtt, boolean ready) {
+        SelectionTcpResult(String address, int rtt, boolean greeted, boolean ready) {
             this.address = address;
             this.rtt = rtt;
+            this.greeted = greeted;
             this.ready = ready;
         }
     }
@@ -3431,15 +3434,22 @@ public static void reportProxyFailure() {
                     socket.connect(new InetSocketAddress(address, candidate.port), remaining);
                     String numeric = address.getHostAddress();
                     int rtt = (int) (SystemClock.elapsedRealtime() - started);
-                    if (candidate.type != 0) return new SelectionTcpResult(numeric, rtt, true);
-                    reachable = new SelectionTcpResult(numeric, rtt, false);
+                    if (candidate.type != 0) return new SelectionTcpResult(numeric, rtt, false, true);
+                    if (reachable == null) reachable = new SelectionTcpResult(numeric, rtt, false, false);
                     // A public SOCKS5 feed supplies no credentials. Only accept a no-auth greeting.
                     // This is a transport filter, not proof that Telegram is reachable.
                     if (remainingSelectionTcp(started) <= 0) break;
                     socket.getOutputStream().write(new byte[]{5, 1, 0});
                     int version = readSelectionSocksByte(socket, started);
                     int method = readSelectionSocksByte(socket, started);
-                    if (version == 5 && method == 0) return new SelectionTcpResult(numeric, rtt, true);
+                    if (version == 5 && method == 0) {
+                        reachable = new SelectionTcpResult(numeric, rtt, true, false);
+                        if (ColgramSocks5Codec.requestConnect(socket.getOutputStream(),
+                                () -> readSelectionSocksByte(socket, started),
+                                ColgramTelegramDcAddresses.bootstrapIpv4(), 443)) {
+                            return new SelectionTcpResult(numeric, rtt, true, true);
+                        }
+                    }
                 } catch (IOException ignored) { }
             }
         } catch (IOException | SecurityException ignored) { }
@@ -3494,7 +3504,8 @@ public static void reportProxyFailure() {
                             selection.tcpOpen++;
                             if (candidate.type == 0) {
                                 selection.socksAttempted++;
-                                if (measured.ready) selection.socksReady++;
+                                if (measured.greeted) selection.socksReady++;
+                                if (measured.ready) selection.socksConnected++;
                             }
                             if (measured.ready) selection.tcpReachable.put(candidate, measured.address);
                         }
@@ -3568,7 +3579,7 @@ public static void reportProxyFailure() {
                     selection.inFlight--;
                     selection.guestPending = false;
                     boolean alive = time >= 0 && endpoint.equals(probeEndpoint(candidate));
-                    selection.guestResult = alive ? "verified" : "not-verified";
+                    selection.guestResult = alive ? "verified" : reason;
                     if (alive) {
                         candidate.pingMs = (int) Math.min(Integer.MAX_VALUE, time);
                         candidate.verifiedEndpoint = endpoint;
@@ -3588,7 +3599,8 @@ public static void reportProxyFailure() {
         SourceBatch batch = lastSourceBatch;
         String https = batch == null ? "—" : batch.available.get() + "/" + batch.total;
         String tcp = selection.requested != null ? "—" : selection.tcpOpen + "/" + selection.tcpFinished;
-        return (selection.requested != null ? "" : "Источники: " + https + " · TCP: " + tcp + " · ")
+        return (selection.requested != null ? "" : "Источники: " + https + " · TCP: " + tcp
+                + " · SOCKS5 CONNECT: " + selection.socksConnected + "/" + selection.socksReady + " · ")
                 + "Telegram: " + selection.protocolAnswered + "/" + selection.protocolTargets.size();
     }
 
@@ -3674,6 +3686,7 @@ public static void reportProxyFailure() {
                     + " sourceFinished=" + (batch == null ? 0 : batch.finished.get())
                     + " tcp=" + selection.tcpOpen + "/" + selection.tcpFinished
                     + " socks=" + selection.socksReady + "/" + selection.socksAttempted
+                    + " socksConnect=" + selection.socksConnected + "/" + selection.socksReady
                     + " telegram=" + selection.protocolAnswered + "/" + selection.protocolTargets.size()
                     + " guest=" + selection.guestResult + "/" + selection.guestAttempts);
             proxySelectionGate.finish(selection.token);

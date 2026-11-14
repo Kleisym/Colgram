@@ -15,6 +15,13 @@ public final class ColgramTelegramDcAddresses {
 
     private ColgramTelegramDcAddresses() {}
 
+    static byte[] bootstrapIpv4() {
+        String[] octets = DC_ADDRESSES[1][0].split("\\.");
+        byte[] address = new byte[4];
+        for (int i = 0; i < address.length; i++) address[i] = (byte) Integer.parseInt(octets[i]);
+        return address;
+    }
+
     /**
      * Return only configured aliases for the same DC. Unknown addresses stay on their own;
      * guessing a sibling from a shared /24 or trying another DC breaks auth-key creation.
