@@ -20,6 +20,10 @@ public final class ColgramProxyPolicyTest {
         check(endpoint("SOCKS5://Proxy.Example:1080", "socks5").host.equals("proxy.example"), "normalized host");
         check(endpoint("[2606:4700::1111]:65535", "socks5").port == 65535, "bracketed IPv6");
         check(endpoint("socks5://[2606:4700::1111]:1080/", "socks5") != null, "URI IPv6");
+        check(!ColgramProxyPolicy.isPublicHost("192.168.0.4"), "public feed links cannot target LAN hosts");
+        check(!ColgramProxyPolicy.isPublicAddress(java.net.InetAddress.getByAddress(new byte[]{127, 0, 0, 2})),
+                "resolved loopback address is rejected before TCP connect");
+        check(!ColgramProxyPolicy.isPublicHost("::ffff:10.0.0.1"), "IPv4-mapped private host is rejected");
         check(endpoint("http://8.8.8.8:80", "http") != null, "HTTP relay supported");
         check(ColgramProxyPolicy.parseEndpoint("8.8.8.8:1080:United States", "socks5", true) != null,
                 "explicit country-column feed adapter");
@@ -48,6 +52,10 @@ public final class ColgramProxyPolicyTest {
         check(ColgramProxyPolicy.compare(sameA, sameB, 0) < 0, "deterministic hostname tie break");
         check(ColgramProxyPolicy.compare(sameA, healthy, 0) < 0, "zero milliseconds is valid");
         check(ColgramProxyPolicy.compare(sameA, sameA, 0) == 0, "equal comparator");
+        check(ColgramProxyPolicy.isReplaceable(failed, 0, 3), "TCP-dead slots can refresh without a native attempt");
+        check(ColgramProxyPolicy.isReplaceable(unknown, 3, 3), "repeated protocol failure can refresh");
+        check(!ColgramProxyPolicy.isReplaceable(healthy, 3, 3), "fresh healthy slot is protected");
+        check(!ColgramProxyPolicy.isReplaceable(tcpOnly, 0, 3), "TCP-open candidates still deserve a protocol attempt");
         check(ColgramProxyPolicy.feedIndices(12, 6, 0).equals(Arrays.asList(0, 1, 2, 3, 4, 5)), "first source window");
         check(ColgramProxyPolicy.feedIndices(12, 6, 1).equals(Arrays.asList(6, 7, 8, 9, 10, 11)), "rotate source window");
         check(ColgramProxyPolicy.feedIndices(3, 6, Integer.MAX_VALUE).size() == 3, "overflow-safe feed cap");
@@ -74,6 +82,13 @@ public final class ColgramProxyPolicyTest {
             oversizedRejected = true;
         }
         check(oversizedRejected, "oversized newline-free body rejected before decoding");
+        boolean deadlineRejected = false;
+        try {
+            ColgramProxyPolicy.readBounded(new java.io.ByteArrayInputStream(new byte[]{65}), 1, System.nanoTime() - 1);
+        } catch (java.io.IOException expected) {
+            deadlineRejected = true;
+        }
+        check(deadlineRejected, "expired per-feed deadline stops before reading");
         System.out.println("PASS ColgramProxyPolicyTest checks=" + checks);
     }
 }

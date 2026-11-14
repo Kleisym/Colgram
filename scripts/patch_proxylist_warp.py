@@ -230,7 +230,7 @@ def upgrade_functional_controls(s):
                         checkCell.setTextAndCheck("Использовать для звонков", callsPreference(), true);
                     } else if (position == warpRow) {
                         checkCell.setTextAndValueAndCheck("Использовать Cloudflare WARP", warpStatusForProxyScreen(),
-                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, false, false);
+                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, true, false);
 ''')
     s = s.replace("                } else if (position == warpRow) {\n                    checkCell.setChecked", "                } else if (position == callsRow) {\n                    checkCell.setChecked(callsPreference());\n                } else if (position == warpRow) {\n                    checkCell.setChecked")
     s = s.replace("checkCell.setChecked(useProxySettings);", "checkCell.setChecked(useProxySettings || org.colgram.core.ColgramProxyManager.isProxySelectionPending());")
@@ -301,6 +301,10 @@ def apply(repo_path):
         if "// COLGRAM_CALL_ROUTE_PICKER = 1" in updated:
             updated = updated.replace("    private int networkModesRow = -1;\n", "")
         updated = upgrade_call_route_picker(updated)
+        updated = updated.replace('warpStatusForProxyScreen(),\n'
+                                  '                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, false, false);',
+                                  'warpStatusForProxyScreen(),\n'
+                                  '                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, true, false);')
         if updated != s:
             Path(p).write_text(updated, encoding="utf-8", newline="\n")
         apply_call_proxy_defaults(repo_path)

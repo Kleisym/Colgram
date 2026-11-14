@@ -34,6 +34,7 @@ public final class ColgramMasqueVpnService extends VpnService {
     private volatile long packetsHandled, repliesWritten;
     private volatile String warpVerdict;
     private volatile String lastTrace = "";
+    private volatile String startupStage;
     private volatile ResultReceiver statusReceiver;
     private final Runnable heartbeat = new Runnable() {
         @Override public void run() {
@@ -92,9 +93,23 @@ public final class ColgramMasqueVpnService extends VpnService {
             fail("Запуск сервиса WARP: " + error.getMessage());
             return START_NOT_STICKY;
         }
-        report(ColgramWarpState.STARTING, null);
+        report(ColgramWarpState.STARTING, null, "enrolling");
         worker = new Thread(() -> bootstrap(attempt, bind, edge, socks), "colgram-masque-start");
         worker.setDaemon(true); worker.start();
+        // Native starts on its worker. Relay only progress from this attempt, and
+        // stop polling as soon as the service owns an established TUN.
+        handler.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (generation != attempt || running || worker == null || !worker.isAlive()) return;
+                if ("enrolling".equals(startupStage) && ColgramMasqueNative.isLoadedInThisProcess()) {
+                    String progress = ColgramMasqueNative.sessionProgress();
+                    if (progress != null && progress.startsWith("dialing")) {
+                        report(ColgramWarpState.STARTING, null, "dialing");
+                    }
+                }
+                if ("enrolling".equals(startupStage)) handler.postDelayed(this, 350L);
+            }
+        }, 350L);
         return START_NOT_STICKY; // A killed process must not silently restore a user-disabled route.
     }
 
@@ -111,13 +126,17 @@ public final class ColgramMasqueVpnService extends VpnService {
             ColgramMasqueNative.openSessionOwned(bind, edge, nativeOwner);
             if (!current(attempt)) return;
             String address = ColgramMasqueNative.tunnelAddress();
-            if (address == null || address.isEmpty()) throw new IllegalStateException("WARP не создал транспорт");
+            if (address == null || address.isEmpty()) throw new IllegalStateException(nativeFailure());
             InetAddress ip = InetAddress.getByName(address);
             if (!(ip instanceof Inet4Address)) throw new IllegalStateException("WARP не выдал IPv4-адрес");
+            report(ColgramWarpState.STARTING, null, "trace");
             String trace = ColgramMasqueNative.trace(); // The SAME session, not a second measurement.
             if (!current(attempt)) return;
             if (!ColgramMasqueNative.traceIsWarpOn(trace)) {
-                throw new IllegalStateException("WARP не подтвердил защищённый маршрут: " + ColgramMasqueNative.sessionProgress());
+                String detail = ColgramMasqueNative.lastError();
+                throw new IllegalStateException(detail == null
+                        ? "Cloudflare не подтвердил, что трафик идёт через WARP"
+                        : describeStartupFailure(detail));
             }
             lastTrace = trace;
             Builder builder = new Builder().setSession("Colgram WARP").setMtu(1280)
@@ -143,13 +162,47 @@ public final class ColgramMasqueVpnService extends VpnService {
             });
             pump(attempt, descriptor);
         } catch (Throwable error) {
-            if (current(attempt)) fail("WARP: " + error.getMessage());
+            if (current(attempt)) fail(error.getMessage() == null ? "Ошибка запуска WARP" : error.getMessage());
         } finally {
             if (generation == attempt) {
                 stopTunnel();
                 handler.post(this::stopSelf);
             }
         }
+    }
+
+    private static String nativeFailure() {
+        String detail = ColgramMasqueNative.lastError();
+        return detail == null ? "Транспорт WARP не запущен" : describeStartupFailure(detail);
+    }
+
+    static String describeStartupFailure(String detail) {
+        String[] parts = detail.split(":", 3);
+        if (parts.length != 3) return "Транспорт WARP не запущен";
+        String stage;
+        switch (parts[0]) {
+            case "dns": stage = "DNS для API Cloudflare"; break;
+            case "register": stage = "регистрация в Cloudflare"; break;
+            case "enrol": stage = "регистрация ключа WARP"; break;
+            case "edge": stage = "подключение к шлюзу Cloudflare"; break;
+            case "connect": stage = "открытие туннеля WARP"; break;
+            case "trace-dns": stage = "DNS для проверки WARP"; break;
+            case "trace": stage = "проверка трафика WARP"; break;
+            default: return "Транспорт WARP не запущен";
+        }
+        String reason;
+        switch (parts[1]) {
+            case "timeout": reason = "нет ответа, время ожидания истекло"; break;
+            case "tls": reason = "сертификат не прошёл проверку"; break;
+            case "http":
+                reason = parts[2].matches("[1-5][0-9][0-9]") ? "HTTP " + parts[2] : "ошибка HTTP";
+                break;
+            case "invalid": reason = "некорректный ответ"; break;
+            case "closed": reason = "соединение прервано"; break;
+            case "cancelled": reason = "отменено"; break;
+            default: reason = "ошибка сети";
+        }
+        return stage + " — " + reason;
     }
 
     private void pump(long attempt, ParcelFileDescriptor descriptor) throws Exception {
@@ -180,11 +233,20 @@ public final class ColgramMasqueVpnService extends VpnService {
     }
 
     private void report(int code, String error) {
+        report(code, error, null);
+    }
+
+    private synchronized void report(int code, String error, String stage) {
+        // The main-thread poll can finish just after the worker enters trace
+        // or fails. Never let that observation overwrite the newer stage.
+        if ("dialing".equals(stage) && !"enrolling".equals(startupStage)) return;
+        startupStage = code == ColgramWarpState.STARTING ? stage : null;
         ResultReceiver callback = statusReceiver;
         if (callback == null) return;
         Bundle data = new Bundle();
         data.putString("trace", lastTrace);
         data.putString("error", error);
+        if (stage != null) data.putString("stage", stage);
         callback.send(code, data);
     }
 

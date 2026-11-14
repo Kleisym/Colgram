@@ -16,6 +16,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramBotSync;
 import org.colgram.core.ColgramConfig;
+import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramOperationGate;
 import org.colgram.core.ColgramRouteEpoch;
 import org.colgram.core.ColgramProxyDoctor;
@@ -24,6 +25,7 @@ import org.colgram.core.ColgramStorageSandbox;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
+import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
@@ -84,7 +86,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         public void run() {
             if (!screenVisible) return;
             String state = warpStatusLine() + "|" + ColgramProxyDoctor.getStatusSummary()
-                    + "|" + ColgramConfig.isWarpEnabled() + "|" + ColgramConfig.isDpiBypassEnabled()
+                    + "|" + ColgramConfig.isWarpEnabled() + "|" + dpiStatusLine()
                     + "|" + ColgramProxyManager.hasActiveRouteForUi()
                     + "|" + ColgramProxyManager.getProxySelectionStatus() + "|" + subscriptionStatusLine()
                     + "|" + isAndroidVpnActive();
@@ -967,7 +969,11 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private String warpStatusLine() {
         if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) return "бэкенд недоступен";
-        if (warpOperationsGate.isPending()) return "запускается… · нажмите для отмены";
+        if (warpOperationsGate.isPending()) {
+            String stage = org.colgram.core.ColgramWarpMasqueTunnel.startupStage();
+            if (stage == null) stage = waitingWarpConsent >= 0 ? "разрешение VPN" : "запуск";
+            return stage + " · нажмите для отмены";
+        }
         String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();
         if (failure != null && !failure.isEmpty()
                 && !org.colgram.core.ColgramWarpTunnel.isUp()) {
@@ -979,6 +985,16 @@ public class ColgramSettingsActivity extends BaseFragment {
         }
         if (org.colgram.core.ColgramWarp.isRegistered()) return "выключен · нажмите, чтобы включить";
         return "выключен · нажмите, чтобы подключить";
+    }
+
+    private String dpiStatusLine() {
+        if (!ColgramConfig.isDpiBypassEnabled()) return "выключен";
+        if (!ColgramDpiBypass.isBound()) return "локальный транспорт ещё не запущен";
+        ColgramProxyManager.ProxyItem route = ColgramProxyManager.getCurrentActiveProxy();
+        if (route == null || !route.isLocalDpi()) return "локальный транспорт не выбран";
+        if (ColgramDpiBypass.bytesFromTarget() > 0 && ConnectionsManager.getInstance(currentAccount).getConnectionState()
+                == ConnectionsManager.ConnectionStateConnected) return "подключён к Telegram";
+        return "ждём ответ Telegram";
     }
 
     /** What the subscription row shows, read back from the store rather than from a guess. */
@@ -1204,8 +1220,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == dpiBypassRow) {
                         // Read the persisted intent, not just whether a socket happens to be
                         // bound: a listener that failed to bind is a fault, not a setting.
-                        checkCell.setTextAndCheck("Обходчик ТСПУ (TCP Desync / 127.0.0.1)",
-                                ColgramConfig.isDpiBypassEnabled(), true);
+                        checkCell.setTextAndValueAndCheck("Локальный обход", dpiStatusLine(),
+                                ColgramConfig.isDpiBypassEnabled(), true, true);
                     } else if (position == dohRow) {
                         checkCell.setTextAndCheck("DNS-over-HTTPS (шифрованный DNS)", ColgramConfig.isDohEnabled(), true);
                     } else if (position == builtinProxyRow) {

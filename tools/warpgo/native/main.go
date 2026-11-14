@@ -43,6 +43,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -67,8 +68,8 @@ const (
 	apiHost = "api.cloudflareclient.com"
 	apiVer  = "v0a4471"
 
-	edgeIP     = "162.159.198.2"
-	edgeSNI    = "consumer-masque.cloudflareclient.com"
+	edgeIP  = "162.159.198.2"
+	edgeSNI = "consumer-masque.cloudflareclient.com"
 	// connectAuth is the :authority the edge compares against its URI template. A request naming
 	// anything else is refused, so it is a constant rather than derived from anything at runtime.
 	connectAuth = "cloudflareaccess.com"
@@ -117,6 +118,10 @@ type socksUDPConn struct {
 
 // dialSocks5UDP opens the control connection and negotiates a UDP ASSOCIATE.
 func dialSocks5UDP(proxy string) (*socksUDPConn, error) {
+	return dialSocks5UDPContext(context.Background(), proxy)
+}
+
+func dialSocks5UDPContext(ctx context.Context, proxy string) (*socksUDPConn, error) {
 	host, portStr, err := net.SplitHostPort(proxy)
 	if err != nil {
 		return nil, fmt.Errorf("socks address %q: %w", proxy, err)
@@ -125,10 +130,14 @@ func dialSocks5UDP(proxy string) (*socksUDPConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("socks port %q: %w", portStr, err)
 	}
-	ctrl, err := dialProtectedTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 10*time.Second)
+	ctrl, err := (&net.Dialer{Control: protectSocket, Timeout: 10 * time.Second}).
+		DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
+	stop := context.AfterFunc(ctx, func() { _ = ctrl.Close() })
+	defer stop()
+	_ = ctrl.SetDeadline(ioDeadline(ctx, 3*time.Second))
 	if err := socks5Greet(ctrl); err != nil {
 		ctrl.Close()
 		return nil, err
@@ -170,6 +179,12 @@ func dialSocks5UDP(proxy string) (*socksUDPConn, error) {
 		ctrl.Close()
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		ctrl.Close()
+		udpSock.Close()
+		return nil, err
+	}
+	_ = ctrl.SetDeadline(time.Time{})
 	return &socksUDPConn{
 		ctrl:    ctrl,
 		relay:   relayAddr,
@@ -752,10 +767,24 @@ func plainHTTPThroughTunnel(tun *tunnel, src, dst net.IP) string {
 // ephemeral source port, random initial sequence, the options this carrier has been measured to accept -
 // and nothing about it is different except that it is not the caller's.
 func tlsTraceThroughTunnel(tun *tunnel, src, dst net.IP) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	return tlsTraceThroughTunnelContext(ctx, tun, src, dst)
+}
+
+func tlsTraceThroughTunnelContext(ctx context.Context, tun *tunnel, src, dst net.IP) (string, error) {
 	c := newTunnelConn(tun, src, dst, ephemeralPort(), 443)
 	tun.addPeer(c)
-	defer c.Close()
-	if err := c.open(); err != nil {
+	defer func() {
+		if ctx.Err() == nil {
+			_ = c.Close()
+		}
+	}()
+	if cs, ok := tun.stream.(*h2CapsuleStream); ok {
+		_ = cs.h2.conn.SetWriteDeadline(ioDeadline(ctx, traceBudget))
+		defer cs.h2.conn.SetWriteDeadline(time.Time{})
+	}
+	if err := c.openContext(ctx); err != nil {
 		return "", err
 	}
 	conn := tls.Client(c, &tls.Config{
@@ -780,10 +809,10 @@ func tlsTraceThroughTunnel(tun *tunnel, src, dst net.IP) (string, error) {
 	//
 	// What is missing is this client's own key share, which in TLS 1.3 is what answers a ServerHello. It
 	// never goes out, and the connection is closed rather than continued.
-	if err := conn.SetDeadline(time.Now().Add(40 * time.Second)); err != nil {
+	if err := conn.SetDeadline(ioDeadline(ctx, 40*time.Second)); err != nil {
 		return "", err
 	}
-	if err := conn.Handshake(); err != nil {
+	if err := conn.HandshakeContext(ctx); err != nil {
 		// The error's own type, and the flow's counts beside it.
 		//
 		// The trace shows the whole server flight arriving and being acknowledged and then a FIN. A client
@@ -805,18 +834,16 @@ func tlsTraceThroughTunnel(tun *tunnel, src, dst net.IP) (string, error) {
 	if _, err := io.WriteString(conn, req); err != nil {
 		return "", err
 	}
-	body := &bytes.Buffer{}
-	buf := make([]byte, 4096)
-	deadline := time.Now().Add(25 * time.Second)
-	for time.Now().Before(deadline) {
-		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, err := conn.Read(buf)
-		body.Write(buf[:n])
-		if err != nil {
-			break
-		}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		return "", err
 	}
-	return body.String(), nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", newStartupError("trace", "http", strconv.Itoa(resp.StatusCode), nil)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<15))
+	return string(body), err
 }
 
 // ipv4UDP builds a datagram packet: the header this file already builds, with protocol 17 in it and the
@@ -1476,6 +1503,13 @@ func (c *tunnelConn) feed(ip []byte) {
 }
 
 func (c *tunnelConn) open() error {
+	return c.openContext(context.Background())
+}
+
+func (c *tunnelConn) openContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// A SYN retransmission must repeat the original sequence number. Incrementing between sends
 	// makes the far side see two different connections and answer with RST.
 	synSeq := c.seq
@@ -1488,7 +1522,7 @@ func (c *tunnelConn) open() error {
 	c.synPending = false
 	c.seq = synSeq + 1
 
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := ioDeadline(ctx, 20*time.Second)
 	for time.Now().Before(deadline) {
 		c.mu.Lock()
 		ok := c.synned
@@ -1508,7 +1542,9 @@ func (c *tunnelConn) open() error {
 			c.emit(nil, 0x02)
 			c.seq = synSeq + 1
 		}
-		time.Sleep(50 * time.Millisecond)
+		if err := waitForContext(ctx, 50*time.Millisecond); err != nil {
+			return err
+		}
 	}
 	return fmt.Errorf("tcp handshake through the tunnel did not complete")
 }
@@ -1792,6 +1828,8 @@ func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, 
 	if err != nil {
 		return nil, err
 	}
+	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stop()
 	tc := tls.Client(raw, masqueTLSConfig(cert, "h2"))
 	if err := tc.HandshakeContext(ctx); err != nil {
 		raw.Close()
@@ -1827,10 +1865,12 @@ func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, 
 	// It is off by default and it is not a debug aid left in by accident: a carrier that accepts a request
 	// with status 200, answers a SYN-ACK, and then forwards no data is indistinguishable from a correct one
 	// at every layer this client can see. The bytes are the layer below that.
+	_ = c.conn.SetWriteDeadline(ioDeadline(ctx, 4*time.Second))
 	if _, err := c.conn.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...)); err != nil {
 		tc.Close()
 		return nil, err
 	}
+	_ = c.conn.SetWriteDeadline(time.Time{})
 	return c, nil
 }
 
@@ -1856,8 +1896,13 @@ func (c *h2raw) readFrame() (typ, flags byte, stream uint32, payload []byte, err
 // awaitSettings reads until the peer's SETTINGS have arrived and reports whether it enabled the
 // extended CONNECT.
 func (c *h2raw) awaitSettings(ctx context.Context) (bool, error) {
+	stop := context.AfterFunc(ctx, func() { _ = c.conn.Close() })
+	defer stop()
+	deadline := ioDeadline(ctx, 6*time.Second)
+	_ = c.conn.SetWriteDeadline(deadline)
+	defer c.conn.SetWriteDeadline(time.Time{})
 	for {
-		if err := c.conn.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		if err := c.conn.SetReadDeadline(deadline); err != nil {
 			return false, err
 		}
 		typ, _, _, payload, err := c.readFrame()
@@ -1980,6 +2025,11 @@ func variants() []connectVariant {
 // sendConnect writes the extended CONNECT on stream 1 and reads the response headers, without
 // END_STREAM: the capsule stream needs this side of the stream to stay open for the tunnel's life.
 func (c *h2raw) sendConnect(ctx context.Context, v connectVariant) (int, map[string]string, error) {
+	stop := context.AfterFunc(ctx, func() { _ = c.conn.Close() })
+	defer stop()
+	deadline := ioDeadline(ctx, 6*time.Second)
+	_ = c.conn.SetWriteDeadline(deadline)
+	defer c.conn.SetWriteDeadline(time.Time{})
 	var block bytes.Buffer
 	enc := hpack.NewEncoder(&block)
 	// :method, :scheme and :path are literal-without-indexing against the static table names, and each
@@ -2058,7 +2108,7 @@ func (c *h2raw) sendConnect(ctx context.Context, v connectVariant) (int, map[str
 		return 0, nil, err
 	}
 	for {
-		if err := c.conn.SetReadDeadline(time.Now().Add(25 * time.Second)); err != nil {
+		if err := c.conn.SetReadDeadline(deadline); err != nil {
 			return 0, nil, err
 		}
 		typ, _, stream, payload, err := c.readFrame()
@@ -2448,6 +2498,7 @@ func openH2Session(ctx context.Context, cert tls.Certificate, edgeAddr string) (
 		c.conn.Close()
 		return nil, fmt.Errorf("h2 CONNECT refused with %d", status)
 	}
+	_ = c.conn.SetDeadline(time.Time{})
 	return &h2CapsuleStream{h2: c}, nil
 }
 
@@ -2476,13 +2527,19 @@ func negotiateH2Shape(ctx context.Context, edgeAddr string, cert tls.Certificate
 		//
 		// So: the accepted shape is remembered across calls (below), and the shapes are spaced. The first
 		// call in a process still costs one connection per shape, and that is now the only place it does.
-		time.Sleep(400 * time.Millisecond)
+		if err := waitForContext(ctx, 400*time.Millisecond); err != nil {
+			return "", err
+		}
 		probe, err := dialH2Raw(ctx, edgeAddr, cert)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		probe.awaitSettings(ctx)
+		if _, err := probe.awaitSettings(ctx); err != nil {
+			probe.conn.Close()
+			lastErr = err
+			continue
+		}
 		status, _, err := probe.sendConnect(ctx, v)
 		if err == nil && status == 200 {
 			probe.conn.Close()
@@ -2891,6 +2948,8 @@ func enrolmentTLSConfig() *tls.Config {
 }
 
 func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
+	ctx, cancel := context.WithTimeout(ctx, enrolmentBudget)
+	defer cancel()
 	// An enrolment made elsewhere, when one is named.
 	//
 	// The two roles are swapped rather than reasoned about. This client registering and then running its own
@@ -2905,6 +2964,9 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 	if path := os.Getenv("WARP_LOAD_CREDENTIALS"); path != "" {
 		return enrolFromFile(path)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, tls.Certificate{}, classifyStartupError("enrol", err)
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, tls.Certificate{}, err
@@ -2916,71 +2978,40 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 	scalar := make([]byte, 32)
 	key.D.FillBytes(scalar)
 
-	apiIP, err := resolve4(apiHost)
+	dnsCtx, cancelDNS := context.WithTimeout(ctx, enrolmentDNSBudget)
+	addresses, err := resolveContext(dnsCtx, apiHost)
+	cancelDNS()
 	if err != nil {
-		return nil, tls.Certificate{}, err
+		return nil, tls.Certificate{}, classifyStartupError("dns", err)
+	}
+	var apiIPs []string
+	for _, address := range addresses {
+		if ip := address.To4(); ip != nil {
+			apiIPs = append(apiIPs, ip.String())
+		}
+	}
+	if len(apiIPs) == 0 {
+		return nil, tls.Certificate{}, newStartupError("dns", "invalid", "no IPv4", nil)
 	}
 
-	client := &http.Client{
-		Timeout: 25 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: enrolmentTLSConfig(),
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				d := net.Dialer{Control: protectSocket}
-				return d.DialContext(ctx, "tcp", net.JoinHostPort(apiIP, "443"))
-			},
+	var nextIP atomic.Uint32
+	transport := &http.Transport{
+		TLSClientConfig: enrolmentTLSConfig(),
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			index := int(nextIP.Add(1)-1) % len(apiIPs)
+			d := net.Dialer{Control: protectSocket, Timeout: 2500 * time.Millisecond}
+			return d.DialContext(ctx, network, net.JoinHostPort(apiIPs[index], "443"))
 		},
 	}
-	call := func(method, path, token string, body map[string]any) (map[string]any, error) {
-		buf, _ := json.Marshal(body)
-		// Retried per request, on a freshly resolved address each time. The enrolment endpoint resolves
-		// into a rotating set and the failure is per-address, not per-request: across runs the same call
-		// returns a body, then EOF, then a header timeout. One attempt is not a measurement, and without
-		// this the whole tunnel fails at enrolment before a single packet of it is built:
-		//
-		//   IllegalStateException: register: Post ".../v0a4471/reg": context deadline exceeded
-		//     at ColgramWarpMasqueTunnel.bringUp(ColgramWarpMasqueTunnel.java:247)
-		var lastErr error
-		const attempts = 3
-		for attempt := 1; attempt <= attempts; attempt++ {
-			req, err := http.NewRequest(method, "https://"+apiHost+path, bytes.NewReader(buf))
-			if err != nil {
-				return nil, err
-			}
-			req = req.WithContext(ctx)
-			req.Host = apiHost
-			req.Header.Set("User-Agent", "WARP for Android")
-			req.Header.Set("CF-Client-Version", "a-6.35-4471")
-			req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-			if token != "" {
-				req.Header.Set("Authorization", "Bearer "+token)
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				lastErr = err
-				androidLog(fmt.Sprintf("colgram_masque: %s %s attempt %d/%d: %v", method, path, attempt, attempts, err))
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-				if fresh, ferr := resolve4(apiHost); ferr == nil {
-					apiIP = fresh
-				}
-				time.Sleep(time.Duration(attempt%4) * 500 * time.Millisecond)
-				continue
-			}
-			raw, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 400 {
-				return nil, fmt.Errorf("%s %s: %d %s", method, path, resp.StatusCode, string(raw))
-			}
-			var out map[string]any
-			json.Unmarshal(raw, &out)
-			return out, nil
-		}
-		return nil, lastErr
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	call := func(stage, method, path, token string, body map[string]any) (map[string]any, error) {
+		return callEnrolmentAPI(ctx, client, "https://"+apiHost+path, stage, method, token, body)
 	}
 
-	reg, err := call("POST", "/"+apiVer+"/reg", "", map[string]any{
+	reg, err := call("register", http.MethodPost, "/"+apiVer+"/reg", "", map[string]any{
 		"fcm_token": "", "install_id": "", "tos": "2024-06-01T00:00:00.000Z",
 		"model": "PC", "serial_number": randomID(),
 		"locale": "en_US", "os_version": "",
@@ -3005,39 +3036,26 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 		"key":      base64.StdEncoding.EncodeToString(scalar),
 		"key_type": "curve25519", "tunnel_type": "wireguard"})
 	if err != nil {
-		return nil, tls.Certificate{}, fmt.Errorf("register: %w", err)
+		return nil, tls.Certificate{}, err
 	}
 	id, _ := reg["id"].(string)
 	token, _ := reg["token"].(string)
 	if id == "" || token == "" {
-		return nil, tls.Certificate{}, fmt.Errorf("register: response carried no id/token")
+		return nil, tls.Certificate{}, newStartupError("register", "invalid", "response", nil)
 	}
-	updated, err := call("PATCH", "/"+apiVer+"/reg/"+id, token, map[string]any{
+	updated, err := call("enrol", http.MethodPatch, "/"+apiVer+"/reg/"+id, token, map[string]any{
 		"key": base64.StdEncoding.EncodeToString(spki), "key_type": "secp256r1", "tun_type": "masque"})
 	if err != nil {
-		return nil, tls.Certificate{}, fmt.Errorf("enrol: %w", err)
+		return nil, tls.Certificate{}, err
 	}
 	pin, err := enrollmentPeerKey(updated)
 	if err != nil {
-		return nil, tls.Certificate{}, err
+		return nil, tls.Certificate{}, newStartupError("enrol", "invalid", "peer certificate pin", err)
 	}
 	masquePin.Lock()
 	masquePin.key = pin
 	masquePin.Unlock()
 	reg = updated
-	// Read the account back after enrolling, and log what it says.
-	//
-	// The reference client calls GetAccount before it connects, and the answer is what says whether the
-	// edge will route for this identity: a licence bound and `warp_plus: true` is a provisioned account, and
-	// one without is a registered device with nothing behind it. A tunnel that gets a handshake and no data
-	// is what an unprovisioned identity looks like from inside the tunnel, so this is read on every run
-	// rather than assumed from the fact that the PATCH returned 200.
-	if acct, aerr := call("GET", "/"+apiVer+"/reg/"+id+"/account", token, nil); aerr == nil {
-		androidLog(fmt.Sprintf("colgram_masque: account %s warp_plus=%v quota=%v",
-			acct["account_type"], acct["warp_plus"], acct["quota"]))
-	} else {
-		androidLog(fmt.Sprintf("colgram_masque: account read-back failed: %v", aerr))
-	}
 
 	addr := "172.16.0.2"
 	if cfg, ok := reg["config"].(map[string]any); ok {
@@ -3106,23 +3124,14 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 		fmt.Fprintf(os.Stderr, "COLGRAM_CREDENTIALS id=%s token=%s\nCOLGRAM_ADDRESS %s\nCOLGRAM_KEY %s\n",
 			id, token, addr, strings.ReplaceAll(string(keyPEM), "\n", "\\n"))
 	}
-	return net.ParseIP(addr).To4(), pair, nil
-}
-
-// resolve4 returns an IPv4 address for a name, resolved over DoH. The system resolver is not usable
-// here: on the device it fails outright, and this measurement is meant to depend on nothing but
-// the path it is measuring.
-func resolve4(name string) (string, error) {
-	ips, err := resolve(name)
-	if err != nil {
-		return "", err
+	if err := ctx.Err(); err != nil {
+		return nil, tls.Certificate{}, classifyStartupError("enrol", err)
 	}
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String(), nil
-		}
+	ip := net.ParseIP(addr).To4()
+	if ip == nil {
+		return nil, tls.Certificate{}, newStartupError("enrol", "invalid", "address", nil)
 	}
-	return "", fmt.Errorf("no IPv4 for %s", name)
+	return ip, pair, nil
 }
 
 // Config is what the app passes in. The standalone binary reads the same fields from the
@@ -4009,11 +4018,25 @@ func dialQuic(ctx context.Context, udpConn *net.UDPConn, addr string, cert tls.C
 	}
 	// Probed through the front when one is named, for the same reason the candidate search does it: a
 	// probe on a different egress answers about a path the handshake will not take.
-	if !udpReachablePorts(host, []string{port}, socksAddrFor(Config{}))[port] {
+	resolved := net.ParseIP(host)
+	if resolved == nil {
+		addresses, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+		if err != nil {
+			return nil, err
+		}
+		if len(addresses) == 0 {
+			return nil, fmt.Errorf("no IPv4 address for WARP edge")
+		}
+		resolved = addresses[0]
+	}
+	if !udpReachablePortsContext(ctx, resolved.String(), []string{port}, socksAddrFor(Config{}))[port] {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("udp to %s does not answer", addr)
 	}
 	tlsConf := masqueTLSConfig(cert, "h3")
-	return quic.Dial(ctx, udpConn, mustAddr(addr), tlsConf, &quic.Config{
+	return quic.Dial(ctx, udpConn, &net.UDPAddr{IP: resolved, Port: atoiOr(port, 443)}, tlsConf, &quic.Config{
 		EnableDatagrams:         true,
 		InitialPacketSize:       1200,
 		DisablePathMTUDiscovery: true,
@@ -4118,6 +4141,10 @@ func newUdpCarrier(socks string) (net.PacketConn, error) {
 // datagram is a real packet rather than a bare write so that a firewall answering with an ICMP port
 // unreachable is also caught, which a plain connect would report and a filtered path would not.
 func udpReachablePorts(host string, ports []string, socks string) map[string]bool {
+	return udpReachablePortsContext(context.Background(), host, ports, socks)
+}
+
+func udpReachablePortsContext(ctx context.Context, host string, ports []string, socks string) map[string]bool {
 	out := map[string]bool{}
 	addr := net.ParseIP(host).To4()
 	if addr == nil {
@@ -4132,19 +4159,23 @@ func udpReachablePorts(host string, ports []string, socks string) map[string]boo
 	var raw net.PacketConn
 	var err error
 	if socks != "" {
-		relay, err = dialSocks5UDP(socks)
+		relay, err = dialSocks5UDPContext(ctx, socks)
 		if err != nil {
 			androidLog(fmt.Sprintf("colgram_masque: reachability probe could not use the front %s: %v",
 				socks, err))
 			return out
 		}
 		defer relay.Close()
+		stop := context.AfterFunc(ctx, func() { _ = relay.Close() })
+		defer stop()
 	} else {
 		raw, err = listenProtectedUDP("udp4", &net.UDPAddr{})
 		if err != nil {
 			return out
 		}
 		defer raw.Close()
+		stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
+		defer stop()
 	}
 
 	send := func(b []byte, to *net.UDPAddr) error {
@@ -4165,12 +4196,10 @@ func udpReachablePorts(host string, ports []string, socks string) map[string]boo
 	}
 	setDeadline := func(t time.Time) {
 		if relay != nil {
-			// The associate's own reads go through its control socket; the deadline that matters is on the
-			// session, and a stale one would let a filtered port read the previous port's reply.
-			_ = t
+			_ = relay.SetDeadline(t)
 			return
 		}
-		_ = raw.SetReadDeadline(t)
+		_ = raw.SetDeadline(t)
 	}
 
 	conn, err := listenProtectedUDP("udp4", &net.UDPAddr{})
@@ -4189,12 +4218,15 @@ func udpReachablePorts(host string, ports []string, socks string) map[string]boo
 	pkt[3] = 0xba
 
 	for _, p := range ports {
+		if ctx.Err() != nil {
+			return out
+		}
 		port, err := strconv.Atoi(p)
 		if err != nil {
 			continue
 		}
 		target := &net.UDPAddr{IP: addr, Port: port}
-		setDeadline(time.Now().Add(400 * time.Millisecond))
+		setDeadline(ioDeadline(ctx, 400*time.Millisecond))
 		if err := send(pkt, target); err != nil {
 			continue
 		}
@@ -4435,39 +4467,11 @@ func main() {
 // device it fails outright, and the point of this measurement is to depend on nothing but the
 // tunnel's own path.
 func resolve(host string) ([]net.IP, error) {
-	var lastErr error
-	for _, e := range dohEndpoints {
-		lastErr = fmt.Errorf("no DoH endpoint answered for %s", host)
-		ips, err := resolveVia(e, host)
-		// A resolver that answers is not the same as a resolver that answers correctly. Measured here:
-		// when the Cloudflare and Google entries in this list were cut, the AdGuard entry answered - and
-		// returned 94.140.14.14 for api.cloudflareclient.com, which is not a Cloudflare address at all.
-		// The enrolment then completed against it and the API answered 400:
-		//
-		//   register: Post "https://api.cloudflareclient.com/v0a4471/reg": 400
-		//
-		// So an answer is checked against the range the host is actually served from before it is used, and
-		// an answer from outside that range is treated as a failed resolver rather than as the address.
-		// Without the check this is a silent substitution by whichever resolver happens to be reachable,
-		// which is the same attack the system resolver performs and the reason this list exists.
-		if err == nil && len(ips) > 0 && plausible(host, ips) {
-			androidLog(fmt.Sprintf("colgram_masque: resolved %s through %s: %v", host, e.ip, ips))
-			return ips, nil
-		}
-		if err != nil {
-			androidLog(fmt.Sprintf("colgram_masque: resolver %s did not answer for %s: %v", e.ip, host, err))
-		} else {
-			androidLog(fmt.Sprintf("colgram_masque: resolver %s answered for %s with %v, "+
-				"which is not a range it is served from", e.ip, host, ips))
-		}
-		if err != nil {
-			lastErr = err
-		}
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("no DoH endpoint answered for %s", host)
+	return resolveContext(context.Background(), host)
+}
+
+func resolveContext(ctx context.Context, host string) ([]net.IP, error) {
+	return resolveWith(ctx, host, dohEndpoints, resolveVia)
 }
 
 // dohEndpoints are address literal plus the name to carry in SNI and to verify against.
@@ -4546,9 +4550,9 @@ func plausible(host string, ips []net.IP) bool {
 	return true
 }
 
-func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
+func resolveVia(ctx context.Context, e dohEndpoint, host string) ([]net.IP, error) {
 	target := "https://" + e.ip + "/dns-query?name=" + host + "&type=A"
-	req, err := http.NewRequest("GET", target, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -4557,7 +4561,7 @@ func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
 	// host and verified as another - which is the whole point.
 	req.Host = e.verifyName
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 1200 * time.Millisecond,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				ServerName: e.verifyName,
@@ -4572,6 +4576,7 @@ func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
 			},
 		},
 	}
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -4580,7 +4585,7 @@ func resolveVia(e dohEndpoint, host string) ([]net.IP, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("%s: %d", e.ip, resp.StatusCode)
 	}
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {
 		return nil, err
 	}
@@ -4657,6 +4662,20 @@ func colgram_masque_measure(bind, edge, port, relayBind *C.char) *C.char {
 
 //export colgram_masque_last_error
 func colgram_masque_last_error() *C.char {
+	sessionMu.Lock()
+	current := session
+	if current != nil {
+		detail := current.progress.failure()
+		sessionMu.Unlock()
+		return C.CString(detail)
+	}
+	detail, stage := sessionStage.failure(), sessionStage.text()
+	sessionMu.Unlock()
+	if stage != "none" {
+		return C.CString(detail)
+	}
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
 	return C.CString(bridgeErr)
 }
 
@@ -4719,6 +4738,14 @@ func openConnect(ctx context.Context, h3 *http3.ClientConn) (*http3.RequestStrea
 	if err != nil {
 		return nil, err
 	}
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelRead(quic.StreamErrorCode(0))
+		stream.CancelWrite(quic.StreamErrorCode(0))
+	})
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
 	req, err := http.NewRequest("CONNECT", "https://cloudflareaccess.com/", nil)
 	if err != nil {
 		return nil, err
@@ -4737,6 +4764,7 @@ func openConnect(ctx context.Context, h3 *http3.ClientConn) (*http3.RequestStrea
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("CONNECT refused with %d", resp.StatusCode)
 	}
+	_ = stream.SetDeadline(time.Time{})
 	return stream, nil
 }
 
@@ -4774,18 +4802,37 @@ func openSessionForOwner(bind, edge *C.char, owner int64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionDialCancel = cancel
 	sessionMu.Unlock()
+	stage := func(name, detail string) {
+		sessionMu.Lock()
+		defer sessionMu.Unlock()
+		if sessionEpoch == epoch && ctx.Err() == nil {
+			setSessionStage(name, detail)
+		}
+	}
+	fail := func(where string, err error) {
+		var typed *startupError
+		if !errors.As(err, &typed) {
+			typed = classifyStartupError(where, err)
+		}
+		stage("failed", typed.Error())
+	}
 	failed := true
 	defer func() {
 		if failed {
 			cancel()
 		}
 	}()
-	setSessionStage("enrolling", "")
+	stage("enrolling", "")
 	srcIP, cert, err := enrolOnceContext(ctx)
-	if err != nil || ctx.Err() != nil {
-		setSessionStage("failed", fmt.Sprintf("enrollment: %v", err))
+	if ctx.Err() != nil {
 		return
 	}
+	if err != nil {
+		fail("enrol", err)
+		return
+	}
+	carrierCtx, cancelCarrier := context.WithTimeout(ctx, carrierBudget)
+	defer cancelCarrier()
 	addr := net.JoinHostPort(edgeIP, "443")
 	if e := C.GoString(edge); e != "" {
 		if h, p, err := net.SplitHostPort(e); err == nil {
@@ -4800,22 +4847,27 @@ func openSessionForOwner(bind, edge *C.char, owner int64) {
 	}
 	udpConn, err := listenProtectedUDP("udp4", local)
 	if err != nil {
-		setSessionStage("failed", err.Error())
+		fail("edge", err)
 		return
 	}
-	setSessionStage("dialing", "to "+addr)
+	stage("dialing", "to "+addr)
 	var tun *tunnel
-	qconn, qerr := dialQuic(ctx, udpConn, addr, cert)
+	quicCtx, cancelQUIC := context.WithTimeout(carrierCtx, 5*time.Second)
+	qconn, qerr := dialQuic(quicCtx, udpConn, addr, cert)
+	cancelQUIC()
 	if qerr != nil {
 		udpConn.Close()
 		if ctx.Err() != nil {
 			return
 		}
-		setSessionStage("dialing-h2", "trying TCP+TLS+H2")
+		stage("dialing-h2", "trying TCP+TLS+H2")
 		h2addr := addr // Respect an explicit relay/edge override for both carriers.
-		cs, h2err := openH2Session(ctx, cert, h2addr)
+		cs, h2err := openH2Session(carrierCtx, cert, h2addr)
 		if h2err != nil {
-			setSessionStage("failed", h2err.Error())
+			if carrierCtx.Err() != nil {
+				h2err = carrierCtx.Err()
+			}
+			fail("edge", h2err)
 			return
 		}
 		tun = &tunnel{srcIP: srcIP, stream: cs}
@@ -4823,11 +4875,14 @@ func openSessionForOwner(bind, edge *C.char, owner int64) {
 		tun = &tunnel{conn: qconn, srcIP: srcIP}
 		h3c := (&http3.Transport{EnableDatagrams: true, AdditionalSettings: map[uint64]uint64{0x8: 1}}).NewClientConn(qconn)
 		tun.h3 = h3c
-		stream, err := openConnect(ctx, h3c)
+		stream, err := openConnect(carrierCtx, h3c)
 		if err != nil {
 			tun.close()
 			udpConn.Close()
-			setSessionStage("failed", err.Error())
+			if carrierCtx.Err() != nil {
+				err = carrierCtx.Err()
+			}
+			fail("connect", err)
 			return
 		}
 		tun.stream = &h3Stream{s: stream}
@@ -4846,7 +4901,7 @@ func openSessionForOwner(bind, edge *C.char, owner int64) {
 	sessionMu.Unlock()
 	failed = false
 	go s.pump(ctx)
-	setSessionStage("open", "carrying complete IP packets to "+addr)
+	stage("open", "carrying complete IP packets to "+addr)
 }
 
 func (s *longSession) pump(ctx context.Context) {
@@ -4943,6 +4998,7 @@ func colgram_masque_close_session() {
 	sessionMu.Lock()
 	s := session
 	session = nil
+	setSessionStage("none", "")
 	sessionMu.Unlock()
 	if s == nil || s.tun == nil {
 		return
@@ -5029,17 +5085,10 @@ func colgram_masque_last_reply_len() *C.char {
 //	connecting      extended CONNECT not answered yet
 //	opening-peer    the inner TCP SYN has not come back
 //	open            ready, carrying packets
-var sessionStage = struct {
-	sync.Mutex
-	stage  string
-	detail string
-}{stage: "none"}
+var sessionStage = sessionProgressRecord{stage: "none"}
 
 func setSessionStage(stage, detail string) {
-	sessionStage.Lock()
-	sessionStage.stage = stage
-	sessionStage.detail = detail
-	sessionStage.Unlock()
+	sessionStage.set(stage, detail)
 }
 
 //export colgram_masque_session_progress
@@ -5050,12 +5099,7 @@ func colgram_masque_session_progress() *C.char {
 	if current != nil {
 		return C.CString(current.progress.text())
 	}
-	sessionStage.Lock()
-	defer sessionStage.Unlock()
-	if sessionStage.detail == "" {
-		return C.CString(sessionStage.stage)
-	}
-	return C.CString(sessionStage.stage + " (" + sessionStage.detail + ")")
+	return C.CString(sessionStage.text())
 }
 
 //export colgram_masque_capsule_stats
@@ -5080,19 +5124,31 @@ func colgram_masque_trace() *C.char {
 	if s == nil || s.ctx.Err() != nil {
 		return C.CString("")
 	}
-	ips, err := resolve(traceHost)
+	ctx, cancel := context.WithTimeout(s.ctx, traceBudget)
+	defer cancel()
+	dnsCtx, cancelDNS := context.WithTimeout(ctx, enrolmentDNSBudget)
+	ips, err := resolveContext(dnsCtx, traceHost)
+	cancelDNS()
 	if err != nil {
+		s.progress.set("failed", classifyStartupError("trace-dns", err).Error())
 		return C.CString("")
 	}
 	for _, ip := range ips {
 		if ip.To4() == nil {
 			continue
 		}
-		body, err := tlsTraceThroughTunnel(s.tun, s.tun.srcIP, ip.To4())
+		body, err := tlsTraceThroughTunnelContext(ctx, s.tun, s.tun.srcIP, ip.To4())
 		if err == nil {
 			return C.CString(body)
 		}
-		s.progress.set("failed", err.Error())
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		var typed *startupError
+		if !errors.As(err, &typed) {
+			typed = classifyStartupError("trace", err)
+		}
+		s.progress.set("failed", typed.Error())
 		break
 	}
 	return C.CString("")

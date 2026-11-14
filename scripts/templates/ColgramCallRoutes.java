@@ -49,8 +49,7 @@ public final class ColgramCallRoutes {
     }
 
     public static Mode mode() {
-        return ColgramCallRoutePolicy.fromPreference(prefs().getString(MODE_KEY, null),
-                prefs().getBoolean("proxy_enabled_calls", true));
+        return ColgramCallRoutePolicy.fromPreference(prefs().getString(MODE_KEY, null));
     }
 
     public static String summary() {
@@ -137,7 +136,6 @@ public final class ColgramCallRoutes {
 
     /** Track explicit routes after start, not just while constructing the media engine. */
     public static Runnable watch(Context context, Mode selected, Runnable onLost) {
-        if (selected == Mode.CURRENT) return () -> {};
         final class Watch implements Runnable {
             boolean stopped;
             @Override public void run() {
@@ -212,7 +210,7 @@ public final class ColgramCallRoutes {
             ready.run(selected, 0);
             return;
         }
-        if (selected == Mode.DIRECT || hasVpn(activity)) {
+        if (selected == Mode.CURRENT || hasVpn(activity)) {
             onFailure.run();
             showError(activity, current.failure);
             return;
@@ -301,7 +299,9 @@ public final class ColgramCallRoutes {
                 if (!isReady(work))
                     failure = "Маршрут «" + work.mode.labelRu + "» для звонка не подключился.";
             } catch (Exception error) {
-                failure = "Маршрут «" + work.mode.labelRu + "» не запустился. Проверьте настройки подключения.";
+                String detail = work.mode == Mode.WARP ? ColgramWarpTunnel.lastFailureReason() : null;
+                failure = "Маршрут «" + work.mode.labelRu + "» не запустился. "
+                        + (detail == null || detail.isEmpty() ? "Проверьте настройки подключения." : detail);
             }
             String result = failure;
             AndroidUtilities.runOnUIThread(() -> complete(work, result));

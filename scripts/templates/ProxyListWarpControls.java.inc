@@ -163,8 +163,11 @@
     }
 
     private String warpStatusForProxyScreen() {
-        if (org.colgram.core.ColgramConfig.isWarpEnabled() && warpOperationsGate.isPending())
-            return "запускается · нажмите для отмены";
+        if (org.colgram.core.ColgramConfig.isWarpEnabled() && warpOperationsGate.isPending()) {
+            String stage = org.colgram.core.ColgramWarpMasqueTunnel.startupStage();
+            if (stage == null) stage = waitingWarpConsent >= 0 ? "разрешение VPN" : "запуск";
+            return stage + " · нажмите для отмены";
+        }
         if (org.colgram.core.ColgramWarpTunnel.isConnected()) return "подключён";
         if (org.colgram.core.ColgramWarpTunnel.isUp()) return "подключается";
         String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();

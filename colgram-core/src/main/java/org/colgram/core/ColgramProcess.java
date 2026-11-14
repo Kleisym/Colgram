@@ -12,6 +12,14 @@ public final class ColgramProcess {
     private ColgramProcess() { }
 
     public static boolean isMasqueProcess(Context context) {
+        return hasSuffix(":colgram_masque");
+    }
+
+    public static boolean isGuestProxyProcess(Context context) {
+        return hasSuffix(":colgram_proxy_probe");
+    }
+
+    private static boolean hasSuffix(String suffix) {
         String name = null;
         if (Build.VERSION.SDK_INT >= 28) name = Application.getProcessName();
         if (name == null) {
@@ -25,6 +33,6 @@ public final class ColgramProcess {
                 }
             } catch (Exception ignored) { }
         }
-        return name != null && name.endsWith(":colgram_masque");
+        return name != null && name.endsWith(suffix);
     }
 }

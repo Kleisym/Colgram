@@ -3983,8 +3983,12 @@ def inject_hooks(repo_path):
     )
 
     def proxy_error_hook(content):
-        if cm_proxy_current in content:
-            return content
+        guarded_current = cm_proxy_current.replace(
+            "    public static void onProxyError() {\n",
+            "    public static void onProxyError() {\n"
+            "        if (ColgramGuestProxyService.inProbeProcess()) return;\n", 1)
+        if cm_proxy_current in content or guarded_current in content:
+            return CONVERGED
         if cm_proxy_alerting in content:
             return content.replace(cm_proxy_alerting, cm_proxy_current, 1)
         if cm_proxy_previous in content:
@@ -5824,6 +5828,8 @@ def inject_core_device_test_support(repo_path, root_dir):
         module_dir, "src", "androidTest", "java", "org", "colgram", "core")
     for name in ("ColgramDirectConnectionDeviceTest.java",
                  "ColgramDirectApiDeviceTest.java",
+                 "ColgramGuestProxyDeviceTest.java",
+                 "ColgramLocalDpiApiDeviceTest.java",
                  "ColgramOnboardingDeviceTest.java",
                  "ColgramIntroSlidesDeviceTest.java",
                  "ColgramSettingsRowsDeviceTest.java",
@@ -6929,6 +6935,8 @@ def main():
     configure_chaquopy_build(target_repo)
     inject_hooks(target_repo)
     inject_masque_process_isolation(target_repo)
+    from guest_proxy_patches import apply as inject_guest_proxy_probe
+    inject_guest_proxy_probe(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

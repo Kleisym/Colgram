@@ -196,6 +196,14 @@ public class ColgramProxyManager {
     private static final ExecutorService executor = Executors.newFixedThreadPool(8);
     /** Feed downloads are independent; serialize only parsing into the shared proxy pool. */
     private static final ExecutorService sourceFetchers = Executors.newFixedThreadPool(4);
+    // Separate from the background pool: a large relay sweep must not starve a user selection.
+    private static final int SELECTION_TCP_PARALLEL = 6;
+    private static final ExecutorService selectionTcpWorkers = Executors.newFixedThreadPool(SELECTION_TCP_PARALLEL);
+    private static final java.util.concurrent.Semaphore selectionTcpSlots =
+            new java.util.concurrent.Semaphore(SELECTION_TCP_PARALLEL);
+    private static final long SOURCE_BATCH_TIMEOUT_MS = 11_000L;
+    private static final int SOURCE_IO_TIMEOUT_MS = 3_000;
+    private static final int SOURCE_MAX_BYTES = 512 * 1024;
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -227,6 +235,8 @@ public class ColgramProxyManager {
             new java.util.concurrent.atomic.AtomicLong();
     private static volatile long lastSourceFetchAt;
     private static volatile int sourceRound;
+    private static volatile SourceBatch lastSourceBatch;
+    private static final AtomicBoolean harvestingRelays = new AtomicBoolean(false);
     private static final AtomicBoolean networkCallbackRegistered = new AtomicBoolean(false);
     private static volatile ConnectivityManager.NetworkCallback networkCallback;
 
@@ -262,8 +272,9 @@ public class ColgramProxyManager {
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
     };
     private static final String[] PROXY_SOURCES_SOCKS = {
+        "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
         "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
-        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
         "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt",
         "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
@@ -274,9 +285,8 @@ public class ColgramProxyManager {
         "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
         "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
         "https://proxyspace.pro/socks5.txt",
-        "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/HEAD/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/HEAD/proxies/protocols/socks5/data.txt",
-        "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/HEAD/socks5_all.txt"
+        "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5_all.txt"
     };
 
     /** Reachable public tunnels let us test and, if needed, chain a Telegram proxy. */
@@ -365,6 +375,7 @@ public class ColgramProxyManager {
         // process-wide file descriptors and trips bionic's fdsan guard, aborting
         // the process inside libtmessages.49.so. Defer the whole block until the
         // network stack has settled.
+        final long startupEpoch = ColgramRouteEpoch.snapshot();
         STARTUP_DEFERRED.execute(() -> {
             try {
                 Thread.sleep(PROXY_START_DELAY_MS);
@@ -373,7 +384,7 @@ public class ColgramProxyManager {
                 return;
             }
             try {
-                activateBuiltinProxyNow();
+                activateBuiltinProxyNow(startupEpoch);
             } catch (Throwable t) {
                 Log.e(TAG, "Deferred proxy activation failed", t);
             }
@@ -438,178 +449,43 @@ public class ColgramProxyManager {
     /** Delay before any proxy-side socket work begins. */
     private static final long PROXY_START_DELAY_MS = 10000L;
 
-    private static void activateBuiltinProxyNow() {
-        // 1. Start embedded DPI bypass engine (runs local service on 127.0.0.1:9876)
-        //
-        // startImmediately(), NOT start(): this method is already running inside the
-        // manager's own deferral, so asking the bypass to defer again stacked the delays
-        // serially (10s + 8s = ~18s) before the listener existed. That was the dominant
-        // cause of the slow post-login connect.
-        //
-        // Only when the user actually asked for it. The listener used to start on every
-        // launch regardless: a bound socket, its accept thread and the desync machinery all
-        // running for traffic that is no longer routed through them (the proxy is no longer
-        // force-applied by default), plus awaitReady() below blocking up to 20s on a cold
-        // start for a component that is switched off.
-        boolean localReady = false;
-        if (ColgramConfig.isDpiBypassEnabled()) {
-            ColgramDpiBypass.startImmediately();
-            // The local listener is the pool's FIRST entry, so it must actually be accepting
-            // before we point Telegram at it. Without this wait the app would apply a proxy
-            // pointing at a closed port, Telegram would raise a proxy error, and the rotator
-            // would move off the local bypass entirely.
-            localReady = ColgramDpiBypass.awaitReady(20000);
-            if (!localReady) {
-                // Do NOT apply a proxy that points at a closed port: Telegram shows it as
-                // "Недоступен", the toggle flips itself off, and the user loses the proxy UI
-                // entirely. Better to leave the setting alone and say so in the log.
-                Log.e(TAG, "local DPI listener never bound; skipping local proxy application");
-            }
-        } else {
-            Log.i(TAG, "DPI bypass disabled; not starting the local listener");
-        }
-
-        // 2. Start with the local path; public candidates are harvested immediately in the
-        // background and are applied only after a successful Telegram-native handshake.
-        initVerifiedPool();
-        populateSharedConfigProxies();
-
-        // Check cached and bundled candidates immediately. Harvesting remote lists may block
-        // for many seconds (or fail entirely on the filtered network); it must not gate the
-        // first native verdict and the first attempt to connect.
-        sweepFast(null);
-
-        // 3. Apply proxy: DIRECT by default, proxy only when the user asks for one.
-        //
-        // This used to default to ENABLED on a fresh install and force-apply
-        // verifiedPool.get(0), which is the in-process desync listener. Two measurements killed
-        // that design:
-        //
-        //   * On a network where Telegram is blocked, the block is an IP-level silent drop -
-        //     TCP to 149.154.166.110:443 and 149.154.167.99:443 times out while general internet
-        //     is fine (1.1.1.1 answers in 62ms). Desync manipulates payload framing to defeat
-        //     INSPECTION; it cannot make a dropped route answer. So the thing we made the default
-        //     does not help against the block it was written for.
-        //   * On a network where Telegram is NOT blocked, the loopback hop is pure cost: an extra
-        //     proxy, an extra failure mode, and a port that can fail to bind and pin the app to
-        //     a dead 127.0.0.1.
-        //
-        // What does work against an IP block is an obfuscated proxy with a real endpoint - the
-        // user's own MTProto proxy, or a WebSocket bridge. That is now the documented path, and
-        // "Обходчик ТСПУ" stays available as an explicit opt-in for signature-based DPI.
-        SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
-        boolean hasSetProxy = mainPrefs.contains("proxy_enabled");
-        boolean isProxyEnabled = hasSetProxy && mainPrefs.getBoolean("proxy_enabled", false);
-        // The direct-address remap is an explicit choice and its port is ephemeral, so it must be
-        // re-bound on every start rather than restored from the saved 127.0.0.1:<old port>, which
-        // points at a socket that died with the previous process.
-        if (ColgramConfig.isWarpEnabled()) {
-            // WARP owns the route when its persisted switch is on. The old branch order
-            // force-applied the local proxy ten seconds later and forceApplyProxy() tore WARP
-            // down behind the still-blue setting.
-            Log.i(TAG, "WARP is selected; disabling any stale Telegram proxy preference and keeping WARP active");
-            disableProxy(appContext);
-        } else if (localBypassUsable() && ColgramConfig.isBuiltinProxyEnabled()) {
-            // The local desync listener is what his "анонимный обход без прокси" switch turns on,
-            // and it is the only bypass with no third party in the chain. It used to be started,
-            // waited for, and then never pointed at: applying anything was gated behind a proxy
-            // being saved or auto-proxy being on, so the switch produced a bound socket and
-            // nothing else - "обходник не работает от слова совсем", exactly as reported. It is
-            // not a proxy he must consent to; he asked for this one by name.
-            ProxyItem local = null;
-            for (ProxyItem p : verifiedPool) {
-                if (p.isLocalDpi()) { local = p; break; }
-            }
-            // Desync can only reshape a stream the network still ROUTES. Measured on his
-            // network: every Telegram DC address is refused at TCP within milliseconds, so
-            // landing on the local hop first pinned Telegram to a dead route while verified
-            // pool nodes sat unused - "Подключение прокси..." forever with the bypass on.
-            // Probe one DC: dead means skip the local hop and apply the best verified node;
-            // the bypass still applies where TCP answers (signature-based TSPU behaviour).
-            ProxyItem verifiedBest = pickVerifiedAliveNow(5);
-            // The direct route is judged on its own. It used to be probed only when a verified
-            // pool node already existed, so on a fresh install - nothing verified yet - the answer
-            // defaulted to "the local hop is fine", Telegram was pointed at 127.0.0.1:9876, and the
-            // app sat there with the bypass looking enabled and no route carrying anything. It is
-            // also why the row could not be switched off: the front kept being applied on every
-            // start regardless of the switch.
-            //
-            // Measured on the device, where the DC is directly reachable:
-            //
-            //   20:23:20  Applying proxy: 127.0.0.1:9876 (type=0)
-            //
-            // while the same address answered HTTP from the shell on every one of five tries.
-            boolean directDead = ColgramDcRemap.telegramDcProbe() < 0;
-            if (local != null && verifiedBest != null && directDead) {
-                // Only fall back to a third-party node when the user has the stock proxy switch on.
-                // This branch fires on every start while the bypass switch is enabled, so
-                // forceApplyProxy() here turned "Использовать прокси" blue by itself -- the exact
-                // reported bug. The bypass is his own choice; silently swapping it for a public
-                // proxy is not.
-                if (isProxyEnabled) {
-                    Log.i(TAG, "Telegram addresses are refused at TCP; applying verified "
-                            + verifiedBest + " instead of the local desync route");
-                    forceApplyProxy(verifiedBest);
+    private static void activateBuiltinProxyNow(long startupEpoch) {
+        mainHandler.post(() -> ColgramRouteEpoch.runIfCurrent(startupEpoch, () -> {
+            if (ColgramConfig.isWarpEnabled()) {
+                // WARP owns the route; clear stale Telegram proxy settings.
+                disableProxy(appContext);
+            } else if (ColgramConfig.isDpiBypassEnabled()) {
+                // The explicit private route is independent of the public-proxy catalog.
+                // A TCP probe is not evidence that Telegram works directly.
+                setDpiBypassEnabled(appContext, true);
+            } else if (!isUserProxyDisabled()) {
+                if (ColgramConfig.isDcRemapEnabled() && ColgramConfig.isBuiltinProxyEnabled()) {
+                    executor.execute(() -> ColgramRouteEpoch.runIfCurrent(startupEpoch, () -> applyDcRemap(true)));
+                    return;
+                }
+                SharedPreferences mainPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+                if (!mainPrefs.getBoolean("proxy_enabled", false)) return;
+                ProxyItem saved = findSavedProxy(mainPrefs);
+                boolean ephemeral = mainPrefs.getBoolean("proxy_auto_applied", false);
+                if (saved != null && !ephemeral && !isInternalLoopbackEndpoint(saved)) {
+                    selectUserProxyForEpoch(appContext, saved, startupEpoch, false);
                 } else {
-                    Log.i(TAG, "Telegram addresses are refused at TCP; leaving proxy off (user has not enabled it)");
+                    if (ephemeral) {
+                        for (int a = 0; a < colgramAccountSlots; a++) {
+                            appContext.getSharedPreferences(a == 0 ? "mainconfig" : ("mainconfig" + a),
+                                    Context.MODE_PRIVATE).edit().remove("proxy_auto_applied").apply();
+                        }
+                    }
+                    // A missing or stale saved route is not consent to install another proxy.
                     disableProxy(appContext);
                 }
-            } else if (local != null && !directDead) {
-                // The DC answers directly, so the desync front has nothing to defeat and costs a
-                // hop and a handshaked proxy to reach a server that was already reachable.
-                Log.i(TAG, "Telegram answers directly; leaving traffic off the local desync hop");
-                disableProxy(appContext);
-            } else if (local != null) {
-                Log.i(TAG, "applying the local DPI bypass he switched on");
-                forceApplyProxy(local);
-            } else {
-                Log.w(TAG, "DPI listener bound but no local entry in the pool to apply");
             }
-        } else if (isUserProxyDisabled()) {
-            Log.i(TAG, "public proxy route was toggled off; keeping direct/local bypass and feed checks active");
-        } else if (ColgramConfig.isDcRemapEnabled() && ColgramConfig.isBuiltinProxyEnabled()) {
-            executor.execute(() -> applyDcRemap(true));
-        } else if (isProxyEnabled) {
-            // Restore the proxy the user actually chose. This used to apply
-            // verifiedPool.get(0) unconditionally, which is the local desync node - so anyone
-            // who picked a public MTProto proxy was silently moved back onto the loopbar hop
-            // the next time the app started, and "my proxy does not stick" was the result.
-            ProxyItem saved = findSavedProxy(mainPrefs);
-            if (saved != null && mainPrefs.getBoolean("proxy_auto_applied", false)) {
-                // Auto-selected endpoints are ephemeral. A previous build persisted them, so
-                // restoring one after it died pinned the app to "Подключение прокси...".
-                Log.i(TAG, "discarding previously auto-selected proxy "
-                        + saved.address + ":" + saved.port);
-                for (int a = 0; a < colgramAccountSlots; a++) {
-                    appContext.getSharedPreferences(a == 0 ? "mainconfig" : ("mainconfig" + a),
-                            Context.MODE_PRIVATE).edit()
-                            .putBoolean("proxy_enabled", false)
-                            .remove("proxy_auto_applied").apply();
-                }
-                saved = null;
-            }
-            if (saved != null && isStaleLocalHop(saved)) {
-                // A build of ours wrote the remap's 127.0.0.1:<port> into Telegram's prefs, so an
-                // existing install can hold a hop that died with a process from last week. Applying
-                // it means "Подключение прокси..." forever; drop it and stop claiming a proxy is on.
-                Log.w(TAG, "saved proxy " + saved.address + ":" + saved.port
-                        + " is a local hop from an earlier process; discarding it");
-                for (int a = 0; a < colgramAccountSlots; a++) {
-                    appContext.getSharedPreferences(a == 0 ? "mainconfig" : ("mainconfig" + a),
-                            Context.MODE_PRIVATE).edit()
-                            .putBoolean("proxy_enabled", false).apply();
-                }
-                saved = null;
-                isProxyEnabled = false;
-            }
-            final long restoreEpoch = ColgramRouteEpoch.snapshot();
-            if (saved != null && !isInternalLoopbackEndpoint(saved)) {
-                selectUserProxyForEpoch(appContext, saved, restoreEpoch, false);
-            } else {
-                // A missing/failed saved endpoint is not consent to install the pool head.
-                mainHandler.post(() -> ColgramRouteEpoch.runIfCurrent(restoreEpoch,
-                        () -> disableProxy(appContext)));
-            }
+        }));
+
+        if (ColgramConfig.isBuiltinProxyEnabled()) {
+            initVerifiedPool();
+            populateSharedConfigProxies();
+            sweepFast(null);
         }
 
         // Optional source discovery waits until the first screen and cached route are ready.
@@ -1055,6 +931,10 @@ public class ColgramProxyManager {
      */
     public static void sweepFast(final Runnable onDone) {
         if (appContext == null) return;
+        if (isProxySelectionPending()) {
+            if (onDone != null) mainHandler.post(onDone);
+            return;
+        }
         if (!sweeping.compareAndSet(false, true)) {
             // The remote harvest can finish while the cached-candidate sweep is running.
             // The new entries still need a TCP verdict, not a five-minute wait.
@@ -1086,6 +966,7 @@ public class ColgramProxyManager {
             }
             sweeper.execute(() -> {
                 try {
+                    if (isProxySelectionPending()) return;
                     if ("127.0.0.1".equals(item.address)) {
                         int rtt = testProxy(item.address, item.port, 1200);
                         item.tcpMs = rtt >= 0 ? rtt : -2;
@@ -1095,6 +976,7 @@ public class ColgramProxyManager {
                         return;
                     }
                     int rtt = testProxy(item.address, item.port, 1200);
+                    if (isProxySelectionPending()) return;
                     if (rtt >= 0) {
                         item.tcpMs = rtt;
                         item.chainRelay = null;
@@ -2514,10 +2396,14 @@ public static void reportProxyFailure() {
 
     /** Harvest public routes, then let Telegram verify candidates before any auto-connect. */
     private static void fetchAndVerifyAllSources() {
+        fetchAndVerifyAllSources(false);
+    }
+
+    private static void fetchAndVerifyAllSources(boolean foreground) {
         if (!fetchingSources.compareAndSet(false, true)) return;
         try {
             long now = SystemClock.elapsedRealtime();
-            if (lastSourceFetchAt != 0 && now - lastSourceFetchAt < 60_000L) return;
+            if (lastSourceFetchAt != 0 && now - lastSourceFetchAt < (foreground ? 15_000L : 60_000L)) return;
             lastSourceFetchAt = now;
             if (appContext != null) {
                 SharedPreferences prefs = appContext.getSharedPreferences("colgram_sources", Context.MODE_PRIVATE);
@@ -2526,33 +2412,80 @@ public static void reportProxyFailure() {
             }
             final int before = verifiedPool.size();
             fetchSourceFeedsConcurrently();
-            harvestRelays();
             Log.i(TAG, "proxy harvest: " + before + " -> " + verifiedPool.size()
-                    + " Telegram candidates; reachable relays=" + getRelayCount());
+                    + " unverified candidates; HTTPS feeds=" + lastSourceBatch.available.get()
+                    + "/" + lastSourceBatch.total);
             mainHandler.post(() -> {
                 startProber();
                 publishPoolToStock();
-                sweepFast(null);
+                if (!isProxySelectionPending()) sweepFast(null);
             });
+            if (!foreground && ColgramConfig.isAutoProxyEnabled()
+                    && harvestingRelays.compareAndSet(false, true)) {
+                executor.execute(() -> {
+                    try {
+                        if (ColgramConfig.isAutoProxyEnabled()) harvestRelays();
+                    } finally {
+                        harvestingRelays.set(false);
+                    }
+                });
+            }
         } finally {
             fetchingSources.set(false);
         }
     }
 
-    /** Downloads and parses every feed concurrently, then returns before the reachability sweep. */
+    private static final class SourceBatch {
+        final int total;
+        final java.util.concurrent.atomic.AtomicInteger available = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger finished = new java.util.concurrent.atomic.AtomicInteger();
+
+        SourceBatch(int total) { this.total = total; }
+    }
+
+    private interface SourceParser { void parse(String sourceUrl, String body, int limit); }
+
+    private static Runnable feedTask(SourceBatch batch, String url, int limit, SourceParser parser) {
+        return () -> {
+            try {
+                String body = httpGet(url);
+                if (Thread.currentThread().isInterrupted()) return;
+                batch.available.incrementAndGet();
+                parser.parse(url, body, limit);
+            } catch (IOException failure) {
+                Log.i(TAG, "proxy feed unavailable: " + url + " (" + failure.getClass().getSimpleName()
+                        + ": " + failure.getMessage() + ")");
+            } finally {
+                batch.finished.incrementAndGet();
+            }
+        };
+    }
+
+    /** Start independent providers early and make parsed candidates available without a batch join. */
     private static void fetchSourceFeedsConcurrently() {
+        final List<Integer> links = ColgramProxyPolicy.feedIndices(PROXY_SOURCES_MTPROTO_LINKS.length,
+                MAX_STARTUP_MTPROTO_FEEDS, sourceRound);
+        final List<Integer> json = ColgramProxyPolicy.feedIndices(PROXY_SOURCES_MTPROTO_JSON.length,
+                MAX_STARTUP_JSON_FEEDS, sourceRound);
+        final java.util.LinkedHashSet<Integer> socks = new java.util.LinkedHashSet<>();
+        Collections.addAll(socks, 0, 1, 2);
+        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_SOCKS.length,
+                MAX_STARTUP_SOCKS_FEEDS, sourceRound)) {
+            if (socks.size() >= MAX_STARTUP_SOCKS_FEEDS) break;
+            socks.add(index);
+        }
+        final SourceBatch batch = new SourceBatch(links.size() + json.size() + socks.size());
+        lastSourceBatch = batch;
         final List<Runnable> tasks = new ArrayList<>();
-        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_MTPROTO_LINKS.length, MAX_STARTUP_MTPROTO_FEEDS, sourceRound)) {
-            final String url = PROXY_SOURCES_MTPROTO_LINKS[index];
-            tasks.add(() -> fetchProxiesLinkList(url, 24));
+        int i = 0;
+        for (int index : socks) {
+            tasks.add(feedTask(batch, PROXY_SOURCES_SOCKS[index], 24, ColgramProxyManager::fetchSocksList));
+            if (i < links.size()) tasks.add(feedTask(batch, PROXY_SOURCES_MTPROTO_LINKS[links.get(i)], 24,
+                    ColgramProxyManager::fetchProxiesLinkList));
+            i++;
         }
-        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_MTPROTO_JSON.length, MAX_STARTUP_JSON_FEEDS, sourceRound)) {
-            final String url = PROXY_SOURCES_MTPROTO_JSON[index];
-            tasks.add(() -> fetchProxiesJson(url, 30));
-        }
-        for (int index : ColgramProxyPolicy.feedIndices(PROXY_SOURCES_SOCKS.length, MAX_STARTUP_SOCKS_FEEDS, sourceRound)) {
-            final String url = PROXY_SOURCES_SOCKS[index];
-            tasks.add(() -> fetchSocksList(url, 24));
+        for (int index : json) {
+            tasks.add(feedTask(batch, PROXY_SOURCES_MTPROTO_JSON[index], 30, ColgramProxyManager::fetchProxiesJson));
         }
         runSourceFetchTasks(tasks, "proxy feed");
     }
@@ -2564,8 +2497,9 @@ public static void reportProxyFailure() {
     private static void runSourceFetchTasks(List<Runnable> tasks, String label) {
         if (tasks == null || tasks.isEmpty()) return;
         final CountDownLatch finished = new CountDownLatch(tasks.size());
+        final List<java.util.concurrent.Future<?>> submitted = new ArrayList<>(tasks.size());
         for (final Runnable task : tasks) {
-            sourceFetchers.execute(() -> {
+            submitted.add(sourceFetchers.submit(() -> {
                 try {
                     task.run();
                 } catch (Throwable t) {
@@ -2573,13 +2507,19 @@ public static void reportProxyFailure() {
                 } finally {
                     finished.countDown();
                 }
-            });
+            }));
         }
         try {
-            finished.await();
+            if (!finished.await(SOURCE_BATCH_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                Log.i(TAG, label + " batch deadline: unfinished=" + finished.getCount());
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             Log.w(TAG, label + " batch interrupted");
+        } finally {
+            for (java.util.concurrent.Future<?> future : submitted) {
+                if (!future.isDone()) future.cancel(true);
+            }
         }
     }
 
@@ -2629,6 +2569,12 @@ public static void reportProxyFailure() {
             tasks.add(() -> collectRelayFeed(feed, true, source));
         }
         runSourceFetchTasks(tasks, "relay feed");
+        for (int i = 0; i < foundBySource.size(); i++) {
+            List<ColgramProxyChain.Relay> source = foundBySource.get(i);
+            synchronized (source) {
+                foundBySource.set(i, new ArrayList<>(source));
+            }
+        }
         final List<ColgramProxyChain.Relay> found = new ArrayList<>();
         for (int offset = 0; found.size() < MAX_RELAYS; offset++) {
             boolean foundAtOffset = false;
@@ -2926,8 +2872,9 @@ public static void reportProxyFailure() {
                 int victim = -1;
                 for (int i = 0; i < verifiedPool.size(); i++) {
                     ProxyItem p = verifiedPool.get(i);
-                    if (p.type == item.type && p != currentActiveProxy
-                            && p.failedVerdicts >= MAX_FAILED_VERDICTS) {
+                    if (p.type == item.type && p != currentActiveProxy && !isInternalLoopbackEndpoint(p)
+                            && !p.nativeProbeInFlight.get() && ColgramProxyPolicy.isReplaceable(
+                                    rankingState(p), p.failedVerdicts, MAX_FAILED_VERDICTS)) {
                         victim = i;
                         break;
                     }
@@ -2941,99 +2888,31 @@ public static void reportProxyFailure() {
         return true;
     }
 
-    /** Plain HTTP GET as a string, with the connection always returned. */
-    private static String httpGet(String sourceUrl) throws Exception {
-        // ColgramHttp rather than a bare connection: on a network that drops the source's IP
-        // there is nothing to fetch directly, and a harvest that silently returns nothing is
-        // indistinguishable from an empty list. This one retries through the SOCKS5 relays
-        // already in the pool and names every attempt it made.
-        //
-        // Mirrors matter on the same network: raw.githubusercontent.com is throttled by the
-        // same infrastructure that throttles Telegram, so a feed can be perfectly alive and
-        // still unreadable without a VPN. Each GitHub feed is also tried through a CDN mirror
-        // and a couple of proxying gateways before the source is called dead.
-        List<String> candidates = new ArrayList<>();
-        candidates.add(sourceUrl);
-        candidates.addAll(mirrorUrls(sourceUrl));
-        IOException lastFailure = null;
-        int candidateAttempts = 0;
-        for (String candidate : candidates) {
-            // One canonical endpoint plus one CDN mirror is enough for optional list refreshes.
-            // Walking six gateways per feed multiplied 40+ feeds into hundreds of sockets at
-            // every launch, despite most candidate addresses being stale before their first check.
-            if (candidateAttempts++ >= 2) break;
-            try {
-                ColgramHttp.Response r = ColgramHttp.getFast(candidate);
-                if (r.code >= 200 && r.code < 300 && r.body != null && !r.body.isEmpty()) {
-                    return r.body;
-                }
-                Log.i(TAG, "feed " + candidate + " answered HTTP " + r.code);
-            } catch (IOException failed) {
-                lastFailure = failed;
-            } catch (Throwable t) {
-                Log.w(TAG, "feed " + candidate + " failed: " + t.getMessage());
-            }
+    /** Direct, TLS-verified fetch from an explicitly registered public source, never a proxy gateway. */
+    private static String httpGet(String sourceUrl) throws IOException {
+        java.net.URL url = new java.net.URL(sourceUrl);
+        if (!"https".equals(url.getProtocol()) || url.getUserInfo() != null) {
+            throw new IOException("expected an HTTPS source");
         }
-        if (lastFailure != null) throw lastFailure;
-        return "";
-    }
-
-    /**
-     * Mirror variants for a public feed URL, in try order. jsdelivr serves the same GitHub
-     * content from a CDN that Russian networks do not touch; gitmirror and the gh-proxy
-     * gateways re-serve raw.githubusercontent; github.io pages map to their source repos.
-     */
-    private static List<String> mirrorUrls(String url) {
-        List<String> out = new ArrayList<>();
-        if (url == null) return out;
-        String raw = "raw.githubusercontent.com/";
-        int rawAt = url.indexOf(raw);
-        if (rawAt >= 0) {
-            String rest = url.substring(rawAt + raw.length());
-            int slash1 = rest.indexOf('/');
-            int slash2 = slash1 < 0 ? -1 : rest.indexOf('/', slash1 + 1);
-            if (slash1 > 0 && slash2 > slash1) {
-                String user = rest.substring(0, slash1);
-                String repo = rest.substring(slash1 + 1, slash2);
-                String branchPath = rest.substring(slash2 + 1);
-                int branchEnd = branchPath.indexOf('/');
-                if (branchEnd > 0) {
-                    out.add("https://cdn.jsdelivr.net/gh/" + user + "/" + repo + "@"
-                            + branchPath.substring(0, branchEnd) + "/" + branchPath.substring(branchEnd + 1));
-                }
-                out.add("https://raw.gitmirror.com/" + rest);
-                out.add("https://gh-proxy.com/https://raw.githubusercontent.com/" + rest);
-                out.add("https://ghproxy.net/https://raw.githubusercontent.com/" + rest);
-                out.add("https://ghfast.top/https://raw.githubusercontent.com/" + rest);
-            }
-            return out;
-        }
-        // owner.github.io/repo/path is served from the repo's pages branch; jsdelivr mirrors it.
-        int ioAt = url.indexOf(".github.io/");
-        if (ioAt > 0) {
-            int scheme = url.indexOf("://");
-            String owner = url.substring(scheme > 0 ? scheme + 3 : 0, ioAt);
-            String rest = url.substring(ioAt + ".github.io/".length());
-            int repoEnd = rest.indexOf('/');
-            if (repoEnd > 0) {
-                String repo = rest.substring(0, repoEnd);
-                String path = rest.substring(repoEnd + 1);
-                out.add("https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@main/" + path);
-                out.add("https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@gh-pages/" + path);
-            }
-        }
-        return out;
-    }
-
-    /** t.me/proxy?server=..&port=..&secret=.. and tg://webproxy links, in any parameter order. */
-    private static void fetchProxiesLinkList(String sourceUrl, int limit) {
-        String body = null;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        javax.net.ssl.HttpsURLConnection connection =
+                (javax.net.ssl.HttpsURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
         try {
-            body = httpGet(sourceUrl);
-        } catch (Throwable t) {
-            Log.w(TAG, "link list fetch failed: " + sourceUrl, t);
-            return;
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(SOURCE_IO_TIMEOUT_MS);
+            connection.setReadTimeout(SOURCE_IO_TIMEOUT_MS);
+            connection.setRequestProperty("Accept-Encoding", "identity");
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) throw new IOException("HTTP " + status);
+            if (connection.getContentLengthLong() > SOURCE_MAX_BYTES) throw new IOException("feed exceeds byte budget");
+            return ColgramProxyPolicy.readBounded(connection.getInputStream(), SOURCE_MAX_BYTES, deadline);
+        } finally {
+            connection.disconnect();
         }
+    }
+
+    /** t.me/proxy and tg://socks links, in any parameter order. Web endpoints remain manual. */
+    private static void fetchProxiesLinkList(String sourceUrl, String body, int limit) {
         if (body == null || body.isEmpty()) return;
         int added = 0;
         java.util.regex.Matcher link = Pattern.compile(
@@ -3058,22 +2937,18 @@ public static void reportProxyFailure() {
                 }
                 String secret = ColgramMtprotoSecrets.canonicalHex(m.group(3));
                 if (secret == null) continue;
-                if (addCandidate(new ProxyItem(server, port, secret, 1))) added++;
+                if (addFeedCandidate(new ProxyItem(server, port, secret, 1))) added++;
             }
         }
         Log.i(TAG, "link source " + sourceUrl + " added " + added);
     }
 
-    /** Parse one tg://proxy, tg://webproxy or tg://socks link into a pool candidate. */
+    /** Parse one supported Telegram link into a public pool candidate. */
     private static boolean addedProxyFromLink(String url, String kind) {
         String server = param(url, "server");
         if (server == null || server.isEmpty()) return false;
         server = server.replaceAll("\\.$", "");
-        if (kind.equalsIgnoreCase("webproxy")) {
-            String secret = ColgramMtprotoSecrets.canonicalHex(param(url, "secret"));
-            if (secret == null || !secret.startsWith("dd")) return false;
-            return addCandidate(new ProxyItem(server, 0, secret, 2));
-        }
+        if (kind.equalsIgnoreCase("webproxy")) return false;
         int port;
         try {
             port = Integer.parseInt(param(url, "port"));
@@ -3083,7 +2958,7 @@ public static void reportProxyFailure() {
         String secret = ColgramMtprotoSecrets.canonicalHex(param(url, "secret"));
         boolean socks = kind.equalsIgnoreCase("socks");
         if (!socks && secret == null) return false;
-        return addCandidate(new ProxyItem(server, port, socks ? "" : secret, socks ? 0 : 1));
+        return addFeedCandidate(new ProxyItem(server, port, socks ? "" : secret, socks ? 0 : 1));
     }
 
     private static String param(String url, String name) {
@@ -3097,35 +2972,20 @@ public static void reportProxyFailure() {
         return null;
     }
 
-    /** Public SOCKS5 host:port lists. Telegram's DCs are reachable from the proxy's network, so
-     *  these relay fine even though our own route to them is blackholed. */
-    private static void fetchSocksList(String sourceUrl, int limit) {
-        String body;
-        try {
-            body = httpGet(sourceUrl);
-        } catch (Throwable t) {
-            Log.w(TAG, "socks list fetch failed: " + sourceUrl, t);
-            return;
-        }
+    /** Public SOCKS5 host:port lists are only candidate input, not verified routes. */
+    private static void fetchSocksList(String sourceUrl, String body, int limit) {
         if (body == null || body.isEmpty()) return;
         int added = 0;
         for (String line : body.split("\\r?\\n")) {
             ColgramProxyPolicy.Endpoint endpoint = ColgramProxyPolicy.parseEndpoint(line, "socks5",
                     sourceUrl.contains("/zloi-user/hideip.me/"));
-            if (endpoint != null && addCandidate(new ProxyItem(endpoint.host, endpoint.port, "", 0))) added++;
+            if (endpoint != null && addFeedCandidate(new ProxyItem(endpoint.host, endpoint.port, "", 0))) added++;
             if (added >= limit) break;
         }
         Log.i(TAG, "socks source " + sourceUrl + " added " + added);
     }
 
-    private static void fetchProxiesJson(String sourceUrl, int limit) {
-        String body;
-        try {
-            body = httpGet(sourceUrl);
-        } catch (Throwable t) {
-            Log.w(TAG, "Fetch error from " + sourceUrl, t);
-            return;
-        }
+    private static void fetchProxiesJson(String sourceUrl, String body, int limit) {
         if (body == null || body.isEmpty()) return;
         int added = 0;
         try {
@@ -3138,16 +2998,17 @@ public static void reportProxyFailure() {
                 if (arr == null) throw notBareArray;
             }
             for (int i = 0; i < arr.length() && added < limit; i++) {
-                JSONObject obj = arr.getJSONObject(i);
+                JSONObject obj = arr.optJSONObject(i);
+                if (obj == null) continue;
                 // mtpro.xyz and hookzof use "host"; the dubblebyte/zakky feeds use "server".
                 String server = obj.optString("server", obj.optString("host", ""));
                 int port = obj.optInt("port", 0);
                 String secret = ColgramMtprotoSecrets.canonicalHex(obj.optString("secret", ""));
                 if (server.isEmpty() || port <= 0) continue;
                 if (secret != null) {
-                    if (addCandidate(new ProxyItem(server, port, secret, 1))) added++;
+                    if (addFeedCandidate(new ProxyItem(server, port, secret, 1))) added++;
                 } else if (obj.optString("type", "").equalsIgnoreCase("socks5")) {
-                    if (addCandidate(new ProxyItem(server, port, "", 0))) added++;
+                    if (addFeedCandidate(new ProxyItem(server, port, "", 0))) added++;
                 }
             }
         } catch (Throwable t) {
@@ -3155,6 +3016,12 @@ public static void reportProxyFailure() {
             return;
         }
         Log.i(TAG, "json source " + sourceUrl + " added " + added);
+    }
+
+    private static boolean addFeedCandidate(ProxyItem candidate) {
+        return !Thread.currentThread().isInterrupted()
+                && ColgramProxyPolicy.isPublicHost(candidate.address)
+                && addCandidate(candidate);
     }
 
     /** TCP reachability of a relay, for callers that must pick a transport. */
@@ -3403,6 +3270,8 @@ public static void reportProxyFailure() {
     }
 
     private static final long PROXY_SELECTION_TIMEOUT_MS = 25_000L;
+    private static final int MAX_SELECTION_TCP_CHECKS = 48;
+    private static final int SELECTION_TCP_TIMEOUT_MS = 1_250;
     private static final ColgramOperationGate proxySelectionGate = new ColgramOperationGate();
     private static volatile ProxySelection proxySelection;
     private static volatile String proxySelectionStatus = "";
@@ -3411,17 +3280,33 @@ public static void reportProxyFailure() {
         final long token;
         final long routeEpoch;
         final long deadline;
+        final long network = networkProbeEpoch.get();
+        final long started = SystemClock.elapsedRealtime();
         final ProxyItem requested;
-        final java.util.Set<ProxyItem> attempted = new java.util.HashSet<>();
+        final java.util.Set<ProxyItem> nativeAttempted = new java.util.HashSet<>();
+        final java.util.Set<ProxyItem> guestAttempted = new java.util.HashSet<>();
+        final java.util.Set<ProxyItem> protocolTargets = new java.util.HashSet<>();
+        final java.util.Set<ProxyItem> tcpAttempted = new java.util.HashSet<>();
+        final java.util.Map<ProxyItem, String> tcpReachable = new java.util.HashMap<>();
+        final boolean guestEligible;
         Runnable timeout;
         Runnable tick;
         int inFlight;
+        int tcpFinished;
+        int tcpOpen;
+        int socksAttempted;
+        int socksReady;
+        int protocolAnswered;
+        int guestAttempts;
+        boolean guestPending;
+        String guestResult = "not-started";
 
-        ProxySelection(long token, long routeEpoch, ProxyItem requested) {
+        ProxySelection(long token, long routeEpoch, ProxyItem requested, boolean explicit) {
             this.token = token;
             this.routeEpoch = routeEpoch;
             this.requested = requested;
-            this.deadline = SystemClock.elapsedRealtime() + PROXY_SELECTION_TIMEOUT_MS;
+            this.deadline = started + PROXY_SELECTION_TIMEOUT_MS;
+            this.guestEligible = explicit && explicitPreLogin() && (requested == null || requested.type != 2);
         }
     }
 
@@ -3497,9 +3382,9 @@ public static void reportProxyFailure() {
         // Keep the old saved identity, but release a stale active route while checking.
         disableProxy(ctx);
         setUserProxyDisabled(false);
-        ProxySelection selection = new ProxySelection(proxySelectionGate.begin(), routeEpoch, requested);
+        ProxySelection selection = new ProxySelection(proxySelectionGate.begin(), routeEpoch, requested, explicit);
         proxySelection = selection;
-        proxySelectionStatus = "Проверяю протокол Telegram (до 25 с)";
+        proxySelectionStatus = "Проверяю прокси (до 25 с)";
         selection.timeout = () -> finishProxySelection(selection, null,
                 "Рабочий прокси не найден за 25 с; прокси выключен");
         selection.tick = () -> proxySelectionTick(selection);
@@ -3507,10 +3392,204 @@ public static void reportProxyFailure() {
         notifyProxySettingsChanged();
         if (requested == null) {
             if (verifiedPool.isEmpty()) initVerifiedPool();
-            checkPoolNow();
-            executor.execute(ColgramProxyManager::fetchAndVerifyAllSources);
+            executor.execute(() -> fetchAndVerifyAllSources(true));
         }
         proxySelectionTick(selection);
+    }
+
+    private static boolean isDirectSelectionCandidate(ProxyItem item) {
+        // Explicit public mode never introduces a secondary relay or a process-local front.
+        return !isInternalLoopbackEndpoint(item) && item.chainRelay == null
+                && item.chainPort == 0 && !item.mimicActive;
+    }
+
+    private static final class SelectionTcpResult {
+        final String address;
+        final int rtt;
+        final boolean ready;
+
+        SelectionTcpResult(String address, int rtt, boolean ready) {
+            this.address = address;
+            this.rtt = rtt;
+            this.ready = ready;
+        }
+    }
+
+    private static int remainingSelectionTcp(long started) {
+        return (int) Math.max(0, SELECTION_TCP_TIMEOUT_MS - (SystemClock.elapsedRealtime() - started));
+    }
+
+    private static SelectionTcpResult probePublicCandidateTcp(ProxyItem candidate) {
+        final long started = SystemClock.elapsedRealtime();
+        SelectionTcpResult reachable = null;
+        try {
+            for (java.net.InetAddress address : java.net.InetAddress.getAllByName(candidate.address)) {
+                int remaining = remainingSelectionTcp(started);
+                if (remaining <= 0) break;
+                if (!ColgramProxyPolicy.isPublicAddress(address)) continue;
+                try (Socket socket = new Socket(java.net.Proxy.NO_PROXY)) {
+                    socket.connect(new InetSocketAddress(address, candidate.port), remaining);
+                    String numeric = address.getHostAddress();
+                    int rtt = (int) (SystemClock.elapsedRealtime() - started);
+                    if (candidate.type != 0) return new SelectionTcpResult(numeric, rtt, true);
+                    reachable = new SelectionTcpResult(numeric, rtt, false);
+                    // A public SOCKS5 feed supplies no credentials. Only accept a no-auth greeting.
+                    // This is a transport filter, not proof that Telegram is reachable.
+                    if (remainingSelectionTcp(started) <= 0) break;
+                    socket.getOutputStream().write(new byte[]{5, 1, 0});
+                    int version = readSelectionSocksByte(socket, started);
+                    int method = readSelectionSocksByte(socket, started);
+                    if (version == 5 && method == 0) return new SelectionTcpResult(numeric, rtt, true);
+                } catch (IOException ignored) { }
+            }
+        } catch (IOException | SecurityException ignored) { }
+        return reachable;
+    }
+
+    private static int readSelectionSocksByte(Socket socket, long started) throws IOException {
+        int remaining = remainingSelectionTcp(started);
+        if (remaining <= 0) throw new IOException("SOCKS5 greeting deadline");
+        socket.setSoTimeout(remaining);
+        return ColgramSocks5Codec.readByte(socket.getInputStream());
+    }
+
+    /** Main-thread budget. This path takes newly downloaded candidates without waiting for other feeds. */
+    private static void scheduleSelectionTcp(ProxySelection selection, List<ProxyItem> candidates) {
+        if (selection.requested != null) return;
+        final long now = SystemClock.elapsedRealtime();
+        final List<ProxyItem> direct = new ArrayList<>();
+        for (ProxyItem item : candidates) {
+            if (item.type == 2 || !isDirectSelectionCandidate(item)
+                    || item.nextEligibleAt > now || selection.tcpAttempted.contains(item)) continue;
+            direct.add(item);
+        }
+        // Reserve slots for fresh feed rows even if old endpoints refuse immediately.
+        int budget = now - selection.started < 4_000L ? SELECTION_TCP_PARALLEL * 2 : MAX_SELECTION_TCP_CHECKS;
+        // Alternate transports so one large SOCKS feed cannot occupy the full window.
+        while (!direct.isEmpty() && selection.tcpAttempted.size() < budget
+                && selectionTcpSlots.tryAcquire()) {
+            int preferredType = selection.tcpAttempted.size() % 2;
+            int index = 0;
+            for (int i = 0; i < direct.size(); i++) {
+                if (direct.get(i).type == preferredType) {
+                    index = i;
+                    break;
+                }
+            }
+            ProxyItem candidate = direct.remove(index);
+            selection.tcpAttempted.add(candidate);
+            selectionTcpWorkers.execute(() -> {
+                SelectionTcpResult result = null;
+                try {
+                    if (selectionIsCurrent(selection) && selection.network == networkProbeEpoch.get()) {
+                        result = probePublicCandidateTcp(candidate);
+                    }
+                } finally {
+                    final SelectionTcpResult measured = result;
+                    selectionTcpSlots.release();
+                    mainHandler.post(() -> {
+                        if (!selectionIsCurrent(selection) || selection.network != networkProbeEpoch.get()) return;
+                        selection.tcpFinished++;
+                        if (measured != null) {
+                            selection.tcpOpen++;
+                            if (candidate.type == 0) {
+                                selection.socksAttempted++;
+                                if (measured.ready) selection.socksReady++;
+                            }
+                            if (measured.ready) selection.tcpReachable.put(candidate, measured.address);
+                        }
+                        candidate.tcpMs = measured != null && measured.ready ? measured.rtt : -2;
+                        candidate.tcpCheckedAt = SystemClock.elapsedRealtime();
+                        proxySelectionTick(selection);
+                    });
+                }
+            });
+        }
+    }
+
+    private static boolean explicitPreLogin() {
+        if (tgnetConnectionState() == TG_STATE_CONNECTED) return false;
+        try {
+            Class<?> userConfig = Class.forName("org.telegram.messenger.UserConfig");
+            Object count = userConfig.getMethod("getActivatedAccountsCount").invoke(null);
+            return count instanceof Integer && ((Integer) count) == 0;
+        } catch (ReflectiveOperationException ignored) {
+            return false;
+        }
+    }
+
+    private static void onSelectionProtocolResult(ProxySelection selection, ProxyItem source,
+                                                  ProxyItem candidate, boolean alive) {
+        if (!selectionIsCurrent(selection) || selection.network != networkProbeEpoch.get()) return;
+        ProxyItem proven = candidate;
+        if (alive) {
+            selection.protocolAnswered++;
+            if (candidate != source) {
+                // The proved public address is the one saved/applied, not a later DNS answer.
+                rememberHarvested(candidate.address, candidate.port);
+                synchronized (verifiedPool) {
+                    int index = verifiedPool.indexOf(source);
+                    ProxyItem existing = findPoolCandidate(candidate);
+                    if (existing != null && isDirectSelectionCandidate(existing)
+                            && !existing.nativeProbeInFlight.get()) {
+                        existing.pingMs = candidate.pingMs;
+                        existing.tcpMs = candidate.tcpMs;
+                        existing.tcpCheckedAt = candidate.tcpCheckedAt;
+                        existing.verifiedEndpoint = candidate.verifiedEndpoint;
+                        proven = existing;
+                    }
+                    if (index >= 0) {
+                        if (existing == proven) verifiedPool.remove(index);
+                        else if (existing == null) verifiedPool.set(index, candidate);
+                    }
+                }
+            }
+            onVerdict(proven, true);
+        } else {
+            onVerdict(source, false);
+        }
+        if (alive && isPubliclySelectable(proven)) {
+            finishProxySelection(selection, proven, "");
+        } else if (selection.requested != null && selection.inFlight == 0) {
+            finishProxySelection(selection, null, "Прокси не прошёл проверку Telegram; сохранён, но выключен");
+        } else proxySelectionTick(selection);
+    }
+
+    private static boolean startGuestSelectionProbe(ProxySelection selection, ProxyItem source, ProxyItem candidate) {
+        if (!selection.guestEligible || selection.guestPending || selection.guestAttempts >= 2
+                || selection.guestAttempted.contains(candidate)
+                || selection.deadline - SystemClock.elapsedRealtime() < ColgramGuestProxyProbe.CHECK_TIMEOUT_MS
+                || candidate.type == 2) return false;
+        final String endpoint = probeEndpoint(candidate);
+        boolean started = ColgramGuestProxyProbe.check(appContext, candidate.address, candidate.port,
+                candidate.user, candidate.password, candidate.secret, selection.requested == null,
+                (time, reason) -> mainHandler.post(() -> {
+                    if (!selectionIsCurrent(selection) || selection.network != networkProbeEpoch.get()) return;
+                    selection.inFlight--;
+                    selection.guestPending = false;
+                    boolean alive = time >= 0 && endpoint.equals(probeEndpoint(candidate));
+                    selection.guestResult = alive ? "verified" : "not-verified";
+                    if (alive) {
+                        candidate.pingMs = (int) Math.min(Integer.MAX_VALUE, time);
+                        candidate.verifiedEndpoint = endpoint;
+                    }
+                    onSelectionProtocolResult(selection, source, candidate, alive);
+                }));
+        if (started) {
+            selection.guestPending = true;
+            selection.guestAttempts++;
+            selection.guestAttempted.add(candidate);
+            selection.guestResult = "pending";
+        }
+        return started;
+    }
+
+    private static String selectionProgress(ProxySelection selection) {
+        SourceBatch batch = lastSourceBatch;
+        String https = batch == null ? "—" : batch.available.get() + "/" + batch.total;
+        String tcp = selection.requested != null ? "—" : selection.tcpOpen + "/" + selection.tcpFinished;
+        return (selection.requested != null ? "" : "Источники: " + https + " · TCP: " + tcp + " · ")
+                + "Telegram: " + selection.protocolAnswered + "/" + selection.protocolTargets.size();
     }
 
     private static void proxySelectionTick(ProxySelection selection) {
@@ -3523,39 +3602,51 @@ public static void reportProxyFailure() {
             selection.timeout.run();
             return;
         }
+        if (selection.network != networkProbeEpoch.get()) {
+            finishProxySelection(selection, null, "Сеть изменилась во время проверки; прокси выключен");
+            return;
+        }
         List<ProxyItem> candidates = selection.requested == null
                 ? new ArrayList<>(verifiedPool) : new ArrayList<>(Collections.singletonList(selection.requested));
         sortCandidates(candidates);
+        scheduleSelectionTcp(selection, candidates);
         for (ProxyItem candidate : candidates) {
-            // A public-list selection is a direct proxy choice, not permission for hidden
-            // third-party relay fallback. A manual loopback is process-local and not restorable.
-            if (isInternalLoopbackEndpoint(candidate) || candidate.chainRelay != null
-                    || candidate.chainPort > 0 || candidate.mimicActive) continue;
+            if (!isDirectSelectionCandidate(candidate)) continue;
             if (isPubliclySelectable(candidate)) {
                 finishProxySelection(selection, candidate, "");
                 return;
             }
-            if (selection.inFlight >= FAST_NATIVE_PARALLEL) break;
-            if (selection.attempted.contains(candidate) || candidate.nativeProbeInFlight.get()
-                    || candidate.nextEligibleAt > SystemClock.elapsedRealtime()) continue;
-            if (selection.requested == null && candidate.tcpMs < 0) continue;
-            boolean started = checkOne(candidate, alive -> {
-                selection.inFlight--;
-                if (!selectionIsCurrent(selection)) return;
-                onVerdict(candidate, alive);
-                if (alive && isPubliclySelectable(candidate)) {
-                    finishProxySelection(selection, candidate, "");
-                } else if (selection.requested != null) {
-                    finishProxySelection(selection, null,
-                            "Прокси не прошёл проверку Telegram; сохранён, но выключен");
-                } else proxySelectionTick(selection);
-            });
+            if (selection.inFlight >= FAST_NATIVE_PARALLEL) continue;
+            if (candidate.nextEligibleAt > SystemClock.elapsedRealtime()) continue;
+            String pinnedAddress = selection.tcpReachable.get(candidate);
+            if (selection.requested == null && pinnedAddress == null) continue;
+            final ProxyItem target;
+            if (pinnedAddress != null && !pinnedAddress.equals(candidate.address)) {
+                target = new ProxyItem(pinnedAddress, candidate.port, candidate.secret, candidate.type,
+                        candidate.user, candidate.password);
+                target.tcpMs = candidate.tcpMs;
+                target.tcpCheckedAt = candidate.tcpCheckedAt;
+            } else {
+                target = candidate;
+            }
+            boolean started = startGuestSelectionProbe(selection, candidate, target);
+            // Fresh unauthenticated clients have no temporary DC key for native ping.
+            // Running a keyless ping in parallel only delays/poisons the isolated verdict.
+            if (!started && !selection.guestEligible && !selection.nativeAttempted.contains(target)
+                    && !selection.guestAttempted.contains(target) && !candidate.nativeProbeInFlight.get()) {
+                started = checkOne(target, alive -> {
+                    selection.inFlight--;
+                    onSelectionProtocolResult(selection, candidate, target, alive);
+                });
+                if (started) selection.nativeAttempted.add(target);
+            }
             if (started) {
-                selection.attempted.add(candidate);
+                selection.protocolTargets.add(target);
                 selection.inFlight++;
             }
         }
         if (selectionIsCurrent(selection)) {
+            proxySelectionStatus = "Проверяю прокси: " + selectionProgress(selection);
             mainHandler.postDelayed(selection.tick, 250L);
         }
     }
@@ -3574,9 +3665,17 @@ public static void reportProxyFailure() {
                     setUserProxyDisabled(true);
                 }
             } else {
-                proxySelectionStatus = failure;
+                proxySelectionStatus = failure + ". " + selectionProgress(selection);
                 setUserProxyDisabled(true);
             }
+            SourceBatch batch = lastSourceBatch;
+            Log.i(TAG, "PROXY_DIAG outcome=" + (currentActiveProxy == chosen && chosen != null ? "enabled" : "disabled")
+                    + " sources=" + (batch == null ? "0/0" : batch.available.get() + "/" + batch.total)
+                    + " sourceFinished=" + (batch == null ? 0 : batch.finished.get())
+                    + " tcp=" + selection.tcpOpen + "/" + selection.tcpFinished
+                    + " socks=" + selection.socksReady + "/" + selection.socksAttempted
+                    + " telegram=" + selection.protocolAnswered + "/" + selection.protocolTargets.size()
+                    + " guest=" + selection.guestResult + "/" + selection.guestAttempts);
             proxySelectionGate.finish(selection.token);
             mainHandler.removeCallbacks(selection.timeout);
             mainHandler.removeCallbacks(selection.tick);
@@ -3584,6 +3683,7 @@ public static void reportProxyFailure() {
             notifyProxySettingsChanged();
             toast(proxySelectionStatus);
             startFastNativeChecks();
+            if (selection.requested == null && ColgramConfig.isBuiltinProxyEnabled()) sweepFast(null);
         });
     }
 
@@ -3774,9 +3874,11 @@ public static void reportProxyFailure() {
         final long routeEpoch = ColgramRouteEpoch.snapshot();
         ColgramConfig.setDpiBypassEnabled(enabled);
         if (!enabled) {
-            ColgramDpiBypass.stop();
             ProxyItem active = currentActiveProxy;
-            if (active != null && active.isLocalDpi()) {
+            // stop() resets activePort to the default, which would hide an ephemeral route.
+            boolean wasLocal = active != null && active.isLocalDpi();
+            ColgramDpiBypass.stop();
+            if (wasLocal) {
                 disableProxy(context);
                 setUserProxyDisabled(true);
             }

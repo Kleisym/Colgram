@@ -98,23 +98,30 @@ public final class ColgramProxyPolicy {
         return value;
     }
 
-    private static boolean isPublicHost(String host) {
+    public static boolean isPublicHost(String host) {
+        host = normalizeHost(host);
+        if (host == null) return false;
         if (host.indexOf(':') >= 0 || host.matches("[0-9.]+")) {
             try {
-                InetAddress address = InetAddress.getByName(host);
-                if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isLinkLocalAddress()
-                        || address.isSiteLocalAddress() || address.isMulticastAddress()) return false;
-                byte[] bytes = address.getAddress();
-                if (bytes.length == 16) return (bytes[0] & 0xfe) != 0xfc;
-                int a = bytes[0] & 255, b = bytes[1] & 255;
-                return a != 0 && a < 224 && !(a == 100 && b >= 64 && b <= 127)
-                        && !(a == 198 && (b == 18 || b == 19));
+                return isPublicAddress(InetAddress.getByName(host));
             } catch (Exception malformed) {
                 return false;
             }
         }
         return host.contains(".") && !host.equals("localhost") && !host.endsWith(".localhost")
                 && !host.endsWith(".local") && !host.endsWith(".internal");
+    }
+
+    public static boolean isPublicAddress(InetAddress address) {
+        if (address == null || address.isAnyLocalAddress() || address.isLoopbackAddress()
+                || address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isMulticastAddress()) {
+            return false;
+        }
+        byte[] bytes = address.getAddress();
+        if (bytes.length == 16) return (bytes[0] & 0xe0) == 0x20;
+        int a = bytes[0] & 255, b = bytes[1] & 255;
+        return a != 0 && a < 224 && !(a == 100 && b >= 64 && b <= 127)
+                && !(a == 198 && (b == 18 || b == 19));
     }
 
     public static final class State {
@@ -168,6 +175,12 @@ public final class ColgramProxyPolicy {
                 && checkedAt <= now && maximumAge > 0 && now - checkedAt < maximumAge;
     }
 
+    /** TCP-dead slots must rotate even when they never consumed a native check slot. */
+    public static boolean isReplaceable(State state, int protocolFailures, int failureThreshold) {
+        return state != null && !state.available
+                && (state.tcp == -2 || protocolFailures >= failureThreshold);
+    }
+
     /** A bounded rotating window makes later feeds reachable without fetching every source. */
     public static List<Integer> feedIndices(int count, int budget, int round) {
         List<Integer> indices = new ArrayList<>();
@@ -184,14 +197,20 @@ public final class ColgramProxyPolicy {
 
     /** Caps bytes before decoding, including a hostile response with no newline. */
     public static String readBounded(InputStream input, int maximumBytes) throws IOException {
+        return readBounded(input, maximumBytes, System.nanoTime() + 10_000_000_000L);
+    }
+
+    static String readBounded(InputStream input, int maximumBytes, long deadlineNanos) throws IOException {
         if (input == null) return "";
         if (maximumBytes < 0) throw new IllegalArgumentException("negative response budget");
         try (InputStream stream = input; ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[4096];
-            long deadline = System.nanoTime() + 10_000_000_000L;
-            int count;
-            while ((count = stream.read(buffer)) != -1) {
-                if (System.nanoTime() > deadline) throw new IOException("feed read exceeded 10 seconds");
+            for (;;) {
+                if (Thread.currentThread().isInterrupted() || System.nanoTime() - deadlineNanos >= 0)
+                    throw new IOException("feed read deadline exceeded");
+                int count = stream.read(buffer);
+                if (System.nanoTime() - deadlineNanos >= 0) throw new IOException("feed read deadline exceeded");
+                if (count == -1) break;
                 if (count == 0) throw new IOException("feed stream made no progress");
                 if (count > maximumBytes - output.size()) throw new IOException("feed exceeds " + maximumBytes + " bytes");
                 output.write(buffer, 0, count);

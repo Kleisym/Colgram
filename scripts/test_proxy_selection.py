@@ -30,6 +30,38 @@ class ProxySelectionTest(unittest.TestCase):
         self.assertIn("selectPublicProxy(Context context)", self.source)
         self.assertIn("selectionIsCurrent", self.source)
 
+    def test_public_selection_screens_new_feeds_independently(self):
+        selection = method(self.source, "private static void selectUserProxyForEpoch(", "private static void finishProxySelection(")
+        self.assertIn("scheduleSelectionTcp(selection, candidates)", selection)
+        self.assertNotIn("checkPoolNow()", selection, "explicit selection still depends on the background sweep")
+        self.assertIn("selection.tcpReachable.get(candidate)", selection)
+        self.assertIn("onSelectionProtocolResult(selection, candidate, target, alive)", selection)
+        self.assertIn("new ProxyItem(pinnedAddress", selection)
+        self.assertIn("readSelectionSocksByte", selection)
+        self.assertIn("version == 5 && method == 0", selection)
+        self.assertIn("if (!started && !selection.guestEligible", selection,
+                      "native ping without an authenticated DC key competes with the isolated verdict")
+
+    def test_public_feeds_do_not_wait_for_relay_discovery(self):
+        refresh = method(self.source, "private static void fetchAndVerifyAllSources(boolean foreground)", "private static void fetchSourceFeedsConcurrently(")
+        self.assertLess(refresh.index("sweepFast(null)"), refresh.index("harvestRelays()"))
+        self.assertIn("finished.await(SOURCE_BATCH_TIMEOUT_MS, TimeUnit.MILLISECONDS)", self.source)
+        self.assertIn("https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt", self.source)
+        self.assertIn("https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt", self.source)
+        direct_fetch = method(self.source, "private static String httpGet(", "private static void fetchProxiesLinkList(")
+        self.assertIn("openConnection(java.net.Proxy.NO_PROXY)", direct_fetch)
+        self.assertIn("setInstanceFollowRedirects(false)", direct_fetch)
+        self.assertNotIn("ColgramHttp.getFast", direct_fetch)
+
+    def test_selection_distinguishes_transport_from_protocol(self):
+        for label in ("TCP: ", "Telegram: ", "Источники: ", "PROXY_DIAG "):
+            self.assertTrue(label in self.source, f"missing diagnosis label {label}")
+
+    def test_public_feeds_can_replace_tcp_dead_unverified_entries(self):
+        add = method(self.source, "private static boolean addCandidate(", "private static String httpGet(")
+        self.assertIn("ColgramProxyPolicy.isReplaceable", add)
+        self.assertIn("!p.nativeProbeInFlight.get()", add)
+
     def test_manual_socks_credentials_survive_apply(self):
         self.assertIn('.putString("proxy_user", proxy.user)', self.source)
         self.assertIn('.putString("proxy_pass", proxy.password)', self.source)
@@ -55,9 +87,21 @@ class ProxySelectionTest(unittest.TestCase):
                            "proxy_enabled is persisted before the route API succeeds")
 
     def test_restore_never_chooses_pool_head(self):
-        restore = method(self.source, "private static void activateBuiltinProxyNow()", "// Optional source discovery")
+        restore = method(self.source, "private static void activateBuiltinProxyNow(long startupEpoch)", "// Optional source discovery")
         self.assertNotIn("forceApplyProxy(first)", restore)
         self.assertIn("selectUserProxyForEpoch", restore)
+
+    def test_local_route_restore_is_independent_of_catalog_and_pinned_to_startup_epoch(self):
+        restore = method(self.source, "private static void activateBuiltinProxyNow(long startupEpoch)", "// Optional source discovery")
+        self.assertIn("ColgramRouteEpoch.runIfCurrent(startupEpoch", restore)
+        self.assertIn("setDpiBypassEnabled(", restore)
+        self.assertNotIn("isDirectDcReachable", restore)
+        self.assertLess(restore.index("setDpiBypassEnabled("), restore.index("isBuiltinProxyEnabled()"))
+
+    def test_dpi_identity_is_captured_before_listener_is_reset(self):
+        setter = method(self.source, "public static void setDpiBypassEnabled(Context context, boolean enabled)",
+                        "public static void recheckBypassListener()")
+        self.assertLess(setter.index("active.isLocalDpi()"), setter.index("ColgramDpiBypass.stop()"))
 
     def test_no_candidate_rotation_releases_dead_route(self):
         rotation = method(self.source, "void switchToNextProxy(boolean force)", "private static ProxyItem findLocalDpiProxy")

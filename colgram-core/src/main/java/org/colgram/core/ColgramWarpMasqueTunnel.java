@@ -54,25 +54,9 @@ public final class ColgramWarpMasqueTunnel {
     private static final String KEY_WARP_ON = "warp_on";
     private static final String KEY_LAST_RUN_AT = "last_run_at";
 
-    /**
-     * How long one attempt may take end to end: registration, the carrier search, and one response.
-     *
-     * <p>This covers the whole search rather than one route, and that is a measured change. The
-     * client rotates Cloudflare's five ingresses on every port, and on a network that filters UDP it
-     * tries a TCP carrier first for each one - about five seconds per candidate. Seventy-five seconds
-     * therefore expired partway through the FIRST address, and the device log shows exactly that:
-     *
-     * <pre>
-     * 05:35:34  tcp/h2 to 162.159.198.2:443   failed: h2 read: i/o timeout
-     * 05:35:39  edge 162.159.198.2:443        failed: quic dial: timeout
-     * ...
-     * 05:36:42  run finished: 1 tests, 1 failed
-     * </pre>
-     *
-     * Four ports of one address, then the run ended - the four ingresses that answer TCP were never
-     * dialled. The budget now fits the search it is timing.
-     */
-    private static final long ATTEMPT_TIMEOUT_MS = 180_000L;
+    // Native limits enrolment to 14 s, carrier setup to 16 s, and trace
+    // verification to 12 s. Leave room for service dispatch, then stop the attempt.
+    private static final long ATTEMPT_TIMEOUT_MS = 45_000L;
 
     /**
      * The SOCKS5 front the tunnel's UDP leaves through, host:port, or null for the device's own
@@ -91,6 +75,7 @@ private static volatile String udpRelay;
     private static final ColgramWarpState serviceState = new ColgramWarpState();
     private static volatile Context serviceContext;
     private static volatile String lastFailure;
+    private static volatile String startupStage;
     private static volatile Map<String, String> lastTrace = Collections.emptyMap();
 
     private ColgramWarpMasqueTunnel() {}
@@ -101,6 +86,11 @@ private static volatile String udpRelay;
 
     public static String failure() {
         return lastFailure;
+    }
+
+    /** Latest actual startup phase, or null when no attempt is in progress. */
+    public static String startupStage() {
+        return startupStage;
     }
 
     /** The last trace Cloudflare returned, so the UI can show what the edge actually saw. */
@@ -213,17 +203,25 @@ private static volatile String udpRelay;
         final long attempt = serviceState.begin();
         up = false;
         lastFailure = null;
+        startupStage = "Запуск сервиса";
         final CountDownLatch done = new CountDownLatch(1);
         android.os.ResultReceiver callback = new android.os.ResultReceiver(null) {
             @Override protected void onReceiveResult(int code, android.os.Bundle data) {
                 if (!serviceState.accept(attempt, code, android.os.SystemClock.elapsedRealtime())) return;
-                if (code == ColgramWarpState.UP) {
+                if (code == ColgramWarpState.STARTING) {
+                    String stage = data == null ? null : data.getString("stage");
+                    if ("enrolling".equals(stage)) startupStage = "Регистрация в Cloudflare";
+                    else if ("dialing".equals(stage)) startupStage = "Подключение к шлюзу Cloudflare";
+                    else if ("trace".equals(stage)) startupStage = "Проверка трафика WARP";
+                } else if (code == ColgramWarpState.UP) {
+                    startupStage = null;
                     String text = data == null ? null : data.getString("trace");
                     lastTrace = Collections.unmodifiableMap(ColgramMasqueNative.parseTrace(text == null ? "" : text));
                     up = true;
                     persist(serviceContext, lastTrace, true);
                     done.countDown();
                 } else if (code == ColgramWarpState.FAILED || code == ColgramWarpState.STOPPED) {
+                    startupStage = null;
                     up = false;
                     if (code == ColgramWarpState.FAILED) lastFailure = data == null ? "WARP остановлен" : data.getString("error");
                     persist(serviceContext, lastTrace, false);
@@ -241,7 +239,10 @@ private static volatile String udpRelay;
             long deadline = android.os.SystemClock.elapsedRealtime() + ATTEMPT_TIMEOUT_MS;
             while (!done.await(250L, TimeUnit.MILLISECONDS)) {
                 if (!serviceState.isCurrent(attempt) || !ColgramRouteEpoch.isCurrent(routeEpoch)) throw new InterruptedException("Запуск WARP отменён");
-                if (android.os.SystemClock.elapsedRealtime() >= deadline) throw new IllegalStateException("Превышено время подключения WARP");
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                    String phase = startupStage;
+                    throw new IllegalStateException((phase == null ? "Запуск WARP" : phase) + " — время ожидания истекло");
+                }
             }
             if (!serviceState.isCurrent(attempt) || !isUp()) throw new IllegalStateException(lastFailure == null ? "WARP не подключён" : lastFailure);
         } catch (Exception error) {
@@ -256,6 +257,7 @@ private static volatile String udpRelay;
     /** Invalidates late callbacks immediately; native teardown stays in the service process. */
     public static void cancelPendingStart() {
         serviceState.stop();
+        startupStage = null;
         up = false;
         Context ctx = serviceContext;
         if (ctx != null) {

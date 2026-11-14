@@ -60,9 +60,17 @@ public final class ColgramCallProxyDeviceTest {
     }
 
     @Test
-    public void legacyOffMigratesAndExplicitPickerWins() throws Exception {
-        prefs.edit().remove(MODE).putBoolean(LEGACY, false).commit();
-        assertTrue("DIRECT".equals(currentMode().toString()));
+    public void legacyDirectMigratesWithoutExposingDirectAndExplicitPickerWins() throws Exception {
+        prefs.edit().putString(MODE, "DIRECT").putBoolean(LEGACY, false).commit();
+        Object mode = currentMode();
+        assertTrue("CURRENT".equals(mode.toString()));
+        for (Object candidate : mode.getClass().getEnumConstants()) {
+            assertFalse("Old Direct must not appear in the picker", "DIRECT".equals(candidate.toString()));
+        }
+        Method gate = routes.getMethod("verdict", Context.class, mode.getClass());
+        Object verdict = gate.invoke(null, context, mode);
+        assertFalse("Without an Android VPN the old Direct choice is not allowed",
+                verdict.getClass().getField("allowed").getBoolean(verdict));
         prefs.edit().putString(MODE, "WARP").commit();
         assertTrue("WARP".equals(currentMode().toString()));
     }

@@ -5,8 +5,7 @@ import java.util.Locale;
 /** Decides whether a call may use the selected route without falling back to another one. */
 public final class ColgramCallRoutePolicy {
     public enum Mode {
-        CURRENT("Текущее подключение"),
-        DIRECT("Напрямую"),
+        CURRENT("Активный Android VPN"),
         LOCAL_DPI("Локальный обход"),
         SOCKS5("Прокси SOCKS5"),
         WARP("Cloudflare WARP"),
@@ -48,8 +47,8 @@ public final class ColgramCallRoutePolicy {
     public static Mode fromPreference(String saved) {
         if (saved == null) return Mode.CURRENT;
         String name = saved.trim().toUpperCase(Locale.ROOT);
-        if ("TRUE".equals(name)) return Mode.CURRENT;
-        if ("FALSE".equals(name)) return Mode.DIRECT;
+        // "DIRECT" and the old on/off values all migrate to CURRENT. That
+        // option requires a real active VPN; it is not a direct fallback.
         try {
             return Mode.valueOf(name);
         } catch (IllegalArgumentException ignored) {
@@ -57,17 +56,12 @@ public final class ColgramCallRoutePolicy {
         }
     }
 
-    /** Preserve the old explicit opt-out when the route picker has never been used. */
-    public static Mode fromPreference(String saved, boolean legacyProxyForCalls) {
-        return saved == null && !legacyProxyForCalls ? Mode.DIRECT : fromPreference(saved);
-    }
-
     /** Tunnel flags must describe verified/established runtime state, not requested preferences. */
     public static Decision evaluate(Mode mode, boolean androidVpn, boolean warpVerified,
                                     boolean subscriptionTun, boolean socksTun, boolean dpiTun) {
-        if (mode == null || mode == Mode.CURRENT) return ALLOWED;
-        if (mode == Mode.DIRECT) {
-            return androidVpn ? denied("Отключите активный Android VPN для прямого звонка.") : ALLOWED;
+        if (mode == null || mode == Mode.CURRENT) {
+            return androidVpn ? ALLOWED : denied(
+                    "Android VPN не подключён. Выберите маршрут в меню «Использовать для звонков».");
         }
 
         int ownedTunnels = (warpVerified ? 1 : 0) + (subscriptionTun ? 1 : 0)

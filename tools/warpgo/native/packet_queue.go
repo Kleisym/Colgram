@@ -113,6 +113,15 @@ func (p *sessionProgressRecord) text() string {
 	return p.stage + " (" + p.detail + ")"
 }
 
+func (p *sessionProgressRecord) failure() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stage == "failed" {
+		return p.detail
+	}
+	return ""
+}
+
 func (o *nativeSessionOwner) claim(token int64, closePrevious func()) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
