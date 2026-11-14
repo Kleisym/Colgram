@@ -564,7 +564,10 @@ public class ColgramProxyManager {
 
     /** tgnet's ConnectionStateConnected, from org.telegram.tgnet.ConnectionsManager. */
     private static final int TG_STATE_CONNECTED = 3;
+    private static final int TG_STATE_WAITING_FOR_NETWORK = 2;
+    private static final int TG_STATE_UPDATING = 5;
     private static int watchdogUnconnectedTicks = 0;
+    private static int localBaseUnconnectedTicks = 0;
 
     /**
      * Ticks on which the applied node passed every protocol check and still carried nothing.
@@ -611,7 +614,28 @@ public class ColgramProxyManager {
 
     private static void connectionWatchdogTick() {
         Context ctx = appContext;
-        if (ctx == null || !ColgramConfig.isBuiltinProxyEnabled() || ColgramConfig.isWarpEnabled()) return;
+        if (ctx == null || ColgramConfig.isWarpEnabled()) return;
+        int state = tgnetConnectionState();
+        ProxyItem applied = currentActiveProxy;
+        if (applied != null && applied.isLocalDpi()) {
+            // The permanent listener is not an external proxy. Do not treat local TCP accept
+            // as success or try to rotate it away. Recover signed DC settings independently
+            // of the catalog, without changing the chosen route or using a public relay.
+            if (hasSystemVpn(ctx) || !ColgramUiBridge.isAppInForeground() || state < 0
+                    || state == TG_STATE_CONNECTED || state == TG_STATE_UPDATING
+                    || state == TG_STATE_WAITING_FOR_NETWORK) {
+                localBaseUnconnectedTicks = 0;
+                return;
+            }
+            if (++localBaseUnconnectedTicks >= 3) {
+                localBaseUnconnectedTicks = 0;
+                requestFreshDcAddresses("local base stalled");
+                if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
+            }
+            return;
+        }
+        localBaseUnconnectedTicks = 0;
+        if (!ColgramConfig.isBuiltinProxyEnabled()) return;
         // The remap deliberately does not write Telegram's proxy prefs (its port dies with the
         // process), so isProxyEnabled() cannot be the only test for "something is carrying
         // connections". Reading it alone meant the watchdog quit on the first tick while the remap
@@ -639,9 +663,7 @@ public class ColgramProxyManager {
             return;
         }
         directUnconnectedTicks = 0;
-        int state = tgnetConnectionState();
         if (state < 0) return;                        // no accessor: nothing to judge
-        ProxyItem applied = currentActiveProxy;
         boolean endpointProvenDead = applied != null
                 && (applied.nativeFailures >= 2 || applied.failedVerdicts >= 2);
         if (state == TG_STATE_CONNECTED && !endpointProvenDead) {
@@ -713,8 +735,7 @@ public class ColgramProxyManager {
             autoConnectIfBlocked();
             return;
         }
-        boolean reachable = active.isLocalDpi()
-                || probeTcp(active.effectiveHost(), active.effectivePort(), 2500) >= 0;
+        boolean reachable = probeTcp(active.effectiveHost(), active.effectivePort(), 2500) >= 0;
         if (!reachable) {
             Log.i(TAG, "applied proxy " + active.address + ":" + active.port
                     + " stopped answering while disconnected; rotating");
@@ -727,22 +748,40 @@ public class ColgramProxyManager {
             tgnetCheckConnection();
             return;
         }
-        if (active.isLocalDpi() && !ColgramConfig.isAutoProxyEnabled()) {
-            Log.i(TAG, "local DPI route is stalled; automatic public-proxy fallback is disabled");
-            watchdogRedials = 0;
-            return;
-        }
         Log.i(TAG, "applied proxy " + active.address + ":" + active.port
                 + " answers but carries nothing; rotating to another node");
         watchdogRedials = 0;
         switchToNextProxy(true);
     }
 
-    /** Telegram's own connection state for the main account, or -1 when unavailable. */
+    private static boolean hasSystemVpn(Context context) {
+        try {
+            ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
+            if (manager == null) return true; // Don't reclassify an unknown route as direct.
+            Network network = manager.getActiveNetwork();
+            android.net.NetworkCapabilities capabilities =
+                    network == null ? null : manager.getNetworkCapabilities(network);
+            return capabilities == null
+                    || capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN);
+        } catch (RuntimeException unavailable) {
+            return true;
+        }
+    }
+
+    private static int selectedAccountSlot() {
+        try {
+            int account = Class.forName("org.telegram.messenger.UserConfig").getField("selectedAccount").getInt(null);
+            return account >= 0 && account < colgramAccountSlots ? account : 0;
+        } catch (ReflectiveOperationException unavailable) {
+            return 0;
+        }
+    }
+
+    /** Telegram's own connection state for the selected account, or -1 when unavailable. */
     private static int tgnetConnectionState() {
         try {
             Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Object inst = cm.getMethod("getInstance", int.class).invoke(null, 0);
+            Object inst = cm.getMethod("getInstance", int.class).invoke(null, selectedAccountSlot());
             Object state = cm.getMethod("getConnectionState").invoke(inst);
             return state instanceof Integer ? (Integer) state : -1;
         } catch (Throwable t) {
@@ -767,7 +806,7 @@ public class ColgramProxyManager {
         }
     }
 
-    private static long lastFreshAddressesAt = 0L;
+    private static long lastFreshAddressesAt = -FRESH_ADDRESSES_INTERVAL_MS;
 
     /**
      * Ask Telegram for its current server addresses, through Telegram's own mechanism.
@@ -783,16 +822,16 @@ public class ColgramProxyManager {
      * Rate limited: each call kicks off a network fetch and a reconnect, and doing that every
      * watchdog tick is a storm, not a retry.
      */
-    private static void requestFreshDcAddresses(String reason) {
-        long now = System.currentTimeMillis();
+    private static synchronized void requestFreshDcAddresses(String reason) {
+        long now = SystemClock.elapsedRealtime();
         if (now - lastFreshAddressesAt < FRESH_ADDRESSES_INTERVAL_MS) return;
         lastFreshAddressesAt = now;
         try {
             Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            // The upstream Google task owns fallback to the Mozilla task. Dispatching both
+            // callbacks simultaneously only races Telegram's single currentTask slot.
             cm.getMethod("onRequestNewServerIpAndPort", int.class, int.class)
-                    .invoke(null, 0, 0);
-            cm.getMethod("onRequestNewServerIpAndPort", int.class, int.class)
-                    .invoke(null, 2, 0);
+                    .invoke(null, 0, selectedAccountSlot());
             Log.i(TAG, "asked Telegram for its current server addresses (" + reason + ")");
         } catch (Throwable t) {
             Log.w(TAG, "could not ask Telegram for fresh addresses: " + t);
@@ -4231,6 +4270,12 @@ public static void reportProxyFailure() {
             int ping = testProxy("127.0.0.1", ColgramDpiBypass.activePort(), 3000);
             Log.i(TAG, "desync listener re-check: bound=" + ColgramDpiBypass.isBound()
                     + ", ping=" + ping + "ms");
+            Context context = appContext;
+            ProxyItem active = currentActiveProxy;
+            if (context != null && active != null && active.isLocalDpi() && !hasSystemVpn(context)
+                    && !ColgramConfig.isWarpEnabled() && tgnetConnectionState() != TG_STATE_CONNECTED) {
+                requestFreshDcAddresses("local base recheck");
+            }
         });
     }
 

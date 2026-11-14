@@ -53,6 +53,14 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertEqual(voip, (root / VOIP).read_text(encoding="utf-8"), "second application changed call wiring")
             return proxy, voip
 
+    def test_source_status_row_opens_per_feed_diagnostics(self):
+        for original in (self.pristine, self.existing):
+            proxy, _ = self.transformed(original)
+            click = proxy.split("listView.setOnItemClickListener((view, position) -> {", 1)[1]
+            self.assertIn("position == colgramBackgroundProxyRow) {\n                colgramShowSourceDiagnostics();", click)
+            self.assertIn("position == colgramBackgroundProxyRow ||", method(proxy, "public boolean isEnabled("))
+            self.assertIn("getSourceDiagnostics()", method(proxy, "private void colgramShowSourceDiagnostics()"))
+
     def test_tap_sets_real_desired_state_before_async_start(self):
         for original in (self.pristine, self.existing):
             with self.subTest(pristine=original is self.pristine):

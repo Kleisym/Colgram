@@ -100,6 +100,15 @@
         refreshWarpState();
     }
 
+    private void colgramShowSourceDiagnostics() {
+        if (getParentActivity() == null) return;
+        AlertDialog.Builder details = new AlertDialog.Builder(getParentActivity(), getResourceProvider());
+        details.setTitle(ColgramSubscriptionControls.label("Источники прокси", "Proxy Sources"));
+        details.setMessage(org.colgram.core.ColgramProxyManager.getSourceDiagnostics());
+        details.setPositiveButton(ColgramSubscriptionControls.label("Закрыть", "Close"), null);
+        showDialog(details.create());
+    }
+
     private boolean warpRequested(long token) {
         return token >= 0 && warpOperationsGate.isCurrent(token)
                 && org.colgram.core.ColgramRouteEpoch.isCurrent(warpRouteEpoch)

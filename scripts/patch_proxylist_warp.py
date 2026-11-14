@@ -155,11 +155,28 @@ def replace_section(source, start, end, replacement):
     return source[:begin] + replacement + source[finish:]
 
 
+def add_connection_source_details(s):
+    """Make the catalog summary open a read-only list of per-feed verdicts."""
+    marker = "                colgramShowSourceDiagnostics();"
+    click = "            } else if (position == colgramDpiRow) {\n                colgramToggleDpi();"
+    enabled = "            return position == colgramDpiRow || position == colgramSubscriptionImportRow"
+    if marker not in s:
+        for anchor in (click, enabled):
+            if s.count(anchor) != 1:
+                raise ValueError("Connection source details anchor is missing or ambiguous")
+        s = s.replace(click, "            } else if (position == colgramBackgroundProxyRow) {\n"
+                      + marker + "\n" + click, 1)
+        s = s.replace(enabled, enabled.replace("return position", "return position == colgramBackgroundProxyRow || position"), 1)
+    return s.replace("cell.setText(org.colgram.core.ColgramProxyManager.getBackgroundProxyStatus());",
+                     'cell.setText(org.colgram.core.ColgramProxyManager.getBackgroundProxyStatus() + " · "'
+                     '\n                                + ColgramSubscriptionControls.label("Подробнее", "Details"));', 1)
+
+
 def add_connection_settings(s):
     """Add the route-specific rows without forking the Telegram proxy editor."""
     marker = "// COLGRAM_CONNECTION_SETTINGS = 1"
     if marker in s:
-        return s
+        return add_connection_source_details(s)
 
     def replace(old, new):
         nonlocal s
@@ -272,7 +289,7 @@ def add_connection_settings(s):
                     || position == colgramSubscriptionToggleRow || position == colgramSubscriptionRemoveRow) {
                 return VIEW_TYPE_TEXT_SETTING;
             } else if (position == useProxyRow || position == rotationRow || position == warpRow || position == colgramDpiRow) {''')
-    return s
+    return add_connection_source_details(s)
 
 
 def copy_subscription_controls(proxy_source):

@@ -37,6 +37,16 @@ class AlwaysOnBaseTest(unittest.TestCase):
   self.assertGreaterEqual(ttl,value('BACKGROUND_PROXY_CHECK_WINDOW_MS')+value('BACKGROUND_PROXY_READY_MS')+value('BACKGROUND_PROXY_POSITIVE_RECHECK_MS')+10000)
   due=s.split('private static void sortCatalogProbeOrder(',1)[1].split('private static void backgroundProxyTick',1)[0]
   self.assertTrue('candidate.nativeVerified && candidate.lastCheckAt > 0' in due)
+ def test_stalled_base_refreshes_telegram_owned_addresses_without_replacing_the_route(self):
+  s=(CORE/'ColgramProxyManager.java').read_text(encoding='utf-8')
+  watchdog=s.split('private static void connectionWatchdogTick()',1)[1].split('private static int tgnetConnectionState()',1)[0]
+  self.assertIn('if (applied != null && applied.isLocalDpi())',watchdog)
+  local=watchdog.split('if (applied != null && applied.isLocalDpi())',1)[1].split('boolean endpointProvenDead',1)[0]
+  self.assertIn('requestFreshDcAddresses("local base stalled")',local)
+  self.assertNotIn('switchToNextProxy(',local)
+  self.assertIn('hasSystemVpn(ctx)',local)
+  self.assertNotIn('!ColgramConfig.isBuiltinProxyEnabled()',watchdog.split('if (applied != null && applied.isLocalDpi())',1)[0])
+  self.assertNotIn('!ColgramConfig.isBuiltinProxyEnabled()',local.split('localBaseUnconnectedTicks = 0;\n        if',1)[0])
  def test_fixture_flushes_catalog_restore_before_instrumentation_exits(self):
   s=(ROOT/'scripts/templates/ColgramControlledProxyDeviceTest.java').read_text(encoding='utf-8')
   f=s.split('finally {',1)[1]
