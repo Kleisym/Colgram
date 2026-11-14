@@ -6,9 +6,8 @@
 # (go:cgo_ldflag), because the NDK clang wrappers already carry both. So each ABI pins CC to its
 # wrapper and passes only the JDK include path, which nothing supplies on its own.
 #
-# The JNI bridge in jni_bridge.c is compiled as part of the build because it lives in this package.
-# jniinc/linux must precede the JDK's include/win32 on the include path: the win32 jni_md.h defines
-# JNICALL as __stdcall, which the NDK targets do not have, and every bridge function warns about it.
+# Use the Android JNI ABI even when the host JDK supplies only a Windows jni_md.h.
+# The architecture-independent JNI declarations still come from JDK_INCLUDE.
 #
 # Windows host: run through Git Bash or WSL. The Go toolchain, GOPATH and GOCACHE come from the
 # environment; NDK_ROOT must point at an unpacked NDK.
@@ -40,7 +39,7 @@ for entry in $ABIS; do
   echo "building $abi ($goarch) with $prefix"
   GOOS=android GOARCH="$goarch" CGO_ENABLED=1 \
   CC="$CC" \
-  CGO_CFLAGS="--sysroot=$SYSROOT -I${PWD}/jniinc/linux -I${PWD}/jniinc/win32 -I$JDK_INCLUDE" \
+  CGO_CFLAGS="--sysroot=$SYSROOT -I${PWD}/jniinc/android -I$JDK_INCLUDE" \
   CGO_LDFLAGS="" \
     go build -buildmode=c-shared -o "out_$abi.so" .
 done

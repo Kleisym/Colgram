@@ -46,32 +46,47 @@ public final class ColgramIntroSlidesDeviceTest {
         int oldOrientation = activity.getRequestedOrientation();
         try {
             for (int orientation : new int[]{ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE}) {
-                AtomicReference<Object> screen = new AtomicReference<>();
                 onMain(() -> {
-                    Object intro = load("org.telegram.ui.IntroActivity").getConstructor().newInstance();
-                    activity.getClass().getMethod("presentFragment", load("org.telegram.ui.ActionBar.BaseFragment"), boolean.class, boolean.class)
-                            .invoke(activity, intro, true, true);
-                    screen.set(intro);
+                    if (findArt(activity.getWindow().getDecorView()) == null) {
+                        Object intro = load("org.telegram.ui.IntroActivity").getConstructor().newInstance();
+                        activity.getClass().getMethod("presentFragment", load("org.telegram.ui.ActionBar.BaseFragment"), boolean.class, boolean.class)
+                                .invoke(activity, intro, true, true);
+                    }
                     activity.setRequestedOrientation(orientation);
                 });
                 Thread.sleep(1200);
+                // The tablet host may finish assigning its layer/window bounds after rotation.
+                onMain(() -> activity.setRequestedOrientation(orientation));
+                long layoutDeadline = SystemClock.elapsedRealtime() + 8_000L;
+                AtomicReference<Boolean> ready = new AtomicReference<>(false);
+                while (!ready.get() && SystemClock.elapsedRealtime() < layoutDeadline) {
+                    onMain(() -> {
+                        View art = findArt(activity.getWindow().getDecorView());
+                        int expected = orientation == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                ? android.content.res.Configuration.ORIENTATION_PORTRAIT
+                                : android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+                        ready.set(art != null && art.isShown() && art.getWidth() > 0
+                                && art.getResources().getConfiguration().orientation == expected);
+                    });
+                    if (!ready.get()) Thread.sleep(100);
+                }
                 AtomicReference<View> artRef = new AtomicReference<>();
                 AtomicReference<Object> pagerRef = new AtomicReference<>();
                 onMain(() -> {
-                    View root = (View) screen.get().getClass().getMethod("getFragmentView").invoke(screen.get());
-                    assertNotNull(root);
-                    View art = root.findViewWithTag("colgram_intro_art");
+                    View art = findArt(activity.getWindow().getDecorView());
                     assertNotNull("Custom art did not attach", art);
                     assertEquals("org.telegram.ui.ColgramIntroArtView", art.getClass().getName());
-                    assertTrue(art.isShown());
+                    assertTrue("Custom art isn't visible after rotation to " + orientation, ready.get());
                     assertTrue(art.getWidth() > 0 && art.getHeight() > 0);
+                    View parent = (View) art.getParent();
+                    View root = (View) parent.getParent();
                     assertFalse("An unused EGL/TextureView renderer remains attached", hasTextureView(root));
                     assertNotNull("Shield disappeared", root.findViewWithTag("colgram_network_menu"));
                     art.getClass().getMethod("setMotionEnabled", boolean.class).invoke(art, false);
                     artRef.set(art);
-                    Field field = screen.get().getClass().getDeclaredField("viewPager");
-                    field.setAccessible(true);
-                    pagerRef.set(field.get(screen.get()));
+                    Object pager = findPager(root);
+                    assertNotNull("Welcome pager is absent", pager);
+                    pagerRef.set(pager);
                 });
                 View art = artRef.get();
                 Object pager = pagerRef.get();
@@ -158,6 +173,33 @@ public final class ColgramIntroSlidesDeviceTest {
 
     private Class<?> load(String name) throws ClassNotFoundException {
         return Class.forName(name, true, context.getClassLoader());
+    }
+
+    private static View findArt(View view) {
+        if (!view.isShown()) return null;
+        if ("colgram_intro_art".equals(view.getTag())) return view;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = group.getChildCount() - 1; i >= 0; i--) {
+                View art = findArt(group.getChildAt(i));
+                if (art != null) return art;
+            }
+        }
+        return null;
+    }
+
+    private static Object findPager(View view) {
+        for (Class<?> type = view.getClass(); type != null; type = type.getSuperclass()) {
+            if ("androidx.viewpager.widget.ViewPager".equals(type.getName())) return view;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                Object pager = findPager(group.getChildAt(i));
+                if (pager != null) return pager;
+            }
+        }
+        return null;
     }
 
     private static boolean hasTextureView(View view) {

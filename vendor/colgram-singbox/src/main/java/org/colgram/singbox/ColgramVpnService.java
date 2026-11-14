@@ -38,10 +38,12 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     private static long controlGeneration;
     private static String controlProfile;
     private static String controlState = "stopped";
+    private static AppProfile pendingAppProfile;
 
     private CommandServer server;
     private ColgramPlatformInterface platform;
     private String profilePath;
+    private AppProfile appProfile;
     private long generation = -1L;
     private volatile boolean tunEstablished;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -50,8 +52,34 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         return profilePath != null && profilePath.equals(controlProfile) ? controlState : "stopped";
     }
 
+    public static synchronized String status(String profilePath, long generation) {
+        return generation == controlGeneration ? status(profilePath) : "stopped";
+    }
+
+    /**
+     * Credentials and listener state travel only through this process, not a profile file
+     * or Intent extra. The reservation must never displace an existing owned tunnel.
+     */
+    public static synchronized long startAppProfile(Context context, String profileId, String json,
+            java.util.function.Consumer<VpnService> attach, Runnable close) {
+        if (!"colgram-call-socks".equals(profileId) && !"colgram-call-dpi".equals(profileId)) {
+            throw new IllegalArgumentException("Unknown app-only VPN profile");
+        }
+        if (json == null || json.isEmpty()) throw new IllegalArgumentException("Missing VPN profile");
+        if (!"stopped".equals(controlState) && !"failed".equals(controlState)) {
+            throw new IllegalStateException("Another Colgram VPN profile is active");
+        }
+        return requestStart(context, profileId, new AppProfile(json, attach, close));
+    }
+
     public static synchronized void start(Context context, String profilePath) {
         if (profilePath == null || profilePath.isEmpty()) throw new IllegalArgumentException("Missing VPN profile");
+        requestStart(context, profilePath, null);
+    }
+
+    private static long requestStart(Context context, String profilePath, AppProfile profile) {
+        if (pendingAppProfile != null) pendingAppProfile.close();
+        pendingAppProfile = profile;
         Intent intent = new Intent(context, ColgramVpnService.class);
         intent.setAction(ACTION_START);
         intent.putExtra("profile", profilePath);
@@ -63,18 +91,47 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             else context.startService(intent);
         } catch (RuntimeException failure) {
             controlState = "failed";
+            if (pendingAppProfile != null) {
+                pendingAppProfile.close();
+                pendingAppProfile = null;
+            }
             throw failure;
         }
+        return controlGeneration;
     }
 
     public static synchronized void stop(Context context) {
         ++controlGeneration;
         controlState = "stopping";
+        if (pendingAppProfile != null) {
+            pendingAppProfile.close();
+            pendingAppProfile = null;
+        }
         if (!context.stopService(new Intent(context, ColgramVpnService.class))) controlState = "stopped";
     }
 
     public static synchronized void stopProfile(Context context, String profilePath) {
         if (profilePath != null && profilePath.equals(controlProfile)) stop(context);
+    }
+
+    public static synchronized void stopProfile(Context context, String profilePath, long generation) {
+        if (generation == controlGeneration) stopProfile(context, profilePath);
+    }
+
+    private static final class AppProfile {
+        final String json;
+        final java.util.function.Consumer<VpnService> attach;
+        final Runnable cleanup;
+
+        AppProfile(String json, java.util.function.Consumer<VpnService> attach, Runnable cleanup) {
+            this.json = json;
+            this.attach = attach;
+            this.cleanup = cleanup;
+        }
+
+        void close() {
+            if (cleanup != null) cleanup.run();
+        }
     }
 
     private boolean ownsControl() {
@@ -118,8 +175,11 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
                 if (server == null) stopSelf(startId);
                 return START_NOT_STICKY;
             }
+            if (appProfile != null) appProfile.close();
             generation = requestedGeneration;
             profilePath = path;
+            appProfile = pendingAppProfile;
+            pendingAppProfile = null;
         }
         startProfile(startId);
         // Only an explicit current profile request starts this service; never resurrect an
@@ -129,6 +189,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     private void startProfile(int startId) {
         try {
+            if (appProfile != null && appProfile.attach != null) appProfile.attach.accept(this);
             bringUp();
             if (!ownsControl()) {
                 releaseResources();
@@ -198,7 +259,8 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         // anyway, because the flag is set by the caller. Measured on the device against the real
         // engine, on every single start.
         tunEstablished = false;
-        server.startOrReloadService(readProfile(profilePath), new io.nekohasekai.libbox.OverrideOptions());
+        String config = appProfile == null ? readProfile(profilePath) : appProfile.json;
+        server.startOrReloadService(config, new io.nekohasekai.libbox.OverrideOptions());
     }
 
     /**
@@ -319,6 +381,10 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             platform.closeTun();
             platform = null;
         }
+        if (appProfile != null) {
+            appProfile.close();
+            appProfile = null;
+        }
         stopForeground(true);
     }
 
@@ -346,8 +412,9 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     @Override
     public ParcelFileDescriptor open(TunOptions options) {
         if (options == null || !ownsControl()) return null;
+        final boolean appOnly = appProfile != null;
         Builder builder = new Builder();
-        builder.setSession("Colgram");
+        builder.setSession(appOnly ? "Colgram · звонки" : "Colgram");
         builder.setMtu(options.getMTU() > 0 ? options.getMTU() : 9000);
         builder.setBlocking(false);
 
@@ -414,13 +481,15 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         for (String server : drainStrings(options.getDNSServerAddress())) {
             if (server != null && !server.isEmpty()) builder.addDnsServer(server);
         }
-        for (String name : drainStrings(options.getExcludePackage())) {
-            applyPackage(builder, name, false);
-        }
-        for (String name : drainStrings(options.getIncludePackage())) {
-            applyPackage(builder, name, true);
-        }
         try {
+            if (appOnly) {
+                // Refuse startup if Android does not accept the scope; never fail open
+                // into a whole-device VPN or trust includes from the JSON.
+                builder.addAllowedApplication(getPackageName());
+            } else {
+                for (String name : drainStrings(options.getExcludePackage())) applyPackage(builder, name, false);
+                for (String name : drainStrings(options.getIncludePackage())) applyPackage(builder, name, true);
+            }
             ParcelFileDescriptor descriptor = builder.establish();
             if (descriptor == null) {
                 Log.e(TAG, "establish() returned no descriptor");

@@ -254,6 +254,39 @@ def upgrade_functional_controls(s):
     return s
 
 
+def upgrade_call_route_picker(s):
+    """Replace the v5 calls switch and remove the detour into general settings."""
+    marker = "// COLGRAM_CALL_ROUTE_PICKER = 1"
+    if marker in s:
+        return s
+    s = replace_section(s, "            } else if (position == callsRow) {",
+                        "            } else if (position == warpRow) {", '''            } else if (position == callsRow) {
+                // COLGRAM_CALL_ROUTE_PICKER = 1
+                ColgramCallRoutes.showPicker(getParentActivity(), () -> listAdapter.notifyItemChanged(callsRow));
+''')
+    s = s.replace("        networkModesRow = rowCount++;\n", "")
+    s = s.replace("    private int networkModesRow = -1;\n", "")
+    s = s.replace("            } else if (position == networkModesRow) {\n                presentFragment(new ColgramSettingsActivity());\n", "")
+    s = s.replace("return position == networkModesRow || ", "return position == ")
+    s = s.replace("                    if (position == networkModesRow) {\n                        textCell.setText(\"Режим подключения · Direct / DPI / VPN\", true);\n                    } else if (position == proxyAddRow) {", '''                    if (position == callsRow) {
+                        textCell.setTextAndValue("Использовать для звонков", ColgramCallRoutes.summary(), true);
+                    } else if (position == proxyAddRow) {''')
+    s = s.replace("            } else if (position == networkModesRow) {\n                return -16;\n", "")
+    s = s.replace("position == networkModesRow || position == proxyAddRow", "position == callsRow || position == proxyAddRow")
+    s = s.replace("} else if (position == useProxyRow || position == rotationRow || position == warpRow || position == callsRow)", "} else if (position == useProxyRow || position == rotationRow || position == warpRow)")
+    s = s.replace('''                    } else if (position == callsRow) {
+                        checkCell.setTextAndCheck("Использовать для звонков", callsPreference(), true);
+''', "")
+    s = s.replace('''                } else if (position == callsRow) {
+                    checkCell.setChecked(callsPreference());
+''', "")
+    s = replace_section(s, "                    if (position == callsDetailRow) {",
+                        "                    } else if (position == warpDetailRow) {", '''                    if (position == callsDetailRow) {
+                        cell.setText("Маршрут применяется к новым личным звонкам. Если выбранный маршрут недоступен, звонок не уйдёт по другому.");
+''')
+    return s
+
+
 def apply(repo_path):
     p = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
                      "org", "telegram", "ui", "ProxyListActivity.java")
@@ -261,8 +294,20 @@ def apply(repo_path):
         print(" [!] ProxyListActivity.java not found")
         return
     s = Path(p).read_text(encoding="utf-8", errors="ignore")
+    # Refresh only the generated helper block when its template is updated.
+    if PATCH_VERSION in s:
+        template = (Path(__file__).parent / "templates/ProxyListWarpControls.java.inc").read_text(encoding="utf-8")
+        updated = replace_section(s, "    // ---- Colgram WARP helpers", "    private int connectionsHeaderRow;", template + "\n")
+        if "// COLGRAM_CALL_ROUTE_PICKER = 1" in updated:
+            updated = updated.replace("    private int networkModesRow = -1;\n", "")
+        updated = upgrade_call_route_picker(updated)
+        if updated != s:
+            Path(p).write_text(updated, encoding="utf-8", newline="\n")
+        apply_call_proxy_defaults(repo_path)
+        apply_voip_call_proxy(repo_path)
+        return
     if MARKER in s:
-        upgraded = upgrade_generated(s)
+        upgraded = upgrade_call_route_picker(upgrade_generated(s))
         if upgraded != s:
             Path(p).write_text(upgraded, encoding="utf-8", newline="\n")
             print(" [+] Updated ProxyListActivity WARP state handling")
@@ -571,7 +616,7 @@ def apply(repo_path):
     }"""
     must_replace(anchor_fields_end, helpers, "helpers")
 
-    s = upgrade_generated(s)
+    s = upgrade_call_route_picker(upgrade_generated(s))
     Path(p).write_text(s, encoding="utf-8", newline="\n")
     print(" [+] ProxyListActivity: calls row unconditional + WARP toggle (" + str(n_edits) + " edits)")
     apply_call_proxy_defaults(repo_path)
@@ -601,39 +646,21 @@ def apply_call_proxy_defaults(repo_path):
 
 
 def apply_voip_call_proxy(repo_path):
-    """Restore Telegram's private-call SOCKS5 argument, never pass an MTProto/Web proxy as SOCKS."""
-    path = Path(repo_path) / "TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java"
-    if not path.is_file():
-        return
-    source = path.read_text(encoding="utf-8")
-    if "private Instance.Proxy colgramCallProxy()" in source:
-        return
-    old = "persistentStateFilePath, endpoints, null, getNetworkType()"
-    if source.count(old) != 1:
-        raise AssertionError("private call proxy argument anchor missing or ambiguous")
-    helper = '''
-
-    private Instance.Proxy colgramCallProxy() {
-        if (!MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled_calls", true)) return null;
-        // A VPN routes at the OS layer. This argument is only a SOCKS5 transport for private calls.
-        if (org.colgram.core.ColgramConfig.isWarpEnabled()) return null;
-        org.colgram.core.ColgramProxyManager.ProxyItem active =
-                org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
-        if (active != null) {
-            if (active.type != 0 || active.isLocalDpi()) return null;
-            return new Instance.Proxy(active.effectiveHost(), active.effectivePort(), active.user, active.password);
-        }
-        if (!MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled", false)
-                || SharedConfig.currentProxy == null) return null;
-        org.telegram.utils.proxy.ProxySettings settings = SharedConfig.currentProxy.settings;
-        if (settings.getType() != org.telegram.utils.proxy.ProxySettings.Type.SOCKS5) return null;
-        return new Instance.Proxy(settings.getAddress(), settings.getPort(), settings.getUser(), settings.getPassword());
-    }
-'''
-    closing = source.rfind("}")
-    source = source[:closing] + helper + source[closing:]
-    source = source.replace(old, "persistentStateFilePath, endpoints, colgramCallProxy(), getNetworkType()", 1)
-    path.write_text(source, encoding="utf-8", newline="\n")
+    """Wire actual Android route preflight and fail closed in the private media path."""
+    from call_route_patches import patch_call_activity_result, patch_call_helper, patch_private_call_service
+    prefix = Path(repo_path) / "TMessagesProj/src/main/java/org/telegram"
+    for relative, transform in (
+        ("messenger/voip/VoIPService.java", patch_private_call_service),
+        ("ui/Components/voip/VoIPHelper.java", patch_call_helper),
+        ("ui/LaunchActivity.java", patch_call_activity_result),
+    ):
+        path = prefix / relative
+        if not path.is_file():
+            continue
+        source = path.read_text(encoding="utf-8")
+        updated = transform(source)
+        if updated != source:
+            path.write_text(updated, encoding="utf-8", newline="\n")
 
 
 if __name__ == "__main__":

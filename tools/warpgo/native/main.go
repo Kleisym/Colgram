@@ -67,25 +67,6 @@ const (
 	apiHost = "api.cloudflareclient.com"
 	apiVer  = "v0a4471"
 
-	// apiSNIMask is the name carried in the TLS ClientHello for every request to the enrolment API.
-	//
-	// The filter on this network keys on the SNI extension value and on nothing else, and it applies to
-	// the substring cloudflareclient.com wherever it appears. Measured at the same address, the same
-	// port, in the same run:
-	//
-	//	sni=api.cloudflareclient.com          tls: EOF
-	//	sni=connectivity.cloudflareclient.com  tls: read tcp ... i/o timeout
-	//	sni=cloudflare.com                    tls OK 97ms | HTTP/1.1 403
-	//	sni=cloudflare-dns.com                tls OK 107ms | HTTP/1.1 403
-	//	sni=1.1.1.1                           tls OK | HTTP/1.1 200 {"id":...,"token":...}
-	//
-	// The first two are the filter; the last one is the answer. Cloudflare routes the request on the
-	// HTTP Host header, which still carries apiHost, so the registration lands on the service it was
-	// addressed to while the name on the wire is one the filter allows.
-	//
-	// The certificate is verified against apiSNIMask. A reachable endpoint never
-	// justifies accepting an untrusted certificate.
-	apiSNIMask = "1.1.1.1"
 	edgeIP     = "162.159.198.2"
 	edgeSNI    = "consumer-masque.cloudflareclient.com"
 	// connectAuth is the :authority the edge compares against its URI template. A request naming
@@ -2899,6 +2880,16 @@ func bareCertDER(keyPEM string) []byte {
 	return der
 }
 
+func enrolmentTLSConfig() *tls.Config {
+	// Resolving through DoH changes only the dial address. The certificate
+	// and ClientHello still have to name the host receiving the request.
+	return &tls.Config{
+		ServerName: apiHost,
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	}
+}
+
 func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 	// An enrolment made elsewhere, when one is named.
 	//
@@ -2930,20 +2921,10 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 		return nil, tls.Certificate{}, err
 	}
 
-	// The address is pinned from DoH, so the name has to be carried by SNI and verified explicitly:
-	// a certificate presented for an IP literal cannot be validated at all.
 	client := &http.Client{
 		Timeout: 25 * time.Second,
 		Transport: &http.Transport{
-			// The mask, not apiHost: the filter reads the SNI and drops the connection when it sees
-			// cloudflareclient.com there. The request still names apiHost in its URL and Host header, so
-			// it is routed there. HTTP/1.1 only as well - with the default ALPN the enrolment POST
-			// completes TLS and is then closed before a response byte, which Go reports as a bare EOF.
-			TLSClientConfig: &tls.Config{
-				ServerName:         apiSNIMask,
-				InsecureSkipVerify: false,
-				NextProtos:         []string{"http/1.1"},
-			},
+			TLSClientConfig: enrolmentTLSConfig(),
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				d := net.Dialer{Control: protectSocket}
 				return d.DialContext(ctx, "tcp", net.JoinHostPort(apiIP, "443"))
@@ -2960,7 +2941,8 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 		//   IllegalStateException: register: Post ".../v0a4471/reg": context deadline exceeded
 		//     at ColgramWarpMasqueTunnel.bringUp(ColgramWarpMasqueTunnel.java:247)
 		var lastErr error
-		for attempt := 1; attempt <= 3; attempt++ {
+		const attempts = 3
+		for attempt := 1; attempt <= attempts; attempt++ {
 			req, err := http.NewRequest(method, "https://"+apiHost+path, bytes.NewReader(buf))
 			if err != nil {
 				return nil, err
@@ -2976,7 +2958,10 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 			resp, err := client.Do(req)
 			if err != nil {
 				lastErr = err
-				androidLog(fmt.Sprintf("colgram_masque: %s %s attempt %d/8: %v", method, path, attempt, err))
+				androidLog(fmt.Sprintf("colgram_masque: %s %s attempt %d/%d: %v", method, path, attempt, attempts, err))
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				if fresh, ferr := resolve4(apiHost); ferr == nil {
 					apiIP = fresh
 				}

@@ -244,6 +244,41 @@ public final class ColgramProfileBuilder {
         }
     }
 
+    /** Ephemeral TUN profile. The service additionally enforces the caller package. */
+    public static String forCallSocks(String host, int port, String username, String password) {
+        if (host == null || host.trim().isEmpty() || port < 1 || port > 65535) {
+            throw new IllegalArgumentException("Некорректный адрес SOCKS5");
+        }
+        if ((username == null || username.isEmpty()) != (password == null || password.isEmpty())
+                || (username != null && username.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 255)
+                || (password != null && password.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 255)) {
+            throw new IllegalArgumentException("Некорректные данные авторизации SOCKS5");
+        }
+        try {
+            JSONObject outbound = new JSONObject().put("type", "socks").put("tag", "call-socks")
+                    .put("server", host.trim()).put("server_port", port).put("version", "5");
+            if (username != null && !username.isEmpty()) {
+                outbound.put("username", username).put("password", password);
+            }
+            return new JSONObject()
+                    .put("log", new JSONObject().put("disabled", true))
+                    .put("dns", new JSONObject().put("servers", new JSONArray().put(new JSONObject()
+                            .put("type", "https").put("tag", "call-dns")
+                            .put("server", "1.1.1.1").put("path", "/dns-query")
+                            .put("detour", "call-socks")))
+                            .put("final", "call-dns"))
+                    .put("inbounds", new JSONArray().put(tunInbound().put("mtu", 1400)))
+                    .put("outbounds", new JSONArray().put(outbound))
+                    .put("route", new JSONObject().put("final", "call-socks")
+                            .put("auto_detect_interface", true)
+                            .put("rules", new JSONArray().put(new JSONObject()
+                                    .put("port", 53).put("action", "hijack-dns"))))
+                    .toString();
+        } catch (org.json.JSONException invalid) {
+            throw new IllegalArgumentException("Некорректный профиль SOCKS5");
+        }
+    }
+
     private static JSONArray inbounds() throws Exception {
         JSONArray inbounds = new JSONArray();
         inbounds.put(tunInbound());
@@ -269,7 +304,7 @@ public final class ColgramProfileBuilder {
      * published schema rather than from documentation - this engine version has no route_address
      * key at all, so a profile written against that older shape would be refused by name.
      */
-    private static JSONObject tunInbound() throws Exception {
+    private static JSONObject tunInbound() throws org.json.JSONException {
         return new JSONObject()
                 .put("type", "tun")
                 .put("tag", "tun-in")

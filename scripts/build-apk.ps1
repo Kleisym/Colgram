@@ -4,7 +4,7 @@ param(
     [string]$JavaHome = $env:JAVA_HOME,
     [string]$AndroidSdk = $env:ANDROID_HOME,
     [string]$Output = '',
-    [string]$BuildStamp = 'mumu-routing-20261114'
+    [string]$BuildStamp = 'mumu-call-routes-20261114'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot

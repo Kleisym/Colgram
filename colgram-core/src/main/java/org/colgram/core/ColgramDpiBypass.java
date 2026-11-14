@@ -276,13 +276,124 @@ public class ColgramDpiBypass {
     }
 
     private static void handleClient(Socket client) {
+        handleClient(client, null);
+    }
+
+    /** Separate, authenticated listener: does not change the app-wide bypass preference. */
+    static final class CallListener implements java.io.Closeable {
+        private final ServerSocket listener;
+        private final java.util.Set<Socket> sockets = java.util.Collections.newSetFromMap(
+                new java.util.concurrent.ConcurrentHashMap<Socket, Boolean>());
+        private final java.util.concurrent.Semaphore clients = new java.util.concurrent.Semaphore(32);
+        private final String username;
+        private final String password;
+        private volatile android.net.VpnService vpn;
+        private volatile boolean closed;
+
+        CallListener() throws java.io.IOException {
+            java.security.SecureRandom random = new java.security.SecureRandom();
+            byte[] secret = new byte[24];
+            random.nextBytes(secret);
+            username = "colgram-call";
+            password = android.util.Base64.encodeToString(secret, android.util.Base64.NO_WRAP);
+            java.util.Arrays.fill(secret, (byte) 0);
+            listener = new ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"));
+            workerPool.execute(this::accept);
+        }
+
+        String config() {
+            return ColgramProfileBuilder.forCallSocks("127.0.0.1", listener.getLocalPort(),
+                    username, password);
+        }
+
+        void attach(android.net.VpnService service) {
+            if (closed) throw new IllegalStateException("Local call listener has closed");
+            vpn = service;
+        }
+
+        private void accept() {
+            try {
+                while (!closed) {
+                    Socket client = listener.accept();
+                    if (!clients.tryAcquire()) {
+                        closeQuietly(client);
+                        continue;
+                    }
+                    if (!track(client)) {
+                        clients.release();
+                        continue;
+                    }
+                    workerPool.execute(() -> handleClient(client, this));
+                }
+            } catch (java.io.IOException ignored) {
+                close();
+            }
+        }
+
+        boolean track(Socket socket) {
+            sockets.add(socket);
+            if (!closed) return true;
+            sockets.remove(socket);
+            closeQuietly(socket);
+            return false;
+        }
+
+        void done(Socket client, Socket upstream) {
+            if (sockets.remove(client)) clients.release();
+            if (upstream != null) sockets.remove(upstream);
+        }
+
+        boolean authenticate(InputStream in, OutputStream out) throws java.io.IOException {
+            int version = ColgramSocks5Codec.readByte(in);
+            byte[] user = ColgramSocks5Codec.readFully(in, ColgramSocks5Codec.readByte(in));
+            byte[] pass = ColgramSocks5Codec.readFully(in, ColgramSocks5Codec.readByte(in));
+            boolean valid = version == 1
+                    && java.security.MessageDigest.isEqual(user, username.getBytes(StandardCharsets.UTF_8))
+                    && java.security.MessageDigest.isEqual(pass, password.getBytes(StandardCharsets.UTF_8));
+            java.util.Arrays.fill(pass, (byte) 0);
+            out.write(new byte[]{1, (byte) (valid ? 0 : 1)});
+            out.flush();
+            return valid;
+        }
+
+        Socket connect(String host, int port) {
+            android.net.VpnService owner = vpn;
+            if (owner == null || closed || port <= 0) return null;
+            Socket socket = new Socket();
+            if (!track(socket)) return null;
+            try {
+                // No external relay or network-port substitution on a call route.
+                // Socket creates its underlying fd lazily; set a socket option before protect.
+                socket.setTcpNoDelay(true);
+                if (!owner.protect(socket)) throw new java.io.IOException("Socket protection failed");
+                socket.connect(new InetSocketAddress(host, port), TELEGRAM_DIAL_BUDGET_MS);
+                return socket;
+            } catch (Exception failure) {
+                sockets.remove(socket);
+                closeQuietly(socket);
+                return null;
+            }
+        }
+
+        @Override public synchronized void close() {
+            if (closed) return;
+            closed = true;
+            vpn = null;
+            closeQuietly(listener);
+            for (Socket socket : sockets) closeQuietly(socket);
+            sockets.clear();
+        }
+    }
+
+    private static void handleClient(Socket client, CallListener call) {
         Socket targetSocket = null;
+        boolean handedOff = false;
         try {
             // A connection accepted a moment before stop() is still handed to this worker, and serving
             // it would keep a stopped bypass doing work. The socket is closed rather than left to time
             // out, so what the caller sees after a stop is a refused connection and not a fifteen-second
             // wait.
-            if (!isRunning) {
+            if (call == null ? !isRunning : call.closed || call.vpn == null) {
                 closeQuietly(client);
                 return;
             }
@@ -303,14 +414,15 @@ public class ColgramDpiBypass {
                 return;
             }
             byte[] methods = ColgramSocks5Codec.readFully(in, nmethods);
-            boolean supportsNoAuth = false;
+            int authMethod = call == null ? 0 : 2;
+            boolean supportsAuthMethod = false;
             for (byte method : methods) {
-                if (method == 0) {
-                    supportsNoAuth = true;
+                if (method == authMethod) {
+                    supportsAuthMethod = true;
                     break;
                 }
             }
-            if (!supportsNoAuth) {
+            if (!supportsAuthMethod) {
                 out.write(new byte[]{0x05, (byte) 0xFF});
                 out.flush();
                 closeQuietly(client);
@@ -318,8 +430,9 @@ public class ColgramDpiBypass {
             }
 
             // Reply: NO AUTH REQUIRED
-            out.write(new byte[]{0x05, 0x00});
+            out.write(new byte[]{0x05, (byte) authMethod});
             out.flush();
+            if (call != null && !call.authenticate(in, out)) return;
 
             // 2. SOCKS5 request
             int reqVer = ColgramSocks5Codec.readByte(in);
@@ -384,6 +497,10 @@ public class ColgramDpiBypass {
             // dies after a handshake that looked successful. So the association is answered here,
             // from a socket that actually receives them.
             if (cmd == 3) {
+                if (call != null) {
+                    ColgramCallUdpRelay.serve(call.vpn, client, in, out);
+                    return;
+                }
                 java.net.DatagramSocket udp = new java.net.DatagramSocket(0,
                         InetAddress.getByName("127.0.0.1"));
                 // The zero address means "accept from wherever this control connection came from",
@@ -400,16 +517,18 @@ public class ColgramDpiBypass {
             // Respect any active backoff first: when a full strategy cycle has failed, we
             // deliberately slow new attempts down rather than amplifying Telegram's retry
             // rate into a connection storm.
-            long waitMs = backoffUntil - System.currentTimeMillis();
-            if (waitMs > 0) {
-                sleep(Math.min(waitMs, MAX_BACKOFF_SLEEP_MS));
-            }
-            if (!ColgramDcRemap.shouldSkipDirectAddress(destHost)) {
-                targetSocket = connectWithBackoff(destHost, destPort);
+            if (call != null) {
+                targetSocket = call.connect(destHost, destPort);
             } else {
-                Log.i(TAG, "skipping temporarily silent Telegram address " + destHost + ":" + destPort);
+                long waitMs = backoffUntil - System.currentTimeMillis();
+                if (waitMs > 0) sleep(Math.min(waitMs, MAX_BACKOFF_SLEEP_MS));
+                if (!ColgramDcRemap.shouldSkipDirectAddress(destHost)) {
+                    targetSocket = connectWithBackoff(destHost, destPort);
+                } else {
+                    Log.i(TAG, "skipping temporarily silent Telegram address " + destHost + ":" + destPort);
+                }
             }
-            if (targetSocket == null) {
+            if (call == null && targetSocket == null) {
                 // The DC address tgnet was told about is often the one this network refuses.
                 // Searching for a Telegram address that opens a socket at all is what the
                 // address-remap component already does; desync is only worth trying against a
@@ -421,7 +540,7 @@ public class ColgramDpiBypass {
                     targetSocket = connectWithBackoff(live, destPort);
                 }
             }
-            if (targetSocket == null && ColgramConfig.isAutoProxyEnabled()
+            if (call == null && targetSocket == null && ColgramConfig.isAutoProxyEnabled()
                     && ColgramProxyManager.hasReachableRelays()) {
                 // The listener is a local gateway, not a dead end. Direct dial and remap
                 // alternatives both refused: hand the connection to a reachable relay front.
@@ -466,7 +585,8 @@ public class ColgramDpiBypass {
             // a target has nothing to count, so this separates "the listener is up" from "a
             // connection to Telegram exists behind it".
             relayedConnections.incrementAndGet();
-            pipeWithAdvancedDesync(client, targetSocket);
+            pipeWithAdvancedDesync(client, targetSocket, call);
+            handedOff = true;
 
         } catch (Exception e) {
             // A liveness probe sends a greeting and closes without a request, so the EOF
@@ -478,8 +598,12 @@ public class ColgramDpiBypass {
                 } else {
                     Log.d(TAG, "SOCKS5 session failed: " + e.getMessage());
                 }
-            closeQuietly(client);
-            closeQuietly(targetSocket);
+        } finally {
+            if (!handedOff) {
+                closeQuietly(client);
+                closeQuietly(targetSocket);
+                if (call != null) call.done(client, targetSocket);
+            }
         }
     }
 
@@ -830,7 +954,7 @@ public class ColgramDpiBypass {
      * signatures the TSPU holds for those services, while each real server accepts the rebuilt
      * hello as ordinary TLS.
      */
-    private static void pipeWithAdvancedDesync(final Socket client, final Socket dest) {
+    private static void pipeWithAdvancedDesync(final Socket client, final Socket dest, CallListener call) {
         final int strategy = pickStrategy();
         final boolean mimic = ColgramConfig.isTlsMimicEnabled();
         final java.util.concurrent.atomic.AtomicLong fromTarget =
@@ -849,7 +973,7 @@ public class ColgramDpiBypass {
                     System.arraycopy(more, 0, joined, firstPayload.length, more.length);
                     firstPayload = joined;
                 }
-                if (mimic && ColgramTlsMimic.looksLikeClientHello(firstPayload)) {
+                if (call == null && mimic && ColgramTlsMimic.looksLikeClientHello(firstPayload)) {
                     byte[] rewritten = ColgramTlsMimic.rewrite(firstPayload);
                     java.util.Random rnd = new java.util.Random();
                     for (byte[] segment : ColgramTlsMimic.fragment(rewritten, rnd)) {
@@ -899,7 +1023,7 @@ public class ColgramDpiBypass {
                         cout.write(buffer, 0, len);
                         cout.flush();
                     }
-                } else {
+                } else if (call == null) {
                     Log.w(TAG, "upstream stayed silent (EOF) on " + dest.getRemoteSocketAddress());
                     ColgramDcRemap.reportSilentAddress(
                             dest.getInetAddress().getHostAddress(), dest.getPort());
@@ -907,16 +1031,17 @@ public class ColgramDpiBypass {
             } catch (SocketTimeoutException silent) {
                 Log.w(TAG, "upstream stayed silent for " + FIRST_REPLY_TIMEOUT_MS + "ms on "
                         + dest.getRemoteSocketAddress());
-                ColgramDcRemap.reportSilentAddress(
+                if (call == null) ColgramDcRemap.reportSilentAddress(
                         dest.getInetAddress().getHostAddress(), dest.getPort());
             } catch (Throwable ignored) {
             } finally {
                 closeQuietly(client);
                 closeQuietly(dest);
+                if (call != null) call.done(client, dest);
                 completedRelays.incrementAndGet();
                 // Decide only after the target direction is done, so a slow reply is not
                 // mistaken for a rejection.
-                reportStrategyResult(strategy, fromTarget.get() > 0);
+                if (call == null) reportStrategyResult(strategy, fromTarget.get() > 0);
             }
         });
     }

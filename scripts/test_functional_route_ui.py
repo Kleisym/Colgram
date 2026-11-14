@@ -96,19 +96,19 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertNotIn("SharedConfig.currentProxy = info", node)
         self.assertNotIn("setProxySettings(", node)
 
-    def test_calls_toggle_is_back_and_wired_to_actual_socks_only(self):
+    def test_calls_row_is_a_route_picker_not_a_switch(self):
         proxy, voip = self.transformed()
         self.assertIn("callsRow = rowCount++", proxy)
         self.assertIn("position == callsRow", method(proxy, "public boolean isEnabled("))
         self.assertIn('"Использовать для звонков"', proxy)
-        self.assertIn('putBoolean("proxy_enabled_calls",', proxy)
-        self.assertIn("endpoints, colgramCallProxy(), getNetworkType()", voip)
-        helper = method(voip, "private Instance.Proxy colgramCallProxy()")
-        self.assertIn('getBoolean("proxy_enabled_calls", true)', helper)
-        self.assertIn("ProxySettings.Type.SOCKS5", helper)
-        self.assertIn("new Instance.Proxy(", helper)
-        self.assertIn("active.type != 0", helper)
-        self.assertIn("active.isLocalDpi()", helper)
+        self.assertIn("ColgramCallRoutes.showPicker", proxy)
+        self.assertIn("textCell.setTextAndValue", proxy)
+        self.assertNotIn("networkModesRow", proxy)
+        self.assertNotIn('putBoolean("proxy_enabled_calls",', proxy)
+        self.assertNotIn("colgramCallProxy()", voip)
+        self.assertIn("colgramRequirePrivateCallRoute()", method(voip, "private void initiateActualEncryptedCall()"))
+        self.assertIn("ColgramCallRoutes.prepare", method(voip, "public void acceptIncomingCall()"))
+        self.assertIn("ColgramCallRoutes.release(colgramRouteTicket)", method(voip, "public void onDestroy()"))
 
     def test_subscription_select_writes_selected_node_not_same_auto_group(self):
         source = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramSubscriptionStore.java").read_text(encoding="utf-8")
@@ -130,7 +130,8 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertIn("ColgramSubscriptionStore.nodes(context)", settings)
         self.assertIn("ColgramSubscriptionStore.select(context, which)", settings)
         self.assertIn("startSubscriptionTunnel(context, token)", method(settings, "private void selectSubscriptionNode("))
-        self.assertIn("MTProto / WebSocket не передают звонки", settings)
+        self.assertIn("ColgramCallRoutes.showPicker", settings)
+        self.assertIn("ColgramCallRoutes.summary()", settings)
         for row in ("publicProxyRow", "subscriptionNodeRow", "callsRow"):
             self.assertIn("position == " + row, method(settings, "public boolean isEnabled("))
             self.assertIn("position == " + row, method(settings, "public void onBindViewHolder("))

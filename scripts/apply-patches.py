@@ -2447,7 +2447,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramSettingsActivity.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java"]:
+        for name in ["ColgramSettingsActivity.java", "ColgramCallRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -3227,7 +3227,11 @@ def inject_hooks(repo_path):
         ("tgnet/ConnectionsManager.java", patch_proxy_startup, "COLGRAM_PROXY_STARTUP_VALIDATE"),
     ):
         source_path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", *relative.split("/"))
-        patch_file(source_path, transformer, marker, marker)
+        def proxy_entry_updater(content, transform=transformer):
+            updated = transform(content)
+            return updated if updated != content else CONVERGED
+
+        patch_file(source_path, proxy_entry_updater, None, marker)
 
     proxy_list_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProxyListActivity.java")
     if os.path.exists(proxy_list_file):

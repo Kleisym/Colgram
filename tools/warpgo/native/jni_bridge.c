@@ -48,11 +48,19 @@
  * and read afterwards. They are cached in local statics rather than looked up per line: this is
  * called from the dial path, and FindClass there can allocate.
  */
+#ifdef __ANDROID__
 #include <android/log.h>
+#else
+#include <stdio.h>
+#endif
 
 void colgram_masque_emit(const char *line) {
     if (line != NULL) {
+#ifdef __ANDROID__
         __android_log_print(ANDROID_LOG_INFO, "ColgramMasque", "%s", line);
+#else
+        fprintf(stderr, "ColgramMasque: %s\n", line);
+#endif
     }
 }
 

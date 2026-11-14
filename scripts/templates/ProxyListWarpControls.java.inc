@@ -10,6 +10,10 @@
     private int callsRow = -1;
     private int callsDetailRow = -1;
     private int networkModesRow = -1;
+    private String colgramLastProxyStatus;
+    private String colgramLastWarpStatus;
+    private boolean colgramLastProxyPending;
+    private boolean colgramLastWarpDesired;
     private final android.os.Handler colgramRouteHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable colgramRouteRefresh = new Runnable() {
         @Override public void run() {
@@ -18,15 +22,23 @@
                     && org.colgram.core.ColgramConfig.isWarpEnabled();
             boolean enabled = org.colgram.core.ColgramProxyManager.isProxyEnabled(getContext())
                     || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi();
+            boolean proxyPending = org.colgram.core.ColgramProxyManager.isProxySelectionPending();
+            boolean warpDesired = org.colgram.core.ColgramConfig.isWarpEnabled();
+            String proxyStatus = org.colgram.core.ColgramProxyManager.getProxySelectionStatus();
+            String warpStatus = warpStatusForProxyScreen();
             if (useProxySettings != enabled) {
                 useProxySettings = enabled;
                 updateRows(true);
             } else {
-                listAdapter.notifyItemChanged(useProxyRow);
-                listAdapter.notifyItemChanged(warpRow);
-                listAdapter.notifyItemChanged(callsRow);
-                listAdapter.notifyItemChanged(callsDetailRow);
+                if (proxyPending != colgramLastProxyPending || !android.text.TextUtils.equals(proxyStatus, colgramLastProxyStatus))
+                    listAdapter.notifyItemChanged(useProxyRow);
+                if (warpDesired != colgramLastWarpDesired || !android.text.TextUtils.equals(warpStatus, colgramLastWarpStatus))
+                    listAdapter.notifyItemChanged(warpRow);
             }
+            colgramLastProxyStatus = proxyStatus;
+            colgramLastWarpStatus = warpStatus;
+            colgramLastProxyPending = proxyPending;
+            colgramLastWarpDesired = warpDesired;
             colgramRouteHandler.postDelayed(this, 1000L);
         }
     };

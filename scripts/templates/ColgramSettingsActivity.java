@@ -283,10 +283,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }
                 refreshSettings();
             } else if (position == callsRow) {
-                android.content.SharedPreferences prefs = org.telegram.messenger.MessagesController.getGlobalMainSettings();
-                boolean enabled = !prefs.getBoolean("proxy_enabled_calls", true);
-                prefs.edit().putBoolean("proxy_enabled_calls", enabled).apply();
-                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(enabled);
+                ColgramCallRoutes.showPicker(getParentActivity(), this::refreshSettings);
             } else if (position == directConnectionRow) {
                 selectDirectConnection();
             } else if (position == dataSettingsRow) {
@@ -1120,7 +1117,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                     || position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow
                     || position == sandboxFilesRow || position == pluginsRow || position == botTestRow
                     || position == cloudflareWarpRow || position == subscriptionRow || position == directConnectionRow
-                    || position == publicProxyRow || position == subscriptionNodeRow
+                    || position == publicProxyRow || position == subscriptionNodeRow || position == callsRow
                     || position == dataSettingsRow || position == cacheSettingsRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
@@ -1204,11 +1201,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == autoProxyRow) {
                         checkCell.setTextAndCheck("Самоподключение прокси, если Telegram не отвечает",
                                 ColgramConfig.isAutoProxyEnabled(), true);
-                    } else if (position == callsRow) {
-                        checkCell.setTextAndValueAndCheck("Использовать для звонков",
-                                "Только личный SOCKS5. MTProto / WebSocket не передают звонки.",
-                                org.telegram.messenger.MessagesController.getGlobalMainSettings()
-                                        .getBoolean("proxy_enabled_calls", true), true, true);
                     } else if (position == dpiBypassRow) {
                         // Read the persisted intent, not just whether a socket happens to be
                         // bound: a listener that failed to bind is a fault, not a setting.
@@ -1294,6 +1286,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                                 ? null : org.colgram.core.ColgramSubscriptionStore.current(context);
                         settingsCell.setTextAndValue("Узел / страна из подписки",
                                 state == null ? "импортировать" : state.name + " · " + state.protocol, true);
+                    } else if (position == callsRow) {
+                        settingsCell.setTextAndValue("Использовать для звонков", ColgramCallRoutes.summary(), true);
                     } else if (position == dataSettingsRow) {
                         settingsCell.setTextAndValue("Экономия трафика и автозагрузка", "настроить", true);
                     } else if (position == cacheSettingsRow) {

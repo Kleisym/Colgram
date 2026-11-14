@@ -3497,9 +3497,6 @@ public static void reportProxyFailure() {
         // Keep the old saved identity, but release a stale active route while checking.
         disableProxy(ctx);
         setUserProxyDisabled(false);
-        if (requested != null && !everHarvested(requested.address, requested.port)) {
-            rememberManualProxy(requested);
-        }
         ProxySelection selection = new ProxySelection(proxySelectionGate.begin(), routeEpoch, requested);
         proxySelection = selection;
         proxySelectionStatus = "Проверяю протокол Telegram (до 25 с)";
@@ -4015,6 +4012,15 @@ public static void reportProxyFailure() {
                 .putStringSet(KEY_MANUAL_PROXIES, manual).apply();
     }
 
+    /** Only the manual editor/link flow may promote a saved entry to a user-owned record. */
+    public static void markManuallySavedProxy(Context context, Object proxyInfo) {
+        if (context == null) return;
+        ProxyItem proxy = itemFromProxyInfo(proxyInfo);
+        if (proxy == null) return;
+        if (appContext == null) appContext = context.getApplicationContext();
+        rememberManualProxy(proxy);
+    }
+
     private static boolean isManuallySavedProxy(ProxyItem proxy) {
         if (readProxyIdentities(KEY_MANUAL_PROXIES).contains(proxyIdentity(proxy))) return true;
         Context ctx = appContext;
@@ -4045,10 +4051,9 @@ public static void reportProxyFailure() {
     public static boolean isProxyCatalogVisible(Object proxyInfo) {
         ProxyItem item = itemFromProxyInfo(proxyInfo);
         if (item == null || isInternalLoopbackEndpoint(item)) return false;
-        if (isManuallySavedProxy(item)) return true;
-        boolean managed = readProxyIdentities(KEY_MANAGED_PROXIES).contains(proxyIdentity(item))
-                || everHarvested(item.address, item.port);
-        if (!managed) return true;
+        if (readProxyIdentities(KEY_MANUAL_PROXIES).contains(proxyIdentity(item))) return true;
+        // An older version persisted feed entries without provenance. Do not assume an
+        // unknown row is a user-owned route, and do not remove it until proven managed.
         return isPubliclySelectable(findPoolCandidate(item));
     }
 
@@ -4061,6 +4066,9 @@ public static void reportProxyFailure() {
             for (int index = list.size() - 1; index >= 0; index--) {
                 Object info = list.get(index);
                 if (isProxyCatalogVisible(info)) continue;
+                ProxyItem hidden = itemFromProxyInfo(info);
+                if (hidden == null || !everHarvested(hidden.address, hidden.port)
+                        && !readProxyIdentities(KEY_MANAGED_PROXIES).contains(proxyIdentity(hidden))) continue;
                 list.remove(index);
                 if (current == info) sharedConfigClass.getDeclaredField("currentProxy").set(null, null);
             }
