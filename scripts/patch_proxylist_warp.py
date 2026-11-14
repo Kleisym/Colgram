@@ -6,13 +6,16 @@ Idempotent, marker-based. Called from apply-patches.py and runnable standalone.
 import io
 import os
 import re
+from pathlib import Path
 
 MARKER = "REQ_WARP_CONSENT = 9182"
-PATCH_VERSION = "COLGRAM_WARP_UI_PATCH = 4"
+PATCH_VERSION = "COLGRAM_WARP_UI_PATCH = 5"
 
 
 def upgrade_generated(s):
     """Apply the current state/route fixes to both fresh and already-patched trees."""
+    if PATCH_VERSION in s:
+        return s
     replacements = (
         ('if (context == null || getParentActivity() == null) return;',
          'if (context == null || getParentActivity() == null) {\n'
@@ -143,6 +146,111 @@ def upgrade_generated(s):
             r'^\s*private static final int COLGRAM_WARP_UI_PATCH\s*=\s*\d+;\s*\r?\n',
             '', s, flags=re.MULTILINE)
         s = s.replace(marker_line, marker_line + '\n    private static final int ' + PATCH_VERSION + ';', 1)
+    return upgrade_functional_controls(s)
+
+
+def replace_section(source, start, end, replacement):
+    begin = source.index(start)
+    finish = source.index(end, begin + len(start))
+    return source[:begin] + replacement + source[finish:]
+
+
+def upgrade_functional_controls(s):
+    """Canonical v5 controls, applied after the legacy v1-v4 structure has converged."""
+    template = (Path(__file__).parent / "templates/ProxyListWarpControls.java.inc").read_text(encoding="utf-8")
+    s = replace_section(s, "    // ---- Colgram WARP helpers", "    private int connectionsHeaderRow;", template + "\n")
+    s = s.replace("        warpRow = rowCount++;", "        callsRow = rowCount++;\n        callsDetailRow = rowCount++;\n        warpRow = rowCount++;", 1)
+    s = s.replace("        useProxyRow = rowCount++;", "        networkModesRow = rowCount++;\n        useProxyRow = rowCount++;", 1)
+    s = s.replace("private final static boolean IS_PROXY_ROTATION_AVAILABLE = true;",
+                  "private final static boolean IS_PROXY_ROTATION_AVAILABLE = false;", 1)
+    s = s.replace("            proxyList.addAll(SharedConfig.proxyList);", '''            for (SharedConfig.ProxyInfo item : SharedConfig.proxyList) {
+                if (org.colgram.core.ColgramProxyManager.isProxyCatalogVisible(item)) proxyList.add(item);
+            }''', 1)
+
+    # Validation owns route installation. No stock JNI call or currentProxy assignment occurs first.
+    s = replace_section(s, "            if (position == useProxyRow) {", "            } else if (position == rotationRow) {", '''            if (position == useProxyRow) {
+                if (useProxySettings || org.colgram.core.ColgramProxyManager.isProxySelectionPending()
+                        || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi()) {
+                    org.colgram.core.ColgramProxyManager.disableProxy(getContext());
+                    org.colgram.core.ColgramProxyManager.onStockProxyToggle(false);
+                    useProxySettings = false;
+                } else {
+                    cancelWarpFromProxyScreen();
+                    org.colgram.core.ColgramProxyManager.selectPublicProxy(getContext());
+                }
+                updateRows(true);
+''')
+    s = replace_section(s, "            } else if (position >= proxyStartRow && position < proxyEndRow) {", "            } else if (position == warpRow) {", '''            } else if (position >= proxyStartRow && position < proxyEndRow) {
+                if (!selectedItems.isEmpty()) {
+                    listAdapter.toggleSelected(position);
+                    return;
+                }
+                SharedConfig.ProxyInfo info = proxyList.get(position - proxyStartRow);
+                cancelWarpFromProxyScreen();
+                ProxySettings settings = info.settings;
+                org.colgram.core.ColgramProxyManager.selectUserProxy(getContext(),
+                        settings.getAddress(), settings.getPort(), settings.getSecret(),
+                        ProxySettings.typeToInt(settings.getType()), settings.getUser(), settings.getPassword());
+                updateRows(true);
+''')
+    s = replace_section(s, "            } else if (position == warpRow) {", "            } else if (position == proxyAddRow) {", '''            } else if (position == callsRow) {
+                boolean enabled = !callsPreference();
+                MessagesController.getGlobalMainSettings().edit().putBoolean("proxy_enabled_calls", enabled).apply();
+                ((TextCheckCell) view).setChecked(enabled);
+                listAdapter.notifyItemChanged(callsDetailRow);
+            } else if (position == warpRow) {
+                if (org.colgram.core.ColgramConfig.isWarpEnabled() || warpOperationsGate.isPending())
+                    cancelWarpFromProxyScreen();
+                else startWarpFromProxyScreen();
+''')
+    s = s.replace("            } else if (position == proxyAddRow) {\n                presentFragment", '''            } else if (position == networkModesRow) {
+                presentFragment(new ColgramSettingsActivity());
+            } else if (position == proxyAddRow) {
+                presentFragment''', 1)
+    s = s.replace("position == rotationRow || position == warpRow", "position == rotationRow || position == warpRow || position == callsRow")
+    s = s.replace("return position == useProxyRow ||", "return position == networkModesRow || position == useProxyRow ||", 1)
+    s = s.replace("} else if (position == proxyAddRow || position == deleteAllRow)", "} else if (position == networkModesRow || position == proxyAddRow || position == deleteAllRow)", 1)
+    s = s.replace("                    if (position == proxyAddRow) {\n                        textCell.setText", '''                    if (position == networkModesRow) {
+                        textCell.setText("Режим подключения · Direct / DPI / VPN", true);
+                    } else if (position == proxyAddRow) {
+                        textCell.setText''', 1)
+    s = s.replace("            } else if (position == useProxyRow) {\n                return -4;", '''            } else if (position == networkModesRow) {
+                return -16;
+            } else if (position == useProxyRow) {
+                return -4;''', 1)
+    s = s.replace("        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxyCheckDone, proxyInfo);",
+                  "        org.colgram.core.ColgramProxyManager.onStockProxyCheckResult(proxyInfo, time);\n"
+                  "        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxyCheckDone, proxyInfo);", 1)
+    s = s.replace("checkCell.setTextAndCheck(getString(R.string.UseProxySettings), useProxySettings, rotationRow != -1);", '''checkCell.setTextAndValueAndCheck(getString(R.string.UseProxySettings),
+                                org.colgram.core.ColgramProxyManager.getProxySelectionStatus(),
+                                useProxySettings || org.colgram.core.ColgramProxyManager.isProxySelectionPending(), true, false);''')
+    start = "                    } else if (position == warpRow) {"
+    end = "                    } else if (position == rotationRow) {"
+    s = replace_section(s, start, end, '''                    } else if (position == callsRow) {
+                        checkCell.setTextAndCheck("Использовать для звонков", callsPreference(), true);
+                    } else if (position == warpRow) {
+                        checkCell.setTextAndValueAndCheck("Использовать Cloudflare WARP", warpStatusForProxyScreen(),
+                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, false, false);
+''')
+    s = s.replace("                } else if (position == warpRow) {\n                    checkCell.setChecked", "                } else if (position == callsRow) {\n                    checkCell.setChecked(callsPreference());\n                } else if (position == warpRow) {\n                    checkCell.setChecked")
+    s = s.replace("checkCell.setChecked(useProxySettings);", "checkCell.setChecked(useProxySettings || org.colgram.core.ColgramProxyManager.isProxySelectionPending());")
+    s = s.replace("                    if (position == warpDetailRow) {", '''                    if (position == callsDetailRow) {
+                        cell.setText("Для новых личных звонков через выбранный SOCKS5. MTProto / WebSocket не передают звонки. "
+                                + "Локальный DPI-обходчик не является SOCKS5-прокси для звонков. "
+                                + "WARP / VPN направляют звонки на уровне системы, независимо от этого переключателя.");
+                    } else if (position == warpDetailRow) {''', 1)
+    s = s.replace('            } else if (position == rotationTimeoutInfoRow) {\n                return -11;', '''            } else if (position == warpRow) {
+                return -12;
+            } else if (position == warpDetailRow) {
+                return -13;
+            } else if (position == callsRow) {
+                return -14;
+            } else if (position == callsDetailRow) {
+                return -15;
+            } else if (position == rotationTimeoutInfoRow) {
+                return -11;''', 1)
+    s = s.replace("    public void onResume() {\n        super.onResume();", "    public void onResume() {\n        super.onResume();\n        colgramRouteHandler.removeCallbacks(colgramRouteRefresh);\n        colgramRouteHandler.post(colgramRouteRefresh);", 1)
+    s = s.replace("    public void onFragmentDestroy() {\n        super.onFragmentDestroy();", "    public void onFragmentDestroy() {\n        colgramRouteHandler.removeCallbacks(colgramRouteRefresh);\n        if (waitingWarpConsent >= 0 && warpRequested(waitingWarpConsent)) cancelWarpFromProxyScreen();\n        super.onFragmentDestroy();", 1)
     return s
 
 
@@ -152,15 +260,16 @@ def apply(repo_path):
     if not os.path.exists(p):
         print(" [!] ProxyListActivity.java not found")
         return
-    s = io.open(p, encoding="utf-8", errors="ignore").read()
+    s = Path(p).read_text(encoding="utf-8", errors="ignore")
     if MARKER in s:
         upgraded = upgrade_generated(s)
         if upgraded != s:
-            io.open(p, "w", encoding="utf-8").write(upgraded)
+            Path(p).write_text(upgraded, encoding="utf-8", newline="\n")
             print(" [+] Updated ProxyListActivity WARP state handling")
         else:
             print(" [=] Already patched: ProxyListActivity WARP Row")
         apply_call_proxy_defaults(repo_path)
+        apply_voip_call_proxy(repo_path)
         return
     n_edits = 0
 
@@ -463,9 +572,10 @@ def apply(repo_path):
     must_replace(anchor_fields_end, helpers, "helpers")
 
     s = upgrade_generated(s)
-    io.open(p, "w", encoding="utf-8").write(s)
+    Path(p).write_text(s, encoding="utf-8", newline="\n")
     print(" [+] ProxyListActivity: calls row unconditional + WARP toggle (" + str(n_edits) + " edits)")
     apply_call_proxy_defaults(repo_path)
+    apply_voip_call_proxy(repo_path)
 
 
 def apply_call_proxy_defaults(repo_path):
@@ -484,10 +594,46 @@ def apply_call_proxy_defaults(repo_path):
         path = os.path.join(repo_path, *relative.split('/'))
         if not os.path.isfile(path):
             continue
-        source = io.open(path, encoding="utf-8", errors="ignore").read()
+        source = Path(path).read_text(encoding="utf-8", errors="ignore")
         updated = source.replace(old, new)
         if updated != source:
-            io.open(path, "w", encoding="utf-8", newline="").write(updated)
+            Path(path).write_text(updated, encoding="utf-8", newline="\n")
+
+
+def apply_voip_call_proxy(repo_path):
+    """Restore Telegram's private-call SOCKS5 argument, never pass an MTProto/Web proxy as SOCKS."""
+    path = Path(repo_path) / "TMessagesProj/src/main/java/org/telegram/messenger/voip/VoIPService.java"
+    if not path.is_file():
+        return
+    source = path.read_text(encoding="utf-8")
+    if "private Instance.Proxy colgramCallProxy()" in source:
+        return
+    old = "persistentStateFilePath, endpoints, null, getNetworkType()"
+    if source.count(old) != 1:
+        raise AssertionError("private call proxy argument anchor missing or ambiguous")
+    helper = '''
+
+    private Instance.Proxy colgramCallProxy() {
+        if (!MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled_calls", true)) return null;
+        // A VPN routes at the OS layer. This argument is only a SOCKS5 transport for private calls.
+        if (org.colgram.core.ColgramConfig.isWarpEnabled()) return null;
+        org.colgram.core.ColgramProxyManager.ProxyItem active =
+                org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
+        if (active != null) {
+            if (active.type != 0 || active.isLocalDpi()) return null;
+            return new Instance.Proxy(active.effectiveHost(), active.effectivePort(), active.user, active.password);
+        }
+        if (!MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled", false)
+                || SharedConfig.currentProxy == null) return null;
+        org.telegram.utils.proxy.ProxySettings settings = SharedConfig.currentProxy.settings;
+        if (settings.getType() != org.telegram.utils.proxy.ProxySettings.Type.SOCKS5) return null;
+        return new Instance.Proxy(settings.getAddress(), settings.getPort(), settings.getUser(), settings.getPassword());
+    }
+'''
+    closing = source.rfind("}")
+    source = source[:closing] + helper + source[closing:]
+    source = source.replace(old, "persistentStateFilePath, endpoints, colgramCallProxy(), getNetworkType()", 1)
+    path.write_text(source, encoding="utf-8", newline="\n")
 
 
 if __name__ == "__main__":

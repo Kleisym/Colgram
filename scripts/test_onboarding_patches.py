@@ -43,6 +43,7 @@ class OnboardingPatchesTest(unittest.TestCase):
     def intro(self):
         return '''public class IntroActivity {
     private Drawable logoDrawable;
+    private CharSequence[] titles;
     private volatile int currentViewPagerPage;
         LocaleController.getString(R.string.Page6Message)
         logoDrawable = context.getResources().getDrawable(R.drawable.telegram_logo).mutate();
@@ -51,6 +52,9 @@ class OnboardingPatchesTest(unittest.TestCase):
         ssb.setSpan(new ImageSpan(logoDrawable), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         titles[0] = ssb;
         frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));
+    public class EGLThread extends DispatchQueue {
+        Intro.setPage(currentViewPagerPage);
+        Intro.setPage(currentViewPagerPage);
             loadTexture(R.drawable.intro_private_screw, 20);
             loadTexture(R.drawable.intro_tg_plane, 21);
             loadTexture(v -> {
@@ -59,12 +63,23 @@ class OnboardingPatchesTest(unittest.TestCase):
                 return bm;
             }, 22);
             loadTexture(telegramMaskProvider, 23);
+    }
         TextureView textureView = new TextureView(context);
         frameLayout2.addView(textureView, LayoutHelper.createFrame(ICON_WIDTH_DP, ICON_HEIGHT_DP, Gravity.CENTER));
         textureView.setSurfaceTextureListener(listener);
-        Intro.setPage(currentViewPagerPage);
-        Intro.setPage(currentViewPagerPage);
+        viewPager = new ViewPager(context);
+            public void onPageScrolled(int position, float positionOffset, int positionOffsetPixels) {
                 bottomPages.setPageOffset(position, positionOffset);
+                Intro.setScrollOffset(positionOffset);
+            }
+            public void onPageSelected(int i) {
+                currentViewPagerPage = i;
+            }
+            public void onPageScrollStateChanged(int i) {
+                if (i == ViewPager.SCROLL_STATE_DRAGGING) {
+                    dragging = true;
+                }
+            }
     private void updateColors(boolean fromTheme) {
         logoDrawable.setColorFilter(Theme.multAlpha(getThemedColor(Theme.key_actionBarDefaultTitle), 0.9f), PorterDuff.Mode.MULTIPLY);
         fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
@@ -103,30 +118,25 @@ class OnboardingPatchesTest(unittest.TestCase):
         self.assertEqual(once, self.patch.patch_login_network_menu(once))
         self.assertEqual(1, once.count('setTag("colgram_network_menu")'))
 
-    def test_intro_uses_original_avatar_and_distinct_cloud_without_changing_surface_lifecycle(self):
+    def test_intro_uses_all_custom_art_and_removes_the_entire_unused_gl_lifecycle(self):
         result = self.patch.patch_intro_branding_and_menu(self.intro())
-        self.assertNotIn("R.drawable.intro_tg_plane", result)
-        self.assertNotIn("ThemeColors.TELEGRAM_COLOR", result)
-        self.assertNotIn("R.drawable.telegram_logo", result)
-        self.assertNotIn("logoDrawable", result)
-        self.assertIn("setImageResource(R.drawable.colgram_app_avatar)", result)
-        self.assertIn("setImageResource(R.drawable.colgram_intro_cloud)", result)
-        self.assertIn("setClipToOutline(true)", result)
-        self.assertIn("TextureView textureView = new TextureView(context)", result)
-        self.assertIn("textureView.setSurfaceTextureListener(listener)", result)
-        self.assertNotRegex(result, r"textureView\.setVisibility|removeView\(textureView\)")
+        for obsolete in ("R.drawable.intro_tg_plane", "ThemeColors.TELEGRAM_COLOR", "logoDrawable",
+                         "TextureView", "EGLThread", "eglThread", "Intro.set"):
+            self.assertNotIn(obsolete, result)
+        self.assertIn("colgramIntroArt = new ColgramIntroArtView(context)", result)
+        self.assertIn('setTag("colgram_intro_art")', result)
+        self.assertIn("createFrame(240, 180, Gravity.CENTER)", result)
         self.assertIn('setTag("colgram_network_menu")', result)
         self.assertIn("AndroidUtilities.statusBarHeight / AndroidUtilities.density", result)
 
-    def test_native_renderer_excludes_branded_endpoints_and_pager_keeps_swipe_progress(self):
+    def test_pager_reports_absolute_swipe_progress_without_loading_native_intro(self):
         result = self.patch.patch_intro_branding_and_menu(self.intro())
-        self.assertEqual(2, result.count("Intro.setPage(getNativeIntroPage());"))
-        self.assertIn("Math.max(1, Math.min(currentViewPagerPage, titles.length - 2))", result)
-        self.assertIn("float avatarAlpha = position == 0 ? 1f - positionOffset : 0f;", result)
-        self.assertIn("position == cloudPage - 1 ? positionOffset : 0f;", result)
-        self.assertIn("textureView.setAlpha(1f - avatarAlpha - cloudAlpha)", result)
+        self.assertIn("colgramIntroArt.setPageProgress(position + positionOffset)", result)
+        self.assertIn("colgramIntroArt.setSelectedPage(i)", result)
+        self.assertIn("colgramIntroArt.setScrolling(i != ViewPager.SCROLL_STATE_IDLE)", result)
         self.assertIn("bottomPages.setPageOffset(position, positionOffset)", result)
         self.assertIn('LocaleController.getString(R.string.Page6Message).replace("Telegram", "Colgram")', result)
+        self.assertIn("colgramIntroArt.invalidate()", result)
 
     def test_intro_replaces_legacy_gl_cloud_without_reinstalling_menu(self):
         old = self.intro().replace("private Drawable logoDrawable;", '''private Drawable logoDrawable;
@@ -147,7 +157,7 @@ class OnboardingPatchesTest(unittest.TestCase):
         TextureView textureView''')
         result = self.patch.patch_intro_branding_and_menu(old)
         self.assertNotIn("R.drawable.colgram_cloud_logo", result)
-        self.assertIn("setImageResource(R.drawable.colgram_app_avatar)", result)
+        self.assertIn("new ColgramIntroArtView(context)", result)
         self.assertEqual(1, result.count('setTag("colgram_network_menu")'))
         self.assertEqual(result, self.patch.patch_intro_branding_and_menu(result))
 

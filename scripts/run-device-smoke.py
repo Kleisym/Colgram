@@ -64,8 +64,9 @@ def main():
     # Keep the actual early native verdicts rather than only the final few seconds.
     live_log = (args.output / "logcat-live.txt").open("wb")
     live_process = subprocess.Popen(prefix + ["logcat", "-v", "threadtime",
-        "ColgramDirectTest:I", "ColgramDirectApi:I", "ColgramOnboardingTest:I",
-        "ColgramProxyManager:I", "ColgramDpiBypass:I", "TestRunner:I", "AndroidRuntime:E", "*:S"],
+        "ColgramDirectTest:I", "ColgramDirectApi:I", "ColgramOnboardingTest:I", "ColgramIntroSlides:I",
+        "ColgramProxyManager:I", "ColgramDpiBypass:I", "ColgramWarpMasque:I",
+        "ColgramMasqueVpn:I", "TestRunner:I", "AndroidRuntime:E", "*:S"],
         stdout=live_log, stderr=subprocess.STDOUT)
     try:
         result = subprocess.run(command, capture_output=True, timeout=600)

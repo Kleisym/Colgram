@@ -1159,41 +1159,14 @@ def inject_hooks(repo_path):
         # all, so the callable below - and every repair inside it - was dead code.
         patch_file(intro_activity, intro_lang_replacer, "colgramBadgeTop", "IntroActivity Instant Language Switcher & Badge")
 
-    # 16. LoginActivity.java -> Visual Alert and Auto-Rotation on -1000 Connection Error in PhoneView
-    phone_error_target = """fillNextCodeParams(params, (TLRPC.auth_SentCode) response);
-                    }
-                } else {
-                    if (error.text != null) {"""
-    phone_error_replacement = """fillNextCodeParams(params, (TLRPC.auth_SentCode) response);
-                    }
-                } else {
-                    if (error != null && (error.code == -1000 || error.text == null)) {
-                        try {
-                            android.widget.Toast.makeText(getParentActivity(), "Ошибка соединения с Telegram (-1000). Переключаем прокси...", android.widget.Toast.LENGTH_SHORT).show();
-                            org.colgram.core.ColgramProxyManager.switchToNextProxy();
-                        } catch (Throwable ignored) {}
-                    }
-                    if (error.text != null) {"""
-    patch_file(
-        login_activity,
-        phone_error_target,
-        phone_error_replacement,
-        "LoginActivity Handle -1000 Connection Error In PhoneView"
-    )
+    # 16. LoginActivity.java -> Phone entry and bounded code request on the selected route.
+    def phone_focus_updater(content):
+        from login_patches import patch_phone_focus, patch_phone_form
+        updated = patch_phone_form(patch_phone_focus(content))
+        return updated if updated != content else CONVERGED
 
-    phone_error_target2 = """} else if (error.code != -1000) {
-                            AlertsCreator.processError(currentAccount, error, LoginActivity.this, req, phoneInputData.phoneNumber);
-                        }"""
-    phone_error_replacement2 = """} else {
-                            if (error.code != -1000) {
-                                AlertsCreator.processError(currentAccount, error, LoginActivity.this, req, phoneInputData.phoneNumber);
-                            } else {
-                                try {
-                                    android.widget.Toast.makeText(getParentActivity(), "Ошибка соединения с Telegram (-1000). Переключаем прокси...", android.widget.Toast.LENGTH_SHORT).show();
-                                    org.colgram.core.ColgramProxyManager.switchToNextProxy();
-                                } catch (Throwable ignored) {}
-                            }
-                        }"""
+    patch_file(login_activity, phone_focus_updater, None,
+               "LoginActivity Phone Input and Request Timeout")
     # 17. ConnectionsManager.java -> Suppress proxy promo check (sponsor channels)
     patch_file(
         conn_manager,
@@ -1214,6 +1187,14 @@ def inject_hooks(repo_path):
     # 19. DialogsActivity.java -> Make Proxy Button Always Visible In Header & Popup Menu
     dialogs_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
     if os.path.exists(dialogs_activity):
+        def dialogs_wordmark_updater(content):
+            from login_patches import patch_dialogs_wordmark
+            updated = patch_dialogs_wordmark(content)
+            return updated if updated != content else CONVERGED
+
+        patch_file(dialogs_activity, dialogs_wordmark_updater, None, "DialogsActivity Colgram Wordmark")
+        from theme_repairs import patch_story_hints, STORY_HINT_MARKER
+        patch_file(dialogs_activity, patch_story_hints, STORY_HINT_MARKER, "DialogsActivity Paired Story Hint Colors")
         patch_file(
             dialogs_activity,
             "final boolean proxyVisible = proxyEnabled && !TextUtils.isEmpty(proxyAddress)",
@@ -3238,56 +3219,23 @@ def inject_hooks(repo_path):
         patch_file(build_vars_file, build_vars_injector, "APP_ID = 6", "BuildVars Set APP_ID & APP_HASH to Official Android & Clear SafetyNet")
 
 
-    # 35. ProxyListActivity.java -> Silent 1-Tap Proxy Toggle (Never ask for input on empty list)
+    # 35. ProxyListActivity.java -> Runtime state and bounded stock checks
+    from proxy_entry_patches import patch_saved_proxy_form, patch_proxy_link, patch_proxy_startup
+    for relative, transformer, marker in (
+        ("ui/ProxySettingsActivity.java", patch_saved_proxy_form, "COLGRAM_PROXY_SAVE_VALIDATE"),
+        ("messenger/AndroidUtilities.java", patch_proxy_link, "COLGRAM_PROXY_LINK_VALIDATE"),
+        ("tgnet/ConnectionsManager.java", patch_proxy_startup, "COLGRAM_PROXY_STARTUP_VALIDATE"),
+    ):
+        source_path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", *relative.split("/"))
+        patch_file(source_path, transformer, marker, marker)
+
     proxy_list_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProxyListActivity.java")
     if os.path.exists(proxy_list_file):
-        patch_file(
-            proxy_list_file,
-            "if (SharedConfig.currentProxy == null) {\n                    if (!proxyList.isEmpty()) {",
-            """if (SharedConfig.currentProxy == null) {
-                    if (proxyList.isEmpty()) {
-                        org.colgram.core.ColgramProxyManager.populateSharedConfigProxies();
-                    }
-                    if (!proxyList.isEmpty()) {""",
-            "ProxyListActivity Silent 1-Tap Proxy Toggle"
-        )
         patch_file(
             proxy_list_file,
             'useProxySettings = preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty();',
             'useProxySettings = (preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty())\n                || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi();',
             "ProxyListActivity Shows Runtime Route State"
-        )
-        def proxy_route_sync_patcher(content):
-            changed = False
-            empty_list = """                    } else {
-                        presentFragment(new ProxySettingsActivity());
-                        return;
-                    }"""
-            empty_list_fix = """                    } else if (useProxySettings && org.colgram.core.ColgramProxyManager.hasActiveRouteForUi()) {
-                        useProxySettings = false;
-                        MessagesController.getGlobalMainSettings().edit()
-                                .putBoolean("proxy_enabled", false).commit();
-                        ConnectionsManager.setProxySettings(false, null);
-                        org.colgram.core.ColgramProxyManager.onStockProxyToggle(false);
-                        updateRows(true);
-                        return;
-                    } else {
-                        presentFragment(new ProxySettingsActivity());
-                        return;
-                    }"""
-            if "ColgramProxyManager.onStockProxyToggle(false)" not in content and empty_list in content:
-                content = content.replace(empty_list, empty_list_fix, 1)
-                changed = True
-            setter = "ConnectionsManager.setProxySettings(useProxySettings, SharedConfig.currentProxy.settings);"
-            if "ColgramProxyManager.onStockProxyToggle(useProxySettings)" not in content and setter in content:
-                content = content.replace(setter, setter + "\n                org.colgram.core.ColgramProxyManager.onStockProxyToggle(useProxySettings);")
-                changed = True
-            return content if changed else content
-        patch_file(
-            proxy_list_file,
-            proxy_route_sync_patcher,
-            "ColgramProxyManager.onStockProxyToggle(useProxySettings)",
-            "ProxyListActivity Synchronizes Runtime Route Toggle"
         )
         def proxy_check_scheduler_patcher(content):
             marker = "private static final int MAX_STOCK_PROXY_CHECKS = 2;"
@@ -3445,6 +3393,8 @@ def inject_hooks(repo_path):
     # 38. IntroActivity.java -> Colgram Dark Black Intro Screen with Red Airplane Logo
     intro_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "IntroActivity.java")
     if os.path.exists(intro_file):
+        shutil.copy2(os.path.join(os.path.dirname(__file__), "templates", "ColgramIntroArtView.java"),
+                     os.path.join(os.path.dirname(intro_file), "ColgramIntroArtView.java"))
         patch_file(
             intro_file,
             'ssb.setSpan(new ImageSpan(logoDrawable), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n        titles[0] = ssb;',
@@ -3481,13 +3431,7 @@ def inject_hooks(repo_path):
             None,
             "IntroActivity Native Colgram Artwork and Network Menu"
         )
-        # Replace the GL texture itself; preserve the TextureView/EGL lifecycle.
-        # NOTE: the day/night switcher used to be hidden here with
-        # themeFrameLayout.setVisibility(View.GONE). That is deliberately NOT done any more.
-        # The stock paragraph around this frame also carries the native intro surface; a
-        # GONE child of it is the same invalid-surface hazard described above, and it was a
-        # second contributing cause of the startup abort. Leaving the switcher visible is
-        # harmless (it is a themed 64x64 control) and keeps the native view tree intact.
+        # The replacement draws welcome artwork directly; no native intro surface is created.
         # Colgram branding on the intro screen.
         #
         # HISTORY — this block used to force fragmentView to 0xFF000000 (pure black) while
@@ -3686,19 +3630,19 @@ def inject_hooks(repo_path):
         #
         # Clearing it in onResume is the right place: the intro is only ever re-shown when
         # the user comes back to it, which is exactly when the button must work again.
-        patch_file(
-            intro_file,
-            '''    public void onResume() {
-        super.onResume();
-        if (justCreated) {''',
-            '''    public void onResume() {
-        super.onResume();
-        // Colgram: re-arm the Start Messaging button. Without this, returning to the intro
-        // leaves startPressed true and the button no-ops until the app is restarted.
-        startPressed = false;
-        if (justCreated) {''',
-            "IntroActivity Re-arm Start Button on Resume"
-        )
+        def intro_rearm_updater(content):
+            start = content.index("    public void onResume() {")
+            finish = content.index("\n    @Override", start)
+            resume = content[start:finish]
+            if "startPressed = false;" in resume:
+                return CONVERGED
+            anchor = "        super.onResume();"
+            if anchor not in resume:
+                raise ValueError("Missing pinned IntroActivity onResume super call")
+            resume = resume.replace(anchor, anchor + "\n        startPressed = false;", 1)
+            return content[:start] + resume + content[finish:]
+
+        patch_file(intro_file, intro_rearm_updater, None, "IntroActivity Re-arm Start Button on Resume")
 
 
     # 41. DialogsActivity.java -> Bot Account Chat Initiator on Floating Button
@@ -5877,6 +5821,7 @@ def inject_core_device_test_support(repo_path, root_dir):
     for name in ("ColgramDirectConnectionDeviceTest.java",
                  "ColgramDirectApiDeviceTest.java",
                  "ColgramOnboardingDeviceTest.java",
+                 "ColgramIntroSlidesDeviceTest.java",
                  "ColgramSettingsRowsDeviceTest.java",
                  "ColgramThemeContrastDeviceTest.java",
                  "ColgramCallProxyDeviceTest.java",

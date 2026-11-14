@@ -1,14 +1,16 @@
 package org.colgram.singbox;
 
 import android.app.Notification;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.VpnService;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
-import java.io.FileDescriptor;
 import java.util.List;
 
 import io.nekohasekai.libbox.CommandServer;
@@ -32,30 +34,58 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     private static final String ACTION_START = "org.colgram.singbox.START";
     private static final String ACTION_STOP = "org.colgram.singbox.STOP";
     private static final int FOREGROUND_ID = 0x43_01;
+    private static final String EXTRA_GENERATION = "generation";
+    private static long controlGeneration;
+    private static String controlProfile;
+    private static String controlState = "stopped";
 
     private CommandServer server;
     private ColgramPlatformInterface platform;
     private String profilePath;
+    private long generation = -1L;
+    private volatile boolean tunEstablished;
+    private final Handler main = new Handler(Looper.getMainLooper());
 
-    public static void start(android.content.Context context, String profilePath) {
+    public static synchronized String status(String profilePath) {
+        return profilePath != null && profilePath.equals(controlProfile) ? controlState : "stopped";
+    }
+
+    public static synchronized void start(Context context, String profilePath) {
+        if (profilePath == null || profilePath.isEmpty()) throw new IllegalArgumentException("Missing VPN profile");
         Intent intent = new Intent(context, ColgramVpnService.class);
         intent.setAction(ACTION_START);
         intent.putExtra("profile", profilePath);
+        intent.putExtra(EXTRA_GENERATION, ++controlGeneration);
+        controlProfile = profilePath;
+        controlState = "starting";
         try {
-            context.startService(intent);
-        } catch (IllegalStateException e) {
-            // Android 8+ refuses a background start; the user has to switch the profile on.
-            Log.i(TAG, "background start refused, the profile must be started from the UI");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent);
+            else context.startService(intent);
+        } catch (RuntimeException failure) {
+            controlState = "failed";
+            throw failure;
         }
     }
 
-    public static void stop(android.content.Context context) {
-        Intent intent = new Intent(context, ColgramVpnService.class);
-        intent.setAction(ACTION_STOP);
-        try {
-            context.startService(intent);
-        } catch (IllegalStateException ignored) {
-            // Already gone, which is the state the caller wanted.
+    public static synchronized void stop(Context context) {
+        ++controlGeneration;
+        controlState = "stopping";
+        if (!context.stopService(new Intent(context, ColgramVpnService.class))) controlState = "stopped";
+    }
+
+    public static synchronized void stopProfile(Context context, String profilePath) {
+        if (profilePath != null && profilePath.equals(controlProfile)) stop(context);
+    }
+
+    private boolean ownsControl() {
+        synchronized (ColgramVpnService.class) {
+            return generation == controlGeneration;
+        }
+    }
+
+    private void publishState(String state) {
+        synchronized (ColgramVpnService.class) {
+            if (generation == controlGeneration) controlState = state;
         }
     }
 
@@ -63,29 +93,60 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
-            tearDown();
+            // Compatibility with the legacy WARP bridge. A delayed WARP stop must not
+            // close a user's selected subscription, which lives at a different path.
+            if (profilePath != null && profilePath.endsWith("/colgram-warp.json")) {
+                synchronized (ColgramVpnService.class) {
+                    if (generation == controlGeneration) stopProfile(this, profilePath);
+                }
+            } else if (profilePath == null) {
+                stopSelf(startId);
+            }
             return START_NOT_STICKY;
         }
-        String path = intent == null ? null : intent.getStringExtra("profile");
-        if (path == null || path.isEmpty()) {
-            Log.w(TAG, "started with no profile; nothing to do");
+        if (!ACTION_START.equals(action)) {
+            stopSelf(startId);
             return START_NOT_STICKY;
         }
-        profilePath = path;
+        // Satisfy the foreground start deadline even if a newer request invalidated this one.
+        startForegroundCompat();
+        long requestedGeneration = intent.getLongExtra(EXTRA_GENERATION, -1L);
+        String path = intent.getStringExtra("profile");
+        synchronized (ColgramVpnService.class) {
+            if (requestedGeneration != controlGeneration || !"starting".equals(controlState)
+                    || path == null || !path.equals(controlProfile)) {
+                if (server == null) stopSelf(startId);
+                return START_NOT_STICKY;
+            }
+            generation = requestedGeneration;
+            profilePath = path;
+        }
+        startProfile(startId);
+        // Only an explicit current profile request starts this service; never resurrect an
+        // older route after process death or after switching back to Direct.
+        return START_NOT_STICKY;
+    }
+
+    private void startProfile(int startId) {
         try {
             bringUp();
+            if (!ownsControl()) {
+                releaseResources();
+                if (startId >= 0) stopSelf(startId);
+                return;
+            }
+            if (!tunEstablished) throw new IllegalStateException("Android did not establish a VPN interface");
+            publishState("running");
+            startForegroundCompat();
         } catch (Throwable t) {
-            // A tunnel that dies silently is the failure mode this whole exercise exists to end,
-            // so the reason goes to the log where it can be found rather than into a black hole.
-            Log.e(TAG, "the tunnel could not be started", t);
-            new ColgramNotification(this).fail(t.getMessage() == null
-                    ? t.toString() : t.getMessage());
-            tearDown();
-            return START_NOT_STICKY;
+            // Engine errors may contain profile configuration (provider secrets).
+            Log.e(TAG, "tunnel start failed: " + t.getClass().getSimpleName());
+            publishState("failed");
+            new ColgramNotification(this).fail("Проверьте выбранный узел и разрешение Android VPN.");
+            releaseResources();
+            if (startId >= 0) stopSelf(startId);
+            else stopSelf();
         }
-        // Sticky: Android restarts a VPN service after a reboot or a low-memory kill, and a
-        // subscription that silently stops protecting the phone is worse than one that retries.
-        return START_STICKY;
     }
 
     private void bringUp() throws Exception {
@@ -109,17 +170,17 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             platform = new ColgramPlatformInterface(this);
             platform.setConfigurator(this);
         }
-        if (server == null) {
-            server = new CommandServer(new Handler(), platform);
+        boolean createServer = server == null;
+        if (createServer) {
+            server = new CommandServer(new EngineHandler(), platform);
         }
-        startForegroundCompat();
         // start() before startOrReloadService(). The Go side keeps the running service behind the
         // server, and startOrReloadService reaches straight for it: with no start() in front, the
         // first call dereferences a nil it never created. Measured on the device, twice, as
         // "panic: invalid memory address or nil pointer dereference" inside
         // CommandServer.StartOrReloadService at command_server.go:221 - which survived both the
         // engine setup and passing real OverrideOptions, so neither was the missing piece.
-        server.start();
+        if (createServer) server.start();
         // A real OverrideOptions rather than null. The Go side reads fields off the override
         // argument without a nil check - measured on the device, a nil there panics with an
         // invalid memory address inside CommandServer.StartOrReloadService at
@@ -136,8 +197,8 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         // position, so the engine never saw the profile at all - and the tunnel reported itself up
         // anyway, because the flag is set by the caller. Measured on the device against the real
         // engine, on every single start.
+        tunEstablished = false;
         server.startOrReloadService(readProfile(profilePath), new io.nekohasekai.libbox.OverrideOptions());
-        Log.i(TAG, "tunnel starting with profile " + profilePath);
     }
 
     /**
@@ -149,10 +210,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
      */
     private static String readProfile(String path) throws java.io.IOException {
         byte[] raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
-        String profile = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
-        String head = profile.length() > 80 ? profile.substring(0, 80) : profile;
-        Log.i(TAG, "the profile is " + profile.length() + "B and starts: " + head);
-        return profile;
+        return new String(raw, java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /**
@@ -217,7 +275,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
                 ? new Notification.Builder(this, channel)
                 : new Notification.Builder(this);
         builder.setContentTitle("Colgram VPN")
-                .setContentText("Трафик идёт через туннель")
+                .setContentText(tunEstablished ? "Интерфейс туннеля запущен" : "Настройка интерфейса туннеля…")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .setOngoing(true);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -232,7 +290,8 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         return builder.build();
     }
 
-    private void tearDown() {
+    private void releaseResources() {
+        tunEstablished = false;
         if (server != null) {
             try {
                 server.closeService();
@@ -256,13 +315,20 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             }
             server = null;
         }
+        if (platform != null) {
+            platform.closeTun();
+            platform = null;
+        }
         stopForeground(true);
-        stopSelf();
     }
 
     @Override
     public void onDestroy() {
-        tearDown();
+        releaseResources();
+        synchronized (ColgramVpnService.class) {
+            if ("stopping".equals(controlState)) controlState = "stopped";
+            else if (!"failed".equals(controlState)) publishState("stopped");
+        }
         super.onDestroy();
     }
 
@@ -271,7 +337,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         // The user revoked consent in system settings. Leaving a tunnel running after that would
         // be routing traffic the user has just said no to.
         Log.i(TAG, "consent revoked; taking the tunnel down");
-        tearDown();
+        main.post(this::stopSelf);
         super.onRevoke();
     }
 
@@ -279,7 +345,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     @Override
     public ParcelFileDescriptor open(TunOptions options) {
-        if (options == null) return null;
+        if (options == null || !ownsControl()) return null;
         Builder builder = new Builder();
         builder.setSession("Colgram");
         builder.setMtu(options.getMTU() > 0 ? options.getMTU() : 9000);
@@ -359,6 +425,11 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             if (descriptor == null) {
                 Log.e(TAG, "establish() returned no descriptor");
             } else {
+                if (!ownsControl()) {
+                    descriptor.close();
+                    return null;
+                }
+                tunEstablished = true;
                 // The descriptor existing and the interface existing are different facts, and only
                 // the second one is a tunnel. Measured on the device: the tunnel started with no
                 // error, and no tun interface existed afterwards - not colgram0, not tun0, nothing.
@@ -415,6 +486,11 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         return true;
     }
 
+    @Override
+    public boolean protectOutboundSocket(int fd) {
+        return protect(fd);
+    }
+
     private static List<RoutePrefix> drain(RoutePrefixIterator iterator) {
         List<RoutePrefix> out = new java.util.ArrayList<>();
         if (iterator == null) return out;
@@ -446,7 +522,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     }
 
     /** The engine's side of the conversation: reload requests, stops, and diagnostics. */
-    private final class Handler implements CommandServerHandler {
+    private final class EngineHandler implements CommandServerHandler {
         @Override
         public int connectSSHAgent() {
             // No SSH agent on a phone. Returning zero says "none", which is what the engine
@@ -467,21 +543,18 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
         @Override
         public void serviceReload() {
-            try {
-            if (server != null) {
-                server.start();
-                // The content, for the same reason bringUp() reads the file: a path here is handed
-                // to the JSON decoder and comes back as an offset in a filesystem path.
-                server.startOrReloadService(readProfile(profilePath), new io.nekohasekai.libbox.OverrideOptions());
-            }
-            } catch (Throwable t) {
-                Log.e(TAG, "reload failed", t);
-            }
+            main.post(() -> {
+                if (server == null || !ownsControl()) return;
+                publishState("starting");
+                startProfile(-1);
+            });
         }
 
         @Override
         public void serviceStop() {
-            tearDown();
+            main.post(() -> {
+                if (ownsControl()) stopSelf();
+            });
         }
 
         @Override

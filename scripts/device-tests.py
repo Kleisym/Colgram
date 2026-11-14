@@ -41,6 +41,7 @@ DEVICE_TESTS = [
     "org.colgram.core.ColgramDirectConnectionDeviceTest",
     "org.colgram.core.ColgramDirectApiDeviceTest",
     "org.colgram.core.ColgramOnboardingDeviceTest",
+    "org.colgram.core.ColgramIntroSlidesDeviceTest",
     "org.colgram.core.ColgramDeviceQuicInitialTest",
     "org.colgram.core.ColgramDeviceQuicAnatomyTest",
     "org.colgram.core.ColgramDeviceQuicScopeTest",

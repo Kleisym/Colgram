@@ -3,24 +3,26 @@ package org.telegram.ui;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.graphics.Color;
 import android.graphics.PorterDuff;
-import android.graphics.PorterDuffColorFilter;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.text.InputType;
-import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 
+import org.colgram.core.ColgramBotSync;
+import org.colgram.core.ColgramConfig;
+import org.colgram.core.ColgramThemePolicy;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
@@ -31,282 +33,265 @@ import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RadialProgressView;
 
-public class ColgramBotLoginBottomSheet {
+import java.util.regex.Pattern;
 
-    private static final int[] BUILTIN_API_IDS = {
-        21724, // Telegram Android X
-        2040,  // Telegram Desktop
-        2496,  // Webogram
-        28453, // Telegram macOS
-        17349, // Telegram WebZ
-        8081,  // Telegram WebK
-        94575, // Public Telethon API
-        6      // Official Android Legacy
-    };
+public final class ColgramBotLoginBottomSheet {
+    private static final Pattern TOKEN = Pattern.compile("[0-9]{1,20}:[A-Za-z0-9_-]{20,100}");
+    private static final int requestTimeoutMs = 30_000;
 
-    private static final String[] BUILTIN_API_HASHES = {
-        "3e0cb5ab2c70d5d304694f752b726003",
-        "b18441a1ff607e10a989891a5462e627",
-        "8da85b0d5bfe0250235e736856f2501e",
-        "4bf65da635edd04eb58e23199bcb1682",
-        "344583e45741c457fe1862106095a5eb",
-        "06b537c7c35a331971721dfb23581466",
-        "a3406de8d1717142276863268b373b52",
-        "eb06d4abfb49dc3eeb1aeb98ae0f581e"
-    };
+    private ColgramBotLoginBottomSheet() {}
 
     public static void show(final LoginActivity activity, final int currentAccount) {
         if (activity == null || activity.getParentActivity() == null) return;
         final Context context = activity.getParentActivity();
+        final boolean ru = LocaleController.getInstance().getCurrentLocaleInfo() != null
+                && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+        final ColgramThemePolicy.BotPalette palette = ColgramThemePolicy.forBotSheet(
+                Theme.getColor(Theme.key_windowBackgroundWhite),
+                Theme.getColor(Theme.key_dialogBackground),
+                Theme.getColor(Theme.key_dialogTextBlack),
+                Theme.getColor(Theme.key_dialogTextGray2),
+                Theme.getColor(Theme.key_featuredStickers_addButton),
+                Theme.getColor(Theme.key_featuredStickers_buttonText),
+                ColgramConfig.isCyberThemeEnabled());
 
-        final boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null &&
-                "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
-
-        BottomSheet.Builder builder = new BottomSheet.Builder(context, true);
+        BottomSheet.Builder builder = new BottomSheet.Builder(context, true, palette.sheet);
         builder.setApplyTopPadding(false);
+        LinearLayout content = new LinearLayout(context);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(24), dp(16), dp(24), dp(24));
 
-        int accentColor = Theme.getColor(Theme.key_featuredStickers_addButton);
-        if (accentColor == 0) accentColor = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4);
-        if (accentColor == 0) accentColor = 0xFF2AABEE;
+        View handle = new View(context);
+        handle.setBackground(fill(3, palette.handle));
+        content.addView(handle, LayoutHelper.createLinear(36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16));
 
-        LinearLayout container = new LinearLayout(context);
-        container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(24));
+        FrameLayout badge = new FrameLayout(context);
+        badge.setBackground(fill(28, palette.badge));
+        ImageView icon = new ImageView(context);
+        icon.setImageResource(R.drawable.msg_bot);
+        icon.setColorFilter(palette.badgeIcon, PorterDuff.Mode.SRC_IN);
+        icon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        badge.addView(icon, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
+        content.addView(badge, LayoutHelper.createLinear(56, 56, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
 
-        // Drag handle
-        View dragHandle = new View(context);
-        GradientDrawable handleDrawable = new GradientDrawable();
-        handleDrawable.setCornerRadius(AndroidUtilities.dp(3));
-        handleDrawable.setColor(Theme.getColor(Theme.key_sheet_scrollUp) != 0 ? Theme.getColor(Theme.key_sheet_scrollUp) : 0x40808080);
-        dragHandle.setBackground(handleDrawable);
-        container.addView(dragHandle, LayoutHelper.createLinear(36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16));
+        TextView title = label(context, ru ? "Вход по токену бота" : "Log in via bot token", 20, palette.title);
+        title.setTypeface(AndroidUtilities.bold());
+        content.addView(title, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 6));
+        TextView description = label(context,
+                ru ? "Введите полный токен вашего бота из @BotFather."
+                   : "Enter your bot's full token from @BotFather.", 14, palette.secondary);
+        content.addView(description, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 18));
 
-        // Telegram Native Bot Icon Badge
-        FrameLayout iconBadge = new FrameLayout(context);
-        GradientDrawable badgeBg = new GradientDrawable();
-        badgeBg.setShape(GradientDrawable.OVAL);
-        badgeBg.setColor(accentColor & 0x1AFFFFFF);
-        iconBadge.setBackground(badgeBg);
+        LinearLayout card = new LinearLayout(context);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(12), dp(4), dp(8), dp(4));
+        GradientDrawable field = fill(10, palette.field);
+        field.setStroke(dp(1), palette.fieldStroke);
+        card.setBackground(field);
 
-        ImageView botIconView = new ImageView(context);
-        try {
-            botIconView.setImageResource(R.drawable.msg_bot);
-            botIconView.setColorFilter(new PorterDuffColorFilter(accentColor, PorterDuff.Mode.SRC_IN));
-        } catch (Throwable ignored) {}
-        botIconView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-        iconBadge.addView(botIconView, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
-        container.addView(iconBadge, LayoutHelper.createLinear(56, 56, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
-
-        // Title
-        TextView titleView = new TextView(context);
-        titleView.setText(isRu ? "Вход по токену бота" : "Log in via Bot Token");
-        titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
-        titleView.setTypeface(AndroidUtilities.bold());
-        titleView.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        titleView.setGravity(Gravity.CENTER_HORIZONTAL);
-        container.addView(titleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 6));
-
-        // Subtitle description
-        TextView descView = new TextView(context);
-        descView.setText(isRu
-                ? "Введите токен вашего бота из @BotFather для авторизации в Colgram."
-                : "Enter your bot token from @BotFather to log into Colgram.");
-        descView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-        descView.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
-        descView.setGravity(Gravity.CENTER_HORIZONTAL);
-        descView.setLineSpacing(AndroidUtilities.dp(2), 1.0f);
-        container.addView(descView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 18));
-
-        // Input card
-        LinearLayout inputCard = new LinearLayout(context);
-        inputCard.setOrientation(LinearLayout.HORIZONTAL);
-        inputCard.setGravity(Gravity.CENTER_VERTICAL);
-        inputCard.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(4), AndroidUtilities.dp(8), AndroidUtilities.dp(4));
-
-        GradientDrawable inputBg = new GradientDrawable();
-        inputBg.setCornerRadius(AndroidUtilities.dp(10));
-        int fieldBg = Theme.getColor(Theme.key_dialogInputField);
-        inputBg.setColor(fieldBg != 0 ? fieldBg : 0x0C000000);
-        int strokeColor = Theme.getColor(Theme.key_dialogInputFieldActivated);
-        if (strokeColor == 0) strokeColor = accentColor & 0x4DFFFFFF;
-        inputBg.setStroke(AndroidUtilities.dp(1f), strokeColor);
-        inputCard.setBackground(inputBg);
-
-        final EditText input = new EditText(context);
-        input.setHint("123456789:AAFtZOC...");
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-        input.setTypeface(Typeface.MONOSPACE);
+        EditText input = new EditText(context);
+        input.setTag("colgram_bot_token_input");
+        input.setContentDescription(ru ? "Токен бота" : "Bot token");
+        input.setHint(ru ? "ID:токен" : "ID:token");
+        input.setHintTextColor(palette.fieldHint);
+        input.setTextColor(palette.fieldText);
+        input.setTextSize(14);
         input.setBackground(null);
         input.setSingleLine(true);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
-        inputCard.addView(input, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1.0f, Gravity.CENTER_VERTICAL));
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        input.setTypeface(Typeface.MONOSPACE);
+        input.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+                | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        input.setSaveEnabled(false);
+        if (Build.VERSION.SDK_INT >= 26) input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        card.addView(input, LayoutHelper.createLinear(0, -2, 1f, Gravity.CENTER_VERTICAL));
 
-        // Quick Paste button
-        final TextView pasteBtn = new TextView(context);
-        pasteBtn.setText(isRu ? "Вставить" : "Paste");
-        pasteBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-        pasteBtn.setTypeface(AndroidUtilities.bold());
-        pasteBtn.setTextColor(accentColor);
-        pasteBtn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8));
-        pasteBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(6), accentColor & 0x14FFFFFF, accentColor & 0x28FFFFFF));
-        pasteBtn.setOnClickListener(v -> {
-            try {
-                ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-                if (clipboard != null && clipboard.hasPrimaryClip()) {
-                    ClipData clip = clipboard.getPrimaryClip();
-                    if (clip != null && clip.getItemCount() > 0) {
-                        CharSequence text = clip.getItemAt(0).getText();
-                        if (text != null) {
-                            input.setText(text.toString().trim());
-                            input.setSelection(input.getText().length());
+        TextView paste = label(context, ru ? "Вставить" : "Paste", 13, palette.pasteText);
+        paste.setTypeface(AndroidUtilities.bold());
+        paste.setPadding(dp(12), dp(8), dp(12), dp(8));
+        paste.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(6), palette.paste, palette.pastePressed));
+        paste.setOnClickListener(view -> {
+            ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard == null || !clipboard.hasPrimaryClip()) return;
+            ClipData clip = clipboard.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return;
+            CharSequence text = clip.getItemAt(0).getText();
+            if (text != null) {
+                input.setText(text.toString().trim());
+                input.setSelection(input.length());
+            }
+        });
+        card.addView(paste, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL));
+        content.addView(card, LayoutHelper.createLinear(-1, 50, 0, 0, 0, 16));
+
+        FrameLayout submit = new FrameLayout(context);
+        submit.setTag("colgram_bot_submit");
+        String submitLabel = ru ? "Войти в аккаунт бота" : "Log in as bot";
+        submit.setContentDescription(submitLabel);
+        submit.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(10), palette.button, palette.buttonPressed));
+        TextView buttonText = label(context, submitLabel, 15, palette.buttonText);
+        buttonText.setTypeface(AndroidUtilities.bold());
+        submit.addView(buttonText, LayoutHelper.createFrame(-1, -1, Gravity.CENTER));
+
+        RadialProgressView spinner = new RadialProgressView(context);
+        spinner.setSize(dp(24));
+        spinner.setProgressColor(palette.buttonText);
+        spinner.setVisibility(View.GONE);
+        submit.addView(spinner, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
+        content.addView(submit, LayoutHelper.createLinear(-1, 48, 0, 0, 0, 12));
+
+        TextView status = label(context, "", 13, palette.error);
+        status.setTag("colgram_bot_status");
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        content.addView(status, LayoutHelper.createLinear(-1, -2));
+        status.setVisibility(View.GONE);
+        ScrollView scroll = new ScrollView(context);
+        scroll.addView(content);
+        builder.setCustomView(scroll);
+        final BottomSheet sheet = builder.create();
+        final ConnectionsManager manager = ConnectionsManager.getInstance(currentAccount);
+
+        final class Attempt {
+            int requestId;
+            int generation;
+            Runnable timer;
+            boolean dismissed;
+
+            void clearTimer() {
+                if (timer == null) return;
+                AndroidUtilities.cancelRunOnUIThread(timer);
+                timer = null;
+            }
+
+            void cancel() {
+                generation++;
+                clearTimer();
+                if (requestId != 0) manager.cancelRequest(requestId, true);
+                requestId = 0;
+            }
+
+            void busy(boolean value) {
+                submit.setEnabled(!value);
+                input.setEnabled(!value);
+                paste.setEnabled(!value);
+                buttonText.setVisibility(value ? View.INVISIBLE : View.VISIBLE);
+                spinner.setVisibility(value ? View.VISIBLE : View.GONE);
+            }
+
+            void error(String message) {
+                busy(false);
+                status.setText(message);
+                status.setVisibility(View.VISIBLE);
+                scroll.post(() -> scroll.smoothScrollTo(0, content.getBottom()));
+            }
+
+            void submitToken() {
+                if (dismissed || requestId != 0) return;
+                final String token = input.getText().toString().trim();
+                if (!TOKEN.matcher(token).matches()) {
+                    error(ru ? "Нужен полный токен: цифры, двоеточие и секрет из @BotFather."
+                             : "Enter the complete token: numeric ID, colon and secret from @BotFather.");
+                    return;
+                }
+                AndroidUtilities.hideKeyboard(input);
+                status.setVisibility(View.GONE);
+                busy(true);
+                final int ticket = ++generation;
+                TLRPC.TL_auth_importBotAuthorization request = new TLRPC.TL_auth_importBotAuthorization();
+                request.api_id = BuildVars.APP_ID;
+                request.api_hash = BuildVars.APP_HASH;
+                request.bot_auth_token = token;
+                int flags = ConnectionsManager.RequestFlagEnableUnauthorized
+                        | ConnectionsManager.RequestFlagWithoutLogin
+                        | ConnectionsManager.RequestFlagFailOnServerErrors
+                        | ConnectionsManager.RequestFlagTryDifferentDc;
+                requestId = manager.sendRequest(request, (response, failure) -> AndroidUtilities.runOnUIThread(() -> {
+                    if (dismissed || generation != ticket || !sheet.isShowing()) return;
+                    clearTimer();
+                    requestId = 0;
+                    if (failure == null && response instanceof TLRPC.TL_auth_authorization) {
+                        TLRPC.TL_auth_authorization auth = (TLRPC.TL_auth_authorization) response;
+                        if (auth.user != null && auth.user.bot) {
+                            input.setText("");
+                            sheet.dismiss();
+                            activity.onAuthSuccess(auth);
+                            if (UserConfig.getInstance(currentAccount).getClientUserId() == auth.user.id) {
+                                ColgramBotSync.saveBotToken(context, currentAccount, token);
+                                ColgramBotSync.syncBotDialogs(context, currentAccount, false);
+                            }
+                            return;
                         }
                     }
-                }
-            } catch (Throwable ignored) {}
-        });
-        inputCard.addView(pasteBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
-
-        container.addView(inputCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50, 0, 0, 0, 16));
-
-        // Primary Action Button (Telegram style rounded 10dp)
-        final FrameLayout buttonLayout = new FrameLayout(context);
-        buttonLayout.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
-                AndroidUtilities.dp(10),
-                accentColor,
-                Theme.getColor(Theme.key_featuredStickers_addButtonPressed) != 0 ? Theme.getColor(Theme.key_featuredStickers_addButtonPressed) : (accentColor & 0xCCFFFFFF)
-        ));
-
-        final TextView buttonText = new TextView(context);
-        buttonText.setText(isRu ? "Войти в аккаунт бота" : "Log In as Bot");
-        buttonText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
-        buttonText.setTypeface(AndroidUtilities.bold());
-        buttonText.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText) != 0 ? Theme.getColor(Theme.key_featuredStickers_buttonText) : Color.WHITE);
-        buttonText.setGravity(Gravity.CENTER);
-        buttonLayout.addView(buttonText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.CENTER));
-
-        final RadialProgressView progressView = new RadialProgressView(context);
-        progressView.setSize(AndroidUtilities.dp(24));
-        progressView.setProgressColor(Color.WHITE);
-        progressView.setVisibility(View.GONE);
-        buttonLayout.addView(progressView, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
-
-        container.addView(buttonLayout, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48, 0, 0, 0, 12));
-
-        // Subtitle Tip
-        TextView tipView = new TextView(context);
-        tipView.setText(isRu
-                ? "Токен бота можно бесплатно получить у официального @BotFather"
-                : "You can create and get a bot token for free from @BotFather");
-        tipView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
-        tipView.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
-        tipView.setGravity(Gravity.CENTER_HORIZONTAL);
-        container.addView(tipView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 4));
-
-        ScrollView scrollView = new ScrollView(context);
-        scrollView.addView(container);
-        builder.setCustomView(scrollView);
-        final BottomSheet bottomSheet = builder.create();
-
-        buttonLayout.setOnClickListener(v -> {
-            String token = input.getText().toString().trim();
-            if (!token.contains(":")) {
-                if ("AAFtZOCkjmwpLJFUlue7l-WH4IbNDWBkdiw".equalsIgnoreCase(token)) {
-                    token = "8931400108:" + token;
-                } else {
-                    Toast.makeText(context, isRu
-                            ? "Токен неполный! В начале должны быть цифры и двоеточие из @BotFather (например, 1234567890:AAFtZOC...)"
-                            : "Incomplete token! Please include bot ID and colon (e.g. 1234567890:AAFtZOC...)", Toast.LENGTH_LONG).show();
-                    return;
-                }
+                    error(failureMessage(failure, ru));
+                }), flags);
+                manager.bindRequestToGuid(requestId, activity.getClassGuid());
+                timer = () -> {
+                    if (dismissed || generation != ticket) return;
+                    cancel();
+                    error(networkMessage(ru));
+                };
+                AndroidUtilities.runOnUIThread(timer, requestTimeoutMs);
             }
-            if (token.isEmpty() || token.length() < 15) {
-                Toast.makeText(context, isRu
-                        ? "Укажите полный токен бота из @BotFather"
-                        : "Please enter full bot token from @BotFather", Toast.LENGTH_LONG).show();
-                return;
-            }
-
-            buttonText.setVisibility(View.INVISIBLE);
-            progressView.setVisibility(View.VISIBLE);
-            buttonLayout.setEnabled(false);
-            input.setEnabled(false);
-            pasteBtn.setEnabled(false);
-
-            executeBotAuth(activity, currentAccount, bottomSheet, token, 0,
-                    buttonText, progressView, buttonLayout, input, pasteBtn, context, isRu);
+        }
+        Attempt attempt = new Attempt();
+        submit.setOnClickListener(view -> attempt.submitToken());
+        input.setOnEditorActionListener((view, action, event) -> {
+            if (action != EditorInfo.IME_ACTION_DONE) return false;
+            attempt.submitToken();
+            return true;
         });
-
-        bottomSheet.show();
+        activity.showDialog(sheet, dialog -> {
+            attempt.dismissed = true;
+            attempt.cancel();
+            input.setText("");
+        });
     }
 
-    private static void executeBotAuth(final LoginActivity activity, final int currentAccount, final BottomSheet bottomSheet,
-                                       final String token, final int apiIndex,
-                                       final TextView buttonText, final RadialProgressView progressView,
-                                       final FrameLayout buttonLayout, final EditText input, final TextView pasteBtn,
-                                       final Context context, final boolean isRu) {
-        if (apiIndex >= BUILTIN_API_IDS.length) {
-            buttonText.setVisibility(View.VISIBLE);
-            progressView.setVisibility(View.GONE);
-            buttonLayout.setEnabled(true);
-            input.setEnabled(true);
-            pasteBtn.setEnabled(true);
-            Toast.makeText(context, isRu ? "Не удалось войти: неверный токен бота. Проверьте его в @BotFather." : "Failed to log in: invalid bot token. Check @BotFather.", Toast.LENGTH_LONG).show();
-            return;
+    private static String failureMessage(TLRPC.TL_error failure, boolean ru) {
+        if (failure != null && (failure.code == -1000 || failure.text == null || failure.text.isEmpty())) {
+            return networkMessage(ru);
         }
+        String kind = failure == null ? "" : failure.text;
+        if ("ACCESS_TOKEN_EXPIRED".equals(kind) || "ACCESS_TOKEN_INVALID".equals(kind)
+                || "BOT_TOKEN_INVALID".equals(kind)) {
+            return ru ? "Telegram отклонил токен. Проверьте полный токен в @BotFather."
+                      : "Telegram rejected the token. Check the full token in @BotFather.";
+        }
+        if ("API_ID_INVALID".equals(kind) || "API_ID_PUBLISHED_FLOOD".equals(kind)) {
+            return ru ? "Telegram отклонил идентификатор этой сборки, а не токен."
+                      : "Telegram rejected this build's application ID, not your token.";
+        }
+        if (kind.startsWith("FLOOD_WAIT")) {
+            return ru ? "Слишком много попыток. Попробуйте позже."
+                      : "Too many attempts. Try again later.";
+        }
+        return ru ? "Telegram не завершил вход бота. Попробуйте снова."
+                  : "Telegram did not complete bot login. Try again.";
+    }
 
-        TLRPC.TL_auth_importBotAuthorization req = new TLRPC.TL_auth_importBotAuthorization();
-        req.flags = 0;
-        req.api_id = BUILTIN_API_IDS[apiIndex];
-        req.api_hash = BUILTIN_API_HASHES[apiIndex];
-        req.bot_auth_token = token;
+    private static String networkMessage(boolean ru) {
+        return ru ? "Нет ответа от Telegram по текущему маршруту. Откройте настройки сети через щит и проверьте подключение."
+                  : "No reply from Telegram on this route. Use the shield menu to check the connection.";
+    }
 
-        int flags = ConnectionsManager.RequestFlagEnableUnauthorized
-                | ConnectionsManager.RequestFlagFailOnServerErrors
-                | ConnectionsManager.RequestFlagWithoutLogin
-                | ConnectionsManager.RequestFlagTryDifferentDc;
+    private static TextView label(Context context, String text, int size, int color) {
+        TextView view = new TextView(context);
+        view.setText(text);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        view.setGravity(Gravity.CENTER);
+        return view;
+    }
 
-        ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
-            if (error == null && response instanceof TLRPC.TL_auth_authorization) {
-                try {
-                    bottomSheet.dismiss();
-                } catch (Throwable ignored) {}
-                try {
-                    // Save for the account that is actually authenticating, and for
-                    // UserConfig.selectedAccount in case the two disagree — that mismatch is why
-                    // this used to spray the token across slots 0..3 "so getBotToken is never
-                    // empty". Spraying made every account look like the same bot: ensurePollers
-                    // then started up to four long-pollers on one token (Bot API 409s all but
-                    // one), each called deleteWebhook, and the bot's dialogs were injected into
-                    // ordinary accounts that had nothing to do with it.
-                    org.colgram.core.ColgramBotSync.saveBotToken(context, currentAccount, token);
-                    activity.onAuthSuccess((TLRPC.TL_auth_authorization) response);
-                    org.colgram.core.ColgramBotSync.saveBotToken(context, UserConfig.selectedAccount, token);
-                    org.colgram.core.ColgramBotSync.syncBotDialogs(context, UserConfig.selectedAccount, false);
-                } catch (Throwable t) {
-                    org.telegram.messenger.FileLog.e(t);
-                }
-            } else {
-                String errorMsg = (error != null && error.text != null) ? error.text : "UNKNOWN_ERROR";
-                if ("API_ID_PUBLISHED_FLOOD".equals(errorMsg) || "API_ID_INVALID".equals(errorMsg)) {
-                    // Silently try next API pair from the pool
-                    executeBotAuth(activity, currentAccount, bottomSheet, token, apiIndex + 1,
-                            buttonText, progressView, buttonLayout, input, pasteBtn, context, isRu);
-                    return;
-                }
+    private static GradientDrawable fill(int radius, int color) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setCornerRadius(dp(radius));
+        drawable.setColor(color);
+        return drawable;
+    }
 
-                buttonText.setVisibility(View.VISIBLE);
-                progressView.setVisibility(View.GONE);
-                buttonLayout.setEnabled(true);
-                input.setEnabled(true);
-                pasteBtn.setEnabled(true);
-
-                if ("BOT_TOKEN_INVALID".equals(errorMsg)) {
-                    errorMsg = isRu ? "Неверный токен бота (BOT_TOKEN_INVALID). Проверьте токен в @BotFather." : "Invalid bot token (BOT_TOKEN_INVALID).";
-                }
-                Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show();
-            }
-        }), flags);
+    private static int dp(int value) {
+        return AndroidUtilities.dp(value);
     }
 }

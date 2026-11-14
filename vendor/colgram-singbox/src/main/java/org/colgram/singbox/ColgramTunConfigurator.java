@@ -22,4 +22,7 @@ public interface ColgramTunConfigurator {
 
     /** True only when the app holds consent to route other apps' traffic as well as its own. */
     boolean hasWholeDeviceConsent();
+
+    /** Keep an engine-owned outbound socket off the VPN interface. */
+    default boolean protectOutboundSocket(int fd) { return false; }
 }

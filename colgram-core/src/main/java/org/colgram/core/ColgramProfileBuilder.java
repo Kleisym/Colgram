@@ -51,6 +51,29 @@ public final class ColgramProfileBuilder {
         return assemble(new JSONArray().put(outbound));
     }
 
+    /** A pinned node: selection never silently changes country or escapes via direct/urltest. */
+    public static String forSelectedNode(ColgramSubscription.Node node) {
+        if (node == null || !node.usable) throw new IllegalArgumentException("не выбран подходящий узел");
+        try {
+            JSONObject outbound = outboundFor(node);
+            if (outbound == null) throw new IllegalArgumentException("протокол узла не поддерживается");
+            outbound.put("tag", "selected");
+            JSONObject root = new JSONObject();
+            root.put("log", new JSONObject().put("level", "warn").put("timestamp", true));
+            root.put("dns", dns());
+            root.put("inbounds", inbounds());
+            root.put("outbounds", new JSONArray().put(outbound)
+                    .put(new JSONObject().put("type", "direct").put("tag", "direct")));
+            root.put("route", new JSONObject().put("final", "selected").put("auto_detect_interface", true)
+                    .put("rules", new JSONArray().put(new JSONObject()
+                            .put("ip_cidr", new JSONArray().put("0.0.0.0/0").put("::/0"))
+                            .put("outbound", "selected"))));
+            return root.toString();
+        } catch (Exception failure) {
+            throw new IllegalArgumentException("узел не удалось описать: " + failure.getMessage(), failure);
+        }
+    }
+
     /**
      * A profile that fails over between nodes, in the order given.
      *

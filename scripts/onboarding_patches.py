@@ -4,7 +4,7 @@ import re
 
 LOGIN_MARKER = "// COLGRAM_LOGIN_NETWORK_MENU = 2"
 INTRO_MARKER = "// COLGRAM_INTRO_BRANDING_MENU = 2"
-INTRO_ART_MARKER = "// COLGRAM_INTRO_ART = 1"
+INTRO_ART_MARKER = "// COLGRAM_INTRO_ART = 2"
 HEADER_MARKER = "// COLGRAM_HEADER_NETWORK_MENU = 2"
 
 
@@ -135,91 +135,148 @@ def _patch_intro_network_menu(content):
     return _replace_once(content, color_anchor, color_anchor + color_code, "intro theme-aware icon")
 
 
+def _intro_block_end(content, start):
+    """Find a Java block end without treating braces in literals/comments as code."""
+    opening = content.find("{", start)
+    if opening < 0:
+        raise ValueError("Missing pinned intro block opening")
+    depth = 0
+    state = "code"
+    i = opening
+    while i < len(content):
+        ch = content[i]
+        following = content[i:i + 2]
+        if state == "line":
+            if ch == "\n":
+                state = "code"
+        elif state == "block":
+            if following == "*/":
+                state = "code"
+                i += 1
+        elif state in ("string", "char"):
+            if ch == "\\":
+                i += 1
+            elif ch == ('"' if state == "string" else "'"):
+                state = "code"
+        elif following == "//":
+            state = "line"
+            i += 1
+        elif following == "/*":
+            state = "block"
+            i += 1
+        elif ch == '"':
+            state = "string"
+        elif ch == "'":
+            state = "char"
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError("Missing pinned intro block closing")
+
+
+def _replace_intro_block(content, anchor, replacement):
+    start = content.find(anchor)
+    if start < 0:
+        raise ValueError("Missing pinned upstream intro block: " + anchor)
+    return content[:start] + replacement + content[_intro_block_end(content, start):]
+
+
 def patch_intro_branding_and_menu(content):
     content = _patch_intro_network_menu(content)
     if INTRO_ART_MARKER in content:
         return content
 
-    # The title has a text-only version in older Colgram-patched checkouts.
-    # Remove the obsolete Drawable/ImageSpan code from either starting point.
-    content = _replace_once(content, "    private Drawable logoDrawable;\n", "", "intro title drawable field")
-    title = re.compile(
-        r"        logoDrawable = .*?;\n"
-        r"        logoDrawable\.setBounds\(.*?\);\n"
-        r"        SpannableStringBuilder ssb = .*?;\n"
-        r"(?:        ssb\.setSpan\(.*?\);\n)?"
-        r'        titles\[0\] = (?:ssb|"Colgram");'
-    )
-    content, count = title.subn('        titles[0] = "Colgram";', content, count=1)
-    if count != 1:
-        raise ValueError("Missing pinned upstream intro title")
-    content = _replace_once(content,
-        "        logoDrawable.setColorFilter(Theme.multAlpha(getThemedColor(Theme.key_actionBarDefaultTitle), 0.9f), PorterDuff.Mode.MULTIPLY);\n",
-        "", "intro title drawable tint")
+    # Both pristine Telegram and the previous two-custom-page build converge.
+    # This migration removes the renderer, not just its transparent surface:
+    # no EGL thread, native texture allocation or native Intro call remains.
+    if "    private Drawable logoDrawable;\n" in content:
+        content = content.replace("    private Drawable logoDrawable;\n", "", 1)
+        title = re.compile(
+            r"        logoDrawable = .*?;\n"
+            r"        logoDrawable\.setBounds\(.*?\);\n"
+            r"        SpannableStringBuilder ssb = .*?;\n"
+            r"(?:        ssb\.setSpan\(.*?\);\n)?"
+            r'        titles\[0\] = (?:ssb|"Colgram");'
+        )
+        content, count = title.subn('        titles[0] = "Colgram";', content, count=1)
+        if count != 1:
+            raise ValueError("Missing pinned upstream intro title")
+        content = _replace_once(content,
+            "        logoDrawable.setColorFilter(Theme.multAlpha(getThemedColor(Theme.key_actionBarDefaultTitle), 0.9f), PorterDuff.Mode.MULTIPLY);\n",
+            "", "intro title drawable tint")
+    if 'LocaleController.getString(R.string.Page6Message).replace("Telegram", "Colgram")' not in content:
+        content = _replace_once(content, "LocaleController.getString(R.string.Page6Message)",
+            'LocaleController.getString(R.string.Page6Message).replace("Telegram", "Colgram")', "localized cloud slide text")
+
+    surface_start = content.find("        TextureView textureView = new TextureView(context);")
+    surface_end = content.find("        viewPager = new ViewPager(context);", surface_start)
+    if surface_start < 0 or surface_end < 0:
+        raise ValueError("Missing pinned upstream complete intro surface lifecycle")
+    content = content[:surface_start] + '''        // COLGRAM_INTRO_ART = 2
+        // Six custom Canvas scenes. The first avatar and final circuit cloud are unchanged assets.
+        colgramIntroArt = new ColgramIntroArtView(context);
+        colgramIntroArt.setTag("colgram_intro_art");
+        frameLayout2.addView(colgramIntroArt, LayoutHelper.createFrame(240, 180, Gravity.CENTER));
+
+''' + content[surface_end:]
+    content = _replace_once(content, "    private CharSequence[] titles;",
+        "    private ColgramIntroArtView colgramIntroArt;\n    private CharSequence[] titles;", "intro art field")
+    content = _replace_intro_block(content,
+        "            public void onPageScrolled(int position, float positionOffset, int positionOffsetPixels) {",
+        '''            public void onPageScrolled(int position, float positionOffset, int positionOffsetPixels) {
+                bottomPages.setPageOffset(position, positionOffset);
+                colgramIntroArt.setPageProgress(position + positionOffset);
+            }''')
+    content = _replace_once(content, "                currentViewPagerPage = i;",
+        "                currentViewPagerPage = i;\n                colgramIntroArt.setSelectedPage(i);", "intro selected page")
+    scroll_state = "            public void onPageScrollStateChanged(int i) {"
+    content = _replace_once(content, scroll_state, scroll_state +
+        "\n                colgramIntroArt.setScrolling(i != ViewPager.SCROLL_STATE_IDLE);", "intro animation drag state")
+
+    content = _replace_intro_block(content, "    public class EGLThread extends DispatchQueue {", "")
+    if "    private int getNativeIntroPage() {" in content:
+        content = _replace_intro_block(content, "    private int getNativeIntroPage() {", "")
+    for field in ("    private EGLThread eglThread;\n", "    private long currentDate;\n"):
+        content = content.replace(field, "", 1)
+    if "            if (eglThread != null) {" in content:
+        content = _replace_intro_block(content, "            if (eglThread != null) {", "")
+    content = content.replace("} else Intro.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));", "}", 1)
+    content = _replace_once(content, "    private void updateColors(boolean fromTheme) {",
+        "    private void updateColors(boolean fromTheme) {\n        if (colgramIntroArt != null) {\n            colgramIntroArt.invalidate();\n        }", "intro live theme invalidation")
+
+    # A ScrollView owns the page: a compact landscape viewport scrolls the full
+    # composition instead of overlapping artwork, paragraphs, dots and buttons.
+    content = content.replace("ICON_WIDTH_DP = 200, ICON_HEIGHT_DP = 150", "ICON_WIDTH_DP = 240, ICON_HEIGHT_DP = 180", 1)
+    scroll_container = "        scrollView.addView(frameContainerView, LayoutHelper.createScroll("
+    if scroll_container in content:
+        content = _replace_once(content, scroll_container,
+            "        frameContainerView.setMinimumHeight(dp(580) + AndroidUtilities.statusBarHeight);\n" + scroll_container,
+            "intro landscape content minimum")
+    content = content.replace("        AndroidUtilities.lockOrientation(getParentActivity(), ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);\n", "", 1)
+    if "        super.onResume();" in content:
+        content = content.replace("        super.onResume();",
+            "        super.onResume();\n        if (colgramIntroArt != null) {\n            colgramIntroArt.setMotionEnabled(true);\n        }", 1)
+    if "        super.onPause();" in content:
+        content = content.replace("        super.onPause();",
+            "        super.onPause();\n        if (colgramIntroArt != null) {\n            colgramIntroArt.setMotionEnabled(false);\n        }", 1)
     for name in ("android.text.SpannableStringBuilder", "android.text.Spanned", "android.text.style.ImageSpan",
-                 "org.telegram.ui.ActionBar.ThemeColors"):
+                 "org.telegram.ui.ActionBar.ThemeColors", "android.graphics.Bitmap", "android.graphics.Paint",
+                 "android.graphics.PorterDuffXfermode", "android.graphics.SurfaceTexture",
+                 "android.graphics.drawable.BitmapDrawable", "android.opengl.GLES20", "android.opengl.GLUtils",
+                 "android.os.Looper", "android.view.Display", "android.view.TextureView", "android.view.WindowManager",
+                 "org.telegram.messenger.BuildVars", "org.telegram.messenger.DispatchQueue", "org.telegram.messenger.EmuDetector",
+                 "org.telegram.messenger.FileLog", "org.telegram.messenger.GenericProvider", "org.telegram.messenger.Intro",
+                 "javax.microedition.khronos.egl.EGL10", "javax.microedition.khronos.egl.EGLConfig",
+                 "javax.microedition.khronos.egl.EGLContext", "javax.microedition.khronos.egl.EGLDisplay",
+                 "javax.microedition.khronos.egl.EGLSurface", "javax.microedition.khronos.opengles.GL10"):
         content = content.replace("import " + name + ";\n", "", 1)
-    content = _replace_once(content, "LocaleController.getString(R.string.Page6Message)",
-        'LocaleController.getString(R.string.Page6Message).replace("Telegram", "Colgram")', "localized cloud slide text")
-
-    surface = "        frameLayout2.addView(textureView, LayoutHelper.createFrame(ICON_WIDTH_DP, ICON_HEIGHT_DP, Gravity.CENTER));"
-    art = '''
-
-        // COLGRAM_INTRO_ART = 1
-        // These two pages use Android drawables; the middle four keep the native animations.
-        final android.widget.ImageView colgramWelcomeAvatar = new android.widget.ImageView(context);
-        colgramWelcomeAvatar.setImageResource(R.drawable.colgram_app_avatar);
-        GradientDrawable avatarOutline = new GradientDrawable();
-        avatarOutline.setColor(Color.BLACK);
-        avatarOutline.setCornerRadius(dp(28));
-        colgramWelcomeAvatar.setBackground(avatarOutline);
-        colgramWelcomeAvatar.setClipToOutline(true);
-        colgramWelcomeAvatar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        frameLayout2.addView(colgramWelcomeAvatar, LayoutHelper.createFrame(128, 128, Gravity.CENTER));
-
-        final android.widget.ImageView colgramCloudArt = new android.widget.ImageView(context);
-        colgramCloudArt.setImageResource(R.drawable.colgram_intro_cloud);
-        colgramCloudArt.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        frameLayout2.addView(colgramCloudArt, LayoutHelper.createFrame(180, 126, Gravity.CENTER));
-        colgramCloudArt.setAlpha(0f);
-        textureView.setAlpha(0f);
-'''
-    content = _replace_once(content, surface, surface + art, "intro artwork frame")
-    scroll = "                bottomPages.setPageOffset(position, positionOffset);"
-    content = _replace_once(content, scroll, scroll + '''
-                int cloudPage = titles.length - 1;
-                float avatarAlpha = position == 0 ? 1f - positionOffset : 0f;
-                float cloudAlpha = position == cloudPage ? 1f : position == cloudPage - 1 ? positionOffset : 0f;
-                colgramWelcomeAvatar.setAlpha(avatarAlpha);
-                colgramCloudArt.setAlpha(cloudAlpha);
-                textureView.setAlpha(1f - avatarAlpha - cloudAlpha);''', "intro pager artwork progress")
-
-    page = "Intro.setPage(currentViewPagerPage);"
-    if content.count(page) != 2:
-        raise ValueError("Missing pinned native intro page updates")
-    content = content.replace(page, "Intro.setPage(getNativeIntroPage());")
-    content = content.replace("private int currentViewPagerPage;", "private volatile int currentViewPagerPage;", 1)
-    adapter = "    private class IntroAdapter extends PagerAdapter {"
-    content = _replace_once(content, adapter, '''    private int getNativeIntroPage() {
-        // Never expose the stock cloud or logo during a swipe. Keep EGL attached and drawing.
-        return Math.max(1, Math.min(currentViewPagerPage, titles.length - 2));
-    }
-
-''' + adapter, "intro pager adapter")
-
-    # The bundled native library still takes its fixed set of texture slots.
-    # Bind blank logo textures for the native speed page's initial transition.
-    private_texture = "loadTexture(R.drawable.intro_private_screw, 20);"
-    mask_texture = "            loadTexture(telegramMaskProvider, 23);"
-    start = content.find(private_texture)
-    end = content.find(mask_texture, start)
-    if start < 0 or end < 0 or "}, 22);" not in content[start:end]:
-        raise ValueError("Missing pinned upstream intro GL logo textures")
-    start += len(private_texture)
-    return content[:start] + '''
-            loadTexture(unused -> Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888), 21);
-            loadTexture(unused -> Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888), 22);
-''' + content[end:]
+    if "Intro." in content or "eglThread" in content or "TextureView" in content:
+        raise ValueError("Pinned intro migration left an unused native renderer reference")
+    return content
 
 
 def patch_dialogs_network_menu(content):

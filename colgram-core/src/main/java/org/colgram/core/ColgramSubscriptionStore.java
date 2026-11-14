@@ -7,6 +7,11 @@ import android.util.Log;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.Proxy;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -28,8 +33,12 @@ public final class ColgramSubscriptionStore {
     private static final String PREFS = "colgram_subscription";
     private static final String KEY_LINK = "link";
     private static final String KEY_NODE_INDEX = "node_index";
+    private static final String KEY_NODE_TOTAL = "node_total";
+    private static final String KEY_NODE_NAME = "node_name";
+    private static final String KEY_NODE_PROTOCOL = "node_protocol";
 
     private static final String PROFILE_FILE = "profile.json";
+    private static final int MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
 
     /**
      * The profile directory, derived from the context rather than hard-coded.
@@ -75,13 +84,19 @@ public final class ColgramSubscriptionStore {
         if (link == null || link.trim().isEmpty()) {
             throw new IllegalArgumentException("ссылка пустая");
         }
-        List<ColgramSubscription.Node> nodes = usable(context, link);
+        String content = link.trim();
+        if (content.startsWith("https://") || content.startsWith("http://")) {
+            content = fetchSubscription(content);
+        }
+        List<ColgramSubscription.Node> nodes = usable(context, content);
         if (nodes.isEmpty()) {
             throw new IllegalArgumentException("в подписке нет подходящих узлов");
         }
-        prefs(context).edit().putString(KEY_LINK, link.trim()).apply();
+        writeProfile(context, nodes.get(0));
+        State state = stateOf(nodes, 0);
+        recordState(prefs(context).edit().putString(KEY_LINK, content), state).apply();
         Log.i(TAG, "subscription stored with " + nodes.size() + " usable nodes");
-        return stateOf(nodes, 0);
+        return state;
     }
 
     /** Parse a link without keeping it, so the UI can preview before committing. */
@@ -92,7 +107,7 @@ public final class ColgramSubscriptionStore {
             try {
                 // Building it is the filter: a node the builder cannot express is one the engine
                 // would reject, and shipping it in a profile only moves the failure later.
-                ColgramProfileBuilder.forNode(node);
+                ColgramProfileBuilder.forSelectedNode(node);
                 out.add(node);
             } catch (Throwable t) {
                 Log.i(TAG, "dropping " + node.protocol + " node: " + t.getMessage());
@@ -101,21 +116,82 @@ public final class ColgramSubscriptionStore {
         return out;
     }
 
+    /** Provider names are labels, not independently verified countries or health verdicts. */
+    public static List<ColgramSubscription.Node> nodes(Context context) {
+        String link = prefs(context).getString(KEY_LINK, null);
+        return link == null ? new ArrayList<>() : usable(context, link);
+    }
+
+    /** Provider fetches are direct, bounded and never log the credential-bearing URL or response. */
+    private static String fetchSubscription(String link) {
+        try {
+            URL current = new URL(link);
+            for (int redirects = 0; redirects <= 3; redirects++) {
+                String scheme = current.getProtocol();
+                if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme))
+                    throw new IOException("неподдерживаемая схема подписки");
+                HttpURLConnection connection = (HttpURLConnection) current.openConnection(Proxy.NO_PROXY);
+                connection.setConnectTimeout(8000);
+                connection.setReadTimeout(10000);
+                connection.setInstanceFollowRedirects(false);
+                connection.setRequestProperty("User-Agent", "Colgram/Subscription");
+                try {
+                    int status = connection.getResponseCode();
+                    if (status >= 300 && status < 400) {
+                        String location = connection.getHeaderField("Location");
+                        if (location == null || redirects == 3) throw new IOException("слишком много перенаправлений");
+                        URL next = new URL(current, location);
+                        if ("https".equalsIgnoreCase(current.getProtocol()) && !"https".equalsIgnoreCase(next.getProtocol()))
+                            throw new IOException("подписка перенаправляет без HTTPS");
+                        current = next;
+                        continue;
+                    }
+                    if (status < 200 || status >= 300) throw new IOException("сервер подписки вернул HTTP " + status);
+                    if (connection.getContentLengthLong() > MAX_SUBSCRIPTION_BYTES)
+                        throw new IOException("подписка превышает 2 МиБ");
+                    try (InputStream input = connection.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                        byte[] buffer = new byte[8192];
+                        int count;
+                        while ((count = input.read(buffer)) != -1) {
+                            if (out.size() + count > MAX_SUBSCRIPTION_BYTES) throw new IOException("подписка превышает 2 МиБ");
+                            out.write(buffer, 0, count);
+                        }
+                        return new String(out.toByteArray(), StandardCharsets.UTF_8);
+                    }
+                } finally {
+                    connection.disconnect();
+                }
+            }
+            throw new IOException("слишком много перенаправлений");
+        } catch (IOException failure) {
+            // Exception messages from URL/TLS stacks can contain the full paid link.
+            throw new IllegalArgumentException("сервер подписки недоступен или ответ не подходит");
+        }
+    }
+
     public static boolean hasSubscription(Context context) {
         String link = prefs(context).getString(KEY_LINK, null);
         return link != null && !link.isEmpty();
     }
 
     public static void clear(Context context) {
-        prefs(context).edit().remove(KEY_LINK).remove(KEY_NODE_INDEX).apply();
-        File profile = new File(profileDir(context), PROFILE_FILE);
-        if (profile.exists()) profile.delete();
+        prefs(context).edit().clear().apply();
+        new android.util.AtomicFile(new File(profileLocation(context))).delete();
     }
 
     /** The current selection, or null when nothing is stored. */
     public static State current(Context context) {
-        String link = prefs(context).getString(KEY_LINK, null);
+        SharedPreferences preferences = prefs(context);
+        String link = preferences.getString(KEY_LINK, null);
         if (link == null || link.isEmpty()) return null;
+        int total = preferences.getInt(KEY_NODE_TOTAL, 0);
+        int index = preferences.getInt(KEY_NODE_INDEX, 0);
+        if (total > 0) {
+            return new State(total, Math.max(0, Math.min(total - 1, index)),
+                    preferences.getString(KEY_NODE_NAME, "Узел"),
+                    preferences.getString(KEY_NODE_PROTOCOL, ""));
+        }
+        // Migrate the old prefs once; polling the UI must not reparse a large subscription.
         List<ColgramSubscription.Node> nodes;
         try {
             nodes = usable(context, link);
@@ -123,17 +199,18 @@ public final class ColgramSubscriptionStore {
             return null;
         }
         if (nodes.isEmpty()) return null;
-        int index = Math.max(0, Math.min(nodes.size() - 1,
-                prefs(context).getInt(KEY_NODE_INDEX, 0)));
-        return stateOf(nodes, index);
+        State state = stateOf(nodes, index);
+        if (link.equals(preferences.getString(KEY_LINK, null)) && index == preferences.getInt(KEY_NODE_INDEX, 0)) {
+            recordState(preferences.edit(), state).apply();
+        }
+        return state;
     }
 
     /**
      * Point the tunnel at one node.
      *
-     * The profile covers every usable node in a failover group, and the index only decides which is
-     * tried first. That is deliberate: writing a single node would leave a blocked subscription
-     * with no way through, which is the failure this whole exercise exists to remove.
+     * The profile pins exactly the selected node. Other countries and direct access never compete
+     * in a latency group behind an explicit selection.
      */
     public static State select(Context context, int index) {
         String link = prefs(context).getString(KEY_LINK, null);
@@ -143,29 +220,41 @@ public final class ColgramSubscriptionStore {
         List<ColgramSubscription.Node> nodes = usable(context, link);
         if (nodes.isEmpty()) throw new IllegalStateException("в подписке нет узлов");
         if (index < 0 || index >= nodes.size()) throw new IllegalArgumentException("нет такого узла");
-        writeProfile(context, nodes);
-        prefs(context).edit().putInt(KEY_NODE_INDEX, index).apply();
-        return stateOf(nodes, index);
+        writeProfile(context, nodes.get(index));
+        State state = stateOf(nodes, index);
+        recordState(prefs(context).edit(), state).apply();
+        return state;
     }
 
     /** The profile file the engine is pointed at, or null when there is nothing to run. */
     public static String profilePath(Context context) {
-        if (!hasSubscription(context)) return null;
-        select(context, prefs(context).getInt(KEY_NODE_INDEX, 0));
-        File profile = new File(profileDir(context), PROFILE_FILE);
-        return profile.exists() ? profile.getAbsolutePath() : null;
+        String path = profileLocation(context);
+        return hasSubscription(context) && new File(path).isFile() ? path : null;
     }
 
-    private static void writeProfile(Context context, List<ColgramSubscription.Node> nodes) {
-        String json = ColgramProfileBuilder.forNodes(nodes);
+    public static String profileLocation(Context context) {
+        return new File(profileDir(context), PROFILE_FILE).getAbsolutePath();
+    }
+
+    private static SharedPreferences.Editor recordState(SharedPreferences.Editor editor, State state) {
+        return editor.putInt(KEY_NODE_INDEX, state.selected).putInt(KEY_NODE_TOTAL, state.total)
+                .putString(KEY_NODE_NAME, state.name).putString(KEY_NODE_PROTOCOL, state.protocol);
+    }
+
+    private static void writeProfile(Context context, ColgramSubscription.Node node) {
+        String json = ColgramProfileBuilder.forSelectedNode(node);
         File directory = profileDir(context);
         if (!directory.exists() && !directory.mkdirs()) {
             throw new IllegalStateException("не удалось создать каталог для профиля");
         }
-        try (FileOutputStream out = new FileOutputStream(new File(directory, PROFILE_FILE))) {
+        android.util.AtomicFile file = new android.util.AtomicFile(new File(directory, PROFILE_FILE));
+        FileOutputStream out = null;
+        try {
+            out = file.startWrite();
             out.write(json.getBytes(StandardCharsets.UTF_8));
-            out.flush();
+            file.finishWrite(out);
         } catch (IOException e) {
+            if (out != null) file.failWrite(out);
             throw new IllegalStateException("не удалось записать профиль: " + e.getMessage(), e);
         }
     }

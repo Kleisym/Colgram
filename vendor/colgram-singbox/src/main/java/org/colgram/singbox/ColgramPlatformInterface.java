@@ -1,6 +1,11 @@
 package org.colgram.singbox;
 
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
@@ -43,6 +48,7 @@ public final class ColgramPlatformInterface implements PlatformInterface {
     private final Context context;
     private volatile ParcelFileDescriptor tun;
     private volatile ColgramTunConfigurator configurator;
+    private ConnectivityManager.NetworkCallback networkCallback;
 
     public ColgramPlatformInterface(Context context) {
         this.context = context.getApplicationContext();
@@ -54,6 +60,14 @@ public final class ColgramPlatformInterface implements PlatformInterface {
 
     public ParcelFileDescriptor currentTun() {
         return tun;
+    }
+
+    public void closeTun() {
+        ParcelFileDescriptor descriptor = tun;
+        tun = null;
+        if (descriptor != null) {
+            try { descriptor.close(); } catch (java.io.IOException ignored) { }
+        }
     }
 
     // ---- the TUN, which is the whole point -------------------------------------------------
@@ -71,6 +85,7 @@ public final class ColgramPlatformInterface implements PlatformInterface {
                 Log.e(TAG, "openTun: the platform returned no descriptor");
                 return -1;
             }
+            closeTun();
             tun = descriptor;
             int fd = rawFd(descriptor);
             Log.i(TAG, "openTun: descriptor held here, fd " + fd);
@@ -106,14 +121,17 @@ public final class ColgramPlatformInterface implements PlatformInterface {
     }
 
     @Override
-    public void autoDetectInterfaceControl(int index) {
-        // Android gives an app no way to choose which interface a socket leaves by, so the engine
-        // must not try - saying so makes it bind to the default route instead of guessing.
+    public void autoDetectInterfaceControl(int fd) {
+        ColgramTunConfigurator target = configurator;
+        if (target != null && !target.protectOutboundSocket(fd)) {
+            Log.w(TAG, "VPN socket protection failed");
+        }
     }
 
     @Override
     public boolean usePlatformAutoDetectInterfaceControl() {
-        return false;
+        ColgramTunConfigurator target = configurator;
+        return target != null && target.hasWholeDeviceConsent();
     }
 
     @Override
@@ -222,14 +240,66 @@ public final class ColgramPlatformInterface implements PlatformInterface {
     }
 
     @Override
-    public void startDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
-        // VpnService observes network changes itself and rebuilds the tunnel, so the engine hears
-        // about them through the configurator rather than by polling from here.
+    public synchronized void startDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
+        closeDefaultInterfaceMonitor(listener);
+        ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
+        if (manager == null || listener == null) return;
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            private void refresh() {
+                synchronized (ColgramPlatformInterface.this) {
+                    if (networkCallback == this) publishPhysicalNetwork(manager, listener);
+                }
+            }
+            @Override public void onAvailable(Network network) { refresh(); }
+            @Override public void onLost(Network network) { refresh(); }
+            @Override public void onLinkPropertiesChanged(Network network, LinkProperties properties) { refresh(); }
+            @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) { refresh(); }
+        };
+        manager.registerNetworkCallback(new NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build(), networkCallback);
+        publishPhysicalNetwork(manager, listener);
     }
 
     @Override
-    public void closeDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
-        // Nothing was opened above, so nothing to close.
+    public synchronized void closeDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
+        if (networkCallback == null) return;
+        ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
+        try {
+            if (manager != null) manager.unregisterNetworkCallback(networkCallback);
+        } catch (IllegalArgumentException ignored) { }
+        networkCallback = null;
+    }
+
+    private static void publishPhysicalNetwork(ConnectivityManager manager, InterfaceUpdateListener listener) {
+        Network active = manager.getActiveNetwork();
+        if (publishIfPhysical(manager, listener, active, false)) return;
+        Network[] networks = manager.getAllNetworks();
+        for (boolean validatedOnly : new boolean[]{true, false}) {
+            for (Network candidate : networks) {
+                if (publishIfPhysical(manager, listener, candidate, validatedOnly)) return;
+            }
+        }
+        listener.updateDefaultInterface("", -1, false, false);
+    }
+
+    private static boolean publishIfPhysical(ConnectivityManager manager, InterfaceUpdateListener listener,
+                                             Network network, boolean validatedOnly) {
+        if (network == null) return false;
+        NetworkCapabilities caps = manager.getNetworkCapabilities(network);
+        if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                || validatedOnly && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return false;
+        LinkProperties properties = manager.getLinkProperties(network);
+        String name = properties == null ? null : properties.getInterfaceName();
+        if (name == null) return false;
+        java.net.NetworkInterface device;
+        try { device = java.net.NetworkInterface.getByName(name); }
+        catch (java.net.SocketException ignored) { return false; }
+        if (device == null || device.getIndex() <= 0) return false;
+        listener.updateDefaultInterface(name, device.getIndex(),
+                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED), false);
+        return true;
     }
 
     @Override

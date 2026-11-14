@@ -161,6 +161,13 @@ public final class ColgramProxyPolicy {
         return comparison;
     }
 
+    /** TCP-open and a previous process's verdict are not current protocol availability. */
+    public static boolean isSelectable(State state, long checkedAt, long now, long maximumAge) {
+        return state != null && state.verified && state.available && state.ping >= 0
+                && state.tcp != -2 && state.eligibleAt <= now && checkedAt > 0
+                && checkedAt <= now && maximumAge > 0 && now - checkedAt < maximumAge;
+    }
+
     /** A bounded rotating window makes later feeds reachable without fetching every source. */
     public static List<Integer> feedIndices(int count, int budget, int round) {
         List<Integer> indices = new ArrayList<>();
