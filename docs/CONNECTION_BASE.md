@@ -20,7 +20,7 @@ A positive protocol verdict lasts at most 180 seconds on the same network. Posit
 
 ## Acceptance evidence
 
-`F:/brom/artifacts/connection-recovery/VERIFICATION.txt` records the exact tested APK hash, commands, literal results, errors and rollback evidence. Tests only operate on the disposable bridged MuMu guest `192.168.0.59:5555`. No host VPN changes, account logins or user tokens are required.
+`F:/brom/artifacts/base-readonly-final/VERIFICATION.txt` records the exact tested APK hash, commands, literal results, errors and rollback evidence. Tests only operate on the disposable bridged MuMu guest `192.168.0.59:5555`. No host VPN changes, account logins or user tokens are required.
 
 On a stalled direct local route the watchdog requests Telegram’s signed DC configuration through the upstream resolver without selecting a public proxy. A system VPN, WARP, or an off-screen app does not trigger that direct recovery. The background status row opens per-source HTTP and parser outcomes.
 
