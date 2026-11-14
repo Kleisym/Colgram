@@ -142,6 +142,8 @@ public final class ColgramSettingsRowsDeviceTest {
                             holder.itemView instanceof org.telegram.ui.Cells.TextInfoPrivacyCell);
                     assertFalse(name + " base status accepts taps", holder.itemView.isClickable());
                     assertFalse(name + " base status accepts long presses", holder.itemView.isLongClickable());
+                    assertTrue(name + " lets status taps fall through to the login screen",
+                            ((org.telegram.ui.Cells.TextInfoPrivacyCell) holder.itemView).getTextView().isClickable());
                     assertTrue(name + " has no always-on explanation", containsText(holder.itemView,
                             "Локальный слой всегда включён", "Local base is always on"));
                 }

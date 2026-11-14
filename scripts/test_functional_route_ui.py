@@ -69,7 +69,7 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertIn("v -> colgramShowSourceDiagnostics() : null", bind)
             self.assertIn("cell.setClickable(position == colgramBackgroundProxyRow)", bind)
             self.assertIn("cell.getTextView().setMovementMethod(position == colgramBackgroundProxyRow", bind)
-            self.assertIn("cell.getTextView().setClickable(false)", bind)
+            self.assertIn("cell.getTextView().setClickable(position != colgramBackgroundProxyRow)", bind)
 
     def test_local_base_is_read_only_on_fresh_and_existing_shield_screens(self):
         for original in (self.pristine, self.existing):

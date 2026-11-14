@@ -295,7 +295,8 @@ def add_connection_settings(s):
 def bind_source_details_click(s):
     """Own summary-row touches instead of relying on a links/info cell's selection."""
     if "// COLGRAM_SOURCE_DETAILS_TOUCH = 1" in s:
-        return s
+        return s.replace("cell.getTextView().setClickable(false);",
+                         "cell.getTextView().setClickable(position != colgramBackgroundProxyRow);")
     anchor = "                    TextInfoPrivacyCell cell = (TextInfoPrivacyCell) holder.itemView;"
     if s.count(anchor) != 1:
         raise ValueError("Source details touch anchor missing or ambiguous")
@@ -306,7 +307,7 @@ def bind_source_details_click(s):
                     cell.setClickable(position == colgramBackgroundProxyRow);
                     cell.getTextView().setMovementMethod(position == colgramBackgroundProxyRow
                             ? null : android.text.method.LinkMovementMethod.getInstance());
-                    cell.getTextView().setClickable(false);
+                    cell.getTextView().setClickable(position != colgramBackgroundProxyRow);
                     cell.getTextView().setLongClickable(false);''', 1)
 
 
