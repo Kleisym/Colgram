@@ -39,6 +39,30 @@ public final class ColgramSubscriptionRouteDeviceTest {
     private static final byte[] PONG = "only-vless-peer-answers".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] TEST_IP = {(byte) 192, 0, 2, 23}; // RFC 5737: not a real Internet service
 
+    @Test public void interfaceInventoryUsesCidrPrefixesWithoutIPv6Zones() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext().getApplicationContext();
+        org.colgram.singbox.ColgramPlatformInterface platform = new org.colgram.singbox.ColgramPlatformInterface(context);
+        io.nekohasekai.libbox.NetworkInterfaceIterator interfaces = platform.getInterfaces();
+        int count = 0;
+        while (interfaces.hasNext()) {
+            io.nekohasekai.libbox.NetworkInterface network = interfaces.next();
+            assertTrue((network.getFlags() & android.system.OsConstants.IFF_UP) != 0);
+            io.nekohasekai.libbox.StringIterator addresses = network.getAddresses();
+            while (addresses.hasNext()) {
+                String value = addresses.next();
+                assertFalse(value.contains("%"));
+                int slash = value.indexOf('/');
+                assertTrue(value, slash > 0);
+                InetAddress address = InetAddress.getByName(value.substring(0, slash));
+                int mask = Integer.parseInt(value.substring(slash + 1));
+                assertTrue(mask >= 0 && mask <= (address instanceof java.net.Inet4Address ? 32 : 128));
+                count++;
+            }
+        }
+        assertTrue("No real physical interface addresses reported", count > 0);
+        Log.i("ColgramSubRoute", "INTERFACE_PREFIXES=PASS addresses=" + count);
+    }
+
     @Test public void chosenVlessProfileCarriesTrafficWithoutDirectFallback() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext().getApplicationContext();
         Assume.assumeTrue("Explicitly grant Android VPN permission on an idle disposable emulator first", VpnService.prepare(context) == null);

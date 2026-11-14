@@ -180,6 +180,10 @@ public final class ColgramPlatformInterface implements PlatformInterface {
                     wrapper.setType(typeOf(candidate));
                     wrapper.setIndex(candidate.getIndex());
                     wrapper.setMTU(candidate.getMTU());
+                    int flags = android.system.OsConstants.IFF_UP | android.system.OsConstants.IFF_RUNNING;
+                    if (candidate.supportsMulticast()) flags |= android.system.OsConstants.IFF_MULTICAST;
+                    if (candidate.isPointToPoint()) flags |= android.system.OsConstants.IFF_POINTOPOINT;
+                    wrapper.setFlags(flags);
                     wrapper.setMetered(false);
                     wrapper.setAddresses(addresses(candidate));
                     wrapper.setGateway(null);
@@ -212,9 +216,19 @@ public final class ColgramPlatformInterface implements PlatformInterface {
     private static StringIterator addresses(java.net.NetworkInterface candidate) {
         final List<String> found = new ArrayList<>();
         try {
-            Enumeration<java.net.InetAddress> all = candidate.getInetAddresses();
-            while (all.hasMoreElements()) {
-                found.add(all.nextElement().getHostAddress());
+            for (java.net.InterfaceAddress entry : candidate.getInterfaceAddresses()) {
+                java.net.InetAddress address = entry.getAddress();
+                if (address == null) continue;
+                int prefix = entry.getNetworkPrefixLength();
+                int maximum = address instanceof java.net.Inet4Address ? 32 : 128;
+                if (prefix < 0 || prefix > maximum) continue;
+                String literal = address.getHostAddress();
+                if (literal == null) continue;
+                int zone = literal.indexOf('%');
+                if (zone >= 0) literal = literal.substring(0, zone);
+                // libbox parses every value using netip.MustParsePrefix: neither a bare
+                // address nor an Android link-local zone is valid input to that contract.
+                found.add(literal + "/" + prefix);
             }
         } catch (Throwable ignored) {
             // An interface with no readable address is simply one the engine should avoid.
