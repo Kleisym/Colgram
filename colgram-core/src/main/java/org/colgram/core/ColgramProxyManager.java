@@ -789,6 +789,11 @@ public class ColgramProxyManager {
         }
     }
 
+    /** Carrier availability and the selected Telegram account's connection are distinct facts. */
+    public static boolean isTelegramConnected() {
+        return tgnetConnectionState() == TG_STATE_CONNECTED;
+    }
+
     /** Public entry for the settings screen: re-read the network policy right now. */
     public static void recheckConnectionNow() {
         invalidateNetworkProbeState("manual recheck");
@@ -799,7 +804,7 @@ public class ColgramProxyManager {
     private static void tgnetCheckConnection() {
         try {
             Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Object inst = cm.getMethod("getInstance", int.class).invoke(null, 0);
+            Object inst = cm.getMethod("getInstance", int.class).invoke(null, selectedAccountSlot());
             cm.getMethod("checkConnection").invoke(inst);
         } catch (Throwable t) {
             Log.w(TAG, "could not ask tgnet to re-dial: " + t);
@@ -807,6 +812,33 @@ public class ColgramProxyManager {
     }
 
     private static long lastFreshAddressesAt = -FRESH_ADDRESSES_INTERVAL_MS;
+
+    /** Recreate app-owned MTProto sockets on a new overlay instead of retaining direct retries. */
+    public static void onOverlayTransportChanged(Context context, long routeEpoch) {
+        mainHandler.post(() -> {
+            if (!ColgramRouteEpoch.isCurrent(routeEpoch)) return;
+            invalidateNetworkProbeState("overlay transport changed");
+            ensureLocalBaseRoute(context);
+            final int account = selectedAccountSlot();
+            executor.execute(() -> {
+                if (!ColgramRouteEpoch.isCurrent(routeEpoch)) return;
+                try {
+                    Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                    Object instance = cm.getMethod("getInstance", int.class).invoke(null, account);
+                    try {
+                        cm.getMethod("native_setNetworkAvailable", int.class, boolean.class, int.class, boolean.class)
+                                .invoke(null, account, false, 1, false);
+                    } finally {
+                        // Always restore the captured account, even if the user changed routes meanwhile.
+                        cm.getMethod("checkConnection").invoke(instance);
+                    }
+                    Log.i(TAG, "OVERLAY_RECONNECT account=" + account + " local_base=true native_network_reset=true");
+                } catch (ReflectiveOperationException error) {
+                    Log.w(TAG, "overlay reconnect failed", error);
+                }
+            });
+        });
+    }
 
     /**
      * Ask Telegram for its current server addresses, through Telegram's own mechanism.
@@ -3296,9 +3328,10 @@ public static void reportProxyFailure() {
 
     private static final long PROXY_SELECTION_TIMEOUT_MS = 25_000L;
     private static final int MAX_SELECTION_TCP_CHECKS = 48;
+    private static final int MAX_SELECTION_GUEST_CHECKS = 9;
     private static final int SELECTION_TCP_TIMEOUT_MS = 1_250;
     private static final int MAX_BACKGROUND_TCP_CHECKS = 96;
-    private static final int MAX_BACKGROUND_GUEST_CHECKS = 5;
+    private static final int MAX_BACKGROUND_GUEST_CHECKS = 18;
     private static final long BACKGROUND_PROXY_CHECK_WINDOW_MS = 50_000L;
     private static final long BACKGROUND_PROXY_BUSY_RETRY_MS = 4_000L;
     private static final long BACKGROUND_PROXY_IDLE_MS = 25_000L;
@@ -3375,6 +3408,7 @@ public static void reportProxyFailure() {
         int socksConnected;
         int protocolAnswered;
         int guestAttempts;
+        int guestInFlight;
         boolean guestPending;
         String guestResult = "not-started";
 
@@ -3541,7 +3575,7 @@ public static void reportProxyFailure() {
         // Prefer a fresh or previously verified SOCKS route over a TCP-only MTProto candidate,
         // while alternating types so neither protocol can consume the entire guest window.
         int preferredType = selection.guestAttempts % 2;
-        boolean guestAllowed = !selection.guestPending && selection.guestAttempts < MAX_BACKGROUND_GUEST_CHECKS
+        boolean guestAllowed = selection.guestInFlight < ColgramGuestProxyProbe.MAX_PARALLEL && selection.guestAttempts < MAX_BACKGROUND_GUEST_CHECKS
                 && selection.deadline - now >= ColgramGuestProxyProbe.CHECK_TIMEOUT_MS;
         for (int pass = 0; guestAllowed && pass < 2; pass++) {
             int type = pass == 0 ? preferredType : 1 - preferredType;
@@ -3581,7 +3615,8 @@ public static void reportProxyFailure() {
         boolean started = ColgramGuestProxyProbe.checkThroughBase(appContext, candidate.address, candidate.port,
                 candidate.user, candidate.password, candidate.secret, true, (time, reason) -> {
                     if (backgroundProxySelection != selection) return;
-                    selection.guestPending = false;
+                    selection.guestInFlight--;
+                    selection.guestPending = selection.guestInFlight > 0;
                     if (preflightIsCurrent(selection) && selection.network == networkProbeEpoch.get()
                             && source != currentActiveProxy && endpoint.equals(probeEndpoint(candidate))) {
                         boolean alive = time >= 0;
@@ -3614,12 +3649,14 @@ public static void reportProxyFailure() {
                     backgroundProxyTick(selection);
                 });
         if (started) {
+            selection.guestInFlight++;
             selection.guestPending = true;
             selection.guestAttempts++;
             selection.guestAttempted.add(candidate);
             selection.protocolTargets.add(candidate);
             selection.guestResult = "pending";
-            Log.i(TAG, "PROXY_BACKGROUND_CHECK telegram_attempt=" + selection.guestAttempts + " type=" + candidate.type);
+            Log.i(TAG, "PROXY_BACKGROUND_CHECK telegram_attempt=" + selection.guestAttempts + " type=" + candidate.type
+                    + " parallel=" + selection.guestInFlight);
         }
         return started;
     }
@@ -3912,7 +3949,8 @@ public static void reportProxyFailure() {
     }
 
     private static boolean startGuestSelectionProbe(ProxySelection selection, ProxyItem source, ProxyItem candidate) {
-        if (!selection.guestEligible || selection.guestPending || selection.guestAttempts >= 2
+        if (!selection.guestEligible || selection.guestInFlight >= ColgramGuestProxyProbe.MAX_PARALLEL
+                || selection.guestAttempts >= MAX_SELECTION_GUEST_CHECKS
                 || selection.guestAttempted.contains(candidate)
                 || selection.deadline - SystemClock.elapsedRealtime() < ColgramGuestProxyProbe.CHECK_TIMEOUT_MS
                 || candidate.type == 2) return false;
@@ -3922,7 +3960,8 @@ public static void reportProxyFailure() {
                 (time, reason) -> mainHandler.post(() -> {
                     if (!selectionIsCurrent(selection) || selection.network != networkProbeEpoch.get()) return;
                     selection.inFlight--;
-                    selection.guestPending = false;
+                    selection.guestInFlight--;
+                    selection.guestPending = selection.guestInFlight > 0;
                     boolean alive = time >= 0 && endpoint.equals(probeEndpoint(candidate));
                     selection.guestResult = alive ? "verified" : reason;
                     if (alive) {
@@ -3932,6 +3971,7 @@ public static void reportProxyFailure() {
                     onSelectionProtocolResult(selection, source, candidate, alive);
                 }));
         if (started) {
+            selection.guestInFlight++;
             selection.guestPending = true;
             selection.guestAttempts++;
             selection.guestAttempted.add(candidate);

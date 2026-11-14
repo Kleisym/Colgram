@@ -102,6 +102,34 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertIn("Локальный слой всегда включён", source)
         self.assertIn("PendingIntent.getActivity", source)
 
+    def test_warp_off_dispatches_a_stop_command_instead_of_waiting_for_unbind(self):
+        source = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramMasqueVpnService.java").read_text(encoding="utf-8")
+        stop = method(source, "public static void stop(Context context)")
+        self.assertIn("setAction(ACTION_STOP)", stop)
+        self.assertIn("context.startService(", stop)
+        self.assertNotIn("context.stopService(", stop)
+
+    def test_overlay_activation_reconnects_the_selected_telegram_account(self):
+        manager = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramProxyManager.java").read_text(encoding="utf-8")
+        check = method(manager, "private static void tgnetCheckConnection()")
+        self.assertIn("selectedAccountSlot()", check)
+        hook = method(manager, "public static void onOverlayTransportChanged(")
+        self.assertIn("invalidateNetworkProbeState", hook)
+        self.assertIn("ensureLocalBaseRoute", hook)
+        self.assertIn("native_setNetworkAvailable", hook)
+        self.assertIn("ColgramRouteEpoch.isCurrent", hook)
+        warp = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramWarpTunnel.java").read_text(encoding="utf-8")
+        self.assertIn("ColgramProxyManager.onOverlayTransportChanged(ctx, routeEpoch)", method(warp, "public static void bringUp(Context ctx, long routeEpoch)"))
+
+    def test_warp_transport_status_does_not_claim_telegram_is_connected(self):
+        shield = (ROOT / "scripts/templates/ProxyListWarpControls.java.inc").read_text(encoding="utf-8")
+        settings = (ROOT / "scripts/templates/ColgramSettingsActivity.java").read_text(encoding="utf-8")
+        for source, signature in [(shield, "private String warpStatusForProxyScreen()"),
+                                  (settings, "private String warpStatusLine()")]:
+            body = method(source, signature)
+            self.assertIn("isTelegramConnected()", body)
+            self.assertIn("Telegram", body)
+
     def test_tap_sets_real_desired_state_before_async_start(self):
         for original in (self.pristine, self.existing):
             with self.subTest(pristine=original is self.pristine):

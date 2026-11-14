@@ -753,7 +753,9 @@ public class ColgramSettingsActivity extends BaseFragment {
             return "не работает: " + failure;
         }
         if (org.colgram.core.ColgramWarpTunnel.isUp()) {
-            return (org.colgram.core.ColgramWarpTunnel.isConnected() ? "подключён · " : "подключается · ")
+            return (org.colgram.core.ColgramWarpTunnel.isConnected()
+                    ? ColgramProxyManager.isTelegramConnected() ? "WARP подключён · Telegram доступен · "
+                            : "WARP подключён · ожидаем связь с Telegram · " : "подключается · ")
                     + org.colgram.core.ColgramWarpTunnel.transportDescription();
         }
         if (org.colgram.core.ColgramWarp.isRegistered()) return "выключен · нажмите, чтобы включить";

@@ -224,7 +224,8 @@
             if (stage == null) stage = waitingWarpConsent >= 0 ? "разрешение VPN" : "запуск";
             return stage + " · нажмите для отмены";
         }
-        if (org.colgram.core.ColgramWarpTunnel.isConnected()) return "подключён";
+        if (org.colgram.core.ColgramWarpTunnel.isConnected()) return org.colgram.core.ColgramProxyManager.isTelegramConnected()
+                ? "WARP подключён · Telegram доступен" : "WARP подключён · ожидаем связь с Telegram";
         if (org.colgram.core.ColgramWarpTunnel.isUp()) return "подключается";
         String failure = org.colgram.core.ColgramWarpTunnel.lastFailureReason();
         if (failure == null || failure.isEmpty()) failure = warpUiFailure;

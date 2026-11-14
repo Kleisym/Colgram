@@ -97,6 +97,63 @@ public final class ColgramGuestProxyDeviceTest {
         }
     }
 
+    @Test public void threeAnonymousNativeChecksRunTogetherWithoutTouchingTheMainRoute() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext().getApplicationContext();
+        boolean catalog = ColgramConfig.isBuiltinProxyEnabled();
+        ColgramConfig.setBuiltinProxyEnabled(false);
+        Thread.sleep(11_000L);
+        Map<String, Object> before = savedMainRoute(context);
+        int lanes = ColgramGuestProxyProbe.MAX_PARALLEL;
+        ServerSocket[] peers = new ServerSocket[lanes];
+        CountDownLatch accepted = new CountDownLatch(lanes), finished = new CountDownLatch(lanes), release = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        long started = SystemClock.elapsedRealtime();
+        try {
+            for (int index = 0; index < lanes; index++) {
+                ServerSocket peer = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"));
+                peer.setSoTimeout(8_000); peers[index] = peer;
+                Thread server = new Thread(() -> {
+                    try (Socket socket = peer.accept()) {
+                        socket.setSoTimeout(5_000);
+                        DataInputStream input = new DataInputStream(socket.getInputStream());
+                        OutputStream output = socket.getOutputStream();
+                        assertEquals(5, input.readUnsignedByte());
+                        int methods = input.readUnsignedByte();
+                        for (int item = 0; item < methods; item++) input.readUnsignedByte();
+                        output.write(new byte[]{5, 0}); output.flush();
+                        assertEquals(5, input.readUnsignedByte()); assertEquals(1, input.readUnsignedByte()); input.readUnsignedByte();
+                        int type = input.readUnsignedByte();
+                        assertTrue(type == 1 || type == 4);
+                        byte[] address = new byte[type == 1 ? 4 : 16]; input.readFully(address); input.readUnsignedShort();
+                        output.write(new byte[]{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); output.flush();
+                        assertTrue("Each lane must emit real native MTProto bytes", input.read() >= 0);
+                        accepted.countDown(); release.await(12, TimeUnit.SECONDS);
+                    } catch (Throwable error) { failure.compareAndSet(null, error); accepted.countDown(); }
+                }, "parallel-guest-negative-control-" + index);
+                server.setDaemon(true); server.start();
+                assertTrue("The bounded broker rejected a free parallel slot", ColgramGuestProxyProbe.check(context,
+                        "127.0.0.1", peer.getLocalPort(), "", "", "", false, (rtt, reason) -> {
+                            if (rtt >= 0 || "TG_CONFIG_OK".equals(reason)) failure.compareAndSet(null,
+                                    new AssertionError("A silent fixture was marked Telegram-healthy"));
+                            finished.countDown();
+                        }));
+            }
+            assertTrue("Native lanes were serialized instead of starting together", accepted.await(6, TimeUnit.SECONDS));
+            if (failure.get() != null) throw new AssertionError("Parallel fixture failed", failure.get());
+            assertTrue("Parallel checks exceeded one shared timeout window", finished.await(7, TimeUnit.SECONDS));
+            assertTrue("Parallel checks took serial-timeout duration", SystemClock.elapsedRealtime() - started < 13_000L);
+            if (failure.get() != null) throw new AssertionError("Parallel verdict failed", failure.get());
+            assertEquals(before, savedMainRoute(context));
+            Log.i(TAG, "GUEST_PARALLEL=PASS lanes=" + lanes + " native_requests=true false_positive=false main_route=UNCHANGED elapsed_ms="
+                    + (SystemClock.elapsedRealtime() - started));
+        } finally {
+            release.countDown();
+            for (ServerSocket peer : peers) if (peer != null) peer.close();
+            ColgramConfig.setBuiltinProxyEnabled(catalog);
+            context.getSharedPreferences("colgram_secure_config", Context.MODE_PRIVATE).edit().putBoolean("builtin_proxy_enabled", catalog).commit();
+        }
+    }
+
     private static ProbeResult runProbe(Context context, int port, boolean publicOnly) throws Exception {
         AtomicReference<ProbeResult> answer = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);

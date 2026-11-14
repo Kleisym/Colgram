@@ -13,134 +13,135 @@ import android.os.Messenger;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
-
 import org.colgram.core.ColgramGuestProxyProbe;
 import org.colgram.core.ColgramProcess;
 import org.colgram.core.ColgramProxyPolicy;
 import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.NativeLoader;
-
 import java.io.File;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
-/** Reuses the pinned MTProto engine with an anonymous cache and no live account state. */
+/** Bounded anonymous MTProto lanes; each owns a distinct cache, account slot and RPC. */
 public final class ColgramGuestProxyService extends Service {
-    private static final int ACCOUNT = 0;
     private static final long RPC_TIMEOUT_MS = 8_000L;
     private static final AtomicInteger TOKENS = new AtomicInteger(600_000);
+    private static final boolean[] initialized = new boolean[ColgramGuestProxyProbe.MAX_PARALLEL];
     private static volatile boolean probeProcess;
     private static volatile ColgramGuestProxyService service;
-    private static boolean initialized;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Messenger inbound = new Messenger(new Handler(Looper.getMainLooper(), this::receive));
-    private final Runnable timeout = () -> finish(-1, ColgramGuestProxyProbe.TIMEOUT);
-    private Messenger reply;
-    private volatile int token;
-    private long started;
+    private final AtomicReferenceArray<Probe> probes = new AtomicReferenceArray<>(ColgramGuestProxyProbe.MAX_PARALLEL);
 
-    /** Set before loading the library so its static callbacks cannot open the real account. */
     public static void enterProbeProcess() { probeProcess = true; }
     public static boolean inProbeProcess() { return probeProcess; }
-
     @Override public IBinder onBind(Intent intent) {
         return probeProcess && ColgramProcess.isGuestProxyProcess(this) ? inbound.getBinder() : null;
     }
 
     private boolean receive(Message message) {
-        if (message.what != ColgramGuestProxyProbe.CHECK || message.replyTo == null
-                || message.sendingUid != Process.myUid() || !probeProcess) return false;
-        if (reply != null) {
-            deliver(message.replyTo, -1, "TG_PROBE_BUSY");
-            return true;
-        }
-        reply = message.replyTo;
-        started = SystemClock.elapsedRealtime();
-        service = this;
-        main.postDelayed(timeout, RPC_TIMEOUT_MS);
+        if (message.sendingUid != Process.myUid() || !probeProcess) return false;
         Bundle target = message.getData();
-        final String host = target.getString("host", "");
-        final int port = target.getInt("port");
-        if (host.isEmpty() || host.length() > 255 || port < 1 || port > 65535) {
-            finish(-1, "INVALID_PROXY");
+        int account = target.getInt("lane", -1);
+        long ticket = target.getLong("ticket", 0L);
+        if (account < 0 || account >= ColgramGuestProxyProbe.MAX_PARALLEL || ticket == 0L) return false;
+        if (message.what == ColgramGuestProxyProbe.CANCEL) {
+            Probe existing = probes.get(account);
+            if (existing != null && existing.ticket == ticket) existing.finish(-1L, "TG_PROBE_CANCELLED");
             return true;
         }
-        final Messenger request = reply;
-        final String user = target.getString("user", "");
-        final String pass = target.getString("pass", "");
-        final String secret = target.getString("secret", "");
-        final boolean publicOnly = target.getBoolean("publicOnly");
-        Thread resolve = new Thread(() -> {
-            try {
-                InetAddress[] addresses = InetAddress.getAllByName(host);
-                InetAddress chosen = null;
-                for (InetAddress address : addresses) {
-                    if (publicOnly && !ColgramProxyPolicy.isPublicAddress(address)) continue;
-                    if (chosen == null) chosen = address;
-                    if (address instanceof Inet4Address) {
-                        chosen = address;
-                        break;
-                    }
-                }
-                if (chosen == null) {
-                    main.post(() -> {
-                        if (reply == request) finish(-1, "NON_PUBLIC_PROXY");
-                    });
-                    return;
-                }
-                String address = chosen.getHostAddress();
-                main.post(() -> {
-                    if (reply == request) open(address, port, user, pass, secret);
-                });
-            } catch (Exception failure) {
-                main.post(() -> {
-                    if (reply == request) finish(-1, "PROXY_DNS_FAILED");
-                });
-            }
-        }, "colgram-probe-resolve");
-        resolve.setDaemon(true);
-        resolve.start();
+        if (message.what != ColgramGuestProxyProbe.CHECK || message.replyTo == null) return false;
+        if (probes.get(account) != null) { deliver(message.replyTo, -1L, "TG_PROBE_BUSY"); return true; }
+        Probe probe = new Probe(account, ticket, message.replyTo);
+        probes.set(account, probe);
+        service = this;
+        probe.resolve(target);
         return true;
     }
 
-    private void open(String address, int port, String user, String pass, String secret) {
-        try {
-            if (!initialized) {
-                NativeLoader.loadPackagedForGuestProbe();
-                ConnectionsManager.native_setJava(false);
-                File cache = new File(getCacheDir(), "guest-route-probe");
-                if (!cache.isDirectory() && !cache.mkdirs()) {
-                    finish(-1, "TG_PROBE_UNAVAILABLE");
-                    return;
-                }
-                PackageInfo pkg = getPackageManager().getPackageInfo(getPackageName(), 0);
-                ConnectionsManager.native_init(ACCOUNT, pkg.versionCode, TLRPC.LAYER, BuildVars.APP_ID,
-                        "Android", "SDK " + Build.VERSION.SDK_INT, pkg.versionName, "en", "en",
-                        cache.getAbsolutePath(), "", "", "", "", getPackageName(), 0,
-                        0L, false, false, false, 1, 0);
-                initialized = true;
+    private final class Probe {
+        final int account;
+        final long ticket;
+        final Messenger reply;
+        final long started = SystemClock.elapsedRealtime();
+        final Runnable timeout = () -> finish(-1L, ColgramGuestProxyProbe.TIMEOUT);
+        volatile int token;
+        Probe(int account, long ticket, Messenger reply) {
+            this.account = account; this.ticket = ticket; this.reply = reply;
+        }
+        boolean current() { return probes.get(account) == this; }
+        void resolve(Bundle target) {
+            main.postDelayed(timeout, RPC_TIMEOUT_MS);
+            String host = target.getString("host", "");
+            int port = target.getInt("port");
+            if (host.isEmpty() || host.length() > 255 || port < 1 || port > 65535) {
+                finish(-1L, "INVALID_PROXY"); return;
             }
-            ConnectionsManager.native_setProxySettings(ACCOUNT, address, port,
-                    user == null ? "" : user, pass == null ? "" : pass, secret == null ? "" : secret);
-            ConnectionsManager.native_setNetworkAvailable(ACCOUNT, true, 1, false);
-            ConnectionsManager.native_resumeNetwork(ACCOUNT, false);
-            TLRPC.TL_help_getConfig request = new TLRPC.TL_help_getConfig();
-            NativeByteBuffer buffer = new NativeByteBuffer(request.getObjectSize());
-            request.serializeToStream(buffer);
-            token = TOKENS.incrementAndGet();
-            int flags = ConnectionsManager.RequestFlagEnableUnauthorized | ConnectionsManager.RequestFlagWithoutLogin;
-            ConnectionsManager.native_sendRequest(ACCOUNT, buffer.address, flags,
-                    ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true, token);
-        } catch (Exception | LinkageError failure) {
-            finish(-1, "TG_PROBE_UNAVAILABLE");
+            String user = target.getString("user", ""), pass = target.getString("pass", ""), secret = target.getString("secret", "");
+            boolean publicOnly = target.getBoolean("publicOnly");
+            Thread resolver = new Thread(() -> {
+                try {
+                    InetAddress chosen = null;
+                    for (InetAddress address : InetAddress.getAllByName(host)) {
+                        if (publicOnly && !ColgramProxyPolicy.isPublicAddress(address)) continue;
+                        if (chosen == null) chosen = address;
+                        if (address instanceof Inet4Address) { chosen = address; break; }
+                    }
+                    if (chosen == null) { main.post(() -> finish(-1L, "NON_PUBLIC_PROXY")); return; }
+                    String address = chosen.getHostAddress();
+                    main.post(() -> { if (current()) open(address, port, user, pass, secret); });
+                } catch (Exception error) { main.post(() -> finish(-1L, "PROXY_DNS_FAILED")); }
+            }, "colgram-probe-resolve-" + account);
+            resolver.setDaemon(true); resolver.start();
+        }
+        void open(String address, int port, String user, String pass, String secret) {
+            try {
+                if (!initialized[account]) {
+                    NativeLoader.loadPackagedForGuestProbe();
+                    ConnectionsManager.native_setJava(false);
+                    File cache = new File(getCacheDir(), account == 0 ? "guest-route-probe" : "guest-route-probe-" + account);
+                    if (!cache.isDirectory() && !cache.mkdirs()) { finish(-1L, "TG_PROBE_UNAVAILABLE"); return; }
+                    PackageInfo pkg = getPackageManager().getPackageInfo(getPackageName(), 0);
+                    ConnectionsManager.native_init(account, pkg.versionCode, TLRPC.LAYER, BuildVars.APP_ID,
+                            "Android", "SDK " + Build.VERSION.SDK_INT, pkg.versionName, "en", "en",
+                            cache.getAbsolutePath(), "", "", "", "", getPackageName(), 0,
+                            0L, false, false, false, 1, 0);
+                    initialized[account] = true;
+                }
+                ConnectionsManager.native_setProxySettings(account, address, port,
+                        user == null ? "" : user, pass == null ? "" : pass, secret == null ? "" : secret);
+                ConnectionsManager.native_setNetworkAvailable(account, true, 1, false);
+                ConnectionsManager.native_resumeNetwork(account, false);
+                TLRPC.TL_help_getConfig request = new TLRPC.TL_help_getConfig();
+                NativeByteBuffer buffer = new NativeByteBuffer(request.getObjectSize());
+                request.serializeToStream(buffer);
+                token = TOKENS.incrementAndGet();
+                int flags = ConnectionsManager.RequestFlagEnableUnauthorized | ConnectionsManager.RequestFlagWithoutLogin;
+                ConnectionsManager.native_sendRequest(account, buffer.address, flags,
+                        ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true, token);
+            } catch (Exception | LinkageError error) { finish(-1L, "TG_PROBE_UNAVAILABLE"); }
+        }
+        void finish(long time, String reason) {
+            if (!probes.compareAndSet(account, this, null)) return;
+            main.removeCallbacks(timeout);
+            int request = token; token = 0;
+            if (initialized[account]) {
+                ConnectionsManager.native_setNetworkAvailable(account, false, 1, false);
+                if (request != 0) ConnectionsManager.native_cancelRequest(account, request, false);
+                ConnectionsManager.native_pauseNetwork(account);
+            }
+            deliver(reply, time, reason);
         }
     }
 
-    /** Called on tgnet's thread while the response buffer still belongs to the engine. */
+    /** Called on tgnet's thread while the response buffer is still owned by the engine. */
     public static void onRequestComplete(int account, int request, long pointer) {
         ColgramGuestProxyService active = service;
-        if (active == null || account != ACCOUNT || active.token != request) return;
+        if (active == null || account < 0 || account >= ColgramGuestProxyProbe.MAX_PARALLEL) return;
+        Probe probe = active.probes.get(account);
+        if (probe == null || probe.token != request) return;
         boolean accepted = false;
         try {
             if (pointer != 0) {
@@ -152,41 +153,23 @@ public final class ColgramGuestProxyService extends Service {
         } catch (RuntimeException ignored) { }
         boolean verified = accepted;
         active.main.post(() -> {
-            if (active.token != request) return;
-            active.finish(verified ? Math.max(1L, SystemClock.elapsedRealtime() - active.started) : -1L,
+            if (!probe.current() || probe.token != request) return;
+            probe.finish(verified ? Math.max(1L, SystemClock.elapsedRealtime() - probe.started) : -1L,
                     verified ? "TG_CONFIG_OK" : "TG_CONFIG_REJECTED");
         });
     }
-
     private static void deliver(Messenger messenger, long time, String reason) {
-        if (messenger == null) return;
-        Message reply = Message.obtain(null, ColgramGuestProxyProbe.RESULT);
-        Bundle result = new Bundle();
-        result.putLong("time", time);
-        result.putString("reason", reason);
-        reply.setData(result);
-        try { messenger.send(reply); } catch (RemoteException callerGone) { }
+        Message result = Message.obtain(null, ColgramGuestProxyProbe.RESULT);
+        Bundle verdict = new Bundle();
+        verdict.putLong("time", time); verdict.putString("reason", reason); result.setData(verdict);
+        try { messenger.send(result); } catch (RemoteException callerGone) { }
     }
-
-    private void finish(long time, String reason) {
-        main.removeCallbacks(timeout);
-        int request = token;
-        token = 0;
-        if (service == this) service = null;
-        if (initialized) {
-            // Leave the previous proxy installed in this *guest* native instance.
-            // Disable network before ending the request; never let it retry directly.
-            ConnectionsManager.native_setNetworkAvailable(ACCOUNT, false, 1, false);
-            if (request != 0) ConnectionsManager.native_cancelRequest(ACCOUNT, request, false);
-            ConnectionsManager.native_pauseNetwork(ACCOUNT);
-        }
-        Messenger caller = reply;
-        reply = null;
-        deliver(caller, time, reason);
-    }
-
     @Override public void onDestroy() {
-        if (reply != null) finish(-1, "TG_PROBE_DISCONNECTED");
+        for (int account = 0; account < probes.length(); account++) {
+            Probe probe = probes.get(account);
+            if (probe != null) probe.finish(-1L, "TG_PROBE_DISCONNECTED");
+        }
+        if (service == this) service = null;
         super.onDestroy();
     }
 }

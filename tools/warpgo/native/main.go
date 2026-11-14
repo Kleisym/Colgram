@@ -474,6 +474,7 @@ type tunnelConn struct {
 	writeDeadline time.Time
 	seq           uint32
 	ack           uint32
+	receiver      *tcpReceiveState
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -1430,75 +1431,34 @@ func (c *tunnelConn) feed(ip []byte) {
 				// A second SYN|ACK after the flow is up is answered with a bare ACK carrying our
 				// current sequence number. Answering it with another SYN, or with an ACK whose
 				// sequence is stale, is what makes the edge reply RST and tear the session down.
-				c.ack = seq + 1
+				// A duplicate SYN/ACK must not rewind an established receive sequence.
 				c.emit(nil, 0x10)
 			}
 		}
 		c.mu.Unlock()
 		return
 	}
-	// Every segment the far side sends advances what this side acknowledges - payload or not.
-	//
-	// The acknowledgement was only moved when a segment carried payload, so a bare ACK left it where the
-	// handshake had put it. That number is then frozen into every packet for the rest of the flow:
-	//
-	//   WRITE 0x018  76 bytes  seq=110508361  ack=3085367042
-	//   WRITE 0x018  76 bytes  seq=110508437  ack=3085367042
-	//   WRITE 0x018  76 bytes  seq=110508513  ack=3085367042
-	//   WRITE 0x018 1100 bytes seq=110508665  ack=3085367042
-	//
-	// Four data segments and a ClientHello, every one claiming to have received nothing since the
-	// SYN-ACK. The edge acknowledged them - it sent eight bare ACKs whose own sequence numbers advanced
-	// in order - and then stopped, because a peer whose window never moves has told it that nothing it
-	// sends is being received:
-	//
-	//   plaintext trace returned 0 bytes, sent=15 recv=7
-	//
-	// That is the last thing that had to be wrong for the edge to carry traffic and this client to see
-	// nothing: the packets were well formed, the capsules were well framed, and the acknowledgement the
-	// far side reads off every one of them said it had heard nothing at all.
-	if len(payload) > 0 {
-		c.ack = seq + uint32(len(payload))
-		c.inbuf = append(c.inbuf, payload...)
-		// Acknowledge what arrived.
-		//
-		// The buffer was filled and nothing was sent back, so the far side kept its own send window
-		// closed and the flow stalled after the handshake:
-		//
-		//   h2 peer open, sent=7 recv=2      SYN out, SYN-ACK in, ACK out
-		//   tls inside tunnel: i/o timeout    ClientHello out, nothing back, ever
-		//
-		// `sent` rising and `recv` frozen is that: the ClientHello left and the server's reply never did,
-		// because nothing told the server its window was open. TCP has no other way to say so.
-		c.emit(nil, 0x10)
-	} else {
-		// A bare ACK still moves the window. TCP's acknowledgement is cumulative: acknowledging a segment
-		// with no data acknowledges every byte before it, so `seq` alone is the next byte this side expects.
-		//
-		// Segments carrying the SYN or the FIN each consume one sequence number, which is why the handshake
-		// branch adds one and this one does not - a payload-free ACK with neither flag is exactly the next
-		// byte expected, and adding one here would acknowledge a byte that has not arrived.
-		c.ack = seq
-		c.emit(nil, 0x10)
-	}
-	// RST must not be acknowledged. Replying to it is what made the edge re-open the flow with a
-	// fresh SYN, which in turn tore down the session mid-handshake.
 	if flags&0x04 != 0 {
 		c.eof = true
 		c.wakeReader()
 		c.mu.Unlock()
 		return
 	}
-	if flags&0x01 != 0 {
-		c.ack = seq + uint32(len(payload)) + 1
-		c.emit(nil, 0x11)
-		c.eof = true
-		c.wakeReader()
-		c.mu.Unlock()
-		return
+	if c.receiver == nil {
+		c.receiver = &tcpReceiveState{next: c.ack}
 	}
-	c.emit(nil, 0x10)
-	c.wakeReader()
+	ordered := c.receiver.push(seq, payload, flags&0x01 != 0)
+	c.ack = c.receiver.next
+	c.inbuf = append(c.inbuf, ordered...)
+	if c.receiver.eof {
+		c.eof = true
+	}
+	if len(payload) > 0 || flags&0x01 != 0 {
+		c.emit(nil, 0x10)
+	}
+	if len(ordered) > 0 || c.eof {
+		c.wakeReader()
+	}
 	c.mu.Unlock()
 }
 
@@ -4551,7 +4511,7 @@ func resolveViaFamily(ctx context.Context, e dohEndpoint, host, family string, r
 	// host and verified as another - which is the whole point.
 	req.Host = e.verifyName
 	client := &http.Client{
-		Timeout: 1200 * time.Millisecond,
+		Timeout:       1200 * time.Millisecond,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{

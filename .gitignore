@@ -90,6 +90,8 @@ colgram-core/src/main/assets/antispam/__pycache__/
 
 # Native staging; only verified libraries in colgram-core are shipped.
 tools/warpgo/native/out/
+tools/warpgo/native/out_*.so
+tools/warpgo/native/out_*.h
 
 # Version-pinned native APK cache and prior generated libraries.
 .native-cache/

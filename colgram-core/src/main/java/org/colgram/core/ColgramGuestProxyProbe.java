@@ -17,10 +17,12 @@ public final class ColgramGuestProxyProbe {
     public static final long CHECK_TIMEOUT_MS = 10_000L;
     public static final int CHECK = 1;
     public static final int RESULT = 2;
+    public static final int CANCEL = 3;
+    public static final int MAX_PARALLEL = 3;
     public static final String TIMEOUT = "TG_CONFIG_TIMEOUT";
     private static final String SERVICE = "org.telegram.tgnet.ColgramGuestProxyService";
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
-    private static Attempt active;
+    private static final ColgramProbeLanes LANES = new ColgramProbeLanes(MAX_PARALLEL);
 
     private ColgramGuestProxyProbe() { }
 
@@ -31,6 +33,7 @@ public final class ColgramGuestProxyProbe {
                                            String user, String pass, String secret, boolean publicOnly,
                                            Result result) {
         if (result == null || host == null) return false;
+        if (!LANES.hasCapacity()) return false;
         // Public callers supply the numeric address pinned by their preflight; no DNS rebinding.
         if (publicOnly) {
             if (!(host.matches("[0-9.]+") || host.indexOf(':') >= 0)) return false;
@@ -53,17 +56,20 @@ public final class ColgramGuestProxyProbe {
     public static synchronized boolean check(Context context, String host, int port,
                                              String user, String pass, String secret, boolean publicOnly,
                                              Result result) {
-        if (active != null || context == null || result == null || host == null || host.isEmpty()
+        if (context == null || result == null || host == null || host.isEmpty()
                 || host.length() > 255 || port < 1 || port > 65535) return false;
+        ColgramProbeLanes.Ticket ticket = LANES.acquire();
+        if (ticket == null) return false;
         Bundle target = new Bundle();
+        target.putInt("lane", ticket.lane());
+        target.putLong("ticket", ticket.id());
         target.putString("host", host);
         target.putInt("port", port);
         target.putString("user", user);
         target.putString("pass", pass);
         target.putString("secret", secret);
         target.putBoolean("publicOnly", publicOnly);
-        Attempt attempt = new Attempt(context.getApplicationContext(), target, result);
-        active = attempt;
+        Attempt attempt = new Attempt(context.getApplicationContext(), target, result, ticket);
         MAIN.post(attempt::bind);
         return true;
     }
@@ -72,6 +78,7 @@ public final class ColgramGuestProxyProbe {
         final Context app;
         final Bundle target;
         final Result result;
+        final ColgramProbeLanes.Ticket ticket;
         final Runnable timeout = () -> finish(-1, TIMEOUT);
         final Messenger replies = new Messenger(new Handler(Looper.getMainLooper(), message -> {
             if (message.what != RESULT) return false;
@@ -81,11 +88,13 @@ public final class ColgramGuestProxyProbe {
         }));
         boolean bound;
         boolean finished;
+        Messenger remoteMessenger;
 
-        Attempt(Context app, Bundle target, Result result) {
+        Attempt(Context app, Bundle target, Result result, ColgramProbeLanes.Ticket ticket) {
             this.app = app;
             this.target = target;
             this.result = result;
+            this.ticket = ticket;
         }
 
         void bind() {
@@ -105,7 +114,8 @@ public final class ColgramGuestProxyProbe {
             request.setData(target);
             request.replyTo = replies;
             try {
-                new Messenger(remote).send(request);
+                remoteMessenger = new Messenger(remote);
+                remoteMessenger.send(request);
             } catch (RemoteException disconnected) {
                 finish(-1, "TG_PROBE_DISCONNECTED");
             }
@@ -119,14 +129,21 @@ public final class ColgramGuestProxyProbe {
             if (finished) return;
             finished = true;
             MAIN.removeCallbacks(timeout);
+            if (remoteMessenger != null) {
+                Message cancel = Message.obtain(null, CANCEL);
+                Bundle owned = new Bundle();
+                owned.putInt("lane", ticket.lane());
+                owned.putLong("ticket", ticket.id());
+                cancel.setData(owned);
+                try { remoteMessenger.send(cancel); } catch (RemoteException alreadyClosed) { }
+                remoteMessenger = null;
+            }
             if (bound) {
                 try { app.unbindService(this); } catch (IllegalArgumentException alreadyUnbound) { }
                 bound = false;
             }
             target.clear();
-            synchronized (ColgramGuestProxyProbe.class) {
-                if (active == this) active = null;
-            }
+            LANES.release(ticket);
             result.complete(timeMs, reason);
         }
     }

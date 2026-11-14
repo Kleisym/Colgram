@@ -21,6 +21,11 @@ TC="$NDK_ROOT/toolchains/llvm/prebuilt/windows-x86_64"
 [ -d "$TC" ] || TC="$NDK_ROOT/toolchains/llvm/prebuilt/darwin-x86_64"
 SYSROOT="$TC/sysroot"
 JDK_INCLUDE="${JDK_INCLUDE:-C:/Colgram/tools/jdk17/jdk-17.0.20.1+1/include}"
+JNI_PLATFORM_INCLUDE="${PWD}/jniinc/android"
+if command -v cygpath >/dev/null 2>&1; then
+  # Windows go.exe invokes clang.cmd without MSYS path rewriting.
+  JNI_PLATFORM_INCLUDE="$(cygpath -m "$JNI_PLATFORM_INCLUDE")"
+fi
 
 # abi:goarch:clang-prefix
 ABIS="arm64-v8a:arm64:aarch64-linux-android21
@@ -39,7 +44,7 @@ for entry in $ABIS; do
   echo "building $abi ($goarch) with $prefix"
   GOOS=android GOARCH="$goarch" CGO_ENABLED=1 \
   CC="$CC" \
-  CGO_CFLAGS="--sysroot=$SYSROOT -I${PWD}/jniinc/android -I$JDK_INCLUDE" \
+  CGO_CFLAGS="--sysroot=$SYSROOT -I$JNI_PLATFORM_INCLUDE -I$JDK_INCLUDE" \
   CGO_LDFLAGS="" \
     go build -buildmode=c-shared -o "out_$abi.so" .
 done

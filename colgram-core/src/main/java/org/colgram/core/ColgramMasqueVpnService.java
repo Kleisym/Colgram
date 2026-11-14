@@ -71,7 +71,11 @@ public final class ColgramMasqueVpnService extends VpnService {
     }
 
     public static void stop(Context context) {
-        if (context != null) context.stopService(new Intent(context, ColgramMasqueVpnService.class));
+        if (context == null) return;
+        // Android may still hold the VpnService binding. stopService alone defers
+        // onDestroy until that binding disappears, leaving the TUN routing packets.
+        // The explicit command closes the TUN immediately, before stopSelf/unbind.
+        context.startService(new Intent(context, ColgramMasqueVpnService.class).setAction(ACTION_STOP));
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
