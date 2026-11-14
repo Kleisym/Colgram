@@ -10,7 +10,7 @@ func TestEnrolmentTLSUsesAPIHostAndKeepsVerification(t *testing.T) {
 	if config.ServerName != apiHost || config.InsecureSkipVerify {
 		t.Fatal("enrolment must authenticate the actual Cloudflare API hostname")
 	}
-	if config.MinVersion < tls.VersionTLS12 || len(config.NextProtos) != 1 || config.NextProtos[0] != "http/1.1" {
-		t.Fatal("enrolment must negotiate TLS 1.2+ and HTTP/1.1")
+	if config.MinVersion < tls.VersionTLS12 || len(config.NextProtos) != 0 {
+		t.Fatal("enrolment must use TLS 1.2+ and let the selected HTTP transport negotiate ALPN")
 	}
 }

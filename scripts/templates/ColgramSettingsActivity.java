@@ -76,8 +76,9 @@ public class ColgramSettingsActivity extends BaseFragment {
     private static final java.util.concurrent.ExecutorService warpOperations =
             org.colgram.core.ColgramRouteControl.OPERATIONS;
     private final android.os.Handler uiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final ColgramSubscriptionControls subscription =
+            new ColgramSubscriptionControls(this, REQ_SUBSCRIPTION_VPN, this::refreshSettings);
     private long waitingWarpConsent = -1L;
-    private long waitingSubscriptionConsent = -1L;
     private long warpRouteEpoch = -1L;
     private boolean screenVisible;
     private String lastVisibleNetworkState = "";
@@ -153,21 +154,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             }
             return;
         }
-        if (requestCode == REQ_SUBSCRIPTION_VPN) {
-            final long token = waitingSubscriptionConsent;
-            waitingSubscriptionConsent = -1L;
-            if (token < 0 || !ColgramRouteEpoch.isCurrent(token)) return;
-            Context context = getContext();
-            if (resultCode == android.app.Activity.RESULT_OK) {
-                if (context != null) startSubscriptionTunnel(context, token);
-            } else if (context != null) {
-                // Without the consent the tunnel cannot exist, and saying so plainly beats a
-                // switch that appears to work while nothing is routed.
-                Toast.makeText(context,
-                        "Без разрешения на VPN туннель не запускается", Toast.LENGTH_LONG).show();
-            }
-            return;
-        }
+        if (subscription.onActivityResult(requestCode, resultCode)) return;
         super.onActivityResultFragment(requestCode, resultCode, data);
     }
 
@@ -265,15 +252,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                 Context routeContext = getContext();
                 if (routeContext != null) { cancelWarp(routeContext); stopSubscriptionTunnel(routeContext); }
                 ColgramRouteEpoch.next();
-                waitingSubscriptionConsent = -1L;
                 ColgramProxyManager.cancelProxySelection();
             }
             if (position == cloudflareWarpRow) {
                 openCloudflareWarp();
             } else if (position == subscriptionRow) {
-                openSubscription();
+                subscription.showMenu();
             } else if (position == subscriptionNodeRow) {
-                showSubscriptionNodes();
+                subscription.showNodes();
             } else if (position == publicProxyRow) {
                 if (ColgramProxyManager.isProxySelectionPending()) {
                     ColgramRouteEpoch.next();
@@ -513,6 +499,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     public void onFragmentDestroy() {
         screenVisible = false;
         uiHandler.removeCallbacks(refreshVisibleNetworkState);
+        subscription.abandonConsent();
         if (waitingWarpConsent >= 0 && warpOperationsGate.isCurrent(waitingWarpConsent)
                 && warpOperationsGate.isPending()) {
             Context context = getContext();
@@ -665,7 +652,6 @@ public class ColgramSettingsActivity extends BaseFragment {
         final long token = warpOperationsGate.begin();
         warpRouteEpoch = ColgramRouteEpoch.next();
         ColgramProxyManager.cancelProxySelection();
-        waitingSubscriptionConsent = -1L;
         stopSubscriptionTunnel(context);
         waitingWarpConsent = token;
         // This is the desired route, not proof of a connection. It also suppresses late proxy results.
@@ -694,7 +680,6 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private void cancelWarp(Context context) {
         ColgramRouteEpoch.next();
-        waitingSubscriptionConsent = -1L;
         warpOperationsGate.cancel();
         waitingWarpConsent = -1L;
         ColgramConfig.setWarpEnabled(false);
@@ -721,202 +706,8 @@ public class ColgramSettingsActivity extends BaseFragment {
         });
     }
 
-    /**
-     * Paste a subscription link, and switch the tunnel to it.
-     *
-     * The link is the user's paid access to someone else's server, so it is only ever handed to
-     * the store inside the app's own storage and never leaves it in a log. The parse happens on a
-     * worker thread because a subscription can carry a few hundred nodes, and a link that turns
-     * out to be unusable has to say so at paste time - otherwise the tunnel comes up and routes
-     * nothing, which is indistinguishable from a broken subscription.
-     */
-    private void openSubscription() {
-        final Context context = getContext();
-        if (context == null || getParentActivity() == null) return;
-        if (!org.colgram.core.ColgramSubscriptionStore.hasSubscription(context)) {
-            importSubscription();
-            return;
-        }
-        new AlertDialog.Builder(getParentActivity()).setTitle("Свои VPN-ключи / подписка")
-                .setItems(new String[]{"Подключить выбранный узел", "Выбрать узел / страну из подписки",
-                        "Импортировать другую подписку", "Отключить VPN", "Удалить подписку"}, (dialog, which) -> {
-                    if (which == 0) {
-                        org.colgram.core.ColgramSubscriptionStore.State state = org.colgram.core.ColgramSubscriptionStore.current(context);
-                        if (state != null) selectSubscriptionNode(state.selected);
-                    } else if (which == 1) showSubscriptionNodes();
-                    else if (which == 2) importSubscription();
-                    else if (which == 3) {
-                        ColgramRouteEpoch.next();
-                        waitingSubscriptionConsent = -1L;
-                        stopSubscriptionTunnel(context);
-                        refreshSettings();
-                    } else {
-                        new AlertDialog.Builder(getParentActivity()).setTitle("Удалить подписку?")
-                                .setMessage("Удалятся сохранённые ключи и выбранный узел.")
-                                .setPositiveButton("Удалить", (d, w) -> {
-                                    ColgramRouteEpoch.next();
-                                    waitingSubscriptionConsent = -1L;
-                                    stopSubscriptionTunnel(context);
-                                    org.colgram.core.ColgramSubscriptionStore.clear(context);
-                                    refreshSettings();
-                                }).setNegativeButton("Отмена", null).show();
-                    }
-                }).setNegativeButton("Отмена", null).show();
-    }
-
-    private void showSubscriptionNodes() {
-        final Context context = getContext();
-        if (context == null || getParentActivity() == null) return;
-        if (!org.colgram.core.ColgramSubscriptionStore.hasSubscription(context)) { importSubscription(); return; }
-        warpOperations.execute(() -> {
-            java.util.List<org.colgram.core.ColgramSubscription.Node> nodes =
-                    org.colgram.core.ColgramSubscriptionStore.nodes(context);
-            uiHandler.post(() -> {
-                if (getParentActivity() == null) return;
-                if (nodes.isEmpty()) { Toast.makeText(context, "В подписке нет подходящих узлов", Toast.LENGTH_LONG).show(); return; }
-                String[] labels = new String[nodes.size()];
-                for (int i = 0; i < labels.length; i++) {
-                    org.colgram.core.ColgramSubscription.Node node = nodes.get(i);
-                    labels[i] = (node.name == null || node.name.isEmpty() ? "Узел " + (i + 1) : node.name)
-                            + " · " + node.protocol;
-                }
-                new AlertDialog.Builder(getParentActivity()).setTitle("Узел / страна: названия провайдера")
-                        .setItems(labels, (d, which) -> selectSubscriptionNode(which))
-                        .setNegativeButton("Отмена", null).show();
-            });
-        });
-    }
-
-    private void selectSubscriptionNode(final int which) {
-        final Context context = getContext();
-        if (context == null) return;
-        cancelWarp(context);
-        ColgramProxyManager.cancelProxySelection();
-        final long token = ColgramRouteEpoch.next();
-        warpOperations.execute(() -> {
-            if (!ColgramRouteEpoch.isCurrent(token)) return;
-            try {
-                org.colgram.core.ColgramSubscriptionStore.select(context, which);
-                uiHandler.post(() -> {
-                    if (!ColgramRouteEpoch.isCurrent(token) || getParentActivity() == null) return;
-                    refreshSettings();
-                    startSubscriptionTunnel(context, token);
-                });
-            } catch (Throwable failure) {
-                uiHandler.post(() -> {
-                    if (ColgramRouteEpoch.isCurrent(token) && getParentActivity() != null)
-                        Toast.makeText(context, "Узел не выбран: " + failure.getMessage(), Toast.LENGTH_LONG).show();
-                });
-            }
-        });
-    }
-
-    private void importSubscription() {
-        final Context context = getContext();
-        if (context == null) return;
-
-        final android.widget.EditText input = new android.widget.EditText(context);
-        input.setHint("https://подписка… или vless://… / ss://…");
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        input.setTextSize(13);
-        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
-                | android.text.InputType.TYPE_TEXT_VARIATION_URI);
-        input.setSingleLine(false);
-        input.setMinLines(3);
-        input.setMaxLines(6);
-        // Long links are unreadable on one line, and a link the user cannot check is a link they
-        // will not trust.
-        input.setHorizontallyScrolling(false);
-
-        org.telegram.ui.ActionBar.AlertDialog.Builder builder =
-                new org.telegram.ui.ActionBar.AlertDialog.Builder(getParentActivity());
-        builder.setTitle("Подписка на VPN");
-        builder.setMessage("Вставьте ссылку подписки или ключ из бота. Название страны берётся у провайдера, "
-                + "а не подтверждается приложением. Ключи хранятся только в приложении.");
-        builder.setView(input);
-        builder.setPositiveButton("Подключить", (d, w) -> applySubscription(input.getText().toString()));
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        if (org.colgram.core.ColgramSubscriptionStore.hasSubscription(context)) {
-            builder.setNeutralButton("Удалить", (d, w) -> {
-                ColgramRouteEpoch.next();
-                waitingSubscriptionConsent = -1L;
-                stopSubscriptionTunnel(context);
-                org.colgram.core.ColgramSubscriptionStore.clear(context);
-                if (listAdapter != null) listAdapter.notifyDataSetChanged();
-                Toast.makeText(context, "Подписка удалена", Toast.LENGTH_SHORT).show();
-            });
-        }
-        builder.show();
-    }
-
-    private void applySubscription(final String link) {
-        final Context context = getContext();
-        if (context == null) return;
-        final String trimmed = link == null ? "" : link.trim();
-        if (trimmed.isEmpty()) { Toast.makeText(context, "Ссылка пустая", Toast.LENGTH_SHORT).show(); return; }
-        cancelWarp(context);
-        ColgramProxyManager.cancelProxySelection();
-        final long token = ColgramRouteEpoch.next();
-        Toast.makeText(context, "Разбираю подписку…", Toast.LENGTH_SHORT).show();
-        warpOperations.execute(() -> {
-            if (!ColgramRouteEpoch.isCurrent(token)) return;
-            try {
-                org.colgram.core.ColgramSubscriptionStore.State state = org.colgram.core.ColgramSubscriptionStore.save(context, trimmed);
-                uiHandler.post(() -> {
-                    if (!ColgramRouteEpoch.isCurrent(token) || getParentActivity() == null) return;
-                    refreshSettings();
-                    Toast.makeText(context, state.total + " узлов", Toast.LENGTH_SHORT).show();
-                    showSubscriptionNodes();
-                });
-            } catch (Throwable failure) {
-                uiHandler.post(() -> {
-                    if (ColgramRouteEpoch.isCurrent(token) && getParentActivity() != null)
-                        Toast.makeText(context, "Подписка не подошла: " + failure.getMessage(), Toast.LENGTH_LONG).show();
-                });
-            }
-        });
-    }
-
     private void stopSubscriptionTunnel(Context context) {
-        waitingSubscriptionConsent = -1L;
-        try {
-            Class.forName("org.colgram.singbox.ColgramVpnService")
-                    .getMethod("stopProfile", Context.class, String.class).invoke(null, context,
-                            org.colgram.core.ColgramSubscriptionStore.profileLocation(context));
-        } catch (Throwable failure) { Log.d("ColgramSub", "Subscription service already stopped"); }
-    }
-
-    private void startSubscriptionTunnel(final Context context, final long token) {
-        if (!ColgramRouteEpoch.isCurrent(token) || getParentActivity() == null) return;
-        try {
-            final Class<?> service = Class.forName("org.colgram.singbox.ColgramVpnService");
-            Intent prepare = android.net.VpnService.prepare(getParentActivity());
-            if (prepare != null) {
-                waitingSubscriptionConsent = token;
-                startActivityForResult(prepare, REQ_SUBSCRIPTION_VPN);
-                return;
-            }
-            warpOperations.execute(() -> {
-                if (!ColgramRouteEpoch.isCurrent(token)) return;
-                ColgramConfig.setAutoProxyEnabled(false);
-                ColgramConfig.setDpiBypassEnabled(false);
-                ColgramConfig.setDcRemapEnabled(false);
-                ColgramConfig.setIpv6BypassEnabled(false);
-                ColgramProxyManager.setDpiBypassEnabled(context, false);
-                ColgramProxyManager.applyDcRemap(false);
-                ColgramProxyManager.disableProxy(context);
-                ColgramProxyManager.notifyProxySettingsChanged();
-                ColgramRouteEpoch.runIfCurrent(token, () -> {
-                    try {
-                        service.getMethod("start", Context.class, String.class).invoke(null, context,
-                                org.colgram.core.ColgramSubscriptionStore.profilePath(context));
-                    } catch (Throwable failure) {
-                        uiHandler.post(() -> { if (ColgramRouteEpoch.isCurrent(token) && getParentActivity() != null)
-                            Toast.makeText(context, "Не удалось запустить VPN подписки", Toast.LENGTH_LONG).show(); });
-                    }
-                });
-            });
-        } catch (Throwable failure) { Toast.makeText(context, "VPN подписки недоступен", Toast.LENGTH_LONG).show(); }
+        subscription.stopForAlternativeRoute(context);
     }
 
     /** Android requires the one-time VPN consent dialog before a tunnel can come up. */
@@ -949,7 +740,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             String error = null;
             try {
                 ColgramConfig.setAutoProxyEnabled(false);
-                stopSubscriptionTunnel(context);
+                ColgramSubscriptionControls.stopStoredProfile(context);
                 ColgramConfig.setDpiBypassEnabled(false);
                 ColgramConfig.setDcRemapEnabled(false);
                 ColgramConfig.setIpv6BypassEnabled(false);
@@ -994,32 +785,15 @@ public class ColgramSettingsActivity extends BaseFragment {
         if (route == null || !route.isLocalDpi()) return "локальный транспорт не выбран";
         if (ColgramDpiBypass.bytesFromTarget() > 0 && ConnectionsManager.getInstance(currentAccount).getConnectionState()
                 == ConnectionsManager.ConnectionStateConnected) return "подключён к Telegram";
-        return "ждём ответ Telegram";
+        return ColgramDpiBypass.upstreamStatus();
     }
 
-    /** What the subscription row shows, read back from the store rather than from a guess. */
     private String subscriptionStatusLine() {
-        Context context = getContext();
-        if (context == null) return "не настроена";
-        org.colgram.core.ColgramSubscriptionStore.State state = org.colgram.core.ColgramSubscriptionStore.current(context);
-        if (state == null) return "не настроена";
-        switch (subscriptionTunnelStatus(context)) {
-            case "starting": return "запускается…";
-            case "running": return "туннель запущен";
-            case "stopping": return "выключается…";
-            case "failed": return "ошибка запуска · проверьте выбранный узел";
-            case "unavailable": return "VPN-бэкенд недоступен";
-            default: return "выключена";
-        }
+        return subscription.statusLine();
     }
 
     private String subscriptionTunnelStatus(Context context) {
-        if (context == null) return "stopped";
-        try {
-            return (String) Class.forName("org.colgram.singbox.ColgramVpnService")
-                    .getMethod("status", String.class).invoke(null,
-                            org.colgram.core.ColgramSubscriptionStore.profileLocation(context));
-        } catch (Throwable failure) { return "unavailable"; }
+        return context == null ? "stopped" : subscription.rawStatus();
     }
 
     private boolean isAndroidVpnActive() {
@@ -1281,14 +1055,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                         settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
                                 ColgramProxyDoctor.getStatusSummary(), false);
                     } else if (position == directConnectionRow) {
-                        String subscription = subscriptionTunnelStatus(getContext());
+                        String subscriptionState = subscriptionTunnelStatus(getContext());
                         boolean vpnActive = isAndroidVpnActive();
                         boolean direct = !ColgramConfig.isWarpEnabled() && !ColgramConfig.isDpiBypassEnabled()
                                 && !ColgramProxyManager.hasActiveRouteForUi() && !ColgramProxyManager.isDcRemapActive()
                                 && !ColgramConfig.isIpv6BypassEnabled() && !ColgramConfig.isAutoProxyEnabled()
                                 && !ColgramProxyManager.isProxySelectionPending() && !vpnActive
-                                && !"running".equals(subscription) && !"starting".equals(subscription)
-                                && !"stopping".equals(subscription) && waitingSubscriptionConsent < 0;
+                                && !"running".equals(subscriptionState) && !"starting".equals(subscriptionState)
+                                && !"stopping".equals(subscriptionState) && !"consent".equals(subscriptionState);
                         settingsCell.setTextAndValue("Обычный интернет (без прокси и VPN)",
                                 direct ? "выбран" : vpnActive ? "активен Android VPN" : "нажмите для переключения", true);
                     } else if (position == publicProxyRow) {
@@ -1297,11 +1071,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                                 ColgramProxyManager.isProxySelectionPending() ? "проверяется · нажмите для отмены"
                                         : status == null || status.isEmpty() ? "проверить" : status, true);
                     } else if (position == subscriptionNodeRow) {
-                        Context context = getContext();
-                        org.colgram.core.ColgramSubscriptionStore.State state = context == null
-                                ? null : org.colgram.core.ColgramSubscriptionStore.current(context);
                         settingsCell.setTextAndValue("Узел / страна из подписки",
-                                state == null ? "импортировать" : state.name + " · " + state.protocol, true);
+                                subscription.nodeLabel(), true);
                     } else if (position == callsRow) {
                         settingsCell.setTextAndValue("Использовать для звонков", ColgramCallRoutes.summary(), true);
                     } else if (position == dataSettingsRow) {

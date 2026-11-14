@@ -125,6 +125,12 @@ public final class ColgramConnectFailureBackoff {
         return delay;
     }
 
+    /** Release a ticket that never touched the network; keep the previous failure history. */
+    public synchronized void release(String endpoint, long ticket) {
+        Long active = inFlightGeneration.get(endpoint);
+        if (active != null && active == ticket && ticket == generation) inFlightGeneration.remove(endpoint);
+    }
+
     public synchronized boolean shouldSkip(String endpoint, long nowMs) {
         if (endpoint == null || endpoint.isEmpty()) return false;
         Long active = inFlightGeneration.get(endpoint);

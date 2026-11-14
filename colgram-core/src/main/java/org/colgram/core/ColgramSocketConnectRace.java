@@ -1,134 +1,96 @@
 package org.colgram.core;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Races a small set of ports without paying the timeout serially for each one.
- *
- * <p>The first TCP socket to complete the handshake is NOT automatically the one Telegram
- * answers on. Measured on the device, against the same live DC address:
- *
- * <pre>
- *   port 443   HTTP/1.1 404 Not Found     (nginx speaks)
- *   port 80    HTTP/1.1 404 Not Found
- *   port 5222  HTTP/1.1 404 Not Found
- *   port 8443  (silent, never answers)
- * </pre>
- *
- * A race that returns the first connected socket therefore hands back 8443 roughly half the
- * time, the tunnel then reads MTProto from a port that never speaks, and the connection is
- * dead while every log line says the address answered. Order is the fix: the port that was
- * actually requested wins, and the alternatives are only raced when the requested one could
- * not be opened at all.
- */
+/** Small endpoint race under a single deadline. The result is only a TCP socket, not MTProto. */
 public final class ColgramSocketConnectRace {
-
     private ColgramSocketConnectRace() {}
 
-    /**
-     * Open {@code host} on {@code primaryPort}, and race the remaining candidates only if that
-     * fails. A reachable primary is never traded for a faster secondary.
-     */
-    public static Socket connectPreferred(String host, int primaryPort, int[] alternatives,
-            int timeoutMs) {
-        if (host == null || host.isEmpty() || primaryPort <= 0 || primaryPort > 65535) return null;
-        Socket preferred = null;
-        try {
-            Socket candidate = new Socket();
-            candidate.setTcpNoDelay(true);
-            candidate.connect(new InetSocketAddress(host, primaryPort), Math.max(1, timeoutMs));
-            preferred = candidate;
-        } catch (Throwable ignored) {
-            closeQuietly(preferred);
-            preferred = null;
+    /** Keep a reachable primary; give it part, not all, of the shared deadline. */
+    public static Socket connectPreferred(InetSocketAddress primary, InetSocketAddress[] alternatives, int timeoutMs) {
+        if (primary == null || timeoutMs <= 0) return null;
+        LinkedHashSet<InetSocketAddress> distinct = new LinkedHashSet<>();
+        if (alternatives != null) for (InetSocketAddress address : alternatives) {
+            if (address != null && !address.equals(primary) && address.getPort() > 0) distinct.add(address);
         }
-        if (preferred != null) return preferred;
-        return alternatives == null || alternatives.length == 0 ? null
-                : connect(host, alternatives, timeoutMs);
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        Socket socket = new Socket(Proxy.NO_PROXY);
+        try {
+            socket.setTcpNoDelay(true);
+            socket.connect(primary, distinct.isEmpty() ? timeoutMs : Math.min(timeoutMs, 800));
+            return socket;
+        } catch (IOException | RuntimeException unavailable) {
+            close(socket);
+        }
+        return distinct.isEmpty() ? null : race(new ArrayList<>(distinct), deadline);
     }
 
-    public static Socket connect(String host, int[] ports, int timeoutMs) {
-        if (host == null || host.isEmpty() || ports == null || ports.length == 0) return null;
-        final List<Integer> validPorts = new ArrayList<>();
-        for (int port : ports) {
-            if (port > 0 && port <= 65535 && !validPorts.contains(port)) validPorts.add(port);
-        }
-        if (validPorts.isEmpty()) return null;
-
+    private static Socket race(List<InetSocketAddress> endpoints, long deadline) {
         final Object gate = new Object();
         final Socket[] winner = new Socket[1];
         final boolean[] finished = new boolean[1];
         final List<Socket> pending = new ArrayList<>();
         final CountDownLatch outcome = new CountDownLatch(1);
-        final AtomicInteger remaining = new AtomicInteger(validPorts.size());
-
-        for (int port : validPorts) {
-            final Socket candidate = new Socket();
+        final AtomicInteger remaining = new AtomicInteger(endpoints.size());
+        for (InetSocketAddress endpoint : endpoints) {
+            Socket socket = new Socket(Proxy.NO_PROXY);
             synchronized (gate) {
-                if (finished[0]) {
-                    close(candidate);
+                if (winner[0] != null || nanosLeft(deadline) <= 0) {
+                    close(socket);
                     if (remaining.decrementAndGet() == 0) outcome.countDown();
                     continue;
                 }
-                pending.add(candidate);
+                pending.add(socket);
             }
             Thread attempt = new Thread(() -> {
+                boolean selected = false;
                 try {
+                    long left = nanosLeft(deadline);
+                    if (left <= 0) return;
+                    socket.setTcpNoDelay(true);
+                    socket.connect(endpoint, (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left)));
                     synchronized (gate) {
-                        if (finished[0]) return;
-                    }
-                    candidate.setTcpNoDelay(true);
-                    candidate.connect(new InetSocketAddress(host, port), Math.max(1, timeoutMs));
-                    synchronized (gate) {
-                        if (!finished[0] && winner[0] == null) {
-                            winner[0] = candidate;
+                        if (!finished[0] && winner[0] == null && nanosLeft(deadline) > 0) {
+                            winner[0] = socket;
+                            selected = true;
                             outcome.countDown();
-                        } else {
-                            close(candidate);
                         }
                     }
-                } catch (Throwable ignored) {
-                    close(candidate);
+                } catch (IOException | RuntimeException unavailable) {
+                    // A sibling can still answer. The parent owns the common deadline.
                 } finally {
-                    synchronized (gate) {
-                        pending.remove(candidate);
-                    }
+                    if (!selected) close(socket);
+                    synchronized (gate) { pending.remove(socket); }
                     if (remaining.decrementAndGet() == 0) outcome.countDown();
                 }
-            }, "colgram-port-race-" + port);
+            }, "colgram-direct-dial");
             attempt.setDaemon(true);
             attempt.start();
         }
-
         try {
-            outcome.await(Math.max(1, timeoutMs) + 100L, TimeUnit.MILLISECONDS);
+            outcome.await(Math.max(0L, nanosLeft(deadline)), TimeUnit.NANOSECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
-
-        final Socket result;
         synchronized (gate) {
             finished[0] = true;
-            result = winner[0];
-            for (Socket socket : pending) {
-                if (socket != result) close(socket);
-            }
+            for (Socket socket : pending) if (socket != winner[0]) close(socket);
+            return winner[0];
         }
-        return result;
     }
+
+    private static long nanosLeft(long deadline) { return deadline - System.nanoTime(); }
 
     private static void close(Socket socket) {
-        if (socket == null) return;
-        try { socket.close(); } catch (Throwable ignored) {}
-    }
-
-    private static void closeQuietly(Socket socket) {
-        close(socket);
+        try { socket.close(); } catch (IOException ignored) {}
     }
 }

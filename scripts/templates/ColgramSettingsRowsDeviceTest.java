@@ -69,6 +69,49 @@ public final class ColgramSettingsRowsDeviceTest {
     }
 
     @Test
+    public void shieldRoutesAreVisibleDistinctAndSelectableWithoutALogin() throws Throwable {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            try {
+                Class<?> screenType = Class.forName("org.telegram.ui.ProxyListActivity", true, context.getClassLoader());
+                Object screen = screenType.getDeclaredConstructor().newInstance();
+                Method update = screenType.getDeclaredMethod("updateRows", boolean.class);
+                update.setAccessible(true);
+                update.invoke(screen, false);
+                Class<?> adapterType = Class.forName("org.telegram.ui.ProxyListActivity$ListAdapter", true, context.getClassLoader());
+                Constructor<?> constructor = adapterType.getDeclaredConstructor(screenType, Context.class);
+                constructor.setAccessible(true);
+                androidx.recyclerview.widget.RecyclerView.Adapter<?> adapter =
+                        (androidx.recyclerview.widget.RecyclerView.Adapter<?>) constructor.newInstance(screen, context);
+                Set<Integer> positions = new HashSet<>();
+                Set<Long> ids = new HashSet<>();
+                int proxyType = adapter.getItemViewType(row(screenType, screen, "useProxyRow"));
+                int buttonType = adapter.getItemViewType(row(screenType, screen, "callsRow"));
+                for (String name : new String[]{"useProxyRow", "callsRow", "warpRow", "colgramBackgroundProxyRow",
+                        "colgramDpiRow", "colgramSubscriptionImportRow", "colgramSubscriptionNodeRow",
+                        "colgramSubscriptionToggleRow", "colgramSubscriptionRemoveRow"}) {
+                    int position = row(screenType, screen, name);
+                    assertTrue(name + " is hidden", position >= 0 && position < adapter.getItemCount());
+                    assertTrue(name + " overlaps another row", positions.add(position));
+                    assertTrue(name + " reuses an adapter ID", ids.add(adapter.getItemId(position)));
+                    if (name.startsWith("colgramSubscription")) assertEquals(buttonType, adapter.getItemViewType(position));
+                    if ("colgramDpiRow".equals(name)) assertEquals(proxyType, adapter.getItemViewType(position));
+                }
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
+        if (failure.get() != null) throw failure.get();
+    }
+
+    private static int row(Class<?> type, Object screen, String fieldName) throws ReflectiveOperationException {
+        Field field = type.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.getInt(screen);
+    }
+
+    @Test
     public void initializationPreservesAnExplicitlyDisabledAutoProxy() throws Exception {
         Context target = InstrumentationRegistry.getInstrumentation().getTargetContext();
         SharedPreferences isolated = target.getSharedPreferences("colgram_regression_config", Context.MODE_PRIVATE);

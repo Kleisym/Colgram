@@ -110,12 +110,8 @@ func callEnrolmentAPI(ctx context.Context, client *http.Client, endpoint, stage,
 		if err != nil {
 			return nil, newStartupError(stage, "invalid", "request", err)
 		}
-		req.Header.Set("User-Agent", "WARP for Android")
-		req.Header.Set("CF-Client-Version", "a-6.35-4471")
+		setEnrolmentHeaders(req, token)
 		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
 		resp, err := client.Do(req)
 		if err != nil {
 			var op *net.OpError
@@ -145,6 +141,14 @@ func callEnrolmentAPI(ctx context.Context, client *http.Client, endpoint, stage,
 			return nil, newStartupError(stage, "invalid", "response", nil)
 		}
 		return result, nil
+	}
+}
+
+func setEnrolmentHeaders(req *http.Request, token string) {
+	req.Header.Set("User-Agent", "WARP for Android")
+	req.Header.Set("CF-Client-Version", "a-6.35-4471")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 }
 

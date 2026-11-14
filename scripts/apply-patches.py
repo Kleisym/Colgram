@@ -3235,10 +3235,18 @@ def inject_hooks(repo_path):
 
     proxy_list_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProxyListActivity.java")
     if os.path.exists(proxy_list_file):
+        def runtime_proxy_state(content):
+            if ("// COLGRAM_CONNECTION_SETTINGS = 1" in content
+                    and "useProxySettings = colgramRemoteProxyEnabled();" in content
+                    and "private boolean colgramRemoteProxyEnabled()" in content):
+                return CONVERGED
+            before = 'useProxySettings = preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty();'
+            after = 'useProxySettings = (preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty())\n                || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi();'
+            return CONVERGED if after in content else content.replace(before, after, 1)
         patch_file(
             proxy_list_file,
-            'useProxySettings = preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty();',
-            'useProxySettings = (preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty())\n                || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi();',
+            runtime_proxy_state,
+            None,
             "ProxyListActivity Shows Runtime Route State"
         )
         def proxy_check_scheduler_patcher(content):
@@ -5829,7 +5837,10 @@ def inject_core_device_test_support(repo_path, root_dir):
     for name in ("ColgramDirectConnectionDeviceTest.java",
                  "ColgramDirectApiDeviceTest.java",
                  "ColgramGuestProxyDeviceTest.java",
+                 "ColgramControlledProxyDeviceTest.java",
                  "ColgramLocalDpiApiDeviceTest.java",
+                 "ColgramSubscriptionSecurityDeviceTest.java",
+                 "ColgramSubscriptionRouteDeviceTest.java",
                  "ColgramOnboardingDeviceTest.java",
                  "ColgramIntroSlidesDeviceTest.java",
                  "ColgramSettingsRowsDeviceTest.java",

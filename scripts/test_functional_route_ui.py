@@ -111,6 +111,47 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertIn("ColgramCallRoutes.prepare", method(voip, "public void acceptIncomingCall()"))
         self.assertIn("ColgramCallRoutes.release(colgramRouteTicket)", method(voip, "public void onDestroy()"))
 
+    def test_shield_has_connection_title_and_owns_vpn_and_local_routes(self):
+        for original in (self.pristine, self.existing):
+            proxy, _ = self.transformed(original)
+            self.assertIn('"Настройки подключения", "Connection Settings"', proxy)
+            self.assertNotIn("setTitle(getString(R.string.ProxySettings))", proxy)
+            for row in ("colgramSubscriptionImportRow", "colgramSubscriptionNodeRow", "colgramSubscriptionToggleRow",
+                        "colgramSubscriptionRemoveRow", "colgramDpiRow"):
+                self.assertIn(row + " = rowCount++", proxy)
+                for signature in ("public boolean isEnabled(", "public int getItemViewType(", "public void onBindViewHolder("):
+                    self.assertIn("position == " + row, method(proxy, signature))
+            self.assertIn("colgramSubscription.importLink()", proxy)
+            self.assertIn("colgramSubscription.showNodes()", proxy)
+            self.assertIn("colgramSubscription.toggle()", proxy)
+            self.assertIn("colgramSubscription.confirmRemove()", proxy)
+            self.assertIn("colgramSubscription.onActivityResult(requestCode, resultCode)", proxy)
+            self.assertIn("setDpiBypassEnabled(context, enabled)", proxy)
+            self.assertIn("getBackgroundProxyStatus()", proxy)
+
+    def test_subscription_import_does_not_switch_route_and_consent_precedes_activation(self):
+        path = ROOT / "scripts/templates/ColgramSubscriptionControls.java"
+        self.assertTrue(path.is_file(), "Shield lacks a shared subscription controller")
+        source = path.read_text(encoding="utf-8")
+        imported = method(source, "private void saveSubscription(")
+        self.assertIn("ColgramSubscriptionStore.save(context, text)", imported)
+        self.assertNotIn("ColgramRouteEpoch.next()", imported)
+        self.assertNotIn("ColgramVpnService.start(", imported)
+        selected = method(source, "private void selectNode(")
+        self.assertIn("ColgramSubscriptionStore.select(context, index)", selected)
+        self.assertNotIn("VpnService.prepare", selected)
+        consent = method(source, "private void prepareSelectedRoute(")
+        self.assertIn("VpnService.prepare", consent)
+        self.assertNotIn("cancelProxySelection", consent)
+        start = method(source, "private void startSubscriptionTunnel(")
+        self.assertIn("ColgramRouteEpoch.runIfCurrent(token", start)
+        self.assertIn("ColgramVpnService.start(context, profile)", start)
+        self.assertLess(start.index("if (profile == null)"), start.index("cancelProxySelection"))
+        self.assertNotIn("failure.getMessage()", source)
+        for original in (self.pristine, self.existing):
+            proxy, _ = self.transformed(original)
+            self.assertIn("usesCatalogVerifier(proxyInfo)", method(proxy, "private void checkProxyList()"))
+
     def test_subscription_select_writes_selected_node_not_same_auto_group(self):
         source = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramSubscriptionStore.java").read_text(encoding="utf-8")
         select = method(source, "public static State select(")
@@ -127,10 +168,11 @@ class FunctionalRouteUiTests(unittest.TestCase):
         settings = (ROOT / "scripts/templates/ColgramSettingsActivity.java").read_text(encoding="utf-8")
         self.assertIn("publicProxyRow = rowCount++", settings)
         self.assertIn("selectPublicProxy(getContext())", settings)
-        self.assertIn("private void showSubscriptionNodes()", settings)
-        self.assertIn("ColgramSubscriptionStore.nodes(context)", settings)
-        self.assertIn("ColgramSubscriptionStore.select(context, which)", settings)
-        self.assertIn("startSubscriptionTunnel(context, token)", method(settings, "private void selectSubscriptionNode("))
+        self.assertIn("subscription.showMenu()", settings)
+        self.assertIn("subscription.showNodes()", settings)
+        self.assertIn("subscription.nodeLabel()", settings)
+        self.assertIn("subscription.rawStatus()", settings)
+        self.assertIn("subscription.onActivityResult(requestCode, resultCode)", settings)
         self.assertIn("ColgramCallRoutes.showPicker", settings)
         self.assertIn("ColgramCallRoutes.summary()", settings)
         for row in ("publicProxyRow", "subscriptionNodeRow", "callsRow"):
@@ -141,7 +183,7 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertIn("caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)",
                       method(settings, "private boolean isAndroidVpnActive("))
         body = method(settings, "public void onBindViewHolder(")
-        self.assertIn('!"running".equals(subscription)', body)
+        self.assertIn('!"running".equals(subscriptionState)', body)
         self.assertIn("!vpnActive", body)
 
     def test_selected_profile_has_no_automatic_or_direct_fallback(self):

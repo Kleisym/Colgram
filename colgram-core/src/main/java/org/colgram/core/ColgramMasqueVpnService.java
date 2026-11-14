@@ -182,6 +182,9 @@ public final class ColgramMasqueVpnService extends VpnService {
         String stage;
         switch (parts[0]) {
             case "dns": stage = "DNS для API Cloudflare"; break;
+            case "api-connect": stage = "TCP к API Cloudflare"; break;
+            case "api-tls": stage = "TLS с API Cloudflare"; break;
+            case "api-http": stage = "ответ HTTPS API Cloudflare"; break;
             case "register": stage = "регистрация в Cloudflare"; break;
             case "enrol": stage = "регистрация ключа WARP"; break;
             case "edge": stage = "подключение к шлюзу Cloudflare"; break;

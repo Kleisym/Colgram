@@ -36,6 +36,7 @@ class ProxySelectionTest(unittest.TestCase):
         self.assertNotIn("checkPoolNow()", selection, "explicit selection still depends on the background sweep")
         self.assertIn("selection.tcpReachable.get(candidate)", selection)
         self.assertIn("onSelectionProtocolResult(selection, candidate, target, alive)", selection)
+        self.assertIn("pinSelectionCandidate(candidate, pinnedAddress)", selection)
         self.assertIn("new ProxyItem(pinnedAddress", selection)
         self.assertIn("readSelectionSocksByte", selection)
         self.assertIn("version == 5 && method == 0", selection)

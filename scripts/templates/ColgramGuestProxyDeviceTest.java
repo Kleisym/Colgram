@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class ColgramGuestProxyDeviceTest {
     private static final String TAG = "ColgramGuestProbe";
 
+
     @Test public void anonymousTgnetNegotiatesSocksWithoutChangingMainRoute() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext().getApplicationContext();
         Map<String, Object> before = savedMainRoute(context);

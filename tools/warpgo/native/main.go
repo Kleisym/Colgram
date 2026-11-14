@@ -41,7 +41,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -49,6 +48,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -2943,7 +2943,6 @@ func enrolmentTLSConfig() *tls.Config {
 	return &tls.Config{
 		ServerName: apiHost,
 		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"http/1.1"},
 	}
 }
 
@@ -2978,35 +2977,17 @@ func enrolFreshContext(ctx context.Context) (net.IP, tls.Certificate, error) {
 	scalar := make([]byte, 32)
 	key.D.FillBytes(scalar)
 
-	dnsCtx, cancelDNS := context.WithTimeout(ctx, enrolmentDNSBudget)
-	addresses, err := resolveContext(dnsCtx, apiHost)
-	cancelDNS()
+	addresses, err := resolveEnrolmentAPI(ctx)
 	if err != nil {
 		return nil, tls.Certificate{}, classifyStartupError("dns", err)
 	}
-	var apiIPs []string
-	for _, address := range addresses {
-		if ip := address.To4(); ip != nil {
-			apiIPs = append(apiIPs, ip.String())
-		}
+	dialer := &net.Dialer{Control: protectSocket, Timeout: 2500 * time.Millisecond}
+	client, err := selectEnrolmentAPI(ctx, "https://"+apiHost+"/"+apiVer+"/reg", addresses,
+		enrolmentTLSConfig(), dialer.DialContext)
+	if err != nil {
+		return nil, tls.Certificate{}, err
 	}
-	if len(apiIPs) == 0 {
-		return nil, tls.Certificate{}, newStartupError("dns", "invalid", "no IPv4", nil)
-	}
-
-	var nextIP atomic.Uint32
-	transport := &http.Transport{
-		TLSClientConfig: enrolmentTLSConfig(),
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			index := int(nextIP.Add(1)-1) % len(apiIPs)
-			d := net.Dialer{Control: protectSocket, Timeout: 2500 * time.Millisecond}
-			return d.DialContext(ctx, network, net.JoinHostPort(apiIPs[index], "443"))
-		},
-	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
+	defer client.CloseIdleConnections()
 	call := func(stage, method, path, token string, body map[string]any) (map[string]any, error) {
 		return callEnrolmentAPI(ctx, client, "https://"+apiHost+path, stage, method, token, body)
 	}
@@ -4497,6 +4478,10 @@ var dohEndpoints = []dohEndpoint{
 	{"94.140.14.14", "adguard-dns.com", "adguard-dns.com"},
 }
 
+var dohEnrolmentEndpoints = append(append([]dohEndpoint{}, dohEndpoints[:2]...),
+	append([]dohEndpoint{{"2606:4700:4700::1111", "cloudflare-dns.com", "cloudflare-dns.com"},
+		{"2606:4700:4700::1001", "cloudflare-dns.com", "cloudflare-dns.com"}}, dohEndpoints[2:]...)...)
+
 // servedFrom pins the range each of these hosts is actually served from, so an answer that comes back
 // from outside it is a substituted resolver rather than a moved service.
 //
@@ -4510,7 +4495,7 @@ var dohEndpoints = []dohEndpoint{
 // A host not listed here is not checked, because an unknown host has no range to check against and a
 // guess would be worse than the answer it replaced.
 var servedFrom = map[string][]string{
-	apiHost:                             {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
+	apiHost:                             {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20", "2606:4700::/32", "2a06:98c0::/29"},
 	"engage.cloudflareclient.com":       {"162.158.0.0/15", "162.159.0.0/16"},
 	"connectivity.cloudflareclient.com": {"162.158.0.0/15", "162.159.0.0/16"},
 	"www.cloudflare.com":                {"104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "188.114.96.0/20"},
@@ -4551,7 +4536,12 @@ func plausible(host string, ips []net.IP) bool {
 }
 
 func resolveVia(ctx context.Context, e dohEndpoint, host string) ([]net.IP, error) {
-	target := "https://" + e.ip + "/dns-query?name=" + host + "&type=A"
+	return resolveViaFamily(ctx, e, host, "A", 1)
+}
+
+func resolveViaFamily(ctx context.Context, e dohEndpoint, host, family string, rrType int) ([]net.IP, error) {
+	values := url.Values{"name": {host}, "type": {family}}
+	target := "https://" + net.JoinHostPort(e.ip, "443") + "/dns-query?" + values.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
@@ -4562,6 +4552,7 @@ func resolveVia(ctx context.Context, e dohEndpoint, host string) ([]net.IP, erro
 	req.Host = e.verifyName
 	client := &http.Client{
 		Timeout: 1200 * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				ServerName: e.verifyName,
@@ -4589,30 +4580,7 @@ func resolveVia(ctx context.Context, e dohEndpoint, host string) ([]net.IP, erro
 	if err != nil {
 		return nil, err
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
-	}
-	answers, _ := out["Answer"].([]any)
-	var ips []net.IP
-	for _, a := range answers {
-		rec, ok := a.(map[string]any)
-		if !ok {
-			continue
-		}
-		if t, _ := rec["type"].(float64); int(t) != 1 {
-			continue
-		}
-		if data, ok := rec["data"].(string); ok {
-			if ip := net.ParseIP(data); ip != nil {
-				ips = append(ips, ip)
-			}
-		}
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A record for %s", host)
-	}
-	return ips, nil
+	return decodeDoHAddressAnswers(raw, rrType)
 }
 
 // --- JNI bridge ---------------------------------------------------------

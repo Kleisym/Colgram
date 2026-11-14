@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch ProxyListActivity: always-visible calls toggle + Cloudflare WARP row.
+"""Patch the shield's Connection Settings: proxies, WARP, local route and VPN subscriptions.
 
 Idempotent, marker-based. Called from apply-patches.py and runnable standalone.
 """
@@ -155,6 +155,134 @@ def replace_section(source, start, end, replacement):
     return source[:begin] + replacement + source[finish:]
 
 
+def add_connection_settings(s):
+    """Add the route-specific rows without forking the Telegram proxy editor."""
+    marker = "// COLGRAM_CONNECTION_SETTINGS = 1"
+    if marker in s:
+        return s
+
+    def replace(old, new):
+        nonlocal s
+        if s.count(old) != 1:
+            raise ValueError("Connection Settings anchor is missing or ambiguous: " + old.splitlines()[0])
+        s = s.replace(old, new, 1)
+
+    replace("        actionBar.setTitle(getString(R.string.ProxySettings));",
+            f"        {marker}\n        actionBar.setTitle(ColgramSubscriptionControls.label(\"Настройки подключения\", \"Connection Settings\"));")
+    for old in ('''        final SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+        useProxySettings = (preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty())
+                || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi();''', '''        final SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+        useProxySettings = preferences.getBoolean("proxy_enabled", false) && !SharedConfig.proxyList.isEmpty();'''):
+        if old in s:
+            replace(old, "        useProxySettings = colgramRemoteProxyEnabled();")
+            break
+    else:
+        raise ValueError("Connection Settings remote proxy initialization anchor missing")
+    replace("        if (waitingWarpConsent >= 0 && warpRequested(waitingWarpConsent)) cancelWarpFromProxyScreen();",
+            "        colgramSubscription.abandonConsent();\n        if (waitingWarpConsent >= 0 && warpRequested(waitingWarpConsent)) cancelWarpFromProxyScreen();")
+    replace('''                if (useProxySettings || org.colgram.core.ColgramProxyManager.isProxySelectionPending()
+                        || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi()) {
+                    org.colgram.core.ColgramProxyManager.disableProxy(getContext());''', '''                if (colgramRemoteProxyEnabled() || org.colgram.core.ColgramProxyManager.isProxySelectionPending()) {''')
+    replace('''                    cancelWarpFromProxyScreen();
+                    org.colgram.core.ColgramProxyManager.selectPublicProxy(getContext());''', '''                    colgramSubscription.stopForAlternativeRoute(getContext());
+                    cancelWarpFromProxyScreen();
+                    org.colgram.core.ColgramProxyManager.selectPublicProxy(getContext());''')
+    replace('''                SharedConfig.ProxyInfo info = proxyList.get(position - proxyStartRow);
+                cancelWarpFromProxyScreen();''', '''                SharedConfig.ProxyInfo info = proxyList.get(position - proxyStartRow);
+                colgramSubscription.stopForAlternativeRoute(getContext());
+                cancelWarpFromProxyScreen();''')
+    replace('''            } else if (position == proxyAddRow) {
+                presentFragment(new ProxySettingsActivity());''', '''            } else if (position == colgramDpiRow) {
+                colgramToggleDpi();
+            } else if (position == colgramSubscriptionImportRow) {
+                colgramSubscription.importLink();
+            } else if (position == colgramSubscriptionNodeRow) {
+                colgramSubscription.showNodes();
+            } else if (position == colgramSubscriptionToggleRow) {
+                colgramSubscription.toggle();
+            } else if (position == colgramSubscriptionRemoveRow) {
+                colgramSubscription.confirmRemove();
+            } else if (position == proxyAddRow) {
+                presentFragment(new ProxySettingsActivity());''')
+    replace("        useProxyRow = rowCount++;", "        useProxyRow = rowCount++;\n        colgramBackgroundProxyRow = rowCount++;")
+    replace('''        warpDetailRow = rowCount++;
+        connectionsHeaderRow = rowCount++;''', '''        warpDetailRow = rowCount++;
+        colgramDpiRow = rowCount++;
+        colgramSubscriptionImportRow = rowCount++;
+        colgramSubscriptionNodeRow = rowCount++;
+        colgramSubscriptionToggleRow = rowCount++;
+        colgramSubscriptionRemoveRow = rowCount++;
+        connectionsHeaderRow = rowCount++;''')
+    replace('''                    if (position == callsRow) {
+                        textCell.setTextAndValue''', '''                    if (position == colgramSubscriptionImportRow) {
+                        textCell.setText(ColgramSubscriptionControls.label("Импорт VPN-подписки или ключа", "Import VPN subscription or key"), true);
+                    } else if (position == colgramSubscriptionNodeRow) {
+                        textCell.setTextAndValue(ColgramSubscriptionControls.label("Узел VPN / страна", "VPN node / country"),
+                                colgramSubscription.nodeLabel(), true);
+                    } else if (position == colgramSubscriptionToggleRow) {
+                        textCell.setTextAndValue(colgramSubscription.toggleLabel(), colgramSubscription.statusLine(), true);
+                    } else if (position == colgramSubscriptionRemoveRow) {
+                        textCell.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
+                        textCell.setText(ColgramSubscriptionControls.label("Удалить подписку", "Remove subscription"), true);
+                    } else if (position == callsRow) {
+                        textCell.setTextAndValue''')
+    replace('''                    } else if (position == warpRow) {
+                        checkCell.setTextAndValueAndCheck''', '''                    } else if (position == colgramDpiRow) {
+                        checkCell.setTextAndValueAndCheck(ColgramSubscriptionControls.label("Локальный обход", "Local bypass"),
+                                colgramDpiStatus(), org.colgram.core.ColgramConfig.isDpiBypassEnabled(), true, true);
+                    } else if (position == warpRow) {
+                        checkCell.setTextAndValueAndCheck''')
+    replace('''                    if (position == callsDetailRow) {
+                        cell.setText''', '''                    if (position == colgramBackgroundProxyRow) {
+                        cell.setText(org.colgram.core.ColgramProxyManager.getBackgroundProxyStatus());
+                    } else if (position == callsDetailRow) {
+                        cell.setText''')
+    for index in ("proxyIndex", "a"):
+        anchor = f"            final SharedConfig.ProxyInfo proxyInfo = proxyList.get({index});\n            if (proxyInfo.checking"
+        if anchor in s:
+            replace(anchor, anchor.replace("            if (proxyInfo.checking",
+                    "            if (org.colgram.core.ColgramProxyManager.usesCatalogVerifier(proxyInfo)) continue;\n"
+                    "            if (proxyInfo.checking"))
+            break
+    else:
+        raise ValueError("Connection Settings native checker anchor missing")
+    replace('''            return position == useProxyRow ||''', '''            return position == colgramDpiRow || position == colgramSubscriptionImportRow
+                    || position == colgramSubscriptionNodeRow || position == colgramSubscriptionToggleRow
+                    || position == colgramSubscriptionRemoveRow
+                    || position == useProxyRow ||''')
+    replace('''            } else if (position == callsDetailRow) {
+                return -15;''', '''            } else if (position == callsDetailRow) {
+                return -15;
+            } else if (position == colgramBackgroundProxyRow) {
+                return -16;
+            } else if (position == colgramDpiRow) {
+                return -17;
+            } else if (position == colgramSubscriptionImportRow) {
+                return -18;
+            } else if (position == colgramSubscriptionNodeRow) {
+                return -19;
+            } else if (position == colgramSubscriptionToggleRow) {
+                return -20;
+            } else if (position == colgramSubscriptionRemoveRow) {
+                return -21;''')
+    replace('''            } else if (position == callsRow || position == proxyAddRow || position == deleteAllRow) {
+                return VIEW_TYPE_TEXT_SETTING;
+            } else if (position == useProxyRow || position == rotationRow || position == warpRow) {''', '''            } else if (position == callsRow || position == proxyAddRow || position == deleteAllRow
+                    || position == colgramSubscriptionImportRow || position == colgramSubscriptionNodeRow
+                    || position == colgramSubscriptionToggleRow || position == colgramSubscriptionRemoveRow) {
+                return VIEW_TYPE_TEXT_SETTING;
+            } else if (position == useProxyRow || position == rotationRow || position == warpRow || position == colgramDpiRow) {''')
+    return s
+
+
+def copy_subscription_controls(proxy_source):
+    target = Path(proxy_source).with_name("ColgramSubscriptionControls.java")
+    template = Path(__file__).parent / "templates/ColgramSubscriptionControls.java"
+    contents = template.read_text(encoding="utf-8")
+    if not target.is_file() or target.read_text(encoding="utf-8") != contents:
+        target.write_text(contents, encoding="utf-8", newline="\n")
+
+
 def upgrade_functional_controls(s):
     """Canonical v5 controls, applied after the legacy v1-v4 structure has converged."""
     template = (Path(__file__).parent / "templates/ProxyListWarpControls.java.inc").read_text(encoding="utf-8")
@@ -294,6 +422,7 @@ def apply(repo_path):
         print(" [!] ProxyListActivity.java not found")
         return
     s = Path(p).read_text(encoding="utf-8", errors="ignore")
+    copy_subscription_controls(p)
     # Refresh only the generated helper block when its template is updated.
     if PATCH_VERSION in s:
         template = (Path(__file__).parent / "templates/ProxyListWarpControls.java.inc").read_text(encoding="utf-8")
@@ -305,13 +434,14 @@ def apply(repo_path):
                                   '                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, false, false);',
                                   'warpStatusForProxyScreen(),\n'
                                   '                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, true, false);')
+        updated = add_connection_settings(updated)
         if updated != s:
             Path(p).write_text(updated, encoding="utf-8", newline="\n")
         apply_call_proxy_defaults(repo_path)
         apply_voip_call_proxy(repo_path)
         return
     if MARKER in s:
-        upgraded = upgrade_call_route_picker(upgrade_generated(s))
+        upgraded = add_connection_settings(upgrade_call_route_picker(upgrade_generated(s)))
         if upgraded != s:
             Path(p).write_text(upgraded, encoding="utf-8", newline="\n")
             print(" [+] Updated ProxyListActivity WARP state handling")
@@ -620,7 +750,7 @@ def apply(repo_path):
     }"""
     must_replace(anchor_fields_end, helpers, "helpers")
 
-    s = upgrade_call_route_picker(upgrade_generated(s))
+    s = add_connection_settings(upgrade_call_route_picker(upgrade_generated(s)))
     Path(p).write_text(s, encoding="utf-8", newline="\n")
     print(" [+] ProxyListActivity: calls row unconditional + WARP toggle (" + str(n_edits) + " edits)")
     apply_call_proxy_defaults(repo_path)

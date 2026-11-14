@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -12,6 +13,85 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRegistrationPreflightSelectsVerifiedAlternateWithoutPostingTwice(t *testing.T) {
+	var heads, posts atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			heads.Add(1)
+			if r.ProtoMajor != 2 {
+				t.Errorf("wanted normal ALPN to negotiate HTTP/2, got %s", r.Proto)
+			}
+			w.WriteHeader(http.StatusNotFound) // A valid HTTPS transport, not a registration.
+		case http.MethodPost:
+			posts.Add(1)
+			_, _ = io.WriteString(w, "{}")
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	tlsConfig := enrolmentTLSConfig()
+	tlsConfig.RootCAs = roots
+	tlsConfig.ServerName = "example.com" // Included in httptest's certificate, not the dial target.
+	var stalled atomic.Int32
+	dial := func(ctx context.Context, _, addr string) (net.Conn, error) {
+		if strings.HasPrefix(addr, "192.0.2.1:") {
+			stalled.Add(1)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	client, err := selectEnrolmentAPI(ctx, "https://example.com/register", []net.IP{
+		net.ParseIP("192.0.2.1"), net.ParseIP("2001:db8::1"),
+	}, tlsConfig, dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	if _, err := callEnrolmentAPI(ctx, client, "https://example.com/register", "register", http.MethodPost, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if stalled.Load() < 1 || heads.Load() != 1 || posts.Load() != 1 {
+		t.Fatalf("expected one reachable HEAD and one registration, stalled=%d heads=%d posts=%d", stalled.Load(), heads.Load(), posts.Load())
+	}
+}
+
+func TestRegistrationPreflightReportsTLSStageBeforeAnyHTTP(t *testing.T) {
+	var connects atomic.Int32
+	peers := make(chan net.Conn, 2)
+	dial := func(_ context.Context, _, _ string) (net.Conn, error) {
+		local, peer := net.Pipe()
+		connects.Add(1)
+		peers <- peer
+		return local, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_, err := selectEnrolmentAPI(ctx, "https://example.com/register", []net.IP{net.ParseIP("192.0.2.1")}, enrolmentTLSConfig(), dial)
+	for len(peers) > 0 {
+		(<-peers).Close()
+	}
+	if err == nil || err.Error() != "api-tls:timeout:api tls" || connects.Load() == 0 {
+		t.Fatalf("expected a TLS timeout before HTTP was sent, connects=%d error=%v", connects.Load(), err)
+	}
+}
+
+func TestResolverOnlyReturnsRequestedPublicAddressFamily(t *testing.T) {
+	response := []byte(`{"Status":0,"Answer":[{"type":28,"data":"2606:4700::6810:1854"}, {"type":28,"data":"::1"}, {"type":1,"data":"104.16.24.84"}]}`)
+	ips, err := decodeDoHAddressAnswers(response, 28)
+	if err != nil || len(ips) != 2 || len(eligibleEnrolmentAddresses(append(ips, net.ParseIP("127.0.0.1")), apiHost)) != 1 || !ips[0].Equal(net.ParseIP("2606:4700::6810:1854")) {
+		t.Fatalf("invalid AAAA handling: ips=%v err=%v", ips, err)
+	}
+}
 
 func TestRegistrationDeadlineIsSharedAcrossAttempts(t *testing.T) {
 	var requests atomic.Int32

@@ -88,6 +88,11 @@ public class ColgramProxyManager {
         public volatile int tcpMs = -1;
         /** elapsedRealtime of the last TCP-level check. */
         public volatile long tcpCheckedAt = 0L;
+        /** Catalog measurement belongs to this network, and does not activate the candidate. */
+        private long catalogNetwork = -1L;
+        private long catalogTcpAt;
+        private long catalogProtocolAt;
+        private String catalogPinnedAddress;
         /** Set when a native MTProto/SOCKS handshake succeeded at least once. */
         public volatile boolean nativeVerified = false;
         /** A verdict belongs to the exact effective endpoint, not a later replacement front. */
@@ -366,6 +371,7 @@ public class ColgramProxyManager {
         // loading the library into this process - see ColgramMasqueNative.isAvailableForProbe().
         ColgramMasqueNative.setProbeContext(appContext);
         ColgramBootJobService.scheduleProxyRefresh(appContext);
+        scheduleBackgroundProxyCheck(PROXY_START_DELAY_MS);
         registerNetworkCallback(appContext);
 
         // Everything below touches sockets: binding the local DPI listener,
@@ -437,7 +443,11 @@ public class ColgramProxyManager {
         ColgramDpiBypass.clearConnectionFailureBackoff();
         directRouteCheckedAt = 0L;
         localRouteUnavailableUntil = 0L;
-        mainHandler.post(ColgramProxyManager::publishPoolToStock);
+        mainHandler.post(() -> {
+            publishPoolToStock();
+            if (backgroundProxySelection != null) backgroundProxyTick(backgroundProxySelection);
+            else scheduleBackgroundProxyCheck(PROXY_START_DELAY_MS);
+        });
         Log.i(TAG, "invalidated direct-route probe cache (" + reason + ")");
     }
 
@@ -912,6 +922,7 @@ public class ColgramProxyManager {
 
     /** Manual "check now": a parallel TCP sweep first, then protocol handshakes on survivors. */
     public static void checkPoolNow() {
+        scheduleBackgroundProxyCheck(0L);
         sweepFast(null);
     }
 
@@ -960,7 +971,9 @@ public class ColgramProxyManager {
         final java.util.concurrent.atomic.AtomicInteger doneCount =
                 new java.util.concurrent.atomic.AtomicInteger(0);
         for (final ProxyItem item : snapshot) {
-            if (item.type == 2 || item.isLocalDpi()) {
+            if (item.type == 2 || item.isLocalDpi()
+                    || (isBackgroundCatalogCandidate(item) && item != currentActiveProxy
+                        && (!ColgramConfig.isAutoProxyEnabled() || isFreshProtocolVerified(item)))) {
                 if (remaining.decrementAndGet() == 0) finishSweep(onDone);
                 continue;
             }
@@ -1107,6 +1120,7 @@ public class ColgramProxyManager {
             for (ProxyItem item : new ArrayList<>(verifiedPool)) {
                 if (fastNativeInFlight >= FAST_NATIVE_PARALLEL) break;
                 if (item.type == 2 || item.isLocalDpi() || item.tcpMs < 0
+                        || (item != currentActiveProxy && isBackgroundCatalogCandidate(item))
                         || item.fastProbeAttempted || item.nativeProbeInFlight.get()) continue;
                 item.fastProbeAttempted = true;
                 final AtomicBoolean done = new AtomicBoolean(false);
@@ -1496,7 +1510,8 @@ public class ColgramProxyManager {
      */
     private static ProxyItem nextProberTarget() {
         final long now = SystemClock.elapsedRealtime();
-        final int size = verifiedPool.size();
+        final List<ProxyItem> snapshot = new ArrayList<>(verifiedPool);
+        final int size = snapshot.size();
         if (size == 0) return null;
         // The applied proxy is checked before anything else, every tick.
         //
@@ -1516,10 +1531,11 @@ public class ColgramProxyManager {
         ProxyItem stale = null;
         for (int step = 0; step < size; step++) {
             int idx = (proberCursor + step) % size;
-            ProxyItem p = verifiedPool.get(idx);
+            ProxyItem p = snapshot.get(idx);
             // A WEB entry needs a WebView bridge per check and the pool never holds one; the
             // user's own WEB proxy is exercised where it is actually applied.
             if (p.type == 2) continue;
+            if (p != applied && isBackgroundCatalogCandidate(p)) continue;
             // A TCP-dead endpoint cannot complete an MTProto handshake. Retrying it through
             // checkProxy consumed the full 12s timeout for every stale feed entry, so a mostly
             // dead 200-node list looked like it was being checked forever.
@@ -1539,7 +1555,7 @@ public class ColgramProxyManager {
         }
         ProxyItem target = tcpAlive != null ? tcpAlive : stale;
         if (target != null && tcpAlive == null) {
-            proberCursor = (verifiedPool.indexOf(target) + 1) % Math.max(1, size);
+            proberCursor = (snapshot.indexOf(target) + 1) % Math.max(1, size);
         }
         return target;
     }
@@ -1760,7 +1776,7 @@ public class ColgramProxyManager {
         try {
             StringBuilder sb = new StringBuilder();
             int saved = 0;
-            for (ProxyItem p : verifiedPool) {
+            for (ProxyItem p : new ArrayList<>(verifiedPool)) {
                 // Chain fronts use ephemeral in-process ports; never restore them after a reboot.
                 if (!p.isAvailable || p.isLocalDpi() || p.type == 2
                         || isInternalLoopbackEndpoint(p)) continue;
@@ -2536,6 +2552,10 @@ public static void reportProxyFailure() {
         }
         if (appContext == null) appContext = ctx;
         ColgramConfig.init(ctx);
+        if (!ColgramConfig.isBuiltinProxyEnabled()) {
+            if (onComplete != null) onComplete.run();
+            return;
+        }
         if (verifiedPool.isEmpty()) initVerifiedPool();
         executor.execute(() -> {
             try {
@@ -3272,9 +3292,23 @@ public static void reportProxyFailure() {
     private static final long PROXY_SELECTION_TIMEOUT_MS = 25_000L;
     private static final int MAX_SELECTION_TCP_CHECKS = 48;
     private static final int SELECTION_TCP_TIMEOUT_MS = 1_250;
+    private static final int MAX_BACKGROUND_TCP_CHECKS = 24;
+    private static final int MAX_BACKGROUND_GUEST_CHECKS = 5;
+    private static final long BACKGROUND_PROXY_CHECK_WINDOW_MS = 50_000L;
+    private static final long BACKGROUND_PROXY_BUSY_RETRY_MS = 4_000L;
+    private static final long BACKGROUND_PROXY_IDLE_MS = 25_000L;
+    private static final long BACKGROUND_PROXY_READY_MS = 40_000L;
+    private static final long BACKGROUND_PROXY_FEED_INTERVAL_MS = 4 * 60_000L;
+    private static final long BACKGROUND_PROXY_TCP_RECHECK_MS = 3 * 60_000L;
+    private static final long BACKGROUND_PROXY_NEGATIVE_RECHECK_MS = 3 * 60_000L;
+    private static final long BACKGROUND_PROXY_POSITIVE_RECHECK_MS = 35_000L;
     private static final ColgramOperationGate proxySelectionGate = new ColgramOperationGate();
     private static volatile ProxySelection proxySelection;
+    private static volatile ProxySelection backgroundProxySelection;
     private static volatile String proxySelectionStatus = "";
+    private static volatile String backgroundProxyStatus = "Проверка каталога запланирована";
+    private static long backgroundProxyScheduledAt = Long.MAX_VALUE;
+    private static final Runnable backgroundProxyRunner = ColgramProxyManager::runBackgroundProxyCheck;
 
     private static final class ProxySelection {
         final long token;
@@ -3289,6 +3323,7 @@ public static void reportProxyFailure() {
         final java.util.Set<ProxyItem> tcpAttempted = new java.util.HashSet<>();
         final java.util.Map<ProxyItem, String> tcpReachable = new java.util.HashMap<>();
         final boolean guestEligible;
+        final boolean catalogOnly;
         Runnable timeout;
         Runnable tick;
         int inFlight;
@@ -3302,12 +3337,22 @@ public static void reportProxyFailure() {
         boolean guestPending;
         String guestResult = "not-started";
 
-        ProxySelection(long token, long routeEpoch, ProxyItem requested, boolean explicit) {
+        ProxySelection(long token, long routeEpoch, ProxyItem requested) {
             this.token = token;
             this.routeEpoch = routeEpoch;
             this.requested = requested;
             this.deadline = started + PROXY_SELECTION_TIMEOUT_MS;
-            this.guestEligible = explicit && explicitPreLogin() && (requested == null || requested.type != 2);
+            this.guestEligible = explicitPreLogin() && (requested == null || requested.type != 2);
+            this.catalogOnly = false;
+        }
+
+        ProxySelection() {
+            token = -1L;
+            routeEpoch = -1L;
+            requested = null;
+            deadline = started + BACKGROUND_PROXY_CHECK_WINDOW_MS;
+            guestEligible = true;
+            catalogOnly = true;
         }
     }
 
@@ -3318,6 +3363,11 @@ public static void reportProxyFailure() {
 
     public static String getProxySelectionStatus() { return proxySelectionStatus; }
 
+    public static String getBackgroundProxyStatus() {
+        if (!ColgramConfig.isBuiltinProxyEnabled()) return "Фоновая проверка отключена";
+        return backgroundProxyStatus + " · Доступно: " + getSelectableProxies().size();
+    }
+
     public static void cancelProxySelection() {
         ProxySelection old = proxySelection;
         proxySelectionGate.cancel();
@@ -3327,6 +3377,7 @@ public static void reportProxyFailure() {
         if (old != null) {
             proxySelectionStatus = "Проверка прокси отменена";
             mainHandler.post(ColgramProxyManager::notifyProxySettingsChanged);
+            scheduleBackgroundProxyCheck(BACKGROUND_PROXY_BUSY_RETRY_MS);
         }
     }
 
@@ -3334,6 +3385,212 @@ public static void reportProxyFailure() {
         return proxySelection == selection && proxySelectionGate.isPending()
                 && proxySelectionGate.isCurrent(selection.token)
                 && ColgramRouteEpoch.isCurrent(selection.routeEpoch);
+    }
+
+    private static boolean preflightIsCurrent(ProxySelection selection) {
+        return selection.catalogOnly
+                ? backgroundProxySelection == selection && !isProxySelectionPending()
+                    && ColgramConfig.isBuiltinProxyEnabled() && ColgramUiBridge.isAppInForeground()
+                : selectionIsCurrent(selection);
+    }
+
+    private static void scheduleBackgroundProxyCheck(long delayMs) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(() -> scheduleBackgroundProxyCheck(delayMs));
+            return;
+        }
+        long deadline = SystemClock.elapsedRealtime() + delayMs;
+        if (deadline >= backgroundProxyScheduledAt) return;
+        backgroundProxyScheduledAt = deadline;
+        mainHandler.removeCallbacks(backgroundProxyRunner);
+        mainHandler.postDelayed(backgroundProxyRunner, delayMs);
+    }
+
+    private static void runBackgroundProxyCheck() {
+        backgroundProxyScheduledAt = Long.MAX_VALUE;
+        Context context = appContext;
+        if (context == null || !ColgramConfig.isBuiltinProxyEnabled() || !ColgramUiBridge.isAppInForeground()
+                || ColgramPowerGuard.shouldThrottle(context) || !hasCatalogNetwork(context)) {
+            scheduleBackgroundProxyCheck(BACKGROUND_PROXY_IDLE_MS);
+            return;
+        }
+        if (isProxySelectionPending()) {
+            scheduleBackgroundProxyCheck(BACKGROUND_PROXY_BUSY_RETRY_MS);
+            return;
+        }
+        if (backgroundProxySelection != null) return;
+        if (verifiedPool.isEmpty()) initVerifiedPool();
+        releaseQuarantine();
+        ProxySelection selection = new ProxySelection();
+        backgroundProxySelection = selection;
+        selection.tick = () -> backgroundProxyTick(selection);
+        Log.i(TAG, "PROXY_BACKGROUND_START network=" + selection.network
+                + " proxy_enabled=" + isProxyEnabled(context));
+        if (lastSourceFetchAt == 0 || selection.started - lastSourceFetchAt >= BACKGROUND_PROXY_FEED_INTERVAL_MS) {
+            executor.execute(() -> fetchAndVerifyAllSources());
+        }
+        backgroundProxyTick(selection);
+    }
+
+    private static boolean hasCatalogNetwork(Context context) {
+        try {
+            ConnectivityManager manager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            Network network = manager == null ? null : manager.getActiveNetwork();
+            android.net.NetworkCapabilities capabilities = network == null ? null : manager.getNetworkCapabilities(network);
+            return capabilities != null && capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (RuntimeException unavailable) {
+            return false;
+        }
+    }
+
+    private static boolean isBackgroundCatalogCandidate(ProxyItem item) {
+        return item != null && item.type != 2 && isDirectSelectionCandidate(item)
+                && ColgramProxyPolicy.isPublicHost(item.address);
+    }
+
+    private static long catalogTcpAt(ProxyItem candidate, long network) {
+        return candidate.catalogNetwork == network ? candidate.catalogTcpAt : 0L;
+    }
+
+    private static long catalogProtocolAt(ProxyItem candidate, long network) {
+        return candidate.catalogNetwork == network ? candidate.catalogProtocolAt : 0L;
+    }
+
+    private static void enterCatalogNetwork(ProxyItem candidate, long network) {
+        if (candidate.catalogNetwork == network) return;
+        candidate.catalogTcpAt = candidate.catalogProtocolAt = 0L;
+        candidate.catalogPinnedAddress = null;
+        candidate.catalogNetwork = network;
+    }
+
+    private static void sortCatalogProbeOrder(List<ProxyItem> candidates, long now, long network) {
+        sortCandidates(candidates);
+        final java.util.Set<ProxyItem> due = new java.util.HashSet<>();
+        for (ProxyItem candidate : candidates) {
+            if (isFreshProtocolVerified(candidate) && now - candidate.lastCheckAt >= BACKGROUND_PROXY_POSITIVE_RECHECK_MS) {
+                due.add(candidate);
+            }
+        }
+        candidates.sort((a, b) -> {
+            boolean refreshA = due.contains(a), refreshB = due.contains(b);
+            if (refreshA != refreshB) return refreshA ? -1 : 1;
+            return Long.compare(catalogTcpAt(a, network), catalogTcpAt(b, network));
+        });
+    }
+
+    private static void backgroundProxyTick(ProxySelection selection) {
+        mainHandler.removeCallbacks(selection.tick);
+        if (backgroundProxySelection != selection) return;
+        if (!preflightIsCurrent(selection) || selection.network != networkProbeEpoch.get()) {
+            finishBackgroundProxyCheck(selection, BACKGROUND_PROXY_BUSY_RETRY_MS);
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now >= selection.deadline) {
+            finishBackgroundProxyCheck(selection, BACKGROUND_PROXY_IDLE_MS);
+            return;
+        }
+        List<ProxyItem> candidates = new ArrayList<>(verifiedPool);
+        candidates.removeIf(candidate -> candidate == currentActiveProxy || !isBackgroundCatalogCandidate(candidate));
+        sortCatalogProbeOrder(candidates, now, selection.network);
+        scheduleSelectionTcp(selection, candidates);
+        // Prefer a fresh or previously verified SOCKS route over a TCP-only MTProto candidate,
+        // while alternating types so neither protocol can consume the entire guest window.
+        int preferredType = selection.guestAttempts % 2;
+        boolean guestAllowed = !selection.guestPending && selection.guestAttempts < MAX_BACKGROUND_GUEST_CHECKS
+                && selection.deadline - now >= ColgramGuestProxyProbe.CHECK_TIMEOUT_MS;
+        for (int pass = 0; guestAllowed && pass < 2; pass++) {
+            int type = pass == 0 ? preferredType : 1 - preferredType;
+            for (ProxyItem source : candidates) {
+                if (source.type != type || source.nativeProbeInFlight.get() || source.nextEligibleAt > now) continue;
+                long last = catalogProtocolAt(source, selection.network);
+                long recheck = source.nativeVerified ? BACKGROUND_PROXY_POSITIVE_RECHECK_MS : BACKGROUND_PROXY_NEGATIVE_RECHECK_MS;
+                if (last != 0L && now - last < recheck) continue;
+                String pinnedAddress = selection.tcpReachable.get(source);
+                if (pinnedAddress == null && catalogTcpAt(source, selection.network) != 0L
+                        && now - source.catalogTcpAt < BACKGROUND_PROXY_TCP_RECHECK_MS) {
+                    pinnedAddress = source.catalogPinnedAddress;
+                }
+                if (pinnedAddress == null) continue;
+                ProxyItem candidate = pinSelectionCandidate(source, pinnedAddress);
+                if (selection.guestAttempted.contains(candidate)) continue;
+                if (startBackgroundGuestProbe(selection, source, candidate)) {
+                    guestAllowed = false;
+                    break;
+                }
+            }
+        }
+        backgroundProxyStatus = "Проверяю в фоне · " + selectionProgress(selection);
+        if (!selection.guestPending && selection.tcpFinished == selection.tcpAttempted.size()
+                && !fetchingSources.get() && now - selection.started >= 12_000L
+                && (selection.guestAttempts >= MAX_BACKGROUND_GUEST_CHECKS
+                    || now - selection.started >= 16_000L)) {
+            finishBackgroundProxyCheck(selection,
+                    getSelectableProxies().isEmpty() ? BACKGROUND_PROXY_IDLE_MS : BACKGROUND_PROXY_READY_MS);
+            return;
+        }
+        mainHandler.postDelayed(selection.tick, 750L);
+    }
+
+    private static boolean startBackgroundGuestProbe(ProxySelection selection, ProxyItem source, ProxyItem candidate) {
+        final String endpoint = probeEndpoint(candidate);
+        boolean started = ColgramGuestProxyProbe.check(appContext, candidate.address, candidate.port,
+                candidate.user, candidate.password, candidate.secret, true, (time, reason) -> {
+                    if (backgroundProxySelection != selection) return;
+                    selection.guestPending = false;
+                    if (preflightIsCurrent(selection) && selection.network == networkProbeEpoch.get()
+                            && source != currentActiveProxy && endpoint.equals(probeEndpoint(candidate))) {
+                        boolean alive = time >= 0;
+                        ProxyItem measured = source;
+                        selection.guestResult = alive ? "verified" : reason;
+                        if (alive) {
+                            selection.protocolAnswered++;
+                            candidate.pingMs = (int) Math.min(Integer.MAX_VALUE, time);
+                            candidate.verifiedEndpoint = endpoint;
+                            measured = storePinnedCandidate(source, candidate);
+                        }
+                        enterCatalogNetwork(measured, selection.network);
+                        if (measured != source) {
+                            measured.catalogTcpAt = source.catalogTcpAt;
+                            measured.catalogPinnedAddress = measured.address;
+                        }
+                        measured.catalogProtocolAt = SystemClock.elapsedRealtime();
+                        measured.lastCheckAt = measured.catalogProtocolAt;
+                        measured.nativeVerified = measured.isAvailable = alive;
+                        if (alive) {
+                            measured.failedVerdicts = 0;
+                            rememberAlive();
+                        } else {
+                            measured.pingMs = -2;
+                            if (measured.failedVerdicts < MAX_FAILED_VERDICTS) measured.failedVerdicts++;
+                        }
+                        publishPoolToStock();
+                        notifyProxySettingsChanged();
+                    }
+                    backgroundProxyTick(selection);
+                });
+        if (started) {
+            selection.guestPending = true;
+            selection.guestAttempts++;
+            selection.guestAttempted.add(candidate);
+            selection.protocolTargets.add(candidate);
+            selection.guestResult = "pending";
+            Log.i(TAG, "PROXY_BACKGROUND_CHECK telegram_attempt=" + selection.guestAttempts);
+        }
+        return started;
+    }
+
+    private static void finishBackgroundProxyCheck(ProxySelection selection, long delayMs) {
+        if (backgroundProxySelection != selection) return;
+        mainHandler.removeCallbacks(selection.tick);
+        backgroundProxySelection = null;
+        backgroundProxyStatus = "Фоновая проверка · " + selectionProgress(selection);
+        Log.i(TAG, "PROXY_BACKGROUND " + selectionDiagnostic(selection)
+                + " fresh=" + getSelectableProxies().size() + " route_changed=false"
+                + " proxy_enabled=" + isProxyEnabled(appContext));
+        publishPoolToStock();
+        notifyProxySettingsChanged();
+        scheduleBackgroundProxyCheck(delayMs);
     }
 
     /** Explicit public-proxy mode: no endpoint reaches JNI until its protocol check succeeds. */
@@ -3362,6 +3619,9 @@ public static void reportProxyFailure() {
         if (!explicit && (ColgramConfig.isWarpEnabled() || ColgramConfig.isDpiBypassEnabled()
                 || isUserProxyDisabled() || isProxySelectionPending())) return;
         appContext = ctx;
+        if (backgroundProxySelection != null) {
+            finishBackgroundProxyCheck(backgroundProxySelection, BACKGROUND_PROXY_BUSY_RETRY_MS);
+        }
         cancelProxySelection();
         if (explicit) {
             ColgramConfig.setAutoProxyEnabled(false);
@@ -3374,8 +3634,11 @@ public static void reportProxyFailure() {
             ColgramDcRemap.stop();
             ColgramConfig.setWarpEnabled(false);
             ColgramWarpTunnel.cancelPendingStart();
-            try { ctx.stopService(new android.content.Intent(ctx,
-                    Class.forName("org.colgram.singbox.ColgramVpnService"))); } catch (Throwable ignored) { }
+            try {
+                Class.forName("org.colgram.singbox.ColgramVpnService")
+                        .getMethod("stopProfile", Context.class, String.class)
+                        .invoke(null, ctx, ColgramSubscriptionStore.profileLocation(ctx));
+            } catch (ReflectiveOperationException ignored) { }
             executor.execute(() -> {
                 if (ColgramRouteEpoch.isCurrent(routeEpoch)) ColgramWarpTunnel.bringDown(ctx);
             });
@@ -3383,7 +3646,7 @@ public static void reportProxyFailure() {
         // Keep the old saved identity, but release a stale active route while checking.
         disableProxy(ctx);
         setUserProxyDisabled(false);
-        ProxySelection selection = new ProxySelection(proxySelectionGate.begin(), routeEpoch, requested, explicit);
+        ProxySelection selection = new ProxySelection(proxySelectionGate.begin(), routeEpoch, requested);
         proxySelection = selection;
         proxySelectionStatus = "Проверяю прокси (до 25 с)";
         selection.timeout = () -> finishProxySelection(selection, null,
@@ -3471,17 +3734,25 @@ public static void reportProxyFailure() {
         for (ProxyItem item : candidates) {
             if (item.type == 2 || !isDirectSelectionCandidate(item)
                     || item.nextEligibleAt > now || selection.tcpAttempted.contains(item)) continue;
+            if (selection.catalogOnly) {
+                long checkedAt = catalogTcpAt(item, selection.network);
+                long threshold = item.nativeVerified ? BACKGROUND_PROXY_POSITIVE_RECHECK_MS
+                        : BACKGROUND_PROXY_TCP_RECHECK_MS;
+                if (checkedAt != 0L && now - checkedAt < threshold) continue;
+            }
             direct.add(item);
         }
         // Reserve slots for fresh feed rows even if old endpoints refuse immediately.
-        int budget = now - selection.started < 4_000L ? SELECTION_TCP_PARALLEL * 2 : MAX_SELECTION_TCP_CHECKS;
+        int total = selection.catalogOnly ? MAX_BACKGROUND_TCP_CHECKS : MAX_SELECTION_TCP_CHECKS;
+        int budget = now - selection.started < 4_000L ? SELECTION_TCP_PARALLEL * 2 : total;
         // Alternate transports so one large SOCKS feed cannot occupy the full window.
         while (!direct.isEmpty() && selection.tcpAttempted.size() < budget
+                && (!selection.catalogOnly || selectionTcpSlots.availablePermits() > 3)
                 && selectionTcpSlots.tryAcquire()) {
             int preferredType = selection.tcpAttempted.size() % 2;
             int index = 0;
             for (int i = 0; i < direct.size(); i++) {
-                if (direct.get(i).type == preferredType) {
+                if (isFreshProtocolVerified(direct.get(0)) || direct.get(i).type == preferredType) {
                     index = i;
                     break;
                 }
@@ -3491,14 +3762,14 @@ public static void reportProxyFailure() {
             selectionTcpWorkers.execute(() -> {
                 SelectionTcpResult result = null;
                 try {
-                    if (selectionIsCurrent(selection) && selection.network == networkProbeEpoch.get()) {
+                    if (preflightIsCurrent(selection) && selection.network == networkProbeEpoch.get()) {
                         result = probePublicCandidateTcp(candidate);
                     }
                 } finally {
                     final SelectionTcpResult measured = result;
                     selectionTcpSlots.release();
                     mainHandler.post(() -> {
-                        if (!selectionIsCurrent(selection) || selection.network != networkProbeEpoch.get()) return;
+                        if (!preflightIsCurrent(selection) || selection.network != networkProbeEpoch.get()) return;
                         selection.tcpFinished++;
                         if (measured != null) {
                             selection.tcpOpen++;
@@ -3509,9 +3780,24 @@ public static void reportProxyFailure() {
                             }
                             if (measured.ready) selection.tcpReachable.put(candidate, measured.address);
                         }
-                        candidate.tcpMs = measured != null && measured.ready ? measured.rtt : -2;
-                        candidate.tcpCheckedAt = SystemClock.elapsedRealtime();
-                        proxySelectionTick(selection);
+                        long finishedAt = SystemClock.elapsedRealtime();
+                        if (selection.catalogOnly) {
+                            enterCatalogNetwork(candidate, selection.network);
+                            candidate.catalogTcpAt = finishedAt;
+                            candidate.catalogPinnedAddress = measured != null && measured.ready ? measured.address : null;
+                            if (measured != null && measured.ready) {
+                                candidate.tcpMs = measured.rtt;
+                                candidate.tcpCheckedAt = finishedAt;
+                            } else if (!isFreshProtocolVerified(candidate)) {
+                                candidate.tcpMs = -2;
+                                candidate.tcpCheckedAt = finishedAt;
+                            }
+                            backgroundProxyTick(selection);
+                        } else {
+                            candidate.tcpMs = measured != null && measured.ready ? measured.rtt : -2;
+                            candidate.tcpCheckedAt = finishedAt;
+                            proxySelectionTick(selection);
+                        }
                     });
                 }
             });
@@ -3535,26 +3821,7 @@ public static void reportProxyFailure() {
         ProxyItem proven = candidate;
         if (alive) {
             selection.protocolAnswered++;
-            if (candidate != source) {
-                // The proved public address is the one saved/applied, not a later DNS answer.
-                rememberHarvested(candidate.address, candidate.port);
-                synchronized (verifiedPool) {
-                    int index = verifiedPool.indexOf(source);
-                    ProxyItem existing = findPoolCandidate(candidate);
-                    if (existing != null && isDirectSelectionCandidate(existing)
-                            && !existing.nativeProbeInFlight.get()) {
-                        existing.pingMs = candidate.pingMs;
-                        existing.tcpMs = candidate.tcpMs;
-                        existing.tcpCheckedAt = candidate.tcpCheckedAt;
-                        existing.verifiedEndpoint = candidate.verifiedEndpoint;
-                        proven = existing;
-                    }
-                    if (index >= 0) {
-                        if (existing == proven) verifiedPool.remove(index);
-                        else if (existing == null) verifiedPool.set(index, candidate);
-                    }
-                }
-            }
+            proven = storePinnedCandidate(source, candidate);
             onVerdict(proven, true);
         } else {
             onVerdict(source, false);
@@ -3564,6 +3831,40 @@ public static void reportProxyFailure() {
         } else if (selection.requested != null && selection.inFlight == 0) {
             finishProxySelection(selection, null, "Прокси не прошёл проверку Telegram; сохранён, но выключен");
         } else proxySelectionTick(selection);
+    }
+
+    private static ProxyItem pinSelectionCandidate(ProxyItem source, String pinnedAddress) {
+        if (pinnedAddress == null || pinnedAddress.equals(source.address)) return source;
+        ProxyItem target = new ProxyItem(pinnedAddress, source.port, source.secret, source.type,
+                source.user, source.password);
+        target.tcpMs = source.tcpMs;
+        target.tcpCheckedAt = source.tcpCheckedAt;
+        return target;
+    }
+
+    private static ProxyItem storePinnedCandidate(ProxyItem source, ProxyItem candidate) {
+        if (candidate == source) return source;
+        // The proved public address is the one saved/applied, not a later DNS answer.
+        rememberHarvested(candidate.address, candidate.port);
+        synchronized (verifiedPool) {
+            int index = verifiedPool.indexOf(source);
+            ProxyItem existing = findPoolCandidate(candidate);
+            if (existing != null && isDirectSelectionCandidate(existing)
+                    && !existing.nativeProbeInFlight.get()) {
+                existing.pingMs = candidate.pingMs;
+                existing.tcpMs = candidate.tcpMs;
+                existing.tcpCheckedAt = candidate.tcpCheckedAt;
+                existing.verifiedEndpoint = candidate.verifiedEndpoint;
+                if (index >= 0) verifiedPool.remove(index);
+                return existing;
+            }
+            if (index >= 0 && existing == null) {
+                verifiedPool.set(index, candidate);
+            } else if (existing == null) {
+                addCandidate(candidate);
+            }
+            return candidate;
+        }
     }
 
     private static boolean startGuestSelectionProbe(ProxySelection selection, ProxyItem source, ProxyItem candidate) {
@@ -3604,6 +3905,17 @@ public static void reportProxyFailure() {
                 + "Telegram: " + selection.protocolAnswered + "/" + selection.protocolTargets.size();
     }
 
+    private static String selectionDiagnostic(ProxySelection selection) {
+        SourceBatch batch = lastSourceBatch;
+        return "sources=" + (batch == null ? "0/0" : batch.available.get() + "/" + batch.total)
+                + " sourceFinished=" + (batch == null ? 0 : batch.finished.get())
+                + " tcp=" + selection.tcpOpen + "/" + selection.tcpFinished
+                + " socks=" + selection.socksReady + "/" + selection.socksAttempted
+                + " socksConnect=" + selection.socksConnected + "/" + selection.socksReady
+                + " telegram=" + selection.protocolAnswered + "/" + selection.protocolTargets.size()
+                + " guest=" + selection.guestResult + "/" + selection.guestAttempts;
+    }
+
     private static void proxySelectionTick(ProxySelection selection) {
         mainHandler.removeCallbacks(selection.tick);
         if (!selectionIsCurrent(selection)) {
@@ -3632,15 +3944,7 @@ public static void reportProxyFailure() {
             if (candidate.nextEligibleAt > SystemClock.elapsedRealtime()) continue;
             String pinnedAddress = selection.tcpReachable.get(candidate);
             if (selection.requested == null && pinnedAddress == null) continue;
-            final ProxyItem target;
-            if (pinnedAddress != null && !pinnedAddress.equals(candidate.address)) {
-                target = new ProxyItem(pinnedAddress, candidate.port, candidate.secret, candidate.type,
-                        candidate.user, candidate.password);
-                target.tcpMs = candidate.tcpMs;
-                target.tcpCheckedAt = candidate.tcpCheckedAt;
-            } else {
-                target = candidate;
-            }
+            final ProxyItem target = pinSelectionCandidate(candidate, pinnedAddress);
             boolean started = startGuestSelectionProbe(selection, candidate, target);
             // Fresh unauthenticated clients have no temporary DC key for native ping.
             // Running a keyless ping in parallel only delays/poisons the isolated verdict.
@@ -3680,19 +3984,13 @@ public static void reportProxyFailure() {
                 proxySelectionStatus = failure + ". " + selectionProgress(selection);
                 setUserProxyDisabled(true);
             }
-            SourceBatch batch = lastSourceBatch;
             Log.i(TAG, "PROXY_DIAG outcome=" + (currentActiveProxy == chosen && chosen != null ? "enabled" : "disabled")
-                    + " sources=" + (batch == null ? "0/0" : batch.available.get() + "/" + batch.total)
-                    + " sourceFinished=" + (batch == null ? 0 : batch.finished.get())
-                    + " tcp=" + selection.tcpOpen + "/" + selection.tcpFinished
-                    + " socks=" + selection.socksReady + "/" + selection.socksAttempted
-                    + " socksConnect=" + selection.socksConnected + "/" + selection.socksReady
-                    + " telegram=" + selection.protocolAnswered + "/" + selection.protocolTargets.size()
-                    + " guest=" + selection.guestResult + "/" + selection.guestAttempts);
+                    + " " + selectionDiagnostic(selection));
             proxySelectionGate.finish(selection.token);
             mainHandler.removeCallbacks(selection.timeout);
             mainHandler.removeCallbacks(selection.tick);
             proxySelection = null;
+            scheduleBackgroundProxyCheck(BACKGROUND_PROXY_BUSY_RETRY_MS);
             notifyProxySettingsChanged();
             toast(proxySelectionStatus);
             startFastNativeChecks();
@@ -4172,6 +4470,13 @@ public static void reportProxyFailure() {
         return isPubliclySelectable(findPoolCandidate(item));
     }
 
+    /** Stock pings cannot independently age out managed rows that the catalog verifies. */
+    public static boolean usesCatalogVerifier(Object proxyInfo) {
+        ProxyItem item = itemFromProxyInfo(proxyInfo);
+        return item != null && item.type != 2 && everHarvested(item.address, item.port)
+                && !readProxyIdentities(KEY_MANUAL_PROXIES).contains(proxyIdentity(item));
+    }
+
     private static void removeUnselectableManagedProxies(Class<?> sharedConfigClass) throws Exception {
         Object value = sharedConfigClass.getDeclaredField("proxyList").get(null);
         if (!(value instanceof List)) return;
@@ -4201,6 +4506,7 @@ public static void reportProxyFailure() {
         ProxyItem item = findPoolCandidate(identity);
         if (item == null && identity.equals(currentActiveProxy)) item = currentActiveProxy;
         if (item == null) return;
+        if (item != currentActiveProxy && usesCatalogVerifier(proxyInfo)) return;
         // The stock checker tests the public identity, never our process-local chain front.
         if (item.chainPort > 0 || item.chainRelay != null || item.mimicActive) return;
         item.pingMs = time >= 0 ? (int) Math.min(Integer.MAX_VALUE, time) : -2;

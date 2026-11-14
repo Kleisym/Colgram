@@ -3,6 +3,7 @@
             org.colgram.core.ColgramRouteControl.WARP_GATE;
     private static final java.util.concurrent.ExecutorService warpOperations =
             org.colgram.core.ColgramRouteControl.OPERATIONS;
+    private static final int REQ_COLGRAM_SUBSCRIPTION_CONSENT = 9184;
     private boolean warpStartPending;
     private long waitingWarpConsent = -1L;
     private long warpRouteEpoch = -1L;
@@ -10,22 +11,39 @@
     private int callsRow = -1;
     private int callsDetailRow = -1;
     private int networkModesRow = -1;
+    private int colgramBackgroundProxyRow = -1;
+    private int colgramDpiRow = -1;
+    private int colgramSubscriptionImportRow = -1;
+    private int colgramSubscriptionNodeRow = -1;
+    private int colgramSubscriptionToggleRow = -1;
+    private int colgramSubscriptionRemoveRow = -1;
+    private final ColgramSubscriptionControls colgramSubscription =
+            new ColgramSubscriptionControls(this, REQ_COLGRAM_SUBSCRIPTION_CONSENT, this::refreshWarpState);
     private String colgramLastProxyStatus;
     private String colgramLastWarpStatus;
+    private String colgramLastBackgroundProxyStatus;
+    private String colgramLastDpiStatus;
+    private String colgramLastSubscriptionStatus;
+    private String colgramLastSubscriptionNode;
     private boolean colgramLastProxyPending;
     private boolean colgramLastWarpDesired;
+    private boolean colgramLastSubscriptionActive;
     private final android.os.Handler colgramRouteHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable colgramRouteRefresh = new Runnable() {
         @Override public void run() {
             if (getParentActivity() == null || listAdapter == null) return;
             warpStartPending = warpOperationsGate.isPending()
                     && org.colgram.core.ColgramConfig.isWarpEnabled();
-            boolean enabled = org.colgram.core.ColgramProxyManager.isProxyEnabled(getContext())
-                    || org.colgram.core.ColgramProxyManager.hasActiveRouteForUi();
+            boolean enabled = colgramRemoteProxyEnabled();
             boolean proxyPending = org.colgram.core.ColgramProxyManager.isProxySelectionPending();
             boolean warpDesired = org.colgram.core.ColgramConfig.isWarpEnabled();
             String proxyStatus = org.colgram.core.ColgramProxyManager.getProxySelectionStatus();
             String warpStatus = warpStatusForProxyScreen();
+            String background = org.colgram.core.ColgramProxyManager.getBackgroundProxyStatus();
+            String dpi = colgramDpiStatus();
+            String subscription = colgramSubscription.statusLine();
+            boolean subscriptionActive = colgramSubscription.canDisconnect();
+            String node = colgramSubscription.nodeLabel();
             if (useProxySettings != enabled) {
                 useProxySettings = enabled;
                 updateRows(true);
@@ -34,14 +52,66 @@
                     listAdapter.notifyItemChanged(useProxyRow);
                 if (warpDesired != colgramLastWarpDesired || !android.text.TextUtils.equals(warpStatus, colgramLastWarpStatus))
                     listAdapter.notifyItemChanged(warpRow);
+                if (!android.text.TextUtils.equals(background, colgramLastBackgroundProxyStatus))
+                    listAdapter.notifyItemChanged(colgramBackgroundProxyRow);
+                if (!android.text.TextUtils.equals(dpi, colgramLastDpiStatus))
+                    listAdapter.notifyItemChanged(colgramDpiRow);
+                if (subscriptionActive != colgramLastSubscriptionActive
+                        || !android.text.TextUtils.equals(subscription, colgramLastSubscriptionStatus))
+                    listAdapter.notifyItemChanged(colgramSubscriptionToggleRow);
+                if (!android.text.TextUtils.equals(node, colgramLastSubscriptionNode))
+                    listAdapter.notifyItemChanged(colgramSubscriptionNodeRow);
             }
             colgramLastProxyStatus = proxyStatus;
             colgramLastWarpStatus = warpStatus;
+            colgramLastBackgroundProxyStatus = background;
+            colgramLastDpiStatus = dpi;
+            colgramLastSubscriptionStatus = subscription;
+            colgramLastSubscriptionActive = subscriptionActive;
+            colgramLastSubscriptionNode = node;
             colgramLastProxyPending = proxyPending;
             colgramLastWarpDesired = warpDesired;
             colgramRouteHandler.postDelayed(this, 1000L);
         }
     };
+
+    private boolean colgramRemoteProxyEnabled() {
+        if (org.colgram.core.ColgramConfig.isDpiBypassEnabled()
+                || org.colgram.core.ColgramProxyManager.isDcRemapActive()) return false;
+        org.colgram.core.ColgramProxyManager.ProxyItem active = org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
+        return active == null ? org.colgram.core.ColgramProxyManager.isProxyEnabled(getContext()) : !active.isLocalDpi();
+    }
+
+    private String colgramDpiStatus() {
+        if (!org.colgram.core.ColgramConfig.isDpiBypassEnabled()) return ColgramSubscriptionControls.label("выключен", "Off");
+        if (!org.colgram.core.ColgramDpiBypass.isBound()) return org.colgram.core.ColgramDpiBypass.upstreamStatus();
+        org.colgram.core.ColgramProxyManager.ProxyItem active = org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
+        if (active == null || !active.isLocalDpi()) return ColgramSubscriptionControls.label("локальный маршрут не выбран", "Local route not applied");
+        if (org.colgram.core.ColgramDpiBypass.bytesFromTarget() > 0 && ConnectionsManager.getInstance(currentAccount).getConnectionState()
+                == ConnectionsManager.ConnectionStateConnected)
+            return ColgramSubscriptionControls.label("подключён к Telegram", "Connected to Telegram");
+        return org.colgram.core.ColgramDpiBypass.upstreamStatus();
+    }
+
+    private void colgramToggleDpi() {
+        android.content.Context context = getContext();
+        if (context == null) return;
+        final boolean enabled = !org.colgram.core.ColgramConfig.isDpiBypassEnabled();
+        if (enabled) {
+            colgramSubscription.stopForAlternativeRoute(context);
+            cancelWarpFromProxyScreen();
+            org.colgram.core.ColgramProxyManager.cancelProxySelection();
+            org.colgram.core.ColgramConfig.setAutoProxyEnabled(false);
+            org.colgram.core.ColgramConfig.setDcRemapEnabled(false);
+            org.colgram.core.ColgramConfig.setIpv6BypassEnabled(false);
+            if (org.colgram.core.ColgramProxyManager.isDcRemapActive()) org.colgram.core.ColgramProxyManager.applyDcRemap(false);
+            if (org.colgram.core.ColgramProxyManager.isProxyEnabled(context)) org.colgram.core.ColgramProxyManager.disableProxy(context);
+        } else {
+            org.colgram.core.ColgramRouteEpoch.next();
+        }
+        org.colgram.core.ColgramProxyManager.setDpiBypassEnabled(context, enabled);
+        refreshWarpState();
+    }
 
     private boolean warpRequested(long token) {
         return token >= 0 && warpOperationsGate.isCurrent(token)
@@ -57,6 +127,8 @@
             android.widget.Toast.makeText(source, "WARP-бэкенд отсутствует в этой сборке", android.widget.Toast.LENGTH_LONG).show();
             return;
         }
+        colgramSubscription.stopForAlternativeRoute(context);
+        org.colgram.core.ColgramProxyManager.cancelProxySelection();
         final long token = warpOperationsGate.begin();
         warpRouteEpoch = org.colgram.core.ColgramRouteEpoch.next();
         waitingWarpConsent = token;
@@ -128,8 +200,7 @@
             if (!warpRequested(token)) return;
             String error = null;
             try {
-                context.stopService(new android.content.Intent(context,
-                        Class.forName("org.colgram.singbox.ColgramVpnService")));
+                ColgramSubscriptionControls.stopStoredProfile(context);
                 org.colgram.core.ColgramConfig.setAutoProxyEnabled(false);
                 org.colgram.core.ColgramConfig.setDpiBypassEnabled(false);
                 org.colgram.core.ColgramConfig.setDcRemapEnabled(false);
@@ -188,6 +259,7 @@
 
     @Override
     public void onActivityResultFragment(int requestCode, int resultCode, android.content.Intent data) {
+        if (colgramSubscription.onActivityResult(requestCode, resultCode)) return;
         if (requestCode != REQ_WARP_CONSENT) {
             super.onActivityResultFragment(requestCode, resultCode, data);
             return;

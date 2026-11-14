@@ -47,6 +47,7 @@ public final class ColgramSubscription {
         public String password;
         public String method;
         public int network;
+        public String transport;
         public String host;
         public String path;
         public String sni;
@@ -213,6 +214,7 @@ public final class ColgramSubscription {
             node.publicKey = options.get("pbk");
             node.shortId = options.get("sid");
             node.network = "ws".equals(options.get("type")) ? 1 : 0;
+            node.transport = options.get("type");
             if (!credentials.isEmpty()) {
                 // Shadowsocks base64 wraps "method:password", not a bare password, and getting
                 // that wrong hands the tunnel a cipher where the secret belongs.
@@ -327,6 +329,8 @@ public final class ColgramSubscription {
         node.shortId = entry.get("short-id");
         node.flow = entry.get("flow");
         node.network = "ws".equals(entry.get("network")) ? 1 : 0;
+        node.transport = entry.get("network");
+        if (entry.containsKey("tls")) node.security = "true".equalsIgnoreCase(entry.get("tls")) ? "tls" : "none";
         node.path = entry.get("ws-path");
         return node;
     }

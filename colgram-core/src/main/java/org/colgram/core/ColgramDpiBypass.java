@@ -22,7 +22,7 @@ import java.util.concurrent.Executors;
  *
  * 1. Multiple desync strategies (splitting at randomised offsets, TLS-record splitting,
  *    TCP urgent/OOB bytes), auto-probed per connection — see the strategy block below.
- * 2. Multi-port DC fallback: connects to 443, 80, 5222, 8443 if the primary port is throttled.
+ * 2. Bounded direct dialing of the requested port and known same-DC aliases.
  * 3. Completely local (127.0.0.1:9876): no third-party server in the path at all.
  *
  * Why local matters: a proxy is a server somebody runs, and its operator sees your IP,
@@ -65,8 +65,12 @@ public class ColgramDpiBypass {
     private static final ColgramConnectFailureBackoff connectFailures =
             new ColgramConnectFailureBackoff(CONNECT_FAILURE_BASE_DELAY_MS,
                     CONNECT_FAILURE_MAX_DELAY_MS);
+    private static final java.util.concurrent.Semaphore DIAL_GROUPS = new java.util.concurrent.Semaphore(3);
+    private static final int UPSTREAM_WAIT = 0, UPSTREAM_DIAL = 1, UPSTREAM_NO_SOCKET = 2,
+            UPSTREAM_SOCKET = 3, UPSTREAM_SILENT = 4, UPSTREAM_REPLY = 5;
+    private static volatile int upstreamState = UPSTREAM_WAIT;
 
-    private static long listenerGeneration;
+    private static volatile long listenerGeneration;
 
     public static synchronized void start() {
         if (isRunning || startScheduled) return;
@@ -118,6 +122,8 @@ public class ColgramDpiBypass {
             final ServerSocket listener = candidate;
             serverSocket = listener;
             activePort = listener.getLocalPort();
+            upstreamState = UPSTREAM_WAIT;
+            resetCarriageCounters();
             bound = true;
             isRunning = true;
             workerPool.execute(() -> acceptClients(listener, generation));
@@ -145,7 +151,7 @@ public class ColgramDpiBypass {
                         closeQuietly(client);
                         break;
                     }
-                    workerPool.execute(() -> handleClient(client));
+                    workerPool.execute(() -> handleClient(client, null, generation));
                 }
             }
         } catch (Exception failure) {
@@ -174,12 +180,26 @@ public class ColgramDpiBypass {
         closeQuietly(serverSocket);
         serverSocket = null;
         activePort = LOCAL_PORT;
+        upstreamState = UPSTREAM_WAIT;
+        clearConnectionFailureBackoff();
         Log.d(TAG, "ColgramDpiBypass stopped");
     }
 
     /** The port the listener is actually on, which is LOCAL_PORT unless that was busy. */
     public static int activePort() {
         return activePort;
+    }
+
+    public static String upstreamStatus() {
+        if (!bound) return "локальный транспорт не запущен";
+        switch (upstreamState) {
+            case UPSTREAM_DIAL: return "подключение к серверу Telegram";
+            case UPSTREAM_NO_SOCKET: return "TCP до Telegram не открылся";
+            case UPSTREAM_SOCKET: return "TCP открыт · ждём ответ Telegram";
+            case UPSTREAM_SILENT: return "TCP открыт · Telegram не ответил";
+            case UPSTREAM_REPLY: return "трафик получен · проверяем протокол Telegram";
+            default: return "локальный транспорт запущен · ждём запрос Telegram";
+        }
     }
 
     /**
@@ -275,10 +295,6 @@ public class ColgramDpiBypass {
         return false;
     }
 
-    private static void handleClient(Socket client) {
-        handleClient(client, null);
-    }
-
     /** Separate, authenticated listener: does not change the app-wide bypass preference. */
     static final class CallListener implements java.io.Closeable {
         private final ServerSocket listener;
@@ -323,7 +339,7 @@ public class ColgramDpiBypass {
                         clients.release();
                         continue;
                     }
-                    workerPool.execute(() -> handleClient(client, this));
+                    workerPool.execute(() -> handleClient(client, this, -1L));
                 }
             } catch (java.io.IOException ignored) {
                 close();
@@ -385,7 +401,7 @@ public class ColgramDpiBypass {
         }
     }
 
-    private static void handleClient(Socket client, CallListener call) {
+    private static void handleClient(Socket client, CallListener call, long generation) {
         Socket targetSocket = null;
         boolean handedOff = false;
         try {
@@ -393,7 +409,7 @@ public class ColgramDpiBypass {
             // it would keep a stopped bypass doing work. The socket is closed rather than left to time
             // out, so what the caller sees after a stop is a refused connection and not a fifteen-second
             // wait.
-            if (call == null ? !isRunning : call.closed || call.vpn == null) {
+            if (call == null ? !isCurrentListener(generation) : call.closed || call.vpn == null) {
                 closeQuietly(client);
                 return;
             }
@@ -508,7 +524,7 @@ public class ColgramDpiBypass {
                 out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0,
                         (byte) (udp.getLocalPort() >>> 8), (byte) udp.getLocalPort()});
                 out.flush();
-                pumpAssociated(udp, client);
+                pumpAssociated(udp, client, generation);
                 return;
             }
 
@@ -522,23 +538,8 @@ public class ColgramDpiBypass {
             } else {
                 long waitMs = backoffUntil - System.currentTimeMillis();
                 if (waitMs > 0) sleep(Math.min(waitMs, MAX_BACKOFF_SLEEP_MS));
-                if (!ColgramDcRemap.shouldSkipDirectAddress(destHost)) {
-                    targetSocket = connectWithBackoff(destHost, destPort);
-                } else {
-                    Log.i(TAG, "skipping temporarily silent Telegram address " + destHost + ":" + destPort);
-                }
-            }
-            if (call == null && targetSocket == null) {
-                // The DC address tgnet was told about is often the one this network refuses.
-                // Searching for a Telegram address that opens a socket at all is what the
-                // address-remap component already does; desync is only worth trying against a
-                // server that answers.
-                String live = ColgramDcRemap.liveAlternativeFor(destHost, destPort);
-                if (live != null && !live.equals(destHost)) {
-                    Log.i(TAG, "desync: " + destHost + ":" + destPort + " refused, trying "
-                            + live + ":" + destPort);
-                    targetSocket = connectWithBackoff(live, destPort);
-                }
+                if (!isCurrentListener(generation)) return;
+                targetSocket = connectWithBackoff(destHost, destPort, generation);
             }
             if (call == null && targetSocket == null && ColgramConfig.isAutoProxyEnabled()
                     && ColgramProxyManager.hasReachableRelays()) {
@@ -563,6 +564,7 @@ public class ColgramDpiBypass {
                     }
                 }
             }
+            if (call == null && !isCurrentListener(generation)) return;
             if (targetSocket == null) {
                 // Per-retry noise from tgnet hammering the listener; a Log.w here floods
                 // logcat a hundred lines a second on a network where the DCs refuse TCP.
@@ -584,8 +586,9 @@ public class ColgramDpiBypass {
             // Counted here, where the upstream socket is known to exist: a front that never reached
             // a target has nothing to count, so this separates "the listener is up" from "a
             // connection to Telegram exists behind it".
-            relayedConnections.incrementAndGet();
-            pipeWithAdvancedDesync(client, targetSocket, call);
+            if (call == null) relayedConnections.incrementAndGet();
+            pipeWithAdvancedDesync(client, targetSocket, call, generation,
+                    call == null && ColgramTelegramDcAddresses.isKnownAddress(destHost));
             handedOff = true;
 
         } catch (Exception e) {
@@ -607,7 +610,15 @@ public class ColgramDpiBypass {
         }
     }
 
-    private static Socket connectWithBackoff(String host, int port) {
+    private static boolean isCurrentListener(long generation) {
+        return bound && generation == listenerGeneration;
+    }
+
+    private static synchronized void publishUpstream(long generation, int state) {
+        if (isCurrentListener(generation)) upstreamState = state;
+    }
+
+    private static Socket connectWithBackoff(String host, int port, long generation) {
         String endpoint = host.toLowerCase(java.util.Locale.US) + ":" + port;
         long now = SystemClock.elapsedRealtime();
         ColgramConnectFailureBackoff.Decision decision = connectFailures.acquire(endpoint, now);
@@ -621,7 +632,19 @@ public class ColgramDpiBypass {
             return null;
         }
         long ticket = decision.ticket();
-        Socket socket = establishConnection(host, port);
+        if (!DIAL_GROUPS.tryAcquire()) {
+            connectFailures.release(endpoint, ticket);
+            return null;
+        }
+        Socket socket;
+        boolean telegram = ColgramTelegramDcAddresses.isKnownAddress(host);
+        if (telegram) publishUpstream(generation, UPSTREAM_DIAL);
+        try {
+            socket = establishConnection(host, port);
+        } finally {
+            DIAL_GROUPS.release();
+        }
+        if (telegram) publishUpstream(generation, socket == null ? UPSTREAM_NO_SOCKET : UPSTREAM_SOCKET);
         if (socket == null) {
             long delay = connectFailures.finish(endpoint, ticket, false, SystemClock.elapsedRealtime());
             if (delay > 0L) {
@@ -638,43 +661,19 @@ public class ColgramDpiBypass {
         connectFailures.clear();
     }
 
-    /**
-     * Connects to target host with multi-port fallback.
-     *
-     * The fallback list exists for MTProto, where Telegram genuinely serves the same
-     * account on several ports. It must NOT be applied blindly to every host: an HTTPS
-     * request to api.telegram.org should not be sent to ports that do not speak TLS. Telegram
-     * DC alternatives race within one shared 1.8-second budget; other hosts use only their
-     * requested port.
-     *
-     * Ports are now used only when the destination is one of Telegram's own MTProto DC
-     * hosts. Everything else gets exactly the port that was asked for. The DC alternatives
-     * race inside one deadline rather than serially burning four connect timeouts on an IP block.
-     */
+    /** Keep the requested port; use only exact stock aliases for the same Telegram DC. */
     private static Socket establishConnection(String host, int port) {
-        // The port that was ASKED FOR is opened first and on its own. Racing all four MTProto
-        // ports and taking whichever socket connected first is what made the bypass fail against
-        // a perfectly reachable Telegram address:
-        //
-        //   19:30:46  W/ColgramDpiBypass: upstream stayed silent for 3000ms on /111.154.167.41:443
-        //
-        // while the same address answered on 443, 80 and 5222 from the device shell. 8443 opens
-        // its socket instantly and never speaks, so the race handed it back, the first MTProto read
-        // timed out, and the whole "обходник не работает" report was the port lottery, not a block.
-        // Measured: 443/80/5222 -> HTTP/1.1 404 (live nginx), 8443 -> silent.
-        if (port == 443 && isMtProtoHost(host)) {
-            Socket preferred = ColgramSocketConnectRace.connectPreferred(
-                    host, 443, new int[]{80, 5222}, TELEGRAM_DIAL_BUDGET_MS);
-            if (preferred != null) return preferred;
-            // 8443 is left out on purpose: it completes a TCP handshake and then never answers.
-            return ColgramSocketConnectRace.connect(host, new int[]{8443}, 3000);
-        }
-        return ColgramSocketConnectRace.connect(host, new int[]{port}, 3000);
+        if (port < 1 || port > 65535) return null;
+        InetSocketAddress primary = new InetSocketAddress(host, port);
+        String[] aliases = ColgramTelegramDcAddresses.candidatesFor(host);
+        InetSocketAddress[] alternatives = new InetSocketAddress[aliases.length];
+        for (int i = 0; i < aliases.length; i++) alternatives[i] = new InetSocketAddress(aliases[i], port);
+        return ColgramSocketConnectRace.connectPreferred(primary, alternatives, TELEGRAM_DIAL_BUDGET_MS);
     }
 
     /**
      * Whether a host is one of Telegram's own MTProto endpoints, where the multi-port
-     * fallback in {@link #establishConnection} is legitimate.
+     * optional user-approved relay fallback is permitted.
      */
     private static boolean isMtProtoHost(String host) {
         if (host == null) return false;
@@ -947,14 +946,11 @@ public class ColgramDpiBypass {
      * stream traffic that a DPI has already stopped caring about, and mangling it would
      * cost throughput for no benefit.
      *
-     * When the first packet is a TLS ClientHello and the mimic is on, it is REWRITTEN into a
-     * browser fingerprint and sent fragmented — not merely split. This is what makes the
-     * listener a general-purpose bypass: Telegram's FakeTLS hello, YouTube, GitHub, Cloudflare
-     * and every other HTTPS destination forwarded through it stop matching the ClientHello
-     * signatures the TSPU holds for those services, while each real server accepts the rebuilt
-     * hello as ordinary TLS.
+     * TLS records are fragmented without modifying a single byte. Rewriting a real ClientHello
+     * here invalidates the client's TLS transcript; rewriting FakeTLS also invalidates its HMAC.
      */
-    private static void pipeWithAdvancedDesync(final Socket client, final Socket dest, CallListener call) {
+    private static void pipeWithAdvancedDesync(final Socket client, final Socket dest, CallListener call,
+                                               long generation, boolean telegram) {
         final int strategy = pickStrategy();
         final boolean mimic = ColgramConfig.isTlsMimicEnabled();
         final java.util.concurrent.atomic.AtomicLong fromTarget =
@@ -974,21 +970,20 @@ public class ColgramDpiBypass {
                     firstPayload = joined;
                 }
                 if (call == null && mimic && ColgramTlsMimic.looksLikeClientHello(firstPayload)) {
-                    byte[] rewritten = ColgramTlsMimic.rewrite(firstPayload);
                     java.util.Random rnd = new java.util.Random();
-                    for (byte[] segment : ColgramTlsMimic.fragment(rewritten, rnd)) {
+                    for (byte[] segment : ColgramTlsMimic.fragment(firstPayload, rnd)) {
                         dout.write(segment);
                         dout.flush();
-                        toTargetBytes.addAndGet(segment.length);
+                        if (isCurrentListener(generation)) toTargetBytes.addAndGet(segment.length);
                         sleep(1 + rnd.nextInt(3));
                     }
                 } else if (firstPayload.length > 1) {
                     sendDesynced(dest, dout, firstPayload, firstPayload.length, strategy);
-                    toTargetBytes.addAndGet(firstPayload.length);
+                    if (isCurrentListener(generation)) toTargetBytes.addAndGet(firstPayload.length);
                 } else if (firstPayload.length == 1) {
                     dout.write(firstPayload, 0, 1);
                     dout.flush();
-                    toTargetBytes.incrementAndGet();
+                    if (isCurrentListener(generation)) toTargetBytes.incrementAndGet();
                 }
 
                 byte[] buffer = new byte[16384];
@@ -996,7 +991,7 @@ public class ColgramDpiBypass {
                 while ((len = cin.read(buffer)) != -1) {
                     dout.write(buffer, 0, len);
                     dout.flush();
-                    toTargetBytes.addAndGet(len);
+                    if (isCurrentListener(generation)) toTargetBytes.addAndGet(len);
                 }
             } catch (Throwable ignored) {
             } finally {
@@ -1013,22 +1008,25 @@ public class ColgramDpiBypass {
                 byte[] buffer = new byte[16384];
                 int len = ColgramFirstResponseReader.readFirst(dest, buffer, FIRST_REPLY_TIMEOUT_MS);
                 if (len > 0) {
+                    if (telegram) publishUpstream(generation, UPSTREAM_REPLY);
                     fromTarget.addAndGet(len);
-                    fromTargetBytes.addAndGet(len);
+                    if (isCurrentListener(generation)) fromTargetBytes.addAndGet(len);
                     cout.write(buffer, 0, len);
                     cout.flush();
                     while ((len = din.read(buffer)) != -1) {
                         fromTarget.addAndGet(len);
-                        fromTargetBytes.addAndGet(len);
+                        if (isCurrentListener(generation)) fromTargetBytes.addAndGet(len);
                         cout.write(buffer, 0, len);
                         cout.flush();
                     }
                 } else if (call == null) {
+                    if (telegram) publishUpstream(generation, UPSTREAM_SILENT);
                     Log.w(TAG, "upstream stayed silent (EOF) on " + dest.getRemoteSocketAddress());
                     ColgramDcRemap.reportSilentAddress(
                             dest.getInetAddress().getHostAddress(), dest.getPort());
                 }
             } catch (SocketTimeoutException silent) {
+                if (telegram) publishUpstream(generation, UPSTREAM_SILENT);
                 Log.w(TAG, "upstream stayed silent for " + FIRST_REPLY_TIMEOUT_MS + "ms on "
                         + dest.getRemoteSocketAddress());
                 if (call == null) ColgramDcRemap.reportSilentAddress(
@@ -1038,10 +1036,10 @@ public class ColgramDpiBypass {
                 closeQuietly(client);
                 closeQuietly(dest);
                 if (call != null) call.done(client, dest);
-                completedRelays.incrementAndGet();
+                if (isCurrentListener(generation)) completedRelays.incrementAndGet();
                 // Decide only after the target direction is done, so a slow reply is not
                 // mistaken for a rejection.
-                if (call == null) reportStrategyResult(strategy, fromTarget.get() > 0);
+                if (isCurrentListener(generation)) reportStrategyResult(strategy, fromTarget.get() > 0);
             }
         });
     }
@@ -1056,11 +1054,11 @@ public class ColgramDpiBypass {
      * completes at all -- previously it was refused, and every connection through this front died
      * before a byte of Telegram traffic moved.
      */
-    private static void pumpAssociated(final java.net.DatagramSocket udp, final Socket client) {
+    private static void pumpAssociated(final java.net.DatagramSocket udp, final Socket client, long generation) {
         Thread inbound = new Thread(() -> {
             java.net.DatagramPacket packet = new java.net.DatagramPacket(new byte[65535], 65535);
             try {
-                while (true) {
+                while (isCurrentListener(generation)) {
                     packet.setLength(65535);
                     udp.receive(packet);
                     int hostAt;
@@ -1090,7 +1088,7 @@ public class ColgramDpiBypass {
                     int payloadLen = packet.getLength() - payloadAt;
                     if (payloadLen <= 0) continue;
 
-                    Socket up = connectWithBackoff(host, port);
+                    Socket up = connectWithBackoff(host, port, generation);
                     if (up == null) continue;
                     try {
                         up.getOutputStream().write(packet.getData(), payloadAt, payloadLen);
@@ -1118,7 +1116,7 @@ public class ColgramDpiBypass {
         // loop that turns them into connections.
         try {
             java.io.InputStream in = client.getInputStream();
-            while (true) {
+            while (isCurrentListener(generation)) {
                 byte[] head = ColgramSocks5Codec.readFully(in, 4);
                 int atyp = head[3] & 0xff;
                 int len;
@@ -1152,7 +1150,7 @@ public class ColgramDpiBypass {
                 int payloadLen = rest.length - payloadAt;
                 if (payloadLen <= 0) continue;
 
-                Socket up = connectWithBackoff(host, port);
+                Socket up = connectWithBackoff(host, port, generation);
                 if (up == null) continue;
                 final Socket sock = up;
                 final byte[] payload = new byte[payloadLen];

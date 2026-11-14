@@ -149,38 +149,16 @@ public final class ColgramProfileBuilder {
 
         if (ColgramSubscription.TROJAN.equals(node.protocol)) {
             out.put("password", orEmpty(node.password));
+            addStreamSecurity(out, node, false);
         } else if (ColgramSubscription.VLESS.equals(node.protocol)) {
             out.put("uuid", orEmpty(node.uuid));
             out.put("flow", orEmpty(node.flow));
-            if (node.publicKey != null && !node.publicKey.isEmpty()) {
-                // Reality is what makes a VLESS node look like a browser to a censor, which is
-                // most of why it is the protocol of choice here. It needs both halves: the peer's
-                // public key and a server name to borrow.
-                out.put("tls", new JSONObject()
-                        .put("enabled", true)
-                        .put("server_name", orEmpty(node.sni))
-                        .put("insecure", false)
-                        // Reality without uTLS does not work, and the engine refuses to start
-                        // rather than quietly connecting unshaped. A browser fingerprint is the
-                        // whole point: it is what makes the handshake look like Chrome to a censor
-                        // inspecting SNI and ALPN instead of a VPN client announcing itself.
-                        .put("utls", new JSONObject()
-                                .put("enabled", true)
-                                .put("fingerprint", "chrome"))
-                        .put("reality", new JSONObject()
-                                .put("enabled", true)
-                                .put("public_key", node.publicKey)
-                                .put("short_id", orEmpty(node.shortId))));
-            } else {
-                out.put("tls", new JSONObject()
-                        .put("enabled", true)
-                        .put("server_name", orEmpty(node.sni))
-                        .put("insecure", false));
-            }
+            addStreamSecurity(out, node, true);
         } else if (ColgramSubscription.VMESS.equals(node.protocol)) {
             out.put("uuid", orEmpty(node.uuid));
             out.put("security", node.method != null ? node.method : "auto");
             out.put("alter_id", 0);
+            if ("tls".equalsIgnoreCase(node.security)) addStreamSecurity(out, node, false);
         } else if (ColgramSubscription.SHADOWSOCKS.equals(node.protocol)) {
             out.put("method", orEmpty(node.method));
             out.put("password", orEmpty(node.password));
@@ -219,13 +197,42 @@ public final class ColgramProfileBuilder {
             }
         }
 
-        if (node.network == 1) {
+        if ((ColgramSubscription.VLESS.equals(node.protocol) || ColgramSubscription.TROJAN.equals(node.protocol))
+                && node.transport != null && !node.transport.isEmpty()
+                && !"tcp".equalsIgnoreCase(node.transport) && !"raw".equalsIgnoreCase(node.transport)
+                && !"ws".equalsIgnoreCase(node.transport)) {
+            throw new IllegalArgumentException("этот транспорт узла не поддерживается");
+        }
+        if (node.network == 1 || "ws".equalsIgnoreCase(node.transport)) {
             out.put("transport", new JSONObject()
                     .put("type", "ws")
                     .put("path", node.path != null ? node.path : "/")
-                    .put("headers", new JSONObject().put("Host", orEmpty(node.host))));
+                    .put("headers", node.host == null || node.host.isEmpty() ? new JSONObject()
+                            : new JSONObject().put("Host", node.host)));
         }
         return out;
+    }
+
+    private static void addStreamSecurity(JSONObject outbound, ColgramSubscription.Node node,
+                                          boolean allowPlain) throws Exception {
+        String mode = node.security == null ? "" : node.security.trim().toLowerCase(java.util.Locale.ROOT);
+        boolean hasKey = node.publicKey != null && !node.publicKey.isEmpty();
+        if ("none".equals(mode) && allowPlain && !hasKey) return;
+        if (!mode.isEmpty() && !"tls".equals(mode) && !"reality".equals(mode)) {
+            throw new IllegalArgumentException("этот режим защиты узла не поддерживается");
+        }
+        boolean reality = "reality".equals(mode) || (mode.isEmpty() && hasKey);
+        if (reality && (!hasKey || node.sni == null || node.sni.isEmpty())) {
+            throw new IllegalArgumentException("для REALITY нужны публичный ключ и SNI");
+        }
+        JSONObject tls = new JSONObject().put("enabled", true).put("insecure", false);
+        if (node.sni != null && !node.sni.isEmpty()) tls.put("server_name", node.sni);
+        if (reality) {
+            tls.put("utls", new JSONObject().put("enabled", true).put("fingerprint", "chrome"));
+            tls.put("reality", new JSONObject().put("enabled", true)
+                    .put("public_key", node.publicKey).put("short_id", orEmpty(node.shortId)));
+        }
+        outbound.put("tls", tls);
     }
 
     private static String outboundType(String protocol) {

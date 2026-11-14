@@ -15,10 +15,11 @@ class RouteCancellationTest(unittest.TestCase):
         self.assertTrue("stopSubscriptionTunnel" in body, "Direct leaves subscription VPN running")
 
     def test_subscription_parse_and_consent_share_route_epoch(self):
-        s = (ROOT / "scripts/templates/ColgramSettingsActivity.java").read_text(encoding="utf-8")
-        self.assertTrue("waitingSubscriptionConsent" in s, "subscription consent has no owner")
-        self.assertTrue("ColgramRouteEpoch.isCurrent" in s, "stale subscription result can install a VPN")
-        self.assertTrue("startSubscriptionTunnel(context, token)" in s, "subscription start loses its generation")
+        s = (ROOT / "scripts/templates/ColgramSubscriptionControls.java").read_text(encoding="utf-8")
+        self.assertIn("awaitingConsent = ColgramRouteEpoch.snapshot()", s, "subscription consent has no owner")
+        self.assertIn("!ColgramRouteEpoch.isCurrent(requested)", s, "stale consent can install a VPN")
+        self.assertIn("ColgramRouteEpoch.runIfCurrent(token", s, "subscription start loses its generation")
+        self.assertIn("abandonConsent();", s, "another route must clear a pending subscription request")
 
     def test_delayed_public_and_dpi_routes_recheck_generation(self):
         s = (CORE / "ColgramProxyManager.java").read_text(encoding="utf-8")

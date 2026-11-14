@@ -16,6 +16,15 @@ import org.junit.runner.RunWith;
 import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.ServerSocket;
+import java.net.InetAddress;
+import java.io.DataInputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
 
 /**
  * Account-free check that the local bypass is a real listener, not a flag that says it is.
@@ -33,6 +42,59 @@ public final class ColgramDpiBypassDeviceTest {
 
     private Context context;
     private Class<?> bypass;
+
+    @Test public void localTlsSegmentationPreservesTheExactClientHello() throws Exception {
+        SSLEngine engine = SSLContext.getDefault().createSSLEngine("fixture.invalid", 443);
+        engine.setUseClientMode(true);
+        engine.beginHandshake();
+        ByteBuffer generated = ByteBuffer.allocate(32768);
+        engine.wrap(ByteBuffer.allocate(0), generated);
+        byte[] hello = new byte[generated.position()];
+        generated.flip();
+        generated.get(hello);
+        assertTrue("ClientHello must be generated without any network request", hello.length > 64);
+        boolean mimic = ColgramConfig.isTlsMimicEnabled();
+        ColgramConfig.setTlsMimicEnabled(true);
+        try (ServerSocket peer = new ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"))) {
+            peer.setSoTimeout(5000);
+            FutureTask<Void> echo = new FutureTask<>(() -> {
+                try (Socket socket = peer.accept()) {
+                    socket.setSoTimeout(3500);
+                    byte[] received = new byte[hello.length];
+                    new DataInputStream(socket.getInputStream()).readFully(received);
+                    org.junit.Assert.assertArrayEquals("A bridge must not rewrite TLS transcript/HMAC bytes", hello, received);
+                    socket.getOutputStream().write(received);
+                    socket.getOutputStream().flush();
+                }
+                return null;
+            });
+            Thread fixture = new Thread(echo, "colgram-tls-byte-fixture");
+            fixture.setDaemon(true);
+            fixture.start();
+            ColgramDpiBypass.startImmediately();
+            assertTrue(ColgramDpiBypass.awaitReady(1500));
+            try (Socket client = new Socket("127.0.0.1", ColgramDpiBypass.activePort())) {
+                client.setSoTimeout(5000);
+                OutputStream out = client.getOutputStream();
+                DataInputStream in = new DataInputStream(client.getInputStream());
+                out.write(new byte[]{5, 1, 0}); out.flush();
+                org.junit.Assert.assertEquals(5, in.readUnsignedByte());
+                org.junit.Assert.assertEquals(0, in.readUnsignedByte());
+                int port = peer.getLocalPort();
+                out.write(new byte[]{5, 1, 0, 1, 127, 0, 0, 1, (byte) (port >>> 8), (byte) port});
+                out.flush();
+                byte[] accepted = new byte[10]; in.readFully(accepted);
+                org.junit.Assert.assertEquals(0, accepted[1]);
+                out.write(hello); out.flush();
+                byte[] returned = new byte[hello.length]; in.readFully(returned);
+                org.junit.Assert.assertArrayEquals(hello, returned);
+            }
+            echo.get(4, TimeUnit.SECONDS);
+            android.util.Log.i("ColgramDpiBypassTest", "TLS_STREAM_INTEGRITY=PASS client_hello_bytes=" + hello.length);
+        } finally {
+            ColgramConfig.setTlsMimicEnabled(mimic);
+        }
+    }
 
     @Before
     public void setUp() throws Exception {
