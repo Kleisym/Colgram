@@ -1,5 +1,6 @@
 """Regression tests for persistent account-free network controls and welcome branding."""
 import importlib.util
+import math
 from pathlib import Path
 import subprocess
 import unittest
@@ -42,14 +43,33 @@ class OnboardingPatchesTest(unittest.TestCase):
     def intro(self):
         return '''public class IntroActivity {
     private Drawable logoDrawable;
+    private volatile int currentViewPagerPage;
+        LocaleController.getString(R.string.Page6Message)
         logoDrawable = context.getResources().getDrawable(R.drawable.telegram_logo).mutate();
+        logoDrawable.setBounds(0, dp(8.666f), dp(115), dp(35));
+        SpannableStringBuilder ssb = new SpannableStringBuilder(LocaleController.getString(R.string.Page1Title));
+        ssb.setSpan(new ImageSpan(logoDrawable), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        titles[0] = ssb;
         frameContainerView.addView(themeFrameLayout, LayoutHelper.createFrame(64, 64, Gravity.TOP | Gravity.RIGHT, 0, themeMargin, themeMargin, 0));
+            loadTexture(R.drawable.intro_private_screw, 20);
             loadTexture(R.drawable.intro_tg_plane, 21);
+            loadTexture(v -> {
+                Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
                 paint.setColor(ThemeColors.TELEGRAM_COLOR); // It's logo color, it should not be colored by the theme
+                return bm;
+            }, 22);
+            loadTexture(telegramMaskProvider, 23);
         TextureView textureView = new TextureView(context);
+        frameLayout2.addView(textureView, LayoutHelper.createFrame(ICON_WIDTH_DP, ICON_HEIGHT_DP, Gravity.CENTER));
         textureView.setSurfaceTextureListener(listener);
+        Intro.setPage(currentViewPagerPage);
+        Intro.setPage(currentViewPagerPage);
+                bottomPages.setPageOffset(position, positionOffset);
     private void updateColors(boolean fromTheme) {
+        logoDrawable.setColorFilter(Theme.multAlpha(getThemedColor(Theme.key_actionBarDefaultTitle), 0.9f), PorterDuff.Mode.MULTIPLY);
         fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+    }
+    private class IntroAdapter extends PagerAdapter {
     }
 }'''
 
@@ -83,18 +103,53 @@ class OnboardingPatchesTest(unittest.TestCase):
         self.assertEqual(once, self.patch.patch_login_network_menu(once))
         self.assertEqual(1, once.count('setTag("colgram_network_menu")'))
 
-    def test_intro_uses_real_colgram_texture_without_changing_surface_lifecycle(self):
+    def test_intro_uses_original_avatar_and_distinct_cloud_without_changing_surface_lifecycle(self):
         result = self.patch.patch_intro_branding_and_menu(self.intro())
         self.assertNotIn("R.drawable.intro_tg_plane", result)
         self.assertNotIn("ThemeColors.TELEGRAM_COLOR", result)
         self.assertNotIn("R.drawable.telegram_logo", result)
-        self.assertIn("R.drawable.colgram_cloud_logo", result)
-        self.assertIn("cloud.draw(new android.graphics.Canvas(bitmap))", result)
-        self.assertIn("paint.setColor(android.graphics.Color.TRANSPARENT)", result)
+        self.assertNotIn("logoDrawable", result)
+        self.assertIn("setImageResource(R.drawable.colgram_app_avatar)", result)
+        self.assertIn("setImageResource(R.drawable.colgram_intro_cloud)", result)
+        self.assertIn("setClipToOutline(true)", result)
         self.assertIn("TextureView textureView = new TextureView(context)", result)
         self.assertIn("textureView.setSurfaceTextureListener(listener)", result)
+        self.assertNotRegex(result, r"textureView\.setVisibility|removeView\(textureView\)")
         self.assertIn('setTag("colgram_network_menu")', result)
         self.assertIn("AndroidUtilities.statusBarHeight / AndroidUtilities.density", result)
+
+    def test_native_renderer_excludes_branded_endpoints_and_pager_keeps_swipe_progress(self):
+        result = self.patch.patch_intro_branding_and_menu(self.intro())
+        self.assertEqual(2, result.count("Intro.setPage(getNativeIntroPage());"))
+        self.assertIn("Math.max(1, Math.min(currentViewPagerPage, titles.length - 2))", result)
+        self.assertIn("float avatarAlpha = position == 0 ? 1f - positionOffset : 0f;", result)
+        self.assertIn("position == cloudPage - 1 ? positionOffset : 0f;", result)
+        self.assertIn("textureView.setAlpha(1f - avatarAlpha - cloudAlpha)", result)
+        self.assertIn("bottomPages.setPageOffset(position, positionOffset)", result)
+        self.assertIn('LocaleController.getString(R.string.Page6Message).replace("Telegram", "Colgram")', result)
+
+    def test_intro_replaces_legacy_gl_cloud_without_reinstalling_menu(self):
+        old = self.intro().replace("private Drawable logoDrawable;", '''private Drawable logoDrawable;
+    private android.widget.ImageView colgramNetworkButton;''').replace(
+            "R.drawable.telegram_logo", "R.drawable.colgram_cloud_logo").replace(
+            "        ssb.setSpan(new ImageSpan(logoDrawable), 0, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n        titles[0] = ssb;",
+            '        titles[0] = "Colgram";').replace(
+            "loadTexture(R.drawable.intro_tg_plane, 21);", '''loadTexture(unused -> {
+                android.graphics.drawable.Drawable cloud = getParentActivity().getResources().getDrawable(R.drawable.colgram_cloud_logo).mutate();
+                Bitmap bitmap = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888);
+                cloud.setBounds(0, 0, 512, 512);
+                cloud.draw(new android.graphics.Canvas(bitmap));
+                return bitmap;
+            }, 21);''').replace(
+            "ThemeColors.TELEGRAM_COLOR", "android.graphics.Color.TRANSPARENT").replace(
+            "        TextureView textureView", '''        // COLGRAM_INTRO_BRANDING_MENU = 2
+        colgramNetworkButton.setTag("colgram_network_menu");
+        TextureView textureView''')
+        result = self.patch.patch_intro_branding_and_menu(old)
+        self.assertNotIn("R.drawable.colgram_cloud_logo", result)
+        self.assertIn("setImageResource(R.drawable.colgram_app_avatar)", result)
+        self.assertEqual(1, result.count('setTag("colgram_network_menu")'))
+        self.assertEqual(result, self.patch.patch_intro_branding_and_menu(result))
 
     def test_intro_patch_is_idempotent(self):
         once = self.patch.patch_intro_branding_and_menu(self.intro())
@@ -152,6 +207,32 @@ class OnboardingPatchesTest(unittest.TestCase):
         self.assertEqual("64", root.get("{http://schemas.android.com/apk/res/android}viewportWidth"))
         gradient = root.find(".//gradient")
         self.assertEqual("#FF4A56", gradient.get("{http://schemas.android.com/apk/res/android}endColor"))
+
+    def test_startup_wrapper_fits_the_whole_original_avatar_inside_android_mask(self):
+        path = ROOT / "assets/colgram_startup_avatar.xml"
+        self.assertTrue(path.is_file(), "startup needs a dedicated mask-safe avatar drawable")
+        root = ET.parse(path).getroot()
+        android = "{http://schemas.android.com/apk/res/android}"
+        self.assertEqual("inset", root.tag)
+        self.assertEqual("@drawable/colgram_app_avatar", root.get(android + "drawable"))
+        inset = float(root.get(android + "inset").removesuffix("%")) / 100
+        # Android 12: a 288dp asset with no icon-background layer must fit inside
+        # the inner 192dp circle. Check the corner, not merely the side length.
+        avatar_side = 288 * (1 - 2 * inset)
+        self.assertLess(math.hypot(avatar_side / 2, avatar_side / 2), 96)
+        self.assertGreater(avatar_side, 110, "the avatar must remain recognizable")
+
+    def test_cloud_slide_art_is_independent_of_the_menu_glyph(self):
+        path = ROOT / "assets/colgram_intro_cloud.xml"
+        self.assertTrue(path.is_file(), "the cloud slide needs its own red artwork")
+        art = ET.parse(path).getroot()
+        menu = ET.parse(ROOT / "assets/colgram_cloud_logo.xml").getroot()
+        android = "{http://schemas.android.com/apk/res/android}"
+        self.assertEqual("vector", art.tag)
+        self.assertEqual("#FF4A56", art.find(".//gradient").get(android + "endColor"))
+        menu_paths = {node.get(android + "pathData") for node in menu.findall("path")}
+        art_paths = {node.get(android + "pathData") for node in art.findall("path")}
+        self.assertTrue(menu_paths.isdisjoint(art_paths))
 
     def test_pristine_pinned_upstream_and_already_patched_tree_converge(self):
         checkout = ROOT / "Telegram-Src"

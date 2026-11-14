@@ -6846,91 +6846,43 @@ def apply_custom_app_icon(repo_path, source_icon_path):
             with open(bg_xml, "w", encoding="utf-8") as f:
                 f.write('<?xml version="1.0" encoding="utf-8"?>\n<shape xmlns:android="http://schemas.android.com/apk/res/android">\n    <solid android:color="#000000" />\n</shape>\n')
 
-    # 3. Splash plane & black launch screen background
-    splash_src = os.path.join(root_dir, "assets", "colgram_plane_splash.png")
-    if os.path.exists(splash_src):
-        for res_dir in target_dirs:
-            if not os.path.exists(res_dir):
-                continue
-            drawable_dir = os.path.join(res_dir, "drawable")
-            os.makedirs(drawable_dir, exist_ok=True)
-            shutil.copy2(splash_src, os.path.join(drawable_dir, "colgram_plane_splash.png"))
-            shutil.copy2(os.path.join(root_dir, "assets", "colgram_cloud_logo.xml"),
-                         os.path.join(drawable_dir, "colgram_cloud_logo.xml"))
+    # Launcher/first slide: original avatar. Last slide and proxy panel: distinct artwork.
+    # Only the temporary Android splash surface is black; app content keeps its active theme.
+    from pathlib import Path
 
-            splash_bg_xml = os.path.join(drawable_dir, "colgram_splash_bg.xml")
-            with open(splash_bg_xml, "w", encoding="utf-8") as f:
-                f.write('''<?xml version="1.0" encoding="utf-8"?>
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/black" />
-    <item
-        android:gravity="center"
-        android:width="160dp"
-        android:height="160dp"
-        android:drawable="@drawable/colgram_cloud_logo" />
-</layer-list>
-''')
+    assets = Path(root_dir) / "assets"
+    startup_style = re.compile(r'(<style\s+name="Theme\.TMessages\.Start"[^>]*>)(.*?)(</style>)', re.S)
+    splash_item = re.compile(
+        r'(<item name="android:(windowSplashScreenAnimatedIcon|windowSplashScreenBackground)">)[^<]*(</item>)')
 
-            tg_splash = os.path.join(drawable_dir, "tg_splash_320.xml")
-            with open(tg_splash, "w", encoding="utf-8") as f:
-                f.write('''<?xml version="1.0" encoding="utf-8"?>
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/black" />
-    <item
-        android:gravity="center"
-        android:width="160dp"
-        android:height="160dp"
-        android:drawable="@drawable/colgram_cloud_logo" />
-</layer-list>
-''')
+    def update_splash(item):
+        value = ("@drawable/colgram_startup_avatar" if item[2] == "windowSplashScreenAnimatedIcon"
+                 else "@android:color/black")
+        return item[1] + value + item[3]
 
-    # 4. Patch styles.xml — Colgram splash branding ONLY.
-    #
-    # ⚠️ android:windowBackground and android:colorBackground are deliberately NOT
-    # touched any more. An earlier revision forced both to
-    # `@drawable/colgram_splash_bg` / `@android:color/black` in every variant, and that
-    # drawable's first layer is pure black. This was the second half of the
-    # black-on-black bug:
-    #
-    #   * android:windowBackground is what you see wherever a screen's own content is
-    #     transparent, and Telegram leaves it transparent in places (the intro surface,
-    #     transition gaps, list spacing).
-    #   * In the LIGHT theme that was invisible, because the theme's own background is
-    #     white and the window was black - opaque content covered it and the two never
-    #     visibly disagreed. That is why this hid for so long.
-    #   * In a DARK theme it is not invisible: transparent areas showed pure black
-    #     instead of the theme colour, and IntroActivity feeds the same colour to the
-    #     NATIVE intro renderer (Intro.setBackgroundColor(Theme.getColor(
-    #     key_windowBackgroundWhite))), which then paints an opaque rectangle over the
-    #     intro's title/subtitle TextViews. Net result: black-on-black, unreadable
-    #     intro and login form.
-    #
-    # Same rule as the fragmentView bug fixed earlier, one level up: never hardcode a
-    # background behind theme-driven content. Brand the SPLASH instead - that is what
-    # windowSplashScreenBackground / windowSplashScreenAnimatedIcon are for.
-    res_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "res")
+    def patch_startup_style(style):
+        return style[1] + splash_item.sub(update_splash, style[2]) + style[3]
 
-    v31_styles = os.path.join(res_dir, "values-v31", "styles.xml")
-    if os.path.exists(v31_styles):
-        with open(v31_styles, "r", encoding="utf-8") as f:
-            v31_content = f.read()
-        v31_content = v31_content.replace(
-            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">?android:windowBackground</item>',
-            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
-        )
-        with open(v31_styles, "w", encoding="utf-8") as f:
-            f.write(v31_content.replace("@drawable/colgram_plane_splash", "@drawable/colgram_cloud_logo"))
+    for res in map(Path, target_dirs):
+        if not res.is_dir():
+            continue
+        drawable = res / "drawable"
+        nodpi = res / "drawable-nodpi"
+        drawable.mkdir(exist_ok=True)
+        nodpi.mkdir(exist_ok=True)
+        shutil.copy2(source_icon_path, nodpi / "colgram_app_avatar.png")
+        for name in ("colgram_startup_avatar.xml", "colgram_intro_cloud.xml", "colgram_cloud_logo.xml"):
+            shutil.copy2(assets / name, drawable / name)
+        for styles in sorted(res.glob("values*/styles.xml")):
+            content = styles.read_text(encoding="utf-8")
+            updated = startup_style.sub(patch_startup_style, content)
+            if updated != content:
+                styles.write_text(updated, encoding="utf-8")
 
-    night_styles = os.path.join(res_dir, "values-night", "styles.xml")
-    if os.path.exists(night_styles):
-        with open(night_styles, "r", encoding="utf-8") as f:
-            n_content = f.read()
-        n_content = n_content.replace(
-            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">#1f2732</item>',
-            '<item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_plane_splash</item>\n        <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>\n        <item name="android:windowSplashScreenBackground">@android:color/black</item>'
-        )
-        with open(night_styles, "w", encoding="utf-8") as f:
-            f.write(n_content.replace("@drawable/colgram_plane_splash", "@drawable/colgram_cloud_logo"))
+    required_style = Path(target_dirs[0]) / "values-v31/styles.xml"
+    if "@drawable/colgram_startup_avatar" not in required_style.read_text(encoding="utf-8"):
+        raise ValueError("Pinned Android startup style did not select the Colgram avatar")
+
 
 def isolate_masque_process(content):
     marker = "// Colgram: isolated MASQUE service bootstrap"

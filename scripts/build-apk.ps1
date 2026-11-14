@@ -4,7 +4,7 @@ param(
     [string]$JavaHome = $env:JAVA_HOME,
     [string]$AndroidSdk = $env:ANDROID_HOME,
     [string]$Output = '',
-    [string]$BuildStamp = 'mumu-cloud-20261114'
+    [string]$BuildStamp = 'mumu-avatar-cloud-20261114'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
