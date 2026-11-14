@@ -176,7 +176,7 @@ def add_connection_settings(s):
     """Add the route-specific rows without forking the Telegram proxy editor."""
     marker = "// COLGRAM_CONNECTION_SETTINGS = 1"
     if marker in s:
-        return make_local_base_read_only(add_connection_source_details(s))
+        return bind_source_details_click(make_local_base_read_only(add_connection_source_details(s)))
 
     def replace(old, new):
         nonlocal s
@@ -289,7 +289,25 @@ def add_connection_settings(s):
                     || position == colgramSubscriptionToggleRow || position == colgramSubscriptionRemoveRow) {
                 return VIEW_TYPE_TEXT_SETTING;
             } else if (position == useProxyRow || position == rotationRow || position == warpRow || position == colgramDpiRow) {''')
-    return make_local_base_read_only(add_connection_source_details(s))
+    return bind_source_details_click(make_local_base_read_only(add_connection_source_details(s)))
+
+
+def bind_source_details_click(s):
+    """Own summary-row touches instead of relying on a links/info cell's selection."""
+    if "// COLGRAM_SOURCE_DETAILS_TOUCH = 1" in s:
+        return s
+    anchor = "                    TextInfoPrivacyCell cell = (TextInfoPrivacyCell) holder.itemView;"
+    if s.count(anchor) != 1:
+        raise ValueError("Source details touch anchor missing or ambiguous")
+    return s.replace(anchor, anchor + '''
+                    // COLGRAM_SOURCE_DETAILS_TOUCH = 1
+                    cell.setOnClickListener(position == colgramBackgroundProxyRow
+                            ? v -> colgramShowSourceDiagnostics() : null);
+                    cell.setClickable(position == colgramBackgroundProxyRow);
+                    cell.getTextView().setMovementMethod(position == colgramBackgroundProxyRow
+                            ? null : android.text.method.LinkMovementMethod.getInstance());
+                    cell.getTextView().setClickable(false);
+                    cell.getTextView().setLongClickable(false);''', 1)
 
 
 def make_local_base_read_only(s):

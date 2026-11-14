@@ -128,6 +128,15 @@ public final class ColgramSettingsRowsDeviceTest {
                     int position = row(screenType, screen, shield ? "colgramDpiRow" : "dpiBypassRow");
                     androidx.recyclerview.widget.RecyclerView.ViewHolder holder = adapter.createViewHolder(
                             new android.widget.FrameLayout(context), adapter.getItemViewType(position));
+                    if (shield) {
+                        adapter.bindViewHolder(holder, row(screenType, screen, "colgramBackgroundProxyRow"));
+                        assertTrue("The source summary does not own its tap", holder.itemView.isClickable());
+                        org.telegram.ui.Cells.TextInfoPrivacyCell summary =
+                                (org.telegram.ui.Cells.TextInfoPrivacyCell) holder.itemView;
+                        assertTrue("The links movement handler still intercepts source details", summary.getTextView().getMovementMethod() == null);
+                        assertFalse("The source child still intercepts its parent", summary.getTextView().isClickable());
+                    }
+                    // Recycle the actionable source cell into the non-interactive local status.
                     adapter.bindViewHolder(holder, position);
                     assertTrue(name + " still uses a switch instead of read-only status",
                             holder.itemView instanceof org.telegram.ui.Cells.TextInfoPrivacyCell);

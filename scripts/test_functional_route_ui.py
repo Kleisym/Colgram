@@ -61,6 +61,16 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertIn("position == colgramBackgroundProxyRow ||", method(proxy, "public boolean isEnabled("))
             self.assertIn("getSourceDiagnostics()", method(proxy, "private void colgramShowSourceDiagnostics()"))
 
+    def test_source_details_click_is_owned_by_the_cell_and_cleared_on_recycle(self):
+        for original in (self.pristine, self.existing):
+            proxy, _ = self.transformed(original)
+            bind = method(proxy, "public void onBindViewHolder(")
+            self.assertIn("cell.setOnClickListener(position == colgramBackgroundProxyRow", bind)
+            self.assertIn("v -> colgramShowSourceDiagnostics() : null", bind)
+            self.assertIn("cell.setClickable(position == colgramBackgroundProxyRow)", bind)
+            self.assertIn("cell.getTextView().setMovementMethod(position == colgramBackgroundProxyRow", bind)
+            self.assertIn("cell.getTextView().setClickable(false)", bind)
+
     def test_local_base_is_read_only_on_fresh_and_existing_shield_screens(self):
         for original in (self.pristine, self.existing):
             proxy, _ = self.transformed(original)
