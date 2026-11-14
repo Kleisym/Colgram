@@ -60,6 +60,17 @@ class BackgroundProxyCatalogTest(unittest.TestCase):
         self.assertIn("scheduleBackgroundProxyCheck", finish)
         self.assertIn("public static String getBackgroundProxyStatus()", self.manager)
 
+    def test_os_job_keeps_anonymous_checks_alive_until_a_bounded_finish(self):
+        start = method(self.manager, "public static void refreshProxySourcesInBackground(")
+        self.assertIn("beginScheduledCatalogCheck", start)
+        eligibility = method(self.manager, "private static boolean catalogChecksAllowed()")
+        self.assertIn("scheduledCatalogCheck", eligibility)
+        self.assertIn("ColgramUiBridge.isAppInForeground()", eligibility)
+        finish = method(self.manager, "private static void finishBackgroundProxyCheck(")
+        self.assertIn("finishScheduledCatalogCheck", finish)
+        job = (CORE / "ColgramBootJobService.java").read_text(encoding="utf-8")
+        self.assertIn("ColgramProxyManager.cancelScheduledCatalogCheck()", method(job, "public boolean onStopJob("))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -92,6 +92,8 @@ public class ColgramBootJobService extends JobService {
 
     @Override
     public boolean onStopJob(JobParameters params) {
+        if (params != null && params.getJobId() == PROXY_REFRESH_JOB_ID)
+            ColgramProxyManager.cancelScheduledCatalogCheck();
         return false;
     }
 }

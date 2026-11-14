@@ -2556,16 +2556,7 @@ public static void reportProxyFailure() {
             if (onComplete != null) onComplete.run();
             return;
         }
-        if (verifiedPool.isEmpty()) initVerifiedPool();
-        executor.execute(() -> {
-            try {
-                fetchAndVerifyAllSources();
-            } catch (Throwable t) {
-                Log.w(TAG, "OS-scheduled proxy source refresh failed", t);
-            } finally {
-                if (onComplete != null) mainHandler.post(onComplete);
-            }
-        });
+        mainHandler.post(() -> beginScheduledCatalogCheck(onComplete));
     }
 
     /**
@@ -3309,6 +3300,42 @@ public static void reportProxyFailure() {
     private static volatile String backgroundProxyStatus = "Проверка каталога запланирована";
     private static long backgroundProxyScheduledAt = Long.MAX_VALUE;
     private static final Runnable backgroundProxyRunner = ColgramProxyManager::runBackgroundProxyCheck;
+    private static ScheduledCatalogCheck scheduledCatalogCheck;
+
+    private static final class ScheduledCatalogCheck {
+        final Runnable completed;
+        final Runnable timeout;
+        ScheduledCatalogCheck(Runnable completed) {
+            this.completed = completed;
+            timeout = () -> { if (scheduledCatalogCheck == this) finishScheduledCatalogCheck(true); };
+        }
+    }
+
+    private static boolean catalogChecksAllowed() {
+        return scheduledCatalogCheck != null || ColgramUiBridge.isAppInForeground();
+    }
+
+    private static void beginScheduledCatalogCheck(Runnable completed) {
+        finishScheduledCatalogCheck(true);
+        scheduledCatalogCheck = new ScheduledCatalogCheck(completed);
+        mainHandler.postDelayed(scheduledCatalogCheck.timeout, BACKGROUND_PROXY_CHECK_WINDOW_MS + 15_000L);
+        scheduleBackgroundProxyCheck(0L);
+    }
+
+    private static void finishScheduledCatalogCheck(boolean notify) {
+        ScheduledCatalogCheck job = scheduledCatalogCheck;
+        scheduledCatalogCheck = null;
+        if (job == null) return;
+        mainHandler.removeCallbacks(job.timeout);
+        if (notify && job.completed != null) job.completed.run();
+        if (!ColgramUiBridge.isAppInForeground() && backgroundProxySelection != null) {
+            backgroundProxyTick(backgroundProxySelection);
+        }
+    }
+
+    public static void cancelScheduledCatalogCheck() {
+        mainHandler.post(() -> finishScheduledCatalogCheck(false));
+    }
 
     private static final class ProxySelection {
         final long token;
@@ -3390,7 +3417,7 @@ public static void reportProxyFailure() {
     private static boolean preflightIsCurrent(ProxySelection selection) {
         return selection.catalogOnly
                 ? backgroundProxySelection == selection && !isProxySelectionPending()
-                    && ColgramConfig.isBuiltinProxyEnabled() && ColgramUiBridge.isAppInForeground()
+                    && ColgramConfig.isBuiltinProxyEnabled() && catalogChecksAllowed()
                 : selectionIsCurrent(selection);
     }
 
@@ -3409,8 +3436,9 @@ public static void reportProxyFailure() {
     private static void runBackgroundProxyCheck() {
         backgroundProxyScheduledAt = Long.MAX_VALUE;
         Context context = appContext;
-        if (context == null || !ColgramConfig.isBuiltinProxyEnabled() || !ColgramUiBridge.isAppInForeground()
+        if (context == null || !ColgramConfig.isBuiltinProxyEnabled() || !catalogChecksAllowed()
                 || ColgramPowerGuard.shouldThrottle(context) || !hasCatalogNetwork(context)) {
+            finishScheduledCatalogCheck(true);
             scheduleBackgroundProxyCheck(BACKGROUND_PROXY_IDLE_MS);
             return;
         }
@@ -3590,6 +3618,7 @@ public static void reportProxyFailure() {
                 + " proxy_enabled=" + isProxyEnabled(appContext));
         publishPoolToStock();
         notifyProxySettingsChanged();
+        finishScheduledCatalogCheck(true);
         scheduleBackgroundProxyCheck(delayMs);
     }
 
