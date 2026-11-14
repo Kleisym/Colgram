@@ -173,7 +173,7 @@ public final class ColgramCallRoutes {
         final String subscription;
         final boolean oldWarp;
         volatile boolean started;
-        volatile long engineGeneration;
+        volatile long engineGeneration = -1L;
 
         Pending(Activity activity, Mode mode, Ready ready, Runnable onFailure, ProxySettings socks, String subscription) {
             this.activity = new WeakReference<>(activity);
@@ -362,10 +362,12 @@ public final class ColgramCallRoutes {
                     ColgramVpnService.stopProfile(work.app, work.subscription);
                     break;
                 case SOCKS5:
-                    ColgramCallSocksTunnel.stop(work.app, false, work.engineGeneration);
+                    if (work.engineGeneration >= 0)
+                        ColgramCallSocksTunnel.stop(work.app, false, work.engineGeneration);
                     break;
                 case LOCAL_DPI:
-                    ColgramCallSocksTunnel.stop(work.app, true, work.engineGeneration);
+                    if (work.engineGeneration >= 0)
+                        ColgramCallSocksTunnel.stop(work.app, true, work.engineGeneration);
                     break;
                 default:
                     break;
