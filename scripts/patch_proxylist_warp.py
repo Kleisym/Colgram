@@ -258,7 +258,7 @@ def upgrade_call_route_picker(s):
     """Replace the v5 calls switch and remove the detour into general settings."""
     marker = "// COLGRAM_CALL_ROUTE_PICKER = 1"
     if marker in s:
-        return s
+        return s.replace("return position == position == useProxyRow", "return position == useProxyRow")
     s = replace_section(s, "            } else if (position == callsRow) {",
                         "            } else if (position == warpRow) {", '''            } else if (position == callsRow) {
                 // COLGRAM_CALL_ROUTE_PICKER = 1
@@ -267,7 +267,7 @@ def upgrade_call_route_picker(s):
     s = s.replace("        networkModesRow = rowCount++;\n", "")
     s = s.replace("    private int networkModesRow = -1;\n", "")
     s = s.replace("            } else if (position == networkModesRow) {\n                presentFragment(new ColgramSettingsActivity());\n", "")
-    s = s.replace("return position == networkModesRow || ", "return position == ")
+    s = s.replace("return position == networkModesRow || ", "return ")
     s = s.replace("                    if (position == networkModesRow) {\n                        textCell.setText(\"Режим подключения · Direct / DPI / VPN\", true);\n                    } else if (position == proxyAddRow) {", '''                    if (position == callsRow) {
                         textCell.setTextAndValue("Использовать для звонков", ColgramCallRoutes.summary(), true);
                     } else if (position == proxyAddRow) {''')

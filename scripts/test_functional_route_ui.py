@@ -104,6 +104,7 @@ class FunctionalRouteUiTests(unittest.TestCase):
         self.assertIn("ColgramCallRoutes.showPicker", proxy)
         self.assertIn("textCell.setTextAndValue", proxy)
         self.assertNotIn("networkModesRow", proxy)
+        self.assertNotIn("position == position ==", proxy)
         self.assertNotIn('putBoolean("proxy_enabled_calls",', proxy)
         self.assertNotIn("colgramCallProxy()", voip)
         self.assertIn("colgramRequirePrivateCallRoute()", method(voip, "private void initiateActualEncryptedCall()"))
