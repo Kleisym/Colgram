@@ -60,6 +60,9 @@ public class ColgramDpiBypass {
     /** Keep the proxy listener out of the fragile application-startup window. */
     private static final long START_DELAY_MS = 8000L;
     private static final ExecutorService workerPool = Executors.newCachedThreadPool();
+    // Admission backpressure prevents failed native SOCKS retries from spinning the CPU.
+    private static final java.util.concurrent.Semaphore HANDSHAKE_SLOTS = new java.util.concurrent.Semaphore(32);
+    private static final long REJECT_RETRY_DELAY_MS = 1000L;
     private static final long CONNECT_FAILURE_BASE_DELAY_MS = 3000L;
     private static final long CONNECT_FAILURE_MAX_DELAY_MS = 60000L;
     private static final ColgramConnectFailureBackoff connectFailures =
@@ -145,21 +148,31 @@ public class ColgramDpiBypass {
     private static void acceptClients(ServerSocket listener, long generation) {
         try {
             while (ownsListener(listener, generation)) {
-                Socket client = listener.accept();
-                synchronized (ColgramDpiBypass.class) {
-                    if (!ownsListener(listener, generation)) {
-                        closeQuietly(client);
-                        break;
+                if (!HANDSHAKE_SLOTS.tryAcquire(500, java.util.concurrent.TimeUnit.MILLISECONDS)) continue;
+                boolean submitted = false;
+                Socket client = null;
+                try {
+                    client = listener.accept();
+                    synchronized (ColgramDpiBypass.class) {
+                        if (!ownsListener(listener, generation)) break;
+                        final Socket accepted = client;
+                        workerPool.execute(() -> {
+                            try { handleClient(accepted, null, generation); }
+                            finally { HANDSHAKE_SLOTS.release(); }
+                        });
+                        submitted = true;
                     }
-                    workerPool.execute(() -> handleClient(client, null, generation));
+                } finally {
+                    if (!submitted) { closeQuietly(client); HANDSHAKE_SLOTS.release(); }
                 }
             }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         } catch (Exception failure) {
             if (ownsListener(listener, generation)) Log.w(TAG, "DPI accept loop stopped", failure);
         } finally {
             closeQuietly(listener);
             synchronized (ColgramDpiBypass.class) {
-                // An old accept loop must never clear a newer listener's readiness.
                 if (serverSocket == listener && listenerGeneration == generation) {
                     serverSocket = null;
                     bound = false;
@@ -566,6 +579,11 @@ public class ColgramDpiBypass {
             }
             if (call == null && !isCurrentListener(generation)) return;
             if (targetSocket == null) {
+                if (call == null && (isMtProtoHost(destHost) || ColgramTelegramDcAddresses.isKnownAddress(destHost))) {
+                    // A backoff cache hit must not yield an immediate SOCKS error: tgnet can
+                    // retry it thousands of times per second while no dial is taking place.
+                    sleep(REJECT_RETRY_DELAY_MS);
+                }
                 // Per-retry noise from tgnet hammering the listener; a Log.w here floods
                 // logcat a hundred lines a second on a network where the DCs refuse TCP.
                 Log.d(TAG, "Failed to connect to target: " + destHost + ":" + destPort);
