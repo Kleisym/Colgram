@@ -2,7 +2,13 @@ package org.colgram.core;
 
 /** Fixed anonymous-probe capacity with generation-owned completion, independent of Android. */
 public final class ColgramProbeLanes {
-    public record Ticket(int lane, long id) { }
+    public static final class Ticket {
+        private final int lane;
+        private final long id;
+        private Ticket(int lane, long id) { this.lane = lane; this.id = id; }
+        public int lane() { return lane; }
+        public long id() { return id; }
+    }
     private final long[] owners;
     private long next;
 
