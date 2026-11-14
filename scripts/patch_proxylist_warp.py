@@ -176,7 +176,7 @@ def add_connection_settings(s):
     """Add the route-specific rows without forking the Telegram proxy editor."""
     marker = "// COLGRAM_CONNECTION_SETTINGS = 1"
     if marker in s:
-        return add_connection_source_details(s)
+        return make_local_base_read_only(add_connection_source_details(s))
 
     def replace(old, new):
         nonlocal s
@@ -289,7 +289,33 @@ def add_connection_settings(s):
                     || position == colgramSubscriptionToggleRow || position == colgramSubscriptionRemoveRow) {
                 return VIEW_TYPE_TEXT_SETTING;
             } else if (position == useProxyRow || position == rotationRow || position == warpRow || position == colgramDpiRow) {''')
-    return add_connection_source_details(s)
+    return make_local_base_read_only(add_connection_source_details(s))
+
+
+def make_local_base_read_only(s):
+    """Migrate the old checked base row to non-interactive, live status text."""
+    if "// COLGRAM_LOCAL_BASE_READ_ONLY = 1" in s:
+        return s
+    changes = (
+        ("            } else if (position == colgramDpiRow) {\n                colgramToggleDpi();\n", ""),
+        (" || position == colgramDpiRow", ""),
+        ('''                    } else if (position == colgramDpiRow) {
+                        checkCell.setTextAndValueAndCheck(ColgramSubscriptionControls.label("Локальный обход", "Local bypass"),
+                                colgramDpiStatus(), org.colgram.core.ColgramConfig.isDpiBypassEnabled(), true, true);
+''', ""),
+        ('''                    if (position == colgramBackgroundProxyRow) {
+                        cell.setText''', '''                    // COLGRAM_LOCAL_BASE_READ_ONLY = 1
+                    if (position == colgramDpiRow) {
+                        cell.setText(ColgramSubscriptionControls.label("Локальный слой всегда включён", "Local base is always on")
+                                + "\\n" + colgramDpiStatus());
+                    } else if (position == colgramBackgroundProxyRow) {
+                        cell.setText'''),
+    )
+    for old, new in changes:
+        if old not in s:
+            raise ValueError("Local base read-only migration anchor missing: " + old.splitlines()[0])
+        s = s.replace(old, new)
+    return s
 
 
 def copy_subscription_controls(proxy_source):

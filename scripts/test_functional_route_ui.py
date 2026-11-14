@@ -61,6 +61,29 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertIn("position == colgramBackgroundProxyRow ||", method(proxy, "public boolean isEnabled("))
             self.assertIn("getSourceDiagnostics()", method(proxy, "private void colgramShowSourceDiagnostics()"))
 
+    def test_local_base_is_read_only_on_fresh_and_existing_shield_screens(self):
+        for original in (self.pristine, self.existing):
+            proxy, _ = self.transformed(original)
+            enabled = method(proxy, "public boolean isEnabled(")
+            self.assertNotIn("position == colgramDpiRow", enabled)
+            click = proxy.split("listView.setOnItemClickListener((view, position) -> {", 1)[1]
+            self.assertNotIn("position == colgramDpiRow", click.split("listView.setOnItemLongClickListener", 1)[0])
+            self.assertNotIn("colgramToggleDpi", proxy)
+            self.assertIn('"Локальный слой всегда включён", "Local base is always on"', proxy)
+            binding = method(proxy, "public void onBindViewHolder(")
+            info = binding.split("TextInfoPrivacyCell", 1)[1]
+            self.assertIn("position == colgramDpiRow", info)
+
+    def test_general_settings_does_not_offer_local_base_off_or_an_off_callsite(self):
+        source = (ROOT / "scripts/templates/ColgramSettingsActivity.java").read_text(encoding="utf-8")
+        self.assertNotIn("position == dpiBypassRow", method(source, "public boolean isEnabled("))
+        click = source.split("listView.setOnItemClickListener((view, position) -> {", 1)[1].split("return fragmentView;", 1)[0]
+        self.assertNotIn("position == dpiBypassRow", click)
+        self.assertNotIn("setDpiBypassEnabled(false)", source)
+        self.assertNotIn("setDpiBypassEnabled(context, false)", source)
+        self.assertIn('"Локальный слой всегда включён\\n" + dpiStatusLine()', source)
+        self.assertIn("TextInfoPrivacyCell", source)
+
     def test_tap_sets_real_desired_state_before_async_start(self):
         for original in (self.pristine, self.existing):
             with self.subTest(pristine=original is self.pristine):
@@ -125,7 +148,7 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertIn('"Настройки подключения", "Connection Settings"', proxy)
             self.assertNotIn("setTitle(getString(R.string.ProxySettings))", proxy)
             for row in ("colgramSubscriptionImportRow", "colgramSubscriptionNodeRow", "colgramSubscriptionToggleRow",
-                        "colgramSubscriptionRemoveRow", "colgramDpiRow"):
+                        "colgramSubscriptionRemoveRow"):
                 self.assertIn(row + " = rowCount++", proxy)
                 for signature in ("public boolean isEnabled(", "public int getItemViewType(", "public void onBindViewHolder("):
                     self.assertIn("position == " + row, method(proxy, signature))
@@ -134,7 +157,7 @@ class FunctionalRouteUiTests(unittest.TestCase):
             self.assertIn("colgramSubscription.toggle()", proxy)
             self.assertIn("colgramSubscription.confirmRemove()", proxy)
             self.assertIn("colgramSubscription.onActivityResult(requestCode, resultCode)", proxy)
-            self.assertIn("recheckBypassListener()", proxy)
+            self.assertIn("colgramDpiRow = rowCount++", proxy)
             self.assertNotIn("ColgramDpiBypass.stop()", proxy)
             self.assertIn("getBackgroundProxyStatus()", proxy)
 

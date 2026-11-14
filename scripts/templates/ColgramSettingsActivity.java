@@ -33,6 +33,7 @@ import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.HeaderCell;
 import org.telegram.ui.Cells.ShadowSectionCell;
 import org.telegram.ui.Cells.TextCheckCell;
+import org.telegram.ui.Cells.TextInfoPrivacyCell;
 import org.telegram.ui.Cells.TextSettingsCell;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RecyclerListView;
@@ -248,7 +249,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         listView.setAdapter(listAdapter);
 
         listView.setOnItemClickListener((view, position) -> {
-            if (position == dpiBypassRow || position == ipv6BypassRow || position == dcRemapRow) {
+            if (position == ipv6BypassRow || position == dcRemapRow) {
                 Context routeContext = getContext();
                 if (routeContext != null) { cancelWarp(routeContext); stopSubscriptionTunnel(routeContext); }
                 ColgramRouteEpoch.next();
@@ -346,9 +347,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
-            } else if (position == dpiBypassRow) {
-                ColgramProxyManager.recheckBypassListener();
-                listAdapter.notifyDataSetChanged();
             } else if (position == dohRow) {
                 boolean val = !ColgramConfig.isDohEnabled();
                 ColgramConfig.setDohEnabled(val);
@@ -537,14 +535,13 @@ public class ColgramSettingsActivity extends BaseFragment {
         cancelWarp(context);
         ColgramProxyManager.cancelProxySelection();
         ColgramConfig.setAutoProxyEnabled(false);
-        ColgramConfig.setDpiBypassEnabled(false);
         ColgramConfig.setDcRemapEnabled(false);
         ColgramConfig.setIpv6BypassEnabled(false);
         final long token = ColgramRouteEpoch.snapshot();
         stopSubscriptionTunnel(context);
         warpOperations.execute(() -> {
             if (!ColgramRouteEpoch.isCurrent(token)) return;
-            ColgramProxyManager.setDpiBypassEnabled(context, false);
+            ColgramProxyManager.ensureLocalBaseRoute(context);
             ColgramProxyManager.applyDcRemap(false);
             ColgramProxyManager.disableProxy(context);
             ColgramProxyManager.recheckConnectionNow();
@@ -727,10 +724,9 @@ public class ColgramSettingsActivity extends BaseFragment {
             try {
                 ColgramConfig.setAutoProxyEnabled(false);
                 ColgramSubscriptionControls.stopStoredProfile(context);
-                ColgramConfig.setDpiBypassEnabled(false);
                 ColgramConfig.setDcRemapEnabled(false);
                 ColgramConfig.setIpv6BypassEnabled(false);
-                ColgramProxyManager.setDpiBypassEnabled(context, false);
+                ColgramProxyManager.ensureLocalBaseRoute(context);
                 ColgramProxyManager.applyDcRemap(false);
                 ColgramProxyManager.disableProxy(context);
                 ColgramProxyManager.notifyProxySettingsChanged();
@@ -765,10 +761,9 @@ public class ColgramSettingsActivity extends BaseFragment {
     }
 
     private String dpiStatusLine() {
-        if (!ColgramConfig.isDpiBypassEnabled()) return "выключен";
         if (!ColgramDpiBypass.isBound()) return "локальный транспорт ещё не запущен";
         ColgramProxyManager.ProxyItem route = ColgramProxyManager.getCurrentActiveProxy();
-        if (route == null || !route.isLocalDpi()) return "локальный транспорт не выбран";
+        if (route == null || !route.isLocalDpi()) return "поверх локального слоя выбран другой транспорт";
         if (ColgramDpiBypass.bytesFromTarget() > 0 && ConnectionsManager.getInstance(currentAccount).getConnectionState()
                 == ConnectionsManager.ConnectionStateConnected) return "подключён к Telegram";
         return ColgramDpiBypass.upstreamStatus();
@@ -874,7 +869,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             return position == cloakEnabledRow || position == cloakModelRow ||
                    position == antiDeleteRow || position == antiDeleteHighlightRow || position == antiDeleteWipeRow || position == preserveMediaRow || position == editHistoryRow || position == autoHidePhoneRow ||
                    position == ghostReadRow || position == ghostTypingRow || position == ghostOnlineRow || position == bypassFlagSecureRow ||
-                   position == dpiBypassRow || position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow || position == ipv6BypassRow || position == dcRemapRow ||
+                   position == dohRow || position == builtinProxyRow || position == proxyBrowserRow || position == currentProxyRow || position == ipv6BypassRow || position == dcRemapRow ||
                    position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow || position == autoProxyRow ||
                    position == sandboxStorageRow || position == sandboxFilesRow ||
                    position == botRealtimeRow || position == botTestRow || position == pluginsRow ||
@@ -885,6 +880,7 @@ public class ColgramSettingsActivity extends BaseFragment {
 
         @Override
         public int getItemViewType(int position) {
+            if (position == dpiBypassRow) return 4; // Non-interactive TextInfoPrivacyCell, never a switch.
             if (position == cloakingHeaderRow || position == vaultHeaderRow || position == ghostHeaderRow ||
                 position == networkHeaderRow || position == resourceHeaderRow || position == sandboxHeaderRow ||
                 position == botsHeaderRow) {
@@ -923,6 +919,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                 case 3:
                 default:
                     view = new ShadowSectionCell(mContext);
+                    break;
+                case 4:
+                    view = new TextInfoPrivacyCell(mContext);
                     break;
             }
             return new RecyclerListView.Holder(view);
@@ -977,11 +976,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == autoProxyRow) {
                         checkCell.setTextAndCheck("Самоподключение прокси, если Telegram не отвечает",
                                 ColgramConfig.isAutoProxyEnabled(), true);
-                    } else if (position == dpiBypassRow) {
-                        // Read the persisted intent, not just whether a socket happens to be
-                        // bound: a listener that failed to bind is a fault, not a setting.
-                        checkCell.setTextAndValueAndCheck("Локальный обход", dpiStatusLine(),
-                                ColgramConfig.isDpiBypassEnabled(), true, true);
                     } else if (position == dohRow) {
                         checkCell.setTextAndCheck("DNS-over-HTTPS (шифрованный DNS)", ColgramConfig.isDohEnabled(), true);
                     } else if (position == builtinProxyRow) {
@@ -1043,14 +1037,15 @@ public class ColgramSettingsActivity extends BaseFragment {
                     } else if (position == directConnectionRow) {
                         String subscriptionState = subscriptionTunnelStatus(getContext());
                         boolean vpnActive = isAndroidVpnActive();
-                        boolean direct = !ColgramConfig.isWarpEnabled() && !ColgramConfig.isDpiBypassEnabled()
-                                && !ColgramProxyManager.hasActiveRouteForUi() && !ColgramProxyManager.isDcRemapActive()
+                        ColgramProxyManager.ProxyItem route = ColgramProxyManager.getCurrentActiveProxy();
+                        boolean direct = !ColgramConfig.isWarpEnabled() && route != null && route.isLocalDpi()
+                                && !ColgramProxyManager.isDcRemapActive()
                                 && !ColgramConfig.isIpv6BypassEnabled() && !ColgramConfig.isAutoProxyEnabled()
                                 && !ColgramProxyManager.isProxySelectionPending() && !vpnActive
                                 && !"running".equals(subscriptionState) && !"starting".equals(subscriptionState)
                                 && !"stopping".equals(subscriptionState) && !"consent".equals(subscriptionState);
-                        settingsCell.setTextAndValue("Обычный интернет (без прокси и VPN)",
-                                direct ? "выбран" : vpnActive ? "активен Android VPN" : "нажмите для переключения", true);
+                        settingsCell.setTextAndValue("Обычный интернет · локальный слой",
+                                direct ? "выбран · " + dpiStatusLine() : vpnActive ? "активен Android VPN" : "нажмите для переключения", true);
                     } else if (position == publicProxyRow) {
                         String status = ColgramProxyManager.getProxySelectionStatus();
                         settingsCell.setTextAndValue("Найти рабочий публичный прокси",
@@ -1075,6 +1070,11 @@ public class ColgramSettingsActivity extends BaseFragment {
                         settingsCell.setTextAndValue("Подписка (VPN на весь телефон)",
                                 subscriptionStatusLine(), false);
                     }
+                    break;
+                }
+                case 4: {
+                    TextInfoPrivacyCell statusCell = (TextInfoPrivacyCell) holder.itemView;
+                    statusCell.setText("Локальный слой всегда включён\n" + dpiStatusLine());
                     break;
                 }
             }

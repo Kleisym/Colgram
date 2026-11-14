@@ -3670,7 +3670,6 @@ public static void reportProxyFailure() {
         cancelProxySelection();
         if (explicit) {
             ColgramConfig.setAutoProxyEnabled(false);
-            ColgramConfig.setDpiBypassEnabled(false);
             ColgramConfig.setDcRemapEnabled(false);
             ColgramConfig.setIpv6BypassEnabled(false);
             dpiRequestGeneration.incrementAndGet();
@@ -4214,15 +4213,7 @@ public static void reportProxyFailure() {
         return harvestedEndpoints.contains(address + ":" + port);
     }
 
-    /**
-     * Single place that turns the desync bypass on or off, for real.
-     *
-     * The settings row used to only call ColgramDpiBypass.start()/stop(). That started or
-     * killed a listener nobody was necessarily routed through, persisted nothing so the
-     * choice reverted on the next launch, and left the UI showing one state while tgnet was
-     * pointed at another. Persisting, running the listener and routing traffic through it are
-     * three different things and all three have to agree.
-     */
+    /** Kept for older callers. The foundation is mandatory and has no OFF transition. */
     private static final java.util.concurrent.atomic.AtomicLong dpiRequestGeneration = new java.util.concurrent.atomic.AtomicLong();
 
     public static void setDpiBypassEnabled(Context context, boolean enabled) {

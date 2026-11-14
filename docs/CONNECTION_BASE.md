@@ -1,6 +1,6 @@
 # Connection base and measured transport states
 
-The in-process base is mandatory. `isDpiBypassEnabled()` is no longer a route selector. An old saved `false` is ignored. Startup binds the listener and attaches it to Telegram; a three-second watchdog repairs a lost listener without replacing an explicitly selected remote route. Disabling a remote proxy persists the OFF choice and returns to the base, not to unshaped direct sockets. Tapping the base row rechecks it rather than stopping WARP, a subscription, or a selected proxy. Pending SOCKS handshakes have a 32-slot admission limit; a failed Telegram connect waits one second before returning an error, preventing a cached connect failure from becoming an immediate native retry/logging loop.
+The in-process base is mandatory. `isDpiBypassEnabled()` is no longer a route selector. An old saved `false` is ignored. Startup binds the listener and attaches it to Telegram; a three-second watchdog repairs a lost listener without replacing an explicitly selected remote route. Disabling a remote proxy persists the OFF choice and returns to the base, not to unshaped direct sockets. Both settings screens show read-only live status for the base: no switch, click handler, or OFF action exists. Pending SOCKS handshakes have a 32-slot admission limit; a failed Telegram connect waits one second before returning an error, preventing a cached connect failure from becoming an immediate native retry/logging loop.
 
 ## Layer composition
 

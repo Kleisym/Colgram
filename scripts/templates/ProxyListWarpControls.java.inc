@@ -82,7 +82,6 @@
     }
 
     private String colgramDpiStatus() {
-        if (!org.colgram.core.ColgramConfig.isDpiBypassEnabled()) return ColgramSubscriptionControls.label("выключен", "Off");
         if (!org.colgram.core.ColgramDpiBypass.isBound()) return org.colgram.core.ColgramDpiBypass.upstreamStatus();
         org.colgram.core.ColgramProxyManager.ProxyItem active = org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
         if (active == null || !active.isLocalDpi()) return ColgramSubscriptionControls.label("всегда включён · поверх выбранный транспорт", "Always on · selected transport above it");
@@ -90,14 +89,6 @@
                 == ConnectionsManager.ConnectionStateConnected)
             return ColgramSubscriptionControls.label("подключён к Telegram", "Connected to Telegram");
         return org.colgram.core.ColgramDpiBypass.upstreamStatus();
-    }
-
-    private void colgramToggleDpi() {
-        org.colgram.core.ColgramProxyManager.recheckBypassListener();
-        android.widget.Toast.makeText(getContext(), ColgramSubscriptionControls.label(
-                "Локальный слой всегда включён. Проверяю его состояние.",
-                "The local base is always enabled. Checking its state."), android.widget.Toast.LENGTH_SHORT).show();
-        refreshWarpState();
     }
 
     private void colgramShowSourceDiagnostics() {

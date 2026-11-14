@@ -22,7 +22,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Menu wiring and explicit-off regressions without a Telegram login or external network. */
+/** Menu wiring and permanent-base regressions without a Telegram login or external network. */
 @RunWith(AndroidJUnit4.class)
 public final class ColgramSettingsRowsDeviceTest {
     @Test
@@ -96,13 +96,65 @@ public final class ColgramSettingsRowsDeviceTest {
                     assertTrue(name + " overlaps another row", positions.add(position));
                     assertTrue(name + " reuses an adapter ID", ids.add(adapter.getItemId(position)));
                     if (name.startsWith("colgramSubscription")) assertEquals(buttonType, adapter.getItemViewType(position));
-                    if ("colgramDpiRow".equals(name)) assertEquals(proxyType, adapter.getItemViewType(position));
+                    if ("colgramDpiRow".equals(name)) assertTrue("The base is still a switch", proxyType != adapter.getItemViewType(position));
                 }
             } catch (Throwable error) {
                 failure.set(error);
             }
         });
         if (failure.get() != null) throw failure.get();
+    }
+
+    @Test
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public void bothLocalBaseRowsAreRealReadOnlyInformationCells() throws Throwable {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            try {
+                for (String name : new String[]{"ProxyListActivity", "ColgramSettingsActivity"}) {
+                    Class<?> screenType = Class.forName("org.telegram.ui." + name, true, context.getClassLoader());
+                    Object screen = screenType.getDeclaredConstructor().newInstance();
+                    boolean shield = "ProxyListActivity".equals(name);
+                    Method update = shield ? screenType.getDeclaredMethod("updateRows", boolean.class)
+                            : screenType.getDeclaredMethod("updateRows");
+                    update.setAccessible(true);
+                    if (shield) update.invoke(screen, false); else update.invoke(screen);
+                    Class<?> adapterType = Class.forName("org.telegram.ui." + name + "$ListAdapter", true, context.getClassLoader());
+                    Constructor<?> constructor = adapterType.getDeclaredConstructor(screenType, Context.class);
+                    constructor.setAccessible(true);
+                    androidx.recyclerview.widget.RecyclerView.Adapter adapter =
+                            (androidx.recyclerview.widget.RecyclerView.Adapter) constructor.newInstance(screen, context);
+                    int position = row(screenType, screen, shield ? "colgramDpiRow" : "dpiBypassRow");
+                    androidx.recyclerview.widget.RecyclerView.ViewHolder holder = adapter.createViewHolder(
+                            new android.widget.FrameLayout(context), adapter.getItemViewType(position));
+                    adapter.bindViewHolder(holder, position);
+                    assertTrue(name + " still uses a switch instead of read-only status",
+                            holder.itemView instanceof org.telegram.ui.Cells.TextInfoPrivacyCell);
+                    assertFalse(name + " base status accepts taps", holder.itemView.isClickable());
+                    assertFalse(name + " base status accepts long presses", holder.itemView.isLongClickable());
+                    assertTrue(name + " has no always-on explanation", containsText(holder.itemView,
+                            "Локальный слой всегда включён", "Local base is always on"));
+                }
+                android.util.Log.i("ColgramBaseTest", "LOCAL_BASE_UI=PASS screens=2 info_cell=true switch=false click=false");
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
+        if (failure.get() != null) throw failure.get();
+    }
+
+    private static boolean containsText(android.view.View view, String... expected) {
+        if (view instanceof android.widget.TextView) {
+            String text = ((android.widget.TextView) view).getText().toString();
+            for (String value : expected) if (text.contains(value)) return true;
+        }
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int index = 0; index < group.getChildCount(); index++)
+                if (containsText(group.getChildAt(index), expected)) return true;
+        }
+        return false;
     }
 
     private static int row(Class<?> type, Object screen, String fieldName) throws ReflectiveOperationException {
