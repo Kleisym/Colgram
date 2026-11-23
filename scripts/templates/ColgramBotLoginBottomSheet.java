@@ -55,48 +55,52 @@ public final class ColgramBotLoginBottomSheet {
                 Theme.getColor(Theme.key_featuredStickers_buttonText),
                 ColgramConfig.isCyberThemeEnabled());
 
+        final ColgramAeroStyler.Palette aeroPal = ColgramAeroStyler.Palette.resolve();
         BottomSheet.Builder builder = new BottomSheet.Builder(context, true, palette.sheet);
         builder.setApplyTopPadding(false);
         LinearLayout content = new LinearLayout(context);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(24), dp(16), dp(24), dp(24));
+        content.setPadding(dp(24), dp(14), dp(24), dp(22) + AndroidUtilities.navigationBarHeight);
 
         View handle = new View(context);
         handle.setBackground(fill(3, palette.handle));
-        content.addView(handle, LayoutHelper.createLinear(36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16));
+        content.addView(handle, LayoutHelper.createLinear(40, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
 
         FrameLayout badge = new FrameLayout(context);
-        badge.setBackground(fill(28, palette.badge));
+        GradientDrawable badgeBg = fill(28, aeroPal.accentSoft);
+        badgeBg.setStroke(dp(1), aeroPal.borderAccent);
+        badge.setBackground(badgeBg);
         ImageView icon = new ImageView(context);
         icon.setImageResource(R.drawable.msg_bot);
-        icon.setColorFilter(palette.badgeIcon, PorterDuff.Mode.SRC_IN);
+        icon.setColorFilter(aeroPal.accentPrimary, PorterDuff.Mode.SRC_IN);
         icon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-        badge.addView(icon, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
+        badge.addView(icon, LayoutHelper.createFrame(28, 28, Gravity.CENTER));
         content.addView(badge, LayoutHelper.createLinear(56, 56, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
 
-        TextView title = label(context, ru ? "Вход по токену бота" : "Log in via bot token", 20, palette.title);
+        TextView title = label(context, ru ? "Вход по токену бота" : "Log in via bot token", 20, aeroPal.textPrimary);
         title.setTypeface(AndroidUtilities.bold());
         content.addView(title, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 6));
         TextView description = label(context,
                 ru ? "Введите полный токен вашего бота из @BotFather."
-                   : "Enter your bot's full token from @BotFather.", 14, palette.secondary);
+                   : "Enter your bot's full token from @BotFather.", 14, aeroPal.textSecondary);
         content.addView(description, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 18));
 
-        LinearLayout card = new LinearLayout(context);
+        final LinearLayout card = new LinearLayout(context);
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setGravity(Gravity.CENTER_VERTICAL);
-        card.setPadding(dp(12), dp(4), dp(8), dp(4));
-        GradientDrawable field = fill(10, palette.field);
-        field.setStroke(dp(1), palette.fieldStroke);
+        card.setMinimumHeight(dp(52));
+        card.setPadding(dp(14), dp(6), dp(8), dp(6));
+        final GradientDrawable field = fill(14, aeroPal.inputSurface);
+        field.setStroke(dp(1), aeroPal.borderSubtle);
         card.setBackground(field);
 
-        EditText input = new EditText(context);
+        final EditText input = new EditText(context);
         input.setTag("colgram_bot_token_input");
         input.setContentDescription(ru ? "Токен бота" : "Bot token");
         input.setHint(ru ? "ID:токен" : "ID:token");
-        input.setHintTextColor(palette.fieldHint);
-        input.setTextColor(palette.fieldText);
-        input.setTextSize(14);
+        input.setHintTextColor(aeroPal.textSecondary);
+        input.setTextColor(aeroPal.textPrimary);
+        input.setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 14);
         input.setBackground(null);
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
@@ -107,10 +111,19 @@ public final class ColgramBotLoginBottomSheet {
         if (Build.VERSION.SDK_INT >= 26) input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         card.addView(input, LayoutHelper.createLinear(0, -2, 1f, Gravity.CENTER_VERTICAL));
 
-        TextView paste = label(context, ru ? "Вставить" : "Paste", 13, palette.pasteText);
-        paste.setTypeface(AndroidUtilities.bold());
-        paste.setPadding(dp(12), dp(8), dp(12), dp(8));
-        paste.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(6), palette.paste, palette.pastePressed));
+        final LinearLayout paste = new LinearLayout(context);
+        paste.setOrientation(LinearLayout.HORIZONTAL);
+        paste.setGravity(Gravity.CENTER);
+        paste.setPadding(dp(10), dp(7), dp(12), dp(7));
+        ColgramMenuChrome.attachTactileFeedback(paste, 10, aeroPal.chipSurface, aeroPal.borderSubtle, aeroPal.accentSoft);
+        ImageView pasteIcon = new ImageView(context);
+        pasteIcon.setImageResource(R.drawable.msg_copy);
+        pasteIcon.setColorFilter(aeroPal.accentPrimary, PorterDuff.Mode.SRC_IN);
+        pasteIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        paste.addView(pasteIcon, LayoutHelper.createLinear(15, 15, Gravity.CENTER_VERTICAL, 0, 0, 5, 0));
+        TextView pasteLabel = label(context, ru ? "Вставить" : "Paste", 13, aeroPal.textPrimary);
+        pasteLabel.setTypeface(AndroidUtilities.bold());
+        paste.addView(pasteLabel, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL));
         paste.setOnClickListener(view -> {
             ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
             if (clipboard == null || !clipboard.hasPrimaryClip()) return;
@@ -120,26 +133,39 @@ public final class ColgramBotLoginBottomSheet {
             if (text != null) {
                 input.setText(text.toString().trim());
                 input.setSelection(input.length());
+                field.setStroke(dp(1), aeroPal.borderSubtle);
             }
         });
         card.addView(paste, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL));
-        content.addView(card, LayoutHelper.createLinear(-1, 50, 0, 0, 0, 16));
+        content.addView(card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 16));
 
         FrameLayout submit = new FrameLayout(context);
         submit.setTag("colgram_bot_submit");
         String submitLabel = ru ? "Войти в аккаунт бота" : "Log in as bot";
         submit.setContentDescription(submitLabel);
-        submit.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(10), palette.button, palette.buttonPressed));
-        TextView buttonText = label(context, submitLabel, 15, palette.buttonText);
+        submit.setMinimumHeight(dp(50));
+        submit.setPadding(dp(14), dp(10), dp(14), dp(10));
+        submit.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(14), aeroPal.accentPrimary, aeroPal.accentSecondary));
+        ColgramMenuChrome.attachSpringPress(submit);
+        final LinearLayout buttonRow = new LinearLayout(context);
+        buttonRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonRow.setGravity(Gravity.CENTER);
+        ImageView submitIcon = new ImageView(context);
+        submitIcon.setImageResource(R.drawable.msg_bot);
+        submitIcon.setColorFilter(0xFFFFFFFF, PorterDuff.Mode.SRC_IN);
+        submitIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        buttonRow.addView(submitIcon, LayoutHelper.createLinear(18, 18, Gravity.CENTER_VERTICAL, 0, 0, 8, 0));
+        TextView buttonText = label(context, submitLabel, 15, 0xFFFFFFFF);
         buttonText.setTypeface(AndroidUtilities.bold());
-        submit.addView(buttonText, LayoutHelper.createFrame(-1, -1, Gravity.CENTER));
+        buttonRow.addView(buttonText, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL));
+        submit.addView(buttonRow, LayoutHelper.createFrame(-2, -2, Gravity.CENTER));
 
         RadialProgressView spinner = new RadialProgressView(context);
-        spinner.setSize(dp(24));
-        spinner.setProgressColor(palette.buttonText);
+        spinner.setSize(dp(22));
+        spinner.setProgressColor(0xFFFFFFFF);
         spinner.setVisibility(View.GONE);
-        submit.addView(spinner, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
-        content.addView(submit, LayoutHelper.createLinear(-1, 48, 0, 0, 0, 12));
+        submit.addView(spinner, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
+        content.addView(submit, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12));
 
         TextView status = label(context, "", 13, palette.error);
         status.setTag("colgram_bot_status");
@@ -150,6 +176,7 @@ public final class ColgramBotLoginBottomSheet {
         scroll.addView(content);
         builder.setCustomView(scroll);
         final BottomSheet sheet = builder.create();
+        ColgramAeroStyler.applyFlagshipSheetChrome(sheet, scroll, aeroPal);
         final ConnectionsManager manager = ConnectionsManager.getInstance(currentAccount);
 
         final class Attempt {
@@ -175,7 +202,7 @@ public final class ColgramBotLoginBottomSheet {
                 submit.setEnabled(!value);
                 input.setEnabled(!value);
                 paste.setEnabled(!value);
-                buttonText.setVisibility(value ? View.INVISIBLE : View.VISIBLE);
+                buttonRow.setVisibility(value ? View.INVISIBLE : View.VISIBLE);
                 spinner.setVisibility(value ? View.VISIBLE : View.GONE);
             }
 
@@ -183,6 +210,8 @@ public final class ColgramBotLoginBottomSheet {
                 busy(false);
                 status.setText(message);
                 status.setVisibility(View.VISIBLE);
+                field.setStroke(AndroidUtilities.dp(1.5f), palette.error);
+                AndroidUtilities.shakeViewSpring(card, -4);
                 scroll.post(() -> scroll.smoothScrollTo(0, content.getBottom()));
             }
 
@@ -194,6 +223,7 @@ public final class ColgramBotLoginBottomSheet {
                              : "Enter the complete token: numeric ID, colon and secret from @BotFather.");
                     return;
                 }
+                field.setStroke(dp(1), palette.fieldStroke);
                 AndroidUtilities.hideKeyboard(input);
                 status.setVisibility(View.GONE);
                 busy(true);
@@ -278,7 +308,7 @@ public final class ColgramBotLoginBottomSheet {
     private static TextView label(Context context, String text, int size, int color) {
         TextView view = new TextView(context);
         view.setText(text);
-        view.setTextSize(size);
+        view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, size);
         view.setTextColor(color);
         view.setGravity(Gravity.CENTER);
         return view;

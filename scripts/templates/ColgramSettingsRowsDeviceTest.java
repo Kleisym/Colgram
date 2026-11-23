@@ -56,7 +56,7 @@ public final class ColgramSettingsRowsDeviceTest {
                 Method viewType = adapterType.getDeclaredMethod("getItemViewType", int.class);
                 viewType.setAccessible(true);
                 for (String row : new String[]{"subscriptionRow", "directConnectionRow", "cloudflareWarpRow",
-                        "dataSettingsRow", "cacheSettingsRow"}) {
+                        "dataSettingsRow", "cacheSettingsRow", "settingsBackupRow"}) {
                     Field field = settings.getDeclaredField(row);
                     field.setAccessible(true);
                     assertEquals(row, 2, ((Number) viewType.invoke(adapter, field.getInt(screen))).intValue());
@@ -88,7 +88,7 @@ public final class ColgramSettingsRowsDeviceTest {
                 Set<Long> ids = new HashSet<>();
                 int proxyType = adapter.getItemViewType(row(screenType, screen, "useProxyRow"));
                 int buttonType = adapter.getItemViewType(row(screenType, screen, "callsRow"));
-                for (String name : new String[]{"useProxyRow", "callsRow", "warpRow", "colgramBackgroundProxyRow",
+                for (String name : new String[]{"useProxyRow", "callsRow", "browserRow", "warpRow", "colgramBackgroundProxyRow",
                         "colgramDpiRow", "colgramSubscriptionImportRow", "colgramSubscriptionNodeRow",
                         "colgramSubscriptionToggleRow", "colgramSubscriptionRemoveRow"}) {
                     int position = row(screenType, screen, name);

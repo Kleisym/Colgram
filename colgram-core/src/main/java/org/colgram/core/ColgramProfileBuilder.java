@@ -269,10 +269,15 @@ public final class ColgramProfileBuilder {
             }
             return new JSONObject()
                     .put("log", new JSONObject().put("disabled", true))
-                    .put("dns", new JSONObject().put("servers", new JSONArray().put(new JSONObject()
-                            .put("type", "https").put("tag", "call-dns")
-                            .put("server", "1.1.1.1").put("path", "/dns-query")
-                            .put("detour", "call-socks")))
+                    .put("dns", new JSONObject().put("servers", new JSONArray()
+                            .put(new JSONObject()
+                                    .put("type", "https").put("tag", "call-dns")
+                                    .put("server", "94.140.14.14").put("path", "/dns-query")
+                                    .put("detour", "call-socks"))
+                            .put(new JSONObject()
+                                    .put("type", "https").put("tag", "call-dns-google")
+                                    .put("server", "8.8.8.8").put("path", "/dns-query")
+                                    .put("detour", "call-socks")))
                             .put("final", "call-dns"))
                     .put("inbounds", new JSONArray().put(tunInbound().put("mtu", 1400)))
                     .put("outbounds", new JSONArray().put(outbound))
@@ -283,6 +288,110 @@ public final class ColgramProfileBuilder {
                     .toString();
         } catch (org.json.JSONException invalid) {
             throw new IllegalArgumentException("Некорректный профиль SOCKS5");
+        }
+    }
+
+    /**
+     * Whole-device Local DPI Bypass TUN profile (YouTube, Discord, Chrome, Instagram, Telegram).
+     * Rejects UDP:443 (QUIC/HTTP3) so browsers/apps fall back in <1ms to TCP TLS 443, where
+     * ColgramDpiBypass slices the TLS SNI hostname across RFC-valid TLS records and TCP segments;
+     * hijacks port 53 DNS through uncensored AdGuard/Google/Cloudflare/Quad9 DoH over the
+     * protected, SNI-desynced local SOCKS5 so ISP DNS poisoning and 1.1.1.1 drops are defeated.
+     */
+    public static String forSystemDpiSocks(String host, int port, String username, String password) {
+        return forSystemDpiSocks(host, port, username, password, 0);
+    }
+
+    /**
+     * Whole-device Local DPI Bypass TUN profile with optional local multi-provider DoH DNS proxy
+     * port (`localDnsPort > 0`), eliminating single-provider DNS blackouts on mobile carriers and
+     * using MTU 1280 to avoid cellular LTE/464XLAT PMTU blackholes.
+     */
+    public static String forSystemDpiSocks(String host, int port, String username, String password,
+                                           int localDnsPort) {
+        return forSystemDpiSocks(host, port, username, password, localDnsPort, false);
+    }
+
+    /**
+     * Whole-device Local DPI Bypass TUN profile with optional local multi-provider DoH DNS proxy
+     * and automatic Dual-Stack IPv6 support when the carrier provides globally routable IPv6
+     * (punching through IPv4-only mobile whitelists while avoiding dead IPv6 routes on IPv4-only Wi-Fi).
+     */
+    public static String forSystemDpiSocks(String host, int port, String username, String password,
+                                           int localDnsPort, boolean enableIpv6) {
+        if (host == null || host.trim().isEmpty() || port < 1 || port > 65535) {
+            throw new IllegalArgumentException("Некорректный адрес локального обхода");
+        }
+        try {
+            JSONObject outbound = new JSONObject().put("type", "socks").put("tag", "call-socks")
+                    .put("server", host.trim()).put("server_port", port).put("version", "5");
+            if (username != null && !username.isEmpty()) {
+                outbound.put("username", username).put("password", password);
+            }
+            JSONArray dnsServers = new JSONArray();
+            String finalDnsTag;
+            if (localDnsPort > 0 && localDnsPort <= 65535) {
+                dnsServers.put(new JSONObject()
+                        .put("type", "udp")
+                        .put("tag", "sys-dns-local")
+                        .put("server", "127.0.0.1")
+                        .put("server_port", localDnsPort));
+                finalDnsTag = "sys-dns-local";
+            } else {
+                dnsServers
+                        .put(new JSONObject()
+                                .put("type", "https").put("tag", "sys-dns-adguard")
+                                .put("server", "94.140.14.14").put("path", "/dns-query")
+                                .put("detour", "call-socks"))
+                        .put(new JSONObject()
+                                .put("type", "https").put("tag", "sys-dns-google")
+                                .put("server", "8.8.8.8").put("path", "/dns-query")
+                                .put("detour", "call-socks"))
+                        .put(new JSONObject()
+                                .put("type", "https").put("tag", "sys-dns-cf")
+                                .put("server", "1.1.1.1").put("path", "/dns-query")
+                                .put("detour", "call-socks"))
+                        .put(new JSONObject()
+                                .put("type", "https").put("tag", "sys-dns-q9")
+                                .put("server", "9.9.9.9").put("path", "/dns-query")
+                                .put("detour", "call-socks"));
+                finalDnsTag = "sys-dns-adguard";
+            }
+            JSONArray rules = new JSONArray()
+                    .put(new JSONObject().put("port", 53).put("action", "hijack-dns"))
+                    // Force instant QUIC HTTP/3 -> TCP TLS fallback (crucial for YouTube/Instagram/Discord on TSPU)
+                    .put(new JSONObject().put("network", "udp").put("port", 443).put("action", "reject"));
+            JSONArray tunAddrs = new JSONArray().put("172.19.0.1/30");
+            JSONArray routeAddrs = new JSONArray().put("0.0.0.0/0");
+            if (enableIpv6) {
+                tunAddrs.put("fdfe:dcba:9876::1/126");
+                routeAddrs.put("::/0");
+            }
+            // MTU 1280 satisfies IPv6 minimum MTU AND avoids Russian 4G/LTE/464XLAT PMTU blackholes.
+            JSONObject sysTun = new JSONObject()
+                    .put("type", "tun")
+                    .put("tag", "tun-in")
+                    .put("interface_name", "colgram0")
+                    .put("address", tunAddrs)
+                    .put("mtu", 1280)
+                    .put("auto_route", true)
+                    .put("route_address", routeAddrs)
+                    .put("strict_route", true);
+            return new JSONObject()
+                    .put("log", new JSONObject().put("disabled", true))
+                    .put("dns", new JSONObject()
+                            .put("servers", dnsServers)
+                            .put("final", finalDnsTag)
+                            .put("strategy", enableIpv6 ? "prefer_ipv4" : "ipv4_only"))
+                    .put("inbounds", new JSONArray().put(sysTun))
+                    .put("outbounds", new JSONArray().put(outbound))
+                    .put("route", new JSONObject()
+                            .put("final", "call-socks")
+                            .put("auto_detect_interface", true)
+                            .put("rules", rules))
+                    .toString();
+        } catch (org.json.JSONException invalid) {
+            throw new IllegalArgumentException("Некорректный профиль системного DPI-обхода");
         }
     }
 

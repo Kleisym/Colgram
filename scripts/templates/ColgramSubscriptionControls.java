@@ -79,18 +79,18 @@ final class ColgramSubscriptionControls {
     }
 
     String statusLine() {
-        if (EDITING.get()) return label("читаю подписку…", "Reading subscription…");
+        if (EDITING.get()) return label("чтение…", "Reading…");
         switch (rawStatus()) {
-            case "consent": return label("ожидаю разрешение Android VPN", "Waiting for Android VPN permission");
-            case "starting": return label("запускается…", "Starting…");
-            case "running": return label("VPN-туннель запущен", "VPN tunnel started");
-            case "stopping": return label("выключается…", "Stopping…");
-            case "failed": return label("ошибка запуска · проверьте узел", "Startup failed · check the node");
+            case "consent": return label("нужен VPN", "VPN consent");
+            case "starting": return label("запуск…", "Starting…");
+            case "running": return label("активен", "Active");
+            case "stopping": return label("выключение…", "Stopping…");
+            case "failed": return label("ошибка", "Error");
             default:
                 if (failure != null) return failure;
                 Context context = context();
                 return context != null && ColgramSubscriptionStore.hasSubscription(context)
-                        ? label("выключен", "Off") : label("добавьте подписку или ключ", "Add a subscription or key");
+                        ? label("выключен", "Off") : label("нет ключа", "No key");
         }
     }
 
@@ -126,27 +126,32 @@ final class ColgramSubscriptionControls {
     void importLink() {
         Activity activity = screen.getParentActivity();
         if (activity == null) return;
-        EditText input = new EditText(activity);
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
-        input.setHint("https://…   vless://…   vmess://…   trojan://…");
+        org.telegram.ui.Components.EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
+                activity, screen.getResourceProvider(), "https://…   vless://…   vmess://…   trojan://…", true);
         input.setContentDescription(label("Ссылка подписки или ключ VPN", "VPN subscription link or key"));
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI
                 | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        input.setSingleLine(false);
         input.setMinLines(2);
         input.setMaxLines(4);
         input.setHorizontallyScrolling(false);
         input.setSaveEnabled(false);
         input.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         if (Build.VERSION.SDK_INT >= 26) input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
-        AlertDialog dialog = new AlertDialog.Builder(activity).setTitle(label("Импорт VPN", "Import VPN"))
+        android.widget.FrameLayout wrap = new android.widget.FrameLayout(activity);
+        int pad = AndroidUtilities.dp(20);
+        wrap.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(4));
+        wrap.addView(input, org.telegram.ui.Components.LayoutHelper.createFrame(
+                org.telegram.ui.Components.LayoutHelper.MATCH_PARENT,
+                org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT));
+        AlertDialog dialog = new AlertDialog.Builder(activity, screen.getResourceProvider()).setTitle(label("Импорт VPN", "Import VPN"))
                 .setMessage(label("Вставьте URL подписки или ключ: VLESS TCP/WS, VMess, Trojan, Shadowsocks. Сохранение не включает VPN. Если VPN подписки уже запущен, он остановится после успешного импорта.",
                         "Paste a subscription URL or key: VLESS over TCP/WS, VMess, Trojan, or Shadowsocks. Saving does not connect the VPN. An existing subscription VPN stops after a successful import."))
-                .setView(input)
+                .setView(wrap)
                 .setPositiveButton(label("Сохранить", "Save"), (d, w) -> saveSubscription(input.getText().toString().trim()))
                 .setNegativeButton(label("Отмена", "Cancel"), null).create();
-        if (dialog.getWindow() != null) dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        if (dialog.getWindow() != null && !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()) {
+            dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        }
         dialog.setOnDismissListener(d -> input.setText(""));
         screen.showDialog(dialog, d -> input.setText(""));
     }

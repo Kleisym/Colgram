@@ -58,6 +58,13 @@ public class ColgramForegroundService extends Service {
     private Handler handler;
     private Runnable heartbeat;
     private boolean foregroundStarted = false;
+    private static volatile boolean serviceRunning = false;
+    private static volatile long lastDefenderSweepAtMs = 0L;
+    private static volatile long screenOffSinceMs = 0L;
+
+    public static boolean isServiceRunning() {
+        return serviceRunning;
+    }
 
     // ---------------------------------------------------------------------------------------
     // Lifecycle
@@ -67,27 +74,75 @@ public class ColgramForegroundService extends Service {
     public void onCreate() {
         super.onCreate();
         handler = new Handler(Looper.getMainLooper());
+        serviceRunning = true;
         ensureForeground();
+        // Register persistent self-healing JobScheduler watchdog so OEM killers / Android 15 6h quota
+        // can never permanently stop Colgram's 24/7 background engine.
+        if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+            try {
+                ColgramBootJobService.scheduleProxyRefresh(getApplicationContext());
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        // Drop idle Koliti GGUF RAM footprint when backgrounded so OEM LMK sees a tiny ~80 MB resident process.
+        if (level >= TRIM_MEMORY_UI_HIDDEN) {
+            try {
+                ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+            } catch (Throwable ignored) {}
+            try {
+                ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
+            } catch (Throwable ignored) {}
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         // START_STICKY: if the system kills us for memory, restart with a null intent rather than
         // leaving the app dead until the user opens it again.
+        serviceRunning = true;
         ensureForeground();
         ensurePollers();
         startHeartbeat();
         return START_STICKY;
     }
 
+    /** Android 15 (API 35+) enforces a 6-hour rolling window on dataSync FGS; stop cleanly and reschedule. */
+    public void onTimeout(int startId, int fgsType) {
+        Log.i(TAG, "dataSync foreground quota reached (type=" + fgsType + "), stopping safely and rescheduling job");
+        stopHeartbeat();
+        foregroundStarted = false;
+        serviceRunning = false;
+        try {
+            if (Build.VERSION.SDK_INT >= 24) {
+                stopForeground(Service.STOP_FOREGROUND_REMOVE);
+            } else {
+                stopForeground(true);
+            }
+        } catch (Throwable ignored) {}
+        try {
+            ColgramBootJobService.schedule(getApplicationContext());
+        } catch (Throwable ignored) {}
+        stopSelf(startId);
+    }
+
     @Override
     public void onDestroy() {
         stopHeartbeat();
+        serviceRunning = false;
         // Do NOT tear the pollers down here. onDestroy can fire on a config change or a
         // system-initiated restart, and killing the pollers would then lose updates until the
         // user next opened the app - the exact failure this service exists to prevent.
         // They are daemon threads and are re-asserted by ensurePollers() on the next start.
         Log.i(TAG, "service destroyed; pollers left running for restart");
+        if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+            try {
+                ColgramBootJobService.scheduleProxyRefresh(getApplicationContext());
+            } catch (Throwable ignored) {}
+        }
         super.onDestroy();
     }
 
@@ -132,15 +187,19 @@ public class ColgramForegroundService extends Service {
                 b = new Notification.Builder(this);
             }
             b.setContentTitle("Colgram");
-            b.setContentText("Синхронизация чатов в фоне");
+            b.setContentText("Тихий эко-фон 24/7");
             b.setSmallIcon(android.R.drawable.stat_notify_sync);
             b.setOngoing(true);
             b.setShowWhen(false);
+            if (Build.VERSION.SDK_INT >= 16) {
+                b.setPriority(Notification.PRIORITY_MIN);
+            }
+            if (Build.VERSION.SDK_INT >= 21) {
+                b.setVisibility(Notification.VISIBILITY_SECRET);
+            }
             if (pi != null) {
                 b.setContentIntent(pi);
             }
-            // LOW: present but silent. A syncing client has nothing to alert about, and an
-            // IMPORTANCE_LOW channel is what keeps the system from treating this as a nuisance.
             if (Build.VERSION.SDK_INT >= 26) {
                 b.setChannelId(CHANNEL_ID);
             }
@@ -205,9 +264,13 @@ public class ColgramForegroundService extends Service {
                 return;
             }
             NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Фоновая синхронизация",
-                    NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("Держит Colgram активным, чтобы чаты синхронизировались в фоне");
+                    NotificationManager.IMPORTANCE_MIN);
+            ch.setDescription("Удерживает Colgram в эко-фоне без расхода заряда");
             ch.setShowBadge(false);
+            ch.setSound(null, null);
+            ch.enableVibration(false);
+            ch.enableLights(false);
+            ch.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
             nm.createNotificationChannel(ch);
         } catch (Throwable t) {
             Log.w(TAG, "channel creation failed: " + t.getMessage());
@@ -225,6 +288,13 @@ public class ColgramForegroundService extends Service {
      * spawns), so calling it on a timer is safe and is how a poller that died gets replaced
      * without the user noticing.
      */
+    private static long lastHumanSyncAtMs = 0L;
+
+    /**
+     * Make sure a poller is running for every bot account AND keep active human accounts synced
+     * cleanly in the background so anti-delete / edit history / vaults capture every chat update
+     * without exceeding RAM/battery budgets.
+     */
     private void ensurePollers() {
         try {
             for (int account = 0; account < 5; account++) {
@@ -239,8 +309,117 @@ public class ColgramForegroundService extends Service {
                     Log.w(TAG, "poller ensure failed for account " + account + ": " + t.getMessage());
                 }
             }
+            ensureHumanAccountBackgroundSync();
+            ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
+            ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
+            if (active != null && active.isLocalDpi() && !ColgramDpiBypass.isBound()) {
+                ColgramOptimizer.scheduleAfterStartup(() -> ColgramDpiBypass.restartIfDeadAndWait(2000L));
+            }
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (ColgramConfig.isDefenderEnabled()
+                    && (lastDefenderSweepAtMs == 0L || now - lastDefenderSweepAtMs > 15L * 60L * 1000L)) {
+                lastDefenderSweepAtMs = now;
+                ColgramOptimizer.scheduleAfterStartup(
+                        () -> ColgramSecurityDefender.runFullAuditAndHeal(getApplicationContext(), "background-watchdog"));
+            }
         } catch (Throwable t) {
             Log.w(TAG, "ensurePollers failed: " + t);
+        }
+    }
+
+    private void ensureHumanAccountBackgroundSync() {
+        if (!ColgramConfig.isAlwaysBackgroundEnabled() || ColgramPowerGuard.shouldThrottle(this)) {
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        boolean screenOn = ColgramPowerGuard.isScreenInteractive(this);
+        if (!screenOn) {
+            if (screenOffSinceMs == 0L) {
+                screenOffSinceMs = now;
+            } else if (now - screenOffSinceMs > 180_000L) {
+                // Screen has been off > 3 min: unload idle LLM weights so OEM RAM killers leave Colgram alive.
+                try {
+                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+                } catch (Throwable ignored) {}
+            }
+        } else {
+            screenOffSinceMs = 0L;
+        }
+        // Zero-drain eco cadence: 5 min when screen is ON, 15 min when screen is OFF (native MTProto socket stays awake in kernel).
+        long minIntervalMs = screenOn ? 300_000L : 900_000L;
+        if (lastHumanSyncAtMs != 0L && now - lastHumanSyncAtMs < minIntervalMs) {
+            return;
+        }
+        lastHumanSyncAtMs = now;
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            for (int a = 0; a < 5; a++) {
+                Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, a);
+                if (uc == null) continue;
+                Boolean active = (Boolean) ucClass.getMethod("isClientActivated").invoke(uc);
+                if (active == null || !active) continue;
+                Object user = ucClass.getMethod("getCurrentUser").invoke(uc);
+                if (user != null) {
+                    try {
+                        boolean isBot = user.getClass().getField("bot").getBoolean(user);
+                        if (isBot) continue; // bot pollers already handled via Bot API loop
+                    } catch (Throwable ignored) {}
+                }
+                Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
+                if (cm != null) {
+                    cmClass.getMethod("checkConnection").invoke(cm);
+                }
+                if (screenOn && handler != null) {
+                    final int acc = a;
+                    handler.postDelayed(() -> {
+                        try {
+                            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, acc);
+                            if (mc != null) {
+                                mcClass.getMethod("loadDialogs", int.class, int.class, boolean.class)
+                                        .invoke(mc, 0, 15, false);
+                            }
+                        } catch (Throwable ignored) {}
+                    }, 300L * (a + 1));
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "human background sync tick error: " + t.getMessage());
+        }
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        super.onTaskRemoved(rootIntent);
+        if (!ColgramConfig.isAlwaysBackgroundEnabled()) return;
+        try {
+            ColgramBootJobService.schedule(this);
+            // Only schedule a PendingIntent.getForegroundService alarm when battery-optimization
+            // exemption is granted; on Android 12+ (targetSdk 36), an inexact alarm without
+            // battery exemption throws ForegroundServiceStartNotAllowedException.
+            if (Build.VERSION.SDK_INT >= 31 && !ColgramPowerGuard.isBatteryExemptionGranted(this)) {
+                return;
+            }
+            android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am != null) {
+                Intent restart = new Intent(this, ColgramForegroundService.class);
+                int flags = android.app.PendingIntent.FLAG_ONE_SHOT | android.app.PendingIntent.FLAG_UPDATE_CURRENT;
+                if (Build.VERSION.SDK_INT >= 23) {
+                    flags |= android.app.PendingIntent.FLAG_IMMUTABLE;
+                }
+                android.app.PendingIntent pi = Build.VERSION.SDK_INT >= 26
+                        ? android.app.PendingIntent.getForegroundService(this, 1007, restart, flags)
+                        : android.app.PendingIntent.getService(this, 1007, restart, flags);
+                long triggerAt = android.os.SystemClock.elapsedRealtime() + 4_000L;
+                if (Build.VERSION.SDK_INT >= 23) {
+                    am.setAndAllowWhileIdle(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+                } else {
+                    am.set(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "onTaskRemoved reschedule failed: " + t.getMessage());
         }
     }
 
@@ -253,7 +432,8 @@ public class ColgramForegroundService extends Service {
             public void run() {
                 ensurePollers();
                 if (handler != null) {
-                    handler.postDelayed(this, HEARTBEAT_MS);
+                    long delay = HEARTBEAT_MS * Math.max(1, ColgramPowerGuard.intervalFactor(ColgramForegroundService.this));
+                    handler.postDelayed(this, delay);
                 }
             }
         };
@@ -271,17 +451,47 @@ public class ColgramForegroundService extends Service {
     // Static control surface
     // ---------------------------------------------------------------------------------------
 
+    private static void scheduleProxyRefreshIfNotPending(Context context) {
+        if (context == null || Build.VERSION.SDK_INT < 21) return;
+        try {
+            android.app.job.JobScheduler js =
+                    (android.app.job.JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+            if (js != null && Build.VERSION.SDK_INT >= 24 && js.getPendingJob(8802) != null) {
+                return;
+            }
+            ColgramBootJobService.scheduleProxyRefresh(context);
+        } catch (Throwable ignored) {}
+    }
+
     /** Start (or re-assert) the service. Safe to call from any thread and any component. */
     public static void start(Context context) {
         if (context == null) {
             return;
         }
+        if (serviceRunning) {
+            return;
+        }
+        Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         try {
-            Intent i = new Intent(context, ColgramForegroundService.class);
+            Intent i = new Intent(app, ColgramForegroundService.class);
+            if (Build.VERSION.SDK_INT >= 31
+                    && !ColgramUiBridge.isAppInForeground()
+                    && !ColgramPowerGuard.isBatteryExemptionGranted(app)) {
+                // On Android 12+ (targetSdk 36), calling startForegroundService() from the background
+                // without battery-optimization exemption throws ForegroundServiceStartNotAllowedException.
+                // Start in-process via startService() or defer via JobScheduler until foreground/exempt.
+                try {
+                    app.startService(i);
+                    Log.i(TAG, "background start used startService (not foreground/exempt)");
+                } catch (Throwable bgErr) {
+                    scheduleProxyRefreshIfNotPending(app);
+                }
+                return;
+            }
             if (Build.VERSION.SDK_INT >= 26) {
-                context.startForegroundService(i);
+                app.startForegroundService(i);
             } else {
-                context.startService(i);
+                app.startService(i);
             }
             Log.i(TAG, "start requested");
         } catch (Throwable t) {
@@ -289,10 +499,11 @@ public class ColgramForegroundService extends Service {
             // Falling back to startService at least keeps the pollers alive while the process is
             // up; a later foreground entry (or the boot receiver) will promote it properly.
             try {
-                context.startService(new Intent(context, ColgramForegroundService.class));
+                app.startService(new Intent(app, ColgramForegroundService.class));
                 Log.i(TAG, "start fell back to startService");
             } catch (Throwable t2) {
-                Log.w(TAG, "could not start service: " + t2);
+                Log.w(TAG, "could not start service directly; deferring via JobScheduler: " + t2);
+                scheduleProxyRefreshIfNotPending(app);
             }
         }
     }

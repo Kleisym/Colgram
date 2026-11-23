@@ -28,8 +28,10 @@ public final class ColgramChatExport {
     /** @return the exported file, or null when nothing could be exported. */
     public static File exportDialog(long dialogId) {
         try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            int acct = ucClass.getField("selectedAccount").getInt(null);
             Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, 0);
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, acct);
             Object dialogMessage = mcClass.getField("dialogMessage").get(mc);
             Object list = dialogMessage.getClass().getMethod("get", long.class).invoke(dialogMessage, dialogId);
             if (!(list instanceof List)) return null;
@@ -66,9 +68,25 @@ public final class ColgramChatExport {
 
             android.content.Context ctx = ColgramPythonEngine.appContext();
             if (ctx == null) return null;
-            File dir = new File(new File(ctx.getFilesDir(), "Colgram"), "exports");
-            if (!dir.exists()) dir.mkdirs();
-            File out = new File(dir, "chat_" + dialogId + "_" + System.currentTimeMillis() / 1000L + ".html");
+            File baseRoot = ColgramStorageSandbox.getSandboxRootDir(ctx);
+            if (baseRoot == null) {
+                baseRoot = new File(ctx.getFilesDir(), "Colgram");
+            }
+            File dir = new File(baseRoot, "exports");
+            ColgramStorageSandbox.ensureDirWithNoMedia(dir);
+            compressPreviousExports(dir);
+
+            long tsSec = System.currentTimeMillis() / 1000L;
+            byte[] utf8 = html.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            // Write GZIP-compressed archive when export is large (>= 256 KB) or store both compact .html.gz
+            if (utf8.length >= 256 * 1024) {
+                File gzOut = new File(dir, "chat_" + dialogId + "_" + tsSec + ".html.gz");
+                if (ColgramStorageOptimizer.writeGzipBytesAtomic(gzOut, utf8)) {
+                    Log.i(TAG, "exported " + exported + " messages (GZIP) of dialog " + dialogId + " to " + gzOut);
+                    return gzOut;
+                }
+            }
+            File out = new File(dir, "chat_" + dialogId + "_" + tsSec + ".html");
             try (PrintWriter w = new PrintWriter(out, "UTF-8")) {
                 w.write(html.toString());
             }
@@ -80,7 +98,35 @@ public final class ColgramChatExport {
         }
     }
 
+    /** Compresses older uncompressed .html exports in the directory into .html.gz to save 5-10x space. */
+    public static int compressPreviousExports(File exportDir) {
+        if (exportDir == null || !exportDir.isDirectory()) return 0;
+        File[] files = exportDir.listFiles();
+        if (files == null) return 0;
+        int count = 0;
+        long now = System.currentTimeMillis();
+        for (File f : files) {
+            if (f == null || !f.isFile()) continue;
+            String name = f.getName();
+            if (!name.endsWith(".html")) continue;
+            // Compress any export >= 64 KB or older than 24h
+            if (f.length() >= 64 * 1024L || (now - f.lastModified()) >= 24L * 3600_000L) {
+                byte[] raw = ColgramStorageOptimizer.readGzipOrPlainBytes(f);
+                if (raw != null && raw.length > 0) {
+                    File gz = new File(exportDir, name + ".gz");
+                    if (ColgramStorageOptimizer.writeGzipBytesAtomic(gz, raw)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                        count++;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
     private static String htmlEscape(String s) {
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&#39;");
     }
 }

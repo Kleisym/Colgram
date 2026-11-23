@@ -26,7 +26,8 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /** Bounded anonymous MTProto lanes; each owns a distinct cache, account slot and RPC. */
 public final class ColgramGuestProxyService extends Service {
-    private static final long RPC_TIMEOUT_MS = 8_000L;
+    private static final long RPC_TIMEOUT_MS = 9_500L;
+    private static final long IDLE_STOP_MS = 25_000L;
     private static final AtomicInteger TOKENS = new AtomicInteger(600_000);
     private static final boolean[] initialized = new boolean[ColgramGuestProxyProbe.MAX_PARALLEL];
     private static volatile boolean probeProcess;
@@ -34,11 +35,57 @@ public final class ColgramGuestProxyService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Messenger inbound = new Messenger(new Handler(Looper.getMainLooper(), this::receive));
     private final AtomicReferenceArray<Probe> probes = new AtomicReferenceArray<>(ColgramGuestProxyProbe.MAX_PARALLEL);
+    private volatile boolean bound;
+    private final Runnable killSelf = () -> {
+        if (!bound && !hasActiveProbes() && probeProcess && ColgramProcess.isGuestProxyProcess(this)) {
+            Process.killProcess(Process.myPid());
+        }
+    };
+    private final Runnable idleStop = () -> {
+        if (bound || hasActiveProbes()) return;
+        stopSelf();
+        main.postDelayed(killSelf, 1_000L);
+    };
+
+    private boolean hasActiveProbes() {
+        for (int i = 0; i < probes.length(); i++) {
+            if (probes.get(i) != null) return true;
+        }
+        return false;
+    }
+
+    private void cancelIdleStop() {
+        main.removeCallbacks(idleStop);
+        main.removeCallbacks(killSelf);
+    }
+
+    private void scheduleIdleStop() {
+        cancelIdleStop();
+        if (!bound && !hasActiveProbes()) {
+            main.postDelayed(idleStop, IDLE_STOP_MS);
+        }
+    }
 
     public static void enterProbeProcess() { probeProcess = true; }
     public static boolean inProbeProcess() { return probeProcess; }
     @Override public IBinder onBind(Intent intent) {
-        return probeProcess && ColgramProcess.isGuestProxyProcess(this) ? inbound.getBinder() : null;
+        if (!probeProcess || !ColgramProcess.isGuestProxyProcess(this)) return null;
+        bound = true;
+        cancelIdleStop();
+        return inbound.getBinder();
+    }
+
+    @Override public void onRebind(Intent intent) {
+        if (!probeProcess || !ColgramProcess.isGuestProxyProcess(this)) return;
+        bound = true;
+        cancelIdleStop();
+    }
+
+    @Override public boolean onUnbind(Intent intent) {
+        bound = false;
+        scheduleIdleStop();
+        // Keep rebind active so multi-wave scans reuse the live process without racing stopSelf/killSelf.
+        return true;
     }
 
     private boolean receive(Message message) {
@@ -53,6 +100,7 @@ public final class ColgramGuestProxyService extends Service {
             return true;
         }
         if (message.what != ColgramGuestProxyProbe.CHECK || message.replyTo == null) return false;
+        cancelIdleStop();
         if (probes.get(account) != null) { deliver(message.replyTo, -1L, "TG_PROBE_BUSY"); return true; }
         Probe probe = new Probe(account, ticket, message.replyTo);
         probes.set(account, probe);
@@ -98,6 +146,7 @@ public final class ColgramGuestProxyService extends Service {
         }
         void open(String address, int port, String user, String pass, String secret) {
             try {
+                android.util.Log.d("ColgramGuestProbe", "open account=" + account + " proxy=" + address + ":" + port + " init=" + initialized[account]);
                 if (!initialized[account]) {
                     NativeLoader.loadPackagedForGuestProbe();
                     ConnectionsManager.native_setJava(false);
@@ -125,6 +174,7 @@ public final class ColgramGuestProxyService extends Service {
         }
         void finish(long time, String reason) {
             if (!probes.compareAndSet(account, this, null)) return;
+            android.util.Log.d("ColgramGuestProbe", "finish account=" + account + " time=" + time + " reason=" + reason);
             main.removeCallbacks(timeout);
             int request = token; token = 0;
             if (initialized[account]) {
@@ -133,6 +183,7 @@ public final class ColgramGuestProxyService extends Service {
                 ConnectionsManager.native_pauseNetwork(account);
             }
             deliver(reply, time, reason);
+            scheduleIdleStop();
         }
     }
 
@@ -165,6 +216,8 @@ public final class ColgramGuestProxyService extends Service {
         try { messenger.send(result); } catch (RemoteException callerGone) { }
     }
     @Override public void onDestroy() {
+        bound = false;
+        cancelIdleStop();
         for (int account = 0; account < probes.length(); account++) {
             Probe probe = probes.get(account);
             if (probe != null) probe.finish(-1L, "TG_PROBE_DISCONNECTED");

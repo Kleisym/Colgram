@@ -125,17 +125,23 @@ public final class ColgramHttp {
         }
 
         int connectAttempts = 0;
-        for (ColgramProxyChain.Relay relay : ColgramProxyManager.getReachableRelays()) {
-            if (relay == null || relay.rttMs < 0) continue;
-            if (connectAttempts++ >= 1) break;
-            try {
-                Response response = openFastConnection(urlStr, new Proxy(
-                        relay.socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP,
-                        new InetSocketAddress(relay.host, relay.port)));
-                if (response.code >= 200 && response.code < 300) return response;
-                attempts.add(relay.key() + " -> HTTP " + response.code);
-            } catch (Throwable t) {
-                attempts.add(relay.key() + " -> " + reason(t));
+        if (allowThirdPartyRelays()) {
+            for (ColgramProxyChain.Relay relay : ColgramProxyManager.getReachableRelays()) {
+                if (relay == null || relay.rttMs < 0) continue;
+                if (ColgramConfig.isStrictProxySecurityEnabled()
+                        && !urlStr.toLowerCase(java.util.Locale.ROOT).startsWith("https://")) {
+                    break;
+                }
+                if (connectAttempts++ >= 1) break;
+                try {
+                    Response response = openFastConnection(urlStr, new Proxy(
+                            relay.socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP,
+                            new InetSocketAddress(relay.host, relay.port)));
+                    if (response.code >= 200 && response.code < 300) return response;
+                    attempts.add(relay.key() + " -> HTTP " + response.code);
+                } catch (Throwable t) {
+                    attempts.add(relay.key() + " -> " + reason(t));
+                }
             }
         }
         throw new IOException(join(attempts));
@@ -148,7 +154,7 @@ public final class ColgramHttp {
         try {
             String target = URLEncoder.encode(urlStr, "UTF-8");
             String sep = relay.contains("?") ? "&" : "?";
-            conn = (HttpURLConnection) new URL(relay + sep + "url=" + target).openConnection();
+            conn = (HttpURLConnection) new URL(relay + sep + "url=" + target).openConnection(Proxy.NO_PROXY);
             conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0");
@@ -174,7 +180,21 @@ public final class ColgramHttp {
 
     private static Response openFastConnection(String urlStr, Proxy proxy) throws Exception {
         // Standard HTTP framing handles chunked responses without returning chunk headers as data.
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection(proxy);
+        URL url = new URL(urlStr);
+        boolean externalProxy = proxy != null && proxy.type() != Proxy.Type.DIRECT;
+        if (externalProxy && ColgramConfig.isStrictProxySecurityEnabled()
+                && !"https".equalsIgnoreCase(url.getProtocol())) {
+            throw new IOException("в строгом режиме через чужой прокси разрешён только HTTPS");
+        }
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection(proxy != null ? proxy : Proxy.NO_PROXY);
+        if (externalProxy && ColgramConfig.isStrictProxySecurityEnabled()) {
+            conn.setInstanceFollowRedirects(false);
+        }
+        if (conn instanceof javax.net.ssl.HttpsURLConnection && externalProxy) {
+            java.net.InetAddress viaProxy = ColgramDohResolver.resolveOrNull(url.getHost());
+            conn = ColgramPinnedConnection.create(
+                    (javax.net.ssl.HttpsURLConnection) conn, url, viaProxy, proxy);
+        }
         try {
             conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
@@ -262,7 +282,7 @@ public final class ColgramHttp {
             String target = URLEncoder.encode(urlStr, "UTF-8");
             String sep = relay.contains("?") ? "&" : "?";
             String via = relay + sep + "url=" + target;
-            HttpURLConnection conn = (HttpURLConnection) new URL(via).openConnection();
+            HttpURLConnection conn = (HttpURLConnection) new URL(via).openConnection(Proxy.NO_PROXY);
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(READ_TIMEOUT_MS);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0");
@@ -294,6 +314,9 @@ public final class ColgramHttp {
                 Log.i(TAG, "fetched " + hostOf(urlStr) + " through the configured relay");
                 return new Response(code, sb.toString());
             }
+            if (code >= 400 && code < 500 && "1".equals(conn.getHeaderField("X-Colgram-Relay"))) {
+                return new Response(code, sb.toString());
+            }
             attempts.add("реле-адрес: HTTP " + code);
         } catch (Throwable t) {
             attempts.add("реле-адрес: " + reason(t));
@@ -301,12 +324,21 @@ public final class ColgramHttp {
         return null;
     }
 
+    private static boolean isThirdPartySocks(ColgramProxyManager.ProxyItem item) {
+        return item != null && item.type == 0 && !item.isLocalDpi()
+                && !ColgramDohResolver.isLoopbackHost(item.address);
+    }
+
+    static boolean allowThirdPartyRelays() {
+        return ColgramConfig.isAutoProxyEnabled()
+                || isThirdPartySocks(ColgramProxyManager.getCurrentActiveProxy());
+    }
+
     /**
      * A {@link Proxy} that can carry HTTPS right now: the local desync listener when the user
      * switched it on, else a live SOCKS5 node, else a loopback front tunnelled through a
-     * reachable CONNECT relay. Null means "nothing works, dial directly".
-     *
-     * Cached because choosing it costs a TCP probe, and callers ask on every request.
+     * reachable CONNECT relay. Third-party nodes are never selected while local direct bypass
+     * owns the path unless auto-proxy or an explicit third-party SOCKS proxy is enabled.
      */
     public static synchronized Proxy pickRelayProxy() {
         long now = System.currentTimeMillis();
@@ -318,7 +350,7 @@ public final class ColgramHttp {
                 break;
             }
         }
-        if (picked == null) {
+        if (picked == null && allowThirdPartyRelays()) {
             for (ColgramProxyChain.Relay relay : ColgramProxyManager.getReachableRelays()) {
                 if (relay.socks) continue;
                 int port = ColgramProxyChain.openProxyFront(relay);
@@ -341,20 +373,20 @@ public final class ColgramHttp {
     private static final long TRANSPORT_CACHE_MS = 60000L;
 
     /**
-     * Relays worth trying: SOCKS5 entries only (MTProto and WEB cannot carry plain HTTP), the
-     * applied proxy first if it qualifies, then verified-alive, then the rest.
+     * Relays worth trying: local desync listener first; explicit or auto-proxy third-party
+     * SOCKS5 relays only when allowed by user settings.
      */
     private static List<ColgramProxyManager.ProxyItem> relayCandidates() {
         List<ColgramProxyManager.ProxyItem> out = new ArrayList<>();
-        List<ColgramProxyManager.ProxyItem> pool = ColgramProxyManager.getVerifiedPool();
         ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
-        // The local desync listener first when the user switched it on: it is the one relay with
-        // nobody else in the path, so the bot API and the mail providers should reach Telegram
-        // through it before any stranger's proxy is touched.
-        if (ColgramConfig.isDpiBypassEnabled() && ColgramDpiBypass.isBound()) {
+        if (ColgramDpiBypass.isBound()) {
             out.add(new ColgramProxyManager.ProxyItem("127.0.0.1", ColgramDpiBypass.activePort(), "", 0));
         }
-        if (active != null && active.type == 0 && !active.isLocalDpi()) out.add(active);
+        if (isThirdPartySocks(active)) out.add(active);
+        if (!allowThirdPartyRelays()) {
+            return out;
+        }
+        List<ColgramProxyManager.ProxyItem> pool = ColgramProxyManager.getVerifiedPool();
         for (ColgramProxyManager.ProxyItem p : pool) {
             if (p.type != 0 || p.isLocalDpi() || p.equals(active)) continue;
             if (p.isAvailable) out.add(p);
@@ -367,14 +399,12 @@ public final class ColgramHttp {
     }
 
     /**
-     * Last resort when the pool has no usable SOCKS5: the harvested tunnel list. An HTTP CONNECT
-     * proxy is an order of magnitude more common than a SOCKS5 one, and a CONNECT tunnel carries
-     * TLS untouched, so api.telegram.org and the mail providers become reachable through it even
-     * when every SOCKS5 in the pool is dead. This is what "сеть недоступна" on a bot request
-     * actually needed: the applied proxy was MTProto, which plain Java HTTPS cannot speak.
+     * Last resort when the pool has no usable SOCKS5: the harvested tunnel list (only when
+     * third-party fallback is explicitly allowed).
      */
     private static Response viaConnectRelays(String urlStr, String jsonBody, String bearer,
                                              List<String> attempts) {
+        if (!allowThirdPartyRelays()) return null;
         List<ColgramProxyChain.Relay> relays = ColgramProxyManager.getReachableRelays();
         int used = 0;
         for (ColgramProxyChain.Relay relay : relays) {
@@ -404,8 +434,23 @@ public final class ColgramHttp {
         return open(urlStr, relay.address, relay.port, jsonBody, bearer);
     }
 
-    private static Response open(String urlStr, String socksHost, int socksPort,
-                                 String jsonBody, String bearer) throws Exception {
+    /** Opens a configured HTTP(S) connection for binary downloads via active Colgram SOCKS5/DPI/DoH route. */
+    public static HttpURLConnection openBinaryStream(String urlStr, int connectTimeoutMs, int readTimeoutMs) throws IOException {
+        ColgramProxyManager.ProxyItem relay = ColgramProxyManager.getCurrentActiveProxy();
+        String socksHost = (relay != null && relay.type == 0) ? relay.address : null;
+        int socksPort = (relay != null && relay.type == 0) ? relay.port : 0;
+        if (socksHost == null && ColgramDpiBypass.isBound()) {
+            socksHost = "127.0.0.1";
+            socksPort = ColgramDpiBypass.activePort();
+        }
+        HttpURLConnection conn = openConfiguredConnection(urlStr, socksHost, socksPort);
+        conn.setConnectTimeout(connectTimeoutMs);
+        conn.setReadTimeout(readTimeoutMs);
+        conn.setRequestProperty("User-Agent", "Colgram/Updater");
+        return conn;
+    }
+
+    private static HttpURLConnection openConfiguredConnection(String urlStr, String socksHost, int socksPort) throws IOException {
         HttpURLConnection conn;
         URL url = new URL(urlStr);
         if (socksHost == null) {
@@ -439,30 +484,33 @@ public final class ColgramHttp {
             java.net.InetAddress resolved = ColgramDohResolver.resolveOrNull(url.getHost());
             if (resolved != null && conn instanceof javax.net.ssl.HttpsURLConnection) {
                 conn = ColgramPinnedConnection.create(
-                        (javax.net.ssl.HttpsURLConnection) conn, url, resolved);
+                        (javax.net.ssl.HttpsURLConnection) conn, url, resolved, Proxy.NO_PROXY);
             }
         } else {
-            conn = (HttpURLConnection) url.openConnection(new Proxy(Proxy.Type.SOCKS,
-                    new InetSocketAddress(socksHost, socksPort)));
-            // The SOCKS branch did the same job without the pinning, and the proxy answers for a host
-            // it cannot reach:
-            //
-            //   failed to connect to api.cloudflareclient.com/104.16.192.82 (port 443) after 8000ms;
-            //   127.0.0.1:38295 -> SOCKS: Host unreachable
-            //
-            // The direct branch had it and this did not, so the same request succeeded one way and
-            // failed the other. The name is still left in the URL, so SNI, Host and certificate
-            // verification are unchanged - what changes is that the socket is aimed at an answer the
-            // bypass obtained rather than at whatever the proxy decides.
+            if (ColgramConfig.isStrictProxySecurityEnabled()
+                    && !ColgramDohResolver.isLoopbackHost(socksHost)
+                    && !"https".equalsIgnoreCase(url.getProtocol())) {
+                throw new IOException("в строгом режиме через чужой прокси разрешён только HTTPS");
+            }
+            Proxy socksProxy = new Proxy(Proxy.Type.SOCKS,
+                    new InetSocketAddress(socksHost, socksPort));
+            conn = (HttpURLConnection) url.openConnection(socksProxy);
+            if (ColgramConfig.isStrictProxySecurityEnabled()
+                    && !ColgramDohResolver.isLoopbackHost(socksHost)) {
+                conn.setInstanceFollowRedirects(false);
+            }
             if (conn instanceof javax.net.ssl.HttpsURLConnection) {
                 java.net.InetAddress viaProxy = ColgramDohResolver.resolveOrNull(url.getHost());
-                if (viaProxy != null) {
-                    conn = ColgramPinnedConnection.create(
-                            (javax.net.ssl.HttpsURLConnection) conn, url, viaProxy,
-                            new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(socksHost, socksPort)));
-                }
+                conn = ColgramPinnedConnection.create(
+                        (javax.net.ssl.HttpsURLConnection) conn, url, viaProxy, socksProxy);
             }
         }
+        return conn;
+    }
+
+    private static Response open(String urlStr, String socksHost, int socksPort,
+                                 String jsonBody, String bearer) throws Exception {
+        HttpURLConnection conn = openConfiguredConnection(urlStr, socksHost, socksPort);
         try {
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(READ_TIMEOUT_MS);
@@ -518,7 +566,11 @@ public final class ColgramHttp {
                                            String jsonBody, String bearer,
                                            int connectTimeoutMs, int readTimeoutMs) throws Exception {
         URL url = new URL(urlStr);
-        boolean tls = "https".equals(url.getProtocol());
+        boolean tls = "https".equalsIgnoreCase(url.getProtocol());
+        if (ColgramConfig.isStrictProxySecurityEnabled()
+                && !tls && !ColgramDohResolver.isLoopbackHost(proxyHost)) {
+            throw new IOException("в строгом режиме через чужой прокси разрешён только HTTPS");
+        }
         int port = url.getPort() > 0 ? url.getPort() : (tls ? 443 : 80);
         String host = url.getHost();
         String path = url.getFile().isEmpty() ? "/" : url.getFile();
@@ -544,6 +596,7 @@ public final class ColgramHttp {
                 javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket)
                         ((javax.net.ssl.SSLSocketFactory) javax.net.ssl.SSLSocketFactory.getDefault())
                                 .createSocket(tunnel, host, port, true);
+                ColgramDohResolver.hardenTlsSocket(ssl);
                 ssl.startHandshake();
                 if (!javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
                         .verify(host, ssl.getSession())) {

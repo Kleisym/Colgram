@@ -58,41 +58,63 @@ public class ColgramPluginManager {
     private static Context appContext = null;
     private static File internalPluginsDir = null;
     private static File externalPluginsDir = null;
+    private static File legacyPublicPluginsDir = null;
 
     public static void init(Context context) {
         if (context == null) return;
         appContext = context.getApplicationContext();
-        try {
-            // 1. Internal secure plugins directory (zero permissions needed on Android 10-14)
-            internalPluginsDir = new File(appContext.getFilesDir(), "plugins");
-            if (!internalPluginsDir.exists()) {
-                internalPluginsDir.mkdirs();
-            }
-
-            // 2. Optional external directory for user-dropped files
+        internalPluginsDir = new File(appContext.getFilesDir(), "plugins");
+        // Defer filesystem setup, shim writes, and plugin directory scanning off the cold-start UI thread.
+        Thread t = new Thread(() -> {
             try {
-                File docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
-                externalPluginsDir = new File(docsDir, "Colgram/Plugins");
-                if (!externalPluginsDir.exists()) {
-                    externalPluginsDir.mkdirs();
-                }
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             } catch (Throwable ignored) {}
+            try {
+                if (!internalPluginsDir.exists()) {
+                    internalPluginsDir.mkdirs();
+                }
+                try {
+                    new File(internalPluginsDir, ".nomedia").createNewFile();
+                } catch (Throwable ignored) {}
+                try {
+                    File sandboxRoot = ColgramStorageSandbox.getSandboxRootDir(appContext);
+                    externalPluginsDir = new File(sandboxRoot, "Plugins");
+                    if (!externalPluginsDir.exists()) {
+                        externalPluginsDir.mkdirs();
+                    }
+                    try {
+                        new File(externalPluginsDir, ".nomedia").createNewFile();
+                    } catch (Throwable ignored) {}
 
-            // 3b. Always refresh the exteraGram compatibility shim. It is infrastructure,
-            //     not a user plugin, so it is overwritten on every start — that way a
-            //     Colgram update that changes the shim takes effect without the user
-            //     having to clear app data.
-            installExteraCompatShim(internalPluginsDir);
+                    // Do NOT create public /sdcard/Documents/Colgram/Plugins if it doesn't exist;
+                    // if a legacy folder already exists on disk, drop .nomedia and read existing plugins only.
+                    File docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+                    if (docsDir != null) {
+                        File legacyRoot = new File(docsDir, "Colgram");
+                        if (legacyRoot.isDirectory()) {
+                            try {
+                                new File(legacyRoot, ".nomedia").createNewFile();
+                            } catch (Throwable ignored) {}
+                            File legacyPlugins = new File(legacyRoot, "Plugins");
+                            if (legacyPlugins.isDirectory() && !legacyPlugins.equals(externalPluginsDir)) {
+                                try {
+                                    new File(legacyPlugins, ".nomedia").createNewFile();
+                                } catch (Throwable ignored) {}
+                                legacyPublicPluginsDir = legacyPlugins;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
 
-            // 3c. Install the marketplace set as built-ins.
-            installBundledCatalog();
-
-            // 4. Reload
-            reloadPlugins();
-
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to initialize ColgramPluginManager", t);
-        }
+                installExteraCompatShim(internalPluginsDir);
+                installBundledCatalog();
+                reloadPlugins();
+            } catch (Throwable err) {
+                Log.e(TAG, "Failed to initialize ColgramPluginManager", err);
+            }
+        }, "colgram-plugins-init");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
@@ -141,13 +163,65 @@ public class ColgramPluginManager {
         if (externalPluginsDir != null && externalPluginsDir.exists()) {
             ColgramPythonEngine.addPythonPath(externalPluginsDir.getAbsolutePath());
         }
+        if (legacyPublicPluginsDir != null && legacyPublicPluginsDir.exists()) {
+            ColgramPythonEngine.addPythonPath(legacyPublicPluginsDir.getAbsolutePath());
+        }
 
         normalizePluginExtensions(internalPluginsDir);
         normalizePluginExtensions(externalPluginsDir);
+        normalizePluginExtensionsToTarget(legacyPublicPluginsDir, internalPluginsDir);
         scanDir(internalPluginsDir, prefs);
         if (externalPluginsDir != null && externalPluginsDir.exists()) {
             scanDir(externalPluginsDir, prefs);
         }
+        if (legacyPublicPluginsDir != null && legacyPublicPluginsDir.exists()) {
+            scanDir(legacyPublicPluginsDir, prefs);
+        }
+        if (ColgramPythonEngine.isPythonReady()) {
+            syncActiveExteraPlugins();
+        }
+    }
+
+    /** Returns sanitized module names (without .py) for every currently enabled plugin. */
+    public static java.util.List<String> getEnabledPythonModules() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        synchronized (loadedPlugins) {
+            for (PluginInfo p : loadedPlugins) {
+                if (p != null && p.isEnabled && p.fileName != null && p.fileName.endsWith(".py")
+                        && !"extera_compat.py".equals(p.fileName)) {
+                    String mod = moduleNameFor(p.fileName);
+                    if (mod != null && !out.contains(mod)) {
+                        out.add(mod);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Synchronize active ExteraGram BasePlugin instances with the enabled plugin set. */
+    public static void syncActiveExteraPlugins() {
+        ColgramPythonEngine.syncExteraPluginsAsync(getEnabledPythonModules());
+    }
+
+    public static String moduleNameFor(String fileName) {
+        if (fileName == null) return null;
+        String stored = canonicalName(fileName);
+        if (stored == null || !stored.endsWith(".py")) return null;
+        String mod = stored.substring(0, stored.length() - 3);
+        return mod.matches("[A-Za-z_][A-Za-z0-9_]*") ? mod : null;
+    }
+
+    public static String getPluginSettingsSchemaJson(String fileName) {
+        String mod = moduleNameFor(fileName);
+        if (mod == null) return "[]";
+        return ColgramPythonEngine.getExteraSettingsJson(mod);
+    }
+
+    public static boolean updatePluginSetting(String fileName, String key, String valueJson) {
+        String mod = moduleNameFor(fileName);
+        if (mod == null) return false;
+        return ColgramPythonEngine.updateExteraSetting(mod, key, valueJson);
     }
 
     /**
@@ -160,13 +234,17 @@ public class ColgramPluginManager {
      * whenever the source is newer, so editing the .plugin still takes effect.
      */
     private static void normalizePluginExtensions(File dir) {
-        if (dir == null || !dir.exists()) return;
-        File[] files = dir.listFiles((d, name) -> name.toLowerCase().endsWith(".plugin"));
+        normalizePluginExtensionsToTarget(dir, dir);
+    }
+
+    private static void normalizePluginExtensionsToTarget(File srcDir, File targetDir) {
+        if (srcDir == null || !srcDir.exists() || targetDir == null || !targetDir.exists()) return;
+        File[] files = srcDir.listFiles((d, name) -> name.toLowerCase().endsWith(".plugin"));
         if (files == null) return;
         for (File src : files) {
             try {
                 String base = src.getName().substring(0, src.getName().length() - ".plugin".length());
-                File twin = new File(dir, base + ".py");
+                File twin = new File(targetDir, base + ".py");
                 if (twin.exists() && twin.lastModified() >= src.lastModified()) continue;
                 java.io.InputStream in = new java.io.FileInputStream(src);
                 java.io.OutputStream out = new java.io.FileOutputStream(twin, false);
@@ -191,6 +269,16 @@ public class ColgramPluginManager {
             try {
                 String fileName = f.getName();
                 if ("extera_compat.py".equals(fileName)) continue;
+                boolean alreadyLoaded = false;
+                synchronized (loadedPlugins) {
+                    for (PluginInfo existing : loadedPlugins) {
+                        if (existing != null && fileName.equals(existing.fileName)) {
+                            alreadyLoaded = true;
+                            break;
+                        }
+                    }
+                }
+                if (alreadyLoaded) continue;
                 String name = fileName.replace(".py", "");
                 String description = "Colgram Script Plugin";
                 String author = "Colgram Team";
@@ -203,7 +291,7 @@ public class ColgramPluginManager {
                 int headLines = 0;
                 while ((line = r.readLine()) != null) {
                     line = line.trim();
-                    if (headLines++ < 60) head.append(line).append('\n');
+                    if (headLines++ < 120) head.append(line).append('\n');
                     if (line.startsWith("# name:")) description = line.substring(7).trim();
                     else if (line.startsWith("# title:")) name = line.substring(8).trim();
                     else if (line.startsWith("# author:")) author = line.substring(9).trim();
@@ -213,9 +301,7 @@ public class ColgramPluginManager {
                 r.close();
 
                 // exteraGram plugin metadata (https://plugins.exteragram.app): Python string
-                // constants such as __name__ = "Weather" declared at module top level. Their
-                // .plugin files carry no "# name:" comment header, so without this every
-                // imported extera plugin showed up as its file name with no author or version.
+                // constants such as __name__ = "Weather" declared at module top level.
                 String h = head.toString();
                 String v;
                 if ((v = stringConst(h, "__name__")) != null) name = v;
@@ -223,6 +309,9 @@ public class ColgramPluginManager {
                 if ((v = stringConst(h, "__author__")) != null) author = v;
                 if ((v = stringConst(h, "__version__")) != null) version = v;
                 if ((v = stringConst(h, "__command__")) != null) command = v.toLowerCase();
+                if ((v = stringConst(h, "__min_version__")) != null && !description.contains("extera")) {
+                    description = description + " (extera " + v + "+)";
+                }
 
                 boolean isEnabled = prefs == null || prefs.getBoolean("plugin_enabled_" + fileName, true);
                 boolean builtIn = dir.equals(internalPluginsDir) && isBundledFeature(fileName);
@@ -285,8 +374,18 @@ public class ColgramPluginManager {
             handleInfoCommand(dialogId);
             return true;
         } else if ("calc".equals(cmd) || "py".equals(cmd) || "eval".equals(cmd)) {
-            ColgramPythonEngine.sendMessage(dialogId, "🐍 Результат: " + ColgramPythonEngine.executeCode(args));
+            final long targetDialog = dialogId;
+            final String codeArg = args;
+            new Thread(() -> {
+                String res = ColgramPythonEngine.executePluginCode(codeArg);
+                if (res == null) {
+                    res = ColgramPythonEngine.executeCode(codeArg);
+                }
+                ColgramPythonEngine.sendMessage(targetDialog, "🐍 Результат: " + res);
+            }, "colgram-py-cmd").start();
             return true;
+        } else if ("ping".equals(cmd) || "id".equals(cmd) || "del".equals(cmd) || "help".equals(cmd) || "plugins".equals(cmd)) {
+            return ColgramPythonEngine.handleCommand(dialogId, 0, "." + cmd + (args == null || args.isEmpty() ? "" : (" " + args)));
         } else if ("rev".equals(cmd)) {
             ColgramPythonEngine.sendMessage(dialogId, new StringBuilder(args).reverse().toString());
             return true;
@@ -295,6 +394,11 @@ public class ColgramPluginManager {
             return true;
         } else if ("flip".equals(cmd)) {
             ColgramPythonEngine.sendMessage(dialogId, "(╯°□°)╯︵ ┻━┻");
+            return true;
+        }
+
+        if (ColgramPythonEngine.isPythonReady() && ColgramPythonEngine.isShimCommandRegistered(cmd)) {
+            new Thread(() -> dispatchExteraShimCommand(dialogId, cmd, args), "colgram-extera-cmd").start();
             return true;
         }
 
@@ -430,23 +534,42 @@ public class ColgramPluginManager {
     }
 
     private static void handleInfoCommand(long dialogId) {
+        String appVer = "12.10.6";
+        try {
+            Object v = Class.forName("org.telegram.messenger.BuildVars")
+                    .getField("BUILD_VERSION_STRING").get(null);
+            if (v != null && !v.toString().trim().isEmpty()) {
+                appVer = v.toString().trim();
+            }
+        } catch (Throwable ignored) {}
         String info = "ℹ️ **Colgram Chat Info**\n"
                 + "• Dialog ID: `" + dialogId + "`\n"
-                + "• Client: `Colgram v11.1.3`\n"
+                + "• Client: `Colgram v" + appVer + "`\n"
                 + "• Plugins Loaded: `" + loadedPlugins.size() + "`\n"
                 + "• Engine: `CPython 3.11 Embedded`\n"
                 + "• DPI Bypass: `" + (ColgramDpiBypass.isRunning() ? "Встроенный маршрут активен" : "Offline") + "`";
         ColgramPythonEngine.sendMessage(dialogId, info);
     }
 
+    private static final java.util.concurrent.ExecutorService PLUGIN_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "colgram-plugin-worker");
+                t.setDaemon(true);
+                return t;
+            });
+
     private static void executePluginCommand(long dialogId, PluginInfo plugin, String cmd, String args) {
-        new Thread(() -> {
+        PLUGIN_EXECUTOR.execute(() -> {
             try {
                 String module = plugin.fileName.substring(0, plugin.fileName.length() - 3);
                 if (!module.matches("[A-Za-z_][A-Za-z0-9_]*")) return;
                 String encoded = android.util.Base64.encodeToString(
                         args.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
-                String firstArg = plugin.builtIn ? Long.toString(dialogId) : "'" + cmd + "'";
+                String encodedCmd = android.util.Base64.encodeToString(
+                        (cmd != null ? cmd : "").getBytes("UTF-8"), android.util.Base64.NO_WRAP);
+                String firstArg = plugin.builtIn
+                        ? Long.toString(dialogId)
+                        : "base64.b64decode('" + encodedCmd + "').decode('utf-8')";
                 String pySnippet = "import base64, importlib\n"
                         + "_m = importlib.import_module('" + module + "')\n"
                         + "_f = getattr(_m, 'on_command', None)\n"
@@ -461,42 +584,31 @@ public class ColgramPluginManager {
             } catch (Throwable t) {
                 Log.e(TAG, "Plugin execution error", t);
             }
-        }).start();
+        });
     }
 
-    /**
-     * Broadcast an incoming message to every enabled plugin's on_message().
-     *
-     * This method used to contain only a comment, and nothing called it either — which is why
-     * auto_reply.py, keyword_alerts.py and message_logger.py were inert no matter what the
-     * plugin screen showed. The dispatch is deliberately defensive: a plugin that does not
-     * define on_message is skipped, and one that raises cannot stop the others.
-     *
-     * Only INCOMING messages reach here. A reply we send is itself a message, so filtering on
-     * isOut at the call site is what prevents auto-reply from answering itself forever.
-     */
     public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
         if (isOut || text == null) return;
-        final String messageText = text;
-        new Thread(() -> {
-            // Snapshot the list: loadedPlugins is synchronised but iterating it while a reload
-            // swaps entries would throw.
-            List<PluginInfo> snapshot;
-            synchronized (loadedPlugins) {
-                snapshot = new ArrayList<>(loadedPlugins);
+        // Fast bail-out BEFORE scheduling any worker thread if zero enabled plugins exist!
+        List<PluginInfo> enabledPlugins = null;
+        synchronized (loadedPlugins) {
+            for (PluginInfo p : loadedPlugins) {
+                if (p != null && p.isEnabled && p.fileName != null && p.fileName.endsWith(".py")) {
+                    if (enabledPlugins == null) enabledPlugins = new ArrayList<>();
+                    enabledPlugins.add(p);
+                }
             }
+        }
+        if (enabledPlugins == null || enabledPlugins.isEmpty()) return;
+        final List<PluginInfo> snapshot = enabledPlugins;
+        final String messageText = text;
+        PLUGIN_EXECUTOR.execute(() -> {
             for (PluginInfo p : snapshot) {
-                if (!p.isEnabled || p.fileName == null) continue;
                 String module = p.fileName;
                 int dot = module.lastIndexOf('.');
                 if (dot > 0) module = module.substring(0, dot);
+                if (!module.matches("[A-Za-z_][A-Za-z0-9_]*")) continue;
                 try {
-                    // The message text travels as base64 rather than as a quoted Python literal.
-                    // Escaping quotes correctly is necessary but not sufficient: the snippet is
-                    // compiled as SOURCE, so anything the host hands to Chaquopy's parser has to
-                    // survive its encoding too, and non-ASCII text plus astral characters (emoji)
-                    // are exactly where that gets murky. base64 keeps the generated source pure
-                    // ASCII and removes the quoting surface entirely.
                     String b64 = android.util.Base64.encodeToString(
                             messageText.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
                     String snippet = "import base64, importlib\n"
@@ -510,8 +622,6 @@ public class ColgramPluginManager {
                     String out = ColgramPythonEngine.executePluginCode(snippet);
                     if (out == null) continue;
                     String reply = out.trim();
-                    // executeCode prefixes successful-but-silent runs; anything else is the
-                    // plugin's own answer and should actually be delivered.
                     if (reply.isEmpty() || reply.startsWith("Executed")) continue;
                     ColgramPythonEngine.sendMessage(dialogId, reply);
                     Log.i(TAG, "plugin " + p.fileName + " replied to message " + messageId);
@@ -519,7 +629,7 @@ public class ColgramPluginManager {
                     Log.w(TAG, "plugin " + p.fileName + " on_message failed: " + t.getMessage());
                 }
             }
-        }, "colgram-plugin-inbound").start();
+        });
     }
 
     public static boolean installPlugin(String fileName, String code) {
@@ -590,6 +700,10 @@ public class ColgramPluginManager {
     public static boolean deletePlugin(String fileName) {
         try {
             if (isBundledFeature(fileName) || "extera_compat.py".equals(fileName)) return false;
+            String mod = moduleNameFor(fileName);
+            if (mod != null) {
+                ColgramPythonEngine.unloadExteraPluginAsync(mod);
+            }
             boolean deleted = false;
             // Delete BOTH extensions of the base name, not just the one the caller named.
             //
@@ -610,6 +724,10 @@ public class ColgramPluginManager {
                 if (externalPluginsDir != null) {
                     File f2 = new File(externalPluginsDir, name);
                     if (f2.exists()) deleted |= f2.delete();
+                }
+                if (legacyPublicPluginsDir != null) {
+                    File f3 = new File(legacyPublicPluginsDir, name);
+                    if (f3.exists()) deleted |= f3.delete();
                 }
             }
             reloadPlugins();
@@ -704,6 +822,7 @@ public class ColgramPluginManager {
                     .putBoolean("plugin_enabled_" + stored, enabled)
                     .apply();
         }
+        boolean updated = false;
         for (PluginInfo p : loadedPlugins) {
             if (p.fileName.equals(stored)) {
                 p.isEnabled = enabled;
@@ -711,7 +830,18 @@ public class ColgramPluginManager {
                     if (enabled) activeCommands.put(p.command, p);
                     else activeCommands.remove(p.command);
                 }
-                break;
+                updated = true;
+            }
+        }
+        if (updated) {
+            // Ensure all duplicate entries remain consistent without early break
+        }
+        String mod = moduleNameFor(stored);
+        if (mod != null && ColgramPythonEngine.isPythonReady()) {
+            if (enabled) {
+                syncActiveExteraPlugins();
+            } else {
+                ColgramPythonEngine.unloadExteraPluginAsync(mod);
             }
         }
     }
@@ -758,6 +888,10 @@ public class ColgramPluginManager {
             }
             if (externalPluginsDir != null) {
                 File f = new File(externalPluginsDir, name);
+                if (f.exists()) return f;
+            }
+            if (legacyPublicPluginsDir != null) {
+                File f = new File(legacyPublicPluginsDir, name);
                 if (f.exists()) return f;
             }
         }
@@ -1077,37 +1211,17 @@ public class ColgramPluginManager {
         }
     }
 
-    /** Minimal HTTP GET returning the body as text, or null on any failure. */
+    /** Proxy/DoH/relay-aware HTTP GET returning the body as text, or null on any failure. */
     private static String httpGet(String urlStr) {
-        HttpURLConnection conn = null;
+        if (urlStr == null || urlStr.trim().isEmpty()) return null;
         try {
-            URL url = new URL(urlStr);
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(15000);
-            conn.setRequestMethod("GET");
-            conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", "Colgram");
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) {
-                Log.e(TAG, "httpGet HTTP " + code + " for " + urlStr);
-                return null;
+            ColgramHttp.Response resp = ColgramHttp.get(urlStr);
+            if (resp != null && resp.code >= 200 && resp.code < 300 && resp.body != null) {
+                return resp.body;
             }
-            InputStream in = conn.getInputStream();
-            if (in == null) return null;
-            BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = r.readLine()) != null) {
-                sb.append(line).append('\n');
-            }
-            r.close();
-            return sb.toString();
         } catch (Throwable t) {
             Log.e(TAG, "httpGet failed for " + urlStr, t);
-            return null;
-        } finally {
-            if (conn != null) conn.disconnect();
         }
+        return null;
     }
 }

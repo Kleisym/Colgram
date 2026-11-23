@@ -10,6 +10,8 @@
     private String warpUiFailure;
     private int callsRow = -1;
     private int callsDetailRow = -1;
+    private int browserRow = -1;
+    private int browserDetailRow = -1;
     private int networkModesRow = -1;
     private int colgramBackgroundProxyRow = -1;
     private int colgramDpiRow = -1;
@@ -49,18 +51,18 @@
                 updateRows(true);
             } else {
                 if (proxyPending != colgramLastProxyPending || !android.text.TextUtils.equals(proxyStatus, colgramLastProxyStatus))
-                    listAdapter.notifyItemChanged(useProxyRow);
+                    colgramRefreshBoundRow(useProxyRow);
                 if (warpDesired != colgramLastWarpDesired || !android.text.TextUtils.equals(warpStatus, colgramLastWarpStatus))
-                    listAdapter.notifyItemChanged(warpRow);
+                    colgramRefreshBoundRow(warpRow);
                 if (!android.text.TextUtils.equals(background, colgramLastBackgroundProxyStatus))
-                    listAdapter.notifyItemChanged(colgramBackgroundProxyRow);
+                    colgramRefreshBoundRow(colgramBackgroundProxyRow);
                 if (!android.text.TextUtils.equals(dpi, colgramLastDpiStatus))
-                    listAdapter.notifyItemChanged(colgramDpiRow);
+                    colgramRefreshBoundRow(colgramDpiRow);
                 if (subscriptionActive != colgramLastSubscriptionActive
                         || !android.text.TextUtils.equals(subscription, colgramLastSubscriptionStatus))
-                    listAdapter.notifyItemChanged(colgramSubscriptionToggleRow);
+                    colgramRefreshBoundRow(colgramSubscriptionToggleRow);
                 if (!android.text.TextUtils.equals(node, colgramLastSubscriptionNode))
-                    listAdapter.notifyItemChanged(colgramSubscriptionNodeRow);
+                    colgramRefreshBoundRow(colgramSubscriptionNodeRow);
             }
             colgramLastProxyStatus = proxyStatus;
             colgramLastWarpStatus = warpStatus;
@@ -81,13 +83,34 @@
         return active == null ? org.colgram.core.ColgramProxyManager.isProxyEnabled(getContext()) : !active.isLocalDpi();
     }
 
+    private void colgramRefreshBoundRow(int position) {
+        if (position < 0 || listAdapter == null) return;
+        if (listView != null) {
+            RecyclerView.ViewHolder holder = listView.findViewHolderForAdapterPosition(position);
+            if (holder != null) {
+                listAdapter.onBindViewHolder(holder, position);
+                holder.itemView.requestLayout();
+                return;
+            }
+        }
+        listAdapter.notifyItemChanged(position);
+    }
+
     private String colgramDpiStatus() {
         if (!org.colgram.core.ColgramDpiBypass.isBound()) return org.colgram.core.ColgramDpiBypass.upstreamStatus();
+        if (org.colgram.core.ColgramConfig.isWarpEnabled() && org.colgram.core.ColgramWarpTunnel.isConnected()) {
+            return ColgramSubscriptionControls.label("всегда включён · поверх WARP", "Always on · WARP active above it");
+        }
         org.colgram.core.ColgramProxyManager.ProxyItem active = org.colgram.core.ColgramProxyManager.getCurrentActiveProxy();
         if (active == null || !active.isLocalDpi()) return ColgramSubscriptionControls.label("всегда включён · поверх выбранный транспорт", "Always on · selected transport above it");
-        if (org.colgram.core.ColgramDpiBypass.bytesFromTarget() > 0 && ConnectionsManager.getInstance(currentAccount).getConnectionState()
-                == ConnectionsManager.ConnectionStateConnected)
-            return ColgramSubscriptionControls.label("подключён к Telegram", "Connected to Telegram");
+        if (org.colgram.core.ColgramDpiBypass.bytesFromTarget() > 0 && org.colgram.core.ColgramProxyManager.isTelegramConnected()) {
+            String engineTag = org.colgram.core.ColgramNativeDesync.isAvailable()
+                    ? (org.colgram.core.ColgramDpiBypass.isCellularNetwork() ? " · ByeDPI 4G" : " · ByeDPI")
+                    : "";
+            return org.colgram.core.ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
+                    ? ColgramSubscriptionControls.label("WSS-мост активен" + engineTag + " · подключён", "WSS bridge active" + engineTag + " · connected")
+                    : ColgramSubscriptionControls.label("подключён к Telegram" + engineTag, "Connected to Telegram" + engineTag);
+        }
         return org.colgram.core.ColgramDpiBypass.upstreamStatus();
     }
 
@@ -96,6 +119,14 @@
         AlertDialog.Builder details = new AlertDialog.Builder(getParentActivity(), getResourceProvider());
         details.setTitle(ColgramSubscriptionControls.label("Источники прокси", "Proxy Sources"));
         details.setMessage(org.colgram.core.ColgramProxyManager.getSourceDiagnostics());
+        details.setNeutralButton(ColgramSubscriptionControls.label("Найти ещё прокси", "Find more proxies"), (d, w) -> {
+            org.colgram.core.ColgramProxyManager.checkPoolNow();
+            if (getParentActivity() != null) {
+                android.widget.Toast.makeText(getParentActivity(),
+                        ColgramSubscriptionControls.label("Ищем и проверяем рабочие прокси...", "Scanning for working proxies..."),
+                        android.widget.Toast.LENGTH_SHORT).show();
+            }
+        });
         details.setPositiveButton(ColgramSubscriptionControls.label("Закрыть", "Close"), null);
         showDialog(details.create());
     }

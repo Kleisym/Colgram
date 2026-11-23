@@ -65,7 +65,7 @@ public final class ColgramCrashGuard {
         previousHandler = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
             try {
-                write(file, header("java") + describe(thread, throwable));
+                write(file, header("java") + ColgramSecurityPolicy.redactSensitiveLogs(describe(thread, throwable)));
             } catch (Throwable ignored) {
                 // A handler that throws while handling a crash replaces the crash with a different
                 // one, which is worse than losing the report.
@@ -140,6 +140,40 @@ public final class ColgramCrashGuard {
         return new File(app.getFilesDir(), FILE_NAME).getAbsolutePath();
     }
 
+    /** True once the uncaught handler is active in this process. */
+    public static boolean isInstalled() {
+        return installed;
+    }
+
+    /** Redacts any sensitive tokens/phones that may have been written by native signals or earlier logs. */
+    public static synchronized int redactExistingLog(Context context) {
+        if (context == null) return 0;
+        Context app = context.getApplicationContext();
+        if (app == null) app = context;
+        File file = new File(app.getFilesDir(), FILE_NAME);
+        if (!file.isFile() || file.length() == 0) return 0;
+        try {
+            byte[] data;
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file);
+                 java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream()) {
+                byte[] buf = new byte[4096];
+                int r;
+                while ((r = fis.read(buf)) > 0) bos.write(buf, 0, r);
+                data = bos.toByteArray();
+            }
+            String orig = new String(data, StandardCharsets.UTF_8);
+            String cleaned = ColgramSecurityPolicy.redactSensitiveLogs(orig);
+            if (!cleaned.equals(orig)) {
+                try (FileOutputStream fos = new FileOutputStream(file, false)) {
+                    fos.write(cleaned.getBytes(StandardCharsets.UTF_8));
+                    fos.flush();
+                }
+                return 1;
+            }
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
     /** Appends a line by hand, for the failures that are not crashes at all. */
     public static void note(String message) {
         Context ctx = ColgramPythonEngine.appContext();
@@ -147,6 +181,6 @@ public final class ColgramCrashGuard {
             return;
         }
         write(new File(ctx.getFilesDir(), FILE_NAME),
-                header("note") + (message == null ? "" : message) + "\n");
+                header("note") + ColgramSecurityPolicy.redactSensitiveLogs(message == null ? "" : message) + "\n");
     }
 }

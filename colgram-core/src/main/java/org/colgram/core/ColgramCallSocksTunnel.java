@@ -22,6 +22,7 @@ public final class ColgramCallSocksTunnel {
     private static final String SERVICE = "org.colgram.singbox.ColgramVpnService";
     private static final String SOCKS = "colgram-call-socks";
     private static final String DPI = "colgram-call-dpi";
+    private static final String SYSTEM_DPI = "colgram-system-dpi";
     private static final int SOCKET_TIMEOUT_MS = 2500;
 
     private ColgramCallSocksTunnel() { }
@@ -47,7 +48,7 @@ public final class ColgramCallSocksTunnel {
     public static long startLocalDpi(Context context) throws IOException {
         Context app = requireAvailable(context);
         long route = ColgramRouteEpoch.snapshot();
-        ColgramDpiBypass.CallListener local = new ColgramDpiBypass.CallListener();
+        ColgramDpiBypass.CallListener local = new ColgramDpiBypass.CallListener(false);
         try {
             return launchIfCurrent(route, app, DPI, local.config(), local::attach, local::close);
         } catch (IOException | RuntimeException failure) {
@@ -56,8 +57,51 @@ public final class ColgramCallSocksTunnel {
         }
     }
 
+    /**
+     * Whole-device Local DPI Bypass TUN: routes all phone apps (YouTube, Discord, browsers,
+     * Telegram, calls) through local TLS SNI-splitting + DoH + QUIC fallback with zero external server.
+     */
+    public static long startSystemDpi(Context context) throws IOException {
+        Context app = requireAvailable(context);
+        long route = ColgramRouteEpoch.snapshot();
+        ColgramDpiBypass.CallListener local = new ColgramDpiBypass.CallListener(true);
+        try {
+            return launchIfCurrent(route, app, SYSTEM_DPI, local.config(), local::attach, local::close);
+        } catch (IOException | RuntimeException failure) {
+            local.close();
+            throw failure;
+        }
+    }
+
+    public static String systemDpiStatus(Context context) {
+        if (context == null) return "unavailable";
+        try {
+            return (String) service(context).getMethod("status", String.class).invoke(null, SYSTEM_DPI);
+        } catch (ReflectiveOperationException | LinkageError unavailable) {
+            return "unavailable";
+        }
+    }
+
+    public static boolean isSystemDpiRunning(Context context) {
+        return "running".equals(systemDpiStatus(context));
+    }
+
+    public static void stopSystemDpi(Context context) {
+        if (context == null) return;
+        try {
+            service(context).getMethod("stopProfile", Context.class, String.class)
+                    .invoke(null, context.getApplicationContext(), SYSTEM_DPI);
+        } catch (ReflectiveOperationException | LinkageError unavailable) {
+            // Backend unavailable
+        }
+    }
+
     public static String status(Context context, boolean localDpi) {
-        return status(context, localDpi, -1L);
+        String st = status(context, localDpi, -1L);
+        if (localDpi && !"running".equals(st) && "running".equals(systemDpiStatus(context))) {
+            return "running";
+        }
+        return st;
     }
 
     public static String status(Context context, boolean localDpi, long generation) {

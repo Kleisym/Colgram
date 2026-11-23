@@ -94,7 +94,13 @@ public final class ColgramSubscriptionStore {
         }
         writeProfile(context, nodes.get(0));
         State state = stateOf(nodes, 0);
-        recordState(prefs(context).edit().putString(KEY_LINK, content), state).apply();
+        SharedPreferences.Editor ed = prefs(context).edit().putString(KEY_LINK, content);
+        if (link.trim().startsWith("https://") || link.trim().startsWith("http://")) {
+            ed.putString("source_url", link.trim());
+        } else {
+            ed.remove("source_url");
+        }
+        recordState(ed, state).apply();
         Log.i(TAG, "subscription stored with " + nodes.size() + " usable nodes");
         return state;
     }
@@ -164,6 +170,13 @@ public final class ColgramSubscriptionStore {
             }
             throw new IOException("слишком много перенаправлений");
         } catch (IOException failure) {
+            try {
+                ColgramHttp.Response resp = ColgramHttp.get(link);
+                if (resp != null && resp.code >= 200 && resp.code < 300
+                        && resp.body != null && !resp.body.trim().isEmpty()) {
+                    return resp.body;
+                }
+            } catch (Throwable ignored) {}
             // Exception messages from URL/TLS stacks can contain the full paid link.
             throw new IllegalArgumentException("сервер подписки недоступен или ответ не подходит");
         }

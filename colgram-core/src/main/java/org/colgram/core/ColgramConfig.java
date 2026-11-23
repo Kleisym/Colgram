@@ -42,6 +42,7 @@ public class ColgramConfig {
     private static final String KEY_DOH_ENABLED = "doh_resolver_enabled";
     private static final String KEY_PROXY_BROWSER_ENABLED = "proxy_browser_enabled";
     private static final String KEY_UPDATE_REPO = "github_update_repo";
+    private static final String KEY_AUTO_UPDATE_ENABLED = "auto_update_enabled";
 
     // Theme
     private static final String KEY_CYBER_THEME_ENABLED = "cyber_theme_enabled";
@@ -66,12 +67,25 @@ public class ColgramConfig {
     public static void init(Context context) {
         if (prefs == null && context != null) {
             prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            // Upgrade defaults once so anti-delete self-preserve & unlimited auto-compress storage are always ON by default.
+            if (!prefs.getBoolean("colgram_defaults_v3_migrated", false)) {
+                prefs.edit()
+                        .putBoolean(KEY_ANTI_DELETE_ENABLED, true)
+                        .putBoolean(KEY_ANTI_DELETE_SELF, true)
+                        .putBoolean(KEY_ANTI_DELETE_WIPE, false)
+                        .putBoolean(KEY_ANTI_DELETE_HIGHLIGHT, true)
+                        .putBoolean(KEY_UNLIMITED_MEMORY, true)
+                        .putBoolean("auto_compress_storage_enabled", true)
+                        .putBoolean("colgram_defaults_v3_migrated", true)
+                        .apply();
+            }
         }
         // The WARP row's gate asks whether the MASQUE client exists without loading it, and needs a
         // Context to answer from the package. ColgramConfig.init is the one initialiser every entry
         // point already calls, so it is where that Context is available.
         if (context != null) {
             ColgramMasqueNative.setProbeContext(context.getApplicationContext());
+            ColgramDesignConfig.init(context.getApplicationContext());
         }
     }
 
@@ -148,7 +162,7 @@ public class ColgramConfig {
      *       side tried to retract.
      */
     public static boolean isAntiDeleteWipeEnabled() {
-        return prefs == null || prefs.getBoolean(KEY_ANTI_DELETE_WIPE, true);
+        return prefs != null && prefs.getBoolean(KEY_ANTI_DELETE_WIPE, false);
     }
 
     public static void setAntiDeleteWipeEnabled(boolean enabled) {
@@ -277,6 +291,24 @@ public class ColgramConfig {
         return prefs != null ? prefs.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO) : DEFAULT_UPDATE_REPO;
     }
 
+    public static void setUpdateRepo(String repo) {
+        if (prefs == null) return;
+        String clean = repo != null ? repo.trim() : "";
+        if (clean.isEmpty()) {
+            prefs.edit().remove(KEY_UPDATE_REPO).apply();
+        } else {
+            prefs.edit().putString(KEY_UPDATE_REPO, clean).apply();
+        }
+    }
+
+    public static boolean isAutoUpdateEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_AUTO_UPDATE_ENABLED, true);
+    }
+
+    public static void setAutoUpdateEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_UPDATE_ENABLED, enabled).apply();
+    }
+
     /**
      * Whether to force Colgram's red/near-black palette over the user's own theme.
      *
@@ -368,13 +400,24 @@ public class ColgramConfig {
         }
     }
 
-    // --- Auto-reply ---
+    // --- Auto-reply (Business Responder) ---
     private static final String KEY_AUTO_REPLY_ENABLED = "auto_reply_enabled";
     private static final String KEY_AUTO_REPLY_TEXT = "auto_reply_text";
     private static final String KEY_AUTO_REPLY_GROUPS = "auto_reply_groups";
     private static final String KEY_AUTO_REPLY_COOLDOWN = "auto_reply_cooldown_sec";
+    private static final String KEY_AUTO_REPLY_SCHEDULE = "auto_reply_schedule_enabled";
+    private static final String KEY_AUTO_REPLY_ONLY_AWAY = "auto_reply_only_when_away";
+    private static final String KEY_AUTO_REPLY_START_MIN = "auto_reply_start_min";
+    private static final String KEY_AUTO_REPLY_END_MIN = "auto_reply_end_min";
+    private static final String KEY_AUTO_REPLY_AWAY_TEXT = "auto_reply_away_text";
+    private static final String KEY_AUTO_REPLY_AUDIENCE = "auto_reply_audience";
+    private static final String KEY_AUTO_REPLY_BOTS = "auto_reply_to_bots";
+    private static final String KEY_AUTO_REPLY_BLACKLIST = "auto_reply_blacklist_csv";
+    private static final String KEY_LIVE_WALLPAPER_STYLE = "live_wallpaper_style";
     public static final String DEFAULT_AUTO_REPLY_TEXT =
-            "Я сейчас не у экрана, отвечу позже. (автоответ Colgram)";
+            "Привет, {first_name}! Сейчас занят, отвечу позже. ({time})";
+    public static final String DEFAULT_AUTO_REPLY_AWAY_TEXT =
+            "Сейчас не в сети (нерабочее время), {first_name}. Отвечу утром!";
 
     public static boolean isAutoReplyEnabled() {
         return prefs != null && prefs.getBoolean(KEY_AUTO_REPLY_ENABLED, false);
@@ -409,6 +452,99 @@ public class ColgramConfig {
 
     public static void setAutoReplyCooldownSec(int seconds) {
         if (prefs != null) prefs.edit().putInt(KEY_AUTO_REPLY_COOLDOWN, seconds).apply();
+    }
+
+    public static boolean isAutoReplyScheduleEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_AUTO_REPLY_SCHEDULE, false);
+    }
+
+    public static void setAutoReplyScheduleEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_REPLY_SCHEDULE, enabled).apply();
+    }
+
+    public static boolean isAutoReplyOnlyWhenAway() {
+        return prefs != null && prefs.getBoolean(KEY_AUTO_REPLY_ONLY_AWAY, false);
+    }
+
+    public static void setAutoReplyOnlyWhenAway(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_REPLY_ONLY_AWAY, enabled).apply();
+    }
+
+    public static int getAutoReplyStartMin() {
+        return prefs != null ? prefs.getInt(KEY_AUTO_REPLY_START_MIN, 22 * 60) : 22 * 60;
+    }
+
+    public static void setAutoReplyStartMin(int minutes) {
+        if (prefs != null) prefs.edit().putInt(KEY_AUTO_REPLY_START_MIN, minutes).apply();
+    }
+
+    public static int getAutoReplyEndMin() {
+        return prefs != null ? prefs.getInt(KEY_AUTO_REPLY_END_MIN, 9 * 60) : 9 * 60;
+    }
+
+    public static void setAutoReplyEndMin(int minutes) {
+        if (prefs != null) prefs.edit().putInt(KEY_AUTO_REPLY_END_MIN, minutes).apply();
+    }
+
+    public static String getAutoReplyAwayText() {
+        return prefs != null ? prefs.getString(KEY_AUTO_REPLY_AWAY_TEXT, DEFAULT_AUTO_REPLY_AWAY_TEXT)
+                : DEFAULT_AUTO_REPLY_AWAY_TEXT;
+    }
+
+    public static void setAutoReplyAwayText(String text) {
+        if (prefs != null) prefs.edit().putString(KEY_AUTO_REPLY_AWAY_TEXT, text).apply();
+    }
+
+    public static int getAutoReplyAudience() {
+        return prefs != null ? prefs.getInt(KEY_AUTO_REPLY_AUDIENCE, ColgramAutoReplyPolicy.AUDIENCE_ALL)
+                : ColgramAutoReplyPolicy.AUDIENCE_ALL;
+    }
+
+    public static void setAutoReplyAudience(int mode) {
+        if (prefs != null) prefs.edit().putInt(KEY_AUTO_REPLY_AUDIENCE, mode).apply();
+    }
+
+    public static boolean isAutoReplyToBots() {
+        return prefs != null && prefs.getBoolean(KEY_AUTO_REPLY_BOTS, false);
+    }
+
+    public static void setAutoReplyToBots(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_REPLY_BOTS, enabled).apply();
+    }
+
+    public static String getAutoReplyBlacklist() {
+        return prefs != null ? prefs.getString(KEY_AUTO_REPLY_BLACKLIST, "") : "";
+    }
+
+    public static void setAutoReplyBlacklist(String csv) {
+        if (prefs != null) prefs.edit().putString(KEY_AUTO_REPLY_BLACKLIST, csv == null ? "" : csv).apply();
+    }
+
+    private static final String KEY_LIVE_WALLPAPER_WAVES_MIGRATED = "live_wallpaper_waves_v2";
+
+    public static int getLiveWallpaperStyle() {
+        if (prefs == null) return ColgramLiveWallpaper.STYLE_AURORA;
+        if (!prefs.getBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, false)) {
+            int cur = prefs.getInt(KEY_LIVE_WALLPAPER_STYLE, ColgramLiveWallpaper.STYLE_AURORA);
+            if (cur == ColgramLiveWallpaper.STYLE_OFF) {
+                cur = ColgramLiveWallpaper.STYLE_AURORA;
+            }
+            prefs.edit()
+                    .putInt(KEY_LIVE_WALLPAPER_STYLE, cur)
+                    .putBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, true)
+                    .apply();
+            return cur;
+        }
+        return prefs.getInt(KEY_LIVE_WALLPAPER_STYLE, ColgramLiveWallpaper.STYLE_AURORA);
+    }
+
+    public static void setLiveWallpaperStyle(int style) {
+        if (prefs != null) {
+            prefs.edit()
+                    .putInt(KEY_LIVE_WALLPAPER_STYLE, Math.max(0, Math.min(4, style)))
+                    .putBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, true)
+                    .apply();
+        }
     }
 
     // --- Keyword alerts (built-in, was plugins/keyword_alerts.py) ---
@@ -486,8 +622,15 @@ public class ColgramConfig {
     // --- Unlimited memory ---
     private static final String KEY_UNLIMITED_MEMORY = "unlimited_memory_enabled";
 
-    // --- Built-in spam guard ---
+    // --- Built-in spam guard & Colemailer suite ---
     private static final String KEY_SPAM_GUARD = "spam_guard_enabled";
+    private static final String KEY_COLEMAILER_NOTIF_FILTER = "colemailer_notif_filter_enabled";
+    private static final String KEY_COLEMAILER_SAVE_LEADS = "colemailer_save_leads_enabled";
+    private static final String KEY_COLEMAILER_BROADCASTER = "colemailer_broadcaster_enabled";
+    private static final String KEY_COLEMAILER_AUTOSUB = "colemailer_autosub_enabled";
+    private static final String KEY_COLEMAILER_MUTE_MODE = "colemailer_mute_mode";
+    private static final String KEY_COLEMAILER_BOT_TOKEN = "colemailer_bot_token";
+    private static final String KEY_COLEMAILER_STATE = "colemailer_state_v1";
 
     // --- Fetch relay ---
     private static final String KEY_RELAY_URL = "relay_url";
@@ -497,26 +640,168 @@ public class ColgramConfig {
     private static final String KEY_KEYWORD_ALERTS_LIST = "keyword_alerts_list";
     private static final String KEY_MESSAGE_LOGGER = "message_logger_enabled";
 
-    // --- Auto proxy ---
+    // --- Auto proxy & strict proxy security ---
     private static final String KEY_AUTO_PROXY = "auto_proxy_enabled";
     private static final String KEY_IPV6_BYPASS = "ipv6_bypass_enabled";
     private static final String KEY_DC_REMAP = "dc_remap_enabled";
     private static final String KEY_TLS_MIMIC = "tls_mimic_enabled";
+    private static final String KEY_STRICT_PROXY_SECURITY = "strict_proxy_security_enabled";
+    private static final String KEY_BROWSER_ROUTE = "browser_route_mode";
+    private static final String KEY_BROWSER_ROUTE_SOCKS = "browser_route_socks";
+
+    // --- Max anonymity & AyuGram+ privacy controls ---
+    private static final String KEY_MAX_ANONYMITY = "max_anonymity_enabled";
+    private static final String KEY_SAVE_ONETIME_MEDIA = "save_onetime_media_enabled";
+    private static final String KEY_HIDE_SCREENSHOT_NOTIFY = "hide_screenshot_notify_enabled";
+    private static final String KEY_STEALTH_STORIES = "stealth_stories_enabled";
+    private static final String KEY_FORWARD_NO_QUOTE = "forward_no_quote_enabled";
+    private static final String KEY_HIDE_PHONE_LOCAL = "hide_phone_local_enabled";
+    private static final String KEY_ANTI_DELETE_SELF = "anti_delete_self_enabled";
+    private static final String KEY_CONFIRM_CALLS = "confirm_calls_enabled";
+    private static final String KEY_CONFIRM_STICKERS = "confirm_stickers_enabled";
+    private static final String KEY_CONFIRM_LINKS = "confirm_links_enabled";
 
     /**
-     * Whether Colgram may switch a proxy on by itself when Telegram is unreachable.
+     * Whether Colgram may switch to a third-party public proxy when direct local bypass is cut.
      *
-     * On by default: a network that refuses Telegram's own addresses otherwise leaves the app
-     * on "Соединение..." forever, which is the exact failure the bypass exists to remove. The
-     * rotator stays conservative (Telegram's own verdicts, budgets, holds), so an automatic
-     * route never overrides one chosen by hand.
+     * Off by default: the local DPI bypass stays strictly on the user's own internet without
+     * routing traffic through third-party proxies unless explicitly opted into.
      */
     public static boolean isAutoProxyEnabled() {
-        return prefs == null || prefs.getBoolean(KEY_AUTO_PROXY, true);
+        return prefs != null && prefs.getBoolean(KEY_AUTO_PROXY, false);
     }
 
     public static void setAutoProxyEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_AUTO_PROXY, enabled).apply();
+    }
+
+    /** Enforce DoH-first resolution, remote SOCKS5 DNS, no plaintext HTTP over third-party proxies, and no WebRTC P2P IP leaks. */
+    public static boolean isStrictProxySecurityEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_STRICT_PROXY_SECURITY, true);
+    }
+
+    public static void setStrictProxySecurityEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_STRICT_PROXY_SECURITY, enabled).apply();
+    }
+
+    public static String getBrowserRouteMode() {
+        return prefs != null ? prefs.getString(KEY_BROWSER_ROUTE, "LOCAL_DPI") : "LOCAL_DPI";
+    }
+
+    public static void setBrowserRouteMode(String mode) {
+        if (prefs != null) {
+            prefs.edit().putString(KEY_BROWSER_ROUTE, mode == null || mode.trim().isEmpty() ? "LOCAL_DPI" : mode.trim()).apply();
+        }
+    }
+
+    public static String getBrowserRouteSocks() {
+        return prefs != null ? prefs.getString(KEY_BROWSER_ROUTE_SOCKS, "") : "";
+    }
+
+    public static void setBrowserRouteSocks(String socksIdentity) {
+        if (prefs != null) {
+            prefs.edit().putString(KEY_BROWSER_ROUTE_SOCKS, socksIdentity == null ? "" : socksIdentity.trim()).apply();
+        }
+    }
+
+    public static boolean isMaxAnonymityEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_MAX_ANONYMITY, false);
+    }
+
+    /** Apply or clear the one-tap maximum anonymity preset across ghost mode, stealth, cloaking, and proxy hardening. */
+    public static void setMaxAnonymityEnabled(boolean enabled) {
+        if (prefs == null) return;
+        SharedPreferences.Editor ed = prefs.edit().putBoolean(KEY_MAX_ANONYMITY, enabled);
+        if (enabled) {
+            ed.putBoolean(KEY_GHOST_READ, true)
+                    .putBoolean(KEY_GHOST_TYPING, true)
+                    .putBoolean(KEY_GHOST_ONLINE, true)
+                    .putBoolean(KEY_STEALTH_STORIES, true)
+                    .putBoolean(KEY_BYPASS_FLAG_SECURE, true)
+                    .putBoolean(KEY_HIDE_SCREENSHOT_NOTIFY, true)
+                    .putBoolean(KEY_CLOAK_ENABLED, true)
+                    .putBoolean(KEY_AUTO_HIDE_PHONE, true)
+                    .putBoolean(KEY_HIDE_PHONE_LOCAL, true)
+                    .putBoolean(KEY_STRICT_PROXY_SECURITY, true)
+                    .putBoolean(KEY_DOH_ENABLED, true)
+                    .putBoolean(KEY_AUTO_PROXY, false)
+                    .putBoolean(KEY_FORWARD_NO_QUOTE, true)
+                    .putBoolean(KEY_CONFIRM_CALLS, true)
+                    .putBoolean(KEY_CONFIRM_LINKS, true);
+        }
+        ed.apply();
+    }
+
+    public static boolean isSaveOneTimeMediaEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_SAVE_ONETIME_MEDIA, true);
+    }
+
+    public static void setSaveOneTimeMediaEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_SAVE_ONETIME_MEDIA, enabled).apply();
+    }
+
+    public static boolean isHideScreenshotNotifyEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_HIDE_SCREENSHOT_NOTIFY, true);
+    }
+
+    public static void setHideScreenshotNotifyEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_HIDE_SCREENSHOT_NOTIFY, enabled).apply();
+    }
+
+    public static boolean isStealthStoriesEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_STEALTH_STORIES, true);
+    }
+
+    public static void setStealthStoriesEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_STEALTH_STORIES, enabled).apply();
+    }
+
+    public static boolean isForwardNoQuoteEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_FORWARD_NO_QUOTE, false);
+    }
+
+    public static void setForwardNoQuoteEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_FORWARD_NO_QUOTE, enabled).apply();
+    }
+
+    public static boolean isHidePhoneLocalEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_HIDE_PHONE_LOCAL, false);
+    }
+
+    public static void setHidePhoneLocalEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_HIDE_PHONE_LOCAL, enabled).apply();
+    }
+
+    public static boolean isAntiDeleteSelfEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_ANTI_DELETE_SELF, true);
+    }
+
+    public static void setAntiDeleteSelfEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_ANTI_DELETE_SELF, enabled).apply();
+    }
+
+    public static boolean isConfirmCallsEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_CONFIRM_CALLS, false);
+    }
+
+    public static void setConfirmCallsEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_CONFIRM_CALLS, enabled).apply();
+    }
+
+    public static boolean isConfirmStickersEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_CONFIRM_STICKERS, false);
+    }
+
+    public static void setConfirmStickersEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_CONFIRM_STICKERS, enabled).apply();
+    }
+
+    public static boolean isConfirmLinksEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_CONFIRM_LINKS, false);
+    }
+
+    public static void setConfirmLinksEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_CONFIRM_LINKS, enabled).apply();
     }
 
     /**
@@ -599,6 +884,71 @@ public class ColgramConfig {
         if (prefs != null) prefs.edit().putBoolean(KEY_SPAM_GUARD, enabled).apply();
     }
 
+    public static boolean isNotificationAdFilterEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_COLEMAILER_NOTIF_FILTER, false);
+    }
+
+    public static void setNotificationAdFilterEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_COLEMAILER_NOTIF_FILTER, enabled).apply();
+    }
+
+    public static boolean isSaveLeadsEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_COLEMAILER_SAVE_LEADS, true);
+    }
+
+    public static void setSaveLeadsEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_COLEMAILER_SAVE_LEADS, enabled).apply();
+    }
+
+    public static boolean isBroadcasterEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_COLEMAILER_BROADCASTER, false);
+    }
+
+    public static void setBroadcasterEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_COLEMAILER_BROADCASTER, enabled).apply();
+    }
+
+    public static boolean isAutoSubEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_COLEMAILER_AUTOSUB, false);
+    }
+
+    public static void setAutoSubEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_COLEMAILER_AUTOSUB, enabled).apply();
+    }
+
+    public static String getDefaultMuteMode() {
+        return prefs != null ? prefs.getString(KEY_COLEMAILER_MUTE_MODE, "silent") : "silent";
+    }
+
+    public static void setDefaultMuteMode(String mode) {
+        if (prefs == null) return;
+        String clean = mode == null ? "silent" : mode.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!clean.equals("silent") && !clean.equals("delete") && !clean.equals("warn") && !clean.equals("ban")) {
+            clean = "silent";
+        }
+        prefs.edit().putString(KEY_COLEMAILER_MUTE_MODE, clean).apply();
+    }
+
+    public static String getHelperBotToken() {
+        return prefs != null ? prefs.getString(KEY_COLEMAILER_BOT_TOKEN, "") : "";
+    }
+
+    public static void setHelperBotToken(String token) {
+        if (prefs != null) {
+            prefs.edit().putString(KEY_COLEMAILER_BOT_TOKEN, token == null ? "" : token.trim()).apply();
+        }
+    }
+
+    public static String getColemailerState() {
+        return prefs != null ? prefs.getString(KEY_COLEMAILER_STATE, "") : "";
+    }
+
+    public static void setColemailerState(String serialized) {
+        if (prefs != null) {
+            prefs.edit().putString(KEY_COLEMAILER_STATE, serialized == null ? "" : serialized).apply();
+        }
+    }
+
     /**
      * "Unlimited memory" means the media cache is never auto-evicted: Telegram's own
      * AutoDeleteMediaTask reads the cache_limit preference and defaults it to 300 MB, which is
@@ -611,10 +961,254 @@ public class ColgramConfig {
     }
 
     public static boolean isUnlimitedMemoryEnabled() {
-        return prefs != null && prefs.getBoolean(KEY_UNLIMITED_MEMORY, false);
+        return prefs == null || prefs.getBoolean(KEY_UNLIMITED_MEMORY, true);
     }
 
     public static void setUnlimitedMemoryEnabled(boolean enabled) {
         if (prefs != null) prefs.edit().putBoolean(KEY_UNLIMITED_MEMORY, enabled).apply();
+    }
+
+    public static boolean isAutoCompressStorageEnabled() {
+        return prefs == null || prefs.getBoolean("auto_compress_storage_enabled", true);
+    }
+
+    public static void setAutoCompressStorageEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean("auto_compress_storage_enabled", enabled).apply();
+    }
+
+    /** Per-chat (dialogId != 0) or global (dialogId == 0) local Video Wallpaper path (.mp4/.webm/.gif). */
+    public static String getChatVideoWallpaper(long dialogId) {
+        if (prefs == null) return "";
+        String specific = dialogId != 0L ? prefs.getString("colgram_video_wp_" + dialogId, "") : "";
+        if (specific != null && !specific.isEmpty()) return specific;
+        return prefs.getString("colgram_video_wp_0", "");
+    }
+
+    public static String getExactChatVideoWallpaper(long dialogId) {
+        return prefs != null ? prefs.getString("colgram_video_wp_" + dialogId, "") : "";
+    }
+
+    public static void setChatVideoWallpaper(long dialogId, String path) {
+        if (prefs != null) {
+            if (path == null || path.trim().isEmpty()) {
+                prefs.edit().remove("colgram_video_wp_" + dialogId).apply();
+            } else {
+                prefs.edit().putString("colgram_video_wp_" + dialogId, path.trim()).apply();
+            }
+        }
+    }
+
+    /** Per-chat or global (dialogId == 0) local gallery image wallpaper path (persists across restarts on all accounts). */
+    public static String getChatImageWallpaper(long dialogId) {
+        if (prefs == null) return "";
+        if (dialogId != 0L) {
+            String exact = prefs.getString("colgram_img_wp_" + dialogId, "");
+            if (exact != null && !exact.isEmpty()) return exact;
+        }
+        return prefs.getString("colgram_img_wp_0", "");
+    }
+
+    public static String getExactChatImageWallpaper(long dialogId) {
+        return prefs != null ? prefs.getString("colgram_img_wp_" + dialogId, "") : "";
+    }
+
+    public static void setChatImageWallpaper(long dialogId, String path) {
+        if (prefs != null) {
+            if (path == null || path.trim().isEmpty()) {
+                prefs.edit().remove("colgram_img_wp_" + dialogId).apply();
+            } else {
+                prefs.edit().putString("colgram_img_wp_" + dialogId, path.trim()).apply();
+            }
+        }
+    }
+
+    // --- Always-On Background & OTA Throttle ---
+    private static final String KEY_ALWAYS_BACKGROUND = "always_background_enabled";
+    private static final String KEY_LAST_UPDATE_CHECK_MS = "last_auto_update_check_ms";
+    private static final String KEY_SHOW_MESSAGE_SECONDS = "show_message_seconds";
+    private static final String KEY_SHOW_MESSAGE_ID = "show_message_id_menu";
+
+    public static boolean isAlwaysBackgroundEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_ALWAYS_BACKGROUND, true);
+    }
+
+    public static void setAlwaysBackgroundEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_ALWAYS_BACKGROUND, enabled).apply();
+    }
+
+    public static long getLastAutoUpdateCheckMs() {
+        return prefs != null ? prefs.getLong(KEY_LAST_UPDATE_CHECK_MS, 0L) : 0L;
+    }
+
+    public static void setLastAutoUpdateCheckMs(long tsMs) {
+        if (prefs != null) prefs.edit().putLong(KEY_LAST_UPDATE_CHECK_MS, tsMs).apply();
+    }
+
+    public static boolean isShowMessageSecondsEnabled() {
+        return prefs != null && prefs.getBoolean(KEY_SHOW_MESSAGE_SECONDS, false);
+    }
+
+    public static void setShowMessageSecondsEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_SHOW_MESSAGE_SECONDS, enabled).apply();
+    }
+
+    public static boolean isShowMessageIdEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_SHOW_MESSAGE_ID, true);
+    }
+
+    public static void setShowMessageIdEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_SHOW_MESSAGE_ID, enabled).apply();
+    }
+
+    // --- Built-in Defender Bot ("Бот-защитник Colgram") & Update Helpers ---
+    private static final String KEY_DEFENDER_ENABLED = "defender_enabled";
+    private static final String KEY_DEFENDER_AUTO_CLOSE = "defender_auto_close";
+    private static final String KEY_DEFENDER_BLOCK_VOIP_P2P = "defender_block_voip_p2p";
+    private static final String KEY_DEFENDER_BLOCK_BOT_LOCATION = "defender_block_bot_location";
+    private static final String KEY_DEFENDER_STRIP_TRACKERS = "defender_strip_trackers";
+    private static final String KEY_DEFENDER_WEBVIEW_HARDENING = "defender_webview_hardening";
+    private static final String KEY_DEFENDER_LAST_SCAN_MS = "defender_last_scan_ms";
+    private static final String KEY_DEFENDER_FIXED_TOTAL = "defender_fixed_total";
+    private static final String KEY_DEFENDER_TRACKERS_STRIPPED = "defender_trackers_stripped";
+    private static final String KEY_DEFENDER_P2P_BLOCKED = "defender_p2p_blocked";
+
+    public static boolean isDefenderEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_DEFENDER_ENABLED, true);
+    }
+
+    public static void setDefenderEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DEFENDER_ENABLED, enabled).apply();
+    }
+
+    public static boolean isDefenderAutoCloseEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_DEFENDER_AUTO_CLOSE, true);
+    }
+
+    public static void setDefenderAutoCloseEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DEFENDER_AUTO_CLOSE, enabled).apply();
+    }
+
+    public static boolean isDefenderBlockVoipP2pEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_DEFENDER_BLOCK_VOIP_P2P, true);
+    }
+
+    public static void setDefenderBlockVoipP2pEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DEFENDER_BLOCK_VOIP_P2P, enabled).apply();
+    }
+
+    public static boolean isDefenderBlockBotLocationEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_DEFENDER_BLOCK_BOT_LOCATION, true);
+    }
+
+    public static void setDefenderBlockBotLocationEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DEFENDER_BLOCK_BOT_LOCATION, enabled).apply();
+    }
+
+    public static boolean isDefenderStripTrackersEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_DEFENDER_STRIP_TRACKERS, true);
+    }
+
+    public static void setDefenderStripTrackersEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DEFENDER_STRIP_TRACKERS, enabled).apply();
+    }
+
+    public static boolean isDefenderWebViewHardeningEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_DEFENDER_WEBVIEW_HARDENING, true);
+    }
+
+    public static void setDefenderWebViewHardeningEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_DEFENDER_WEBVIEW_HARDENING, enabled).apply();
+    }
+
+    public static long getDefenderLastScanMs() {
+        return prefs != null ? prefs.getLong(KEY_DEFENDER_LAST_SCAN_MS, 0L) : 0L;
+    }
+
+    public static void setDefenderLastScanMs(long tsMs) {
+        if (prefs != null) prefs.edit().putLong(KEY_DEFENDER_LAST_SCAN_MS, tsMs).apply();
+    }
+
+    public static int getDefenderFixedTotal() {
+        return prefs != null ? prefs.getInt(KEY_DEFENDER_FIXED_TOTAL, 0) : 0;
+    }
+
+    public static void addDefenderFixedCount(int delta) {
+        if (prefs != null && delta > 0) {
+            prefs.edit().putInt(KEY_DEFENDER_FIXED_TOTAL, getDefenderFixedTotal() + delta).apply();
+        }
+    }
+
+    public static int getDefenderTrackersStripped() {
+        return prefs != null ? prefs.getInt(KEY_DEFENDER_TRACKERS_STRIPPED, 0) : 0;
+    }
+
+    public static void addDefenderTrackersStripped(int delta) {
+        if (prefs != null && delta > 0) {
+            prefs.edit().putInt(KEY_DEFENDER_TRACKERS_STRIPPED, getDefenderTrackersStripped() + delta).apply();
+        }
+    }
+
+    public static int getDefenderP2pBlocked() {
+        return prefs != null ? prefs.getInt(KEY_DEFENDER_P2P_BLOCKED, 0) : 0;
+    }
+
+    public static void incrementDefenderP2pBlocked() {
+        if (prefs != null) {
+            prefs.edit().putInt(KEY_DEFENDER_P2P_BLOCKED, getDefenderP2pBlocked() + 1).apply();
+        }
+    }
+
+    // --- Quick Access Panel & 1-Tap Ghost Mode ---
+    private static final String KEY_QUICK_BAR_ENABLED = "quick_bar_enabled";
+    private static final String KEY_QUICK_BAR_ITEMS = "quick_bar_items";
+    public static final String DEFAULT_QUICK_BAR_ITEMS = "ghost,proxy,koliti,saved,theme";
+
+    public static boolean isQuickBarEnabled() {
+        return prefs == null || prefs.getBoolean(KEY_QUICK_BAR_ENABLED, true);
+    }
+
+    public static void setQuickBarEnabled(boolean enabled) {
+        if (prefs != null) prefs.edit().putBoolean(KEY_QUICK_BAR_ENABLED, enabled).apply();
+    }
+
+    public static java.util.List<String> getQuickBarItems() {
+        String raw = prefs != null ? prefs.getString(KEY_QUICK_BAR_ITEMS, DEFAULT_QUICK_BAR_ITEMS) : DEFAULT_QUICK_BAR_ITEMS;
+        java.util.ArrayList<String> list = new java.util.ArrayList<>();
+        if (raw != null && !raw.trim().isEmpty()) {
+            for (String part : raw.split(",")) {
+                String clean = part.trim();
+                if (!clean.isEmpty() && !list.contains(clean)) {
+                    list.add(clean);
+                }
+            }
+        }
+        return list;
+    }
+
+    public static void setQuickBarItems(java.util.List<String> items) {
+        if (prefs == null) return;
+        StringBuilder sb = new StringBuilder();
+        if (items != null) {
+            for (String item : items) {
+                if (item == null || item.trim().isEmpty()) continue;
+                if (sb.length() > 0) sb.append(',');
+                sb.append(item.trim());
+            }
+        }
+        prefs.edit().putString(KEY_QUICK_BAR_ITEMS, sb.toString()).apply();
+    }
+
+    public static boolean isQuickGhostActive() {
+        return isGhostOnlineEnabled() && isGhostReadEnabled();
+    }
+
+    public static void setQuickGhostMode(boolean enabled) {
+        if (prefs == null) return;
+        prefs.edit()
+                .putBoolean(KEY_GHOST_READ, enabled)
+                .putBoolean(KEY_GHOST_ONLINE, enabled)
+                .putBoolean(KEY_GHOST_TYPING, enabled)
+                .putBoolean(KEY_STEALTH_STORIES, enabled)
+                .apply();
     }
 }

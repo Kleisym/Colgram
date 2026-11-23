@@ -49,6 +49,8 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     private long generation = -1L;
     private volatile boolean tunEstablished;
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final java.util.concurrent.ExecutorService vpnExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
 
     public static synchronized String status(String profilePath) {
         return profilePath != null && profilePath.equals(controlProfile) ? controlState : "stopped";
@@ -64,7 +66,8 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
      */
     public static synchronized long startAppProfile(Context context, String profileId, String json,
             java.util.function.Consumer<VpnService> attach, Runnable close) {
-        if (!"colgram-call-socks".equals(profileId) && !"colgram-call-dpi".equals(profileId)) {
+        if (!"colgram-call-socks".equals(profileId) && !"colgram-call-dpi".equals(profileId)
+                && !"colgram-system-dpi".equals(profileId)) {
             throw new IllegalArgumentException("Unknown app-only VPN profile");
         }
         if (json == null || json.isEmpty()) throw new IllegalArgumentException("Missing VPN profile");
@@ -202,7 +205,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             appProfile = pendingAppProfile;
             pendingAppProfile = null;
         }
-        startProfile(startId);
+        vpnExecutor.execute(() -> startProfile(startId));
         // Only an explicit current profile request starts this service; never resurrect an
         // older route after process death or after switching back to Direct.
         return START_NOT_STICKY;
@@ -446,11 +449,16 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     @Override
     public ParcelFileDescriptor open(TunOptions options) {
         if (options == null || !ownsControl()) return null;
-        final boolean appOnly = appProfile != null;
+        final boolean systemDpi = "colgram-system-dpi".equals(profilePath);
+        final boolean appOnly = appProfile != null && !systemDpi;
         Builder builder = new Builder();
-        builder.setSession(appOnly ? "Colgram · звонки" : "Colgram");
-        builder.setMtu(options.getMTU() > 0 ? options.getMTU() : 9000);
+        builder.setSession(systemDpi ? "Colgram · Локальный обход" : (appOnly ? "Colgram · звонки" : "Colgram"));
+        int mtu = options.getMTU() > 0 ? options.getMTU() : (systemDpi ? 1280 : 9000);
+        builder.setMtu(mtu);
         builder.setBlocking(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setMetered(false);
+        }
 
         for (RoutePrefix prefix : drain(options.getInet4Address())) {
             if (prefix == null || prefix.address() == null || prefix.prefix() < 0) continue;
@@ -646,7 +654,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
         @Override
         public void serviceReload() {
-            main.post(() -> {
+            vpnExecutor.execute(() -> {
                 if (server == null || !ownsControl()) return;
                 publishState("starting");
                 startProfile(-1);

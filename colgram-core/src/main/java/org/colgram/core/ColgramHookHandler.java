@@ -23,8 +23,16 @@ public class ColgramHookHandler {
             appContext = context.getApplicationContext();
             ColgramOptimizer.optimizeStartup(appContext);
             ColgramConfig.init(appContext);
+            try {
+                java.io.File cacheDir = appContext.getCacheDir();
+                if (cacheDir != null) {
+                    ColgramNativeDesync.setTempDir(cacheDir.getAbsolutePath());
+                }
+                ColgramNativeDesync.runSelfTest();
+            } catch (Throwable ignored) {}
             ColgramUnlimitedMemory.restore(appContext);
             ColgramStorageSandbox.init(appContext);
+            ColgramStorageIndex.init(appContext.getFilesDir());
             ColgramDatabase.getInstance(appContext);
             // Registers the context only. The CPython runtime itself is started
             // lazily by ColgramPythonEngine.ensureInitialized() on first real use:
@@ -41,6 +49,8 @@ public class ColgramHookHandler {
             // so this method no longer calls ColgramDpiBypass.start() directly.
             ColgramProxyManager.activateBuiltinProxy(appContext);
             ColgramProxyDoctor.init(appContext);
+            ColgramSecurityDefender.runStartupAutoHeal(appContext);
+            invokeBridgeStartScheduler();
             // WARP that was left on: re-establish it on every start (consent is already
             // granted system-wide after the first dialog; prepare() returns null then).
             if (ColgramConfig.isWarpEnabled()) {
@@ -68,12 +78,65 @@ public class ColgramHookHandler {
      * @return true if the message was handled as a plugin command and should NOT be sent.
      */
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text) {
+        if (invokeBridgeChatCommand(dialogId, replyToMsgId, text, 0L)) {
+            return true;
+        }
         return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text);
     }
 
     /** Same hook with the replied-to message's author, so reply-targeted commands work. */
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text, long replySenderId) {
+        if (invokeBridgeChatCommand(dialogId, replyToMsgId, text, replySenderId)) {
+            return true;
+        }
         return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text, replySenderId);
+    }
+
+    /** Routes fresh incoming MTProto messages into native Colemailer counters, mute rules, leads, and Auto-Sub. */
+    public static void notifyColemailerIncoming(int account, Object tlMessage) {
+        if (tlMessage == null) return;
+        try {
+            Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
+            Class<?> msgCls = Class.forName("org.telegram.tgnet.TLRPC$Message");
+            bridge.getMethod("onIncomingMessage", int.class, msgCls).invoke(null, account, tlMessage);
+        } catch (Throwable ignored) {}
+    }
+
+    private static void invokeBridgeStartScheduler() {
+        try {
+            Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
+            bridge.getMethod("startScheduler").invoke(null);
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean invokeBridgeChatCommand(long dialogId, int replyToMsgId, String text, long replySenderId) {
+        if (text == null) return false;
+        String trimmed = text.trim();
+        String lower = trimmed.toLowerCase(java.util.Locale.ROOT);
+        if (lower.equals(".defender") || lower.equals(".защита") || lower.equals(".audit")
+                || lower.equals("/defender") || lower.equals("/audit") || lower.equals(".clean")) {
+            final Context ctx = appContext;
+            hookIoExecutor.execute(() -> {
+                String report = ColgramSecurityDefender.handleCommand(ctx, trimmed);
+                if (ctx != null) {
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                        try {
+                            android.widget.Toast.makeText(ctx, report, android.widget.Toast.LENGTH_LONG).show();
+                        } catch (Throwable ignored) {}
+                    });
+                }
+            });
+            return true;
+        }
+        if (!trimmed.startsWith(".")) return false;
+        try {
+            Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
+            Object res = bridge.getMethod("handleChatCommand", long.class, int.class, String.class, long.class)
+                    .invoke(null, dialogId, replyToMsgId, text, replySenderId);
+            return Boolean.TRUE.equals(res);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /**
@@ -81,14 +144,20 @@ public class ColgramHookHandler {
      * in-process and the caller only has to act on it.
      */
     public static int colgramSpamVerdict(long dialogId, long senderId, String text, boolean isGroup) {
+        return colgramSpamVerdict(0, dialogId, senderId, text, isGroup);
+    }
+
+    public static int colgramSpamVerdict(int account, long dialogId, long senderId, String text, boolean isGroup) {
         try {
+            if (ColgramColemailerEngine.getInstance().isWhitelisted(senderId)) {
+                return ColgramSpamGuard.VERDICT_OK;
+            }
             boolean isContact = false;
             try {
-                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, 0);
-                java.util.HashMap<?, ?> contacts =
-                        (java.util.HashMap<?, ?>) mcClass.getField("contactsDict").get(mc);
-                isContact = contacts != null && contacts.containsKey(senderId);
+                Class<?> ccClass = Class.forName("org.telegram.messenger.ContactsController");
+                Object cc = ccClass.getMethod("getInstance", int.class).invoke(null, account);
+                Object res = ccClass.getMethod("isContact", long.class).invoke(cc, senderId);
+                isContact = Boolean.TRUE.equals(res);
             } catch (Throwable ignored) {
             }
             return ColgramSpamGuard.judge(dialogId, senderId, text, isContact, isGroup);
@@ -97,8 +166,17 @@ public class ColgramHookHandler {
         }
     }
 
+    private static int resolveSelectedAccount() {
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            return ucClass.getField("selectedAccount").getInt(null);
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
     /**
-     * HOOK: Called from MessagesController when a new message is received or created.
+     * HOOK: Called from MessagesController / MessagesStorage when a new message is received or created.
      *
      * Deduplicated on (dialog, message id) because more than one transport can report the same
      * arrival: the bot synchroniser dispatches a batch it injected itself, and Telegram's own
@@ -106,15 +184,26 @@ public class ColgramHookHandler {
      * auto-reply is a plugin that answers - would fire twice for one message.
      */
     public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
-        if (!isOut && !colgramRememberDispatch(dialogId, messageId)) return;
-        ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
-        if (!isOut) colgramAutoReply(dialogId);
-        colgramKeywordAlerts(dialogId, text, isOut);
-        colgramMessageLog(dialogId, messageId, text, isOut);
+        hookOnMessageReceived(resolveSelectedAccount(), dialogId, messageId, text, 0L, isOut);
     }
 
-    /** Per-dialog timestamp of the last automatic answer. */
-    private static final java.util.HashMap<Long, Long> colgramAutoReplyAt = new java.util.HashMap<>();
+    public static void hookOnMessageReceived(int account, long dialogId, int messageId, String text, boolean isOut) {
+        hookOnMessageReceived(account, dialogId, messageId, text, 0L, isOut);
+    }
+
+    public static void hookOnMessageReceived(int account, long dialogId, int messageId, String text, long senderId, boolean isOut) {
+        int resolvedAcc = account >= 0 ? account : resolveSelectedAccount();
+        colgramMessageLog(dialogId, messageId, text, isOut);
+        if (!isOut && !colgramRememberDispatch(dialogId, messageId)) return;
+        ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
+        if (!isOut) colgramAutoReply(resolvedAcc, dialogId);
+        colgramKeywordAlerts(resolvedAcc, dialogId, text, isOut);
+    }
+
+    /** Per-(account, dialog) timestamp of the last automatic answer. */
+    private static final java.util.HashMap<String, Long> colgramAutoReplyAt = new java.util.HashMap<>();
+    private static final java.util.concurrent.ExecutorService hookIoExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
 
     /**
      * Built-in keyword alerts (was plugins/keyword_alerts.py).
@@ -123,19 +212,18 @@ public class ColgramHookHandler {
      * notification-style toast with the dialog it came from. Outgoing messages are skipped:
      * the point is to catch other people talking about the things you watch for.
      */
-    private static void colgramKeywordAlerts(long dialogId, String text, boolean isOut) {
+    private static void colgramKeywordAlerts(int account, long dialogId, String text, boolean isOut) {
         if (isOut || !ColgramConfig.isKeywordAlertsEnabled()) return;
         if (!ColgramConfig.keywordAlertMatches(text)) return;
         final String message = text == null ? "" : text;
         final long dialog = dialogId;
-        new Thread(() -> {
+        final int acct = account >= 0 ? account : resolveSelectedAccount();
+        hookIoExecutor.execute(() -> {
             String title = "🔔 Ключевое слово";
             String who;
             try {
                 Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, 0);
-                // getUser/getChat are declared with boxed Long parameters, so the lookup must
-                // ask for Long.class: getMethod matches declared types exactly.
+                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, acct);
                 if (dialog > 0) {
                     Object user = mcClass.getMethod("getUser", Long.class).invoke(mc, dialog);
                     who = user == null ? Long.toString(dialog) : (String)
@@ -159,7 +247,7 @@ public class ColgramHookHandler {
                     android.widget.Toast.makeText(ctx, line, android.widget.Toast.LENGTH_LONG).show();
                 } catch (Throwable ignored) {}
             });
-        }, "colgram-keyword-alert").start();
+        });
     }
 
     private static Object firstNonNull(Object... values) {
@@ -171,6 +259,22 @@ public class ColgramHookHandler {
 
     /** One JSONL writer for the built-in message log; appends are cheap and crash-safe. */
     private static final Object messageLogLock = new Object();
+
+    private static String jsonEscapeLog(String raw) {
+        if (raw == null) return "";
+        StringBuilder sb = new StringBuilder(raw.length() + 8);
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (c == '\\') sb.append("\\\\");
+            else if (c == '"') sb.append("\\\"");
+            else if (c == '\n') sb.append("\\n");
+            else if (c == '\r') sb.append("\\r");
+            else if (c == '\t') sb.append("\\t");
+            else if (c < 0x20) sb.append(String.format(java.util.Locale.US, "\\u%04x", (int) c));
+            else sb.append(c);
+        }
+        return sb.toString();
+    }
 
     /**
      * Built-in message log (was plugins/message_logger.py).
@@ -184,9 +288,9 @@ public class ColgramHookHandler {
         if (!ColgramConfig.isMessageLoggerEnabled() || appContext == null) return;
         final long dialog = dialogId;
         final int mid = messageId;
-        final String safeText = text == null ? "" : text.replace("\\", "\\\\").replace("\"", "\\\"");
+        final String safeText = jsonEscapeLog(text);
         final boolean out = isOut;
-        new Thread(() -> {
+        hookIoExecutor.execute(() -> {
             synchronized (messageLogLock) {
                 try {
                     java.io.File dir = new java.io.File(appContext.getFilesDir(), "Colgram");
@@ -201,7 +305,7 @@ public class ColgramHookHandler {
                     }
                 } catch (Throwable ignored) {}
             }
-        }, "colgram-msg-log").start();
+        });
     }
 
     /**
@@ -211,20 +315,121 @@ public class ColgramHookHandler {
      * would, and the dedupe above guarantees one answer per arrival. The cooldown is what keeps
      * this from becoming a spam cannon in a busy chat: five minutes per dialog by default.
      */
-    private static void colgramAutoReply(long dialogId) {
+    private static void colgramAutoReply(int accountArg, long dialogId) {
         if (!ColgramConfig.isAutoReplyEnabled()) return;
-        // Positive dialog ids are private chats; groups are negative and opt-in; channels are
-        // negative too but cannot be answered unless you post in them, and the send simply fails.
-        if (dialogId < 0 && !ColgramConfig.isAutoReplyInGroups()) return;
         long now = System.currentTimeMillis();
-        long cooldown = ColgramConfig.getAutoReplyCooldownSec() * 1000L;
+        long selfUserId = 0L;
+        boolean isBotPeer = false;
+        boolean isChannel = false;
+        boolean isContact = false;
+        String peerName = "";
+        String peerUsername = "";
+        int account = accountArg >= 0 ? accountArg : resolveSelectedAccount();
+
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
+            if (uc != null) {
+                selfUserId = (Long) ucClass.getMethod("getClientUserId").invoke(uc);
+            }
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+            if (mc != null) {
+                if (dialogId > 0) {
+                    Object user = mcClass.getMethod("getUser", Long.class).invoke(mc, dialogId);
+                    if (user != null) {
+                        isBotPeer = user.getClass().getField("bot").getBoolean(user);
+                        Object fn = user.getClass().getField("first_name").get(user);
+                        Object ln = user.getClass().getField("last_name").get(user);
+                        Object un = user.getClass().getField("username").get(user);
+                        StringBuilder sb = new StringBuilder();
+                        if (fn != null) sb.append(fn);
+                        if (ln != null && !String.valueOf(ln).isEmpty()) {
+                            if (sb.length() > 0) sb.append(' ');
+                            sb.append(ln);
+                        }
+                        peerName = sb.toString();
+                        peerUsername = un != null ? String.valueOf(un) : "";
+                    }
+                    try {
+                        Class<?> ccClass = Class.forName("org.telegram.messenger.ContactsController");
+                        Object cc = ccClass.getMethod("getInstance", int.class).invoke(null, account);
+                        if (cc != null) {
+                            Boolean res = (Boolean) ccClass.getMethod("isContact", long.class).invoke(cc, dialogId);
+                            isContact = Boolean.TRUE.equals(res);
+                        }
+                    } catch (Throwable ignored) {}
+                } else {
+                    Object chat = mcClass.getMethod("getChat", Long.class).invoke(mc, -dialogId);
+                    if (chat != null) {
+                        Object title = chat.getClass().getField("title").get(chat);
+                        peerName = title != null ? String.valueOf(title) : "";
+                        try {
+                            boolean broadcast = chat.getClass().getField("broadcast").getBoolean(chat);
+                            boolean megagroup = chat.getClass().getField("megagroup").getBoolean(chat);
+                            isChannel = broadcast && !megagroup;
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        final String arKey = account + ":" + dialogId;
+        long last = 0L;
         synchronized (colgramAutoReplyAt) {
-            Long last = colgramAutoReplyAt.get(dialogId);
-            if (last != null && now - last < cooldown) return;
-            colgramAutoReplyAt.put(dialogId, now);
+            Long prev = colgramAutoReplyAt.get(arKey);
+            if (prev != null) last = prev;
+        }
+
+        if (!ColgramAutoReplyPolicy.shouldReply(
+                ColgramConfig.isAutoReplyEnabled(),
+                dialogId,
+                selfUserId,
+                false,
+                isBotPeer,
+                ColgramConfig.isAutoReplyToBots(),
+                isChannel,
+                ColgramConfig.isAutoReplyInGroups(),
+                isContact,
+                ColgramConfig.getAutoReplyAudience(),
+                ColgramConfig.getAutoReplyBlacklist(),
+                now,
+                last,
+                ColgramConfig.getAutoReplyCooldownSec())) {
+            return;
+        }
+
+        java.util.Calendar cal = java.util.Calendar.getInstance();
+        int hour = cal.get(java.util.Calendar.HOUR_OF_DAY);
+        int minute = cal.get(java.util.Calendar.MINUTE);
+        int nowMin = hour * 60 + minute;
+
+        String rawTemplate = ColgramAutoReplyPolicy.selectReplyText(
+                ColgramConfig.isAutoReplyScheduleEnabled(),
+                ColgramConfig.isAutoReplyOnlyWhenAway(),
+                ColgramConfig.getAutoReplyStartMin(),
+                ColgramConfig.getAutoReplyEndMin(),
+                nowMin,
+                ColgramConfig.getAutoReplyText(),
+                ColgramConfig.getAutoReplyAwayText());
+        if (rawTemplate == null || rawTemplate.trim().isEmpty()) {
+            return;
+        }
+
+        synchronized (colgramAutoReplyAt) {
+            colgramAutoReplyAt.put(arKey, now);
             if (colgramAutoReplyAt.size() > 256) colgramAutoReplyAt.clear();
         }
-        ColgramPythonEngine.sendMessage(dialogId, ColgramConfig.getAutoReplyText());
+        final int targetAccount = account;
+        final String finalText = ColgramAutoReplyPolicy.renderTemplate(rawTemplate, peerName, peerUsername, hour, minute);
+        hookIoExecutor.execute(() -> {
+            try {
+                ColgramPythonEngine.class.getMethod("sendMessage", int.class, long.class, String.class)
+                        .invoke(null, targetAccount, dialogId, finalText);
+            } catch (Throwable fallback) {
+                ColgramPythonEngine.sendMessage(dialogId, finalText);
+            }
+        });
     }
 
     /** Bounded LRU of recently dispatched inbound messages; false means "already handled". */
@@ -268,6 +473,10 @@ public class ColgramHookHandler {
      * @return true if deletion should be BLOCKED (message preserved locally).
      */
     public static boolean hookShouldPreventDelete(long dialogId, int messageId) {
+        if (isForcePurged(dialogId, messageId)) {
+            unmarkMessageDeleted(dialogId, messageId);
+            return false;
+        }
         if (!ColgramConfig.isAntiDeleteEnabled()) {
             return false;
         }
@@ -278,6 +487,46 @@ public class ColgramHookHandler {
 
         // Return true to tell Telegram's storage layer NOT to delete the row
         return true;
+    }
+
+    /**
+     * HOOK: Called when a chat/dialog clear or remote delete arrives (or when
+     * preserving an entire chat history locally).
+     *
+     * @return true if local dialog history should be preserved and badged.
+     */
+    public static boolean hookShouldPreventDialogDelete(long dialogId, String title) {
+        if (!ColgramConfig.isAntiDeleteEnabled() || dialogId == 0) {
+            return false;
+        }
+        if (appContext != null) {
+            ColgramDatabase.getInstance(appContext).markDialogDeleted(dialogId, title);
+        }
+        return true;
+    }
+
+    /** Removes the local deleted-message tombstone (for local-only deletion). */
+    public static void unmarkMessageDeleted(long dialogId, int messageId) {
+        if (appContext != null) {
+            ColgramDatabase.getInstance(appContext).removeMessageDeleted(dialogId, messageId);
+        }
+    }
+
+    /** Removes the local deleted-dialog marker when the user dismisses it manually. */
+    public static void unmarkDialogDeleted(long dialogId) {
+        if (appContext != null) {
+            ColgramDatabase.getInstance(appContext).clearDialogDeleted(dialogId);
+        }
+    }
+
+    /**
+     * HOOK: Called from MessagesController / DialogCell when rendering a dialog.
+     */
+    public static boolean isDialogMarkedDeleted(long dialogId) {
+        if (!ColgramConfig.isAntiDeleteEnabled() || appContext == null || dialogId == 0) {
+            return false;
+        }
+        return ColgramDatabase.getInstance(appContext).isDialogDeleted(dialogId);
     }
 
     /**
@@ -292,6 +541,189 @@ public class ColgramHookHandler {
      * @param oldText previous revision text, or null if unavailable
      * @param editDate timestamp of the edit
      */
+    private static final int LIVE_SNAPSHOT_CAP = 2000;
+    private static final java.util.Map<String, String> LIVE_TEXT_SNAPSHOTS =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<String, String>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, String> eldest) {
+                    return size() > LIVE_SNAPSHOT_CAP;
+                }
+            });
+
+    private static final class LiveMediaSnapshot {
+        final int mediaType;
+        final String localPath;
+        final String fileName;
+        final long fileSize;
+        final String mimeType;
+        final long remoteId;
+        LiveMediaSnapshot(int mediaType, String localPath, String fileName, long fileSize, String mimeType, long remoteId) {
+            this.mediaType = mediaType;
+            this.localPath = localPath;
+            this.fileName = fileName;
+            this.fileSize = fileSize;
+            this.mimeType = mimeType;
+            this.remoteId = remoteId;
+        }
+    }
+
+    private static final java.util.Map<String, LiveMediaSnapshot> LIVE_MEDIA_SNAPSHOTS =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<String, LiveMediaSnapshot>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, LiveMediaSnapshot> eldest) {
+                    return size() > LIVE_SNAPSHOT_CAP;
+                }
+            });
+
+    private static final java.util.Map<String, String> LIVE_ENTITIES_SNAPSHOTS =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<String, String>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, String> eldest) {
+                    return size() > LIVE_SNAPSHOT_CAP;
+                }
+            });
+
+    public static void recordLiveMessageSnapshot(long dialogId, int messageId, String text) {
+        recordLiveMessageSnapshot(dialogId, messageId, text, null);
+    }
+
+    public static void recordLiveMessageSnapshot(long dialogId, int messageId, String text, String entitiesJson) {
+        if (dialogId == 0 || messageId == 0 || text == null) return;
+        String key = dialogId + ":" + messageId;
+        LIVE_TEXT_SNAPSHOTS.put(key, text);
+        if (entitiesJson != null && !entitiesJson.isEmpty()) {
+            LIVE_ENTITIES_SNAPSHOTS.put(key, entitiesJson);
+        } else {
+            LIVE_ENTITIES_SNAPSHOTS.remove(key);
+        }
+    }
+
+    public static boolean hasLiveMessageSnapshot(long dialogId, int messageId) {
+        if (dialogId == 0 || messageId == 0) return false;
+        return LIVE_TEXT_SNAPSHOTS.containsKey(dialogId + ":" + messageId);
+    }
+
+    public static void recordLiveMediaSnapshot(long dialogId, int messageId, int mediaType,
+                                               String localPath, String fileName, long fileSize,
+                                               String mimeType, long remoteId) {
+        if (dialogId == 0 || messageId == 0 || remoteId == 0) return;
+        LIVE_MEDIA_SNAPSHOTS.put(dialogId + ":" + messageId,
+                new LiveMediaSnapshot(mediaType, localPath, fileName, fileSize, mimeType, remoteId));
+    }
+
+    public static boolean hasLiveMediaSnapshot(long dialogId, int messageId) {
+        if (dialogId == 0 || messageId == 0) return false;
+        return LIVE_MEDIA_SNAPSHOTS.containsKey(dialogId + ":" + messageId);
+    }
+
+    public static String getLiveMediaPath(long dialogId, int messageId) {
+        if (dialogId == 0 || messageId == 0) return null;
+        LiveMediaSnapshot snap = LIVE_MEDIA_SNAPSHOTS.get(dialogId + ":" + messageId);
+        return snap != null ? snap.localPath : null;
+    }
+
+    /**
+     * Captures rapid (<1s) sequential edits accurately by reading the live in-memory previous
+     * revision BEFORE falling back to SQLite (which lags behind async storageQueue writes).
+     */
+    public static void hookOnMessageEditedWithNew(long dialogId, int messageId,
+                                                  String fallbackStoredText, String newText,
+                                                  long editTimestampMs) {
+        hookOnMessageEditedWithNew(dialogId, messageId, fallbackStoredText, null, newText, null, editTimestampMs);
+    }
+
+    public static void hookOnMessageEditedWithNew(long dialogId, int messageId,
+                                                  String fallbackStoredText, String fallbackEntitiesJson,
+                                                  String newText, String newEntitiesJson,
+                                                  long editTimestampMs) {
+        if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) {
+            return;
+        }
+        if (dialogId == 0 || messageId == 0) {
+            return;
+        }
+        String key = dialogId + ":" + messageId;
+        String livePrev = LIVE_TEXT_SNAPSHOTS.get(key);
+        String livePrevEnt = LIVE_ENTITIES_SNAPSHOTS.get(key);
+        String prevText = (livePrev != null && !livePrev.isEmpty()) ? livePrev : fallbackStoredText;
+        String prevEnt = (livePrev != null && !livePrev.isEmpty()) ? livePrevEnt : fallbackEntitiesJson;
+        String safeNew = newText == null ? "" : newText;
+        String safeNewEnt = newEntitiesJson == null ? "" : newEntitiesJson;
+        String safePrevEnt = prevEnt == null ? "" : prevEnt;
+        boolean textChanged = prevText != null && !prevText.equals(safeNew);
+        boolean entChanged = prevText != null && !safePrevEnt.equals(safeNewEnt);
+        if (prevText != null && !prevText.trim().isEmpty() && (textChanged || entChanged)) {
+            long ts = editTimestampMs > 0 ? editTimestampMs : System.currentTimeMillis();
+            ColgramDatabase.getInstance(appContext).saveMessageEdit(dialogId, messageId, prevText, prevEnt, ts);
+        }
+        if (!safeNew.isEmpty()) {
+            LIVE_TEXT_SNAPSHOTS.put(key, safeNew);
+            if (!safeNewEnt.isEmpty()) {
+                LIVE_ENTITIES_SNAPSHOTS.put(key, safeNewEnt);
+            } else {
+                LIVE_ENTITIES_SNAPSHOTS.remove(key);
+            }
+        } else {
+            LIVE_TEXT_SNAPSHOTS.remove(key);
+            LIVE_ENTITIES_SNAPSHOTS.remove(key);
+        }
+    }
+
+    public static void hookOnMediaChangedWithNew(long dialogId, int messageId,
+                                                 String oldMediaKind, String oldMediaId, String oldLocalPath,
+                                                 String newMediaKind, String newMediaId, String newLocalPath,
+                                                 long editTimestampMs) {
+        int oldType = mediaTypeFromKind(oldMediaKind);
+        int newType = mediaTypeFromKind(newMediaKind);
+        long oldRem = oldMediaId != null ? (Math.abs((long) oldMediaId.hashCode()) + 1L) : 1L;
+        long newRem = newMediaId != null ? (Math.abs((long) newMediaId.hashCode()) + 1L) : (oldRem + 1L);
+        if (oldLocalPath != null && !oldLocalPath.isEmpty()) {
+            File fOld = new File(oldLocalPath);
+            recordLiveMediaSnapshot(dialogId, messageId, oldType, oldLocalPath, fOld.getName(),
+                    fOld.isFile() ? fOld.length() : 0L, "", oldRem);
+        }
+        File fNew = newLocalPath != null ? new File(newLocalPath) : null;
+        hookOnMediaChangedWithNew(dialogId, messageId, newType, newLocalPath,
+                fNew != null ? fNew.getName() : newMediaKind,
+                (fNew != null && fNew.isFile()) ? fNew.length() : 0L, "", newRem, editTimestampMs);
+    }
+
+    private static int mediaTypeFromKind(String kind) {
+        if (kind == null) return 0;
+        String k = kind.toLowerCase(java.util.Locale.US);
+        if (k.contains("photo") || k.contains("image")) return 1;
+        if (k.contains("video")) return 2;
+        if (k.contains("anim") || k.contains("gif")) return 3;
+        if (k.contains("voice") || k.contains("audio")) return 4;
+        return 5;
+    }
+
+    public static void hookOnMediaChangedWithNew(long dialogId, int messageId,
+                                                 int newMediaType, String newLocalPath, String newFileName,
+                                                 long newFileSize, String newMimeType, long newRemoteId,
+                                                 long editTimestampMs) {
+        if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) {
+            return;
+        }
+        if (dialogId == 0 || messageId == 0) return;
+        String key = dialogId + ":" + messageId;
+        LiveMediaSnapshot prev = LIVE_MEDIA_SNAPSHOTS.get(key);
+        if (prev != null && prev.remoteId != 0 && prev.remoteId != newRemoteId) {
+            String sandboxCopy = prev.localPath != null
+                    ? colgramCopyRevisionFile(prev.localPath, prev.fileName)
+                    : null;
+            if (sandboxCopy == null) sandboxCopy = prev.localPath;
+            long ts = editTimestampMs > 0 ? editTimestampMs : System.currentTimeMillis();
+            ColgramDatabase.getInstance(appContext).saveMediaRevision(
+                    dialogId, messageId, prev.mediaType, sandboxCopy, prev.fileName,
+                    prev.fileSize, prev.mimeType, prev.remoteId, ts);
+        }
+        if (newRemoteId != 0) {
+            LIVE_MEDIA_SNAPSHOTS.put(key, new LiveMediaSnapshot(
+                    newMediaType, newLocalPath, newFileName, newFileSize, newMimeType, newRemoteId));
+        }
+    }
+
     public static void hookOnMessageEdited(long dialogId, int messageId, String oldText, long editDate) {
         if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) {
             return;
@@ -302,6 +734,42 @@ public class ColgramHookHandler {
         ColgramDatabase.getInstance(appContext).saveMessageEdit(dialogId, messageId, oldText, editDate);
     }
 
+    private static final long FORCE_PURGE_TTL_MS = 30_000L;
+    private static final java.util.concurrent.ConcurrentHashMap<String, Long> FORCE_PURGED_KEYS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static void markForcePurged(long dialogId, int messageId) {
+        if (dialogId == 0 || messageId == 0) return;
+        long now = System.currentTimeMillis();
+        FORCE_PURGED_KEYS.put(dialogId + ":" + messageId, now);
+        if (dialogId > 0) {
+            FORCE_PURGED_KEYS.put("0:" + messageId, now);
+        }
+        if (FORCE_PURGED_KEYS.size() > 512) {
+            FORCE_PURGED_KEYS.entrySet().removeIf(e -> now - e.getValue() > FORCE_PURGE_TTL_MS);
+        }
+    }
+
+    public static boolean isForcePurged(long dialogId, int messageId) {
+        if (messageId == 0) return false;
+        long now = System.currentTimeMillis();
+        Long ts = FORCE_PURGED_KEYS.get(dialogId + ":" + messageId);
+        if (ts != null && now - ts <= FORCE_PURGE_TTL_MS) return true;
+        if (dialogId >= 0) {
+            Long ts0 = FORCE_PURGED_KEYS.get("0:" + messageId);
+            if (ts0 != null && now - ts0 <= FORCE_PURGE_TTL_MS) return true;
+        }
+        return false;
+    }
+
+    /**
+     * TTL-backed check so local deletion + asynchronous server TL_updateDeleteMessages echo both
+     * recognize the intentional double-delete purge without premature single-use consumption!
+     */
+    public static boolean consumeForcePurged(long dialogId, int messageId) {
+        return isForcePurged(dialogId, messageId);
+    }
+
     /**
      * HOOK: Called from ChatMessageCell when drawing or binding a message bubble.
      */
@@ -310,6 +778,17 @@ public class ColgramHookHandler {
             return false;
         }
         return ColgramDatabase.getInstance(appContext).isMessageDeleted(dialogId, messageId);
+    }
+
+    /**
+     * Returns all locally preserved deleted message IDs for a dialog so storage cleanup/sync
+     * never wipes anti-deleted messages or their attached media rows from SQLite.
+     */
+    public static java.util.List<Integer> getPreservedDeletedMessageIds(long dialogId) {
+        if (!ColgramConfig.isAntiDeleteEnabled() || appContext == null || dialogId == 0) {
+            return new java.util.ArrayList<>();
+        }
+        return ColgramDatabase.getInstance(appContext).getDeletedMessageIdsForDialog(dialogId);
     }
 
     /**
@@ -388,6 +867,7 @@ public class ColgramHookHandler {
 
             File dir = new File(appContext.getFilesDir(), "media_history");
             if (!dir.exists() && !dir.mkdirs()) return null;
+            ColgramStorageSandbox.ensureDirWithNoMedia(dir);
 
             String name = (suggestedName == null || suggestedName.trim().isEmpty())
                     ? src.getName() : suggestedName.trim();
@@ -400,26 +880,9 @@ public class ColgramHookHandler {
                 name = name.substring(0, Math.max(1, 120 - ext.length())) + ext;
             }
 
-            File dst = new File(dir, System.currentTimeMillis() + "_" + name);
-            // Guard against a collision if two edits land in the same millisecond.
-            if (dst.exists()) dst = new File(dir, System.currentTimeMillis() + "_" + Math.abs(name.hashCode()) + "_" + name);
-
-            java.io.InputStream in = null;
-            java.io.OutputStream out = null;
-            try {
-                in = new java.io.FileInputStream(src);
-                out = new java.io.FileOutputStream(dst);
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = in.read(buf)) > 0) {
-                    out.write(buf, 0, n);
-                }
-                out.flush();
-            } finally {
-                if (in != null) try { in.close(); } catch (Throwable ignore) {}
-                if (out != null) try { out.close(); } catch (Throwable ignore) {}
-            }
-            return dst.exists() && dst.length() > 0 ? dst.getAbsolutePath() : null;
+            File dst = ColgramStorageOptimizer.copyOrDeduplicateToDir(
+                    src, dir, System.currentTimeMillis() + "_" + name);
+            return dst != null && dst.exists() && dst.length() > 0 ? dst.getAbsolutePath() : null;
         } catch (Throwable t) {
             return null;
         }
@@ -446,11 +909,17 @@ public class ColgramHookHandler {
      * Prevents unlinking media for preserved messages.
      */
     public static boolean shouldPreventMediaDeletion(File file) {
-        if (!ColgramConfig.isPreserveMediaEnabled()) {
+        if (!ColgramConfig.isPreserveMediaEnabled() || file == null || !file.exists()) {
             return false;
         }
-        // If media lock is active, do not allow physical unlinking of cached media
-        return file != null && file.exists();
+        // Only protect preserved revision archives, wallpapers, and explicitly vaulted media —
+        // never block Telegram's Clear Cache / LRU eviction on ordinary temporary cache files.
+        String p = file.getAbsolutePath().replace('\\', '/').toLowerCase(java.util.Locale.US);
+        return p.contains("/media_history/")
+                || p.contains("/colgram_wallpapers/")
+                || p.contains("/colgram_vault/")
+                || p.contains("/colgram_preserved/")
+                || p.contains("/.colgram_cas/");
     }
 
     /**
@@ -479,6 +948,54 @@ public class ColgramHookHandler {
      */
     public static boolean shouldBypassFlagSecure() {
         return ColgramGhostMode.shouldBypassFlagSecure();
+    }
+
+    /** Suppresses outgoing screenshot notification packets in private & secret chats. */
+    public static boolean shouldHideScreenshotNotify() {
+        return ColgramConfig.isHideScreenshotNotifyEnabled();
+    }
+
+    /** Allows viewing, re-opening, saving, and forwarding view-once / TTL media without expiry. */
+    public static boolean shouldUnlockOneTimeMedia() {
+        return ColgramConfig.isSaveOneTimeMediaEnabled();
+    }
+
+    /** Views stories anonymously without reporting stories.readStories to Telegram servers. */
+    public static boolean shouldUseStealthStories() {
+        return ColgramConfig.isStealthStoriesEnabled();
+    }
+
+    /** Strips original sender attribution ("Forwarded from") by default when forwarding. */
+    public static boolean shouldForwardNoQuote() {
+        return ColgramConfig.isForwardNoQuoteEnabled();
+    }
+
+    /** Masks the user's own phone number inside local UI surfaces (drawer/settings/profile). */
+    public static boolean shouldHidePhoneLocally() {
+        return ColgramConfig.isHidePhoneLocalEnabled();
+    }
+
+    /** Formats a phone string safely when local phone hiding is enabled. */
+    public static String maskLocalPhone(String phone) {
+        if (!shouldHidePhoneLocally() || phone == null || phone.isEmpty()) {
+            return phone;
+        }
+        return "••••••••";
+    }
+
+    /** Requires confirmation before starting an outgoing voice/video call. */
+    public static boolean shouldConfirmCalls() {
+        return ColgramConfig.isConfirmCallsEnabled();
+    }
+
+    /** Requires confirmation before sending a sticker or GIF tap. */
+    public static boolean shouldConfirmStickers() {
+        return ColgramConfig.isConfirmStickersEnabled();
+    }
+
+    /** Prompts before opening an external hyperlink from chat or profile. */
+    public static boolean shouldConfirmLinks() {
+        return ColgramConfig.isConfirmLinksEnabled();
     }
 
     // --- Per-user notification blocking -----------------------------------------
@@ -545,6 +1062,11 @@ public class ColgramHookHandler {
         }
     }
 
+    public static long normalizeEpochMillis(long ts) {
+        if (ts <= 0L) return System.currentTimeMillis();
+        return ts < 100_000_000_000L ? ts * 1000L : ts;
+    }
+
     /** HOOK: records that the phone-number privacy request has been accepted. */
     public static void markPhoneNumberHidden(int account) {
         if (appContext == null) return;
@@ -552,5 +1074,58 @@ public class ColgramHookHandler {
             appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     .edit().putBoolean("phone_hidden_" + account, true).apply();
         } catch (Throwable ignored) {}
+    }
+
+    // --- Built-in Defender Bot hooks ("Бот-защитник Colgram") -----------------
+
+    /** True when WebRTC direct P2P / STUN IP negotiation must be blocked to prevent IP leaks in calls. */
+    public static boolean shouldBlockVoipP2p() {
+        return ColgramConfig.isDefenderBlockVoipP2pEnabled()
+                || ColgramConfig.isMaxAnonymityEnabled()
+                || ColgramConfig.isStrictProxySecurityEnabled();
+    }
+
+    /** True when Mini App / WebView geolocation access must be denied unconditionally. */
+    public static boolean shouldBlockBotLocation() {
+        return ColgramConfig.isDefenderBlockBotLocationEnabled() || ColgramConfig.isMaxAnonymityEnabled();
+    }
+
+    /** True when WebView file access, mixed HTTP content, and 3rd-party cookies must be blocked. */
+    public static boolean shouldHardenWebView() {
+        return ColgramConfig.isDefenderWebViewHardeningEnabled()
+                || ColgramConfig.isMaxAnonymityEnabled()
+                || ColgramConfig.isStrictProxySecurityEnabled();
+    }
+
+    /** Blocks foreign upstream Telegram APK popups signed by DrKLO/Telegram's incompatible keystore. */
+    public static boolean shouldBlockForeignAppUpdate() {
+        return true;
+    }
+
+    /** Strips UTM/fbclid/yclid/ref tracking parameters from external links when enabled. */
+    public static String sanitizeOutgoingOrOpenedUrl(String rawUrl) {
+        if (rawUrl == null || !ColgramConfig.isDefenderStripTrackersEnabled()) {
+            return rawUrl;
+        }
+        ColgramSecurityPolicy.SanitizedUrlResult result = ColgramSecurityPolicy.sanitizeTrackingUrl(rawUrl);
+        if (result.strippedCount > 0) {
+            ColgramConfig.addDefenderTrackersStripped(result.strippedCount);
+        }
+        return result.url;
+    }
+
+    /** Replaces real Build.MODEL / manufacturer inside WebView and Mini App User-Agents with the spoof profile. */
+    public static String cloakWebViewUserAgent(String originalUa, boolean isBot, String appVersionName, String perfClass) {
+        boolean cloak = ColgramConfig.isCloakEnabled()
+                || ColgramConfig.isDefenderWebViewHardeningEnabled()
+                || ColgramConfig.isMaxAnonymityEnabled();
+        return ColgramSecurityPolicy.buildCloakedWebViewUserAgent(
+                originalUa,
+                ColgramConfig.getSpoofDeviceModel(),
+                ColgramConfig.getSpoofSystemVersion(),
+                cloak,
+                isBot,
+                appVersionName,
+                perfClass);
     }
 }

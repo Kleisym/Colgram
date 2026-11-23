@@ -338,11 +338,14 @@ def make_local_base_read_only(s):
 
 
 def copy_subscription_controls(proxy_source):
-    target = Path(proxy_source).with_name("ColgramSubscriptionControls.java")
-    template = Path(__file__).parent / "templates/ColgramSubscriptionControls.java"
-    contents = template.read_text(encoding="utf-8")
-    if not target.is_file() or target.read_text(encoding="utf-8") != contents:
-        target.write_text(contents, encoding="utf-8", newline="\n")
+    for name in ("ColgramSubscriptionControls.java", "ColgramBrowserRoutes.java"):
+        target = Path(proxy_source).with_name(name)
+        template = Path(__file__).parent / ("templates/" + name)
+        if not template.is_file():
+            continue
+        contents = template.read_text(encoding="utf-8")
+        if not target.is_file() or target.read_text(encoding="utf-8") != contents:
+            target.write_text(contents, encoding="utf-8", newline="\n")
 
 
 def upgrade_functional_controls(s):
@@ -477,6 +480,50 @@ def upgrade_call_route_picker(s):
     return s
 
 
+def add_browser_route_row(s):
+    marker = "// COLGRAM_BROWSER_ROUTE_PICKER = 1"
+    if marker in s:
+        return s
+    if "private int browserRow = -1;" not in s:
+        s = s.replace(
+            "    private int callsRow = -1;\n    private int callsDetailRow = -1;\n",
+            "    private int callsRow = -1;\n    private int callsDetailRow = -1;\n    private int browserRow = -1;\n    private int browserDetailRow = -1;\n",
+            1,
+        )
+    s = s.replace(
+        "        callsRow = rowCount++;\n        callsDetailRow = rowCount++;\n",
+        "        callsRow = rowCount++;\n        callsDetailRow = rowCount++;\n        browserRow = rowCount++;\n        browserDetailRow = rowCount++;\n",
+        1,
+    )
+    s = s.replace(
+        "            } else if (position == callsRow) {\n                // COLGRAM_CALL_ROUTE_PICKER = 1\n                ColgramCallRoutes.showPicker(getParentActivity(), () -> listAdapter.notifyItemChanged(callsRow));\n",
+        "            } else if (position == callsRow) {\n                // COLGRAM_CALL_ROUTE_PICKER = 1\n                ColgramCallRoutes.showPicker(getParentActivity(), () -> listAdapter.notifyItemChanged(callsRow));\n            } else if (position == browserRow) {\n                // COLGRAM_BROWSER_ROUTE_PICKER = 1\n                ColgramBrowserRoutes.showPicker(getParentActivity(), () -> listAdapter.notifyItemChanged(browserRow));\n",
+        1,
+    )
+    s = s.replace(
+        "                    if (position == callsRow) {\n                        textCell.setTextAndValue(\"Использовать для звонков\", ColgramCallRoutes.summary(), true);\n",
+        "                    if (position == callsRow) {\n                        textCell.setTextAndValue(\"Использовать для звонков\", ColgramCallRoutes.summary(), true);\n                    } else if (position == browserRow) {\n                        textCell.setTextAndValue(\"Использовать для браузера\", ColgramBrowserRoutes.summary(), true);\n",
+        1,
+    )
+    s = s.replace(
+        "                    } else if (position == callsDetailRow) {\n                        cell.setText(\"Маршрут применяется к новым личным звонкам. Если выбранный маршрут недоступен, звонок не уйдёт по другому.\");\n",
+        "                    } else if (position == callsDetailRow) {\n                        cell.setText(\"Маршрут применяется к новым личным звонкам. Если выбранный маршрут недоступен, звонок не уйдёт по другому.\");\n                    } else if (position == browserDetailRow) {\n                        cell.setText(\"Маршрут применяется к встроенному браузеру, Instant View и веб-запросам. По умолчанию — локальный обходник на вашем интернете.\");\n",
+        1,
+    )
+    s = s.replace("position == warpRow || position == callsRow || position == proxyAddRow",
+                  "position == warpRow || position == callsRow || position == browserRow || position == proxyAddRow")
+    s = s.replace("if (position == callsRow || position == proxyAddRow",
+                  "if (position == callsRow || position == browserRow || position == proxyAddRow")
+    s = s.replace("else if (position == callsRow || position == proxyAddRow",
+                  "else if (position == callsRow || position == browserRow || position == proxyAddRow")
+    s = s.replace(
+        "            } else if (position == callsRow) {\n                return -14;\n            } else if (position == callsDetailRow) {\n                return -15;\n",
+        "            } else if (position == callsRow) {\n                return -14;\n            } else if (position == callsDetailRow) {\n                return -15;\n            } else if (position == browserRow) {\n                return -22;\n            } else if (position == browserDetailRow) {\n                return -23;\n",
+        1,
+    )
+    return s
+
+
 def apply(repo_path):
     p = os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
                      "org", "telegram", "ui", "ProxyListActivity.java")
@@ -496,14 +543,14 @@ def apply(repo_path):
                                   '                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, false, false);',
                                   'warpStatusForProxyScreen(),\n'
                                   '                                org.colgram.core.ColgramConfig.isWarpEnabled() || warpStartPending, true, false);')
-        updated = add_connection_settings(updated)
+        updated = add_browser_route_row(add_connection_settings(updated))
         if updated != s:
             Path(p).write_text(updated, encoding="utf-8", newline="\n")
         apply_call_proxy_defaults(repo_path)
         apply_voip_call_proxy(repo_path)
         return
     if MARKER in s:
-        upgraded = add_connection_settings(upgrade_call_route_picker(upgrade_generated(s)))
+        upgraded = add_browser_route_row(add_connection_settings(upgrade_call_route_picker(upgrade_generated(s))))
         if upgraded != s:
             Path(p).write_text(upgraded, encoding="utf-8", newline="\n")
             print(" [+] Updated ProxyListActivity WARP state handling")
@@ -812,7 +859,7 @@ def apply(repo_path):
     }"""
     must_replace(anchor_fields_end, helpers, "helpers")
 
-    s = add_connection_settings(upgrade_call_route_picker(upgrade_generated(s)))
+    s = add_browser_route_row(add_connection_settings(upgrade_call_route_picker(upgrade_generated(s))))
     Path(p).write_text(s, encoding="utf-8", newline="\n")
     print(" [+] ProxyListActivity: calls row unconditional + WARP toggle (" + str(n_edits) + " edits)")
     apply_call_proxy_defaults(repo_path)

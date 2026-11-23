@@ -46,8 +46,8 @@ final class ColgramPinnedConnection {
                                      java.net.Proxy proxy) {
         try {
             HttpsURLConnection copy = (HttpsURLConnection)
-                    (proxy == null ? url.openConnection() : url.openConnection(proxy));
-            copy.setSSLSocketFactory(pinning(original.getSSLSocketFactory(), url, address));
+                    (proxy == null ? url.openConnection(java.net.Proxy.NO_PROXY) : url.openConnection(proxy));
+            copy.setSSLSocketFactory(pinning(original.getSSLSocketFactory(), url, address, proxy));
             copy.setHostnameVerifier(original.getHostnameVerifier());
             copy.setConnectTimeout(original.getConnectTimeout() > 0
                     ? original.getConnectTimeout() : CONNECT_TIMEOUT_MS);
@@ -77,7 +77,7 @@ final class ColgramPinnedConnection {
      * has to be verified against that same name, or a filtered resolver turns into an impostor.
      */
     private static SSLSocketFactory pinning(final SSLSocketFactory delegate, final URL url,
-                                            final InetAddress address) {
+                                            final InetAddress address, final java.net.Proxy proxy) {
         return new SSLSocketFactory() {
             @Override
             public String[] getDefaultCipherSuites() {
@@ -94,40 +94,52 @@ final class ColgramPinnedConnection {
                     throws IOException {
                 // host is the URL's name: the handshake is exactly the one the server expects,
                 // and the socket underneath is already pointed at our address.
-                return delegate.createSocket(socket, host, port, autoClose);
+                Socket s = delegate.createSocket(socket, host, port, autoClose);
+                if (s instanceof javax.net.ssl.SSLSocket) {
+                    ColgramDohResolver.hardenTlsSocket((javax.net.ssl.SSLSocket) s);
+                }
+                return s;
             }
 
             @Override
             public Socket createSocket(String host, int port) throws IOException {
-                return dial(delegate, url, address, port);
+                return dial(delegate, url, address, port, proxy);
             }
 
             @Override
             public Socket createSocket(String host, int port, InetAddress local, int localPort)
                     throws IOException {
-                return dial(delegate, url, address, port);
+                return dial(delegate, url, address, port, proxy);
             }
 
             @Override
             public Socket createSocket(InetAddress host, int port) throws IOException {
-                return dial(delegate, url, address, port);
+                return dial(delegate, url, address, port, proxy);
             }
 
             @Override
             public Socket createSocket(InetAddress host, int port, InetAddress local, int localPort)
                     throws IOException {
-                return dial(delegate, url, address, port);
+                return dial(delegate, url, address, port, proxy);
             }
         };
     }
 
-    private static Socket dial(SSLSocketFactory delegate, URL url, InetAddress address, int port)
-            throws IOException {
+    private static Socket dial(SSLSocketFactory delegate, URL url, InetAddress address, int port,
+                               java.net.Proxy proxy) throws IOException {
         int target = port > 0 ? port : url.getDefaultPort();
-        Socket raw = new Socket();
-        raw.connect(new InetSocketAddress(address, target), CONNECT_TIMEOUT_MS);
+        Socket raw = proxy != null && proxy.type() == java.net.Proxy.Type.SOCKS
+                ? new Socket(proxy) : new Socket();
+        InetSocketAddress remote = (proxy != null && proxy.type() == java.net.Proxy.Type.SOCKS)
+                ? InetSocketAddress.createUnresolved(url.getHost(), target)
+                : new InetSocketAddress(address, target);
+        raw.connect(remote, CONNECT_TIMEOUT_MS);
         raw.setSoTimeout(READ_TIMEOUT_MS);
-        return delegate.createSocket(raw, sniFor(url.getHost()), target, true);
+        Socket wrapped = delegate.createSocket(raw, sniFor(url.getHost()), target, true);
+        if (wrapped instanceof javax.net.ssl.SSLSocket) {
+            ColgramDohResolver.hardenTlsSocket((javax.net.ssl.SSLSocket) wrapped);
+        }
+        return wrapped;
     }
 
     /**

@@ -3,7 +3,7 @@ package org.colgram.core;
 /** Generation-checked service verdicts. No Android dependencies, I/O or native loads. */
 public final class ColgramWarpState {
     public static final int STARTING = 0, UP = 1, FAILED = 2, STOPPED = 3;
-    public static final long HEARTBEAT_TTL_MS = 35_000L;
+    public static final long HEARTBEAT_TTL_MS = 65_000L;
     private long generation;
     private int state = STOPPED;
     private long confirmedAt = -1;

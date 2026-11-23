@@ -32,7 +32,7 @@ CONVERGED = object()
 # the wrapper or the palette: it is both the constant the wrapper declares and the patch_file
 # marker, so the two can no longer disagree and an old build can no longer report "already
 # patched" over a newer body.
-COLGRAM_THEME_PATCH_VERSION = "14"
+COLGRAM_THEME_PATCH_VERSION = "19"
 
 # Misses that are known-benign, with the reason. Anything NOT listed here fails the run.
 # Keeping this explicit is the point: a new miss cannot be waved through by accident, and a
@@ -366,6 +366,12 @@ def inject_hooks(repo_path):
     file_loader = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java")
     patch_file(
         file_loader,
+        "public static File checkDirectory(int type) {",
+        "public static File checkDirectory(int type) {\n        File sandboxed = org.colgram.core.ColgramHookHandler.hookGetDirectory(type);\n        if (sandboxed != null) return sandboxed;",
+        "FileLoader.checkDirectory Sandbox Redirect"
+    )
+    patch_file(
+        file_loader,
         "public static File getDirectory(int type) {",
         "public static File getDirectory(int type) {\n        File sandboxed = org.colgram.core.ColgramHookHandler.hookGetDirectory(type);\n        if (sandboxed != null) return sandboxed;",
         "FileLoader.getDirectory Sandbox Redirect"
@@ -567,9 +573,11 @@ def inject_hooks(repo_path):
     # Correct behaviour when anti-delete is ON: record the id for tombstone styling and
     # leave the message completely untouched — fully replyable, deletable, forwardable.
     # When it is OFF we fall through to upstream behaviour verbatim.
-    patch_file(
-        messages_controller,
-        """            } else {
+    # Wait — call idempotent callable so both upstream and upgraded trees converge cleanly.
+    def mc_anti_delete_injector(content):
+        if "final boolean colgramWipe = org.colgram.core.ColgramConfig.isAntiDeleteWipeEnabled();" in content:
+            return CONVERGED
+        old_ad = """            } else {
                 if (channelId == 0) {
                     for (int a = 0; a < messages.size(); a++) {
                         Integer id = messages.get(a);
@@ -583,8 +591,8 @@ def inject_hooks(repo_path):
                 }
                 getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, forAll, 0, topicId);
                 getMessagesStorage().updateDialogsWithDeletedMessages(dialogId, channelId, messages, null);
-            }""",
-            """            } else {
+            }"""
+        new_ad = """            } else {
                 final boolean colgramKeep = org.colgram.core.ColgramConfig.isAntiDeleteEnabled();
                 final boolean colgramWipe = org.colgram.core.ColgramConfig.isAntiDeleteWipeEnabled();
                 if (channelId == 0) {
@@ -617,7 +625,15 @@ def inject_hooks(repo_path):
                     getMessagesStorage().markMessagesAsDeleted(dialogId, messages, true, forAll, 0, topicId);
                     getMessagesStorage().updateDialogsWithDeletedMessages(dialogId, channelId, messages, null);
                 }
-            }""",
+            }"""
+        if old_ad in content:
+            return content.replace(old_ad, new_ad, 1)
+        return content
+
+    patch_file(
+        messages_controller,
+        mc_anti_delete_injector,
+        None,
         "MessagesController Anti-Delete Preserve Message In Storage"
     )
 
@@ -654,7 +670,7 @@ def inject_hooks(repo_path):
         "LoginActivity Suppress Call Permissions (Secondary)"
     )
 
-    # 8. SendMessagesHelper.java -> Intercept outgoing messages for Python commands and plugins
+    # 8. SendMessagesHelper.java -> Intercept outgoing messages for Python commands, Colemailer, and plugins
     send_messages_helper = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "SendMessagesHelper.java")
     patch_file(
         send_messages_helper,
@@ -662,7 +678,16 @@ def inject_hooks(repo_path):
         """public void sendMessage(SendMessageParams sendMessageParams) {
         if (sendMessageParams != null && sendMessageParams.message != null) {
             int replyId = sendMessageParams.replyToMsg != null ? sendMessageParams.replyToMsg.getId() : 0;
-            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message)) {
+            long colgramReplySender = 0L;
+            if (sendMessageParams.replyToMsg != null) {
+                colgramReplySender = sendMessageParams.replyToMsg.getSenderId();
+                if (colgramReplySender == 0L && sendMessageParams.replyToMsg.messageOwner != null
+                        && sendMessageParams.replyToMsg.messageOwner.from_id != null) {
+                    colgramReplySender = MessageObject.getPeerId(sendMessageParams.replyToMsg.messageOwner.from_id);
+                }
+            }
+            ColgramNativeColemailerBridge.rememberPendingReply(sendMessageParams.peer, sendMessageParams.replyToMsg);
+            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {
                 return;
             }
         }""",
@@ -752,67 +777,169 @@ def inject_hooks(repo_path):
         "LoginActivity Make onAuthSuccess Public"
     )
 
-    # 12. LoginActivity.java -> Inject QR Login & Bot Token Login buttons between subtitleView and countryButton
-    alt_login_btn = """addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 8, 32, 0));
-
-            LinearLayout altButtonsRow = new LinearLayout(context);
-            altButtonsRow.setOrientation(LinearLayout.HORIZONTAL);
-            altButtonsRow.setGravity(Gravity.CENTER);
-            boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
-            int accentBtnColor = Theme.getColor(Theme.key_featuredStickers_addButton);
-            if (accentBtnColor == 0) accentBtnColor = 0xFF2AABEE;
-
-            TextView qrLoginBtn = new TextView(context);
-            qrLoginBtn.setText(isRuLang ? "📷 Вход по QR" : "📷 QR Log in");
-            qrLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-            qrLoginBtn.setTypeface(AndroidUtilities.bold());
-            qrLoginBtn.setTextColor(accentBtnColor);
-            qrLoginBtn.setGravity(Gravity.CENTER);
-            qrLoginBtn.setPadding(dp(8), dp(4), dp(8), dp(4));
-            qrLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(18), accentBtnColor & 0x18ffffff, accentBtnColor & 0x33ffffff));
-            qrLoginBtn.setOnClickListener(v -> {
-                org.telegram.ui.ColgramQRLoginBottomSheet.show(LoginActivity.this, currentAccount);
-            });
-            altButtonsRow.addView(qrLoginBtn, LayoutHelper.createLinear(0, 36, 1.0f, Gravity.CENTER, 0, 0, 6, 0));
-
-            TextView botLoginBtn = new TextView(context);
-            botLoginBtn.setText(isRuLang ? "🤖 Токен бота" : "🤖 Bot Token");
-            botLoginBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-            botLoginBtn.setTypeface(AndroidUtilities.bold());
-            botLoginBtn.setTextColor(accentBtnColor);
-            botLoginBtn.setGravity(Gravity.CENTER);
-            botLoginBtn.setPadding(dp(8), dp(4), dp(8), dp(4));
-            botLoginBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(18), accentBtnColor & 0x18ffffff, accentBtnColor & 0x33ffffff));
-            botLoginBtn.setOnClickListener(v -> {
-                org.telegram.ui.ColgramBotLoginBottomSheet.show(LoginActivity.this, currentAccount);
-            });
-            altButtonsRow.addView(botLoginBtn, LayoutHelper.createLinear(0, 36, 1.0f, Gravity.CENTER, 6, 0, 0, 0));
-
-            addView(altButtonsRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 14, 32, 6));"""
-
+    # 12. LoginActivity.java -> Inject Colgram header badge, QR Login, Bot Token & Temp Mail cards
     def login_btn_replacer(content):
-        # Remove legacy vertical button layout if present
-        legacy_pattern = """addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));
-            LinearLayout altLoginButtonsLayout = new LinearLayout(context);"""
-        if legacy_pattern in content:
-            import re
+        if "colgramHeaderBadge" in content and "updateColgramButtonsTheme();" in content and "tempMailBtn" in content:
+            return CONVERGED
+        nl = "\r\n" if "\r\n" in content else "\n"
+        # Cleanly strip any legacy altLoginButtonsLayout / old altButtonsRow
+        legacy_pattern = "addView(phoneOutlineView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 58, 16, 8, 16, 8));"
+        if legacy_pattern in content and "LinearLayout altLoginButtonsLayout = new LinearLayout(context);" in content:
             content = re.sub(
                 r'LinearLayout altLoginButtonsLayout = new LinearLayout\(context\);.*?addView\(altLoginButtonsLayout, LayoutHelper\.createLinear\(LayoutHelper\.MATCH_PARENT, LayoutHelper\.WRAP_CONTENT, Gravity\.CENTER_HORIZONTAL, 16, 2, 76, 4\)\);',
                 '',
                 content,
                 flags=re.DOTALL
             )
-        if "altButtonsRow" in content:
-            return content
+        content_norm = content.replace("\r\n", "\n")
+        field_anchor = "        private TextView plusTextView;\n        private LinkSpanDrawable.LinksTextView subtitleView;"
+        field_new = "        private TextView plusTextView;\n        private LinkSpanDrawable.LinksTextView subtitleView;\n        private LinearLayout colgramHeaderBadge;\n        private LinearLayout qrLoginBtn;\n        private LinearLayout botLoginBtn;\n        private LinearLayout tempMailBtn;"
+        if "private LinearLayout colgramHeaderBadge;" not in content_norm and field_anchor in content_norm:
+            content_norm = content_norm.replace(field_anchor, field_new, 1)
+
+        phoneview_ctor = "        public PhoneView(Context context) {\n            super(context);\n\n            setOrientation(VERTICAL);\n            setGravity(Gravity.CENTER);\n\n            titleView = new TextView(context);"
+        phoneview_helpers = """        private LinearLayout createColgramActionButton(Context context, int iconRes, String label, int accentColor, View.OnClickListener listener) {
+            LinearLayout card = new LinearLayout(context);
+            card.setOrientation(LinearLayout.HORIZONTAL);
+            card.setGravity(Gravity.CENTER);
+            card.setPadding(dp(10), dp(6), dp(12), dp(6));
+
+            ImageView icon = new ImageView(context);
+            icon.setImageResource(iconRes);
+            icon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            card.addView(icon, LayoutHelper.createLinear(18, 18, Gravity.CENTER_VERTICAL, 0, 0, 7, 0));
+
+            TextView tv = new TextView(context);
+            tv.setText(label);
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+            tv.setTypeface(AndroidUtilities.bold());
+            tv.setSingleLine(true);
+            tv.setEllipsize(TextUtils.TruncateAt.END);
+            card.addView(tv, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
+
+            styleColgramActionButton(card, accentColor);
+            card.setOnClickListener(listener);
+            return card;
+        }
+
+        private void styleColgramActionButton(LinearLayout card, int accentColor) {
+            if (card == null) return;
+            android.graphics.drawable.GradientDrawable normalBg = new android.graphics.drawable.GradientDrawable();
+            normalBg.setCornerRadius(dp(14));
+            normalBg.setColor((accentColor & 0x00FFFFFF) | 0x18000000);
+            normalBg.setStroke(dp(1), (accentColor & 0x00FFFFFF) | 0x48000000);
+            android.graphics.drawable.GradientDrawable pressedBg = new android.graphics.drawable.GradientDrawable();
+            pressedBg.setCornerRadius(dp(14));
+            pressedBg.setColor((accentColor & 0x00FFFFFF) | 0x34000000);
+            pressedBg.setStroke(dp(1), (accentColor & 0x00FFFFFF) | 0x77000000);
+            android.graphics.drawable.StateListDrawable states = new android.graphics.drawable.StateListDrawable();
+            states.addState(new int[]{android.R.attr.state_pressed}, pressedBg);
+            states.addState(new int[]{}, normalBg);
+            card.setBackground(states);
+            if (card.getChildCount() > 0 && card.getChildAt(0) instanceof ImageView) {
+                ((ImageView) card.getChildAt(0)).setColorFilter(new PorterDuffColorFilter(accentColor, PorterDuff.Mode.SRC_IN));
+            }
+            if (card.getChildCount() > 1 && card.getChildAt(1) instanceof TextView) {
+                ((TextView) card.getChildAt(1)).setTextColor(accentColor);
+            }
+        }
+
+        private void updateColgramButtonsTheme() {
+            boolean dark = Theme.isCurrentThemeDark();
+            int baseAccent = Theme.getColor(Theme.key_featuredStickers_addButton);
+            if (baseAccent == 0) baseAccent = 0xFF2AABEE;
+            int qrAccent = dark ? 0xFF60A5FA : baseAccent;
+            int botAccent = dark ? 0xFF34D399 : 0xFF059669;
+            int mailAccent = dark ? 0xFF22D3EE : 0xFF0891B2;
+            styleColgramActionButton(colgramHeaderBadge, dark ? 0xFFFB7185 : 0xFFE11D48);
+            styleColgramActionButton(qrLoginBtn, qrAccent);
+            styleColgramActionButton(botLoginBtn, botAccent);
+            styleColgramActionButton(tempMailBtn, mailAccent);
+        }
+
+        public PhoneView(Context context) {
+            super(context);
+
+            setOrientation(VERTICAL);
+            setGravity(Gravity.CENTER);
+
+            boolean isRuIntro = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            if (activityMode != MODE_CHANGE_PHONE_NUMBER) {
+                colgramHeaderBadge = createColgramActionButton(
+                        context,
+                        R.drawable.outline_shield_check,
+                        isRuIntro ? "Colgram · Прямой вход и защита" : "Colgram · Direct & Protected",
+                        Theme.isCurrentThemeDark() ? 0xFFFB7185 : 0xFFE11D48,
+                        v -> presentFragment(new ColgramDefenderActivity()));
+                colgramHeaderBadge.setPadding(dp(12), dp(5), dp(14), dp(5));
+                addView(colgramHeaderBadge, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, 30, Gravity.CENTER_HORIZONTAL, 16, 0, 16, 10));
+            }
+
+            titleView = new TextView(context);"""
+        if "createColgramActionButton(" not in content_norm and phoneview_ctor in content_norm:
+            content_norm = content_norm.replace(phoneview_ctor, phoneview_helpers, 1)
+
+        alt_block_new = """addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 8, 32, 0));
+
+            LinearLayout altButtonsRow = new LinearLayout(context);
+            altButtonsRow.setOrientation(LinearLayout.HORIZONTAL);
+            altButtonsRow.setGravity(Gravity.CENTER);
+            boolean isRuLang = org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo() != null && "ru".equalsIgnoreCase(org.telegram.messenger.LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+            boolean darkTheme = Theme.isCurrentThemeDark();
+            int accentBtnColor = Theme.getColor(Theme.key_featuredStickers_addButton);
+            if (accentBtnColor == 0) accentBtnColor = 0xFF2AABEE;
+
+            qrLoginBtn = createColgramActionButton(
+                    context,
+                    R.drawable.msg_qrcode,
+                    isRuLang ? "Вход по QR" : "QR Log in",
+                    darkTheme ? 0xFF60A5FA : accentBtnColor,
+                    v -> org.telegram.ui.ColgramQRLoginBottomSheet.show(LoginActivity.this, currentAccount));
+            altButtonsRow.addView(qrLoginBtn, LayoutHelper.createLinear(0, 44, 1.0f, Gravity.CENTER, 0, 0, 6, 0));
+
+            botLoginBtn = createColgramActionButton(
+                    context,
+                    R.drawable.msg_bot,
+                    isRuLang ? "Токен бота" : "Bot Token",
+                    darkTheme ? 0xFF34D399 : 0xFF059669,
+                    v -> org.telegram.ui.ColgramBotLoginBottomSheet.show(LoginActivity.this, currentAccount));
+            altButtonsRow.addView(botLoginBtn, LayoutHelper.createLinear(0, 44, 1.0f, Gravity.CENTER, 6, 0, 0, 0));
+
+            addView(altButtonsRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 24, 14, 24, 6));
+
+            if (activityMode != MODE_CHANGE_PHONE_NUMBER) {
+                tempMailBtn = createColgramActionButton(
+                        context,
+                        R.drawable.msg_send,
+                        isRuLang ? "Временная почта для кода" : "Temp Mail for Verification",
+                        darkTheme ? 0xFF22D3EE : 0xFF0891B2,
+                        v -> presentFragment(new ColgramTempMailActivity()));
+                addView(tempMailBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 38, Gravity.CENTER_HORIZONTAL, 24, 2, 24, 4));
+            }"""
+        old_alt_re = re.compile(
+            r'addView\(subtitleView, LayoutHelper\.createLinear\(LayoutHelper\.MATCH_PARENT, LayoutHelper\.WRAP_CONTENT, Gravity\.CENTER_HORIZONTAL, 32, 8, 32, 0\)\);'
+            r'\s*LinearLayout altButtonsRow = new LinearLayout\(context\);.*?addView\(altButtonsRow, LayoutHelper\.createLinear\(LayoutHelper\.MATCH_PARENT, LayoutHelper\.WRAP_CONTENT, Gravity\.CENTER_HORIZONTAL, 32, 14, 32, 6\)\);',
+            re.DOTALL
+        )
         target = "addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 32, 8, 32, 0));"
-        if target in content:
-            return content.replace(target, alt_login_btn, 1)
-        return content
+        if "tempMailBtn" not in content_norm:
+            if old_alt_re.search(content_norm):
+                content_norm = old_alt_re.sub(alt_block_new, content_norm, count=1)
+            elif target in content_norm:
+                content_norm = content_norm.replace(target, alt_block_new, 1)
+
+        upd_anchor = "            subtitleView.setLinkTextColor(Theme.getColor(Theme.key_chat_messageLinkIn));\n            for (int i = 0; i < countryButton.getChildCount(); i++)"
+        upd_new = "            subtitleView.setLinkTextColor(Theme.getColor(Theme.key_chat_messageLinkIn));\n            updateColgramButtonsTheme();\n            for (int i = 0; i < countryButton.getChildCount(); i++)"
+        if "updateColgramButtonsTheme();" not in content_norm and upd_anchor in content_norm:
+            content_norm = content_norm.replace(upd_anchor, upd_new, 1)
+
+        out = content_norm.replace("\n", nl)
+        return CONVERGED if out == content else out
 
     patch_file(
         login_activity,
         login_btn_replacer,
-        alt_login_btn,
+        None,
         "LoginActivity QR Login & Bot Token Buttons"
     )
 
@@ -861,10 +988,18 @@ def inject_hooks(repo_path):
 
     # 14. UserInfoActivity.java -> Bypass account limit check on Add Account
     user_info_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "UserInfoActivity.java")
+    def user_info_unlock_injector(content):
+        if "freeAccounts -=" not in content:
+            return CONVERGED
+        old_ui = "if (!UserConfig.hasPremiumOnAccounts()) {\n                freeAccounts -= (UserConfig.MAX_ACCOUNT_COUNT - UserConfig.MAX_ACCOUNT_DEFAULT_COUNT);\n            }"
+        if old_ui in content:
+            return content.replace(old_ui, "// Colgram: all account slots unlocked without premium", 1)
+        return content
+
     patch_file(
         user_info_activity,
-        "if (!UserConfig.hasPremiumOnAccounts()) {\n                freeAccounts -= (UserConfig.MAX_ACCOUNT_COUNT - UserConfig.MAX_ACCOUNT_DEFAULT_COUNT);\n            }",
-        "// Colgram: all account slots unlocked without premium",
+        user_info_unlock_injector,
+        None,
         "UserInfoActivity Unlock Add Account"
     )
 
@@ -960,6 +1095,27 @@ def inject_hooks(repo_path):
                         content = content.replace(old_lang, new_lang, 1)
                         break
 
+            if "import org.telegram.messenger.Emoji;" not in content:
+                content = content.replace(
+                    "import org.telegram.messenger.ApplicationLoader;",
+                    "import org.telegram.messenger.ApplicationLoader;\nimport org.telegram.messenger.Emoji;",
+                    1
+                )
+
+            if "langBadge.setText(isRuStart" in content and "Emoji.replaceEmoji" not in content:
+                content = content.replace(
+                    'langBadge.setText(isRuStart ? "🇷🇺 RU" : "🇬🇧 EN");',
+                    'langBadge.setText(Emoji.replaceEmoji(isRuStart ? "🇷🇺 RU" : "🇬🇧 EN", langBadge.getPaint().getFontMetricsInt(), false));',
+                    1
+                )
+                content = content.replace(
+                    'langBadge.setText(target.equals("ru") ? "🇷🇺 RU" : "🇬🇧 EN");',
+                    'langBadge.setText(Emoji.replaceEmoji(target.equals("ru") ? "🇷🇺 RU" : "🇬🇧 EN", langBadge.getPaint().getFontMetricsInt(), false));',
+                    1
+                )
+
+            if "langBadge.setText" in content and "Emoji.replaceEmoji" in content:
+                return CONVERGED
             if "langBadge.setText" in content:
                 return content
             
@@ -1095,12 +1251,12 @@ def inject_hooks(repo_path):
 
         // Top-right language badge
         TextView langBadge = new TextView(context);
-        langBadge.setText(isRuStart ? "🇷🇺 RU" : "🇬🇧 EN");
         langBadge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
         langBadge.setTypeface(AndroidUtilities.bold());
         langBadge.setTextColor(0xFFFFFFFF);
         langBadge.setGravity(Gravity.CENTER);
         langBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
+        langBadge.setText(Emoji.replaceEmoji(isRuStart ? "🇷🇺 RU" : "🇬🇧 EN", langBadge.getPaint().getFontMetricsInt(), false));
         langBadge.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(16), 0x22FFFFFF, 0x44FFFFFF));
         frameContainerView.addView(langBadge, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 32, Gravity.TOP | Gravity.RIGHT, 0, 16, 16, 0));
         langBadge.setOnClickListener(v -> {
@@ -1117,7 +1273,7 @@ def inject_hooks(repo_path):
             if (targetInfo != null) {
                 LocaleController.getInstance().applyLanguage(targetInfo, true, false, currentAccount);
                 MessagesController.getGlobalMainSettings().edit().putString("language", targetInfo.getKey()).apply();
-                langBadge.setText(target.equals("ru") ? "🇷🇺 RU" : "🇬🇧 EN");
+                langBadge.setText(Emoji.replaceEmoji(target.equals("ru") ? "🇷🇺 RU" : "🇬🇧 EN", langBadge.getPaint().getFontMetricsInt(), false));
                 startMessagingButton.setText(target.equals("ru") ? "Начать общение" : "Start Messaging");
                 switchLanguageTextView.setText(target.equals("ru") ? "Continue in English" : "Продолжить на русском");
             }
@@ -1154,10 +1310,7 @@ def inject_hooks(repo_path):
 
             return content
 
-        # The marker MUST name a symbol only the current version emits. With
-        # "langBadge.setText" the guard was satisfied by every build that had the badge at
-        # all, so the callable below - and every repair inside it - was dead code.
-        patch_file(intro_activity, intro_lang_replacer, "colgramBadgeTop", "IntroActivity Instant Language Switcher & Badge")
+        patch_file(intro_activity, intro_lang_replacer, None, "IntroActivity Instant Language Switcher & Badge")
 
     # 16. LoginActivity.java -> Phone entry and bounded code request on the selected route.
     def phone_focus_updater(content):
@@ -1238,11 +1391,44 @@ def inject_hooks(repo_path):
             ):
                 if emoji in content:
                     content = content.replace(emoji, plain)
-            if "Плагины и маркетплейс" in content:
-                return content
+            if "colgramSub" in content:
+                return CONVERGED
             if target not in content:
                 return content
             inject = """
+        io.addGap();
+        org.telegram.ui.ActionBar.ActionBarMenuSubItem colgramSub;
+        io.add(R.drawable.msg_customize, "Плагины и маркетплейс", () -> {
+            presentFragment(new ColgramPluginsActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFA855F7);
+        io.add(R.drawable.msg_settings, "Настройки Colgram", () -> {
+            presentFragment(new ColgramSettingsActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFEF4444);
+        io.add(R.drawable.msg_send, "Временная почта", () -> {
+            presentFragment(new ColgramTempMailActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF06B6D4);
+        io.add(R.drawable.msg_download, "Версии Telegram", () -> {
+            presentFragment(new ColgramVersionsActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF10B981);
+        io.add(R.drawable.msg_policy, "Анти-спам", () -> {
+            presentFragment(new ColgramAntiSpamActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFF97316);
+        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+            io.add(R.drawable.msg_retry, "Синхронизировать чаты бота", () -> {
+                org.colgram.core.ColgramBotSync.syncBotDialogs(getParentActivity(), currentAccount, true);
+            });
+            if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF3B82F6);
+            io.add(R.drawable.msg_edit, "Написать от имени бота", () -> {
+                org.colgram.core.ColgramBotSync.showStartChatDialog(getParentActivity(), currentAccount);
+            });
+            if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF8B5CF6);
+        }"""
+            old_uncolored = """
         io.addGap();
         io.add(R.drawable.msg_customize, "Плагины и маркетплейс", () -> {
             presentFragment(new ColgramPluginsActivity());
@@ -1267,13 +1453,55 @@ def inject_hooks(repo_path):
                 org.colgram.core.ColgramBotSync.showStartChatDialog(getParentActivity(), currentAccount);
             });
         }"""
-            return content.replace(target, target + inject, 1)
+            nl = "\r\n" if "\r\n" in content else "\n"
+            if old_uncolored.strip().replace("\r\n", "\n") in content.replace("\r\n", "\n"):
+                return content.replace("\r\n", "\n").replace(old_uncolored.strip(), inject.strip(), 1).replace("\n", nl)
+            return content.replace(target, target + inject.replace("\n", nl), 1)
 
         patch_file(
             dialogs_activity,
             options_menu_injector,
-            "Плагины и маркетплейс",
+            "colgramSub",
             "DialogsActivity Options Menu: Colgram Entries"
+        )
+
+        def dialogs_ai_and_fx_injector(content):
+            changed = False
+            if "new ColgramAiActivity()" not in content:
+                ai_anchor = """        io.add(R.drawable.msg_customize, "Плагины и маркетплейс", () -> {
+            presentFragment(new ColgramPluginsActivity());
+        });"""
+                ai_block = """        io.add(R.drawable.msg_bot, "Koliti AI", () -> {
+            presentFragment(new ColgramAiActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFE11D48);
+""" + ai_anchor
+                if ai_anchor in content:
+                    content = content.replace(ai_anchor, ai_block, 1)
+                    changed = True
+            if "ColgramEasterEggs.handleDialogsTitleTap" not in content:
+                title_anchor = "        actionBar.setTitleActionRunnable(() -> {"
+                title_repl = """        actionBar.setTitleActionRunnable(() -> {
+            if (ColgramEasterEggs.handleDialogsTitleTap(DialogsActivity.this, fragmentView)) {
+                return;
+            }"""
+                if title_anchor in content:
+                    content = content.replace(title_anchor, title_repl, 1)
+                    changed = True
+            if "ColgramMenuChrome.attachDynamicListAnimations(viewPage.listView);" not in content:
+                list_anchor = "            viewPage.listView.setPivotY(0);"
+                list_repl = """            viewPage.listView.setPivotY(0);
+            ColgramMenuChrome.attachDynamicListAnimations(viewPage.listView);"""
+                if list_anchor in content:
+                    content = content.replace(list_anchor, list_repl, 1)
+                    changed = True
+            return content if changed else CONVERGED
+
+        patch_file(
+            dialogs_activity,
+            dialogs_ai_and_fx_injector,
+            "ColgramEasterEggs.handleDialogsTitleTap",
+            "DialogsActivity AI Menu, Dynamic Animations & Matrix Easter Egg"
         )
 
         # 65b. SettingsActivity -> drop the branded "Colgram" block so its rows sit inside the
@@ -1289,9 +1517,9 @@ def inject_hooks(repo_path):
             # Colgram rows were already sitting exactly where this edit wants them.
             merged_pattern = re.compile(
                 r'R\.string\.SettingsLanguage\),\s*LocaleController\.getCurrentLanguageName\(\)\)\);'
-                r'\s*items\.add\(SettingCell\.Factory\.of\(101,')
+                r'\s*items\.add\(SettingCell\.Factory\.of\(10[18],')
             if merged_pattern.search(content):
-                return content
+                return CONVERGED
             # The shadow plus the branded header is the shape this edit removes.
             header_pattern = re.compile(
                 r'        items\.add\(UItem\.asShadow\(null\)\);\s*'
@@ -1362,24 +1590,42 @@ def inject_hooks(repo_path):
     #
     # This only lifts the CLIENT-side guard. Telegram's server still enforces its own
     # pinned-dialog limit, which a client cannot override.
-    patch_file(
-        messages_controller,
-        '''maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 5);
+    def mc_unlimited_pins_injector(content):
+        if "// Colgram: unlimited pins" in content and "maxPinnedDialogsCountDefault = 1000" in content:
+            return CONVERGED
+        old_pins = '''maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 5);
         maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 5);
         maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 5);
-        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 5);''',
-        '''maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
-        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins
-        maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
-        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins''',
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 5);'''
+        new_pins = '''maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 10000); // Colgram: unlimited pins
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 10000); // Colgram: unlimited pins
+        maxPinnedDialogsCountDefault = mainPreferences.getInt("maxPinnedDialogsCountDefault", 10000); // Colgram: unlimited pins
+        maxPinnedDialogsCountPremium = mainPreferences.getInt("maxPinnedDialogsCountPremium", 10000); // Colgram: unlimited pins'''
+        if old_pins in content:
+            return content.replace(old_pins, new_pins, 1)
+        return content
+
+    def mc_unlimited_folder_pins_injector(content):
+        if "dialogFiltersPinnedLimitDefault = 10000;" in content or ("// Colgram: unlimited pins" in content and "maxFolderPinnedDialogsCountDefault" in content):
+            return CONVERGED
+        old_fp = '''maxFolderPinnedDialogsCountDefault = mainPreferences.getInt("maxFolderPinnedDialogsCountDefault", 100);
+        maxFolderPinnedDialogsCountPremium = mainPreferences.getInt("maxFolderPinnedDialogsCountPremium", 100);'''
+        new_fp = '''maxFolderPinnedDialogsCountDefault = mainPreferences.getInt("maxFolderPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
+        maxFolderPinnedDialogsCountPremium = mainPreferences.getInt("maxFolderPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins'''
+        if old_fp in content:
+            return content.replace(old_fp, new_fp, 1)
+        return content
+
+    patch_file(
+        messages_controller,
+        mc_unlimited_pins_injector,
+        None,
         "MessagesController Unlimited Pins"
     )
     patch_file(
         messages_controller,
-        '''maxFolderPinnedDialogsCountDefault = mainPreferences.getInt("maxFolderPinnedDialogsCountDefault", 100);
-        maxFolderPinnedDialogsCountPremium = mainPreferences.getInt("maxFolderPinnedDialogsCountPremium", 100);''',
-        '''maxFolderPinnedDialogsCountDefault = mainPreferences.getInt("maxFolderPinnedDialogsCountDefault", 1000); // Colgram: unlimited pins
-        maxFolderPinnedDialogsCountPremium = mainPreferences.getInt("maxFolderPinnedDialogsCountPremium", 1000); // Colgram: unlimited pins''',
+        mc_unlimited_folder_pins_injector,
+        None,
         "MessagesController Unlimited Folder Pins"
     )
 
@@ -1804,6 +2050,9 @@ def inject_hooks(repo_path):
         "        if (isDefault != null) {\n"
         "            isDefault[0] = colgramIsDefault[0];\n"
         "        }\n"
+        "        if (!ignoreAnimation && animatingColors != null && animatingColors.indexOfKey(key) >= 0) {\n"
+        "            return colgramResolved;\n"
+        "        }\n"
         "        final boolean colgramCyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();\n"
         # ---------------------------------------------------------------------------
         # The cyber palette, applied as a COMPLETE set.
@@ -1885,11 +2134,97 @@ def inject_hooks(repo_path):
         "            return colgramReadableGrayTextColor(colgramCyber);\n"
         "        }\n"
         "        if (colgramDarkSurface && colgramLooksLikeForeground(key)) {\n"
-        "            if (colgramWorstContrast(key, color, colgramCyber) < COLGRAM_MIN_CONTRAST) {\n"
+        "            boolean isCyberAccent = colgramCyber && ((color & 0x00ffffff) == (COLGRAM_CYBER_ACCENT & 0x00ffffff));\n"
+        "            if (!isCyberAccent && colgramWorstContrast(key, color, colgramCyber) < COLGRAM_MIN_CONTRAST) {\n"
         "                return colgramReadableForeground(colgramCyber);\n"
         "            }\n"
         "        }\n"
+        "        if (key == key_chats_actionIcon) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_chats_actionBackground, colgramCyber),\n"
+        "                    0xffffffff, 0xff101418, 2.8);\n"
+        "        }\n"
+        "        if (key == key_featuredStickers_buttonText\n"
+        "                || key == key_chat_msgIvButtonPrimaryInText\n"
+        "                || key == key_chat_msgIvButtonPrimaryOutText) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_featuredStickers_addButton, colgramCyber),\n"
+        "                    0xffffffff, 0xff101418, 2.8);\n"
+        "        }\n"
+        "        if (key == key_dialogFloatingIcon) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_dialogFloatingButton, colgramCyber),\n"
+        "                    0xffffffff, 0xff101418, 2.8);\n"
+        "        }\n"
+        "        if (key == key_chats_unreadCounterText) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_chats_unreadCounter, colgramCyber),\n"
+        "                    0xffffffff, 0xff101418, 2.8);\n"
+        "        }\n"
+        "        if (key == key_picker_badgeText) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_picker_badge, colgramCyber),\n"
+        "                    0xffffffff, 0xff101418, 2.8);\n"
+        "        }\n"
+        "        if (key == key_windowBackgroundWhiteBlackText\n"
+        "                || key == key_chats_name\n"
+        "                || key == key_chats_nameArchived) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),\n"
+        "                    0xffe8eaed, 0xff14181e, 3.8);\n"
+        "        }\n"
+        "        if (key == key_chats_message || key == key_chats_messageArchived) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),\n"
+        "                    0xffb8bdc7, 0xff495057, 2.8);\n"
+        "        }\n"
+        "        if (key == key_dialogTextBlack || key == key_dialogIcon) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber),\n"
+        "                    0xffe8eaed, 0xff14181e, 3.8);\n"
+        "        }\n"
+        "        if (key == key_actionBarDefaultTitle || key == key_actionBarDefaultIcon) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber),\n"
+        "                    0xffffffff, 0xff14181e, 3.2);\n"
+        "        }\n"
+        "        if (key == key_actionBarDefaultSubmenuItem || key == key_actionBarDefaultSubmenuItemIcon) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_actionBarDefaultSubmenuBackground, colgramCyber),\n"
+        "                    0xffe8eaed, 0xff14181e, 3.4);\n"
+        "        }\n"
+        "        if (key == key_chat_messagePanelText || key == key_chat_messagePanelIcons) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_chat_messagePanelBackground, colgramCyber),\n"
+        "                    0xffe8eaed, 0xff14181e, 3.4);\n"
+        "        }\n"
+        "        if (key == key_chat_messagePanelHint) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_chat_messagePanelBackground, colgramCyber),\n"
+        "                    0xff9aa0a6, 0xff5a6570, 2.4);\n"
+        "        }\n"
+        "        if (key == key_chat_messageTextIn) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_chat_inBubble, colgramCyber),\n"
+        "                    0xffe8eaed, 0xff14181e, 3.5);\n"
+        "        }\n"
+        "        if (key == key_chat_messageTextOut) {\n"
+        "            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(\n"
+        "                    color, colgramEffectiveColor(key_chat_outBubble, colgramCyber),\n"
+        "                    0xffe8eaed, 0xff14181e, 3.5);\n"
+        "        }\n"
+        "        if (key == key_chat_serviceText || key == key_chat_serviceLink || key == key_chat_serviceIcon) {\n"
+        "            return colgramCyber ? 0xffffffff : color;\n"
+        "        }\n"
         "        return color;\n"
+        "    }\n"
+        "\n"
+        "    private static int colgramEffectiveColor(int key, boolean cyber) {\n"
+        "        if (cyber) {\n"
+        "            int ov = colgramCyberOverride(key);\n"
+        "            if (ov != 0) return ov;\n"
+        "        }\n"
+        "        return colgramGetColorInternal(key, null, true);\n"
         "    }\n"
         "\n"
         "    private static boolean colgramHasDarkSurface() {\n"
@@ -1953,15 +2288,76 @@ def inject_hooks(repo_path):
         "        return colgramLuma(light) >= 128;\n"
         "    }\n"
         "\n"
-        "    private static boolean colgramLooksLikeForeground(int key) {\n"
-        "        if (colgramIsForegroundKey(key)) {\n"
+        "    private static boolean colgramIsFillOrAccentKey(int key) {\n"
+        "        if (key == key_chat_messagePanelSend\n"
+        "                || key == key_chat_messagePanelVoiceBackground\n"
+        "                || key == key_chat_messagePanelVoicePressed\n"
+        "                || key == key_featuredStickers_addButton\n"
+        "                || key == key_featuredStickers_addButton2\n"
+        "                || key == key_featuredStickers_addButtonPressed\n"
+        "                || key == key_featuredStickers_addedIcon\n"
+        "                || key == key_featuredStickers_unread\n"
+        "                || key == key_chats_actionBackground\n"
+        "                || key == key_chats_actionPressedBackground\n"
+        "                || key == key_chats_archiveBackground\n"
+        "                || key == key_chats_archivePinBackground\n"
+        "                || key == key_chats_archivePullDownBackground\n"
+        "                || key == key_chats_archivePullDownBackgroundActive\n"
+        "                || key == key_chats_unreadCounter\n"
+        "                || key == key_chats_unreadCounterMuted\n"
+        "                || key == key_chats_tabUnreadActiveBackground\n"
+        "                || key == key_chats_tabUnreadUnactiveBackground\n"
+        "                || key == key_topics_unreadCounter\n"
+        "                || key == key_topics_unreadCounterMuted\n"
+        "                || key == key_picker_badge\n"
+        "                || key == key_dialogFloatingButton\n"
+        "                || key == key_dialogFloatingButtonPressed\n"
+        "                || key == key_switchTrack\n"
+        "                || key == key_switchTrackChecked\n"
+        "                || key == key_switchTrackBlue\n"
+        "                || key == key_switchTrackBlueChecked\n"
+        "                || key == key_switch2Track\n"
+        "                || key == key_switch2TrackChecked\n"
+        "                || key == key_checkbox\n"
+        "                || key == key_checkboxDisabled\n"
+        "                || key == key_checkboxSquareBackground\n"
+        "                || key == key_checkboxSquareUnchecked\n"
+        "                || key == key_checkboxSquareDisabled\n"
+        "                || key == key_radioBackground\n"
+        "                || key == key_radioBackgroundChecked\n"
+        "                || key == key_profile_actionBackground\n"
+        "                || key == key_profile_actionPressedBackground\n"
+        "                || key == key_profile_verifiedBackground\n"
+        "                || key == key_telegram_color\n"
+        "                || key == key_glass_tabSelected\n"
+        "                || key == key_chat_inBubble\n"
+        "                || key == key_chat_inBubbleSelected\n"
+        "                || key == key_chat_inBubbleSelectedOverlay\n"
+        "                || key == key_chat_inBubbleShadow\n"
+        "                || key == key_chat_outBubble\n"
+        "                || key == key_chat_outBubbleSelected\n"
+        "                || key == key_chat_outBubbleSelectedOverlay\n"
+        "                || key == key_chat_outBubbleShadow\n"
+        "                || key == key_chat_outBubbleGradient1\n"
+        "                || key == key_chat_outBubbleGradient2\n"
+        "                || key == key_chat_outBubbleGradient3\n"
+        "                || key == key_chat_outBubbleGradientAnimated\n"
+        "                || key == key_chat_outBubbleGradientSelectedOverlay\n"
+        "                || key == key_chat_msgIvButtonPrimaryIn\n"
+        "                || key == key_chat_msgIvButtonPrimaryInPressed\n"
+        "                || key == key_chat_msgIvButtonPrimaryOut\n"
+        "                || key == key_chat_msgIvButtonPrimaryOutPressed\n"
+        "                || key == key_botKeyboard_button_primary\n"
+        "                || key == key_botKeyboard_button_danger\n"
+        "                || key == key_botKeyboard_button_success) {\n"
         "            return true;\n"
         "        }\n"
-        "        int light = getDefaultColor(key);\n"
-        "        if ((light >>> 24) < 0x20) {\n"
-        "            return false;\n"
-        "        }\n"
-        "        return colgramLuma(light) < 128;\n"
+        "        return false;\n"
+        "    }\n"
+        "\n"
+        "    private static boolean colgramLooksLikeForeground(int key) {\n"
+        "        return org.colgram.core.ColgramThemePolicy.shouldTreatAsDarkForeground(\n"
+        "                getDefaultColor(key), colgramIsForegroundKey(key), colgramIsFillOrAccentKey(key));\n"
         "    }\n"
         "\n"
         "    /**\n"
@@ -1982,7 +2378,10 @@ def inject_hooks(repo_path):
         "     */\n"
         "    private static int colgramWorstContrast(int key, int color, boolean cyber) {\n"
         "        if (cyber) {\n"
-        "            return colgramContrast(color, COLGRAM_CYBER_BG);\n"
+        "            int worstCyber = colgramContrast(color, COLGRAM_CYBER_BG);\n"
+        "            worstCyber = Math.min(worstCyber, colgramContrast(color, COLGRAM_CYBER_SURFACE));\n"
+        "            worstCyber = Math.min(worstCyber, colgramContrast(color, COLGRAM_CYBER_FIELD));\n"
+        "            return worstCyber;\n"
         "        }\n"
         "        int worst = colgramContrast(color, colgramGetColorInternal(key_windowBackgroundWhite, null, true));\n"
         "        worst = Math.min(worst, colgramContrast(color, colgramGetColorInternal(key_dialogBackground, null, true)));\n"
@@ -2006,15 +2405,17 @@ def inject_hooks(repo_path):
         "    // for stray literals. Backgrounds and foregrounds are chosen TOGETHER - a palette\n"
         "    // that overrides only the background is how the UI ended up invisible.\n"
         "    private static final int COLGRAM_CYBER_BG        = 0xff0e0f12;\n"
+        "    private static final int COLGRAM_CYBER_BG_ALT    = 0xff08090c;\n"
         "    private static final int COLGRAM_CYBER_SURFACE   = 0xff16181e;\n"
         "    private static final int COLGRAM_CYBER_FIELD     = 0xff22252d;\n"
         "    private static final int COLGRAM_CYBER_ACCENT    = 0xffff3344;\n"
+        "    private static final int COLGRAM_CYBER_ACCENT_DARK = 0xffcc2233;\n"
         "    private static final int COLGRAM_CYBER_TEXT      = 0xffe8eaed;\n"
         "    private static final int COLGRAM_CYBER_TEXT_DIM  = 0xff9aa0a6;\n"
         "    // 70% white: the glass keys ship as dark ink for a white pill, and the pill is now\n"
         "    // dark. Translucent because upstream composes these over the blurred backdrop.\n"
         "    private static final int COLGRAM_CYBER_GLASS_INK = 0xb3e9edf3;\n"
-        "    private static final int COLGRAM_CYBER_HINT      = 0xff6b7280;\n"
+        "    private static final int COLGRAM_CYBER_HINT      = 0xff858c99;\n"
         "    private static final int COLGRAM_CYBER_DIVIDER   = 0xff2a2e37;\n"
         "    /**\n"
         "     * The cyber palette, applied as a COMPLETE set: foreground and background are\n"
@@ -2032,25 +2433,43 @@ def inject_hooks(repo_path):
         "     */\n"
         "    private static int colgramCyberOverride(int key) {\n"
         "        // Backgrounds\n"
-        "        if (key == key_windowBackgroundWhite || key == key_windowBackgroundGray\n"
-        "                || key == key_windowBackgroundGrayShadow) {\n"
+        "        if (key == key_windowBackgroundWhite) {\n"
         "            return COLGRAM_CYBER_BG;\n"
+        "        }\n"
+        "        if (key == key_windowBackgroundGray || key == key_windowBackgroundGrayShadow) {\n"
+        "            return COLGRAM_CYBER_BG_ALT;\n"
         "        }\n"
         "        if (key == key_actionBarDefault || key == key_actionBarDefaultSelector\n"
         "                || key == key_actionBarWhiteSelector) {\n"
         "            return COLGRAM_CYBER_SURFACE;\n"
         "        }\n"
-        "        if (key == key_windowBackgroundWhiteInputField) {\n"
+        "        if (key == key_listSelector) {\n"
+        "            return 0x22ff3344;\n"
+        "        }\n"
+        "        if (key == key_windowBackgroundWhiteInputField || key == key_dialogInputField) {\n"
         "            return COLGRAM_CYBER_FIELD;\n"
         "        }\n"
         "        // Accents\n"
         "        if (key == key_windowBackgroundWhiteInputFieldActivated\n"
+        "                || key == key_dialogInputFieldActivated\n"
         "                || key == key_chats_actionBackground\n"
         "                || key == key_chats_actionPressedBackground\n"
         "                || key == key_dialogFloatingButton\n"
+        "                || key == key_chat_messagePanelSend\n"
         "                || key == key_switchTrackChecked\n"
-        "                || key == key_checkboxCheck) {\n"
+        "                || key == key_checkboxCheck\n"
+        "                || key == key_featuredStickers_addButton\n"
+        "                || key == key_featuredStickers_addButton2) {\n"
         "            return COLGRAM_CYBER_ACCENT;\n"
+        "        }\n"
+        "        if (key == key_featuredStickers_addButtonPressed) {\n"
+        "            return COLGRAM_CYBER_ACCENT_DARK;\n"
+        "        }\n"
+        "        if (key == key_featuredStickers_buttonText\n"
+        "                || key == key_chats_actionIcon\n"
+        "                || key == key_dialogFloatingIcon\n"
+        "                || key == key_chats_unreadCounterText) {\n"
+        "            return 0xffffffff;\n"
         "        }\n"
         "        // The blue accent family. These were missing entirely, which is why turning\n"
         "        // Cyber on left every section header, link and blue icon stock blue next to a\n"
@@ -2059,11 +2478,18 @@ def inject_hooks(repo_path):
         "        // covered backgrounds and body text but not the one thing that names a section.\n"
         "        if (key == key_windowBackgroundWhiteBlueHeader\n"
         "                || key == key_windowBackgroundWhiteBlueText\n"
+        "                || key == key_windowBackgroundWhiteBlueText2\n"
+        "                || key == key_windowBackgroundWhiteBlueText3\n"
         "                || key == key_windowBackgroundWhiteBlueText4\n"
+        "                || key == key_windowBackgroundWhiteBlueText5\n"
+        "                || key == key_windowBackgroundWhiteBlueText6\n"
+        "                || key == key_windowBackgroundWhiteBlueText7\n"
         "                || key == key_windowBackgroundWhiteBlueIcon\n"
+        "                || key == key_windowBackgroundWhiteLinkText\n"
         "                || key == key_windowBackgroundWhiteValueText\n"
         "                || key == key_dialogTextLink\n"
-        "                || key == key_featuredStickers_addButton) {\n"
+        "                || key == key_text_RedRegular\n"
+        "                || key == key_text_RedBold) {\n"
         "            return COLGRAM_CYBER_ACCENT;\n"
         "        }\n"
         "        // Primary text and icons - the keys whose absence made the UI invisible.\n"
@@ -2085,7 +2511,7 @@ def inject_hooks(repo_path):
         "                || key == key_actionBarDefaultSubtitle) {\n"
         "            return COLGRAM_CYBER_TEXT_DIM;\n"
         "        }\n"
-        "        if (key == key_windowBackgroundWhiteHintText) {\n"
+        "        if (key == key_windowBackgroundWhiteHintText || key == key_dialogTextHint) {\n"
         "            return COLGRAM_CYBER_HINT;\n"
         "        }\n"
         "        // Separators and inactive controls: invisible on the dark panel otherwise.\n"
@@ -2164,8 +2590,67 @@ def inject_hooks(repo_path):
         "                || key == key_chats_unreadCounter\n"
         "                || key == key_topics_unreadCounter\n"
         "                || key == key_featuredStickers_unread\n"
-        "                || key == key_picker_badge) {\n"
+        "                || key == key_picker_badge\n"
+        "                || key == key_chats_sentCheck\n"
+        "                || key == key_chats_sentReadCheck\n"
+        "                || key == key_chats_verifiedBackground\n"
+        "                || key == key_profile_verifiedBackground\n"
+        "                || key == key_switchTrackBlueChecked\n"
+        "                || key == key_switch2TrackChecked\n"
+        "                || key == key_actionBarTabActiveText\n"
+        "                || key == key_profile_tabSelectedText\n"
+        "                || key == key_chat_status) {\n"
         "            return COLGRAM_CYBER_ACCENT;\n"
+        "        }\n"
+        "        if (key == key_chats_name || key == key_chats_nameArchived || key == key_profile_title\n"
+        "                || key == key_chat_messageTextIn || key == key_chat_messageTextOut\n"
+        "                || key == key_chat_messagePanelText || key == key_chat_topPanelTitle\n"
+        "                || key == key_chat_serviceText || key == key_chat_serviceLink || key == key_chat_serviceIcon) {\n"
+        "            return COLGRAM_CYBER_TEXT;\n"
+        "        }\n"
+        "        if (key == key_chats_message || key == key_chats_messageArchived\n"
+        "                || key == key_chats_date || key == key_chats_pinnedIcon\n"
+        "                || key == key_chats_muteIcon || key == key_chat_messagePanelIcons\n"
+        "                || key == key_chat_topPanelMessage || key == key_chat_topPanelClose\n"
+        "                || key == key_actionBarTabUnactiveText) {\n"
+        "            return COLGRAM_CYBER_TEXT_DIM;\n"
+        "        }\n"
+        "        if (key == key_chat_messagePanelHint) {\n"
+        "            return COLGRAM_CYBER_HINT;\n"
+        "        }\n"
+        "        if (key == key_chat_inBubble || key == key_chat_messagePanelBackground || key == key_chat_topPanelBackground) {\n"
+        "            return COLGRAM_CYBER_SURFACE;\n"
+        "        }\n"
+        "        if (key == key_chat_inBubbleSelected) {\n"
+        "            return 0xff232732;\n"
+        "        }\n"
+        "        if (key == key_chat_inBubbleShadow) {\n"
+        "            return 0xff050608;\n"
+        "        }\n"
+        "        if (key == key_chat_outBubble || key == key_chat_outBubbleGradient1) {\n"
+        "            return 0xff2b141b;\n"
+        "        }\n"
+        "        if (key == key_chat_outBubbleGradient2) {\n"
+        "            return 0xff38151f;\n"
+        "        }\n"
+        "        if (key == key_chat_outBubbleGradient3) {\n"
+        "            return 0xff241118;\n"
+        "        }\n"
+        "        if (key == key_chat_outBubbleSelected) {\n"
+        "            return 0xff3d1a24;\n"
+        "        }\n"
+        "        if (key == key_chat_outBubbleShadow) {\n"
+        "            return 0xff080507;\n"
+        "        }\n"
+        "        if (key == key_chats_unreadCounterMuted) {\n"
+        "            return COLGRAM_CYBER_FIELD;\n"
+        "        }\n"
+        "        if (key == key_chats_verifiedCheck || key == key_profile_verifiedCheck\n"
+        "                || key == key_switchTrackBlueThumb || key == key_switchTrackBlueThumbChecked) {\n"
+        "            return 0xffffffff;\n"
+        "        }\n"
+        "        if (key == key_switchTrackBlue || key == key_switch2Track) {\n"
+        "            return COLGRAM_CYBER_DIVIDER;\n"
         "        }\n"
         "        return 0;\n"
         "    }\n"
@@ -2318,6 +2803,18 @@ def inject_hooks(repo_path):
         "                || key == key_windowBackgroundWhiteBlueText7\n"
         "                || key == key_windowBackgroundWhiteGrayIcon\n"
         "                || key == key_windowBackgroundWhiteBlueIcon\n"
+        "                || key == key_dialogTextBlack\n"
+        "                || key == key_dialogTextBlue\n"
+        "                || key == key_dialogTextBlue2\n"
+        "                || key == key_dialogTextBlue4\n"
+        "                || key == key_chat_messagePanelText\n"
+        "                || key == key_chat_messagePanelHint\n"
+        "                || key == key_chat_messagePanelIcons\n"
+        "                || key == key_chats_name\n"
+        "                || key == key_chats_nameArchived\n"
+        "                || key == key_chats_message\n"
+        "                || key == key_chats_messageArchived\n"
+        "                || key == key_chats_actionMessage\n"
         "                || key == key_actionBarDefaultIcon\n"
         "                || key == key_actionBarDefaultTitle\n"
         "                || key == key_actionBarDefaultSubtitle\n"
@@ -2447,7 +2944,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramSettingsActivity.java", "ColgramCallRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java"]:
+        for name in ["ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -2654,6 +3151,13 @@ def inject_hooks(repo_path):
         # the guard forced the whole function body one level deeper and is what produced
         # the IndentationError that stopped this script from parsing at all.
         def settings_items_injector(content):
+            defender_row = '        items.add(SettingCell.Factory.of(107, 0xFF00C853, 0xFF1B5E20, R.drawable.msg_secret, "Бот-защитник Telegram", "Ищет и закрывает все дыры и утечки автоматом"));'
+            if "SettingCell.Factory.of(107," in content:
+                return CONVERGED
+            if "SettingCell.Factory.of(101," in content:
+                anchor101 = '        items.add(SettingCell.Factory.of(101, 0xFFFF3344, 0xFFCC1122, R.drawable.msg_settings, "Настройки Colgram", "Анонимность, защита от удаления, обход блокировок"));'
+                if anchor101 in content:
+                    return content.replace(anchor101, anchor101 + "\n" + defender_row, 1)
             target = "items.add(SettingCell.Factory.of(10, IconBackgroundColors.PURPLE.top, IconBackgroundColors.PURPLE.bottom, R.drawable.settings_language, getString(R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));"
             if target not in content:
                 return content
@@ -2662,13 +3166,15 @@ def inject_hooks(repo_path):
         items.add(UItem.asShadow(null));
         items.add(UItem.asHeader("Colgram"));
         items.add(SettingCell.Factory.of(101, 0xFFFF3344, 0xFFCC1122, R.drawable.msg_settings, "Настройки Colgram", "Анонимность, защита от удаления, обход блокировок"));
+        items.add(SettingCell.Factory.of(107, 0xFF00C853, 0xFF1B5E20, R.drawable.msg_secret, "Бот-защитник Telegram", "Ищет и закрывает все дыры и утечки автоматом"));
         items.add(SettingCell.Factory.of(102, 0xFF9C27B0, 0xFF673AB7, R.drawable.msg_customize, "Плагины и Маркетплейс", "Каталог расширений exteraGram, Python скрипты"));
         items.add(SettingCell.Factory.of(103, 0xFF00BCD4, 0xFF009688, R.drawable.msg_send, "Временная почта (Temp Mail)", "Быстрая анонимная регистрация без спама"));
         items.add(SettingCell.Factory.of(104, 0xFF4CAF50, 0xFF2E7D32, R.drawable.msg_download, "Версии Telegram и обновления", "Переключение каналов и загрузка APK"));
+        items.add(SettingCell.Factory.of(105, 0xFFFF5722, 0xFFD84315, R.drawable.msg_policy, "Антиспам и Colemailer", "Защита от спам-пингов, рассылки, фильтры"));
         items.add(UItem.asShadow(null));"""
             return content.replace(target, inject, 1)
 
-        patch_file(settings_activity, settings_items_injector, "items.add(SettingCell.Factory.of(101", "SettingsActivity Inject Native Colgram Section in List")
+        patch_file(settings_activity, settings_items_injector, "items.add(SettingCell.Factory.of(107", "SettingsActivity Inject Native Colgram Section in List")
         # Must run after the call above: that is the patch that writes the "Colgram" header,
         # and this is the one that removes it. It used to be emitted ~1400 lines earlier, so
         # on a pristine checkout there was nothing to merge yet, the anchor missed, and a miss
@@ -2678,14 +3184,22 @@ def inject_hooks(repo_path):
             os.path.join(repo_path, "TMessagesProj", "src", "main", "java",
                          "org", "telegram", "ui", "SettingsActivity.java"),
             settings_merge_injector,
-            'R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));\n'
-            '\n'
-            '        items.add(SettingCell.Factory.of(101,',
+            None,
             "SettingsActivity Merges Colgram Rows Into Stock List"
         )
 
 
         def settings_clicks_injector(content):
+            if "case 107:" in content:
+                return CONVERGED
+            anchor106 = """            case 106:
+                ColgramAccountSwitcherHelper.showAccountVaultSheet(this, currentAccount);
+                break;"""
+            if anchor106 in content:
+                return content.replace(anchor106, anchor106 + """
+            case 107:
+                presentSettingFragment(new ColgramDefenderActivity());
+                break;""", 1)
             target = """            case 10:
                 presentSettingFragment(new LanguageSelectActivity());
                 break;"""
@@ -2697,6 +3211,9 @@ def inject_hooks(repo_path):
             case 101:
                 presentSettingFragment(new ColgramSettingsActivity());
                 break;
+            case 107:
+                presentSettingFragment(new ColgramDefenderActivity());
+                break;
             case 102:
                 presentSettingFragment(new ColgramPluginsActivity());
                 break;
@@ -2705,10 +3222,48 @@ def inject_hooks(repo_path):
                 break;
             case 104:
                 presentSettingFragment(new ColgramVersionsActivity());
+                break;
+            case 105:
+                presentSettingFragment(new ColgramAntiSpamActivity());
                 break;"""
             return content.replace(target, inject, 1)
 
-        patch_file(settings_activity, settings_clicks_injector, "case 101:", "SettingsActivity Route Colgram Items Clicks")
+        patch_file(settings_activity, settings_clicks_injector, "case 107:", "SettingsActivity Route Colgram Items Clicks")
+
+        def settings_ai_and_anim_injector(content):
+            changed = False
+            if "SettingCell.Factory.of(108," not in content:
+                ai_anchor = '        items.add(SettingCell.Factory.of(101,'
+                ai_row = '        items.add(SettingCell.Factory.of(108, 0xFFE11D48, 0xFF9F1239, R.drawable.msg_bot, "Koliti AI", "Встроено офлайн • Vision • Веб-синтез"));\n'
+                if ai_anchor in content:
+                    content = content.replace(ai_anchor, ai_row + ai_anchor, 1)
+                    changed = True
+            if "case 108:" not in content:
+                case_anchor = """            case 107:
+                presentSettingFragment(new ColgramDefenderActivity());
+                break;"""
+                case_repl = case_anchor + """
+            case 108:
+                presentSettingFragment(new ColgramAiActivity());
+                break;"""
+                if case_anchor in content:
+                    content = content.replace(case_anchor, case_repl, 1)
+                    changed = True
+            if "ColgramMenuChrome.attachDynamicListAnimations(listView);" not in content:
+                anim_anchor = "        listView.setClipToPadding(false);"
+                anim_repl = """        listView.setClipToPadding(false);
+        ColgramMenuChrome.attachDynamicListAnimations(listView);"""
+                if anim_anchor in content:
+                    content = content.replace(anim_anchor, anim_repl, 1)
+                    changed = True
+            return content if changed else CONVERGED
+
+        patch_file(
+            settings_activity,
+            settings_ai_and_anim_injector,
+            "case 108:",
+            "SettingsActivity Aero AI Row and Dynamic List Animations"
+        )
 
         # 26. DialogsActivity.java & ContactsActivity.java -> Complete Permission Suppression
         if os.path.exists(dialogs_activity):
@@ -2781,6 +3336,198 @@ def inject_hooks(repo_path):
             bot_error_replacement,
             "MessagesController Handle Dialogs Load Error"
         )
+
+        # 27b. Bot Account Sync, Empty Cache Reset & Anti-Loop Guards
+        def mc_bot_guards_replacer(content):
+            nl = "\r\n" if "\r\n" in content else "\n"
+            c = content.replace("\r\n", "\n")
+            orig = c
+
+            for sig, guard in [
+                ("private void reloadDialogsReadValue(ArrayList<TLRPC.Dialog> dialogs, long did) {",
+                 "private void reloadDialogsReadValue(ArrayList<TLRPC.Dialog> dialogs, long did) {\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            return;\n        }"),
+                ("private void checkTosUpdate() {",
+                 "private void checkTosUpdate() {\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            return;\n        }"),
+                ("public void loadCurrentState() {",
+                 "public void loadCurrentState() {\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            updatingState = false;\n            return;\n        }"),
+                ("public void loadUnreadDialogs() {",
+                 "public void loadUnreadDialogs() {\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            return;\n        }"),
+                ("public void loadPinnedDialogs(final int folderId, long newDialogId, ArrayList<Long> order) {",
+                 "public void loadPinnedDialogs(final int folderId, long newDialogId, ArrayList<Long> order) {\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            return;\n        }"),
+            ]:
+                if guard not in c and sig in c:
+                    c = c.replace(sig, guard, 1)
+
+            empty_cache_old = """                    loadingDialogs.put(folderId, false);
+                    if (resetEnd) {
+                        dialogsEndReached.put(folderId, false);
+                        serverDialogsEndReached.put(folderId, false);"""
+            empty_cache_new = """                    final boolean colgramBot = getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot;
+                    loadingDialogs.put(folderId, false);
+                    if (colgramBot) {
+                        dialogsLoaded = true;
+                        dialogsLoadedTillDate = Integer.MIN_VALUE;
+                        dialogsEndReached.put(folderId, true);
+                        serverDialogsEndReached.put(folderId, true);
+                        if (!allDialogs.isEmpty()) {
+                            sortDialogs(null);
+                        }
+                    } else if (resetEnd) {
+                        dialogsEndReached.put(folderId, false);
+                        serverDialogsEndReached.put(folderId, false);"""
+            if "dialogsLoadedTillDate = Integer.MIN_VALUE;" not in c and empty_cache_old in c:
+                c = c.replace(empty_cache_old, empty_cache_new, 1)
+
+            sort_old = """                    if (maxDate > Integer.MIN_VALUE) {
+                        if (maxDate < dialogsLoadedTillDate) {
+                            continue;
+                        }
+                    }"""
+            sort_new = """                    if (maxDate > Integer.MIN_VALUE) {
+                        final boolean colgramBotSort = getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot;
+                        if (!colgramBotSort && maxDate < dialogsLoadedTillDate) {
+                            continue;
+                        }
+                    }"""
+            if "colgramBotSort" not in c and sort_old in c:
+                c = c.replace(sort_old, sort_new, 1)
+
+            diff_old = """    public void getDifference(int pts, int date, int qts, boolean slice) {
+        registerForPush(SharedConfig.pushType, SharedConfig.pushString);
+        if (getMessagesStorage().getLastPtsValue() == 0) {
+            loadCurrentState();
+            return;
+        }"""
+            diff_new = """    public void getDifference(int pts, int date, int qts, boolean slice) {
+        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+            if (getMessagesStorage().getLastPtsValue() == 0) {
+                int initPts = 1;
+                int initDate = date == 0
+                        ? Math.max(1, getConnectionsManager().getCurrentTime() - 86400)
+                        : date;
+                getMessagesStorage().setLastPtsValue(initPts);
+                getMessagesStorage().setLastDateValue(initDate);
+                getMessagesStorage().saveDiffParams(getMessagesStorage().getLastSeqValue(), initPts, initDate, qts);
+                org.colgram.core.ColgramBotSync.syncBotDialogs(ApplicationLoader.applicationContext, currentAccount, false);
+                getDifference(initPts, initDate, qts, slice);
+                return;
+            }
+        } else {
+            registerForPush(SharedConfig.pushType, SharedConfig.pushString);
+            if (getMessagesStorage().getLastPtsValue() == 0) {
+                loadCurrentState();
+                return;
+            }
+        }"""
+            # Also handle nested brace layout inside existing getDifference
+            if "int initPts = 1;" not in c and diff_old in c:
+                c = c.replace(diff_old, diff_new, 1)
+
+            state_err_old = """            } else {
+                if (error.code != 401) {
+                    loadCurrentState();
+                }
+            }"""
+            state_err_new = """            } else {
+                boolean isBotInvalid = (error.text != null && error.text.contains("BOT_METHOD_INVALID"))
+                        || (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot);
+                if (error.code != 401 && !isBotInvalid) {
+                    loadCurrentState();
+                }
+            }"""
+            if "isBotInvalid" not in c and state_err_old in c:
+                c = c.replace(state_err_old, state_err_new, 1)
+
+            return CONVERGED if c == orig else c.replace("\n", nl)
+
+        patch_file(messages_controller, mc_bot_guards_replacer, None, "MessagesController Bot Method & Dialogs Guards")
+
+    # 27c. MediaDataController.java & QrActivity.java -> Bot Method Guards
+    media_dc = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MediaDataController.java")
+    if os.path.exists(media_dc):
+        def mdc_bot_replacer(content):
+            nl = "\r\n" if "\r\n" in content else "\n"
+            c = content.replace("\r\n", "\n")
+            orig = c
+            sig = "    public void loadFeaturedStickers(boolean emoji, boolean cache) {\n        if (loadingFeaturedStickers[emoji ? 1 : 0]) {\n            return;\n        }"
+            rep = sig + "\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            loadingFeaturedStickers[emoji ? 1 : 0] = false;\n            featuredStickersLoaded[emoji ? 1 : 0] = true;\n            return;\n        }"
+            if "featuredStickersLoaded[emoji ? 1 : 0] = true;\n            return;" not in c and sig in c:
+                c = c.replace(sig, rep, 1)
+            err_old = "                } else {\n                    processLoadedFeaturedStickers(emoji, null, null, false, false, (int) (System.currentTimeMillis() / 1000), hash);\n                }"
+            err_new = "                } else {\n                    if (error != null && error.text != null && error.text.contains(\"BOT_METHOD_INVALID\")) {\n                        loadingFeaturedStickers[emoji ? 1 : 0] = false;\n                        featuredStickersLoaded[emoji ? 1 : 0] = true;\n                        return;\n                    }\n                    processLoadedFeaturedStickers(emoji, null, null, false, false, (int) (System.currentTimeMillis() / 1000), hash);\n                }"
+            if "error.text.contains(\"BOT_METHOD_INVALID\")" not in c and err_old in c:
+                c = c.replace(err_old, err_new, 1)
+            return CONVERGED if c == orig else c.replace("\n", nl)
+        patch_file(media_dc, mdc_bot_replacer, None, "MediaDataController Bot Featured Stickers Guard")
+
+    qr_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "QrActivity.java")
+    if os.path.exists(qr_activity):
+        def qr_bot_replacer(content):
+            nl = "\r\n" if "\r\n" in content else "\n"
+            c = content.replace("\r\n", "\n")
+            orig = c
+            old_u = """                    userfullname = UserObject.getUserName(user);
+                    if (phoneIsPublic()) {"""
+            new_u = """                    userfullname = UserObject.getUserName(user);
+                    boolean isBotTarget = user.bot || (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot);
+                    if (isBotTarget) {
+                        username = "bot";
+                    } else if (phoneIsPublic()) {"""
+            if "isBotTarget" not in c and old_u in c:
+                c = c.replace(old_u, new_u, 1)
+
+            old_themes = """        fragmentView.postDelayed(() -> {
+            firstOpen = false;
+            if (cachedThemes == null || cachedThemes.isEmpty()) {"""
+            new_themes = """        fragmentView.postDelayed(() -> {
+            firstOpen = false;
+            boolean isBotSelf = getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot;
+            if (isBotSelf) {
+                List<EmojiThemes> localThemes = ChatThemeController.getInstance(currentAccount)
+                        .getEmojiThemes(ChatThemeController.THEME_LIST_WITH_DEFAULT | ChatThemeController.THEME_LIST_WITH_EMOJI);
+                if (localThemes == null || localThemes.isEmpty()) {
+                    localThemes = java.util.Collections.singletonList(homeTheme);
+                }
+                onDataLoaded(localThemes);
+                return;
+            }
+            if (cachedThemes == null || cachedThemes.isEmpty()) {"""
+            if "isBotSelf" not in c and old_themes in c:
+                c = c.replace(old_themes, new_themes, 1)
+
+            old_err = """                    @Override
+                    public void onError(TLRPC.TL_error error) {
+                        Toast.makeText(getParentActivity(), error.text, Toast.LENGTH_SHORT).show();
+                        onDataLoaded(java.util.Collections.singletonList(homeTheme));
+                    }"""
+            new_err = """                    @Override
+                    public void onError(TLRPC.TL_error error) {
+                        String errText = error != null && error.text != null ? error.text : "";
+                        if (!errText.contains("BOT_")) {
+                            if (getParentActivity() != null && !errText.isEmpty()) {
+                                Toast.makeText(getParentActivity(), errText, Toast.LENGTH_SHORT).show();
+                            }
+                        }
+                        onDataLoaded(java.util.Collections.singletonList(homeTheme));
+                    }"""
+            if '!errText.contains("BOT_")' not in c and old_err in c:
+                c = c.replace(old_err, new_err, 1)
+            return CONVERGED if c == orig else c.replace("\n", nl)
+        patch_file(qr_activity, qr_bot_replacer, None, "QrActivity Bot Themes & Error Toast Guard")
+
+    contacts_ctrl = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ContactsController.java")
+    if os.path.exists(contacts_ctrl):
+        def cc_bot_replacer(content):
+            nl = "\r\n" if "\r\n" in content else "\n"
+            c = content.replace("\r\n", "\n")
+            sig = "    public void loadGlobalPrivacySetting() {\n        if (loadingGlobalSettings == 0) {"
+            rep = "    public void loadGlobalPrivacySetting() {\n        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {\n            loadingGlobalSettings = 2;\n            return;\n        }\n        if (loadingGlobalSettings == 0) {"
+            if "loadingGlobalSettings = 2;\n            return;" in c:
+                return CONVERGED
+            if sig in c:
+                return c.replace(sig, rep, 1).replace("\n", nl)
+            return c
+        patch_file(contacts_ctrl, cc_bot_replacer, None, "ContactsController Bot Global Privacy Guard")
 
         def mc_qr_replacer(content):
             if "ColgramQRLoginBottomSheet.onLoginTokenUpdate" in content:
@@ -3081,7 +3828,13 @@ def inject_hooks(repo_path):
             // Colgram: open the Telegram-native edit-history BottomSheet.
             // This lives in TMessagesProj (not colgram-core) because colgram-core
             // compiles before TMessagesProj and cannot see org.telegram.ui.* classes.
-            org.telegram.ui.ColgramEditHistorySheet.show(getParentActivity(), selectedObject.getDialogId(), selectedObject.getId());
+            final long histDid = selectedObject.getDialogId();
+            final int histMsgId = selectedObject.getId();
+            selectedObject = null;
+            selectedObjectGroup = null;
+            selectedObjectToEditCaption = null;
+            closeMenu(true);
+            org.telegram.ui.ColgramEditHistorySheet.show(getParentActivity(), histDid, histMsgId);
             return;
         }
 """
@@ -3090,6 +3843,68 @@ def inject_hooks(repo_path):
             process_option_target,
             process_option_replacement,
             "ChatActivity Handle Edit History Option"
+        )
+
+        def chat_ai_orb_injector(content):
+            changed = False
+            if "private ColgramAiOrbView colgramAiOrb;" not in content:
+                f_anchor = "    private ChatActivitySideControlsButtonsLayout sideControlsButtonsLayout;"
+                f_repl = f_anchor + "\n    private ColgramAiOrbView colgramAiOrb;"
+                if f_anchor in content:
+                    content = content.replace(f_anchor, f_repl, 1)
+                    changed = True
+            if "colgramAiOrb = new ColgramAiOrbView(context);" not in content:
+                v_anchor = "        contentView.addView(chatInputViewsContainer, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));"
+                v_repl = v_anchor + """
+        colgramAiOrb = new ColgramAiOrbView(context);
+        colgramAiOrb.setVisibility(org.colgram.core.ColgramAiConfig.isOrbEnabled(context) && !inPreviewMode && !isInsideContainer ? View.VISIBLE : View.GONE);
+        colgramAiOrb.setOnOrbClickListener(() -> ColgramAiSheet.show(ChatActivity.this, ChatActivity.this, colgramAiOrb));
+        contentView.addView(colgramAiOrb, LayoutHelper.createFrame(54, 54, Gravity.LEFT | Gravity.BOTTOM, 10, 0, 0, 0));"""
+                if v_anchor in content:
+                    content = content.replace(v_anchor, v_repl, 1)
+                    changed = True
+            if "colgramAiOrb.setBaseTranslationY(" not in content:
+                p_anchor = "            sideControlsButtonsLayout.setTranslationY(baseTranslationY2);\n        }"
+                p_repl = p_anchor + """
+        if (colgramAiOrb != null) {
+            float orbY = -windowInsetsStateHolder.getAnimatedMaxBottomInset()
+                - chatInputViewsContainer.getInputBubbleHeight()
+                - getTopicTabsSideSize(TopicsTabsView.Position.BOTTOM)
+                - dp(ChatInputViewsContainer.INPUT_BUBBLE_BOTTOM + 4);
+            colgramAiOrb.setBaseTranslationY(orbY);
+        }"""
+                if p_anchor in content:
+                    content = content.replace(p_anchor, p_repl, 1)
+                    changed = True
+            if "ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET" not in content:
+                r_anchor = "        if (resultCode == Activity.RESULT_OK) {"
+                r_repl = r_anchor + """
+            if (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET && data != null && data.getData() != null) {
+                if (ColgramAiActivity.pendingSheetForMedia != null) {
+                    ColgramAiActivity.pendingSheetForMedia.attachExternalMediaUri(getParentActivity(), data.getData());
+                    ColgramAiActivity.pendingSheetForMedia = null;
+                }
+                return;
+            }"""
+                if r_anchor in content:
+                    content = content.replace(r_anchor, r_repl, 1)
+                    changed = True
+            if "colgramAiOrb.setVisibility(org.colgram.core.ColgramAiConfig.isOrbEnabled" not in content:
+                res_anchor = "        checkChecksHint();"
+                res_repl = res_anchor + """
+        if (colgramAiOrb != null) {
+            colgramAiOrb.setVisibility(org.colgram.core.ColgramAiConfig.isOrbEnabled(getContext()) && !inPreviewMode && !isInsideContainer ? View.VISIBLE : View.GONE);
+        }"""
+                if res_anchor in content:
+                    content = content.replace(res_anchor, res_repl, 1)
+                    changed = True
+            return content if changed else CONVERGED
+
+        patch_file(
+            chat_activity,
+            chat_ai_orb_injector,
+            "colgramAiOrb = new ColgramAiOrbView(context);",
+            "ChatActivity Floating Bottom-Left Aero AI Orb"
         )
 
     # 31.0. provider_paths.xml -> let FileProvider serve recovered media revisions
@@ -3162,12 +3977,12 @@ def inject_hooks(repo_path):
     # 33. UserConfig.java -> Safe Account Bounds & Safe Defaults
     if os.path.exists(user_config):
         user_max_target = "public final static int MAX_ACCOUNT_DEFAULT_COUNT = 3;"
-        user_max_replacement = "public final static int MAX_ACCOUNT_DEFAULT_COUNT = 4;"
+        user_max_replacement = "public final static int MAX_ACCOUNT_DEFAULT_COUNT = 5;"
         patch_file(
             user_config,
             user_max_target,
             user_max_replacement,
-            "UserConfig Set MAX_ACCOUNT_DEFAULT_COUNT to 4"
+            "UserConfig Set MAX_ACCOUNT_DEFAULT_COUNT to 5"
         )
         patch_file(
             user_config,
@@ -3251,66 +4066,88 @@ def inject_hooks(repo_path):
         )
         def proxy_check_scheduler_patcher(content):
             marker = "private static final int MAX_STOCK_PROXY_CHECKS = 2;"
+            method_start = content.find("    private void checkProxyList() {")
+            method_end = content.find("\n    @Override\n    protected void onDialogDismiss", method_start)
             if (marker in content and "STOCK_PROXY_CHECK_TIMEOUT_MS" in content
                     and "finishProxyCheck(SharedConfig.ProxyInfo proxyInfo, long time)" in content
                     and "pendingProxyChecks.remove(proxyInfo);" in content
-                    and "listView.post(() -> checkProxyList());" in content):
-                return content
-            method_start = content.find("    private void checkProxyList() {")
-            method_end = content.find("\n    @Override\n    protected void onDialogDismiss", method_start)
+                    and "listView.post(() -> checkProxyList());" in content
+                    and method_start >= 0 and method_end > method_start
+                    and "proxyInfo == SharedConfig.currentProxy" in content[method_start:method_end]):
+                return CONVERGED
             fields = "    private List<SharedConfig.ProxyInfo> proxyList = new ArrayList<>();\n    private boolean wasCheckedAllList;"
             fields_with_pending = "    private List<SharedConfig.ProxyInfo> proxyList = new ArrayList<>();\n    private final List<SharedConfig.ProxyInfo> pendingProxyChecks = new ArrayList<>();\n    private boolean wasCheckedAllList;"
             adapter_anchor = "        listView.setAdapter(listAdapter);"
             if method_start < 0 or method_end < 0 or (fields not in content and fields_with_pending not in content) or adapter_anchor not in content:
                 return content
-            method = """    private void checkProxyList() {
-        if (listView == null || proxyList.isEmpty() || pendingProxyChecks.size() >= MAX_STOCK_PROXY_CHECKS) {
+            catalog_guard = (
+                "            if (org.colgram.core.ColgramProxyManager.usesCatalogVerifier(proxyInfo)) continue;\n"
+                if "usesCatalogVerifier(proxyInfo)" in content else ""
+            )
+            stock_callback = (
+                "        org.colgram.core.ColgramProxyManager.onStockProxyCheckResult(proxyInfo, time);\n"
+                if "onStockProxyCheckResult(proxyInfo, time)" in content else ""
+            )
+            method = f"""    private void checkProxyList() {{
+        if (listView == null || proxyList.isEmpty() || pendingProxyChecks.size() >= MAX_STOCK_PROXY_CHECKS) {{
             return;
-        }
-        for (int child = 0, childCount = listView.getChildCount(); child < childCount && pendingProxyChecks.size() < MAX_STOCK_PROXY_CHECKS; child++) {
+        }}
+        for (int child = 0, childCount = listView.getChildCount(); child < childCount && pendingProxyChecks.size() < MAX_STOCK_PROXY_CHECKS; child++) {{
             int position = listView.getChildAdapterPosition(listView.getChildAt(child));
             int proxyIndex = position - proxyStartRow;
-            if (position == RecyclerView.NO_POSITION || proxyIndex < 0 || proxyIndex >= proxyList.size()) {
+            if (position == RecyclerView.NO_POSITION || proxyIndex < 0 || proxyIndex >= proxyList.size()) {{
                 continue;
-            }
+            }}
             final SharedConfig.ProxyInfo proxyInfo = proxyList.get(proxyIndex);
-            if (proxyInfo.checking || SystemClock.elapsedRealtime() - proxyInfo.availableCheckTime < 2 * 60 * 1000) {
+{catalog_guard}            if (proxyInfo.checking || SystemClock.elapsedRealtime() - proxyInfo.availableCheckTime < 2 * 60 * 1000) {{
                 continue;
-            }
+            }}
+            if (proxyInfo == SharedConfig.currentProxy && useProxySettings
+                    && org.colgram.core.ColgramProxyManager.isTelegramConnected()) {{
+                proxyInfo.available = true;
+                continue;
+            }}
             proxyInfo.checking = true;
             pendingProxyChecks.add(proxyInfo);
             final AtomicBoolean completed = new AtomicBoolean(false);
-            final Runnable timeout = () -> {
-                if (!completed.compareAndSet(false, true)) {
+            final Runnable timeout = () -> {{
+                if (!completed.compareAndSet(false, true)) {{
                     return;
-                }
+                }}
                 finishProxyCheck(proxyInfo, -1);
-            };
+            }};
             AndroidUtilities.runOnUIThread(timeout, STOCK_PROXY_CHECK_TIMEOUT_MS);
-            ConnectionsManager.getInstance(currentAccount).checkProxy(proxyInfo.settings, time -> AndroidUtilities.runOnUIThread(() -> {
-                if (!completed.compareAndSet(false, true)) {
+            ConnectionsManager.getInstance(currentAccount).checkProxy(proxyInfo.settings, time -> AndroidUtilities.runOnUIThread(() -> {{
+                if (!completed.compareAndSet(false, true)) {{
                     return;
-                }
+                }}
                 AndroidUtilities.cancelRunOnUIThread(timeout);
                 finishProxyCheck(proxyInfo, time);
-            }));
-        }
-    }
+            }}));
+        }}
+    }}
 
-    private void finishProxyCheck(SharedConfig.ProxyInfo proxyInfo, long time) {
+    private void finishProxyCheck(SharedConfig.ProxyInfo proxyInfo, long time) {{
         pendingProxyChecks.remove(proxyInfo);
         proxyInfo.availableCheckTime = SystemClock.elapsedRealtime();
         proxyInfo.checking = false;
-        if (time == -1) {
+        if (time == -1 && proxyInfo == SharedConfig.currentProxy && useProxySettings
+                && org.colgram.core.ColgramProxyManager.isTelegramConnected()) {{
+            proxyInfo.available = true;
+            NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxyCheckDone, proxyInfo);
+            checkProxyList();
+            return;
+        }}
+        if (time == -1) {{
             proxyInfo.available = false;
             proxyInfo.ping = 0;
-        } else {
+        }} else {{
             proxyInfo.ping = time;
             proxyInfo.available = true;
-        }
-        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxyCheckDone, proxyInfo);
+        }}
+{stock_callback}        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxyCheckDone, proxyInfo);
         checkProxyList();
-    }
+    }}
 """
             content = content[:method_start] + method + content[method_end:]
             if "import java.util.concurrent.atomic.AtomicBoolean;" not in content:
@@ -3343,25 +4180,55 @@ def inject_hooks(repo_path):
         patch_file(
             proxy_list_file,
             proxy_check_scheduler_patcher,
-            "private static final long STOCK_PROXY_CHECK_TIMEOUT_MS = 15_000L;",
+            None,
             "ProxyListActivity Bounds Native Proxy Checks to Visible Entries"
         )
 
-
-    # 36. Browser.java -> Route links through in-app browser for proxy anonymity
+    # 36. Browser.java -> Route links through in-app browser & sanitize tracking URLs
     browser_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "browser", "Browser.java")
     if os.path.exists(browser_file):
         def browser_proxy_injector(c):
-            target = "if (allowCustom && !(uri != null && MessagesController.getInstance(currentAccount).isWebBrowserOpenInApp(uri.toString()) || isInstantViewOpen())"
-            if target not in c:
-                return c
-            inject = """if (org.colgram.core.ColgramConfig.isProxyBrowserEnabled()) {
+            if "sanitizeOutgoingOrOpenedUrl" in c:
+                return CONVERGED
+            target_norm = """            if ("http".equals(scheme) || "https".equals(scheme)) {
+                try {
+                    uri = uri.normalizeScheme();
+                } catch (Exception e) {
+                    FileLog.e(e);
+                }
+            }"""
+            repl_norm = """            if ("http".equals(scheme) || "https".equals(scheme)) {
+                try {
+                    uri = uri.normalizeScheme();
+                } catch (Exception e) {
+                    FileLog.e(e);
+                }
+                String cleanUrl = org.colgram.core.ColgramHookHandler.sanitizeOutgoingOrOpenedUrl(uri.toString());
+                if (cleanUrl != null && !cleanUrl.equals(uri.toString())) {
+                    uri = Uri.parse(cleanUrl);
+                }
+            }"""
+            if target_norm in c:
+                c = c.replace(target_norm, repl_norm, 1)
+            old_inapp = """            if (org.colgram.core.ColgramConfig.isProxyBrowserEnabled()) {
                 openInTelegramBrowser(context, uri.toString(), inCaseLoading);
                 return;
-            }
-            if (allowCustom && !(uri != null && MessagesController.getInstance(currentAccount).isWebBrowserOpenInApp(uri.toString()) || isInstantViewOpen())"""
-            return c.replace(target, inject, 1)
-        patch_file(browser_file, browser_proxy_injector, "org.colgram.core.ColgramConfig.isProxyBrowserEnabled()", "Browser Force In-App Browser for Privacy")
+            }"""
+            new_inapp = """            if (!internalUri && ("http".equals(scheme) || "https".equals(scheme) || "tonsite".equals(scheme))
+                    && org.colgram.core.ColgramConfig.isProxyBrowserEnabled()) {
+                if (openInTelegramBrowser(context, uri.toString(), inCaseLoading)) {
+                    return;
+                }
+            }"""
+            if old_inapp in c:
+                c = c.replace(old_inapp, new_inapp, 1)
+            else:
+                target = "if (allowCustom && !(uri != null && MessagesController.getInstance(currentAccount).isWebBrowserOpenInApp(uri.toString()) || isInstantViewOpen())"
+                if target not in c:
+                    return c
+                c = c.replace(target, new_inapp + "\n            " + target, 1)
+            return c
+        patch_file(browser_file, browser_proxy_injector, None, "Browser Force In-App Browser & Strip Tracking Params")
 
     # 37. LoginActivity.java -> Persistent account-free network settings entry
     login_activity_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LoginActivity.java")
@@ -3752,15 +4619,21 @@ def inject_hooks(repo_path):
 
     # 45. DialogsActivity.java -> Start Bot Updates Poller in onResume
     if os.path.exists(dialogs_activity):
-        bot_resume_target = "public void onResume() {\n        super.onResume();"
-        bot_resume_inject = """public void onResume() {\n        super.onResume();
+        def bot_resume_injector(content):
+            if "org.colgram.core.ColgramBotSync.startBotUpdatesPoller" in content:
+                return CONVERGED
+            bot_resume_target = "public void onResume() {\n        super.onResume();"
+            bot_resume_inject = """public void onResume() {\n        super.onResume();
         if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
             org.colgram.core.ColgramBotSync.startBotUpdatesPoller(getParentActivity(), currentAccount);
         }"""
+            if bot_resume_target in content:
+                return content.replace(bot_resume_target, bot_resume_inject, 1)
+            return content
         patch_file(
             dialogs_activity,
-            bot_resume_target,
-            bot_resume_inject,
+            bot_resume_injector,
+            None,
             "DialogsActivity Start Bot Updates Poller in onResume"
         )
 
@@ -4084,26 +4957,17 @@ def inject_hooks(repo_path):
     webview_activity = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "WebviewActivity.java")
     if os.path.exists(webview_activity):
         def webview_proxy_injector(c):
-            anchor = "webView = new WebView(context);"
-            if anchor not in c or "ColgramBrowserProxyHook" in c:
-                return c
-            inject = anchor + """
-        // ColgramBrowserProxyHook: send in-app browser traffic through the local DPI bypass.
-        try {
-            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.PROXY_OVERRIDE)
-                    && org.colgram.core.ColgramConfig.isDpiBypassEnabled()) {
-                androidx.webkit.ProxyConfig.Builder colgramProxyBuilder = new androidx.webkit.ProxyConfig.Builder();
-                if (org.colgram.core.ColgramDpiBypass.isBound()) {
-                    colgramProxyBuilder.addProxyRule("socks5://127.0.0.1:" + org.colgram.core.ColgramDpiBypass.LOCAL_PORT);
-                } else {
-                    colgramProxyBuilder.addProxyRule("direct://");
-                }
-                androidx.webkit.ProxyController.getInstance().setProxyOverride(colgramProxyBuilder.build(),
-                        Runnable::run, () -> { });
-            }
-        } catch (Throwable colgramProxyIgnore) { }"""
-            return c.replace(anchor, inject, 1)
-        patch_file(webview_activity, webview_proxy_injector, "ColgramBrowserProxyHook", "WebviewActivity Browser Traffic Through Local Bypass")
+            after_anchor = "            if (type == TYPE_GAME) {\n                webView.addJavascriptInterface(new TelegramWebviewProxy(), \"TelegramWebviewProxy\");\n            }\n        }"
+            after_target = after_anchor + "\n        ColgramBrowserRoutes.applyToWebView(webView);"
+            if after_target in c:
+                return CONVERGED
+            early = "webView = new WebView(context);\n        ColgramBrowserRoutes.applyToWebView(webView);"
+            if early in c:
+                c = c.replace(early, "webView = new WebView(context);", 1)
+            if after_anchor in c:
+                return c.replace(after_anchor, after_target, 1)
+            return c
+        patch_file(webview_activity, webview_proxy_injector, None, "WebviewActivity Browser Route Hook (Post-Config)")
 
     # 51. MessagesController.java -> Auto-hide the phone number on first login
     #
@@ -4228,7 +5092,7 @@ def inject_hooks(repo_path):
         final boolean hasOverlayPermission = android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M
                 || android.provider.Settings.canDrawOverlays(activity);
         if (!hasOverlayPermission) {
-            new android.app.AlertDialog.Builder(activity)
+            new org.telegram.ui.ActionBar.AlertDialog.Builder(activity, resourcesProvider)
                     .setTitle("Плавающее мини-приложение")
                     .setMessage("Разреши Colgram показывать окно поверх других приложений. Если не хочешь выдавать это разрешение, открой одно системное окно PiP.")
                     .setPositiveButton("Открыть настройки", (dialog, which) -> {
@@ -4247,12 +5111,49 @@ def inject_hooks(repo_path):
 
         // --- Tier 1: real multi-window overlay ---
         if (org.telegram.ui.ColgramFloatWindowManager.isSupported(activity)) {
+            if (colgramPipOriginalParent == null && webViewContainer.getParent() instanceof android.view.ViewGroup) {
+                colgramPipOriginalParent = (android.view.ViewGroup) webViewContainer.getParent();
+                colgramPipOriginalLayoutParams = webViewContainer.getLayoutParams();
+            }
+            String appTitle = "Mini App";
+            try {
+                TLRPC.User botUser = MessagesController.getInstance(currentAccount).getUser(botId);
+                if (botUser != null) {
+                    String n = UserObject.getUserName(botUser);
+                    if (!TextUtils.isEmpty(n)) appTitle = n;
+                }
+            } catch (Throwable ignored) {}
             final org.telegram.ui.ColgramFloatWindowManager.FloatWindow floatWindow =
                     org.telegram.ui.ColgramFloatWindowManager.open(
-                            activity, webViewContainer, "Mini App");
+                            activity,
+                            webViewContainer,
+                            appTitle,
+                            new org.telegram.ui.ColgramFloatWindowManager.Callbacks() {
+                                @Override
+                                public void onRestoreFull() {
+                                    AndroidUtilities.runOnUIThread(() -> {
+                                        colgramFloatingWindow = null;
+                                        colgramRestorePipMiniAppView();
+                                        if (!dismissed) {
+                                            show();
+                                            webViewContainer.invalidateViewPortHeight(true, true);
+                                        }
+                                    });
+                                }
+
+                                @Override
+                                public void onClosed() {
+                                    AndroidUtilities.runOnUIThread(() -> {
+                                        colgramFloatingWindow = null;
+                                        if (!dismissed) {
+                                            dismiss(false, null);
+                                        }
+                                    });
+                                }
+                            });
             if (floatWindow != null) {
-                // The sheet must let go of the view: the window owns it now.
-                dismiss(true, null);
+                colgramFloatingWindow = floatWindow;
+                hide();
                 android.widget.Toast.makeText(activity,
                         "Мини-приложение закреплено как плавающее окно ("
                                 + org.telegram.ui.ColgramFloatWindowManager.getWindowCount()
@@ -4260,6 +5161,7 @@ def inject_hooks(repo_path):
                         android.widget.Toast.LENGTH_SHORT).show();
                 return;
             }
+            colgramRestorePipMiniAppView();
         }
 
         colgramOpenMiniAppInPip(activity);
@@ -4832,12 +5734,10 @@ def inject_hooks(repo_path):
                "Theme Apply Syncs Cyber Flag")
 
     def settings_cyber_row_removal_injector(content):
-        # The marker is the adjacency that only exists once the row line is gone: the Versions
-        # row becomes the last item before the section shadow.
         marker = ('"Версии Telegram и обновления", "Переключение каналов и загрузка APK"));'
                   + '\n        items.add(UItem.asShadow(null));')
-        if marker in content:
-            return content
+        if marker in content or 'SettingCell.Factory.of(108,' in content:
+            return CONVERGED
         row = ('        items.add(SettingCell.Factory.of(105, 0xFFFF3344, 0xFF7A0C14, '
                'R.drawable.msg_colors, "Красно-чёрная тема Colgram Cyber", '
                'org.colgram.core.ColgramConfig.isCyberThemeEnabled() ? "включена" : "выключена"));\n')
@@ -4849,13 +5749,14 @@ def inject_hooks(repo_path):
                    '                    getParentActivity().recreate();\n'
                    '                }\n'
                    '                break;\n')
+        if row not in content and handler not in content:
+            return CONVERGED
         if row not in content or handler not in content:
             return content
         return content.replace(row, "", 1).replace(handler, "", 1)
 
     patch_file(settings_activity, settings_cyber_row_removal_injector,
-               '"Версии Telegram и обновления", "Переключение каналов и загрузка APK"));'
-               + '\n        items.add(UItem.asShadow(null));',
+               None,
                "SettingsActivity Drops Standalone Cyber Row")
 
     # 60. NotificationsSettingsActivity -> the auto-reply setting lives with the notifications.
@@ -5439,6 +6340,102 @@ def inject_hooks(repo_path):
         "ConnectionsManager IPv6-only bypass switch"
     )
 
+    # 69. Defender Bot & Security Hardening Hooks (WebView UA/surface/geolocation, VoIP P2P, OTA guard, AppStart)
+    bot_wv = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "web", "BotWebViewContainer.java")
+    if os.path.exists(bot_wv):
+        def bot_wv_hardener(c):
+            if "ColgramHookHandler.cloakWebViewUserAgent" in c and "shouldBlockBotLocation()" in c:
+                return CONVERGED
+            c = c.replace(
+                "settings.setGeolocationEnabled(true);",
+                "settings.setGeolocationEnabled(!org.colgram.core.ColgramHookHandler.shouldBlockBotLocation());",
+                1
+            )
+            old_ua = """        try {
+            String useragent = settings.getUserAgentString();
+            useragent = useragent.replace("; wv)", ")");
+            useragent = useragent.replaceAll("\\\\(Linux; Android.+?;[^)]+\\\\)", "(Linux; Android " + Build.VERSION.RELEASE + "; K)");
+            useragent = useragent.replaceAll("Version/[\\\\d\\\\.]+ ", "");
+            if (bot) {
+                final PackageInfo packageInfo = ApplicationLoader.applicationContext.getPackageManager().getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0);
+                final int perf = SharedConfig.getDevicePerformanceClass();
+                final String perfName = perf == SharedConfig.PERFORMANCE_CLASS_LOW ? "LOW" : perf == SharedConfig.PERFORMANCE_CLASS_AVERAGE ? "AVERAGE" : "HIGH";
+                useragent += " Telegram-Android/" + packageInfo.versionName + " (" + capitalizeFirst(Build.MANUFACTURER) + " " + Build.MODEL + "; Android " + Build.VERSION.RELEASE + "; SDK " + Build.VERSION.SDK_INT + "; " + perfName + ")";
+            }
+            settings.setUserAgentString(useragent);"""
+            new_ua = """        try {
+            String useragent = settings.getUserAgentString();
+            final PackageInfo packageInfo = ApplicationLoader.applicationContext.getPackageManager().getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0);
+            final int perf = SharedConfig.getDevicePerformanceClass();
+            final String perfName = perf == SharedConfig.PERFORMANCE_CLASS_LOW ? "LOW" : perf == SharedConfig.PERFORMANCE_CLASS_AVERAGE ? "AVERAGE" : "HIGH";
+            useragent = org.colgram.core.ColgramHookHandler.cloakWebViewUserAgent(
+                    useragent, bot, packageInfo.versionName, perfName);
+            settings.setUserAgentString(useragent);"""
+            if old_ua in c:
+                c = c.replace(old_ua, new_ua, 1)
+            return c
+        patch_file(bot_wv, bot_wv_hardener, None, "BotWebViewContainer Cloak UserAgent & Block Geolocation")
+
+    bot_loc = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "bots", "BotLocation.java")
+    if os.path.exists(bot_loc):
+        def bot_loc_blocker(c):
+            if "ColgramHookHandler.shouldBlockBotLocation()" in c:
+                return CONVERGED
+            c = c.replace(
+                "public boolean granted() {\n        return appHasPermission() && granted;\n    }",
+                "public boolean granted() {\n        return !org.colgram.core.ColgramHookHandler.shouldBlockBotLocation() && appHasPermission() && granted;\n    }",
+                1
+            )
+            c = c.replace(
+                "final boolean available = granted && appHasPermission() && deviceHasLocation();",
+                "final boolean available = !org.colgram.core.ColgramHookHandler.shouldBlockBotLocation()\n                && granted && appHasPermission() && deviceHasLocation();",
+                1
+            )
+            return c
+        patch_file(bot_loc, bot_loc_blocker, None, "BotLocation Enforce Defender Location Block")
+
+    article_viewer = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ArticleViewer.java")
+    if os.path.exists(article_viewer):
+        def article_wv_order(c):
+            marker_after = "cookieManager.setAcceptThirdPartyCookies(webView, true);\n                ColgramBrowserRoutes.applyToWebView(webView);"
+            if marker_after in c:
+                return CONVERGED
+            old_blk = "webView = new TouchyWebView(context);\n                ColgramBrowserRoutes.applyToWebView(webView);"
+            if old_blk in c:
+                c = c.replace(old_blk, "webView = new TouchyWebView(context);", 1)
+                c = c.replace(
+                    "cookieManager.setAcceptThirdPartyCookies(webView, true);",
+                    marker_after,
+                    1
+                )
+            return c
+        patch_file(article_viewer, article_wv_order, None, "ArticleViewer Apply Browser Routes After WebView Config")
+
+    voip_file = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "voip", "VoIPService.java")
+    if os.path.exists(voip_file):
+        def voip_defender_p2p(c):
+            if "ColgramHookHandler.shouldBlockVoipP2p()" in c and "enableStunMarking && colgramAllowP2p()" in c:
+                return CONVERGED
+            c = c.replace("serverConfig.enableStunMarking,", "serverConfig.enableStunMarking && colgramAllowP2p(),", 1)
+            old_p2p = "    private boolean colgramAllowP2p() {\n"
+            new_p2p = "    private boolean colgramAllowP2p() {\n        if (org.colgram.core.ColgramHookHandler.shouldBlockVoipP2p()) {\n            org.colgram.core.ColgramConfig.incrementDefenderP2pBlocked();\n            return false;\n        }\n"
+            if old_p2p in c and "shouldBlockVoipP2p()" not in c:
+                c = c.replace(old_p2p, new_p2p, 1)
+            return c
+        patch_file(voip_file, voip_defender_p2p, None, "VoIPService Defender P2P Shield & STUN Gate")
+
+    launch_act = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LaunchActivity.java")
+    if os.path.exists(launch_act):
+        def launch_update_guard(c):
+            if "shouldBlockForeignAppUpdate()" in c:
+                return CONVERGED
+            target = "    public void checkAppUpdate(boolean force, Browser.Progress progress) {"
+            if target in c:
+                inject = target + "\n        if (org.colgram.core.ColgramHookHandler.shouldBlockForeignAppUpdate()) {\n            if (force) {\n                org.colgram.core.ColgramUpdater.checkForUpdates(BuildVars.BUILD_VERSION_STRING, new org.colgram.core.ColgramUpdater.UpdateCheckCallback() {\n                    @Override public void onUpdateAvailable(String v, String n, String u) { if (progress != null) progress.end(); }\n                    @Override public void onUpToDate() { if (progress != null) progress.end(); }\n                    @Override public void onError(String e) { if (progress != null) progress.end(); }\n                });\n            } else if (progress != null) {\n                progress.end();\n            }\n            return;\n        }"
+                c = c.replace(target, inject, 1)
+            return c
+        patch_file(launch_act, launch_update_guard, None, "LaunchActivity Block Foreign Telegram APK Hijack")
+
 def sync_wireguard_module(repo_path, source_dir):
     """Mirror Colgram's patched WireGuard library into the Telegram checkout."""
     required = [
@@ -5632,6 +6629,76 @@ def sync_singbox_module(repo_path, root_dir):
             + gradle_text[anchor_match.end():])
         with open(project_gradle, "w", encoding="utf-8") as gradle_file:
             gradle_file.write(gradle_text)
+
+
+def sync_llama_module(repo_path, root_dir):
+    """Mirror the vendored llama.cpp + mtmd JNI module into the Telegram build tree."""
+    source_dir = os.path.join(root_dir, "vendor", "colgram-llama")
+    if not os.path.isdir(source_dir):
+        PATCH_MISSES.append("Colgram llama module source")
+        return
+
+    target_dir = os.path.join(repo_path, "colgram-llama")
+    repo_real = os.path.realpath(repo_path)
+    target_real = os.path.realpath(target_dir)
+    if os.path.commonpath([repo_real, target_real]) != repo_real:
+        raise ValueError("colgram-llama destination escaped the Telegram checkout")
+    os.makedirs(target_dir, exist_ok=True)
+
+    bg_src = os.path.join(source_dir, "build.gradle")
+    if os.path.isfile(bg_src):
+        shutil.copy2(bg_src, os.path.join(target_dir, "build.gradle"))
+
+    jni_src = os.path.join(source_dir, "src")
+    jni_dst = os.path.join(target_dir, "src")
+    if os.path.isdir(jni_src):
+        if os.path.exists(jni_dst):
+            shutil.rmtree(jni_dst)
+        shutil.copytree(jni_src, jni_dst)
+
+    settings_path = os.path.join(repo_path, "settings.gradle")
+    if os.path.isfile(settings_path):
+        with open(settings_path, "r", encoding="utf-8") as sf:
+            stext = sf.read()
+        changed = False
+        if "':colgram-llama'" not in stext and '":colgram-llama"' not in stext:
+            stext += "\ninclude ':colgram-llama'\n"
+            changed = True
+        if "project(':colgram-llama').projectDir" not in stext:
+            stext += "project(':colgram-llama').projectDir = file('colgram-llama')\n"
+            changed = True
+        if changed:
+            with open(settings_path, "w", encoding="utf-8") as sf:
+                sf.write(stext)
+
+    project_gradle = os.path.join(repo_path, "TMessagesProj", "build.gradle")
+    if os.path.isfile(project_gradle):
+        with open(project_gradle, "r", encoding="utf-8") as gf:
+            gtext = gf.read()
+        if "project(':colgram-llama')" not in gtext:
+            anchor = re.search(
+                r'^[ \t]*implementation[ \t]+project\(\s*["\']:colgram-singbox["\'][ \t]*\)[ \t]*\r?$',
+                gtext,
+                re.MULTILINE,
+            )
+            if anchor is not None:
+                gtext = (
+                    gtext[:anchor.start()]
+                    + anchor.group(0).rstrip("\r")
+                    + "\n    implementation project(':colgram-llama')"
+                    + gtext[anchor.end():]
+                )
+                with open(project_gradle, "w", encoding="utf-8") as gf:
+                    gf.write(gtext)
+
+    present = []
+    for abi in ("arm64-v8a", "x86_64"):
+        if os.path.isfile(os.path.join(jni_dst, "main", "jniLibs", abi, "libcolgram_llama.so")):
+            present.append(abi)
+    if present:
+        print(f" [+] Colgram llama C++/mtmd module synced ({', '.join(present)})")
+    else:
+        PATCH_MISSES.append("Colgram llama native binary (libcolgram_llama.so)")
 
 
 def inject_warp_device_test_support(repo_path, root_dir):
@@ -5871,7 +6938,8 @@ def inject_core_device_test_support(repo_path, root_dir):
                  "ColgramProxyAutonomyDeviceTest.java",
                  "ColgramUdpAssociateDeviceTest.java",
                  "ColgramWarpChurnDeviceTest.java",
-                 "ColgramWarpUdpReachabilityDeviceTest.java"):
+                 "ColgramWarpUdpReachabilityDeviceTest.java",
+                 "ColgramNativeAiDeviceTest.java"):
         source = os.path.join(template_dir, name)
         if not os.path.isfile(source):
             PATCH_MISSES.append("core device-test template " + name)
@@ -6472,6 +7540,7 @@ def configure_package_and_branding(repo_path):
         with open(standalone_gradle, "r", encoding="utf-8") as f:
             content = f.read()
         content = content.replace("defaultConfig.applicationId = APP_PACKAGE", 'defaultConfig.applicationId = "org.colgram.messenger"')
+        content = content.replace('noCompress += "pack"', 'noCompress += ["pack", "gguf"]')
         with open(standalone_gradle, "w", encoding="utf-8") as f:
             f.write(content)
         print(" [+] Set applicationId = org.colgram.messenger in TMessagesProj_AppStandalone/build.gradle")
@@ -6942,6 +8011,7 @@ def main():
     # promise a VPN it could not start. Order the two the only way that works on a fresh clone.
     download_official_binaries(target_repo)
     sync_singbox_module(target_repo, root_dir)
+    sync_llama_module(target_repo, root_dir)
     inject_warp_device_test_support(target_repo, root_dir)
     inject_singbox_device_test_support(target_repo, root_dir)
     inject_core_device_test_support(target_repo, root_dir)

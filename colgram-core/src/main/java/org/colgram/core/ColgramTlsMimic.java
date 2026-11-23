@@ -257,15 +257,210 @@ public final class ColgramTlsMimic {
     }
 
     /**
-     * Split the first packet into 2-3 TCP segments at randomized offsets. Splitting defeats
-     * DPI reassembly even when the fingerprint is fine; combined with the rewrite it is the
-     * same one-two that ByeDPI-class tools use.
+     * Parses a TLS 1.2/1.3 ClientHello (RFC 5246/8446) to find the exact byte span [start, end)
+     * of the SNI hostname string (extension 0x0000). Works with BoringSSL/Chrome/Android GREASE
+     * and post-quantum X25519MLKEM768 keyshares. Returns null if not a TLS ClientHello with SNI.
+     */
+    public static int[] findTlsSniSpan(byte[] buf, int len) {
+        if (buf == null || len < 48) return null;
+        if ((buf[0] & 0xFF) != 0x16 || (buf[1] & 0xFF) != 0x03 || (buf[5] & 0xFF) != 0x01) return null;
+        int recLen = ((buf[3] & 0xFF) << 8) | (buf[4] & 0xFF);
+        int limit = Math.min(len, 5 + recLen);
+        if (limit < 48) return null;
+        int pos = 5 + 4 + 2 + 32; // record(5) + handshake hdr(4) + legacy_version(2) + random(32)
+        if (pos >= limit) return null;
+        int sidLen = buf[pos] & 0xFF;
+        pos += 1 + sidLen;
+        if (pos + 2 > limit) return null;
+        int cipherLen = ((buf[pos] & 0xFF) << 8) | (buf[pos + 1] & 0xFF);
+        pos += 2 + cipherLen;
+        if (pos + 1 > limit) return null;
+        int compLen = buf[pos] & 0xFF;
+        pos += 1 + compLen;
+        if (pos + 2 > limit) return null;
+        int extTotalLen = ((buf[pos] & 0xFF) << 8) | (buf[pos + 1] & 0xFF);
+        pos += 2;
+        int extEnd = Math.min(limit, pos + extTotalLen);
+        while (pos + 4 <= extEnd) {
+            int extType = ((buf[pos] & 0xFF) << 8) | (buf[pos + 1] & 0xFF);
+            int extLen = ((buf[pos + 2] & 0xFF) << 8) | (buf[pos + 3] & 0xFF);
+            pos += 4;
+            if (pos + extLen > extEnd) break;
+            if (extType == 0x0000 && extLen >= 5) {
+                int listLen = ((buf[pos] & 0xFF) << 8) | (buf[pos + 1] & 0xFF);
+                int p = pos + 2;
+                int listEnd = Math.min(pos + extLen, p + listLen);
+                while (p + 3 <= listEnd) {
+                    int nameType = buf[p] & 0xFF;
+                    int nameLen = ((buf[p + 1] & 0xFF) << 8) | (buf[p + 2] & 0xFF);
+                    p += 3;
+                    if (nameType == 0 && nameLen >= 2 && p + nameLen <= listEnd) {
+                        return new int[]{p, p + nameLen};
+                    }
+                    p += nameLen;
+                }
+            }
+            pos += extLen;
+        }
+        return null;
+    }
+
+    /** Extract lowercase SNI hostname from a TLS ClientHello, or null if absent/invalid. */
+    public static String extractSniHostname(byte[] buf, int len) {
+        int[] span = findTlsSniSpan(buf, len);
+        if (span == null || span[1] <= span[0]) return null;
+        for (int i = span[0]; i < span[1]; i++) {
+            int c = buf[i] & 0xFF;
+            boolean valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+            if (!valid) return null;
+        }
+        return new String(buf, span[0], span[1] - span[0], StandardCharsets.US_ASCII)
+                .toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * Returns the full announced TLS record length (5 + payloadLen) for a ClientHello, or -1 if
+     * not a ClientHello or implausibly large.
+     */
+    public static int expectedClientHelloLength(byte[] data, int len) {
+        if (data == null || len < 11 || (data[0] & 0xFF) != 0x16 || (data[1] & 0xFF) != 0x03
+                || (data[5] & 0xFF) != 0x01) {
+            return -1;
+        }
+        int recordLen = ((data[3] & 0xFF) << 8) | (data[4] & 0xFF);
+        if (recordLen < 40 || recordLen > 16384) return -1;
+        return 5 + recordLen;
+    }
+
+    /**
+     * Splits a complete TLS ClientHello record into 2 or 3 RFC-valid 0x16 TLS records sliced
+     * directly inside the SNI hostname extension. Preserves any trailing bytes pipelined after
+     * the ClientHello record. Returns null when data does not hold a complete ClientHello with SNI.
+     */
+    public static byte[][] splitTlsRecordAtSni(byte[] data, int parts) {
+        if (data == null) return null;
+        int recEnd = expectedClientHelloLength(data, data.length);
+        if (recEnd < 0 || data.length < recEnd) return null;
+        int[] sni = findTlsSniSpan(data, recEnd);
+        if (sni == null) return null;
+        int sniStart = sni[0];
+        int sniEnd = sni[1];
+        int sniMid = sniStart + Math.max(1, (sniEnd - sniStart) / 2);
+        int trailingLen = data.length - recEnd;
+
+        if (parts >= 3 && sniEnd - sniStart >= 4) {
+            int cut1 = Math.min(sniStart + 2, sniMid - 1);
+            if (cut1 > 6 && sniMid > cut1 && sniMid < recEnd - 1) {
+                byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, cut1 - 5, null, 0, 0);
+                byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, cut1, sniMid - cut1, null, 0, 0);
+                byte[] r3 = buildTlsRecord(data[0], data[1], data[2], data, sniMid, recEnd - sniMid,
+                        trailingLen > 0 ? data : null, recEnd, trailingLen);
+                return new byte[][]{r1, r2, r3};
+            }
+        }
+        if (sniMid <= 6 || sniMid >= recEnd - 1) return null;
+        byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, sniMid - 5, null, 0, 0);
+        byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, sniMid, recEnd - sniMid,
+                trailingLen > 0 ? data : null, recEnd, trailingLen);
+        return new byte[][]{r1, r2};
+    }
+
+    /**
+     * Splits a complete TLS ClientHello record into 2 RFC-valid 0x16 TLS records at an exact
+     * byte offset inside the SNI hostname (e.g. {@code offsetAfterSniStart == 1} implements exact
+     * ByeDPI {@code -r1+s}, cutting immediately after the 1st character of the domain name).
+     */
+    public static byte[][] splitTlsRecordAtSniOffset(byte[] data, int offsetAfterSniStart) {
+        if (data == null) return null;
+        int recEnd = expectedClientHelloLength(data, data.length);
+        if (recEnd < 0 || data.length < recEnd) return null;
+        int[] sni = findTlsSniSpan(data, recEnd);
+        if (sni == null) return null;
+        int sniLen = sni[1] - sni[0];
+        if (sniLen < 2) return null;
+        int off = Math.max(1, Math.min(offsetAfterSniStart, sniLen - 1));
+        int cut = sni[0] + off;
+        if (cut <= 6 || cut >= recEnd - 1) return null;
+        int trailingLen = data.length - recEnd;
+        byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, cut - 5, null, 0, 0);
+        byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, cut, recEnd - cut,
+                trailingLen > 0 ? data : null, recEnd, trailingLen);
+        return new byte[][]{r1, r2};
+    }
+
+    /**
+     * RFC 9110 §5.1 compliant HTTP/1.x Host header case-mangling (`Host:` -> `hoSt:`).
+     * Defeats naive plain-HTTP DPI parsers matching exact `Host:` while remaining 100% valid
+     * for all standards-compliant HTTP servers. Never mutates the caller's array.
+     */
+    public static byte[] mangleHttpHostHeader(byte[] buf, int len) {
+        if (buf == null || len < 16 || len > buf.length) return buf;
+        byte b0 = buf[0];
+        if (b0 != 'G' && b0 != 'P' && b0 != 'H' && b0 != 'C' && b0 != 'O' && b0 != 'D') return buf;
+        int headerLimit = len - 6;
+        for (int i = 0; i < len - 3; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                headerLimit = Math.min(headerLimit, i);
+                break;
+            }
+        }
+        for (int i = 0; i < headerLimit; i++) {
+            if (buf[i] == '\n'
+                    && (buf[i + 1] == 'H' || buf[i + 1] == 'h')
+                    && (buf[i + 2] == 'o' || buf[i + 2] == 'O')
+                    && (buf[i + 3] == 's' || buf[i + 3] == 'S')
+                    && (buf[i + 4] == 't' || buf[i + 4] == 'T')
+                    && buf[i + 5] == ':') {
+                byte[] copy = Arrays.copyOf(buf, len);
+                copy[i + 1] = 'h';
+                copy[i + 2] = 'o';
+                copy[i + 3] = 'S';
+                copy[i + 4] = 't';
+                return copy;
+            }
+        }
+        return buf;
+    }
+
+    private static byte[] buildTlsRecord(byte type, byte maj, byte min,
+                                         byte[] payload, int off, int len,
+                                         byte[] trailing, int trailingOff, int trailingLen) {
+        byte[] out = new byte[5 + len + trailingLen];
+        out[0] = type;
+        out[1] = maj;
+        out[2] = min;
+        out[3] = (byte) ((len >>> 8) & 0xFF);
+        out[4] = (byte) (len & 0xFF);
+        System.arraycopy(payload, off, out, 5, len);
+        if (trailing != null && trailingLen > 0) {
+            System.arraycopy(trailing, trailingOff, out, 5 + len, trailingLen);
+        }
+        return out;
+    }
+
+    /**
+     * Split the first packet into TCP segments without modifying a single byte.
+     *
+     * For TLS/FakeTLS ClientHellos containing an SNI hostname, ALWAYS slices at byte 1 AND right
+     * across the middle of the SNI domain (`[0..1)`, `[1..sniMid)`, `[sniMid..end)`) so TSPU/RKN
+     * never sees the complete SNI in one TCP segment while preserving TLS transcripts & FakeTLS HMAC.
      */
     public static byte[][] fragment(byte[] data, Random rnd) {
         if (data == null || data.length < 16) return new byte[][]{data};
-        int pieces = 2 + rnd.nextInt(2);
+        int[] sni = findTlsSniSpan(data, data.length);
+        if (sni != null) {
+            int sniMid = sni[0] + Math.max(1, (sni[1] - sni[0]) / 2);
+            if (sniMid > 1 && sniMid < data.length) {
+                return new byte[][]{
+                        Arrays.copyOfRange(data, 0, 1),
+                        Arrays.copyOfRange(data, 1, sniMid),
+                        Arrays.copyOfRange(data, sniMid, data.length)};
+            }
+        }
+        int pieces = 2 + (rnd != null ? rnd.nextInt(2) : 0);
         if (pieces == 2) {
-            int cut = 1 + rnd.nextInt(Math.max(1, Math.min(data.length - 1, 48)));
+            int cut = 1 + (rnd != null ? rnd.nextInt(Math.max(1, Math.min(data.length - 1, 48))) : 1);
             return new byte[][]{
                     Arrays.copyOfRange(data, 0, cut),
                     Arrays.copyOfRange(data, cut, data.length)};
@@ -276,6 +471,103 @@ public final class ColgramTlsMimic {
                 Arrays.copyOfRange(data, 0, a),
                 Arrays.copyOfRange(data, a, b),
                 Arrays.copyOfRange(data, b, data.length)};
+    }
+
+    /**
+     * Whitelisted Russian SNI hostnames used exclusively inside low-TTL ByeDPI decoy packets
+     * that expire before reaching the real destination server.
+     */
+    private static final String[] DECOY_WHITELIST_SNI = {
+            "max.ru", "vk.com", "yandex.ru", "gosuslugi.ru",
+            "ozon.ru", "sberbank.ru", "wildberries.ru", "dzen.ru"
+    };
+
+    /**
+     * Builds a compact, RFC-valid TLS 1.3 ClientHello carrying a whitelisted Russian SNI right at
+     * the start of its extensions (offset ~62..80), padded via RFC 7685 (0x0015) to match
+     * {@code targetLen} when possible. Used exclusively as a low-TTL decoy packet in native
+     * ByeDPI {@code sendfile()+mmap()} desync.
+     */
+    public static byte[] buildFakeWhitelistedClientHello(int targetLen, int variant) {
+        String sni = DECOY_WHITELIST_SNI[Math.abs(variant) % DECOY_WHITELIST_SNI.length];
+        Random rnd = new Random();
+        byte[] random = new byte[32];
+        rnd.nextBytes(random);
+
+        ByteArray hs = new ByteArray(Math.max(256, targetLen));
+        hs.u8(0x01);                                    // HandshakeType: client_hello
+        int hsLenAt = hs.length();
+        hs.u8(0x00); hs.u8(0x00); hs.u8(0x00);          // handshake length placeholder
+        hs.u8(0x03); hs.u8(0x03);                       // legacy_version TLS 1.2
+        hs.bytes(random);                               // 32B client_random
+        hs.u8(0x00);                                    // compact 0-byte session_id so SNI sits very early
+        // Compact modern TLS 1.3 + ECDHE cipher suite list (4 suites = 8B)
+        hs.u16(8);
+        hs.u16(0x1301);
+        hs.u16(0x1302);
+        hs.u16(0x1303);
+        hs.u16(0xc02f);
+        hs.u8(0x01); hs.u8(0x00);                       // compression: null
+
+        int extLenAt = hs.length();
+        hs.u16(0x0000);                                 // extensions length placeholder
+
+        // Put SNI extension FIRST so carrier TSPU sees the complete whitelisted hostname even in small segments
+        ext(hs, serverNameExtension(sni));
+        // supported_versions: TLS 1.3, TLS 1.2
+        ext(hs, simple(0x002b, new byte[]{0x04, 0x03, 0x04, 0x03, 0x03}));
+
+        // If caller wants an exact targetLen >= current record size + 4, pad via RFC 7685 extension 0x0015
+        int currentRecordLen = 5 + hs.length();
+        if (targetLen >= currentRecordLen + 4) {
+            int padBodyLen = targetLen - currentRecordLen - 4;
+            ext(hs, simple(0x0015, new byte[padBodyLen]));
+        }
+
+        int extLen = hs.length() - extLenAt - 2;
+        hs.setU16(extLenAt, extLen);
+        int hsLen = hs.length() - 4;
+        hs.setU24(hsLenAt, hsLen);
+
+        byte[] hello = hs.toArray();
+        byte[] record = new byte[5 + hello.length];
+        record[0] = 0x16;
+        record[1] = 0x03;
+        record[2] = 0x01;
+        record[3] = (byte) ((hello.length >>> 8) & 0xFF);
+        record[4] = (byte) (hello.length & 0xFF);
+        System.arraycopy(hello, 0, record, 5, hello.length);
+        return record;
+    }
+
+    /** True when upstream replied immediately with a fatal TLS Alert (e.g. decode_error / handshake_failure). */
+    public static boolean looksLikeFatalTlsAlert(byte[] data, int len) {
+        return data != null && len >= 7
+                && (data[0] & 0xFF) == 0x15
+                && (data[1] & 0xFF) == 0x03
+                && (data[5] & 0xFF) == 0x02;
+    }
+
+    /** True when upstream replied with a well-known Russian ISP HTTP block-page redirect/stub. */
+    public static boolean looksLikeIspBlockRedirect(byte[] data, int len) {
+        if (data == null || len < 16) return false;
+        if (data[0] != 'H' || data[1] != 'T' || data[2] != 'T' || data[3] != 'P') return false;
+        int checkLen = Math.min(len, 512);
+        String head = new String(data, 0, checkLen, StandardCharsets.ISO_8859_1)
+                .toLowerCase(java.util.Locale.US);
+        if (!head.startsWith("http/1.") || !(head.contains(" 301 ") || head.contains(" 302 ")
+                || head.contains(" 307 ") || head.contains(" 403 ") || head.contains(" 451 "))) {
+            return false;
+        }
+        return head.contains("warning.rt.ru")
+                || head.contains("eais.rkn.gov.ru")
+                || head.contains("blocklist.rkn.gov.ru")
+                || head.contains("lawfilter")
+                || head.contains("fz139")
+                || head.contains("blocked.mts.ru")
+                || head.contains("megafon.ru/block")
+                || head.contains("beeline.ru/block")
+                || head.contains("tele2.ru/block");
     }
 
     /** True when the buffer starts with a TLS record header this class could engage with. */

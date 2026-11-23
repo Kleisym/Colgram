@@ -32,7 +32,7 @@ class GuestProxyProbeTest(unittest.TestCase):
         self.assertIn("bindService", s)
         self.assertIn("unbindService", s)
         self.assertIn("CHECK_TIMEOUT_MS", s)
-        self.assertIn("MAX_PARALLEL = 3", s)
+        self.assertIn("MAX_PARALLEL = 5", s)
         self.assertIn("LANES.acquire()", s)
         self.assertIn("LANES.release(ticket)", s)
         self.assertIn('target.putInt("lane", ticket.lane())', s)
@@ -48,7 +48,10 @@ class GuestProxyProbeTest(unittest.TestCase):
         self.assertIn("selection.guestInFlight < ColgramGuestProxyProbe.MAX_PARALLEL", source)
         self.assertIn("selection.guestInFlight++", source)
         self.assertIn("selection.guestInFlight--", source)
-        self.assertIn("MAX_BACKGROUND_GUEST_CHECKS = 18", source)
+        import re
+        bg_match = re.search(r"MAX_BACKGROUND_GUEST_CHECKS\s*=\s*(\d+)", source)
+        self.assertIsNotNone(bg_match)
+        self.assertGreaterEqual(int(bg_match.group(1)), 60)
         self.assertIn("selection.guestPending = selection.guestInFlight > 0", source)
 
     def test_explicit_selection_is_not_limited_to_two_serial_guesses(self):
@@ -56,7 +59,10 @@ class GuestProxyProbeTest(unittest.TestCase):
         body = source.split("private static boolean startGuestSelectionProbe(", 1)[1].split("private static String selectionProgress", 1)[0]
         self.assertNotIn("selection.guestAttempts >= 2", body)
         self.assertIn("selection.guestInFlight >= ColgramGuestProxyProbe.MAX_PARALLEL", body)
-        self.assertIn("MAX_SELECTION_GUEST_CHECKS = 9", source)
+        import re
+        match = re.search(r"MAX_SELECTION_GUEST_CHECKS\s*=\s*(\d+)", source)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(int(match.group(1)), 30)
 
 
 if __name__ == "__main__":

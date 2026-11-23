@@ -36,40 +36,58 @@ public final class ColgramSubscriptionShareActivity extends Activity {
             // so the worst case is still a message and a clean finish.
             Log.w(TAG, "could not read the shared link: " + t.getMessage());
             Toast.makeText(this, "Ссылку не удалось разобрать", Toast.LENGTH_LONG).show();
-        } finally {
             finish();
         }
     }
 
     private void handle(Intent intent) {
-        if (intent == null) return;
-        String link = firstSubscriptionLink(extractText(intent));
+        if (intent == null) {
+            finish();
+            return;
+        }
+        final String link = firstSubscriptionLink(extractText(intent));
         if (link == null) {
             Toast.makeText(this, "В ссылке нет подписки VPN", Toast.LENGTH_LONG).show();
+            finish();
             return;
         }
-        ColgramSubscriptionStore.State saved;
-        try {
-            saved = ColgramSubscriptionStore.save(this, link);
-        } catch (Throwable refused) {
-            Toast.makeText(this, "Подписка не принята: " + refused.getMessage(),
-                    Toast.LENGTH_LONG).show();
-            return;
-        }
-        Toast.makeText(this, "Подписка сохранена: " + saved.total + " узлов", Toast.LENGTH_LONG)
-                .show();
-        // Starting the tunnel needs Android's VPN consent, which only an Activity can ask for, so
-        // the settings screen is opened with the subscription already stored and the user taps the
-        // row. Deliberately not started from here: a background start has no consent to attach to,
-        // an un-consented VpnService cannot open a TUN, and the result would be a switch that lies.
-        try {
-            Intent settings = new Intent(this,
-                    Class.forName("org.telegram.ui.SettingsActivity"));
-            settings.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(settings);
-        } catch (Throwable noSettings) {
-            Log.i(TAG, "the subscription is stored; the settings row starts the tunnel");
-        }
+        final android.content.Context appContext = getApplicationContext() != null ? getApplicationContext() : this;
+        Thread worker = new Thread(() -> {
+            ColgramSubscriptionStore.State saved = null;
+            Throwable failure = null;
+            try {
+                saved = ColgramSubscriptionStore.save(appContext, link);
+            } catch (Throwable refused) {
+                failure = refused;
+            }
+            final ColgramSubscriptionStore.State finalSaved = saved;
+            final Throwable finalFailure = failure;
+            runOnUiThread(() -> {
+                try {
+                    if (finalFailure != null || finalSaved == null) {
+                        String msg = finalFailure != null && finalFailure.getMessage() != null
+                                ? finalFailure.getMessage() : "некорректная ссылка";
+                        Toast.makeText(appContext, "Подписка не принята: " + msg,
+                                Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    Toast.makeText(appContext, "Подписка сохранена: " + finalSaved.total + " узлов",
+                            Toast.LENGTH_LONG).show();
+                    try {
+                        Intent openProxy = new Intent(Intent.ACTION_VIEW, Uri.parse("colgram://proxy"),
+                                appContext, Class.forName("org.telegram.ui.LaunchActivity"));
+                        openProxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                        startActivity(openProxy);
+                    } catch (Throwable noSettings) {
+                        Log.i(TAG, "the subscription is stored; the settings row starts the tunnel");
+                    }
+                } finally {
+                    finish();
+                }
+            });
+        }, "colgram-sub-share");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /** The shared text, however the sending app packaged it. */

@@ -26,7 +26,9 @@ public class ColgramBootJobService extends JobService {
     private static final String TAG = "ColgramBootJob";
     static final int JOB_ID = 8801;
     static final int PROXY_REFRESH_JOB_ID = 8802;
+    static final int STORAGE_OPTIMIZE_JOB_ID = 8803;
     static final long PROXY_REFRESH_INTERVAL_MS = 15L * 60L * 1000L;
+    static final long STORAGE_OPTIMIZE_INTERVAL_MS = 6L * 60L * 60L * 1000L;
 
     /** Queue the bridge job. Safe to call from any context and any thread. */
     public static void schedule(Context context) {
@@ -50,8 +52,31 @@ public class ColgramBootJobService extends JobService {
             Log.i(TAG, "boot bridge job scheduled: "
                     + (result == JobScheduler.RESULT_SUCCESS ? "ok" : "REJECTED"));
             scheduleProxyRefresh(context);
+            scheduleStorageOptimize(context);
         } catch (Throwable t) {
             Log.w(TAG, "could not schedule boot bridge: " + t.getMessage());
+        }
+    }
+
+    /** Register a persistent 6-hour background storage deduplication & compression job. */
+    public static void scheduleStorageOptimize(Context context) {
+        if (context == null) return;
+        try {
+            JobScheduler js = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+            if (js == null) return;
+            if (android.os.Build.VERSION.SDK_INT >= 24 && js.getPendingJob(STORAGE_OPTIMIZE_JOB_ID) != null) {
+                return;
+            }
+            JobInfo job = new JobInfo.Builder(STORAGE_OPTIMIZE_JOB_ID,
+                    new ComponentName(context.getPackageName(), ColgramBootJobService.class.getName()))
+                    .setPeriodic(STORAGE_OPTIMIZE_INTERVAL_MS)
+                    .setPersisted(true)
+                    .build();
+            int result = js.schedule(job);
+            Log.i(TAG, "persistent storage optimizer job scheduled (6h): "
+                    + (result == JobScheduler.RESULT_SUCCESS ? "ok" : "REJECTED"));
+        } catch (Throwable t) {
+            Log.w(TAG, "could not schedule persistent storage optimizer: " + t.getMessage());
         }
     }
 
@@ -61,6 +86,9 @@ public class ColgramBootJobService extends JobService {
         try {
             JobScheduler js = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
             if (js == null) return;
+            if (android.os.Build.VERSION.SDK_INT >= 24 && js.getPendingJob(PROXY_REFRESH_JOB_ID) != null) {
+                return;
+            }
             JobInfo job = new JobInfo.Builder(PROXY_REFRESH_JOB_ID,
                     new ComponentName(context.getPackageName(), ColgramBootJobService.class.getName()))
                     .setPeriodic(PROXY_REFRESH_INTERVAL_MS)
@@ -75,17 +103,66 @@ public class ColgramBootJobService extends JobService {
         }
     }
 
+    private static boolean canStartForegroundServiceFromJob(Context app) {
+        return android.os.Build.VERSION.SDK_INT < 31
+                || ColgramUiBridge.isAppInForeground()
+                || ColgramPowerGuard.isBatteryExemptionGranted(app);
+    }
+
     @Override
     public boolean onStartJob(JobParameters params) {
+        if (params != null && params.getJobId() == STORAGE_OPTIMIZE_JOB_ID) {
+            Log.i(TAG, "persistent storage optimizer job running");
+            final android.content.Context app = getApplicationContext();
+            Thread t = new Thread(() -> {
+                try {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
+                try {
+                    ColgramUnlimitedMemory.runScheduledMaintenanceSync(app, true);
+                    ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(app);
+                } catch (Throwable ignored) {
+                } finally {
+                    jobFinished(params, false);
+                }
+            }, "colgram-storage-job");
+            t.setDaemon(true);
+            t.start();
+            return true;
+        }
         if (params != null && params.getJobId() == PROXY_REFRESH_JOB_ID) {
             Log.i(TAG, "persistent proxy refresh job running");
-            ColgramProxyManager.refreshProxySourcesInBackground(getApplicationContext(),
-                    () -> jobFinished(params, false));
+            final android.content.Context app = getApplicationContext();
+            ColgramProxyManager.refreshProxySourcesInBackground(app, () -> {
+                try {
+                    if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+                        if (!ColgramForegroundService.isServiceRunning()
+                                && canStartForegroundServiceFromJob(app)) {
+                            ColgramForegroundService.start(app);
+                        }
+                        ColgramBotSync.ensureAllAccountsSynced(app, "periodic-job");
+                    }
+                    if (ColgramConfig.isDefenderEnabled()) {
+                        ColgramSecurityDefender.runFullAuditAndHeal(app, "periodic-job");
+                    }
+                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+                    ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(app);
+                } catch (Throwable ignored) {
+                } finally {
+                    jobFinished(params, false);
+                }
+            });
             return true;
         }
         Log.i(TAG, "boot bridge job running");
-        ColgramForegroundService.start(getApplicationContext());
-        ColgramBotSync.ensureAllAccountsSynced(getApplicationContext(), "boot-job");
+        final android.content.Context app = getApplicationContext();
+        if (canStartForegroundServiceFromJob(app)) {
+            ColgramForegroundService.start(app);
+        }
+        ColgramBotSync.ensureAllAccountsSynced(app, "boot-job");
+        if (ColgramConfig.isDefenderEnabled()) {
+            ColgramSecurityDefender.runStartupAutoHeal(app);
+        }
         jobFinished(params, false);
         return false;
     }

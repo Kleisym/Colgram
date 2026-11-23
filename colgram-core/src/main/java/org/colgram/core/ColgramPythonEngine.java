@@ -126,6 +126,8 @@ public class ColgramPythonEngine {
                 applyPendingPaths();
 
                 pythonInitialized = true;
+                wireShimBridge();
+                ColgramPluginManager.syncActiveExteraPlugins();
                 Log.d(TAG, "Full Mobile CPython 3.11 (Chaquopy) initialized successfully!");
 
             } catch (Throwable t) {
@@ -284,14 +286,23 @@ public class ColgramPythonEngine {
      */
     public static boolean isShimCommandRegistered(String cmd) {
         if (!pythonInitialized || pythonInstance == null || cmd == null) return false;
+        String needle = cmd.trim().toLowerCase(java.util.Locale.ROOT);
+        if (needle.isEmpty()) return false;
         try {
             Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
             if (mod == null) return false;
             Object commands = callAttrMethod.invoke(mod, "list_commands", new Object[]{});
             if (commands == null) return false;
-            // PyObject list -> String and compare, case-insensitively like the dispatcher.
+            // Exact command token matching (never substring match on Python repr like "['weather']" matching ".a" or ".e"!)
             String rendered = commands.toString();
-            return rendered != null && rendered.toLowerCase().contains(cmd.toLowerCase());
+            if (rendered == null || rendered.isEmpty()) return false;
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("['\"]([^'\"]+)['\"]").matcher(rendered);
+            while (m.find()) {
+                if (needle.equals(m.group(1).trim().toLowerCase(java.util.Locale.ROOT))) {
+                    return true;
+                }
+            }
+            return false;
         } catch (Throwable t) {
             return false;
         }
@@ -353,6 +364,92 @@ public class ColgramPythonEngine {
         } catch (Throwable t) {
             Log.w(TAG, "shim command ." + cmd + " failed: " + t.getMessage());
             return null;
+        }
+    }
+
+    private static void wireShimBridge() {
+        if (!pythonInitialized || pythonInstance == null) return;
+        try {
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            if (mod != null) {
+                callAttrMethod.invoke(mod, "set_bridge",
+                        new Object[]{ makeCallback("send"), makeCallback("edit"), makeCallback("delete") });
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** Synchronize active ExteraGram BasePlugin instances on the current background/Python thread. */
+    public static void syncExteraPluginsAsync(final java.util.List<String> enabledModules) {
+        pyExecutor.execute(() -> {
+            ensureInitialized();
+            if (!pythonInitialized || pythonInstance == null) return;
+            try {
+                wireShimBridge();
+                Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+                if (mod == null) return;
+                String[] arr = enabledModules != null ? enabledModules.toArray(new String[0]) : new String[0];
+                callAttrMethod.invoke(mod, "sync_all_plugins", new Object[]{ arr });
+            } catch (Throwable t) {
+                Log.w(TAG, "syncExteraPluginsAsync failed: " + t.getMessage());
+            }
+        });
+    }
+
+    /** Trigger on_plugin_unload() and evict a disabled or deleted ExteraGram module. */
+    public static void unloadExteraPluginAsync(final String moduleName) {
+        if (moduleName == null || moduleName.isEmpty() || !pythonInitialized || pythonInstance == null) return;
+        pyExecutor.execute(() -> {
+            try {
+                Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+                if (mod != null) {
+                    callAttrMethod.invoke(mod, "unload_extera_plugin", new Object[]{ moduleName });
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "unloadExteraPluginAsync(" + moduleName + ") failed: " + t.getMessage());
+            }
+        });
+    }
+
+    /** Query JSON-serialized ui.settings items for an ExteraGram plugin (must be called off main thread). */
+    public static String getExteraSettingsJson(final String moduleName) {
+        if (moduleName == null || moduleName.isEmpty() || Looper.myLooper() == Looper.getMainLooper()) {
+            return "[]";
+        }
+        ensureInitialized();
+        long deadline = android.os.SystemClock.elapsedRealtime() + 8000L;
+        while (!pythonInitialized && pythonStarting && android.os.SystemClock.elapsedRealtime() < deadline) {
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return "[]";
+            }
+        }
+        if (!pythonInitialized || pythonInstance == null) return "[]";
+        try {
+            wireShimBridge();
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            if (mod == null) return "[]";
+            Object res = callAttrMethod.invoke(mod, "get_plugin_settings_json", new Object[]{ moduleName });
+            return res != null ? res.toString() : "[]";
+        } catch (Throwable t) {
+            Log.w(TAG, "getExteraSettingsJson(" + moduleName + ") failed: " + t.getMessage());
+            return "[]";
+        }
+    }
+
+    /** Update an ExteraGram plugin setting (must be called off main thread). */
+    public static boolean updateExteraSetting(final String moduleName, final String key, final String valueJson) {
+        if (moduleName == null || key == null || !pythonInitialized || pythonInstance == null) return false;
+        try {
+            Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
+            if (mod == null) return false;
+            Object res = callAttrMethod.invoke(mod, "apply_plugin_setting_json",
+                    new Object[]{ moduleName, key, valueJson == null ? "null" : valueJson });
+            return res != null && Boolean.parseBoolean(res.toString());
+        } catch (Throwable t) {
+            Log.w(TAG, "updateExteraSetting(" + moduleName + "." + key + ") failed: " + t.getMessage());
+            return false;
         }
     }
 
@@ -633,9 +730,8 @@ public class ColgramPythonEngine {
             Class<?> smhClass = Class.forName("org.telegram.messenger.SendMessagesHelper");
             Object smh = smhClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
 
-            // editMessage does not take the new text as a parameter. The text lives on the
-            // MessageObject, so it is set there and the edit is started with the media slots empty -
-            // the same shape the app uses when a user edits text in place.
+            // SendMessagesHelper.editMessage reads `messageObject.editingMessage` (NOT messageText) and must run on main thread.
+            msgObjClass.getField("editingMessage").set(messageObject, newText);
             msgObjClass.getField("messageText").set(messageObject, newText);
 
             Class<?> photoClass = Class.forName("org.telegram.tgnet.TLRPC$TL_photo");
@@ -643,11 +739,14 @@ public class ColgramPythonEngine {
             Class<?> docClass = Class.forName("org.telegram.tgnet.TLRPC$TL_document");
             Class<?> coverClass = Class.forName("org.telegram.tgnet.TLRPC$PhotoSize");
             Class<?> mapClass = Class.forName("java.util.HashMap");
-            smhClass.getMethod("editMessage", msgObjClass, photoClass, videoClass, docClass,
-                            String.class, coverClass, mapClass, boolean.class, boolean.class,
-                            Object.class)
-                    .invoke(smh, messageObject, null, null, null, null, null, null,
-                            false, false, null);
+            Class<?> baseFragmentClass = Class.forName("org.telegram.ui.ActionBar.BaseFragment");
+            java.lang.reflect.Method editMethod = smhClass.getMethod("editMessage", msgObjClass, photoClass, videoClass, docClass,
+                    String.class, coverClass, mapClass, boolean.class, boolean.class, baseFragmentClass);
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                try {
+                    editMethod.invoke(smh, messageObject, null, null, null, null, null, null, false, false, reflectionRootFragment());
+                } catch (Throwable ignored) {}
+            });
         } catch (Throwable t) {
             Log.w(TAG, "editMessage via reflection failed: " + t.getMessage());
         }
@@ -688,18 +787,25 @@ public class ColgramPythonEngine {
      */
     private static Object reflectionRootFragment() {
         try {
-            Class<?> bridge = Class.forName("org.colgram.core.ColgramUiBridge");
-            Object activity = bridge.getMethod("currentActivity").invoke(null);
-            if (activity == null) return null;
-            // Only return it if Telegram would accept it as a BaseFragment. Any activity
-            // that also implements this shape is the LaunchActivity's fragment host.
             Class<?> baseFragmentClass;
             try {
                 baseFragmentClass = Class.forName("org.telegram.ui.ActionBar.BaseFragment");
             } catch (Throwable t) {
                 return null;
             }
-            return baseFragmentClass.isInstance(activity) ? activity : null;
+            try {
+                Class<?> launchCls = Class.forName("org.telegram.ui.LaunchActivity");
+                Object safeFrag = launchCls.getMethod("getSafeLastFragment").invoke(null);
+                if (safeFrag != null && baseFragmentClass.isInstance(safeFrag)) {
+                    return safeFrag;
+                }
+            } catch (Throwable ignored) {}
+            Class<?> bridge = Class.forName("org.colgram.core.ColgramUiBridge");
+            Object activity = bridge.getMethod("currentActivity").invoke(null);
+            if (activity != null && baseFragmentClass.isInstance(activity)) {
+                return activity;
+            }
+            return null;
         } catch (Throwable t) {
             return null;
         }
@@ -759,12 +865,21 @@ public class ColgramPythonEngine {
      */
     public static void sendMessage(long dialogId, String message) {
         try {
-            Class<?> smhClass = Class.forName("org.telegram.messenger.SendMessagesHelper");
             Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
             int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
+            sendMessage(currentAccount, dialogId, message);
+        } catch (Throwable t) {
+            Log.w(TAG, "sendMessage(" + dialogId + ") failed: " + t);
+        }
+    }
+
+    public static void sendMessage(int account, long dialogId, String message) {
+        try {
+            Class<?> smhClass = Class.forName("org.telegram.messenger.SendMessagesHelper");
+            int safeAccount = account >= 0 && account < 5 ? account : 0;
 
             Method getInstance = smhClass.getMethod("getInstance", int.class);
-            Object smh = getInstance.invoke(null, currentAccount);
+            Object smh = getInstance.invoke(null, safeAccount);
 
             // SendMessagesHelper has exactly one public sendMessage, and it takes a
             // SendMessageParams - there is no (CharSequence, long) overload to find.
@@ -789,28 +904,74 @@ public class ColgramPythonEngine {
             Object params = of.invoke(null, message, dialogId);
             smhClass.getMethod("sendMessage", paramsClass).invoke(smh, params);
         } catch (Throwable t) {
-            Log.w(TAG, "sendMessage(" + dialogId + ") failed: " + t);
+            Log.w(TAG, "sendMessage(acc=" + account + ", " + dialogId + ") failed: " + t);
         }
     }
 
     /**
      * Deletes recent messages via MessagesController reflection.
      */
+    /**
+     * Deletes the most recent `count` outgoing messages from `dialogId` loaded in MessagesController.
+     */
     public static void deleteLastMessages(long dialogId, int count) {
+        if (count <= 0) return;
         try {
             Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
             Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
             int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
 
-            Method getInstance = mcClass.getMethod("getInstance", int.class);
-            Object mc = getInstance.invoke(null, currentAccount);
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
+            Object dialogMap = mcClass.getField("dialogMessage").get(mc);
+            if (dialogMap == null) return;
 
-            for (Method m : mcClass.getMethods()) {
-                if (m.getName().equals("deleteMessages") && m.getParameterTypes().length >= 2) {
+            Object listObj = null;
+            for (Method m : dialogMap.getClass().getMethods()) {
+                if ("get".equals(m.getName()) && m.getParameterTypes().length == 1
+                        && m.getParameterTypes()[0] == long.class) {
+                    listObj = m.invoke(dialogMap, dialogId);
                     break;
                 }
             }
-        } catch (Throwable ignored) {}
+            if (!(listObj instanceof java.util.List)) return;
+
+            java.util.List<?> msgs = (java.util.List<?>) listObj;
+            java.util.ArrayList<Integer> idsToDelete = new java.util.ArrayList<>();
+            Class<?> msgObjClass = Class.forName("org.telegram.messenger.MessageObject");
+            Method isOutMethod = msgObjClass.getMethod("isOut");
+            Method getIdMethod = msgObjClass.getMethod("getId");
+
+            for (Object msg : msgs) {
+                if (msg == null) continue;
+                Object isOut = isOutMethod.invoke(msg);
+                if (Boolean.TRUE.equals(isOut)) {
+                    int id = ((Number) getIdMethod.invoke(msg)).intValue();
+                    if (id > 0) {
+                        idsToDelete.add(id);
+                    }
+                }
+            }
+            if (idsToDelete.isEmpty()) return;
+
+            java.util.Collections.sort(idsToDelete, java.util.Collections.reverseOrder());
+            if (idsToDelete.size() > count) {
+                idsToDelete = new java.util.ArrayList<>(idsToDelete.subList(0, count));
+            }
+
+            Class<?> encryptedChatClass = Class.forName("org.telegram.tgnet.TLRPC$EncryptedChat");
+            final java.util.ArrayList<Integer> finalIds = idsToDelete;
+            mainHandler.post(() -> {
+                try {
+                    mcClass.getMethod("deleteMessages", java.util.ArrayList.class, java.util.ArrayList.class,
+                                    encryptedChatClass, long.class, int.class, boolean.class, int.class)
+                            .invoke(mc, finalIds, null, null, dialogId, 0, true, 0);
+                } catch (Throwable inner) {
+                    Log.w(TAG, "deleteLastMessages dispatch failed: " + inner.getMessage());
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "deleteLastMessages failed: " + t.getMessage());
+        }
     }
 
     public interface ScriptCallback {

@@ -13,6 +13,9 @@ import java.util.Locale;
 
 /** Android-independent, deterministic rules shared by feed ingestion and proxy selection. */
 public final class ColgramProxyPolicy {
+    private static final java.util.regex.Pattern COUNTRY_COLUMN_PATTERN =
+            java.util.regex.Pattern.compile("^([0-9.]+:[0-9]{1,5}):[A-Za-z][A-Za-z .()'-]{1,79}$");
+
     private ColgramProxyPolicy() {}
 
     public static final class Endpoint {
@@ -37,8 +40,7 @@ public final class ColgramProxyPolicy {
         if (!scheme.equals("socks5") && !scheme.equals("http")) return null;
         String value = line.trim();
         if (countryColumn) {
-            java.util.regex.Matcher metadata = java.util.regex.Pattern.compile(
-                    "^([0-9.]+:[0-9]{1,5}):[A-Za-z][A-Za-z .()'-]{1,79}$").matcher(value);
+            java.util.regex.Matcher metadata = COUNTRY_COLUMN_PATTERN.matcher(value);
             if (metadata.matches()) value = metadata.group(1);
         }
         if (value.isEmpty() || value.length() > 512 || value.indexOf('\\') >= 0) return null;
@@ -58,13 +60,78 @@ public final class ColgramProxyPolicy {
         }
     }
 
+    private static boolean isHexColonDotOnly(String value) {
+        for (int i = 0, n = value.length(); i < n; i++) {
+            char c = value.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == ':' || c == '.')) {
+                return false;
+            }
+        }
+        return !value.isEmpty();
+    }
+
+    private static boolean isDigitsDotsOnly(String value) {
+        if (value.isEmpty()) return false;
+        for (int i = 0, n = value.length(); i < n; i++) {
+            char c = value.charAt(i);
+            if ((c < '0' || c > '9') && c != '.') return false;
+        }
+        return true;
+    }
+
+    private static boolean isValidIpv4Literal(String value, int[] outOctets) {
+        int len = value.length();
+        int octet = 0;
+        int count = 0;
+        int digits = 0;
+        int firstChar = 0;
+        for (int i = 0; i <= len; i++) {
+            if (i == len || value.charAt(i) == '.') {
+                if (digits == 0 || digits > 3 || (digits > 1 && firstChar == '0') || octet > 255) {
+                    return false;
+                }
+                if (count >= 4) return false;
+                if (outOctets != null) outOctets[count] = octet;
+                count++;
+                octet = 0;
+                digits = 0;
+            } else {
+                char c = value.charAt(i);
+                if (c < '0' || c > '9') return false;
+                if (digits == 0) firstChar = c;
+                digits++;
+                octet = octet * 10 + (c - '0');
+            }
+        }
+        return count == 4;
+    }
+
+    private static boolean isValidDomainLabels(String value) {
+        int len = value.length();
+        int labelLen = 0;
+        char first = 0;
+        char prev = 0;
+        for (int i = 0; i <= len; i++) {
+            if (i == len || value.charAt(i) == '.') {
+                if (labelLen == 0 || labelLen > 63 || first == '-' || prev == '-') return false;
+                labelLen = 0;
+            } else {
+                char c = value.charAt(i);
+                if (labelLen == 0) first = c;
+                prev = c;
+                labelLen++;
+            }
+        }
+        return true;
+    }
+
     /** Validation does not resolve a hostname or perform network I/O. */
     public static String normalizeHost(String host) {
         if (host == null || host.isEmpty() || !host.equals(host.trim())) return null;
         String value = host.toLowerCase(Locale.ROOT);
         if (value.startsWith("[") && value.endsWith("]")) value = value.substring(1, value.length() - 1);
         if (value.indexOf(':') >= 0) {
-            if (value.indexOf('%') >= 0 || !value.matches("[0-9a-f:.]+")) return null;
+            if (value.indexOf('%') >= 0 || !isHexColonDotOnly(value)) return null;
             try {
                 // A colon makes this a numeric IPv6 literal, so getByName never queries DNS.
                 return InetAddress.getByName(value).getHostAddress();
@@ -73,42 +140,39 @@ public final class ColgramProxyPolicy {
             }
         }
         if (value.endsWith(".")) value = value.substring(0, value.length() - 1);
-        if (value.matches("[0-9.]+")) {
-            String[] octets = value.split("\\.", -1);
-            if (octets.length != 4) return null;
-            for (String octet : octets) {
-                if (octet.isEmpty() || octet.length() > 3 || (octet.length() > 1 && octet.charAt(0) == '0')) return null;
-                try {
-                    if (Integer.parseInt(octet) > 255) return null;
-                } catch (NumberFormatException malformed) {
-                    return null;
-                }
-            }
-            return value;
+        if (isDigitsDotsOnly(value)) {
+            return isValidIpv4Literal(value, null) ? value : null;
         }
         try {
             value = IDN.toASCII(value, IDN.USE_STD3_ASCII_RULES).toLowerCase(Locale.ROOT);
         } catch (IllegalArgumentException malformed) {
             return null;
         }
-        if (value.isEmpty() || value.length() > 253) return null;
-        for (String label : value.split("\\.", -1)) {
-            if (label.isEmpty() || label.length() > 63 || label.startsWith("-") || label.endsWith("-")) return null;
-        }
+        if (value.isEmpty() || value.length() > 253 || !isValidDomainLabels(value)) return null;
         return value;
     }
 
     public static boolean isPublicHost(String host) {
         host = normalizeHost(host);
         if (host == null) return false;
-        if (host.indexOf(':') >= 0 || host.matches("[0-9.]+")) {
+        if (host.indexOf(':') >= 0) {
             try {
                 return isPublicAddress(InetAddress.getByName(host));
             } catch (Exception malformed) {
                 return false;
             }
         }
-        return host.contains(".") && !host.equals("localhost") && !host.endsWith(".localhost")
+        int[] octets = new int[4];
+        if (isValidIpv4Literal(host, octets)) {
+            int b0 = octets[0], b1 = octets[1], b2 = octets[2], b3 = octets[3];
+            if (b0 == 0 && b1 == 0 && b2 == 0 && b3 == 0) return false;
+            if (b0 == 127) return false;
+            if (b0 == 169 && b1 == 254) return false;
+            if (b0 == 10 || (b0 == 172 && b1 >= 16 && b1 <= 31) || (b0 == 192 && b1 == 168)) return false;
+            if (b0 >= 224 && b0 <= 239) return false;
+            return true;
+        }
+        return host.indexOf('.') >= 0 && !host.equals("localhost") && !host.endsWith(".localhost")
                 && !host.endsWith(".local") && !host.endsWith(".internal");
     }
 
@@ -141,7 +205,7 @@ public final class ColgramProxyPolicy {
             this.ping = ping;
             this.tcp = tcp;
             this.eligibleAt = eligibleAt;
-            this.host = host;
+            this.host = host == null ? "" : host;
             this.port = port;
             this.type = type;
         }

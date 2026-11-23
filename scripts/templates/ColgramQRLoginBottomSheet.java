@@ -3,6 +3,8 @@ package org.telegram.ui;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.PorterDuff;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
@@ -23,6 +25,7 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.R;
 import org.telegram.messenger.TelegramQRCodeWriter;
 import org.telegram.messenger.Utilities;
 import android.os.Bundle;
@@ -68,29 +71,43 @@ public class ColgramQRLoginBottomSheet {
 
         final boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null
                 && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
+        final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
 
         final BottomSheet.Builder builder = new BottomSheet.Builder(context, false);
         builder.setApplyTopPadding(false);
 
-        int accentColor = Theme.getColor(Theme.key_featuredStickers_addButton);
-        if (accentColor == 0) accentColor = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4);
-        if (accentColor == 0) accentColor = 0xFF2AABEE;
+        int accentColor = pal.accentPrimary;
 
         final LinearLayout container = new LinearLayout(context);
         container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(24));
+        container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(14), AndroidUtilities.dp(24),
+                AndroidUtilities.dp(22) + AndroidUtilities.navigationBarHeight);
 
         // Drag handle
         View pill = new View(context);
-        pill.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(2.5f), 0x33888888, 0x55888888));
-        container.addView(pill, LayoutHelper.createLinear(36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16));
+        pill.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(2.5f), pal.dark ? 0x44FFFFFF : 0x300F172A));
+        container.addView(pill, LayoutHelper.createLinear(40, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
+
+        // Colgram QR badge
+        FrameLayout badge = new FrameLayout(context);
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setCornerRadius(AndroidUtilities.dp(24));
+        badgeBg.setColor((accentColor & 0x00FFFFFF) | 0x1A000000);
+        badgeBg.setStroke(AndroidUtilities.dp(1), (accentColor & 0x00FFFFFF) | 0x44000000);
+        badge.setBackground(badgeBg);
+        ImageView badgeIcon = new ImageView(context);
+        badgeIcon.setImageResource(R.drawable.msg_qrcode);
+        badgeIcon.setColorFilter(accentColor, PorterDuff.Mode.SRC_IN);
+        badgeIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        badge.addView(badgeIcon, LayoutHelper.createFrame(26, 26, Gravity.CENTER));
+        container.addView(badge, LayoutHelper.createLinear(48, 48, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 10));
 
         // Title
         TextView titleView = new TextView(context);
         titleView.setText(isRu ? "Вход по QR-коду" : "Log in by QR Code");
         titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
         titleView.setTypeface(AndroidUtilities.bold());
-        titleView.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        titleView.setTextColor(pal.textPrimary);
         titleView.setGravity(Gravity.CENTER_HORIZONTAL);
         container.addView(titleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 6));
 
@@ -100,14 +117,21 @@ public class ColgramQRLoginBottomSheet {
                 ? "Откройте Telegram на другом устройстве:\nНастройки → Устройства → Подключить устройство\nи наведите камеру на этот экран."
                 : "Open Telegram on your other device:\nSettings → Devices → Link Desktop Device\nand point your camera at this screen.");
         descView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-        descView.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
+        descView.setTextColor(pal.textSecondary);
         descView.setGravity(Gravity.CENTER_HORIZONTAL);
         descView.setLineSpacing(AndroidUtilities.dp(2), 1.0f);
         container.addView(descView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 16));
 
-        // QR Frame with clean card background
+        // QR Frame with crisp white border + elevation so it stands out cleanly in both Light & Dark themes
         final FrameLayout qrFrame = new FrameLayout(context);
-        qrFrame.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(16), 0xFFFFFFFF, 0xFFEEEEEE));
+        GradientDrawable qrCardBg = new GradientDrawable();
+        qrCardBg.setColor(0xFFFFFFFF);
+        qrCardBg.setCornerRadius(AndroidUtilities.dp(18));
+        qrCardBg.setStroke(AndroidUtilities.dp(1), pal.dark ? 0x22FFFFFF : 0x220F172A);
+        qrFrame.setBackground(qrCardBg);
+        if (android.os.Build.VERSION.SDK_INT >= 21) {
+            qrFrame.setElevation(AndroidUtilities.dp(4));
+        }
         qrFrame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12));
 
         final ImageView qrImageView = new ImageView(context);
@@ -119,53 +143,66 @@ public class ColgramQRLoginBottomSheet {
         progressView.setProgressColor(accentColor);
         qrFrame.addView(progressView, LayoutHelper.createFrame(48, 48, Gravity.CENTER));
 
-        container.addView(qrFrame, LayoutHelper.createLinear(240, 240, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12));
+        int minScreen = Math.min(AndroidUtilities.displaySize.x, AndroidUtilities.displaySize.y);
+        int qrSideDp = Math.max(176, Math.min(236, Math.round((minScreen * 0.56f) / Math.max(1f, AndroidUtilities.density))));
+        container.addView(qrFrame, LayoutHelper.createLinear(qrSideDp, qrSideDp, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12));
 
         // Status / hint text
         final TextView statusText = new TextView(context);
         statusText.setText(isRu ? "Генерация QR-кода..." : "Generating QR code...");
         statusText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-        statusText.setTextColor(Theme.getColor(Theme.key_dialogTextGray));
+        statusText.setTextColor(pal.textSecondary);
         statusText.setGravity(Gravity.CENTER_HORIZONTAL);
         container.addView(statusText, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 10));
 
-        // Check button (allows instant confirmation after scanning)
-        final TextView checkBtn = new TextView(context);
-        checkBtn.setText(isRu ? "🔄 Я отсканировал — войти" : "🔄 I scanned — Log in");
-        checkBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
-        checkBtn.setTypeface(AndroidUtilities.bold());
-        checkBtn.setTextColor(accentColor);
+        // Check button (manual fallback — automatic confirmation runs silently in background)
+        final LinearLayout checkBtn = new LinearLayout(context);
+        checkBtn.setOrientation(LinearLayout.HORIZONTAL);
         checkBtn.setGravity(Gravity.CENTER);
-        checkBtn.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8));
-        checkBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(18), accentColor & 0x14ffffff, accentColor & 0x33ffffff));
-        container.addView(checkBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, 36, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
+        checkBtn.setPadding(AndroidUtilities.dp(18), AndroidUtilities.dp(9), AndroidUtilities.dp(18), AndroidUtilities.dp(9));
+        ColgramMenuChrome.attachTactileFeedback(checkBtn, 20,
+                (accentColor & 0x00FFFFFF) | 0x1A000000,
+                (accentColor & 0x00FFFFFF) | 0x55000000,
+                (accentColor & 0x00FFFFFF) | 0x33000000);
+        ImageView checkIcon = new ImageView(context);
+        checkIcon.setImageResource(R.drawable.msg_retry);
+        checkIcon.setColorFilter(accentColor, PorterDuff.Mode.SRC_IN);
+        checkIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        checkBtn.addView(checkIcon, LayoutHelper.createLinear(18, 18, Gravity.CENTER_VERTICAL, 0, 0, 8, 0));
+        final TextView checkLabel = new TextView(context);
+        checkLabel.setText(isRu ? "Проверить сейчас" : "Check now");
+        checkLabel.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+        checkLabel.setTypeface(AndroidUtilities.bold());
+        checkLabel.setTextColor(accentColor);
+        checkBtn.addView(checkLabel, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
+        container.addView(checkBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
 
         // Cancel button
         final TextView cancelBtn = new TextView(context);
         cancelBtn.setText(isRu ? "Отмена" : "Cancel");
         cancelBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
         cancelBtn.setTypeface(AndroidUtilities.bold());
-        int cancelColor = Theme.getColor(Theme.key_dialogTextBlack);
-        if (cancelColor == 0) cancelColor = 0xFF222222;
-        cancelBtn.setTextColor(cancelColor);
+        cancelBtn.setTextColor(pal.textPrimary);
         cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setMinHeight(AndroidUtilities.dp(44));
         cancelBtn.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(10), AndroidUtilities.dp(16), AndroidUtilities.dp(10));
-        cancelBtn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(8), 0x0C000000, 0x1A000000));
-        container.addView(cancelBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 42, 0, 0, 0, 4));
+        ColgramMenuChrome.attachTactileFeedback(cancelBtn, 12,
+                pal.chipSurface, pal.borderSubtle, pal.dark ? 0x26FFFFFF : 0x180F172A);
+        container.addView(cancelBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 4));
 
         ScrollView scrollView = new ScrollView(context);
         scrollView.addView(container);
         builder.setCustomView(scrollView);
 
         final BottomSheet bottomSheet = builder.create();
+        ColgramAeroStyler.applyFlagshipSheetChrome(bottomSheet, scrollView, pal);
 
         final ColgramQRLoginBottomSheet instance = new ColgramQRLoginBottomSheet(
                 activity, currentAccount, bottomSheet, qrImageView, progressView, statusText, isRu);
         activeInstance = instance;
 
-        // Refresh button is now a manual fallback only — the real confirmation is automatic.
-        checkBtn.setText(isRu ? "Проверить сейчас" : "Check now");
-        checkBtn.setOnClickListener(v -> instance.onTokenScanned());
+        // Refresh button is a manual fallback — automatic confirmation runs silently without blanking QR.
+        checkBtn.setOnClickListener(v -> instance.onTokenScanned(false));
         cancelBtn.setOnClickListener(v -> bottomSheet.dismiss());
 
         bottomSheet.setOnDismissListener(dialog -> {
@@ -204,7 +241,7 @@ public class ColgramQRLoginBottomSheet {
             if (autoConfirmAttempts > 24) {
                 return;
             }
-            onTokenScanned();
+            onTokenScanned(true);
             handler.postDelayed(autoConfirmRunnable, 5000L);
         };
         handler.postDelayed(autoConfirmRunnable, 5000L);
@@ -223,7 +260,7 @@ public class ColgramQRLoginBottomSheet {
     public static void onLoginTokenUpdate(final int account) {
         AndroidUtilities.runOnUIThread(() -> {
             if (activeInstance != null && !activeInstance.isDismissed && activeInstance.currentAccount == account) {
-                activeInstance.onTokenScanned();
+                activeInstance.onTokenScanned(false);
             }
         });
     }
@@ -240,10 +277,18 @@ public class ColgramQRLoginBottomSheet {
         this.isRu = isRu;
     }
 
+    private void showSpinner() {
+        progressView.animate().cancel();
+        progressView.setAlpha(1f);
+        progressView.setVisibility(View.VISIBLE);
+    }
+
     private void startQrExport() {
         if (isDismissed || activity.getParentActivity() == null || activity.getParentActivity().isFinishing()) return;
 
-        progressView.setVisibility(View.VISIBLE);
+        if (qrImageView.getDrawable() == null) {
+            showSpinner();
+        }
 
         TLRPC.TL_auth_exportLoginToken req = new TLRPC.TL_auth_exportLoginToken();
         req.api_id = BuildVars.APP_ID;
@@ -265,7 +310,7 @@ public class ColgramQRLoginBottomSheet {
                         currentToken = token;
                         String b64 = Base64.encodeToString(token, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
                         String qrUri = "tg://login?token=" + b64;
-                        generateAndDisplayQR(qrUri);
+                        generateAndDisplayQR(qrUri, qrImageView.getDrawable() == null);
                         statusText.setText(isRu ? "Наведите камеру Telegram на QR-код" : "Scan QR code with Telegram camera");
 
                         // Calculate validity time (default ~30s), refresh ONLY when expired
@@ -290,11 +335,13 @@ public class ColgramQRLoginBottomSheet {
         }), flags);
     }
 
-    private void onTokenScanned() {
+    private void onTokenScanned(final boolean silent) {
         if (isDismissed || activity == null || activity.getParentActivity() == null || activity.getParentActivity().isFinishing()) return;
 
-        statusText.setText(isRu ? "Подтверждение авторизации..." : "Confirming authorization...");
-        progressView.setVisibility(View.VISIBLE);
+        if (!silent) {
+            statusText.setText(isRu ? "Подтверждение авторизации..." : "Confirming authorization...");
+            showSpinner();
+        }
 
         TLRPC.TL_auth_exportLoginToken req = new TLRPC.TL_auth_exportLoginToken();
         req.api_id = BuildVars.APP_ID;
@@ -315,18 +362,26 @@ public class ColgramQRLoginBottomSheet {
                     handleMigration((TLRPC.TL_auth_loginTokenMigrateTo) response);
                 } else if (response instanceof TLRPC.TL_auth_loginToken) {
                     TLRPC.TL_auth_loginToken tokenObj = (TLRPC.TL_auth_loginToken) response;
-                    currentToken = tokenObj.token;
-                    String b64 = Base64.encodeToString(currentToken, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
-                    generateAndDisplayQR("tg://login?token=" + b64);
-                    statusText.setText(isRu ? "Наведите камеру Telegram на QR-код" : "Scan QR code with Telegram camera");
+                    boolean sameToken = currentToken != null && tokenObj.token != null
+                            && java.util.Arrays.equals(currentToken, tokenObj.token);
+                    if (!sameToken && tokenObj.token != null && tokenObj.token.length > 0) {
+                        currentToken = tokenObj.token;
+                        String b64 = Base64.encodeToString(currentToken, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
+                        generateAndDisplayQR("tg://login?token=" + b64, !silent && qrImageView.getDrawable() == null);
+                    } else if (!silent) {
+                        progressView.setVisibility(View.GONE);
+                    }
+                    if (!silent) {
+                        statusText.setText(isRu ? "Наведите камеру Telegram на QR-код" : "Scan QR code with Telegram camera");
+                    }
                 }
             } else {
                 String err = (error != null && error.text != null) ? error.text : "UNKNOWN";
                 if (err.contains("SESSION_PASSWORD_NEEDED")) {
                     on2FARequired();
-                } else {
+                } else if (!silent) {
                     FileLog.e("QR token confirm error: " + err);
-                    statusText.setText(isRu ? "Нажмите «Я отсканировал» для повторной проверки" : "Tap 'I scanned' to check again");
+                    statusText.setText(isRu ? "Нажмите «Проверить сейчас» для повторной проверки" : "Tap 'Check now' to check again");
                     progressView.setVisibility(View.GONE);
                 }
             }
@@ -337,7 +392,7 @@ public class ColgramQRLoginBottomSheet {
         if (isDismissed || activity == null || activity.getParentActivity() == null || activity.getParentActivity().isFinishing()) return;
 
         statusText.setText(isRu ? "Переключение датацентра..." : "Migrating datacenter...");
-        progressView.setVisibility(View.VISIBLE);
+        showSpinner();
 
         ConnectionsManager.getInstance(currentAccount).setDefaultDatacenterId(migrate.dc_id);
 
@@ -387,7 +442,7 @@ public class ColgramQRLoginBottomSheet {
         }
     }
 
-    private void generateAndDisplayQR(final String content) {
+    private void generateAndDisplayQR(final String content, final boolean fadeIn) {
         new Thread(() -> {
             try {
                 HashMap<EncodeHintType, Object> hints = new HashMap<>();
@@ -399,8 +454,20 @@ public class ColgramQRLoginBottomSheet {
 
                 AndroidUtilities.runOnUIThread(() -> {
                     if (qrBitmap != null && !isDismissed) {
-                        qrImageView.setImageBitmap(qrBitmap);
-                        progressView.setVisibility(View.GONE);
+                        qrImageView.animate().cancel();
+                        if (fadeIn) {
+                            qrImageView.setAlpha(0f);
+                            qrImageView.setImageBitmap(qrBitmap);
+                            qrImageView.animate().alpha(1f).setDuration(220).start();
+                        } else {
+                            qrImageView.setAlpha(1f);
+                            qrImageView.setImageBitmap(qrBitmap);
+                        }
+                        if (progressView.getVisibility() == View.VISIBLE) {
+                            progressView.animate().alpha(0f).setDuration(140)
+                                    .withEndAction(() -> progressView.setVisibility(View.GONE))
+                                    .start();
+                        }
                     }
                 });
             } catch (Throwable t) {
@@ -432,6 +499,7 @@ public class ColgramQRLoginBottomSheet {
         isDismissed = true;
         activeInstance = null;
         cancelRefresh();
+        stopAutoConfirm();
 
         try {
             bottomSheet.dismiss();

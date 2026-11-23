@@ -14,11 +14,11 @@ import android.os.RemoteException;
 
 /** Account-free pre-login verification; never changes the main application's proxy. */
 public final class ColgramGuestProxyProbe {
-    public static final long CHECK_TIMEOUT_MS = 10_000L;
+    public static final long CHECK_TIMEOUT_MS = 11_000L;
     public static final int CHECK = 1;
     public static final int RESULT = 2;
     public static final int CANCEL = 3;
-    public static final int MAX_PARALLEL = 3;
+    public static final int MAX_PARALLEL = 5;
     public static final String TIMEOUT = "TG_CONFIG_TIMEOUT";
     private static final String SERVICE = "org.telegram.tgnet.ColgramGuestProxyService";
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -79,16 +79,72 @@ public final class ColgramGuestProxyProbe {
         final Bundle target;
         final Result result;
         final ColgramProbeLanes.Ticket ticket;
-        final Runnable timeout = () -> finish(-1, TIMEOUT);
+        final Runnable timeout = () -> finish(-1, TIMEOUT, true);
         final Messenger replies = new Messenger(new Handler(Looper.getMainLooper(), message -> {
             if (message.what != RESULT) return false;
             Bundle verdict = message.getData();
-            finish(verdict.getLong("time", -1L), verdict.getString("reason", "TG_CONFIG_UNAVAILABLE"));
+            finish(verdict.getLong("time", -1L), verdict.getString("reason", "TG_CONFIG_UNAVAILABLE"), false);
             return true;
         }));
-        boolean bound;
         boolean finished;
         Messenger remoteMessenger;
+
+        private static final Object BIND_LOCK = new Object();
+        private static final long SHARED_UNBIND_IDLE_MS = 25_000L;
+        private static Context sharedApp;
+        private static Messenger sharedRemote;
+        private static boolean sharedBound;
+        private static boolean sharedConnecting;
+        private static int sharedActiveAttempts;
+        private static final java.util.List<Attempt> sharedWaiting = new java.util.ArrayList<>();
+        private static final ServiceConnection SHARED_CONN = new ServiceConnection() {
+            @Override public void onServiceConnected(ComponentName name, IBinder remote) {
+                java.util.List<Attempt> ready;
+                Messenger m = new Messenger(remote);
+                synchronized (BIND_LOCK) {
+                    sharedRemote = m;
+                    sharedConnecting = false;
+                    ready = new java.util.ArrayList<>(sharedWaiting);
+                    sharedWaiting.clear();
+                }
+                for (Attempt a : ready) {
+                    a.dispatchTo(m);
+                }
+            }
+            @Override public void onServiceDisconnected(ComponentName name) {
+                failWaiting("TG_PROBE_DISCONNECTED");
+            }
+            @Override public void onBindingDied(ComponentName name) {
+                failWaiting("TG_PROBE_DISCONNECTED");
+            }
+            @Override public void onNullBinding(ComponentName name) {
+                failWaiting("TG_PROBE_UNAVAILABLE");
+            }
+            private void failWaiting(String reason) {
+                java.util.List<Attempt> lost;
+                synchronized (BIND_LOCK) {
+                    sharedRemote = null;
+                    sharedConnecting = false;
+                    sharedBound = false;
+                    lost = new java.util.ArrayList<>(sharedWaiting);
+                    sharedWaiting.clear();
+                }
+                for (Attempt a : lost) {
+                    a.finish(-1, reason, false);
+                }
+            }
+        };
+        private static final Runnable sharedIdleUnbind = () -> {
+            synchronized (BIND_LOCK) {
+                if (sharedActiveAttempts > 0 || !sharedWaiting.isEmpty() || !sharedBound) return;
+                if (sharedApp != null) {
+                    try { sharedApp.unbindService(SHARED_CONN); } catch (Throwable ignored) {}
+                }
+                sharedBound = false;
+                sharedConnecting = false;
+                sharedRemote = null;
+            }
+        };
 
         Attempt(Context app, Bundle target, Result result, ColgramProbeLanes.Ticket ticket) {
             this.app = app;
@@ -99,48 +155,89 @@ public final class ColgramGuestProxyProbe {
 
         void bind() {
             MAIN.postDelayed(timeout, CHECK_TIMEOUT_MS);
-            Intent intent = new Intent().setClassName(app, SERVICE);
-            try {
-                bound = app.bindService(intent, this, Context.BIND_AUTO_CREATE);
-                if (!bound) finish(-1, "TG_PROBE_UNAVAILABLE");
-            } catch (RuntimeException unavailable) {
-                finish(-1, "TG_PROBE_UNAVAILABLE");
+            MAIN.removeCallbacks(sharedIdleUnbind);
+            Messenger existing = null;
+            boolean needBind = false;
+            synchronized (BIND_LOCK) {
+                sharedApp = app.getApplicationContext();
+                sharedActiveAttempts++;
+                if (sharedRemote != null) {
+                    existing = sharedRemote;
+                } else {
+                    sharedWaiting.add(this);
+                    if (!sharedConnecting) {
+                        sharedConnecting = true;
+                        needBind = true;
+                    }
+                }
+            }
+            if (existing != null) {
+                dispatchTo(existing);
+                return;
+            }
+            if (needBind) {
+                Intent intent = new Intent().setClassName(app, SERVICE);
+                try {
+                    boolean ok = app.getApplicationContext().bindService(intent, SHARED_CONN, Context.BIND_AUTO_CREATE);
+                    synchronized (BIND_LOCK) {
+                        sharedBound = ok;
+                        if (!ok) sharedConnecting = false;
+                    }
+                    if (!ok) {
+                        SHARED_CONN.onNullBinding(null);
+                    }
+                } catch (RuntimeException unavailable) {
+                    synchronized (BIND_LOCK) {
+                        sharedBound = false;
+                        sharedConnecting = false;
+                    }
+                    SHARED_CONN.onNullBinding(null);
+                }
             }
         }
 
-        @Override public void onServiceConnected(ComponentName name, IBinder remote) {
+        void dispatchTo(Messenger m) {
             if (finished) return;
             Message request = Message.obtain(null, CHECK);
             request.setData(target);
             request.replyTo = replies;
             try {
-                remoteMessenger = new Messenger(remote);
-                remoteMessenger.send(request);
+                remoteMessenger = m;
+                m.send(request);
             } catch (RemoteException disconnected) {
-                finish(-1, "TG_PROBE_DISCONNECTED");
+                synchronized (BIND_LOCK) {
+                    if (sharedRemote == m) {
+                        sharedRemote = null;
+                        sharedBound = false;
+                    }
+                }
+                finish(-1, "TG_PROBE_DISCONNECTED", false);
             }
         }
 
-        @Override public void onServiceDisconnected(ComponentName name) { finish(-1, "TG_PROBE_DISCONNECTED"); }
-        @Override public void onBindingDied(ComponentName name) { finish(-1, "TG_PROBE_DISCONNECTED"); }
-        @Override public void onNullBinding(ComponentName name) { finish(-1, "TG_PROBE_UNAVAILABLE"); }
+        @Override public void onServiceConnected(ComponentName name, IBinder remote) {}
+        @Override public void onServiceDisconnected(ComponentName name) {}
 
-        void finish(long timeMs, String reason) {
+        void finish(long timeMs, String reason, boolean sendCancel) {
             if (finished) return;
             finished = true;
             MAIN.removeCallbacks(timeout);
-            if (remoteMessenger != null) {
+            if (sendCancel && remoteMessenger != null) {
                 Message cancel = Message.obtain(null, CANCEL);
                 Bundle owned = new Bundle();
                 owned.putInt("lane", ticket.lane());
                 owned.putLong("ticket", ticket.id());
                 cancel.setData(owned);
                 try { remoteMessenger.send(cancel); } catch (RemoteException alreadyClosed) { }
-                remoteMessenger = null;
             }
-            if (bound) {
-                try { app.unbindService(this); } catch (IllegalArgumentException alreadyUnbound) { }
-                bound = false;
+            remoteMessenger = null;
+            synchronized (BIND_LOCK) {
+                sharedWaiting.remove(this);
+                sharedActiveAttempts = Math.max(0, sharedActiveAttempts - 1);
+                if (sharedActiveAttempts == 0 && sharedBound) {
+                    MAIN.removeCallbacks(sharedIdleUnbind);
+                    MAIN.postDelayed(sharedIdleUnbind, SHARED_UNBIND_IDLE_MS);
+                }
             }
             target.clear();
             LANES.release(ticket);

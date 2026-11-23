@@ -27,6 +27,8 @@ const ALLOWED_HOSTS = new Set([
   'github.com',
   'api.mail.tm',
   'api.mail.gw',
+  'api.tempmail.lol',
+  'tempmail.lol',
   'api.internal.temp-mail.io',
   'api.guerrillamail.com',
   'guerrillamail.com',
@@ -34,16 +36,24 @@ const ALLOWED_HOSTS = new Set([
   'api.1secmail.com',
   'www.1secmail.com',
   'inbucket.app',
+  'api.dropmail.me',
+  'dropmail.me',
+  'www.developermail.com',
+  'api.mail.cx',
+  'api.github.com',
 ]);
 
+const ALLOWED_METHODS = new Set(['GET', 'POST', 'DELETE', 'PATCH', 'PUT', 'HEAD']);
 const MAX_BODY_BYTES = 512 * 1024;
 
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Colgram-Method, X-Colgram-Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Colgram-Method, X-Colgram-Authorization, X-Colgram-Accept',
+    'Access-Control-Expose-Headers': 'X-Colgram-Relay',
     'Access-Control-Max-Age': '86400',
+    'X-Colgram-Relay': '1',
   };
 }
 
@@ -75,22 +85,27 @@ export default {
       return jsonError(403, 'host not allowed: ' + parsed.hostname);
     }
 
-    const method = (request.headers.get('X-Colgram-Method') || 'GET').toUpperCase();
+    const requestedMethod = (request.headers.get('X-Colgram-Method') || 'GET').toUpperCase();
+    const method = ALLOWED_METHODS.has(requestedMethod) ? requestedMethod : 'GET';
+    const acceptHeader = request.headers.get('X-Colgram-Accept') || 'application/json, text/plain, */*';
     const init = {
       method,
       redirect: 'follow',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Colgram)',
-        Accept: 'application/json, text/plain, */*',
+        Accept: acceptHeader,
       },
     };
 
-    if (method === 'POST') {
+    const bearer = request.headers.get('X-Colgram-Authorization');
+    if (bearer) {
+      init.headers.Authorization = bearer.startsWith('Bearer ') ? bearer : ('Bearer ' + bearer);
+    }
+
+    if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
       const body = await request.arrayBuffer();
       if (body.byteLength > MAX_BODY_BYTES) return jsonError(413, 'body too large');
-      const bearer = request.headers.get('X-Colgram-Authorization');
-      if (bearer) init.headers.Authorization = 'Bearer ' + bearer;
-      init.headers['Content-Type'] = 'application/json';
+      init.headers['Content-Type'] = request.headers.get('Content-Type') || 'application/json';
       init.body = body;
     }
 

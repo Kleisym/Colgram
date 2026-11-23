@@ -483,6 +483,8 @@ public final class ColgramWarpTunnel {
     }
 
     public static void bringDown(Context ctx) {
+        final boolean hadOverlay = up || connected || masqueSession || activeProfile != null;
+        final long bringDownEpoch = ColgramRouteEpoch.snapshot();
         cancelPendingStart();
         up = false;
         connected = false;
@@ -521,8 +523,8 @@ public final class ColgramWarpTunnel {
         ColgramWarpServiceBridge.stop(ctx);
         Log.i(TAG, "WARP tunnel down, and the VPN slot is free again");
         activeProfile = null;
-        if (!ColgramConfig.isWarpEnabled())
-            ColgramProxyManager.onOverlayTransportChanged(ctx, ColgramRouteEpoch.snapshot());
+        if (hadOverlay && !ColgramConfig.isWarpEnabled() && !ColgramProxyManager.isProxySelectionPending())
+            ColgramProxyManager.onOverlayTransportChanged(ctx, bringDownEpoch);
     }
 
     /** Take the WireGuard session down, and say why if it will not. */

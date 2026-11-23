@@ -34,11 +34,12 @@ class RouteCancellationTest(unittest.TestCase):
         s = (CORE / "ColgramConfig.java").read_text(encoding="utf-8")
         self.assertTrue(re.search(r'DEFAULT_BOT_TOKEN\s*=\s*""\s*;', s), "clean installs prefill a shared credential")
 
-    def test_unbounded_cache_is_opt_in(self):
+    def test_unbounded_cache_with_auto_compress_enabled_by_default(self):
         s = (CORE / "ColgramConfig.java").read_text(encoding="utf-8")
-        self.assertTrue("getBoolean(KEY_UNLIMITED_MEMORY, false)" in s, "unbounded cache is still the default")
+        self.assertTrue("getBoolean(KEY_UNLIMITED_MEMORY, true)" in s, "unlimited storage must be enabled by default")
+        self.assertTrue('getBoolean("auto_compress_storage_enabled", true)' in s, "auto-compression must be enabled by default")
         s = (CORE / "ColgramUnlimitedMemory.java").read_text(encoding="utf-8")
-        self.assertTrue("isUnlimitedMemoryConfigured()" in s, "old implicit unlimited cache is never released")
+        self.assertTrue("autoCompressOversizedCacheImagesAsync" in s, "auto-compression worker missing from ColgramUnlimitedMemory")
 
     def test_warp_start_keeps_the_selected_route_generation(self):
         s = (CORE / "ColgramWarpMasqueTunnel.java").read_text(encoding="utf-8")

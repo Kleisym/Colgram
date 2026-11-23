@@ -1,11 +1,13 @@
 package org.colgram.core;
 
 import android.app.Activity;
-import android.app.AlertDialog;
+import android.app.Dialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
@@ -14,7 +16,11 @@ import android.text.InputType;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -24,6 +30,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Constructor;
@@ -93,6 +102,8 @@ public class ColgramBotSync {
     private static final ConcurrentHashMap<Integer, Long> botPollerLastSpawnAt = new ConcurrentHashMap<>();
     private static final long POLLER_REARM_MS = 60_000L;
     private static final ConcurrentHashMap<Integer, Integer> lastUpdateIds = new ConcurrentHashMap<>();
+    private static final java.util.Set<String> dispatchedLiveMsgKeys =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
     private static final java.util.Set<Integer> mtprotoBotLoops =
             java.util.Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
     private static final java.util.Set<Integer> mtprotoDialogRefreshPending =
@@ -122,10 +133,6 @@ public class ColgramBotSync {
     /** Recover missed bot updates over Telegram's authenticated MTProto session. */
     private static void ensureMtprotoBotLoop(final Context context, final int account) {
         if (!mtprotoBotLoops.add(account)) return;
-        Thread old = pollerThreads.remove(account);
-        if (old != null) old.interrupt();
-        botPollerSpawned.remove(account);
-        botPollerLastSpawnAt.remove(account);
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -170,10 +177,23 @@ public class ColgramBotSync {
                     }
                 }
                 // Bot dialogs are backed by local storage in the patched MessagesController.
-                // Reloading that cache makes the button useful even when the periodic update
-                // loop was already armed and ensureMtprotoBotLoop() therefore returned early.
-                controller.getMethod("loadDialogs", int.class, int.class, int.class,
-                        boolean.class, Runnable.class).invoke(instance, 0, 0, 100, true, null);
+                // Load storage directly when the folder list is empty, otherwise re-sort and notify UI.
+                Object dialogsObj = controller.getMethod("getDialogs", int.class).invoke(instance, 0);
+                java.util.List<?> dialogs = dialogsObj instanceof java.util.List ? (java.util.List<?>) dialogsObj : null;
+                if (dialogs == null || dialogs.isEmpty()) {
+                    Object ms = Class.forName("org.telegram.messenger.MessagesStorage")
+                            .getMethod("getInstance", int.class).invoke(null, account);
+                    if (ms != null) {
+                        ms.getClass().getMethod("getDialogs", int.class, int.class, int.class, boolean.class)
+                                .invoke(ms, 0, 0, 100, true);
+                    }
+                } else {
+                    try {
+                        Class<?> lsa = Class.forName("androidx.collection.LongSparseArray");
+                        controller.getMethod("sortDialogs", lsa).invoke(instance, new Object[]{null});
+                    } catch (Throwable ignored) {}
+                    notifyDialogsChanged(account);
+                }
                 Log.i(TAG, "MTProto bot manual dialog refresh requested for account " + account);
             } catch (Throwable t) {
                 Log.w(TAG, "MTProto bot manual dialog refresh failed: " + t.getMessage());
@@ -700,6 +720,10 @@ public class ColgramBotSync {
         return false;
     }
 
+    private static volatile java.net.Proxy lastWorkingBotRung = null;
+    private static volatile long lastWorkingBotRungAtMs = 0L;
+    private static final long BOT_RUNG_CACHE_TTL_MS = 5L * 60L * 1000L;
+
     private static HttpURLConnection openConnection(String urlStr, int readTimeoutMs) throws Exception {
         // Kept for the JVM-host case; on ART it is a documented no-op. Harmless and cheap.
         colgramDisableIpv6IfUnroutable();
@@ -709,25 +733,11 @@ public class ColgramBotSync {
         int port = url.getPort();
         if (port < 0) port = "https".equalsIgnoreCase(url.getProtocol()) ? 443 : 80;
 
-        // Transport ladder: every rung gets its own attempt. Picking a single transport used to be
-        // the whole bug - when that one happened to be a dead public relay, a Bot API write failed
-        // with a connection error although the API answered in 300 ms on another address of the
-        // same hostname.
-        //
-        //   1. the address-pinning front: still a direct connection to Telegram, only to one of
-        //      the host's addresses that answers. SNI and the certificate check stay correct,
-        //      because the hostname travels in the CONNECT line.
-        //   2. the IPv4-forcing loopback proxy (a plain IPv4 dial with no address choice).
-        //   3. a plain direct connection.
-        //   4. the DPI listener, when a plain dial has already been shown not to work here.
-        //   5. a relay - the applied proxy first, then the harvested pool. Last, because it is
-        //      someone else's machine, and on this network no public relay answers at all.
         java.util.List<java.net.Proxy> rungs = transportLadder(host, port);
 
         Throwable last = null;
-        // A short per-rung connect timeout on purpose: a working path here completes in a few
-        // hundred milliseconds, so a rung that has not dialled by 4 s is dead and the next one
-        // deserves its turn. The read timeout stays as the caller asked (long polling waits on it).
+        boolean directFailed = false;
+        java.net.Proxy front = ColgramEndpoints.frontProxy();
         int connectTimeoutMs = Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000);
         for (java.net.Proxy rung : withBestRungRetry(rungs)) {
             try {
@@ -737,13 +747,29 @@ public class ColgramBotSync {
                 conn.setConnectTimeout(connectTimeoutMs);
                 conn.setReadTimeout(readTimeoutMs);
                 conn.connect();
+                lastWorkingBotRung = rung == null ? java.net.Proxy.NO_PROXY : rung;
+                lastWorkingBotRungAtMs = System.currentTimeMillis();
+                if (directFailed && rung != null && !java.net.Proxy.NO_PROXY.equals(rung)
+                        && (front == null || !front.equals(rung))) {
+                    colgramReportDirectRouteFailed();
+                }
                 return conn;
             } catch (Throwable t) {
                 last = t;
+                if (rung == null || java.net.Proxy.NO_PROXY.equals(rung)
+                        || (front != null && front.equals(rung))) {
+                    directFailed = true;
+                }
+                if (rung != null && rung.equals(lastWorkingBotRung)) {
+                    lastWorkingBotRung = null;
+                }
                 if (t instanceof javax.net.ssl.SSLException && isUnknownCert((javax.net.ssl.SSLException) t)) {
                     ColgramEndpoints.parkCurrent(host, port);
                 }
             }
+        }
+        if (directFailed && colgramShouldTryDirect()) {
+            colgramReportDirectRouteFailed();
         }
         // Nothing worked: forget the chosen address so the next call re-probes rather than walking
         // into the same black hole, and report the last failure to the caller.
@@ -788,23 +814,32 @@ public class ColgramBotSync {
      */
     static java.util.List<java.net.Proxy> transportLadder(String host, int port) {
         java.util.List<java.net.Proxy> rungs = new java.util.ArrayList<>();
-        java.net.Proxy front = ColgramEndpoints.frontProxy();
-        if (front != null && ColgramEndpoints.select(host, port) != null) {
-            addRung(rungs, front);
+        java.net.Proxy cached = lastWorkingBotRung;
+        boolean cachedFresh = cached != null && (System.currentTimeMillis() - lastWorkingBotRungAtMs) < BOT_RUNG_CACHE_TTL_MS;
+        if (cachedFresh) {
+            addRung(rungs, cached);
         }
-        int ipv4Port = colgramIpv4ProxyPort();
-        if (ipv4Port > 0) {
-            addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.HTTP,
-                    new java.net.InetSocketAddress("127.0.0.1", ipv4Port)));
-        }
-        if (colgramShouldTryDirect()) {
+        boolean tryDirect = colgramShouldTryDirect();
+        if (tryDirect) {
+            java.net.Proxy front = ColgramEndpoints.frontProxy();
+            if (front != null && ColgramEndpoints.select(host, port) != null) {
+                addRung(rungs, front);
+            }
+            int ipv4Port = colgramIpv4ProxyPort();
+            if (ipv4Port > 0) {
+                addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                        new java.net.InetSocketAddress("127.0.0.1", ipv4Port)));
+            }
             addRung(rungs, java.net.Proxy.NO_PROXY);
         }
-        if (!colgramShouldTryDirect() && ColgramDpiBypass.isBound()) {
+        if (ColgramDpiBypass.isBound()) {
             addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.SOCKS,
                     new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort())));
         }
         addRung(rungs, ColgramHttp.pickRelayProxy());
+        if (!tryDirect) {
+            addRung(rungs, java.net.Proxy.NO_PROXY);
+        }
         if (rungs.isEmpty()) addRung(rungs, java.net.Proxy.NO_PROXY);
         return rungs;
     }
@@ -1236,11 +1271,10 @@ public class ColgramBotSync {
             }
 
             if (isChannel) {
-                // megagroup=true keeps the chat openable in ChatActivity; a channel with
-                // broadcast=true and megagroup=false opens read-only and would look wrong
-                // for a bot's own group.
-                try { channelClass.getField("megagroup").setBoolean(chat, true); } catch (Throwable ignored) {}
-                try { channelClass.getField("broadcast").setBoolean(chat, false); } catch (Throwable ignored) {}
+                String chatType = source != null ? source.optString("type", "") : "";
+                boolean isBroadcastChannel = "channel".equalsIgnoreCase(chatType);
+                try { channelClass.getField("megagroup").setBoolean(chat, !isBroadcastChannel); } catch (Throwable ignored) {}
+                try { channelClass.getField("broadcast").setBoolean(chat, isBroadcastChannel); } catch (Throwable ignored) {}
                 try { channelClass.getField("left").setBoolean(chat, false); } catch (Throwable ignored) {}
                 try { channelClass.getField("creator").setBoolean(chat, true); } catch (Throwable ignored) {}
             }
@@ -1331,6 +1365,12 @@ public class ColgramBotSync {
             mcClass.getMethod("putUser", Class.forName("org.telegram.tgnet.TLRPC$User"), boolean.class)
                     .invoke(mc, user, true);
 
+            try {
+                if (Class.forName("org.telegram.tgnet.TLRPC$User").getField("photo").get(user) == null) {
+                    requestBotAvatarAsync(context, account, botId, false);
+                }
+            } catch (Throwable ignored) {}
+
             SharedPreferences prefs = context.getSharedPreferences(
                     "colgram_bot_account_" + account, Context.MODE_PRIVATE);
             prefs.edit()
@@ -1375,9 +1415,12 @@ public class ColgramBotSync {
      */
     public static synchronized void startBotUpdatesPoller(final Context context, final int account) {
         if (context == null) return;
+        hydrateExistingBotPhotosOnceAsync(context.getApplicationContext(), account);
         if (isMtprotoBotAccount(account) && !isPassiveBotMode(context, account)) {
             ensureMtprotoBotLoop(context.getApplicationContext(), account);
-            return;
+            if (getBotToken(context, account).isEmpty()) {
+                return;
+            }
         }
 
         // Fast path: a live thread is already running.
@@ -1479,7 +1522,7 @@ public class ColgramBotSync {
                             //
                             // Omitting offset entirely returns the pending queue without
                             // acknowledging anything we have not actually processed.
-                            urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22channel_post%22%2C%22callback_query%22%5D";
+                            urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22channel_post%22%2C%22edited_channel_post%22%2C%22message_reaction%22%2C%22callback_query%22%5D";
                         } else {
                             // Long-poll: wait up to 20 seconds on server
                             urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=" + currentOffset + "&timeout=20";
@@ -1601,32 +1644,27 @@ public class ColgramBotSync {
     }
 
     public static void promptBotTokenAndSync(final Activity activity, final int account) {
-        if (activity == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        builder.setTitle("🔑 Токен бота (@BotFather)");
-        builder.setMessage("Введите токен бота из @BotFather для загрузки диалогов и синхронизации сообщений:\n\n"
-                + "Важно: бот видит только те чаты, которые ему писали (или где он добавлен). "
-                + "Если список пуст — напишите боту любое сообщение и нажмите «Синхронизировать» снова.");
-
-        final EditText input = new EditText(activity);
-        input.setHint("123456789:ABCdef...");
+        if (activity == null || activity.isFinishing()) return;
         String existing = getBotToken(activity, account);
-        if (!existing.isEmpty()) input.setText(existing);
-        builder.setView(input);
-
-        builder.setPositiveButton("Синхронизировать", (dialog, which) -> {
-            String token = input.getText().toString().trim();
-            if (token.isEmpty()) {
-                Toast.makeText(activity, "Токен пустой", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            saveBotToken(activity, account, token);
-            // Verify the token before the heavier dialog sync, so a typo is reported as a
-            // token problem instead of surfacing as the misleading "no chats found".
-            syncBotDialogs(activity, account, true);
-        });
-        builder.setNegativeButton("Отмена", null);
-        builder.show();
+        showThemedInputDialog(
+                activity,
+                "Токен бота (@BotFather)",
+                "Введите токен бота из @BotFather для синхронизации диалогов и сообщений. Бот видит только чаты, в которых ему писали или куда он добавлен.",
+                "123456789:ABCdef...",
+                existing,
+                true,
+                "Синхронизировать",
+                "Отмена",
+                token -> {
+                    if (token.isEmpty()) {
+                        Toast.makeText(activity, "Токен пустой", Toast.LENGTH_SHORT).show();
+                        return false;
+                    }
+                    saveBotToken(activity, account, token);
+                    syncBotDialogs(activity, account, true);
+                    return true;
+                }
+        );
     }
 
     public static void syncBotDialogs(final Context context, final int account) {
@@ -1666,10 +1704,12 @@ public class ColgramBotSync {
         if (isMtprotoBotAccount(account) && !isPassiveBotMode(context, account)) {
             ensureMtprotoBotLoop(context.getApplicationContext(), account);
             if (userInitiated) refreshMtprotoBotDialogs(context.getApplicationContext(), account);
-            if (userInitiated) {
-                Toast.makeText(context, "Синхронизирую чаты по MTProto", Toast.LENGTH_SHORT).show();
+            if (getBotToken(context, account).isEmpty()) {
+                if (userInitiated) {
+                    Toast.makeText(context, "Синхронизирую чаты по MTProto", Toast.LENGTH_SHORT).show();
+                }
+                return;
             }
-            return;
         }
         final String token = getBotToken(context, account);
         if (token.isEmpty()) {
@@ -1918,17 +1958,23 @@ public class ColgramBotSync {
 
             // Resolved once: which sender in this batch is "us".
             final long botSelfId = getBotSelfId(context, account);
+            final String botToken = getBotToken(context, account);
 
             // Incoming messages that plugins should see. Collected during the parse loop and
             // dispatched only after the batch is actually in storage, so a plugin replying to
             // message N cannot observe a dialog state that the same batch has not written yet.
             final ArrayList<Object[]> pluginInbound = new ArrayList<>();
+            final java.util.LinkedHashSet<Long> batchCustomEmojiIds = new java.util.LinkedHashSet<>();
+            final java.util.HashSet<String> editedBatchKeys = new java.util.HashSet<>();
 
             for (int i = 0; i < updates.length(); i++) {
                 JSONObject upd = updates.getJSONObject(i);
+                boolean isEditedUpdate = upd.has("edited_message") || upd.has("edited_channel_post");
+                boolean isChannelPostUpdate = upd.has("channel_post") || upd.has("edited_channel_post");
                 JSONObject msgObj = upd.optJSONObject("message");
                 if (msgObj == null) msgObj = upd.optJSONObject("edited_message");
                 if (msgObj == null) msgObj = upd.optJSONObject("channel_post");
+                if (msgObj == null) msgObj = upd.optJSONObject("edited_channel_post");
                 if (msgObj == null) continue;
 
                 JSONObject fromObj = msgObj.optJSONObject("from");
@@ -1942,19 +1988,30 @@ public class ColgramBotSync {
                 String lastName = fromObj != null ? fromObj.optString("last_name", "") : "";
                 String username = fromObj != null ? fromObj.optString("username", "") : "";
 
+                String rawCaption = msgObj.optString("caption", "");
                 String text = msgObj.optString("text", "");
-                if (text.isEmpty()) {
-                    if (msgObj.has("caption")) text = msgObj.optString("caption");
-                    else if (msgObj.has("photo")) text = "🖼 Фотография";
-                    else if (msgObj.has("video")) text = "📹 Видео";
-                    else if (msgObj.has("document")) text = "📎 Документ";
-                    else if (msgObj.has("voice")) text = "🎤 Голосовое сообщение";
-                    else if (msgObj.has("sticker")) text = "🎨 Стикер";
-                    else text = "[Сообщение]";
+                if (text.isEmpty() && !rawCaption.isEmpty()) {
+                    text = rawCaption;
+                }
+                boolean hasAttachableMedia = msgObj.has("sticker") || msgObj.has("photo")
+                        || msgObj.has("video") || msgObj.has("video_note") || msgObj.has("animation")
+                        || msgObj.has("document") || msgObj.has("voice") || msgObj.has("audio");
+                if (text.isEmpty() && !hasAttachableMedia) {
+                    text = "[Сообщение]";
                 }
 
                 int date = msgObj.optInt("date", (int) (System.currentTimeMillis() / 1000));
+                int editDate = msgObj.optInt("edit_date", 0);
                 int msgId = msgObj.optInt("message_id", 1);
+
+                long resolvedDialogId;
+                if (isSupergroupOrChannel(chatId)) {
+                    resolvedDialogId = -channelIdFromBotApi(chatId);
+                } else if (chatId < 0) {
+                    resolvedDialogId = chatId;
+                } else {
+                    resolvedDialogId = chatId;
+                }
 
                 topMessageMap.put(chatId, msgId);
                 lastDateMap.put(chatId, date);
@@ -1988,13 +2045,113 @@ public class ColgramBotSync {
                 Object message = messageClass.getConstructor().newInstance();
                 messageClass.getField("id").setInt(message, msgId);
                 messageClass.getField("date").setInt(message, date);
+                if (editDate > 0) {
+                    try {
+                        messageClass.getField("edit_date").setInt(message, editDate);
+                        int fl = messageClass.getField("flags").getInt(message);
+                        messageClass.getField("flags").setInt(message, fl | 0x00008000);
+                    } catch (Throwable ignored) {}
+                }
                 messageClass.getField("message").set(message, text);
+                JSONArray rawEntities = msgObj.optJSONArray("entities");
+                if (rawEntities == null || rawEntities.length() == 0) {
+                    rawEntities = msgObj.optJSONArray("caption_entities");
+                }
+                String newEntitiesJson = null;
+                if (rawEntities != null && rawEntities.length() > 0) {
+                    ArrayList<Object> parsedEntities = parseBotEntitiesToTl(rawEntities, batchCustomEmojiIds);
+                    if (!parsedEntities.isEmpty()) {
+                        try {
+                            messageClass.getField("entities").set(message, parsedEntities);
+                            int fl = messageClass.getField("flags").getInt(message);
+                            messageClass.getField("flags").setInt(message, fl | 0x00000080); // MESSAGE_FLAG_HAS_ENTITIES
+                        } catch (Throwable ignored) {}
+                    }
+                    newEntitiesJson = rawEntities.toString();
+                }
+                boolean mediaAttached = false;
+                if (botToken != null && !botToken.isEmpty()) {
+                    if (msgObj.has("sticker")) {
+                        if (attachBotStickerMedia(context, account, botToken, msgObj.optJSONObject("sticker"), message, messageClass, date)) {
+                            text = "";
+                            mediaAttached = true;
+                        }
+                    } else if (msgObj.has("photo")) {
+                        if (attachBotPhotoMedia(context, account, botToken, resolvedDialogId, msgId, isEditedUpdate,
+                                msgObj.optJSONArray("photo"), rawCaption, message, messageClass, date)) {
+                            mediaAttached = true;
+                        }
+                    } else if (msgObj.has("video") || msgObj.has("video_note") || msgObj.has("animation")) {
+                        boolean isRoundNote = msgObj.has("video_note");
+                        JSONObject vidObj = isRoundNote ? msgObj.optJSONObject("video_note")
+                                : (msgObj.has("video") ? msgObj.optJSONObject("video") : msgObj.optJSONObject("animation"));
+                        if (attachBotVideoMedia(context, account, botToken, resolvedDialogId, msgId, isEditedUpdate,
+                                vidObj, msgObj.has("animation"), isRoundNote, rawCaption, message, messageClass, date)) {
+                            mediaAttached = true;
+                        }
+                    } else if (msgObj.has("document") || msgObj.has("voice") || msgObj.has("audio")) {
+                        boolean isVoice = msgObj.has("voice");
+                        boolean isAudio = msgObj.has("audio");
+                        JSONObject docObj = msgObj.has("document") ? msgObj.optJSONObject("document")
+                                : (isVoice ? msgObj.optJSONObject("voice") : msgObj.optJSONObject("audio"));
+                        if (attachBotDocumentMedia(context, account, botToken, resolvedDialogId, msgId, isEditedUpdate,
+                                docObj, isVoice, isAudio, rawCaption, message, messageClass, date)) {
+                            mediaAttached = true;
+                        }
+                    }
+                }
+                if (!mediaAttached && text.isEmpty()) {
+                    if (msgObj.has("photo")) text = "🖼 Фотография";
+                    else if (msgObj.has("video_note")) text = "🎥 Видеосообщение";
+                    else if (msgObj.has("video") || msgObj.has("animation")) text = "📹 Видео";
+                    else if (msgObj.has("document")) text = "📎 Документ";
+                    else if (msgObj.has("voice")) text = "🎤 Голосовое сообщение";
+                    else if (msgObj.has("audio")) text = "🎵 Аудиозапись";
+                    else if (msgObj.has("sticker")) text = "🎨 Стикер";
+                    messageClass.getField("message").set(message, text);
+                }
+
+                // Track live snapshots & capture rapid (<1s) text/caption + entity edits from Bot API updates
+                if (isEditedUpdate) {
+                    String fallbackStoredText = null;
+                    String fallbackStoredEntities = null;
+                    if (!ColgramHookHandler.hasLiveMessageSnapshot(resolvedDialogId, msgId)) {
+                        try {
+                            Class<?> msStorageCls = Class.forName("org.telegram.messenger.MessagesStorage");
+                            Object msInst = msStorageCls.getMethod("getInstance", int.class).invoke(null, account);
+                            if (msInst != null) {
+                                Object storedMsg = msStorageCls.getMethod("getMessage", long.class, int.class)
+                                        .invoke(msInst, resolvedDialogId, msgId);
+                                if (storedMsg != null) {
+                                    Object rawPrev = storedMsg.getClass().getField("message").get(storedMsg);
+                                    if (rawPrev instanceof String) fallbackStoredText = (String) rawPrev;
+                                    try {
+                                        Object prevEnts = storedMsg.getClass().getField("entities").get(storedMsg);
+                                        if (prevEnts instanceof java.util.List) {
+                                            fallbackStoredEntities = serializeTlEntitiesToJsonString((java.util.List<?>) prevEnts);
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    ColgramHookHandler.hookOnMessageEditedWithNew(
+                            resolvedDialogId, msgId, fallbackStoredText, fallbackStoredEntities,
+                            text, newEntitiesJson, System.currentTimeMillis());
+                } else if (!text.isEmpty()) {
+                    ColgramHookHandler.recordLiveMessageSnapshot(resolvedDialogId, msgId, text, newEntitiesJson);
+                }
                 try {
-                    // The bot is "self" in this session, so anything it sent is an outgoing
-                    // message. Hard-coded false put every bot reply on the incoming side of
-                    // the thread, which reads as the bot's own messages never arriving.
-                    messageClass.getField("out").setBoolean(message, botSelfId != 0 && fromId == botSelfId);
+                    // The bot is "self" in this session, so anything it sent (or posted to a channel it admins) is outgoing.
+                    boolean isOutMsg = (botSelfId != 0 && fromId == botSelfId) || isChannelPostUpdate;
+                    messageClass.getField("out").setBoolean(message, isOutMsg);
+                    if (isChannelPostUpdate) {
+                        messageClass.getField("post").setBoolean(message, true);
+                    }
                 } catch (Throwable ignored) {}
+                if (isEditedUpdate) {
+                    editedBatchKeys.add(resolvedDialogId + ":" + msgId);
+                }
 
                 // Resolve the correct peer type and id.
                 //
@@ -2065,6 +2222,14 @@ public class ColgramBotSync {
             if (!messagesList.isEmpty()) {
                 msClass.getMethod("putMessages", ArrayList.class, boolean.class, boolean.class, boolean.class, int.class, int.class, long.class)
                         .invoke(ms, messagesList, true, true, false, 0, 0, 0L);
+            }
+            if (!batchCustomEmojiIds.isEmpty()) {
+                ArrayList<Long> prefetchIds = new ArrayList<>(batchCustomEmojiIds);
+                fetchCustomEmojiForBot(context, account, prefetchIds, loadedDocs -> {
+                    if (loadedDocs != null && !loadedDocs.isEmpty()) {
+                        postDebouncedAvatarRefresh(account);
+                    }
+                });
             }
 
             // Create and persist TLRPC.TL_dialog for each unique chat.
@@ -2170,6 +2335,14 @@ public class ColgramBotSync {
             final ArrayList finalMessagesList = messagesList;
             final ArrayList finalUsersList = usersList;
             final ArrayList finalChatsList = chatsList;
+            final java.util.List<Long> finalUserPeersToHydrate = new ArrayList<>(processedUserIds);
+            final java.util.Map<Long, Long> finalGroupPeersToHydrate = new java.util.HashMap<>();
+            for (Long cid : topMessageMap.keySet()) {
+                if (cid != null && cid < 0) {
+                    long tlDid = isSupergroupOrChannel(cid) ? -channelIdFromBotApi(cid) : cid;
+                    finalGroupPeersToHydrate.put(tlDid, cid);
+                }
+            }
             Runnable seedCache = () -> {
                 try {
                     Class<?> dialogBaseClass = Class.forName("org.telegram.tgnet.TLRPC$Dialog");
@@ -2344,23 +2517,129 @@ public class ColgramBotSync {
                     seedCache,
                     () -> {
                 try {
-                    Method loadDialogs = mcClass.getMethod("loadDialogs", int.class, int.class, int.class, boolean.class, Runnable.class);
-                    loadDialogs.invoke(mc, 0, 0, 100, true, null);
+                    Class<?> colgramDialogBaseClass = Class.forName("org.telegram.tgnet.TLRPC$Dialog");
+                    @SuppressWarnings("unchecked")
+                    java.util.ArrayList<Object> mcDialogs = (java.util.ArrayList<Object>) mcClass.getField("dialogs").get(mc);
+                    @SuppressWarnings("unchecked")
+                    java.util.ArrayList<Object> mcAllDialogs = (java.util.ArrayList<Object>) mcClass.getField("allDialogs").get(mc);
+                    java.util.HashSet<Long> existingIds = new java.util.HashSet<>();
+                    if (mcDialogs != null) {
+                        for (Object existing : mcDialogs) {
+                            existingIds.add(colgramDialogBaseClass.getField("id").getLong(existing));
+                        }
+                    }
+                    boolean listChanged = false;
+                    for (Object dlg : finalDialogsList) {
+                        long did = colgramDialogBaseClass.getField("id").getLong(dlg);
+                        if (!existingIds.contains(did)) {
+                            if (mcDialogs != null) mcDialogs.add(dlg);
+                            if (mcAllDialogs != null && !mcAllDialogs.contains(dlg)) mcAllDialogs.add(dlg);
+                            existingIds.add(did);
+                            listChanged = true;
+                        } else if (mcDialogs != null) {
+                            int topMid = colgramDialogBaseClass.getField("top_message").getInt(dlg);
+                            int lastDate = colgramDialogBaseClass.getField("last_message_date").getInt(dlg);
+                            for (Object existing : mcDialogs) {
+                                if (colgramDialogBaseClass.getField("id").getLong(existing) == did) {
+                                    if (topMid > colgramDialogBaseClass.getField("top_message").getInt(existing)) {
+                                        colgramDialogBaseClass.getField("top_message").setInt(existing, topMid);
+                                        colgramDialogBaseClass.getField("last_message_date").setInt(existing, lastDate);
+                                        listChanged = true;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (listChanged) {
+                        try {
+                            for (Method m : mcClass.getMethods()) {
+                                if ("sortDialogs".equals(m.getName()) && m.getParameterTypes().length == 1) {
+                                    m.invoke(mc, new Object[]{null});
+                                    break;
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
 
                     Class<?> ncClass = Class.forName("org.telegram.messenger.NotificationCenter");
                     Method getInst = ncClass.getMethod("getInstance", int.class);
                     Object nc = getInst.invoke(null, account);
-
-                    int dialogsNeedReload = ncClass.getField("dialogsNeedReload").getInt(null);
                     Method postNotification = ncClass.getMethod("postNotificationName", int.class, Object[].class);
-                    postNotification.invoke(nc, dialogsNeedReload, new Object[0]);
 
-                    try {
-                        int updateInterfaces = ncClass.getField("updateInterfaces").getInt(null);
-                        int maskAll = mcClass.getField("UPDATE_MASK_ALL").getInt(null);
-                        postNotification.invoke(nc, updateInterfaces, new Object[]{maskAll});
-                    } catch (Throwable ignored) {}
+                    // Deliver new messages via didReceiveNewMessages AND edited messages live via replaceMessagesObjects.
+                    if (finalMessagesList != null && !finalMessagesList.isEmpty()) {
+                        try {
+                            Class<?> liveMsgObjCls = Class.forName("org.telegram.messenger.MessageObject");
+                            int didReceiveNewMessages = ncClass.getField("didReceiveNewMessages").getInt(null);
+                            int replaceMessagesObjects = ncClass.getField("replaceMessagesObjects").getInt(null);
+                            java.util.LinkedHashMap<Long, java.util.ArrayList<Object>> perDialogLive = new java.util.LinkedHashMap<>();
+                            java.util.LinkedHashMap<Long, java.util.ArrayList<Object>> perDialogEdited = new java.util.LinkedHashMap<>();
+                            if (dispatchedLiveMsgKeys.size() > 4000) {
+                                dispatchedLiveMsgKeys.clear();
+                            }
+                            for (Object msgItem : finalMessagesList) {
+                                long did = peerIdOf(messageClass, peerChannelClass, peerChatClass, peerUserClass, msgItem);
+                                int mid = messageClass.getField("id").getInt(msgItem);
+                                if (did == 0 || mid == 0) continue;
+                                boolean isEditedItem = editedBatchKeys.contains(did + ":" + mid);
+                                String liveKey = account + ":" + did + ":" + mid;
+                                if (!isEditedItem && !dispatchedLiveMsgKeys.add(liveKey)) continue;
+                                Object liveMo = null;
+                                try {
+                                    liveMo = liveMsgObjCls.getConstructor(int.class, messageClass, boolean.class, boolean.class)
+                                            .newInstance(account, msgItem, true, isEditedItem);
+                                } catch (NoSuchMethodException nsme) {
+                                    liveMo = liveMsgObjCls.getConstructor(int.class, messageClass, liveMsgObjCls, boolean.class, boolean.class)
+                                            .newInstance(account, msgItem, null, true, isEditedItem);
+                                }
+                                if (liveMo != null) {
+                                    java.util.LinkedHashMap<Long, java.util.ArrayList<Object>> targetMap = isEditedItem ? perDialogEdited : perDialogLive;
+                                    java.util.ArrayList<Object> bucket = targetMap.get(did);
+                                    if (bucket == null) {
+                                        bucket = new java.util.ArrayList<>();
+                                        targetMap.put(did, bucket);
+                                    }
+                                    bucket.add(liveMo);
+                                }
+                            }
+                            for (java.util.Map.Entry<Long, java.util.ArrayList<Object>> liveEntry : perDialogLive.entrySet()) {
+                                postNotification.invoke(nc, didReceiveNewMessages,
+                                        new Object[]{liveEntry.getKey(), liveEntry.getValue(), Boolean.FALSE, Boolean.FALSE});
+                            }
+                            for (java.util.Map.Entry<Long, java.util.ArrayList<Object>> editEntry : perDialogEdited.entrySet()) {
+                                postNotification.invoke(nc, replaceMessagesObjects,
+                                        new Object[]{editEntry.getKey(), editEntry.getValue(), Boolean.FALSE});
+                            }
+                        } catch (Throwable liveErr) {
+                            Log.w(TAG, "didReceiveNewMessages dispatch warning: " + liveErr.getMessage());
+                        }
+                    }
 
+                    long nowUi = System.currentTimeMillis();
+                    Long prevUi = lastBotUiNotifyAt.get(account);
+                    if (listChanged || prevUi == null || nowUi - prevUi >= 400L) {
+                        lastBotUiNotifyAt.put(account, nowUi);
+                        int dialogsNeedReload = ncClass.getField("dialogsNeedReload").getInt(null);
+                        postNotification.invoke(nc, dialogsNeedReload, new Object[0]);
+                        if (!finalUsersList.isEmpty() || !finalChatsList.isEmpty()) {
+                            try {
+                                int updateInterfaces = ncClass.getField("updateInterfaces").getInt(null);
+                                int mask = mcClass.getField("UPDATE_MASK_NAME").getInt(null)
+                                        | mcClass.getField("UPDATE_MASK_AVATAR").getInt(null);
+                                postNotification.invoke(nc, updateInterfaces, new Object[]{mask});
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+
+                    for (Long uid : finalUserPeersToHydrate) {
+                        if (uid != null && uid != 0) {
+                            requestBotAvatarWithChatId(context, account, uid, uid, false);
+                        }
+                    }
+                    for (java.util.Map.Entry<Long, Long> ge : finalGroupPeersToHydrate.entrySet()) {
+                        requestBotAvatarWithChatId(context, account, ge.getKey(), ge.getValue(), true);
+                    }
                 } catch (Throwable t) {
                     Log.e(TAG, "Error notifying UI after bot sync", t);
                 }
@@ -2920,10 +3199,267 @@ public class ColgramBotSync {
         showStartChatDialog(activity, account, null);
     }
 
+    interface ThemedInputSubmit {
+        boolean onSubmit(String value);
+    }
+
+    /**
+     * Renders a theme-native Colgram modal dialog (matching Telegram's "Новый контакт" sheet style:
+     * dark/light/Cyber surface, rounded outlined field with focus accent, inline Paste action, and
+     * full-width pill CTA). Never falls back to stock white android.app.AlertDialog.
+     */
+    static void showThemedInputDialog(
+            final Context context,
+            final String title,
+            final String subtitle,
+            final String hint,
+            final String initialValue,
+            final boolean monospace,
+            final String primaryLabel,
+            final String cancelLabel,
+            final ThemedInputSubmit onSubmit
+    ) {
+        if (context == null) return;
+        if (context instanceof Activity && ((Activity) context).isFinishing()) return;
+
+        float density = context.getResources() != null ? context.getResources().getDisplayMetrics().density : 2.5f;
+        int dp4 = Math.round(4f * density);
+        int dp8 = Math.round(8f * density);
+        int dp10 = Math.round(10f * density);
+        int dp12 = Math.round(12f * density);
+        int dp14 = Math.round(14f * density);
+        int dp16 = Math.round(16f * density);
+        int dp20 = Math.round(20f * density);
+        int dp22 = Math.round(22f * density);
+        int dp24 = Math.round(24f * density);
+        int dp48 = Math.round(48f * density);
+
+        Class<?> themeClass = null;
+        boolean darkTheme = true;
+        try {
+            themeClass = Class.forName("org.telegram.ui.ActionBar.Theme");
+            darkTheme = (Boolean) themeClass.getMethod("isCurrentThemeDark").invoke(null);
+        } catch (Throwable ignored) {}
+        boolean cyberTheme = darkTheme && ColgramConfig.isCyberThemeEnabled();
+
+        int surfaceColor = getThemeColor(themeClass, "key_dialogBackground",
+                cyberTheme ? 0xFF141519 : (darkTheme ? 0xFF1B1F27 : 0xFFFFFFFF));
+        int textColor = getThemeColor(themeClass, "key_dialogTextBlack",
+                darkTheme ? 0xFFF2F4F8 : 0xFF111827);
+        int grayColor = getThemeColor(themeClass, "key_dialogTextGray",
+                darkTheme ? 0xFF94A0B4 : 0xFF64748B);
+        int hintColor = getThemeColor(themeClass, "key_dialogTextHint",
+                darkTheme ? 0xFF647082 : 0xFF94A3B8);
+        int accentColor = cyberTheme
+                ? 0xFFE11D48
+                : getThemeColor(themeClass, "key_featuredStickers_addButton", 0xFF2AABEE);
+        int fieldFill = darkTheme ? (cyberTheme ? 0xFF1C1D24 : 0xFF232833) : 0xFFF3F6FA;
+        int fieldBorderIdle = darkTheme ? 0x26FFFFFF : 0x220F172A;
+        int fieldBorderFocus = accentColor;
+        int strokePx = Math.max(1, Math.round(1.25f * density));
+
+        Typeface boldFace = Typeface.DEFAULT_BOLD;
+        try {
+            Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
+            Object tf = auClass.getMethod("bold").invoke(null);
+            if (tf instanceof Typeface) boldFace = (Typeface) tf;
+        } catch (Throwable ignored) {}
+
+        LinearLayout container = new LinearLayout(context);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp22, dp22, dp22, dp14);
+
+        TextView titleView = new TextView(context);
+        titleView.setText(title);
+        titleView.setTextColor(textColor);
+        titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 19.5f);
+        titleView.setTypeface(boldFace);
+        container.addView(titleView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView descView = new TextView(context);
+            descView.setText(subtitle);
+            descView.setTextColor(grayColor);
+            descView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
+            descView.setLineSpacing(dp4 * 0.6f, 1.0f);
+            LinearLayout.LayoutParams descLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            descLp.topMargin = dp8;
+            descLp.bottomMargin = dp16;
+            container.addView(descView, descLp);
+        }
+
+        final GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setCornerRadius(dp12);
+        cardBg.setColor(fieldFill);
+        cardBg.setStroke(strokePx, fieldBorderFocus);
+
+        LinearLayout inputCard = new LinearLayout(context);
+        inputCard.setOrientation(LinearLayout.HORIZONTAL);
+        inputCard.setGravity(Gravity.CENTER_VERTICAL);
+        inputCard.setPadding(dp14, dp10, dp10, dp10);
+        inputCard.setBackground(cardBg);
+
+        final EditText input = new EditText(context);
+        input.setHint(hint);
+        input.setHintTextColor(hintColor);
+        input.setTextColor(textColor);
+        input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, monospace ? 13.5f : 15f);
+        if (monospace) {
+            input.setTypeface(Typeface.MONOSPACE);
+            input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        } else {
+            input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        }
+        input.setBackground(null);
+        input.setSingleLine(true);
+        input.setImeOptions(EditorInfo.IME_ACTION_GO);
+        input.setPadding(0, dp4, dp8, dp4);
+        if (initialValue != null && !initialValue.isEmpty()) {
+            input.setText(initialValue);
+            input.setSelection(initialValue.length());
+        }
+        input.setOnFocusChangeListener((v, hasFocus) ->
+                cardBg.setStroke(strokePx, hasFocus ? fieldBorderFocus : fieldBorderIdle));
+        inputCard.addView(input, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView pasteBtn = new TextView(context);
+        pasteBtn.setText("Вставить");
+        pasteBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
+        pasteBtn.setTextColor(accentColor);
+        pasteBtn.setTypeface(boldFace);
+        pasteBtn.setPadding(dp10, dp8, dp10, dp8);
+        GradientDrawable pasteBg = new GradientDrawable();
+        pasteBg.setCornerRadius(dp8);
+        pasteBg.setColor((accentColor & 0x00FFFFFF) | 0x1E000000);
+        pasteBtn.setBackground(pasteBg);
+        pasteBtn.setOnClickListener(v -> {
+            try {
+                ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm != null && cm.hasPrimaryClip()) {
+                    ClipData clip = cm.getPrimaryClip();
+                    if (clip != null && clip.getItemCount() > 0 && clip.getItemAt(0).getText() != null) {
+                        String pasted = clip.getItemAt(0).getText().toString().trim();
+                        input.setText(pasted);
+                        input.setSelection(pasted.length());
+                    }
+                }
+            } catch (Throwable ignored) {}
+        });
+        inputCard.addView(pasteBtn, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout.LayoutParams inputCardLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        inputCardLp.bottomMargin = dp20;
+        container.addView(inputCard, inputCardLp);
+
+        final Dialog[] dialogRef = new Dialog[1];
+        final Runnable triggerSubmit = () -> {
+            String value = input.getText() != null ? input.getText().toString().trim() : "";
+            if (onSubmit == null || onSubmit.onSubmit(value)) {
+                if (dialogRef[0] != null) {
+                    try {
+                        dialogRef[0].dismiss();
+                    } catch (Throwable ignored) {}
+                }
+            }
+        };
+
+        input.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE) {
+                triggerSubmit.run();
+                return true;
+            }
+            return false;
+        });
+
+        TextView primaryBtn = new TextView(context);
+        primaryBtn.setText(primaryLabel);
+        primaryBtn.setTextColor(Color.WHITE);
+        primaryBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15f);
+        primaryBtn.setTypeface(boldFace);
+        primaryBtn.setGravity(Gravity.CENTER);
+        primaryBtn.setMinimumHeight(dp48);
+        GradientDrawable primaryBg = new GradientDrawable();
+        primaryBg.setCornerRadius(dp24);
+        primaryBg.setColor(accentColor);
+        primaryBtn.setBackground(primaryBg);
+        primaryBtn.setOnTouchListener((v, ev) -> {
+            if (ev.getAction() == MotionEvent.ACTION_DOWN) {
+                v.animate().scaleX(0.98f).scaleY(0.98f).alpha(0.88f).setDuration(90).start();
+            } else if (ev.getAction() == MotionEvent.ACTION_UP || ev.getAction() == MotionEvent.ACTION_CANCEL) {
+                v.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(130).start();
+            }
+            return false;
+        });
+        primaryBtn.setOnClickListener(v -> triggerSubmit.run());
+        container.addView(primaryBtn, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp48));
+
+        TextView cancelBtn = new TextView(context);
+        cancelBtn.setText(cancelLabel);
+        cancelBtn.setTextColor(grayColor);
+        cancelBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f);
+        cancelBtn.setTypeface(boldFace);
+        cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setPadding(dp16, dp12, dp16, dp8);
+        cancelBtn.setOnClickListener(v -> {
+            if (dialogRef[0] != null) {
+                try {
+                    dialogRef[0].dismiss();
+                } catch (Throwable ignored) {}
+            }
+        });
+        LinearLayout.LayoutParams cancelLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        cancelLp.topMargin = dp4;
+        container.addView(cancelBtn, cancelLp);
+
+        try {
+            Class<?> alertBuilderClass = Class.forName("org.telegram.ui.ActionBar.AlertDialog$Builder");
+            Object builder = alertBuilderClass.getConstructor(Context.class).newInstance(context);
+            alertBuilderClass.getMethod("setView", View.class).invoke(builder, container);
+            Object shown = alertBuilderClass.getMethod("show").invoke(builder);
+            if (shown instanceof Dialog) {
+                dialogRef[0] = (Dialog) shown;
+            }
+            input.post(() -> {
+                try {
+                    input.requestFocus();
+                } catch (Throwable ignored) {}
+            });
+            return;
+        } catch (Throwable t) {
+            Log.w(TAG, "Telegram AlertDialog unavailable, using themed custom Dialog", t);
+        }
+
+        // Theme-matched fallback Dialog (NEVER stock white android.app.AlertDialog!)
+        Dialog fallback = new Dialog(context);
+        fallback.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        GradientDrawable cardSurface = new GradientDrawable();
+        cardSurface.setColor(surfaceColor);
+        cardSurface.setCornerRadius(dp20);
+        cardSurface.setStroke(strokePx, darkTheme ? 0x1FFFFFFF : 0x140F172A);
+        container.setBackground(cardSurface);
+        fallback.setContentView(container);
+        Window win = fallback.getWindow();
+        if (win != null) {
+            win.setBackgroundDrawableResource(android.R.color.transparent);
+            win.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            int widthPx = Math.min(Math.round(380f * density),
+                    Math.round(context.getResources().getDisplayMetrics().widthPixels * 0.90f));
+            win.setLayout(widthPx, WindowManager.LayoutParams.WRAP_CONTENT);
+        }
+        dialogRef[0] = fallback;
+        fallback.show();
+    }
+
     public static void showStartChatDialog(final Activity activity, final int account, final Object fragmentObj) {
         if (activity == null || activity.isFinishing()) return;
 
-        boolean isRu = false;
+        boolean isRu = true;
         try {
             Class<?> lcClass = Class.forName("org.telegram.messenger.LocaleController");
             Object lc = lcClass.getMethod("getInstance").invoke(null);
@@ -2937,107 +3473,2380 @@ public class ColgramBotSync {
         } catch (Throwable ignored) {}
 
         final boolean isRussian = isRu;
+        showThemedInputDialog(
+                activity,
+                isRussian ? "Написать пользователю" : "Message User",
+                isRussian
+                        ? "Введите @username или числовой ID, чтобы открыть диалог от имени бота"
+                        : "Enter @username or numerical User ID to open a chat as bot",
+                isRussian ? "@username или 123456789" : "@username or 123456789",
+                "",
+                false,
+                isRussian ? "Открыть чат" : "Open Chat",
+                isRussian ? "Отмена" : "Cancel",
+                query -> {
+                    if (query.isEmpty()) {
+                        Toast.makeText(activity,
+                                isRussian ? "Введите @username или User ID" : "Enter @username or User ID",
+                                Toast.LENGTH_SHORT).show();
+                        return false;
+                    }
+                    openChatAsBot(activity, account, fragmentObj, query);
+                    return true;
+                }
+        );
+    }
 
+    private static final ConcurrentHashMap<Integer, Long> lastBotUiNotifyAt = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> botAvatarAttemptedAt = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Integer, Long> botAvatarUiPostedAt = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Integer, Boolean> botAvatarUiPending = new ConcurrentHashMap<>();
+    private static final java.util.Set<String> botAvatarInFlight =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private static final long BOT_AVATAR_NEGATIVE_TTL_MS = 30_000L;
+
+    public interface BotEmojiCallback {
+        void onDocumentsLoaded(ArrayList<Object> documents);
+    }
+
+    private static Context resolveAppContext(Context context) {
+        if (context != null) {
+            return context.getApplicationContext();
+        }
         try {
-            Class<?> auClass = Class.forName("org.telegram.messenger.AndroidUtilities");
-            Class<?> themeClass = Class.forName("org.telegram.ui.ActionBar.Theme");
-            Class<?> alertBuilderClass = Class.forName("org.telegram.ui.ActionBar.AlertDialog$Builder");
-
-            Method dpMethod = auClass.getMethod("dp", float.class);
-            int dp8 = (int) dpMethod.invoke(null, 8f);
-            int dp12 = (int) dpMethod.invoke(null, 12f);
-            int dp16 = (int) dpMethod.invoke(null, 16f);
-            int dp20 = (int) dpMethod.invoke(null, 20f);
-
-            int textColor = getThemeColor(themeClass, "key_dialogTextBlack", Color.parseColor("#222222"));
-            int grayColor = getThemeColor(themeClass, "key_dialogTextGray", Color.parseColor("#888888"));
-            int hintColor = getThemeColor(themeClass, "key_dialogTextHint", Color.parseColor("#AAAAAA"));
-            int accentColor = getThemeColor(themeClass, "key_featuredStickers_addButton", Color.parseColor("#2AABEE"));
-            int fieldBgColor = getThemeColor(themeClass, "key_dialogInputField", Color.parseColor("#0F000000"));
-
-            LinearLayout container = new LinearLayout(activity);
-            container.setOrientation(LinearLayout.VERTICAL);
-            container.setPadding(dp20, dp8, dp20, dp8);
-
-            TextView descView = new TextView(activity);
-            descView.setText(isRussian
-                    ? "Введите @username или числовой ID пользователя, чтобы открыть чат от имени бота:"
-                    : "Enter @username or user ID to start a chat as bot:");
-            descView.setTextColor(grayColor);
-            descView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
-            descView.setPadding(0, 0, 0, dp16);
-            container.addView(descView);
-
-            LinearLayout inputCard = new LinearLayout(activity);
-            inputCard.setOrientation(LinearLayout.HORIZONTAL);
-            inputCard.setGravity(Gravity.CENTER_VERTICAL);
-            inputCard.setPadding(dp12, dp8, dp12, dp8);
-
-            GradientDrawable cardBg = new GradientDrawable();
-            cardBg.setCornerRadius(dp8);
-            cardBg.setColor(fieldBgColor != 0 ? fieldBgColor : Color.parseColor("#15000000"));
-            cardBg.setStroke((int) dpMethod.invoke(null, 1.0f), accentColor & 0x4DFFFFFF);
-            inputCard.setBackground(cardBg);
-
-            final EditText input = new EditText(activity);
-            input.setHint("@username или 123456789");
-            input.setHintTextColor(hintColor);
-            input.setTextColor(textColor);
-            input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
-            input.setBackground(null);
-            input.setSingleLine(true);
-            input.setInputType(InputType.TYPE_CLASS_TEXT);
-            LinearLayout.LayoutParams inputParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-            input.setLayoutParams(inputParams);
-            inputCard.addView(input);
-
-            container.addView(inputCard);
-
-            Object builder = alertBuilderClass.getConstructor(Context.class).newInstance(activity);
-            alertBuilderClass.getMethod("setTitle", CharSequence.class).invoke(builder, isRussian ? "✉️ Написать пользователю" : "✉️ Message User");
-            alertBuilderClass.getMethod("setView", View.class).invoke(builder, container);
-
-            alertBuilderClass.getMethod("setPositiveButton", CharSequence.class, DialogInterface.OnClickListener.class)
-                    .invoke(builder, isRussian ? "Открыть чат" : "Open Chat", (DialogInterface.OnClickListener) (dialog, which) -> {
-                        String query = input.getText().toString().trim();
-                        if (query.isEmpty()) return;
-                        openChatAsBot(activity, account, fragmentObj, query);
-                    });
-
-            alertBuilderClass.getMethod("setNegativeButton", CharSequence.class, DialogInterface.OnClickListener.class)
-                    .invoke(builder, isRussian ? "Отмена" : "Cancel", null);
-
-            alertBuilderClass.getMethod("show").invoke(builder);
-
-        } catch (Throwable t) {
-            Log.e(TAG, "showStartChatDialog fallback error", t);
-            fallbackShowStartChatDialog(activity, account, fragmentObj, isRussian);
+            Class<?> alClass = Class.forName("org.telegram.messenger.ApplicationLoader");
+            return (Context) alClass.getField("applicationContext").get(null);
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
-    private static void fallbackShowStartChatDialog(final Activity activity, final int account, final Object fragmentObj, final boolean isRussian) {
-        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        builder.setTitle(isRussian ? "✉️ Написать пользователю" : "✉️ Message User");
-        builder.setMessage(isRussian ? "Введите @username или числовой User ID пользователя:" : "Enter @username or numerical User ID:");
+    private static File getBotCacheDir(Context context, String sub) {
+        Context app = resolveAppContext(context);
+        if (app == null) return null;
+        File dir = new File(new File(app.getFilesDir(), "colgram_bot_cache"), sub);
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        return dir;
+    }
 
-        LinearLayout layout = new LinearLayout(activity);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(48, 24, 48, 24);
+    public static File getCachedBotAvatarFile(int account, long peerId) {
+        if (peerId == 0) return null;
+        File dir = getBotCacheDir(null, "avatars");
+        if (dir == null) return null;
+        File scoped = new File(dir, "acc_" + account + "_peer_" + peerId + ".jpg");
+        if (scoped.exists() && scoped.length() > 64) {
+            return scoped;
+        }
+        File legacy = new File(dir, "peer_" + peerId + ".jpg");
+        return (legacy.exists() && legacy.length() > 64) ? legacy : null;
+    }
 
-        final EditText input = new EditText(activity);
-        input.setHint("@username или 123456789");
-        input.setInputType(InputType.TYPE_CLASS_TEXT);
-        input.setSingleLine(true);
-        layout.addView(input);
+    public static void requestBotAvatarAsync(Context context, int account, long peerId, boolean isChat) {
+        requestBotAvatarWithChatId(context, account, peerId, 0L, isChat);
+    }
 
-        builder.setView(layout);
-        builder.setPositiveButton(isRussian ? "Открыть чат" : "Open Chat", (dialog, which) -> {
-            String query = input.getText().toString().trim();
-            if (query.isEmpty()) return;
-            openChatAsBot(activity, account, fragmentObj, query);
+    private static final java.util.Set<String> botPeerMetaSynced =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    private static void requestBotAvatarWithChatId(Context context, int account, long peerId,
+                                                   long explicitBotApiChatId, boolean isChat) {
+        if (peerId == 0) return;
+        File existing = getCachedBotAvatarFile(account, peerId);
+        final String key = account + ":" + peerId;
+        final boolean needAvatar = (existing == null);
+        final boolean needMeta = !botPeerMetaSynced.contains(key);
+        if (!needAvatar && !needMeta) return;
+
+        long now = System.currentTimeMillis();
+        Long attempted = botAvatarAttemptedAt.get(key);
+        if (needAvatar && attempted != null && now - attempted < BOT_AVATAR_NEGATIVE_TTL_MS) {
+            return;
+        }
+        if (!botAvatarInFlight.add(key)) {
+            return;
+        }
+        final Context app = resolveAppContext(context);
+        if (app == null) {
+            botAvatarInFlight.remove(key);
+            return;
+        }
+        final String token = getBotToken(app, account);
+        if (token.isEmpty()) {
+            botAvatarAttemptedAt.put(key, now);
+            botAvatarInFlight.remove(key);
+            return;
+        }
+        executor.execute(() -> {
+            try {
+                botAvatarAttemptedAt.put(key, System.currentTimeMillis());
+                String fileId = null;
+                if (needAvatar && !isChat && peerId > 0) {
+                    JSONObject photosPayload = new JSONObject();
+                    photosPayload.put("user_id", peerId);
+                    photosPayload.put("limit", 1);
+                    JSONObject photosResp = botApiPost(token, "getUserProfilePhotos", photosPayload);
+                    if (photosResp != null && photosResp.optBoolean("ok", false)) {
+                        JSONObject res = photosResp.optJSONObject("result");
+                        JSONArray photos = res != null ? res.optJSONArray("photos") : null;
+                        if (photos != null && photos.length() > 0) {
+                            JSONArray sizes = photos.optJSONArray(0);
+                            if (sizes != null && sizes.length() > 0) {
+                                int pick = sizes.length() > 1 ? Math.min(1, sizes.length() - 1) : 0;
+                                JSONObject picked = sizes.optJSONObject(pick);
+                                if (picked != null) {
+                                    fileId = picked.optString("file_id", "");
+                                }
+                            }
+                        }
+                    }
+                }
+                if (needMeta || (needAvatar && (fileId == null || fileId.isEmpty()))) {
+                    long[] candidateChatIds;
+                    if (explicitBotApiChatId != 0) {
+                        candidateChatIds = new long[]{explicitBotApiChatId};
+                    } else if (peerId > 0) {
+                        candidateChatIds = new long[]{peerId};
+                    } else {
+                        long abs = -peerId;
+                        candidateChatIds = new long[]{-1000000000000L - abs, peerId};
+                    }
+                    for (long cid : candidateChatIds) {
+                        JSONObject chatPayload = new JSONObject();
+                        chatPayload.put("chat_id", cid);
+                        JSONObject chatResp = botApiPost(token, "getChat", chatPayload);
+                        if (chatResp != null && chatResp.optBoolean("ok", false)) {
+                            JSONObject res = chatResp.optJSONObject("result");
+                            if (res != null) {
+                                botPeerMetaSynced.add(key);
+                                applyBotChatProfileMetadata(app, account, peerId, isChat, res);
+                                if (needAvatar && (fileId == null || fileId.isEmpty())) {
+                                    JSONObject photo = res.optJSONObject("photo");
+                                    if (photo != null) {
+                                        fileId = photo.optString("small_file_id", photo.optString("big_file_id", ""));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (needAvatar && fileId != null && !fileId.isEmpty()) {
+                    File dir = getBotCacheDir(app, "avatars");
+                    if (dir != null) {
+                        File dest = new File(dir, "acc_" + account + "_peer_" + peerId + ".jpg");
+                        if (downloadBotFileById(token, fileId, dest)) {
+                            postDebouncedAvatarRefresh(account);
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "requestBotAvatarWithChatId failed for " + peerId + ": " + t.getMessage());
+            } finally {
+                botAvatarInFlight.remove(key);
+            }
         });
-        builder.setNegativeButton(isRussian ? "Отмена" : "Cancel", null);
-        builder.show();
+    }
+
+    private static void applyBotChatProfileMetadata(Context app, int account, long peerId, boolean isChat, JSONObject chatRes) {
+        if (chatRes == null || peerId == 0) return;
+        try {
+            int accentColorId = chatRes.optInt("accent_color_id", -1);
+            long bgEmojiId = parseLongSafe(chatRes.optString("background_custom_emoji_id", ""));
+            int profileAccentId = chatRes.optInt("profile_accent_color_id", -1);
+            long profileBgEmojiId = parseLongSafe(chatRes.optString("profile_background_custom_emoji_id", ""));
+            long emojiStatusId = parseLongSafe(chatRes.optString("emoji_status_custom_emoji_id", ""));
+
+            if (accentColorId < 0 && bgEmojiId == 0L && profileAccentId < 0 && profileBgEmojiId == 0L && emojiStatusId == 0L) {
+                return;
+            }
+
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+            if (mc == null) return;
+
+            Class<?> peerColorCls = Class.forName("org.telegram.tgnet.TLRPC$TL_peerColor");
+            Class<?> emojiStatusCls = Class.forName("org.telegram.tgnet.TLRPC$TL_emojiStatus");
+
+            Object target = (!isChat && peerId > 0)
+                    ? mcClass.getMethod("getUser", Long.class).invoke(mc, peerId)
+                    : mcClass.getMethod("getChat", Long.class).invoke(mc, Math.abs(peerId));
+            if (target == null) return;
+
+            boolean changed = false;
+            Class<?> targetCls = target.getClass();
+            boolean isUserObj = (!isChat && peerId > 0);
+
+            if (accentColorId >= 0 || bgEmojiId != 0L) {
+                Object pc = peerColorCls.getConstructor().newInstance();
+                int pFlags = 0;
+                if (accentColorId >= 0) {
+                    pFlags |= 1;
+                    peerColorCls.getField("color").setInt(pc, accentColorId);
+                }
+                if (bgEmojiId != 0L) {
+                    pFlags |= 2;
+                    peerColorCls.getField("background_emoji_id").setLong(pc, bgEmojiId);
+                }
+                peerColorCls.getField("flags").setInt(pc, pFlags);
+                targetCls.getField("color").set(target, pc);
+                int f2 = targetCls.getField("flags2").getInt(target);
+                targetCls.getField("flags2").setInt(target, f2 | (isUserObj ? (1 << 8) : (1 << 7)));
+                changed = true;
+            }
+            if (profileAccentId >= 0 || profileBgEmojiId != 0L) {
+                Object pc = peerColorCls.getConstructor().newInstance();
+                int pFlags = 0;
+                if (profileAccentId >= 0) {
+                    pFlags |= 1;
+                    peerColorCls.getField("color").setInt(pc, profileAccentId);
+                }
+                if (profileBgEmojiId != 0L) {
+                    pFlags |= 2;
+                    peerColorCls.getField("background_emoji_id").setLong(pc, profileBgEmojiId);
+                }
+                peerColorCls.getField("flags").setInt(pc, pFlags);
+                targetCls.getField("profile_color").set(target, pc);
+                int f2 = targetCls.getField("flags2").getInt(target);
+                targetCls.getField("flags2").setInt(target, f2 | (isUserObj ? (1 << 9) : (1 << 8)));
+                changed = true;
+            }
+            if (emojiStatusId != 0L) {
+                Object es = emojiStatusCls.getConstructor().newInstance();
+                emojiStatusCls.getField("flags").setInt(es, 0);
+                emojiStatusCls.getField("document_id").setLong(es, emojiStatusId);
+                targetCls.getField("emoji_status").set(target, es);
+                if (isUserObj) {
+                    int f1 = targetCls.getField("flags").getInt(target);
+                    targetCls.getField("flags").setInt(target, f1 | (1 << 30));
+                } else {
+                    int f2 = targetCls.getField("flags2").getInt(target);
+                    targetCls.getField("flags2").setInt(target, f2 | (1 << 9));
+                }
+                changed = true;
+            }
+
+            if (changed) {
+                ArrayList<Long> emojiIdsToFetch = new ArrayList<>();
+                if (bgEmojiId != 0L) emojiIdsToFetch.add(bgEmojiId);
+                if (profileBgEmojiId != 0L && !emojiIdsToFetch.contains(profileBgEmojiId)) emojiIdsToFetch.add(profileBgEmojiId);
+                if (emojiStatusId != 0L && !emojiIdsToFetch.contains(emojiStatusId)) emojiIdsToFetch.add(emojiStatusId);
+                if (!emojiIdsToFetch.isEmpty()) {
+                    fetchCustomEmojiForBot(app, account, emojiIdsToFetch, docs -> postDebouncedAvatarRefresh(account));
+                } else {
+                    postDebouncedAvatarRefresh(account);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "applyBotChatProfileMetadata error: " + t.getMessage());
+        }
+    }
+
+    private static long parseLongSafe(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return 0L;
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException ignored) {
+            return 0L;
+        }
+    }
+
+    private static void postDebouncedAvatarRefresh(final int account) {
+        long now = System.currentTimeMillis();
+        Long last = botAvatarUiPostedAt.get(account);
+        if (last != null && now - last < 300L) {
+            if (Boolean.TRUE.equals(botAvatarUiPending.putIfAbsent(account, Boolean.TRUE))) {
+                return;
+            }
+            mainHandler.postDelayed(() -> {
+                botAvatarUiPending.remove(account);
+                emitAvatarUpdateNotification(account);
+            }, 320L);
+            return;
+        }
+        botAvatarUiPostedAt.put(account, now);
+        mainHandler.post(() -> emitAvatarUpdateNotification(account));
+    }
+
+    private static void emitAvatarUpdateNotification(int account) {
+        botAvatarUiPostedAt.put(account, System.currentTimeMillis());
+        try {
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Class<?> ncClass = Class.forName("org.telegram.messenger.NotificationCenter");
+            Object nc = ncClass.getMethod("getInstance", int.class).invoke(null, account);
+            int updateInterfaces = ncClass.getField("updateInterfaces").getInt(null);
+            int maskAvatar = mcClass.getField("UPDATE_MASK_AVATAR").getInt(null);
+            int maskChatAvatar = mcClass.getField("UPDATE_MASK_CHAT_AVATAR").getInt(null);
+            ncClass.getMethod("postNotificationName", int.class, Object[].class)
+                    .invoke(nc, updateInterfaces, new Object[]{maskAvatar | maskChatAvatar});
+        } catch (Throwable ignored) {}
+    }
+
+    public static File getCachedBotEmojiFile(long docId) {
+        if (docId == 0) return null;
+        File dir = getBotCacheDir(null, "emoji");
+        if (dir == null) return null;
+        for (String ext : new String[]{".tgs", ".webm", ".webp"}) {
+            File f = new File(dir, docId + ext);
+            if (f.exists() && f.length() > 32) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    public static void fetchCustomEmojiForBot(Context context, int account,
+                                              ArrayList<Long> documentIds, BotEmojiCallback callback) {
+        if (callback == null) return;
+        if (documentIds == null || documentIds.isEmpty()) {
+            mainHandler.post(() -> callback.onDocumentsLoaded(new ArrayList<>()));
+            return;
+        }
+        final Context app = resolveAppContext(context);
+        executor.execute(() -> {
+            ArrayList<Object> docs = new ArrayList<>();
+            String token = getBotToken(app, account);
+            if (app != null && !token.isEmpty()) {
+                File dir = getBotCacheDir(app, "emoji");
+                for (int start = 0; start < documentIds.size(); start += 100) {
+                    int end = Math.min(documentIds.size(), start + 100);
+                    try {
+                        JSONArray idArr = new JSONArray();
+                        for (int i = start; i < end; i++) {
+                            idArr.put(String.valueOf(documentIds.get(i)));
+                        }
+                        JSONObject payload = new JSONObject();
+                        payload.put("custom_emoji_ids", idArr);
+                        JSONObject resp = botApiPost(token, "getCustomEmojiStickers", payload);
+                        if (resp != null && resp.optBoolean("ok", false)) {
+                            JSONArray arr = resp.optJSONArray("result");
+                            if (arr != null) {
+                                for (int i = 0; i < arr.length(); i++) {
+                                    JSONObject st = arr.optJSONObject(i);
+                                    if (st == null) continue;
+                                    String cidStr = st.optString("custom_emoji_id", "0");
+                                    long docId = 0L;
+                                    try { docId = Long.parseLong(cidStr); } catch (NumberFormatException ignored) {}
+                                    if (docId == 0L) continue;
+
+                                    boolean animated = st.optBoolean("is_animated", false);
+                                    boolean video = st.optBoolean("is_video", false);
+                                    String ext = animated ? ".tgs" : (video ? ".webm" : ".webp");
+                                    String mime = animated ? "application/x-tgsticker" : (video ? "video/webm" : "image/webp");
+                                    String fileId = st.optString("file_id", "");
+                                    JSONObject thumbObj = st.optJSONObject("thumbnail");
+                                    String thumbFileId = thumbObj != null ? thumbObj.optString("file_id", "") : "";
+
+                                    File dest = dir != null ? new File(dir, docId + ext) : null;
+                                    boolean downloaded = dest != null && dest.exists() && dest.length() > 32;
+                                    if (!downloaded && dest != null && !fileId.isEmpty()) {
+                                        downloaded = downloadBotFileById(token, fileId, dest);
+                                    }
+                                    if (!downloaded && dir != null && !thumbFileId.isEmpty()) {
+                                        File thumbDest = new File(dir, docId + ".webp");
+                                        if (downloadBotFileById(token, thumbFileId, thumbDest)) {
+                                            ext = ".webp";
+                                            mime = "image/webp";
+                                            dest = thumbDest;
+                                            downloaded = true;
+                                        }
+                                    }
+                                    if (downloaded && dest != null) {
+                                        String setName = st.optString("set_name", "");
+                                        if (!setName.isEmpty()) {
+                                            rememberDiscoveredEmojiSet(app, setName);
+                                        }
+                                        Object tlDoc = buildSyntheticEmojiDocument(
+                                                docId,
+                                                mime,
+                                                (int) dest.length(),
+                                                st.optInt("width", 512),
+                                                st.optInt("height", 512),
+                                                st.optString("emoji", "😀"),
+                                                setName);
+                                        if (tlDoc != null) {
+                                            copyToCanonicalFileLoaderPath(account, tlDoc, dest);
+                                            docs.add(tlDoc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "fetchCustomEmojiForBot batch error: " + t.getMessage());
+                    }
+                }
+            }
+            if (!docs.isEmpty()) {
+                mainHandler.post(() -> callback.onDocumentsLoaded(docs));
+                return;
+            }
+            if (!relayCustomEmojiViaHumanSlot(account, documentIds, callback)) {
+                mainHandler.post(() -> callback.onDocumentsLoaded(new ArrayList<>()));
+            }
+        });
+    }
+
+    private static boolean relayCustomEmojiViaHumanSlot(int botAccount, ArrayList<Long> ids, BotEmojiCallback callback) {
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Class<?> reqClass = Class.forName("org.telegram.tgnet.TLRPC$TL_messages_getCustomEmojiDocuments");
+            Class<?> vecClass = Class.forName("org.telegram.tgnet.TLRPC$Vector");
+            Class<?> delegateClass = Class.forName("org.telegram.tgnet.RequestDelegate");
+            int maxAccounts = ucClass.getField("MAX_ACCOUNT_COUNT").getInt(null);
+            for (int slot = 0; slot < maxAccounts; slot++) {
+                if (slot == botAccount) continue;
+                Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, slot);
+                boolean activated = ucClass.getMethod("isClientActivated").invoke(uc) == Boolean.TRUE;
+                Object user = activated ? ucClass.getMethod("getCurrentUser").invoke(uc) : null;
+                if (user == null || user.getClass().getField("bot").getBoolean(user)) continue;
+
+                Object req = reqClass.getConstructor().newInstance();
+                @SuppressWarnings("unchecked")
+                ArrayList<Long> reqIds = (ArrayList<Long>) reqClass.getField("document_id").get(req);
+                reqIds.addAll(ids);
+
+                Object proxyDelegate = java.lang.reflect.Proxy.newProxyInstance(
+                        delegateClass.getClassLoader(),
+                        new Class<?>[]{delegateClass},
+                        (p, m, args) -> {
+                            ArrayList<Object> out = new ArrayList<>();
+                            if (args != null && args.length > 0 && vecClass.isInstance(args[0])) {
+                                @SuppressWarnings("unchecked")
+                                ArrayList<Object> vecObjs = (ArrayList<Object>) vecClass.getField("objects").get(args[0]);
+                                if (vecObjs != null) out.addAll(vecObjs);
+                            }
+                            mainHandler.post(() -> callback.onDocumentsLoaded(out));
+                            return null;
+                        });
+                Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, slot);
+                Class<?> tlObjClass = Class.forName("org.telegram.tgnet.TLObject");
+                cmClass.getMethod("sendRequest", tlObjClass, delegateClass).invoke(cm, req, proxyDelegate);
+                return true;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "relayCustomEmojiViaHumanSlot failed: " + t.getMessage());
+        }
+        return false;
+    }
+
+    private static boolean attachBotStickerMedia(Context context, int account, String token,
+                                                 JSONObject stObj, Object message, Class<?> messageClass, int date) {
+        if (stObj == null || message == null || token == null || token.isEmpty()) {
+            return false;
+        }
+        try {
+            String fileId = stObj.optString("file_id", "");
+            String uniqueId = stObj.optString("file_unique_id", fileId);
+            if (fileId.isEmpty()) return false;
+            boolean animated = stObj.optBoolean("is_animated", false);
+            boolean video = stObj.optBoolean("is_video", false);
+            String ext = animated ? ".tgs" : (video ? ".webm" : ".webp");
+            String mime = animated ? "application/x-tgsticker" : (video ? "video/webm" : "image/webp");
+            String emoji = stObj.optString("emoji", "😀");
+            int width = stObj.optInt("width", 512);
+            int height = stObj.optInt("height", 512);
+
+            long h64 = 1125899906842597L;
+            for (int k = 0; k < uniqueId.length(); k++) {
+                h64 = 31L * h64 + uniqueId.charAt(k);
+            }
+            long docId = (h64 & 0x000FFFFFFFFFFFFFL) | 0x0010000000000000L;
+
+            File dir = getBotCacheDir(context, "stickers");
+            if (dir == null) return false;
+            File dest = new File(dir, docId + ext);
+            boolean ok = dest.exists() && dest.length() > 32;
+            if (!ok) {
+                ok = downloadBotFileById(token, fileId, dest);
+            }
+            if (!ok) {
+                JSONObject thumbObj = stObj.optJSONObject("thumbnail");
+                String thumbId = thumbObj != null ? thumbObj.optString("file_id", "") : "";
+                if (!thumbId.isEmpty()) {
+                    File thumbDest = new File(dir, docId + ".webp");
+                    if ((thumbDest.exists() && thumbDest.length() > 32) || downloadBotFileById(token, thumbId, thumbDest)) {
+                        dest = thumbDest;
+                        ext = ".webp";
+                        mime = "image/webp";
+                        animated = false;
+                        video = false;
+                        ok = true;
+                    }
+                }
+            }
+            if (!ok || !dest.exists() || dest.length() <= 32) {
+                return false;
+            }
+
+            Class<?> docCls = Class.forName("org.telegram.tgnet.TLRPC$TL_document");
+            Class<?> imgAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeImageSize");
+            Class<?> stAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeSticker");
+            Class<?> fnAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename");
+            Class<?> emptySetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_inputStickerSetEmpty");
+            Class<?> mediaDocCls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageMediaDocument");
+
+            Object doc = docCls.getConstructor().newInstance();
+            docCls.getField("id").setLong(doc, docId);
+            docCls.getField("dc_id").setInt(doc, 1);
+            docCls.getField("access_hash").setLong(doc, 0L);
+            docCls.getField("flags").setInt(doc, 0);
+            docCls.getField("mime_type").set(doc, mime);
+            docCls.getField("size").setLong(doc, dest.length());
+            docCls.getField("date").setInt(doc, date);
+            docCls.getField("file_reference").set(doc, new byte[0]);
+            @SuppressWarnings("unchecked")
+            ArrayList<Object> attrs = (ArrayList<Object>) docCls.getField("attributes").get(doc);
+            if (attrs != null) {
+                Object sz = imgAttrCls.getConstructor().newInstance();
+                imgAttrCls.getField("w").setInt(sz, width > 0 ? width : 512);
+                imgAttrCls.getField("h").setInt(sz, height > 0 ? height : 512);
+                attrs.add(sz);
+
+                Object sa = stAttrCls.getConstructor().newInstance();
+                stAttrCls.getField("alt").set(sa, emoji != null && !emoji.isEmpty() ? emoji : "😀");
+                String setName = stObj.optString("set_name", "").trim();
+                Object stickerSetObj;
+                if (!setName.isEmpty()) {
+                    Class<?> shortNameSetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_inputStickerSetShortName");
+                    stickerSetObj = shortNameSetCls.getConstructor().newInstance();
+                    shortNameSetCls.getField("short_name").set(stickerSetObj, setName);
+                } else {
+                    stickerSetObj = emptySetCls.getConstructor().newInstance();
+                }
+                stAttrCls.getField("stickerset").set(sa, stickerSetObj);
+                attrs.add(sa);
+
+                Object fn = fnAttrCls.getConstructor().newInstance();
+                fnAttrCls.getField("file_name").set(fn, "sticker" + ext);
+                attrs.add(fn);
+            }
+
+            File finalStickerFile = dest;
+            try {
+                Class<?> flCls = Class.forName("org.telegram.messenger.FileLoader");
+                Class<?> tlObjCls = Class.forName("org.telegram.tgnet.TLObject");
+                Object fl = flCls.getMethod("getInstance", int.class).invoke(null, account);
+                // Copy into Telegram's canonical FileLoader attach path so ImageLoader & ChatMessageCell find it immediately!
+                try {
+                    File canonical = (File) flCls.getMethod("getPathToAttach", tlObjCls, boolean.class).invoke(fl, doc, true);
+                    if (canonical != null && !canonical.equals(dest)) {
+                        File parent = canonical.getParentFile();
+                        if (parent != null && !parent.exists()) parent.mkdirs();
+                        if (!canonical.exists() || canonical.length() != dest.length()) {
+                            try (java.io.FileInputStream fis = new java.io.FileInputStream(dest);
+                                 java.io.FileOutputStream fos = new java.io.FileOutputStream(canonical)) {
+                                byte[] buf = new byte[16384];
+                                int n;
+                                while ((n = fis.read(buf)) > 0) fos.write(buf, 0, n);
+                            }
+                        }
+                        if (canonical.exists() && canonical.length() > 32) {
+                            finalStickerFile = canonical;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                flCls.getMethod("setLocalPathTo", tlObjCls, String.class).invoke(fl, doc, finalStickerFile.getAbsolutePath());
+            } catch (Throwable ignored) {}
+
+            Object media = mediaDocCls.getConstructor().newInstance();
+            mediaDocCls.getField("document").set(media, doc);
+            mediaDocCls.getField("flags").setInt(media, 1);
+
+            messageClass.getField("media").set(message, media);
+            messageClass.getField("attachPath").set(message, finalStickerFile.getAbsolutePath());
+            int curFlags = messageClass.getField("flags").getInt(message);
+            messageClass.getField("flags").setInt(message, curFlags | 0x00000200);
+            messageClass.getField("message").set(message, "");
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "attachBotStickerMedia failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    private static long stableBotMediaId(String uniqueId) {
+        long h64 = 1125899906842597L;
+        if (uniqueId != null) {
+            for (int k = 0; k < uniqueId.length(); k++) {
+                h64 = 31L * h64 + uniqueId.charAt(k);
+            }
+        }
+        return (h64 & 0x000FFFFFFFFFFFFFL) | 0x0020000000000000L;
+    }
+
+    private static File copyToCanonicalFileLoaderPath(int account, Object tlAttach, File src) {
+        File result = src;
+        try {
+            Class<?> flCls = Class.forName("org.telegram.messenger.FileLoader");
+            Class<?> tlObjCls = Class.forName("org.telegram.tgnet.TLObject");
+            Object fl = flCls.getMethod("getInstance", int.class).invoke(null, account);
+            // Copy to BOTH non-cache media dir (used by PhotoViewer & MediaDataController) AND cache dir
+            // (used by chat bubble thumbnails) so neither PhotoViewer nor chat cells ever spin trying MTProto!
+            boolean[] modes = {false, true};
+            for (boolean forceCache : modes) {
+                try {
+                    File canonical = (File) flCls.getMethod("getPathToAttach", tlObjCls, boolean.class)
+                            .invoke(fl, tlAttach, forceCache);
+                    if (canonical != null && !canonical.getPath().isEmpty() && !canonical.equals(src)) {
+                        File parent = canonical.getParentFile();
+                        if (parent != null && !parent.exists()) parent.mkdirs();
+                        if (!canonical.exists() || canonical.length() != src.length()) {
+                            try (java.io.FileInputStream fis = new java.io.FileInputStream(src);
+                                 java.io.FileOutputStream fos = new java.io.FileOutputStream(canonical)) {
+                                byte[] buf = new byte[16384];
+                                int n;
+                                while ((n = fis.read(buf)) > 0) fos.write(buf, 0, n);
+                            }
+                        }
+                        if (!forceCache && canonical.exists() && canonical.length() > 16) {
+                            result = canonical;
+                        } else if (result == src && canonical.exists() && canonical.length() > 16) {
+                            result = canonical;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            flCls.getMethod("setLocalPathTo", tlObjCls, String.class).invoke(fl, tlAttach, result.getAbsolutePath());
+        } catch (Throwable ignored) {}
+        return result;
+    }
+
+    private static final java.util.Set<Integer> hydratedBotMediaAccounts =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+    private static void hydrateExistingBotPhotosOnceAsync(final Context appContext, final int account) {
+        if (appContext == null || !hydratedBotMediaAccounts.add(account)) return;
+        Thread t = new Thread(() -> hydrateExistingBotPhotos(appContext, account), "colgram-bot-media-hydrate-" + account);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Migrates any previously downloaded Bot API photos in files/colgram_bot_cache/photos/<photoId>.jpg
+     * into Telegram's canonical FileLoader paths (-<photoId>_121.jpg in both MEDIA_DIR_IMAGE and MEDIA_DIR_CACHE)
+     * so pre-existing bot photos immediately render in ChatActivity, SharedMediaLayout, and PhotoViewer
+     * without spinning forever waiting on MTProto.
+     */
+    private static void hydrateExistingBotPhotos(Context context, int account) {
+        if (context == null) return;
+        try {
+            File photosDir = new File(new File(context.getFilesDir(), "colgram_bot_cache"), "photos");
+            File[] files = photosDir.listFiles();
+            if (files == null || files.length == 0) return;
+            Class<?> sizeCls = Class.forName("org.telegram.tgnet.TLRPC$TL_photoSize");
+            Class<?> locCls = Class.forName("org.telegram.tgnet.TLRPC$TL_fileLocationToBeDeprecated");
+            for (File f : files) {
+                if (f == null || !f.isFile() || f.length() <= 32) continue;
+                String name = f.getName();
+                if (!name.endsWith(".jpg")) continue;
+                String base = name.substring(0, name.length() - 4);
+                long photoId;
+                try {
+                    photoId = Long.parseLong(base);
+                } catch (NumberFormatException ignored) {
+                    continue;
+                }
+                if (photoId <= 0L) continue;
+                Object ps = sizeCls.getConstructor().newInstance();
+                sizeCls.getField("type").set(ps, "y");
+                sizeCls.getField("size").setInt(ps, (int) f.length());
+                Object loc = locCls.getConstructor().newInstance();
+                locCls.getField("volume_id").setLong(loc, -photoId);
+                locCls.getField("local_id").setInt(loc, (int) 'y');
+                sizeCls.getField("location").set(ps, loc);
+                copyToCanonicalFileLoaderPath(account, ps, f);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** Downloads a Bot API photo array and attaches a real TLRPC.TL_messageMediaPhoto (never "🖼 Фотография" text). */
+    private static boolean attachBotPhotoMedia(Context context, int account, String token,
+                                               long dialogId, int msgId, boolean isEdit,
+                                               JSONArray photoArr, String caption,
+                                               Object message, Class<?> messageClass, int date) {
+        if (photoArr == null || photoArr.length() == 0 || message == null) return false;
+        try {
+            JSONObject best = null;
+            int bestArea = -1;
+            for (int k = 0; k < photoArr.length(); k++) {
+                JSONObject item = photoArr.optJSONObject(k);
+                if (item == null || item.optString("file_id", "").isEmpty()) continue;
+                int area = item.optInt("width", 0) * item.optInt("height", 0);
+                if (best == null || area >= bestArea) {
+                    best = item;
+                    bestArea = area;
+                }
+            }
+            if (best == null) return false;
+            String fileId = best.optString("file_id", "");
+            String uniqueId = best.optString("file_unique_id", fileId);
+            int w = Math.max(1, best.optInt("width", 800));
+            int h = Math.max(1, best.optInt("height", 800));
+            long photoId = stableBotMediaId("photo_" + uniqueId);
+
+            File dir = getBotCacheDir(context, "photos");
+            if (dir == null) return false;
+            File dest = new File(dir, photoId + ".jpg");
+            boolean ok = dest.exists() && dest.length() > 64;
+            if (!ok) {
+                ok = downloadBotFileById(token, fileId, dest);
+            }
+            if (!ok || !dest.exists() || dest.length() <= 64) return false;
+
+            Class<?> mediaPhotoCls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageMediaPhoto");
+            Class<?> photoCls = Class.forName("org.telegram.tgnet.TLRPC$TL_photo");
+            Class<?> photoSizeCls = Class.forName("org.telegram.tgnet.TLRPC$TL_photoSize");
+            Class<?> locCls = Class.forName("org.telegram.tgnet.TLRPC$TL_fileLocationToBeDeprecated");
+
+            // EXACT match with TLRPC.PhotoSize.TLdeserialize (volume_id = -photo_id, local_id = type.charAt(0))
+            // so PhotoViewer finds the downloaded JPEG immediately after SQLite reload with ZERO spinner!
+            Object loc = locCls.getConstructor().newInstance();
+            locCls.getField("volume_id").setLong(loc, -photoId);
+            locCls.getField("local_id").setInt(loc, (int) 'y');
+
+            Object ps = photoSizeCls.getConstructor().newInstance();
+            photoSizeCls.getField("type").set(ps, "y");
+            photoSizeCls.getField("w").setInt(ps, w);
+            photoSizeCls.getField("h").setInt(ps, h);
+            photoSizeCls.getField("size").setInt(ps, (int) Math.min(Integer.MAX_VALUE, dest.length()));
+            photoSizeCls.getField("location").set(ps, loc);
+
+            Object photo = photoCls.getConstructor().newInstance();
+            photoCls.getField("id").setLong(photo, photoId);
+            photoCls.getField("access_hash").setLong(photo, 0L);
+            photoCls.getField("date").setInt(photo, date);
+            photoCls.getField("dc_id").setInt(photo, 1);
+            photoCls.getField("file_reference").set(photo, new byte[0]);
+            @SuppressWarnings("unchecked")
+            ArrayList<Object> sizes = (ArrayList<Object>) photoCls.getField("sizes").get(photo);
+            if (sizes != null) sizes.add(ps);
+
+            File finalFile = copyToCanonicalFileLoaderPath(account, ps, dest);
+            Object media = mediaPhotoCls.getConstructor().newInstance();
+            mediaPhotoCls.getField("photo").set(media, photo);
+            mediaPhotoCls.getField("flags").setInt(media, 1);
+
+            messageClass.getField("media").set(message, media);
+            messageClass.getField("attachPath").set(message, finalFile.getAbsolutePath());
+            int curFlags = messageClass.getField("flags").getInt(message);
+            messageClass.getField("flags").setInt(message, curFlags | 0x00000200);
+            messageClass.getField("message").set(message, caption != null ? caption : "");
+
+            if (isEdit) {
+                ColgramHookHandler.hookOnMediaChangedWithNew(
+                        dialogId, msgId, ColgramDatabase.MediaRevision.TYPE_PHOTO,
+                        finalFile.getAbsolutePath(), "photo_" + photoId + ".jpg",
+                        finalFile.length(), "image/jpeg", photoId, System.currentTimeMillis());
+            } else {
+                ColgramHookHandler.recordLiveMediaSnapshot(
+                        dialogId, msgId, ColgramDatabase.MediaRevision.TYPE_PHOTO,
+                        finalFile.getAbsolutePath(), "photo_" + photoId + ".jpg",
+                        finalFile.length(), "image/jpeg", photoId);
+            }
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "attachBotPhotoMedia failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** Downloads a Bot API video/video_note (кружок)/animation and attaches a real TLRPC.TL_messageMediaDocument. */
+    private static boolean attachBotVideoMedia(Context context, int account, String token,
+                                               long dialogId, int msgId, boolean isEdit,
+                                               JSONObject vidObj, boolean isGif, boolean isRound, String caption,
+                                               Object message, Class<?> messageClass, int date) {
+        if (vidObj == null || message == null) return false;
+        try {
+            String fileId = vidObj.optString("file_id", "");
+            String uniqueId = vidObj.optString("file_unique_id", fileId);
+            if (fileId.isEmpty()) return false;
+            String mime = vidObj.optString("mime_type", "video/mp4");
+            String fileName = vidObj.optString("file_name", isRound ? "round_video.mp4" : (isGif ? "animation.mp4" : "video.mp4"));
+            int side = vidObj.optInt("length", 384);
+            int w = Math.max(1, isRound ? side : vidObj.optInt("width", 640));
+            int h = Math.max(1, isRound ? side : vidObj.optInt("height", 640));
+            double duration = vidObj.optDouble("duration", 1.0);
+            long docId = stableBotMediaId((isRound ? "round_" : "vid_") + uniqueId);
+
+            File dir = getBotCacheDir(context, "videos");
+            if (dir == null) return false;
+            File dest = new File(dir, docId + ".mp4");
+            boolean ok = dest.exists() && dest.length() > 64;
+            if (!ok) {
+                ok = downloadBotFileById(token, fileId, dest);
+            }
+            if (!ok || !dest.exists() || dest.length() <= 64) return false;
+
+            Class<?> docCls = Class.forName("org.telegram.tgnet.TLRPC$TL_document");
+            Class<?> vidAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeVideo");
+            Class<?> fnAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename");
+            Class<?> animAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeAnimated");
+            Class<?> mediaDocCls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageMediaDocument");
+
+            Object doc = docCls.getConstructor().newInstance();
+            docCls.getField("id").setLong(doc, docId);
+            docCls.getField("dc_id").setInt(doc, 1);
+            docCls.getField("access_hash").setLong(doc, 0L);
+            docCls.getField("mime_type").set(doc, mime);
+            docCls.getField("size").setLong(doc, dest.length());
+            docCls.getField("date").setInt(doc, date);
+            docCls.getField("file_reference").set(doc, new byte[0]);
+            @SuppressWarnings("unchecked")
+            ArrayList<Object> attrs = (ArrayList<Object>) docCls.getField("attributes").get(doc);
+            if (attrs != null) {
+                Object va = vidAttrCls.getConstructor().newInstance();
+                vidAttrCls.getField("w").setInt(va, w);
+                vidAttrCls.getField("h").setInt(va, h);
+                vidAttrCls.getField("duration").setDouble(va, duration);
+                vidAttrCls.getField("supports_streaming").setBoolean(va, true);
+                if (isRound) {
+                    vidAttrCls.getField("round_message").setBoolean(va, true);
+                }
+                attrs.add(va);
+                if (isGif) attrs.add(animAttrCls.getConstructor().newInstance());
+                Object fn = fnAttrCls.getConstructor().newInstance();
+                fnAttrCls.getField("file_name").set(fn, fileName);
+                attrs.add(fn);
+            }
+
+            File finalFile = copyToCanonicalFileLoaderPath(account, doc, dest);
+            try {
+                docCls.getField("localPath").set(doc, finalFile.getAbsolutePath());
+            } catch (Throwable ignored) {}
+            Object media = mediaDocCls.getConstructor().newInstance();
+            mediaDocCls.getField("document").set(media, doc);
+            mediaDocCls.getField("flags").setInt(media, 1);
+
+            messageClass.getField("media").set(message, media);
+            messageClass.getField("attachPath").set(message, finalFile.getAbsolutePath());
+            int curFlags = messageClass.getField("flags").getInt(message);
+            messageClass.getField("flags").setInt(message, curFlags | 0x00000200);
+            messageClass.getField("message").set(message, caption != null ? caption : "");
+
+            if (isEdit) {
+                ColgramHookHandler.hookOnMediaChangedWithNew(
+                        dialogId, msgId, ColgramDatabase.MediaRevision.TYPE_VIDEO,
+                        finalFile.getAbsolutePath(), fileName, finalFile.length(), mime, docId, System.currentTimeMillis());
+            } else {
+                ColgramHookHandler.recordLiveMediaSnapshot(
+                        dialogId, msgId, ColgramDatabase.MediaRevision.TYPE_VIDEO,
+                        finalFile.getAbsolutePath(), fileName, finalFile.length(), mime, docId);
+            }
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "attachBotVideoMedia failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** Downloads a Bot API document/voice/audio (музыка) and attaches a real TLRPC.TL_messageMediaDocument. */
+    private static boolean attachBotDocumentMedia(Context context, int account, String token,
+                                                  long dialogId, int msgId, boolean isEdit,
+                                                  JSONObject docObj, boolean isVoice, boolean isAudio, String caption,
+                                                  Object message, Class<?> messageClass, int date) {
+        if (docObj == null || message == null) return false;
+        try {
+            String fileId = docObj.optString("file_id", "");
+            String uniqueId = docObj.optString("file_unique_id", fileId);
+            if (fileId.isEmpty()) return false;
+            String defaultMime = isVoice ? "audio/ogg" : (isAudio ? "audio/mpeg" : "application/octet-stream");
+            String mime = docObj.optString("mime_type", defaultMime);
+            String defaultName = isVoice ? "voice.ogg" : (isAudio ? "audio.mp3" : "file.bin");
+            String fileName = docObj.optString("file_name", defaultName);
+            long docId = stableBotMediaId((isVoice ? "voice_" : (isAudio ? "audio_" : "doc_")) + uniqueId);
+
+            File dir = getBotCacheDir(context, "docs");
+            if (dir == null) return false;
+            String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.'))
+                    : (isVoice ? ".ogg" : (isAudio ? ".mp3" : ".bin"));
+            if (ext.length() > 8) ext = ".bin";
+            File dest = new File(dir, docId + ext);
+            boolean ok = dest.exists() && dest.length() > 16;
+            if (!ok) {
+                ok = downloadBotFileById(token, fileId, dest);
+            }
+            if (!ok || !dest.exists() || dest.length() <= 16) return false;
+
+            Class<?> docCls = Class.forName("org.telegram.tgnet.TLRPC$TL_document");
+            Class<?> fnAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename");
+            Class<?> mediaDocCls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageMediaDocument");
+
+            Object doc = docCls.getConstructor().newInstance();
+            docCls.getField("id").setLong(doc, docId);
+            docCls.getField("dc_id").setInt(doc, 1);
+            docCls.getField("access_hash").setLong(doc, 0L);
+            docCls.getField("mime_type").set(doc, mime);
+            docCls.getField("size").setLong(doc, dest.length());
+            docCls.getField("date").setInt(doc, date);
+            docCls.getField("file_reference").set(doc, new byte[0]);
+            @SuppressWarnings("unchecked")
+            ArrayList<Object> attrs = (ArrayList<Object>) docCls.getField("attributes").get(doc);
+            if (attrs != null) {
+                if (isVoice || isAudio) {
+                    try {
+                        Class<?> audAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeAudio");
+                        Object aa = audAttrCls.getConstructor().newInstance();
+                        audAttrCls.getField("voice").setBoolean(aa, isVoice);
+                        audAttrCls.getField("duration").setDouble(aa, docObj.optDouble("duration", 1.0));
+                        int aFlags = isVoice ? 1024 : 0;
+                        String title = docObj.optString("title", "");
+                        String performer = docObj.optString("performer", "");
+                        if (!title.isEmpty()) {
+                            audAttrCls.getField("title").set(aa, title);
+                            aFlags |= 1;
+                        }
+                        if (!performer.isEmpty()) {
+                            audAttrCls.getField("performer").set(aa, performer);
+                            aFlags |= 2;
+                        }
+                        audAttrCls.getField("flags").setInt(aa, aFlags);
+                        attrs.add(aa);
+                    } catch (Throwable ignored) {}
+                }
+                Object fn = fnAttrCls.getConstructor().newInstance();
+                fnAttrCls.getField("file_name").set(fn, fileName);
+                attrs.add(fn);
+            }
+
+            File finalFile = copyToCanonicalFileLoaderPath(account, doc, dest);
+            try {
+                docCls.getField("localPath").set(doc, finalFile.getAbsolutePath());
+            } catch (Throwable ignored) {}
+            Object media = mediaDocCls.getConstructor().newInstance();
+            mediaDocCls.getField("document").set(media, doc);
+            mediaDocCls.getField("flags").setInt(media, 1);
+
+            messageClass.getField("media").set(message, media);
+            messageClass.getField("attachPath").set(message, finalFile.getAbsolutePath());
+            int curFlags = messageClass.getField("flags").getInt(message);
+            messageClass.getField("flags").setInt(message, curFlags | 0x00000200);
+            messageClass.getField("message").set(message, caption != null ? caption : "");
+
+            int revType = mime.startsWith("image/") ? ColgramDatabase.MediaRevision.TYPE_PHOTO
+                    : (mime.startsWith("video/") ? ColgramDatabase.MediaRevision.TYPE_VIDEO
+                    : ColgramDatabase.MediaRevision.TYPE_DOCUMENT);
+            if (isEdit) {
+                ColgramHookHandler.hookOnMediaChangedWithNew(
+                        dialogId, msgId, revType, finalFile.getAbsolutePath(),
+                        fileName, finalFile.length(), mime, docId, System.currentTimeMillis());
+            } else {
+                ColgramHookHandler.recordLiveMediaSnapshot(
+                        dialogId, msgId, revType, finalFile.getAbsolutePath(),
+                        fileName, finalFile.length(), mime, docId);
+            }
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "attachBotDocumentMedia failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Bot API fallback for StickersAlert when MTProto messages.getStickerSet fails on a bot account
+     * or deleted sticker: fetches full sticker pack via Bot API getStickerSet?name=<shortName>.
+     */
+    public static void fetchBotStickerSetAsync(final Context context, final int account, final String shortName,
+                                               final java.util.function.Consumer<Object> onLoaded) {
+        if (shortName == null || shortName.trim().isEmpty() || onLoaded == null) return;
+        executor.execute(() -> {
+            Object resultSet = null;
+            try {
+                String token = getBotToken(context, account);
+                if (token != null && !token.isEmpty()) {
+                    String url = "https://api.telegram.org/bot" + token + "/getStickerSet?name="
+                            + java.net.URLEncoder.encode(shortName.trim(), "UTF-8");
+                    ColgramHttp.Response resp = ColgramHttp.get(url);
+                    if (resp != null && resp.code == 200 && resp.body != null) {
+                        JSONObject root = new JSONObject(resp.body);
+                        if (root.optBoolean("ok", false) && root.has("result")) {
+                            JSONObject res = root.getJSONObject("result");
+                            Class<?> resSetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_messages_stickerSet");
+                            Class<?> setCls = Class.forName("org.telegram.tgnet.TLRPC$TL_stickerSet");
+                            Class<?> packCls = Class.forName("org.telegram.tgnet.TLRPC$TL_stickerPack");
+                            Class<?> docCls = Class.forName("org.telegram.tgnet.TLRPC$TL_document");
+                            Class<?> imgAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeImageSize");
+                            Class<?> stAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeSticker");
+                            Class<?> emAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeCustomEmoji");
+                            Class<?> fnAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename");
+                            Class<?> shortSetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_inputStickerSetShortName");
+
+                            Object tlRes = resSetCls.getConstructor().newInstance();
+                            Object tlSet = setCls.getConstructor().newInstance();
+                            String resolvedShortName = res.optString("name", shortName);
+                            long setId = stableBotMediaId("set_" + resolvedShortName);
+                            setCls.getField("id").setLong(tlSet, setId);
+                            setCls.getField("short_name").set(tlSet, resolvedShortName);
+                            setCls.getField("title").set(tlSet, res.optString("title", resolvedShortName));
+                            String stType = res.optString("sticker_type", "regular");
+                            boolean isCustomEmojiSet = "custom_emoji".equals(stType);
+                            setCls.getField("masks").setBoolean(tlSet, "mask".equals(stType));
+                            setCls.getField("emojis").setBoolean(tlSet, isCustomEmojiSet);
+
+                            JSONArray stickers = res.optJSONArray("stickers");
+                            @SuppressWarnings("unchecked")
+                            ArrayList<Object> docs = (ArrayList<Object>) resSetCls.getField("documents").get(tlRes);
+                            @SuppressWarnings("unchecked")
+                            ArrayList<Object> packs = (ArrayList<Object>) resSetCls.getField("packs").get(tlRes);
+                            File dir = getBotCacheDir(context, isCustomEmojiSet ? "emoji" : "stickers");
+                            int count = stickers != null ? Math.min(stickers.length(), isCustomEmojiSet ? 64 : 40) : 0;
+                            setCls.getField("count").setInt(tlSet, count);
+                            final ArrayList<Object[]> deferredDownloads = new ArrayList<>();
+                            int eagerDownloads = 0;
+                            final int maxEagerDownloads = isCustomEmojiSet ? 16 : 20;
+                            for (int i = 0; i < count; i++) {
+                                JSONObject st = stickers.optJSONObject(i);
+                                if (st == null) continue;
+                                String fId = st.optString("file_id", "");
+                                String uId = st.optString("file_unique_id", fId);
+                                if (fId.isEmpty()) continue;
+                                boolean anim = st.optBoolean("is_animated", false);
+                                boolean vid = st.optBoolean("is_video", false);
+                                String ext = anim ? ".tgs" : (vid ? ".webm" : ".webp");
+                                String mime = anim ? "application/x-tgsticker" : (vid ? "video/webm" : "image/webp");
+                                long customEmojiId = isCustomEmojiSet ? parseLongSafe(st.optString("custom_emoji_id", "")) : 0L;
+                                long docId = customEmojiId != 0L ? customEmojiId : stableBotMediaId(uId);
+                                File dest = dir != null ? new File(dir, docId + ext) : null;
+                                boolean alreadyCached = dest != null && dest.exists() && dest.length() > 32;
+                                if (!alreadyCached && dest != null && eagerDownloads < maxEagerDownloads) {
+                                    eagerDownloads++;
+                                    alreadyCached = downloadBotFileById(token, fId, dest);
+                                }
+                                Object doc = docCls.getConstructor().newInstance();
+                                docCls.getField("id").setLong(doc, docId);
+                                docCls.getField("dc_id").setInt(doc, 1);
+                                docCls.getField("mime_type").set(doc, mime);
+                                docCls.getField("size").setLong(doc, dest != null && dest.exists() ? dest.length() : 1024L);
+                                docCls.getField("file_reference").set(doc, new byte[0]);
+                                @SuppressWarnings("unchecked")
+                                ArrayList<Object> attrs = (ArrayList<Object>) docCls.getField("attributes").get(doc);
+                                if (attrs != null) {
+                                    Object sz = imgAttrCls.getConstructor().newInstance();
+                                    imgAttrCls.getField("w").setInt(sz, st.optInt("width", 512));
+                                    imgAttrCls.getField("h").setInt(sz, st.optInt("height", 512));
+                                    attrs.add(sz);
+                                    String em = st.optString("emoji", "😀");
+                                    Object sn = shortSetCls.getConstructor().newInstance();
+                                    shortSetCls.getField("short_name").set(sn, resolvedShortName);
+                                    if (isCustomEmojiSet) {
+                                        Object ea = emAttrCls.getConstructor().newInstance();
+                                        emAttrCls.getField("alt").set(ea, em);
+                                        emAttrCls.getField("stickerset").set(ea, sn);
+                                        attrs.add(ea);
+                                    } else {
+                                        Object sa = stAttrCls.getConstructor().newInstance();
+                                        stAttrCls.getField("alt").set(sa, em);
+                                        stAttrCls.getField("stickerset").set(sa, sn);
+                                        attrs.add(sa);
+                                    }
+                                    Object fn = fnAttrCls.getConstructor().newInstance();
+                                    fnAttrCls.getField("file_name").set(fn, (isCustomEmojiSet ? "emoji_" + docId : "sticker") + ext);
+                                    attrs.add(fn);
+                                }
+                                if (alreadyCached && dest != null && dest.exists() && dest.length() > 32) {
+                                    copyToCanonicalFileLoaderPath(account, doc, dest);
+                                } else if (dest != null) {
+                                    deferredDownloads.add(new Object[]{fId, dest, doc});
+                                }
+                                if (docs != null) docs.add(doc);
+                                if (packs != null) {
+                                    Object pk = packCls.getConstructor().newInstance();
+                                    packCls.getField("emoticon").set(pk, st.optString("emoji", "😀"));
+                                    @SuppressWarnings("unchecked")
+                                    ArrayList<Long> pkDocs = (ArrayList<Long>) packCls.getField("documents").get(pk);
+                                    if (pkDocs != null) pkDocs.add(docId);
+                                    packs.add(pk);
+                                }
+                            }
+                            if (!deferredDownloads.isEmpty()) {
+                                final String bgToken = token;
+                                executor.execute(() -> {
+                                    for (Object[] item : deferredDownloads) {
+                                        try {
+                                            String fId = (String) item[0];
+                                            File dest = (File) item[1];
+                                            Object doc = item[2];
+                                            if ((!dest.exists() || dest.length() <= 32) && downloadBotFileById(bgToken, fId, dest)) {
+                                                copyToCanonicalFileLoaderPath(account, doc, dest);
+                                            }
+                                        } catch (Throwable ignored) {
+                                        }
+                                    }
+                                });
+                            }
+                            resSetCls.getField("set").set(tlRes, tlSet);
+                            if (docs != null && !docs.isEmpty()) {
+                                resultSet = tlRes;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "fetchBotStickerSetAsync failed: " + t.getMessage());
+            }
+            final Object finalSet = resultSet;
+            mainHandler.post(() -> onLoaded.accept(finalSet));
+        });
+    }
+
+    public interface BotEmojiPacksCallback {
+        void onPacksLoaded(ArrayList<Object> stickerSets);
+    }
+
+    private static final String PREF_BOT_EMOJI_SETS = "colgram_bot_emoji_sets";
+    private static final String[] DEFAULT_BOT_EMOJI_PACKS = new String[]{
+            "RestrictedEmoji",
+            "TelegramEmoji",
+            "EmojiAnimations",
+            "DuckEmoji",
+            "AnimatedEmojis",
+            "CatEmoji"
+    };
+    private static final ConcurrentHashMap<Integer, ArrayList<Object>> cachedBotEmojiPacks = new ConcurrentHashMap<>();
+    private static final Set<Integer> botEmojiPacksInFlight = java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    public static void rememberDiscoveredEmojiSet(Context context, String setName) {
+        if (setName == null || setName.trim().isEmpty()) return;
+        Context app = resolveAppContext(context);
+        if (app == null) return;
+        try {
+            String clean = setName.trim();
+            SharedPreferences sp = app.getSharedPreferences("colgram_bot_emoji_sets_prefs", Context.MODE_PRIVATE);
+            String existing = sp.getString(PREF_BOT_EMOJI_SETS, "");
+            java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+            set.add(clean);
+            if (!existing.isEmpty()) {
+                for (String part : existing.split(",")) {
+                    String p = part.trim();
+                    if (!p.isEmpty() && set.size() < 20) set.add(p);
+                }
+            }
+            StringBuilder sb = new StringBuilder();
+            for (String s : set) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(s);
+            }
+            sp.edit().putString(PREF_BOT_EMOJI_SETS, sb.toString()).apply();
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Fetches real animated Telegram Custom Emoji packs via Bot API getStickerSet
+     * so bot accounts have full Premium Custom Emoji packs in EmojiView instead of an empty list.
+     */
+    public static void fetchBotCustomEmojiPacks(final Context context, final int account, final BotEmojiPacksCallback callback) {
+        if (callback == null) return;
+        ArrayList<Object> cached = cachedBotEmojiPacks.get(account);
+        if (cached != null && !cached.isEmpty()) {
+            mainHandler.post(() -> callback.onPacksLoaded(new ArrayList<>(cached)));
+            return;
+        }
+        final Context app = resolveAppContext(context);
+        final String token = getBotToken(app, account);
+        if (app == null || token.isEmpty()) {
+            mainHandler.post(() -> callback.onPacksLoaded(new ArrayList<>()));
+            return;
+        }
+        if (!botEmojiPacksInFlight.add(account)) {
+            mainHandler.post(() -> callback.onPacksLoaded(new ArrayList<>()));
+            return;
+        }
+        executor.execute(() -> {
+            ArrayList<Object> setsOut = new ArrayList<>();
+            try {
+                java.util.LinkedHashSet<String> packNames = new java.util.LinkedHashSet<>();
+                try {
+                    SharedPreferences sp = app.getSharedPreferences("colgram_bot_emoji_sets_prefs", Context.MODE_PRIVATE);
+                    String saved = sp.getString(PREF_BOT_EMOJI_SETS, "");
+                    if (!saved.isEmpty()) {
+                        for (String p : saved.split(",")) {
+                            if (!p.trim().isEmpty()) packNames.add(p.trim());
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                for (String def : DEFAULT_BOT_EMOJI_PACKS) {
+                    packNames.add(def);
+                }
+
+                Class<?> resSetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_messages_stickerSet");
+                Class<?> setCls = Class.forName("org.telegram.tgnet.TLRPC$TL_stickerSet");
+                Class<?> packCls = Class.forName("org.telegram.tgnet.TLRPC$TL_stickerPack");
+                File emojiDir = getBotCacheDir(app, "emoji");
+                int nowSec = (int) (System.currentTimeMillis() / 1000L);
+                int fetchedCount = 0;
+
+                for (String shortName : packNames) {
+                    if (fetchedCount >= 8) break;
+                    try {
+                        JSONObject payload = new JSONObject();
+                        payload.put("name", shortName);
+                        JSONObject resp = botApiPost(token, "getStickerSet", payload);
+                        if (resp == null || !resp.optBoolean("ok", false)) continue;
+                        JSONObject res = resp.optJSONObject("result");
+                        if (res == null) continue;
+                        if (!"custom_emoji".equals(res.optString("sticker_type", ""))) continue;
+
+                        JSONArray stickers = res.optJSONArray("stickers");
+                        if (stickers == null || stickers.length() == 0) continue;
+
+                        Object tlRes = resSetCls.getConstructor().newInstance();
+                        Object tlSet = setCls.getConstructor().newInstance();
+                        setCls.getField("id").setLong(tlSet, stableBotMediaId("emojiset_" + shortName));
+                        setCls.getField("access_hash").setLong(tlSet, 0L);
+                        setCls.getField("title").set(tlSet, res.optString("title", shortName));
+                        setCls.getField("short_name").set(tlSet, shortName);
+                        setCls.getField("emojis").setBoolean(tlSet, true);
+                        setCls.getField("installed_date").setInt(tlSet, nowSec);
+                        setCls.getField("official").setBoolean(tlSet, true);
+
+                        @SuppressWarnings("unchecked")
+                        ArrayList<Object> docs = (ArrayList<Object>) resSetCls.getField("documents").get(tlRes);
+                        @SuppressWarnings("unchecked")
+                        ArrayList<Object> packs = (ArrayList<Object>) resSetCls.getField("packs").get(tlRes);
+
+                        int limit = Math.min(stickers.length(), 32);
+                        for (int i = 0; i < limit; i++) {
+                            JSONObject st = stickers.optJSONObject(i);
+                            if (st == null) continue;
+                            long docId = parseLongSafe(st.optString("custom_emoji_id", ""));
+                            if (docId == 0L) {
+                                docId = stableBotMediaId(st.optString("file_unique_id", shortName + "_" + i));
+                            }
+                            boolean anim = st.optBoolean("is_animated", false);
+                            boolean vid = st.optBoolean("is_video", false);
+                            String ext = anim ? ".tgs" : (vid ? ".webm" : ".webp");
+                            String mime = anim ? "application/x-tgsticker" : (vid ? "video/webm" : "image/webp");
+                            String fId = st.optString("file_id", "");
+                            File dest = emojiDir != null ? new File(emojiDir, docId + ext) : null;
+                            if (dest != null && (!dest.exists() || dest.length() <= 32) && !fId.isEmpty() && i < 16) {
+                                downloadBotFileById(token, fId, dest);
+                            }
+                            String alt = st.optString("emoji", "😀");
+                            Object tlDoc = buildSyntheticEmojiDocument(
+                                    docId, mime,
+                                    dest != null && dest.exists() ? (int) dest.length() : 2048,
+                                    st.optInt("width", 512), st.optInt("height", 512),
+                                    alt, shortName);
+                            if (tlDoc != null) {
+                                if (dest != null && dest.exists() && dest.length() > 32) {
+                                    copyToCanonicalFileLoaderPath(account, tlDoc, dest);
+                                }
+                                if (docs != null) docs.add(tlDoc);
+                                if (packs != null) {
+                                    Object pk = packCls.getConstructor().newInstance();
+                                    packCls.getField("emoticon").set(pk, alt);
+                                    @SuppressWarnings("unchecked")
+                                    ArrayList<Long> pkDocs = (ArrayList<Long>) packCls.getField("documents").get(pk);
+                                    if (pkDocs != null) pkDocs.add(docId);
+                                    packs.add(pk);
+                                }
+                            }
+                        }
+                        if (docs != null && !docs.isEmpty()) {
+                            setCls.getField("count").setInt(tlSet, docs.size());
+                            resSetCls.getField("set").set(tlRes, tlSet);
+                            setsOut.add(tlRes);
+                            fetchedCount++;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                if (!setsOut.isEmpty()) {
+                    cachedBotEmojiPacks.put(account, new ArrayList<>(setsOut));
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "fetchBotCustomEmojiPacks failed: " + t.getMessage());
+            } finally {
+                botEmojiPacksInFlight.remove(account);
+            }
+            mainHandler.post(() -> callback.onPacksLoaded(setsOut));
+        });
+    }
+
+    /**
+     * Converts Telegram Bot API JSON entities array (entities / caption_entities) into TLRPC.MessageEntity list,
+     * preserving Premium custom_emoji IDs and all rich text formatting.
+     */
+    public static ArrayList<Object> parseBotEntitiesToTl(JSONArray entitiesArr, java.util.Collection<Long> outCustomEmojiIds) {
+        ArrayList<Object> result = new ArrayList<>();
+        if (entitiesArr == null || entitiesArr.length() == 0) return result;
+        for (int i = 0; i < entitiesArr.length(); i++) {
+            JSONObject eo = entitiesArr.optJSONObject(i);
+            if (eo == null) continue;
+            String type = eo.optString("type", "");
+            int offset = eo.optInt("offset", 0);
+            int length = eo.optInt("length", 0);
+            if (type.isEmpty() || length <= 0 || offset < 0) continue;
+            try {
+                Object ent = null;
+                switch (type) {
+                    case "custom_emoji": {
+                        long docId = parseLongSafe(eo.optString("custom_emoji_id", ""));
+                        if (docId != 0L) {
+                            Class<?> cls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityCustomEmoji");
+                            ent = cls.getConstructor().newInstance();
+                            cls.getField("document_id").setLong(ent, docId);
+                            if (outCustomEmojiIds != null) outCustomEmojiIds.add(docId);
+                        }
+                        break;
+                    }
+                    case "bold":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityBold").getConstructor().newInstance();
+                        break;
+                    case "italic":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityItalic").getConstructor().newInstance();
+                        break;
+                    case "underline":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityUnderline").getConstructor().newInstance();
+                        break;
+                    case "strikethrough":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityStrike").getConstructor().newInstance();
+                        break;
+                    case "spoiler":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntitySpoiler").getConstructor().newInstance();
+                        break;
+                    case "code":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityCode").getConstructor().newInstance();
+                        break;
+                    case "pre": {
+                        Class<?> cls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityPre");
+                        ent = cls.getConstructor().newInstance();
+                        cls.getField("language").set(ent, eo.optString("language", ""));
+                        break;
+                    }
+                    case "text_link": {
+                        Class<?> cls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityTextUrl");
+                        ent = cls.getConstructor().newInstance();
+                        cls.getField("url").set(ent, eo.optString("url", ""));
+                        break;
+                    }
+                    case "blockquote":
+                    case "expandable_blockquote": {
+                        Class<?> cls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityBlockquote");
+                        ent = cls.getConstructor().newInstance();
+                        if ("expandable_blockquote".equals(type)) {
+                            try {
+                                cls.getField("collapsed").setBoolean(ent, true);
+                                cls.getField("flags").setInt(ent, 1);
+                            } catch (Throwable ignored) {}
+                        }
+                        break;
+                    }
+                    case "url":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityUrl").getConstructor().newInstance();
+                        break;
+                    case "mention":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityMention").getConstructor().newInstance();
+                        break;
+                    case "hashtag":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityHashtag").getConstructor().newInstance();
+                        break;
+                    case "cashtag":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityCashtag").getConstructor().newInstance();
+                        break;
+                    case "bot_command":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityBotCommand").getConstructor().newInstance();
+                        break;
+                    case "email":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityEmail").getConstructor().newInstance();
+                        break;
+                    case "phone_number":
+                        ent = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityPhone").getConstructor().newInstance();
+                        break;
+                    case "text_mention": {
+                        long uid = eo.optLong("user_id", 0L);
+                        if (uid == 0L && eo.has("user")) {
+                            JSONObject uo = eo.optJSONObject("user");
+                            if (uo != null) uid = uo.optLong("id", 0L);
+                        }
+                        if (uid != 0L) {
+                            Class<?> cls = Class.forName("org.telegram.tgnet.TLRPC$TL_messageEntityMentionName");
+                            ent = cls.getConstructor().newInstance();
+                            cls.getField("user_id").setLong(ent, uid);
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                if (ent != null) {
+                    ent.getClass().getField("offset").setInt(ent, offset);
+                    ent.getClass().getField("length").setInt(ent, length);
+                    result.add(ent);
+                }
+            } catch (Throwable ignored) {}
+        }
+        return result;
+    }
+
+    /**
+     * Serializes a list of TLRPC.MessageEntity objects into a Telegram Bot API JSONArray
+     * (used for outgoing Bot API sendMessage/editMessage AND local edit history storage).
+     */
+    public static JSONArray serializeTlEntitiesToBotApiJson(List<?> tlEntities) {
+        if (tlEntities == null || tlEntities.isEmpty()) return null;
+        JSONArray arr = new JSONArray();
+        for (Object ent : tlEntities) {
+            if (ent == null) continue;
+            try {
+                Class<?> cls = ent.getClass();
+                String simple = cls.getSimpleName();
+                int offset = cls.getField("offset").getInt(ent);
+                int length = cls.getField("length").getInt(ent);
+                if (length <= 0 || offset < 0) continue;
+
+                JSONObject o = new JSONObject();
+                o.put("offset", offset);
+                o.put("length", length);
+
+                if (simple.contains("CustomEmoji")) {
+                    long docId = cls.getField("document_id").getLong(ent);
+                    if (docId == 0L) continue;
+                    o.put("type", "custom_emoji");
+                    o.put("custom_emoji_id", String.valueOf(docId));
+                } else if (simple.contains("Bold")) {
+                    o.put("type", "bold");
+                } else if (simple.contains("Italic")) {
+                    o.put("type", "italic");
+                } else if (simple.contains("Underline")) {
+                    o.put("type", "underline");
+                } else if (simple.contains("Strike")) {
+                    o.put("type", "strikethrough");
+                } else if (simple.contains("Spoiler")) {
+                    o.put("type", "spoiler");
+                } else if (simple.contains("Code")) {
+                    o.put("type", "code");
+                } else if (simple.contains("Pre")) {
+                    o.put("type", "pre");
+                    Object lang = cls.getField("language").get(ent);
+                    if (lang instanceof String && !((String) lang).isEmpty()) {
+                        o.put("language", (String) lang);
+                    }
+                } else if (simple.contains("TextUrl")) {
+                    Object url = cls.getField("url").get(ent);
+                    if (!(url instanceof String) || ((String) url).isEmpty()) continue;
+                    o.put("type", "text_link");
+                    o.put("url", (String) url);
+                } else if (simple.contains("Blockquote")) {
+                    boolean collapsed = false;
+                    try { collapsed = cls.getField("collapsed").getBoolean(ent); } catch (Throwable ignored) {}
+                    o.put("type", collapsed ? "expandable_blockquote" : "blockquote");
+                } else if (simple.contains("MentionName")) {
+                    long uid = 0L;
+                    try {
+                        java.lang.reflect.Field uf = cls.getField("user_id");
+                        Object rawUid = uf.get(ent);
+                        if (rawUid instanceof Number) {
+                            uid = ((Number) rawUid).longValue();
+                        } else if (rawUid != null) {
+                            uid = rawUid.getClass().getField("user_id").getLong(rawUid);
+                        }
+                    } catch (Throwable ignored) {}
+                    if (uid == 0L) continue;
+                    o.put("type", "text_mention");
+                    o.put("user_id", uid);
+                    JSONObject u = new JSONObject();
+                    u.put("id", uid);
+                    o.put("user", u);
+                } else if (simple.endsWith("Url")) {
+                    o.put("type", "url");
+                } else if (simple.endsWith("Mention")) {
+                    o.put("type", "mention");
+                } else if (simple.contains("Hashtag")) {
+                    o.put("type", "hashtag");
+                } else if (simple.contains("Cashtag")) {
+                    o.put("type", "cashtag");
+                } else if (simple.contains("BotCommand")) {
+                    o.put("type", "bot_command");
+                } else if (simple.contains("Email")) {
+                    o.put("type", "email");
+                } else if (simple.contains("Phone")) {
+                    o.put("type", "phone_number");
+                } else {
+                    continue;
+                }
+                arr.put(o);
+            } catch (Throwable ignored) {}
+        }
+        return arr.length() > 0 ? arr : null;
+    }
+
+    public static String serializeTlEntitiesToJsonString(List<?> tlEntities) {
+        JSONArray arr = serializeTlEntitiesToBotApiJson(tlEntities);
+        return (arr != null && arr.length() > 0) ? arr.toString() : null;
+    }
+
+    /** Returns a copy of the Bot API entities JSONArray without custom_emoji entries (fallback when bot lacks custom emoji send rights). */
+    public static JSONArray stripCustomEmojiEntitiesJson(JSONArray src) {
+        if (src == null || src.length() == 0) return null;
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < src.length(); i++) {
+            JSONObject o = src.optJSONObject(i);
+            if (o != null && !"custom_emoji".equals(o.optString("type", ""))) {
+                out.put(o);
+            }
+        }
+        return out.length() > 0 ? out : null;
+    }
+
+    private static Object buildSyntheticEmojiDocument(long docId, String mimeType, int size,
+                                                      int width, int height, String altEmoji) {
+        return buildSyntheticEmojiDocument(docId, mimeType, size, width, height, altEmoji, null);
+    }
+
+    private static Object buildSyntheticEmojiDocument(long docId, String mimeType, int size,
+                                                      int width, int height, String altEmoji, String setName) {
+        try {
+            Class<?> docCls = Class.forName("org.telegram.tgnet.TLRPC$TL_document");
+            Class<?> imgAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeImageSize");
+            Class<?> emojiAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeCustomEmoji");
+            Class<?> emptySetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_inputStickerSetEmpty");
+            Class<?> shortSetCls = Class.forName("org.telegram.tgnet.TLRPC$TL_inputStickerSetShortName");
+            Class<?> fnAttrCls = Class.forName("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename");
+            Object doc = docCls.getConstructor().newInstance();
+            docCls.getField("id").setLong(doc, docId);
+            docCls.getField("dc_id").setInt(doc, 1);
+            docCls.getField("access_hash").setLong(doc, 0L);
+            docCls.getField("flags").setInt(doc, 0);
+            // CRITICAL: TL_document.serializeToStream ALWAYS writes file_reference as a byte array.
+            // Leaving file_reference == null causes NativeByteBuffer.writeByteArray(null) to shift
+            // the stream and trigger TLParseException: can't parse magic ffb62b95 in Vector!
+            docCls.getField("file_reference").set(doc, new byte[0]);
+            String safeMime = mimeType != null ? mimeType : "image/webp";
+            docCls.getField("mime_type").set(doc, safeMime);
+            docCls.getField("size").setLong(doc, size);
+            docCls.getField("date").setInt(doc, (int) (System.currentTimeMillis() / 1000L));
+            @SuppressWarnings("unchecked")
+            ArrayList<Object> attrs = (ArrayList<Object>) docCls.getField("attributes").get(doc);
+            if (attrs != null) {
+                Object sz = imgAttrCls.getConstructor().newInstance();
+                imgAttrCls.getField("w").setInt(sz, width > 0 ? width : 512);
+                imgAttrCls.getField("h").setInt(sz, height > 0 ? height : 512);
+                attrs.add(sz);
+
+                Object ea = emojiAttrCls.getConstructor().newInstance();
+                emojiAttrCls.getField("alt").set(ea, (altEmoji != null && !altEmoji.isEmpty()) ? altEmoji : "😀");
+                if (setName != null && !setName.trim().isEmpty()) {
+                    Object sn = shortSetCls.getConstructor().newInstance();
+                    shortSetCls.getField("short_name").set(sn, setName.trim());
+                    emojiAttrCls.getField("stickerset").set(ea, sn);
+                } else {
+                    emojiAttrCls.getField("stickerset").set(ea, emptySetCls.getConstructor().newInstance());
+                }
+                attrs.add(ea);
+
+                Object fn = fnAttrCls.getConstructor().newInstance();
+                String ext = "application/x-tgsticker".equals(safeMime) ? ".tgs"
+                        : ("video/webm".equals(safeMime) ? ".webm" : ".webp");
+                fnAttrCls.getField("file_name").set(fn, "emoji_" + docId + ext);
+                attrs.add(fn);
+            }
+            return doc;
+        } catch (Throwable t) {
+            Log.w(TAG, "buildSyntheticEmojiDocument failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    public interface BotEditCallback {
+        void onResult(boolean ok, String errorDesc, String acceptedEntitiesJson);
+    }
+
+    public interface BotForwardCallback {
+        void onResult(boolean ok, int[] sentMessageIds, int date, String errorDesc);
+    }
+
+    /**
+     * Resolves exact Bot API candidate chat_id(s) for a Telegram dialog_id without misclassifying
+     * modern basic groups (>1e9) or small supergroups/channels (<=1e9).
+     */
+    public static long[] resolveBotApiChatIdsForHint(long dialogId, Boolean isChannelHint) {
+        return ColgramBotChatIdPolicy.resolveChatIds(dialogId, isChannelHint);
+    }
+
+    public static long[] resolveBotApiChatIds(int account, long dialogId) {
+        if (dialogId >= 0L) {
+            return new long[]{dialogId};
+        }
+        Boolean isChannel = null;
+        try {
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+            Object chat = mcClass.getMethod("getChat", Long.class).invoke(mc, -dialogId);
+            if (chat != null) {
+                String name = chat.getClass().getSimpleName();
+                if (name.contains("channel") || name.contains("Channel")) {
+                    isChannel = Boolean.TRUE;
+                } else {
+                    isChannel = Boolean.FALSE;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return resolveBotApiChatIdsForHint(dialogId, isChannel);
+    }
+
+    private static boolean isNotModifiedResponse(JSONObject resp) {
+        if (resp == null) return false;
+        String desc = resp.optString("description", "").toLowerCase(java.util.Locale.US);
+        return desc.contains("message is not modified");
+    }
+
+    private static boolean isChatNotFoundResponse(JSONObject resp) {
+        if (resp == null) return false;
+        String desc = resp.optString("description", "").toLowerCase(java.util.Locale.US);
+        return desc.contains("chat not found") || desc.contains("peer_id_invalid");
+    }
+
+    private static String extractResultEntitiesJson(JSONObject resp, boolean isCaption) {
+        if (resp == null) return null;
+        JSONObject res = resp.optJSONObject("result");
+        if (res == null) return null;
+        JSONArray arr = res.optJSONArray(isCaption ? "caption_entities" : "entities");
+        if (arr == null) arr = res.optJSONArray("entities");
+        if (arr == null) arr = res.optJSONArray("caption_entities");
+        return (arr != null && arr.length() > 0) ? arr.toString() : null;
+    }
+
+    /**
+     * Edits a bot-authored message via Bot API (editMessageText / editMessageCaption),
+     * bypassing MTProto BOT_METHOD_INVALID / MESSAGE_ID_INVALID on bot accounts.
+     */
+    public static void editBotMessage(final int account, final long dialogId, final int messageId,
+                                      final String newText, final boolean isCaption, final Runnable onComplete) {
+        editBotMessage(account, dialogId, messageId, newText, null, isCaption, false,
+                (ok, err, entJson) -> { if (onComplete != null) onComplete.run(); });
+    }
+
+    public static void editBotMessage(final int account, final long dialogId, final int messageId,
+                                      final String newText, final List<?> tlEntities, final boolean isCaption,
+                                      final Runnable onComplete) {
+        editBotMessage(account, dialogId, messageId, newText, tlEntities, isCaption, false,
+                (ok, err, entJson) -> { if (onComplete != null) onComplete.run(); });
+    }
+
+    public static void editBotMessage(final int account, final long dialogId, final int messageId,
+                                      final String newText, final List<?> tlEntities, final boolean isCaption,
+                                      final boolean noWebpage, final BotEditCallback callback) {
+        final JSONArray entitiesJson = serializeTlEntitiesToBotApiJson(tlEntities);
+        executor.execute(() -> {
+            boolean ok = false;
+            String errDesc = "BOT_EDIT_FAILED";
+            String acceptedEntJson = entitiesJson != null ? entitiesJson.toString() : null;
+            try {
+                String token = getBotToken(null, account);
+                if (token == null || token.isEmpty()) {
+                    errDesc = "NO_BOT_TOKEN";
+                } else {
+                    long[] chatIds = resolveBotApiChatIds(account, dialogId);
+                    for (long chatId : chatIds) {
+                        JSONObject payload = new JSONObject();
+                        payload.put("chat_id", chatId);
+                        payload.put("message_id", messageId);
+                        String method;
+                        String entKey;
+                        if (isCaption) {
+                            method = "editMessageCaption";
+                            entKey = "caption_entities";
+                            payload.put("caption", newText != null ? newText : "");
+                        } else {
+                            method = "editMessageText";
+                            entKey = "entities";
+                            payload.put("text", newText != null ? newText : "");
+                            if (noWebpage) {
+                                JSONObject lpo = new JSONObject();
+                                lpo.put("is_disabled", true);
+                                payload.put("link_preview_options", lpo);
+                            }
+                        }
+                        if (entitiesJson != null && entitiesJson.length() > 0) {
+                            payload.put(entKey, entitiesJson);
+                        }
+                        JSONObject resp = botApiPost(token, method, payload);
+                        ok = (resp != null && resp.optBoolean("ok", false)) || isNotModifiedResponse(resp);
+                        if (ok) {
+                            String srvEnt = extractResultEntitiesJson(resp, isCaption);
+                            if (srvEnt != null) acceptedEntJson = srvEnt;
+                            break;
+                        }
+                        if (resp != null) {
+                            errDesc = resp.optString("description", errDesc);
+                            if (isChatNotFoundResponse(resp) && chatIds.length > 1) {
+                                continue;
+                            }
+                        }
+                        if (entitiesJson != null) {
+                            JSONArray stripped = stripCustomEmojiEntitiesJson(entitiesJson);
+                            if (stripped != null && stripped.length() > 0) {
+                                payload.put(entKey, stripped);
+                            } else {
+                                payload.remove(entKey);
+                            }
+                            JSONObject retryResp = botApiPost(token, method, payload);
+                            ok = (retryResp != null && retryResp.optBoolean("ok", false)) || isNotModifiedResponse(retryResp);
+                            if (ok) {
+                                String srvEnt = extractResultEntitiesJson(retryResp, isCaption);
+                                acceptedEntJson = srvEnt != null ? srvEnt : (stripped != null ? stripped.toString() : null);
+                                break;
+                            }
+                            if (retryResp != null) errDesc = retryResp.optString("description", errDesc);
+                        }
+                        if (isCaption) {
+                            JSONObject fallback = new JSONObject();
+                            fallback.put("chat_id", chatId);
+                            fallback.put("message_id", messageId);
+                            fallback.put("text", newText != null ? newText : "");
+                            if (noWebpage) {
+                                JSONObject lpo = new JSONObject();
+                                lpo.put("is_disabled", true);
+                                fallback.put("link_preview_options", lpo);
+                            }
+                            JSONArray fallbackEnt = stripCustomEmojiEntitiesJson(entitiesJson);
+                            if (fallbackEnt != null && fallbackEnt.length() > 0) {
+                                fallback.put("entities", fallbackEnt);
+                            }
+                            JSONObject resp2 = botApiPost(token, "editMessageText", fallback);
+                            ok = (resp2 != null && resp2.optBoolean("ok", false)) || isNotModifiedResponse(resp2);
+                            if (ok) {
+                                String srvEnt = extractResultEntitiesJson(resp2, false);
+                                acceptedEntJson = srvEnt != null ? srvEnt : (fallbackEnt != null ? fallbackEnt.toString() : null);
+                                break;
+                            }
+                            if (resp2 != null) errDesc = resp2.optString("description", errDesc);
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                errDesc = t.getMessage() != null ? t.getMessage() : errDesc;
+                Log.w(TAG, "editBotMessage failed: " + errDesc);
+            }
+            final boolean fOk = ok;
+            final String fErr = fOk ? null : errDesc;
+            final String fEnt = acceptedEntJson;
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(fOk, fErr, fEnt));
+            }
+        });
+    }
+
+    /**
+     * Replaces photo/video/animation/audio/document media on an existing bot message via Bot API editMessageMedia.
+     */
+    public static void editBotMessageMedia(final Context context, final int account, final long dialogId,
+                                           final int messageId, final File mediaFile, final boolean isVideo,
+                                           final String caption, final List<?> tlEntities, final Runnable onComplete) {
+        editBotMessageMedia(context, account, dialogId, messageId, mediaFile, isVideo ? "video" : "photo",
+                caption, tlEntities, (ok, err, entJson) -> { if (onComplete != null) onComplete.run(); });
+    }
+
+    public static void editBotMessageMedia(final Context context, final int account, final long dialogId,
+                                           final int messageId, final File mediaFile, final String mediaType,
+                                           final String caption, final List<?> tlEntities, final BotEditCallback callback) {
+        final JSONArray entitiesJson = serializeTlEntitiesToBotApiJson(tlEntities);
+        final Context app = resolveAppContext(context);
+        final String safeType = (mediaType != null && !mediaType.isEmpty()) ? mediaType : "photo";
+        executor.execute(() -> {
+            boolean ok = false;
+            String errDesc = "BOT_EDIT_MEDIA_FAILED";
+            String acceptedEntJson = entitiesJson != null ? entitiesJson.toString() : null;
+            try {
+                String token = getBotToken(app, account);
+                if (token == null || token.isEmpty()) {
+                    errDesc = "NO_BOT_TOKEN";
+                } else if (mediaFile == null || !mediaFile.isFile() || mediaFile.length() <= 0) {
+                    errDesc = "MEDIA_FILE_MISSING";
+                } else {
+                    long[] chatIds = resolveBotApiChatIds(account, dialogId);
+                    for (long chatId : chatIds) {
+                        JSONObject mediaObj = new JSONObject();
+                        mediaObj.put("type", safeType);
+                        mediaObj.put("media", "attach://file0");
+                        if (caption != null && !caption.isEmpty()) {
+                            mediaObj.put("caption", caption);
+                        }
+                        if (entitiesJson != null && entitiesJson.length() > 0) {
+                            mediaObj.put("caption_entities", entitiesJson);
+                        }
+                        java.util.LinkedHashMap<String, String> fields = new java.util.LinkedHashMap<>();
+                        fields.put("chat_id", String.valueOf(chatId));
+                        fields.put("message_id", String.valueOf(messageId));
+                        fields.put("media", mediaObj.toString());
+                        JSONObject resp = postBotMultipart(token, "editMessageMedia", fields, "file0", mediaFile);
+                        ok = (resp != null && resp.optBoolean("ok", false)) || isNotModifiedResponse(resp);
+                        if (ok) {
+                            String srvEnt = extractResultEntitiesJson(resp, true);
+                            if (srvEnt != null) acceptedEntJson = srvEnt;
+                            break;
+                        }
+                        if (resp != null) {
+                            errDesc = resp.optString("description", errDesc);
+                            if (isChatNotFoundResponse(resp) && chatIds.length > 1) {
+                                continue;
+                            }
+                        }
+                        if (entitiesJson != null) {
+                            JSONArray stripped = stripCustomEmojiEntitiesJson(entitiesJson);
+                            if (stripped != null && stripped.length() > 0) {
+                                mediaObj.put("caption_entities", stripped);
+                            } else {
+                                mediaObj.remove("caption_entities");
+                            }
+                            fields.put("media", mediaObj.toString());
+                            JSONObject retryResp = postBotMultipart(token, "editMessageMedia", fields, "file0", mediaFile);
+                            ok = (retryResp != null && retryResp.optBoolean("ok", false)) || isNotModifiedResponse(retryResp);
+                            if (ok) {
+                                String srvEnt = extractResultEntitiesJson(retryResp, true);
+                                acceptedEntJson = srvEnt != null ? srvEnt : (stripped != null ? stripped.toString() : null);
+                                break;
+                            }
+                            if (retryResp != null) errDesc = retryResp.optString("description", errDesc);
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                errDesc = t.getMessage() != null ? t.getMessage() : errDesc;
+                Log.w(TAG, "editBotMessageMedia failed: " + errDesc);
+            }
+            final boolean fOk = ok;
+            final String fErr = fOk ? null : errDesc;
+            final String fEnt = acceptedEntJson;
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(fOk, fErr, fEnt));
+            }
+        });
+    }
+
+    private static JSONObject postBotMultipart(String token, String method, java.util.Map<String, String> fields,
+                                               String fileField, File file) {
+        String boundary = "----ColgramBoundary" + System.currentTimeMillis();
+        try {
+            URL url = new URL("https://api.telegram.org/bot" + token + "/" + method);
+            List<java.net.Proxy> rungs = transportLadder(url.getHost(), 443);
+            for (java.net.Proxy rung : withBestRungRetry(rungs)) {
+                HttpURLConnection conn = null;
+                try {
+                    conn = openVia(url, rung, 30000, Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 5000));
+                    conn.setRequestMethod("POST");
+                    conn.setDoOutput(true);
+                    conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+                    try (OutputStream os = conn.getOutputStream()) {
+                        for (java.util.Map.Entry<String, String> e : fields.entrySet()) {
+                            String part = "--" + boundary + "\r\n"
+                                    + "Content-Disposition: form-data; name=\"" + e.getKey() + "\"\r\n\r\n"
+                                    + e.getValue() + "\r\n";
+                            os.write(part.getBytes("UTF-8"));
+                        }
+                        String fileHdr = "--" + boundary + "\r\n"
+                                + "Content-Disposition: form-data; name=\"" + fileField + "\"; filename=\"" + file.getName() + "\"\r\n"
+                                + "Content-Type: application/octet-stream\r\n\r\n";
+                        os.write(fileHdr.getBytes("UTF-8"));
+                        try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                            byte[] buf = new byte[16384];
+                            int n;
+                            while ((n = fis.read(buf)) > 0) os.write(buf, 0, n);
+                        }
+                        os.write(("\r\n--" + boundary + "--\r\n").getBytes("UTF-8"));
+                        os.flush();
+                    }
+                    int code = conn.getResponseCode();
+                    InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+                    if (is != null) {
+                        StringBuilder sb = new StringBuilder();
+                        try (BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"))) {
+                            String line;
+                            while ((line = br.readLine()) != null) sb.append(line);
+                        }
+                        if (code >= 200 && code < 300) ColgramEndpoints.noteSuccess(url.getHost(), 443);
+                        return new JSONObject(sb.toString());
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "postBotMultipart error: " + t.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Sets or clears a standard or custom-emoji reaction on a message via Bot API setMessageReaction.
+     */
+    public static void sendBotReaction(final int account, final long dialogId, final int messageId,
+                                       final String emoji, final boolean isBig, final Runnable onComplete) {
+        sendBotReaction(account, dialogId, messageId, emoji, 0L, isBig, onComplete);
+    }
+
+    public static void sendBotReaction(final int account, final long dialogId, final int messageId,
+                                       final String emoji, final long customEmojiDocId, final boolean isBig,
+                                       final Runnable onComplete) {
+        executor.execute(() -> {
+            try {
+                String token = getBotToken(null, account);
+                if (token != null && !token.isEmpty()) {
+                    long[] chatIds = resolveBotApiChatIds(account, dialogId);
+                    for (long chatId : chatIds) {
+                        JSONObject payload = new JSONObject();
+                        payload.put("chat_id", chatId);
+                        payload.put("message_id", messageId);
+                        JSONArray reactionArr = new JSONArray();
+                        if (customEmojiDocId != 0L) {
+                            JSONObject r = new JSONObject();
+                            r.put("type", "custom_emoji");
+                            r.put("custom_emoji_id", String.valueOf(customEmojiDocId));
+                            reactionArr.put(r);
+                        } else if (emoji != null && !emoji.trim().isEmpty()) {
+                            JSONObject r = new JSONObject();
+                            r.put("type", "emoji");
+                            r.put("emoji", emoji.trim());
+                            reactionArr.put(r);
+                        }
+                        payload.put("reaction", reactionArr);
+                        if (isBig) {
+                            payload.put("is_big", true);
+                        }
+                        JSONObject resp = botApiPost(token, "setMessageReaction", payload);
+                        if (resp != null && resp.optBoolean("ok", false)) {
+                            break;
+                        }
+                        if (!isChatNotFoundResponse(resp)) {
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "sendBotReaction failed: " + t.getMessage());
+            }
+            if (onComplete != null) {
+                mainHandler.post(onComplete);
+            }
+        });
+    }
+
+    /** Deletes one or more messages via Bot API deleteMessages / deleteMessage fallback. */
+    public static void deleteBotMessages(final Context context, final int account, final long dialogId,
+                                         final List<Integer> msgIds) {
+        if (msgIds == null || msgIds.isEmpty() || dialogId == 0) return;
+        final Context app = resolveAppContext(context);
+        final ArrayList<Integer> copy = new ArrayList<>(msgIds);
+        executor.execute(() -> {
+            try {
+                String token = getBotToken(app, account);
+                if (token == null || token.isEmpty()) return;
+                long[] chatIds = resolveBotApiChatIds(account, dialogId);
+                for (long chatId : chatIds) {
+                    if (copy.size() == 1) {
+                        JSONObject p = new JSONObject();
+                        p.put("chat_id", chatId);
+                        p.put("message_id", copy.get(0));
+                        JSONObject resp = botApiPost(token, "deleteMessage", p);
+                        if (resp != null && resp.optBoolean("ok", false)) return;
+                        if (!isChatNotFoundResponse(resp)) return;
+                    } else {
+                        JSONObject p = new JSONObject();
+                        p.put("chat_id", chatId);
+                        JSONArray ids = new JSONArray();
+                        for (Integer id : copy) if (id != null && id > 0) ids.put(id);
+                        p.put("message_ids", ids);
+                        JSONObject resp = botApiPost(token, "deleteMessages", p);
+                        if (resp != null && resp.optBoolean("ok", false)) return;
+                        if (!isChatNotFoundResponse(resp)) {
+                            for (Integer id : copy) {
+                                if (id == null || id <= 0) continue;
+                                JSONObject single = new JSONObject();
+                                single.put("chat_id", chatId);
+                                single.put("message_id", id);
+                                botApiPost(token, "deleteMessage", single);
+                            }
+                            return;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "deleteBotMessages failed: " + t.getMessage());
+            }
+        });
+    }
+
+    /** Pins or unpins a single message via Bot API pinChatMessage / unpinChatMessage. */
+    public static void pinBotMessage(final Context context, final int account, final long dialogId,
+                                     final int messageId, final boolean unpin, final boolean notify,
+                                     final Runnable onSuccess) {
+        final Context app = resolveAppContext(context);
+        executor.execute(() -> {
+            boolean ok = false;
+            try {
+                String token = getBotToken(app, account);
+                if (token != null && !token.isEmpty()) {
+                    long[] chatIds = resolveBotApiChatIds(account, dialogId);
+                    for (long chatId : chatIds) {
+                        JSONObject p = new JSONObject();
+                        p.put("chat_id", chatId);
+                        p.put("message_id", messageId);
+                        if (!unpin) {
+                            p.put("disable_notification", !notify);
+                        }
+                        JSONObject resp = botApiPost(token, unpin ? "unpinChatMessage" : "pinChatMessage", p);
+                        if (resp != null && resp.optBoolean("ok", false)) {
+                            ok = true;
+                            break;
+                        }
+                        if (!isChatNotFoundResponse(resp)) break;
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "pinBotMessage failed: " + t.getMessage());
+            }
+            if (ok && onSuccess != null) {
+                mainHandler.post(onSuccess);
+            }
+        });
+    }
+
+    /** Unpins all messages in a chat via Bot API unpinAllChatMessages. */
+    public static void unpinAllBotMessages(final Context context, final int account, final long dialogId,
+                                           final Runnable onSuccess) {
+        final Context app = resolveAppContext(context);
+        executor.execute(() -> {
+            boolean ok = false;
+            try {
+                String token = getBotToken(app, account);
+                if (token != null && !token.isEmpty()) {
+                    long[] chatIds = resolveBotApiChatIds(account, dialogId);
+                    for (long chatId : chatIds) {
+                        JSONObject p = new JSONObject();
+                        p.put("chat_id", chatId);
+                        JSONObject resp = botApiPost(token, "unpinAllChatMessages", p);
+                        if (resp != null && resp.optBoolean("ok", false)) {
+                            ok = true;
+                            break;
+                        }
+                        if (!isChatNotFoundResponse(resp)) break;
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "unpinAllBotMessages failed: " + t.getMessage());
+            }
+            if (ok && onSuccess != null) {
+                mainHandler.post(onSuccess);
+            }
+        });
+    }
+
+    /** Forwards or copies messages via Bot API forwardMessage / copyMessage when MTProto rejects bot peers. */
+    public static void forwardBotMessages(final Context context, final int account, final long fromDialogId,
+                                          final long toDialogId, final List<Integer> msgIds, final boolean dropAuthor,
+                                          final BotForwardCallback callback) {
+        final Context app = resolveAppContext(context);
+        final ArrayList<Integer> idsCopy = msgIds != null ? new ArrayList<>(msgIds) : new ArrayList<>();
+        executor.execute(() -> {
+            int[] sent = new int[idsCopy.size()];
+            int sentDate = (int) (System.currentTimeMillis() / 1000L);
+            boolean anyOk = false;
+            String lastErr = "BOT_FORWARD_FAILED";
+            try {
+                String token = getBotToken(app, account);
+                if (token != null && !token.isEmpty() && !idsCopy.isEmpty()) {
+                    long[] fromIds = resolveBotApiChatIds(account, fromDialogId);
+                    long[] toIds = resolveBotApiChatIds(account, toDialogId);
+                    String method = dropAuthor ? "copyMessage" : "forwardMessage";
+                    for (int idx = 0; idx < idsCopy.size(); idx++) {
+                        int mid = idsCopy.get(idx);
+                        boolean itemOk = false;
+                        outer:
+                        for (long toCid : toIds) {
+                            for (long fromCid : fromIds) {
+                                JSONObject p = new JSONObject();
+                                p.put("chat_id", toCid);
+                                p.put("from_chat_id", fromCid);
+                                p.put("message_id", mid);
+                                JSONObject resp = botApiPost(token, method, p);
+                                if (resp != null && resp.optBoolean("ok", false)) {
+                                    JSONObject res = resp.optJSONObject("result");
+                                    int newMid = res != null ? res.optInt("message_id", 0) : 0;
+                                    if (res != null && res.has("date")) sentDate = res.optInt("date", sentDate);
+                                    sent[idx] = newMid;
+                                    if (newMid > 0) {
+                                        dispatchedLiveMsgKeys.add(account + ":" + toDialogId + ":" + newMid);
+                                    }
+                                    itemOk = true;
+                                    anyOk = true;
+                                    break outer;
+                                }
+                                if (resp != null) {
+                                    lastErr = resp.optString("description", lastErr);
+                                    if (!isChatNotFoundResponse(resp)) break outer;
+                                }
+                            }
+                        }
+                        if (!itemOk) break;
+                    }
+                }
+            } catch (Throwable t) {
+                lastErr = t.getMessage() != null ? t.getMessage() : lastErr;
+            }
+            final boolean fOk = anyOk;
+            final int fDate = sentDate;
+            final String fErr = fOk ? null : lastErr;
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(fOk, sent, fDate, fErr));
+            }
+        });
+    }
+
+    /** Sends photo/video/animation/audio/voice/document media via Bot API when MTProto rejects bot peers. */
+    public static void sendMediaViaBotApi(
+            final Context context,
+            final int account,
+            final long dialogId,
+            final File mediaFile,
+            final String mediaType,
+            final String caption,
+            final List<?> tlEntities,
+            final int replyToMessageId,
+            final BotSendCallback callback
+    ) {
+        final Context app = resolveAppContext(context);
+        final String token = getBotToken(app, account);
+        final JSONArray entitiesJson = serializeTlEntitiesToBotApiJson(tlEntities);
+        if (token == null || token.isEmpty() || mediaFile == null || !mediaFile.isFile() || dialogId == 0) {
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, 0, 0, "BOT_MEDIA_INVALID"));
+            }
+            return;
+        }
+        final String mt = mediaType != null ? mediaType.toLowerCase(java.util.Locale.US) : "document";
+        final String method;
+        final String fileField;
+        switch (mt) {
+            case "photo": method = "sendPhoto"; fileField = "photo"; break;
+            case "video": method = "sendVideo"; fileField = "video"; break;
+            case "animation": method = "sendAnimation"; fileField = "animation"; break;
+            case "audio": method = "sendAudio"; fileField = "audio"; break;
+            case "voice": method = "sendVoice"; fileField = "voice"; break;
+            default: method = "sendDocument"; fileField = "document"; break;
+        }
+        executor.execute(() -> {
+            long[] chatIds = resolveBotApiChatIds(account, dialogId);
+            String lastErr = "BOT_API_SEND_MEDIA_FAILED";
+            for (long chatId : chatIds) {
+                try {
+                    java.util.LinkedHashMap<String, String> fields = new java.util.LinkedHashMap<>();
+                    fields.put("chat_id", String.valueOf(chatId));
+                    if (caption != null && !caption.isEmpty()) fields.put("caption", caption);
+                    if (entitiesJson != null && entitiesJson.length() > 0) {
+                        fields.put("caption_entities", entitiesJson.toString());
+                    }
+                    if (replyToMessageId > 0) {
+                        fields.put("reply_to_message_id", String.valueOf(replyToMessageId));
+                    }
+                    JSONObject resp = postBotMultipart(token, method, fields, fileField, mediaFile);
+                    if ((resp == null || !resp.optBoolean("ok", false)) && entitiesJson != null) {
+                        JSONArray stripped = stripCustomEmojiEntitiesJson(entitiesJson);
+                        if (stripped != null && stripped.length() > 0) {
+                            fields.put("caption_entities", stripped.toString());
+                        } else {
+                            fields.remove("caption_entities");
+                        }
+                        resp = postBotMultipart(token, method, fields, fileField, mediaFile);
+                    }
+                    if (resp != null && resp.optBoolean("ok", false)) {
+                        JSONObject res = resp.optJSONObject("result");
+                        int msgId = res != null ? res.optInt("message_id", 0) : 0;
+                        int date = res != null ? res.optInt("date", (int) (System.currentTimeMillis() / 1000L))
+                                : (int) (System.currentTimeMillis() / 1000L);
+                        if (msgId > 0) {
+                            dispatchedLiveMsgKeys.add(account + ":" + dialogId + ":" + msgId);
+                            final int fId = msgId;
+                            final int fDate = date;
+                            if (callback != null) {
+                                mainHandler.post(() -> callback.onResult(true, fId, fDate, null));
+                            }
+                            return;
+                        }
+                    } else if (resp != null) {
+                        lastErr = resp.optString("description", lastErr);
+                        if (!isChatNotFoundResponse(resp)) break;
+                    }
+                } catch (Throwable t) {
+                    lastErr = t.getMessage() != null ? t.getMessage() : lastErr;
+                }
+            }
+            final String finalErr = lastErr;
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, 0, 0, finalErr));
+            }
+        });
+    }
+
+    private static long botApiChatIdFromDialogId(long dialogId) {
+        return resolveBotApiChatIdsForHint(dialogId, null)[0];
+    }
+
+    private static boolean downloadBotFileById(String token, String fileId, File destFile) {
+        if (token == null || token.isEmpty() || fileId == null || fileId.isEmpty() || destFile == null) {
+            return false;
+        }
+        try {
+            JSONObject req = new JSONObject();
+            req.put("file_id", fileId);
+            JSONObject resp = botApiPost(token, "getFile", req);
+            if (resp == null || !resp.optBoolean("ok", false)) {
+                return false;
+            }
+            JSONObject res = resp.optJSONObject("result");
+            String filePath = res != null ? res.optString("file_path", "") : "";
+            if (filePath.isEmpty()) return false;
+
+            String urlStr = "https://api.telegram.org/file/bot" + token + "/" + filePath;
+            URL url = new URL(urlStr);
+            List<java.net.Proxy> rungs = transportLadder(url.getHost(), 443);
+            File parent = destFile.getParentFile();
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs();
+            }
+            File tmp = new File(destFile.getAbsolutePath() + ".tmp");
+            for (java.net.Proxy rung : withBestRungRetry(rungs)) {
+                HttpURLConnection conn = null;
+                try {
+                    conn = openVia(url, rung, 15000, Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000));
+                    int code = conn.getResponseCode();
+                    if (code >= 200 && code < 300) {
+                        try (InputStream is = conn.getInputStream();
+                             FileOutputStream fos = new FileOutputStream(tmp)) {
+                            byte[] buf = new byte[8192];
+                            int read;
+                            int total = 0;
+                            while ((read = is.read(buf)) != -1) {
+                                fos.write(buf, 0, read);
+                                total += read;
+                            }
+                            fos.flush();
+                            if (total > 32) {
+                                if (destFile.exists()) destFile.delete();
+                                if (tmp.renameTo(destFile)) {
+                                    ColgramEndpoints.noteSuccess(url.getHost(), 443);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    if (tmp.exists()) tmp.delete();
+                } finally {
+                    if (conn != null) {
+                        try { conn.disconnect(); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "downloadBotFileById error: " + t.getMessage());
+        }
+        return false;
+    }
+
+    public interface BotSendCallback {
+        void onResult(boolean ok, int messageId, int date, String error);
+    }
+
+    /**
+     * Called when a ChatActivity opens on a bot account so background polling / MTProto catch-up
+     * runs immediately and any newly sent incoming messages appear without manual refresh.
+     */
+    public static void onBotChatOpened(final Context context, final int account) {
+        if (context == null) return;
+        final Context app = resolveAppContext(context);
+        if (app == null) return;
+        if (!isMtprotoBotAccount(account) && getBotToken(app, account).isEmpty()) {
+            return;
+        }
+        syncBotDialogs(app, account, false);
+    }
+
+    /**
+     * Fallback delivery over Telegram Bot API sendMessage when MTProto lacks a peer's access_hash
+     * (e.g. users/groups first discovered through Bot API getUpdates).
+     */
+    public static void sendTextMessageViaBotApi(
+            final Context context,
+            final int account,
+            final long dialogId,
+            final String text,
+            final int replyToMessageId,
+            final BotSendCallback callback
+    ) {
+        sendTextMessageViaBotApi(context, account, dialogId, text, null, replyToMessageId, callback);
+    }
+
+    public static void sendTextMessageViaBotApi(
+            final Context context,
+            final int account,
+            final long dialogId,
+            final String text,
+            final List<?> tlEntities,
+            final int replyToMessageId,
+            final BotSendCallback callback
+    ) {
+        final Context app = resolveAppContext(context);
+        final String token = getBotToken(app, account);
+        final JSONArray entitiesJson = serializeTlEntitiesToBotApiJson(tlEntities);
+        if (token.isEmpty() || text == null || text.isEmpty() || dialogId == 0) {
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, 0, 0, "NO_BOT_TOKEN"));
+            }
+            return;
+        }
+        executor.execute(() -> {
+            long[] candidateChatIds = resolveBotApiChatIds(account, dialogId);
+            String lastErr = "BOT_API_SEND_FAILED";
+            for (long chatId : candidateChatIds) {
+                try {
+                    JSONObject payload = new JSONObject();
+                    payload.put("chat_id", chatId);
+                    payload.put("text", text);
+                    if (entitiesJson != null && entitiesJson.length() > 0) {
+                        payload.put("entities", entitiesJson);
+                    }
+                    if (replyToMessageId > 0) {
+                        payload.put("reply_to_message_id", replyToMessageId);
+                    }
+                    JSONObject resp = botApiPost(token, "sendMessage", payload);
+                    if ((resp == null || !resp.optBoolean("ok", false)) && entitiesJson != null) {
+                        JSONArray stripped = stripCustomEmojiEntitiesJson(entitiesJson);
+                        if (stripped != null && stripped.length() > 0) {
+                            payload.put("entities", stripped);
+                        } else {
+                            payload.remove("entities");
+                        }
+                        resp = botApiPost(token, "sendMessage", payload);
+                    }
+                    if (resp != null && resp.optBoolean("ok", false)) {
+                        JSONObject res = resp.optJSONObject("result");
+                        int msgId = res != null ? res.optInt("message_id", 0) : 0;
+                        int date = res != null ? res.optInt("date", (int) (System.currentTimeMillis() / 1000L))
+                                : (int) (System.currentTimeMillis() / 1000L);
+                        if (msgId > 0) {
+                            dispatchedLiveMsgKeys.add(account + ":" + dialogId + ":" + msgId);
+                            final int fId = msgId;
+                            final int fDate = date;
+                            if (callback != null) {
+                                mainHandler.post(() -> callback.onResult(true, fId, fDate, null));
+                            }
+                            return;
+                        }
+                    } else if (resp != null) {
+                        lastErr = resp.optString("description", lastErr);
+                    }
+                } catch (Throwable t) {
+                    lastErr = t.getMessage() != null ? t.getMessage() : lastErr;
+                }
+            }
+            final String finalErr = lastErr;
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, 0, 0, finalErr));
+            }
+        });
     }
 
     private static void openChatAsBot(Activity activity, int account, Object fragmentObj, String query) {
@@ -3071,11 +5880,59 @@ public class ColgramBotSync {
                     presentFragment.invoke(activity, chatFrag);
                 }
             } else {
-                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
-
-                Method openByUserName = mcClass.getMethod("openByUserName", String.class, baseFragmentClass, int.class);
-                openByUserName.invoke(mc, query, targetFragment, 1);
+                final String uname = query;
+                final Object fTarget = targetFragment;
+                executor.execute(() -> {
+                    long resolvedChatId = 0L;
+                    boolean isChannel = false;
+                    try {
+                        String token = getBotToken(activity, account);
+                        if (token != null && !token.isEmpty()) {
+                            JSONObject p = new JSONObject();
+                            p.put("chat_id", "@" + uname);
+                            JSONObject resp = botApiPost(token, "getChat", p);
+                            if (resp != null && resp.optBoolean("ok", false)) {
+                                JSONObject res = resp.optJSONObject("result");
+                                if (res != null) {
+                                    long cid = res.optLong("id", 0L);
+                                    if (cid != 0L) {
+                                        if (isSupergroupOrChannel(cid)) {
+                                            resolvedChatId = channelIdFromBotApi(cid);
+                                            isChannel = true;
+                                        } else {
+                                            resolvedChatId = cid;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    final long fId = resolvedChatId;
+                    final boolean fChan = isChannel;
+                    mainHandler.post(() -> {
+                        try {
+                            if (fId != 0L) {
+                                Bundle args = new Bundle();
+                                if (fChan || fId < 0) args.putLong("chat_id", Math.abs(fId));
+                                else args.putLong("user_id", fId);
+                                Constructor<?> ctor = chatActivityClass.getConstructor(Bundle.class);
+                                Object chatFrag = ctor.newInstance(args);
+                                if (fTarget != null) {
+                                    baseFragmentClass.getMethod("presentFragment", baseFragmentClass).invoke(fTarget, chatFrag);
+                                } else if (launchActivityClass.isInstance(activity)) {
+                                    launchActivityClass.getMethod("presentFragment", baseFragmentClass).invoke(activity, chatFrag);
+                                }
+                                return;
+                            }
+                            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+                            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+                            Method openByUserName = mcClass.getMethod("openByUserName", String.class, baseFragmentClass, int.class);
+                            openByUserName.invoke(mc, uname, fTarget, 1);
+                        } catch (Throwable err) {
+                            Log.e(TAG, "openChatAsBot fallback error", err);
+                        }
+                    });
+                });
             }
         } catch (Throwable t) {
             Log.e(TAG, "openChatAsBot error", t);

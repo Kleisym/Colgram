@@ -27,6 +27,12 @@ scripts/*.log
 # `scripts/*.log` above does not reach these, which is why ~100 of them had accumulated untracked.
 /build*.log
 /build*.txt
+/compile.log
+/device-tests-run.log
+/screen*.png
+/ui_dump*.xml
+build-tmp/
+*.original.md
 # javac scratch + daemon dumps produced while diagnosing build stalls.
 javac.*.args
 daemon-stack*.txt

@@ -79,18 +79,53 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
         byte[] buffer = new byte[16 * 1024];
         int count, shaped = 0;
         while ((count = in.read(buffer)) != -1) {
-            // Shape only the beginning and an actual TLS ClientHello after SOCKS negotiation.
-            // No injected bytes, TLS rewriting, truncation, address/port changes or extra server.
-            boolean hello = count > 5 && buffer[0] == 22 && buffer[1] == 3 && buffer[5] == 1;
+            // Shape SOCKS5 CONNECT requests (10-byte IPv4 / 22-byte IPv6 / domain) into 2-byte
+            // TCP segments (with TCP_NODELAY) so carrier TSPU DPI (e.g. MegaFon/Yota LTE) cannot
+            // match 05 01 00 01 <149.154.*|91.108.*> in a single segment!
+            boolean socksConnect = count >= 8 && count <= 262
+                    && buffer[0] == 5 && buffer[1] == 1 && buffer[2] == 0
+                    && (buffer[3] == 1 || buffer[3] == 3 || buffer[3] == 4);
+            if (shape && socksConnect && shaped < 4) {
+                for (int off = 0; off < count; ) {
+                    int step = Math.min(off < 12 ? 2 : 4, count - off);
+                    out.write(buffer, off, step);
+                    out.flush();
+                    off += step;
+                    if (off < count) sleepQuiet(16);
+                }
+                shaped++;
+                continue;
+            }
+            // Shape only the beginning and an actual TLS/FakeTLS ClientHello after SOCKS negotiation.
+            // 100% byte-preserving: no injected bytes, no TLS rewriting, no HMAC breakage — slices
+            // directly at byte 1 + SNI midpoint so TSPU cannot extract the full FakeTLS/TLS SNI.
+            boolean hello = count > 11 && buffer[0] == 22 && buffer[1] == 3 && buffer[5] == 1;
             if (shape && count > 16 && (shaped == 0 || (hello && shaped < 4))) {
-                int cut = Math.min(32, count / 2);
+                int[] sni = hello ? ColgramTlsMimic.findTlsSniSpan(buffer, count) : null;
+                if (sni != null) {
+                    int sniMid = sni[0] + Math.max(1, (sni[1] - sni[0]) / 2);
+                    if (sniMid > 1 && sniMid < count) {
+                        out.write(buffer, 0, 1); out.flush();
+                        sleepQuiet(1);
+                        out.write(buffer, 1, sniMid - 1); out.flush();
+                        sleepQuiet(2);
+                        out.write(buffer, sniMid, count - sniMid); out.flush();
+                        shaped++;
+                        continue;
+                    }
+                }
+                int cut = hello ? 1 : Math.min(32, count / 2);
                 out.write(buffer, 0, cut); out.flush();
-                try { Thread.sleep(2); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException(e); }
+                sleepQuiet(2);
                 out.write(buffer, cut, count - cut); shaped++;
             } else out.write(buffer, 0, count);
             out.flush();
         }
+    }
+
+    private static void sleepQuiet(long ms) throws IOException {
+        try { Thread.sleep(ms); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException(e); }
     }
 
     private static void closeSocket(Socket socket) {

@@ -295,23 +295,25 @@ public final class ColgramEndpoints {
 
         long at = System.currentTimeMillis();
         if (chosen == null) {
-            // Nothing answered this round. If an address worked here before, keep dialing it for a
-            // short window rather than falling back to the resolver's answer, which is the address
-            // the network is known to drop.
+            // Nothing answered this round. Back off cleanly instead of re-probing every 30s.
             String pinned = ColgramConfig.getPinnedEndpoint(host);
             if (pinned != null && !pinned.isEmpty()) {
-                try {
-                    InetAddress optimistic = InetAddress.getByName(pinned);
-                    if (optimistic instanceof Inet4Address) {
-                        Log.w(TAG, "no answer for " + host + ":" + port
-                                + "; retrying last known " + optimistic.getHostAddress());
-                        return new Choice(optimistic, at, true, OPTIMISTIC_TTL_MS);
+                Long parkedAt = parked.get(pinned);
+                boolean isParked = parkedAt != null && at - parkedAt < PARK_MS;
+                if (!isParked) {
+                    try {
+                        InetAddress optimistic = InetAddress.getByName(pinned);
+                        if (optimistic instanceof Inet4Address) {
+                            Log.w(TAG, "no answer for " + host + ":" + port
+                                    + "; retrying last known " + optimistic.getHostAddress());
+                            return new Choice(optimistic, at, true, Math.max(OPTIMISTIC_TTL_MS, 120_000L));
+                        }
+                    } catch (Throwable ignore) {
                     }
-                } catch (Throwable ignore) {
                 }
             }
             Log.w(TAG, "no live address for " + host + ":" + port);
-            return new Choice(null, at, false, NEGATIVE_TTL_MS);
+            return new Choice(null, at, false, Math.max(NEGATIVE_TTL_MS, 120_000L));
         }
         Log.i(TAG, "using " + host + " -> " + chosen.getHostAddress() + ":" + port);
         ColgramConfig.setPinnedEndpoint(host, chosen.getHostAddress());
@@ -330,7 +332,21 @@ public final class ColgramEndpoints {
         }
     }
 
-    /** Connect to every candidate in parallel; return the first that completes, or null. */
+    private static final java.util.concurrent.ExecutorService PROBE_POOL =
+            java.util.concurrent.Executors.newFixedThreadPool(8, r -> {
+                Thread t = new Thread(r, "colgram-endpoint-probe");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private static final java.util.concurrent.ExecutorService CONN_POOL =
+            java.util.concurrent.Executors.newFixedThreadPool(12, r -> {
+                Thread t = new Thread(r, "colgram-endpoint-conn");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** Connect to every candidate in parallel; return the first that completes, or null immediately once all fail. */
     private static InetAddress probeAll(List<InetAddress> candidates, int port) {
         long now = System.currentTimeMillis();
         candidates.removeIf(a -> {
@@ -339,28 +355,30 @@ public final class ColgramEndpoints {
         });
         if (candidates.isEmpty()) return null;
         final AtomicReference<InetAddress> winner = new AtomicReference<>();
-        // Signalled by the first address that answers. Waiting for every thread instead - which is
-        // what this did - made a cold request pay the whole probe window even when the pinned
-        // address replied in 120 ms: measured as "getMe: ок (20047 мс)" after every restart, and
-        // the message poller runs through here too, so a reboot cost twenty seconds of silence.
         final CountDownLatch answered = new CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicInteger remaining =
+                new java.util.concurrent.atomic.AtomicInteger(candidates.size());
         for (final InetAddress candidate : candidates) {
-            Thread t = new Thread(() -> {
-                if (winner.get() != null) return;
-                Socket s = new Socket();
+            PROBE_POOL.execute(() -> {
                 try {
-                    s.connect(new InetSocketAddress(candidate, port), PROBE_TIMEOUT_MS);
-                    if (winner.compareAndSet(null, candidate)) answered.countDown();
-                } catch (Throwable ignored) {
+                    if (winner.get() != null) return;
+                    Socket s = new Socket();
+                    try {
+                        s.connect(new InetSocketAddress(candidate, port), PROBE_TIMEOUT_MS);
+                        if (winner.compareAndSet(null, candidate)) answered.countDown();
+                    } catch (Throwable ignored) {
+                    } finally {
+                        try { s.close(); } catch (Throwable ignored) {}
+                    }
                 } finally {
-                    try { s.close(); } catch (Throwable ignored) {}
+                    if (remaining.decrementAndGet() == 0) {
+                        answered.countDown();
+                    }
                 }
-            }, "colgram-endpoint-probe");
-            t.setDaemon(true);
-            t.start();
+            });
         }
         try {
-            answered.await(PROBE_TIMEOUT_MS * 2L + 2000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            answered.await(PROBE_TIMEOUT_MS + 1200L, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -413,9 +431,7 @@ public final class ColgramEndpoints {
                 Log.w(TAG, "accept: " + t.getClass().getSimpleName());
                 continue;
             }
-            Thread t = new Thread(() -> serve(client), "colgram-endpoint-conn");
-            t.setDaemon(true);
-            t.start();
+            CONN_POOL.execute(() -> serve(client));
         }
     }
 
@@ -465,9 +481,9 @@ public final class ColgramEndpoints {
 
             Socket upstream = new Socket();
             try {
-                upstream.connect(new InetSocketAddress(address, port), PROBE_TIMEOUT_MS * 4);
+                upstream.connect(new InetSocketAddress(address, port), Math.min(3500, PROBE_TIMEOUT_MS * 2));
             } catch (Throwable t) {
-                invalidate(host);
+                parked.put(address.getHostAddress(), System.currentTimeMillis());
                 cout.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes("US-ASCII"));
                 cout.flush();
                 close(client);

@@ -5,33 +5,54 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
+import android.widget.Toast;
 import androidx.core.content.FileProvider;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * ColgramUpdater — In-app OTA updater.
- * Checks GitHub Releases for new APK builds, downloads them in the background,
- * and launches the system package installer.
+ * ColgramUpdater — In-app OTA & upstream Telegram update checker.
+ * Checks GitHub Releases via ColgramHttp (with proxy/relay support), verifies semantic versions,
+ * ABI-matching APKs, and optional SHA-256 digests, downloads via active Colgram transport or
+ * DownloadManager, and safely launches PackageInstaller.
  */
 public class ColgramUpdater {
 
+    private static final String UPSTREAM_REPO = "DrKLO/Telegram";
     private static final ExecutorService executor = Executors.newSingleThreadExecutor();
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static final Map<String, String> EXPECTED_SHA256_BY_URL = new ConcurrentHashMap<>();
+    private static volatile PendingUpdate pendingUpdate;
+
+    public static final class PendingUpdate {
+        public final String version;
+        public final String releaseNotes;
+        public final String downloadUrl;
+        public final String expectedSha256;
+
+        public PendingUpdate(String version, String releaseNotes, String downloadUrl, String expectedSha256) {
+            this.version = version;
+            this.releaseNotes = releaseNotes == null ? "" : releaseNotes;
+            this.downloadUrl = downloadUrl;
+            this.expectedSha256 = expectedSha256;
+        }
+    }
 
     public interface UpdateCheckCallback {
         void onUpdateAvailable(String newVersion, String releaseNotes, String downloadUrl);
@@ -39,126 +60,370 @@ public class ColgramUpdater {
         void onError(String error);
     }
 
-    /**
-     * Checks if a new release exists on GitHub.
-     */
+    public interface UpstreamCheckCallback {
+        void onResult(String latestUpstreamTag, boolean newerThanBase, String error);
+    }
+
+    public static PendingUpdate getPendingUpdate() {
+        return pendingUpdate;
+    }
+
+    public static PendingUpdate consumePendingUpdate() {
+        PendingUpdate current = pendingUpdate;
+        pendingUpdate = null;
+        return current;
+    }
+
+    /** Checks updates only when auto-update is enabled in ColgramConfig. */
+    public static void checkForUpdatesIfEnabled(final String currentVersion, final UpdateCheckCallback callback) {
+        if (!ColgramConfig.isAutoUpdateEnabled()) {
+            if (callback != null) {
+                mainHandler.post(callback::onUpToDate);
+            }
+            return;
+        }
+        checkForUpdates(currentVersion, callback);
+    }
+
+    /** Checks if a new Colgram release exists on GitHub. */
     public static void checkForUpdates(final String currentVersion, final UpdateCheckCallback callback) {
+        if (callback == null) return;
         executor.execute(() -> {
-            HttpURLConnection conn = null;
             try {
                 String repo = ColgramConfig.getUpdateRepo();
-                URL url = new URL("https://api.github.com/repos/" + repo + "/releases/latest");
-                conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("GET");
-                conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
-                conn.setConnectTimeout(5000);
-                conn.setReadTimeout(5000);
+                ColgramHttp.Response resp = ColgramHttp.get(
+                        "https://api.github.com/repos/" + repo + "/releases/latest");
 
-                // GitHub's REST API rejects requests without a User-Agent with 403.
-                //
-                // The AOSP default IS "Dalvik/<ver>", but only when the value is unset; the
-                // platform also strips it in some configurations, and a 403 here is
-                // indistinguishable from a deleted repo or a rate limit in the UI. Setting
-                // it explicitly costs nothing and removes the whole failure mode.
-                conn.setRequestProperty("User-Agent", "Colgram-Updater");
-
-                if (conn.getResponseCode() == 200) {
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        sb.append(line);
-                    }
-                    reader.close();
-
-                    JSONObject release = new JSONObject(sb.toString());
-                    String tagName = release.optString("tag_name", "");
-                    String body = release.optString("body", "");
-
-                    // Find .apk asset
-                    String apkDownloadUrl = null;
-                    if (release.has("assets")) {
-                        JSONArray assets = release.getJSONArray("assets");
-                        for (int i = 0; i < assets.length(); i++) {
-                            JSONObject asset = assets.getJSONObject(i);
-                            String name = asset.optString("name", "");
-                            if (name.endsWith(".apk")) {
-                                apkDownloadUrl = asset.optString("browser_download_url", null);
+                JSONObject release = null;
+                if (resp.code == 200) {
+                    release = new JSONObject(resp.body);
+                } else if (resp.code == 404 || resp.code == 403) {
+                    // Repository may publish only pre-releases (CI tags) with no "latest" pointer.
+                    ColgramHttp.Response listResp = ColgramHttp.get(
+                            "https://api.github.com/repos/" + repo + "/releases?per_page=10");
+                    if (listResp.code == 200) {
+                        JSONArray arr = new JSONArray(listResp.body);
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject cand = arr.optJSONObject(i);
+                            if (cand == null) continue;
+                            JSONArray assets = cand.optJSONArray("assets");
+                            if (assets != null && assets.length() > 0) {
+                                release = cand;
                                 break;
                             }
                         }
-                    }
-
-                    final String finalApkUrl = apkDownloadUrl;
-                    if (apkDownloadUrl != null && !tagName.equals(currentVersion)) {
-                        mainHandler.post(() -> callback.onUpdateAvailable(tagName, body, finalApkUrl));
                     } else {
-                        mainHandler.post(callback::onUpToDate);
+                        final int listCode = listResp.code;
+                        mainHandler.post(() -> callback.onError("Server returned code " + listCode));
+                        return;
                     }
                 } else {
-                    // Report the real status. This used to hardcode 0, so every upstream
-                    // failure - 403 rate limit, 404, 500 - surfaced as "Server returned code
-                    // 0", which is unactionable and sent debugging in the wrong direction.
-                    final int code = conn.getResponseCode();
+                    final int code = resp.code;
                     mainHandler.post(() -> callback.onError("Server returned code " + code));
+                    return;
+                }
+
+                if (release == null) {
+                    mainHandler.post(callback::onUpToDate);
+                    return;
+                }
+
+                String tagName = release.optString("tag_name", "");
+                String body = release.optString("body", "");
+
+                List<ColgramUpdatePolicy.ApkAsset> apkAssets = new ArrayList<>();
+                String shaAssetUrl = null;
+                if (release.has("assets")) {
+                    JSONArray assets = release.getJSONArray("assets");
+                    java.util.HashMap<String, String> shaByName = new java.util.HashMap<>();
+                    for (int i = 0; i < assets.length(); i++) {
+                        JSONObject asset = assets.optJSONObject(i);
+                        if (asset == null) continue;
+                        String name = asset.optString("name", "");
+                        String dl = asset.optString("browser_download_url", "");
+                        if (name.endsWith(".apk") && !dl.isEmpty()) {
+                            apkAssets.add(new ColgramUpdatePolicy.ApkAsset(name, dl));
+                        } else if (name.endsWith(".sha256") && !dl.isEmpty()) {
+                            shaByName.put(name, dl);
+                            if (shaAssetUrl == null) shaAssetUrl = dl;
+                        }
+                    }
+                    ColgramUpdatePolicy.ApkAsset preBest = ColgramUpdatePolicy.pickBestApkAsset(
+                            apkAssets, Build.SUPPORTED_ABIS);
+                    if (preBest != null && shaByName.containsKey(preBest.name + ".sha256")) {
+                        shaAssetUrl = shaByName.get(preBest.name + ".sha256");
+                    }
+                }
+
+                ColgramUpdatePolicy.ApkAsset bestApk = ColgramUpdatePolicy.pickBestApkAsset(
+                        apkAssets, Build.SUPPORTED_ABIS);
+                String apkDownloadUrl = bestApk != null ? bestApk.downloadUrl : null;
+
+                if (apkDownloadUrl != null && isNewerTag(tagName, currentVersion)) {
+                    String expectedSha = null;
+                    if (shaAssetUrl != null) {
+                        try {
+                            ColgramHttp.Response shaResp = ColgramHttp.get(shaAssetUrl);
+                            if (shaResp.code >= 200 && shaResp.code < 300) {
+                                expectedSha = ColgramUpdatePolicy.extractSha256FromText(
+                                        shaResp.body, bestApk != null ? bestApk.name : null);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    if (expectedSha == null) {
+                        expectedSha = ColgramUpdatePolicy.extractSha256FromText(
+                                body, bestApk != null ? bestApk.name : null);
+                    }
+                    if (expectedSha != null) {
+                        EXPECTED_SHA256_BY_URL.put(apkDownloadUrl, expectedSha);
+                    }
+                    pendingUpdate = new PendingUpdate(tagName, body, apkDownloadUrl, expectedSha);
+                    final String finalApkUrl = apkDownloadUrl;
+                    mainHandler.post(() -> callback.onUpdateAvailable(tagName, body, finalApkUrl));
+                } else {
+                    mainHandler.post(callback::onUpToDate);
                 }
             } catch (Exception e) {
-                mainHandler.post(() -> callback.onError(e.getMessage()));
+                mainHandler.post(() -> callback.onError(e.getMessage() != null ? e.getMessage() : e.toString()));
+            }
+        });
+    }
+
+    /** Queries upstream DrKLO/Telegram tags to see if a newer Telegram base release has landed. */
+    public static void checkUpstreamTelegramUpdate(final String currentVersion, final UpstreamCheckCallback callback) {
+        if (callback == null) return;
+        executor.execute(() -> {
+            try {
+                ColgramHttp.Response resp = ColgramHttp.get(
+                        "https://api.github.com/repos/" + UPSTREAM_REPO + "/tags?per_page=15");
+                if (resp.code >= 200 && resp.code < 300 && resp.body != null) {
+                    JSONArray arr = new JSONArray(resp.body);
+                    String bestTag = null;
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject item = arr.optJSONObject(i);
+                        if (item == null) continue;
+                        String tag = item.optString("name", "").trim();
+                        if (ColgramUpdatePolicy.parseSemver(tag).length >= 2) {
+                            if (bestTag == null || ColgramUpdatePolicy.compareSemver(tag, bestTag) > 0) {
+                                bestTag = tag;
+                            }
+                        }
+                    }
+                    boolean newer = bestTag != null && ColgramUpdatePolicy.isUpstreamTelegramNewer(currentVersion, bestTag);
+                    final String found = bestTag;
+                    mainHandler.post(() -> callback.onResult(found, newer, null));
+                } else {
+                    final int code = resp.code;
+                    mainHandler.post(() -> callback.onResult(null, false, "HTTP " + code));
+                }
+            } catch (Exception e) {
+                final String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                mainHandler.post(() -> callback.onResult(null, false, msg));
+            }
+        });
+    }
+
+    public static int[] parseSemver(String version) {
+        return ColgramUpdatePolicy.parseSemver(version);
+    }
+
+    public static int compareSemver(String a, String b) {
+        return ColgramUpdatePolicy.compareSemver(a, b);
+    }
+
+    public static boolean isNewerTag(String remoteTag, String currentVersion) {
+        return ColgramUpdatePolicy.isNewerTag(remoteTag, currentVersion);
+    }
+
+    public static String extractSha256FromText(String text) {
+        return ColgramUpdatePolicy.extractSha256FromText(text);
+    }
+
+    public static String sha256Hex(byte[] data) {
+        return ColgramUpdatePolicy.sha256Hex(data);
+    }
+
+    public static String sha256Hex(File file) {
+        return ColgramUpdatePolicy.sha256Hex(file);
+    }
+
+    /** Downloads the APK file, optionally verifies SHA-256 checksum if known, and launches installer. */
+    public static void downloadAndInstall(final Context context, final String apkUrl, final String versionName) {
+        String cachedSha = apkUrl != null ? EXPECTED_SHA256_BY_URL.get(apkUrl) : null;
+        downloadAndInstall(context, apkUrl, versionName, cachedSha);
+    }
+
+    /**
+     * Downloads the APK file, verifies expectedSha256 (when provided), and launches installer.
+     * Routes directly through ColgramHttp when DPI bypass, proxy, or relay is active so censored
+     * networks do not fail inside Android's system DownloadManager.
+     */
+    public static void downloadAndInstall(final Context context, final String apkUrl,
+                                          final String versionName, final String expectedSha256) {
+        if (context == null || apkUrl == null) return;
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+
+        File dlDir = appCtx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dlDir != null) {
+            File oldFile = new File(dlDir, "Colgram-Update.apk");
+            if (oldFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                oldFile.delete();
+            }
+        }
+
+        boolean preferColgramTransport = ColgramDpiBypass.isBound()
+                || ColgramProxyManager.hasActiveRouteForUi()
+                || !ColgramConfig.getRelayUrl().isEmpty();
+        final DownloadManager manager = preferColgramTransport
+                ? null : (DownloadManager) appCtx.getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) {
+            mainHandler.post(() -> Toast.makeText(
+                    appCtx, "Загрузка Colgram " + versionName + " через защищённый канал...", Toast.LENGTH_SHORT).show());
+            downloadViaColgramHttpFallback(appCtx, apkUrl, expectedSha256);
+            return;
+        }
+
+        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(apkUrl));
+        request.setTitle("Colgram Update " + versionName);
+        request.setDescription("Downloading latest build...");
+        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+        request.setDestinationInExternalFilesDir(appCtx, Environment.DIRECTORY_DOWNLOADS, "Colgram-Update.apk");
+
+        final long downloadId = manager.enqueue(request);
+        final IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        final BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+                if (id != downloadId) return;
+                try {
+                    ctx.unregisterReceiver(this);
+                } catch (Exception ignored) {}
+
+                boolean success = false;
+                try (Cursor cursor = manager.query(new DownloadManager.Query().setFilterById(downloadId))) {
+                    if (cursor != null && cursor.moveToFirst()) {
+                        int statusCol = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS);
+                        success = statusCol >= 0 && cursor.getInt(statusCol) == DownloadManager.STATUS_SUCCESSFUL;
+                    }
+                } catch (Exception ignored) {
+                    success = true;
+                }
+
+                final File file = new File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Colgram-Update.apk");
+                if (!success || !file.exists()) {
+                    downloadViaColgramHttpFallback(ctx, apkUrl, expectedSha256);
+                    return;
+                }
+
+                executor.execute(() -> {
+                    if (expectedSha256 != null && !expectedSha256.isEmpty()) {
+                        String actual = sha256Hex(file);
+                        if (actual == null || !actual.equalsIgnoreCase(expectedSha256)) {
+                            //noinspection ResultOfMethodCallIgnored
+                            file.delete();
+                            mainHandler.post(() -> Toast.makeText(
+                                    ctx, "Ошибка SHA-256: файл обновления повреждён", Toast.LENGTH_LONG).show());
+                            return;
+                        }
+                    }
+                    mainHandler.post(() -> installApk(ctx, file));
+                });
+            }
+        };
+
+        if (activeDownloadReceiver != null) {
+            try { appCtx.unregisterReceiver(activeDownloadReceiver); } catch (Exception ignored) {}
+            activeDownloadReceiver = null;
+        }
+        activeDownloadReceiver = receiver;
+        if (Build.VERSION.SDK_INT >= 33) {
+            appCtx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            appCtx.registerReceiver(receiver, filter);
+        }
+    }
+
+    private static BroadcastReceiver activeDownloadReceiver = null;
+
+    private static void downloadViaColgramHttpFallback(final Context ctx, final String apkUrl, final String expectedSha256) {
+        executor.execute(() -> {
+            File dlDir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            if (dlDir == null) dlDir = new File(ctx.getFilesDir(), "cache");
+            if (!dlDir.exists()) dlDir.mkdirs();
+            final File file = new File(dlDir, "Colgram-Update.apk");
+            java.net.HttpURLConnection conn = null;
+            try {
+                String currentUrl = apkUrl;
+                int finalCode = -1;
+                for (int r = 0; r < 6; r++) {
+                    conn = ColgramHttp.openBinaryStream(currentUrl, 15000, 60000);
+                    int code = conn.getResponseCode();
+                    if (code >= 300 && code < 400) {
+                        String loc = conn.getHeaderField("Location");
+                        conn.disconnect();
+                        conn = null;
+                        if (loc == null || loc.isEmpty()) throw new java.io.IOException("Redirect empty");
+                        currentUrl = new java.net.URL(new java.net.URL(currentUrl), loc).toString();
+                        continue;
+                    }
+                    finalCode = code;
+                    break;
+                }
+                if (conn == null) throw new java.io.IOException("Too many redirects");
+                if (finalCode < 200 || finalCode >= 300) throw new java.io.IOException("HTTP " + finalCode);
+                try (java.io.InputStream in = conn.getInputStream();
+                     java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+                    byte[] buf = new byte[16384];
+                    int n;
+                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                    out.flush();
+                }
+                if (expectedSha256 != null && !expectedSha256.isEmpty()) {
+                    String actual = sha256Hex(file);
+                    if (actual == null || !actual.equalsIgnoreCase(expectedSha256)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        file.delete();
+                        mainHandler.post(() -> Toast.makeText(ctx, "Ошибка SHA-256: файл обновления повреждён", Toast.LENGTH_LONG).show());
+                        return;
+                    }
+                }
+                mainHandler.post(() -> installApk(ctx, file));
+            } catch (Throwable t) {
+                mainHandler.post(() -> Toast.makeText(ctx, "Загрузка обновления не завершилась: " + t.getMessage(), Toast.LENGTH_LONG).show());
             } finally {
                 if (conn != null) conn.disconnect();
             }
         });
     }
 
-    /**
-     * Downloads the APK file and prompts Android PackageInstaller to install it.
-     */
-    public static void downloadAndInstall(final Context context, final String apkUrl, final String versionName) {
-        if (context == null || apkUrl == null) return;
-
-        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(apkUrl));
-        request.setTitle("Colgram Update v" + versionName);
-        request.setDescription("Downloading latest build...");
-        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-        request.setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, "Colgram-Update.apk");
-
-        final DownloadManager manager = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
-        if (manager == null) return;
-
-        final long downloadId = manager.enqueue(request);
-
-        // Register receiver for install when download finishes
-        context.registerReceiver(new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context ctx, Intent intent) {
-                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
-                if (id == downloadId) {
-                    File file = new File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Colgram-Update.apk");
-                    if (file.exists()) {
-                        installApk(ctx, file);
-                    }
-                    try {
-                        ctx.unregisterReceiver(this);
-                    } catch (Exception ignored) {}
-                }
-            }
-        }, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), Context.RECEIVER_EXPORTED);
-    }
-
     private static void installApk(Context context, File apkFile) {
-        Intent intent = new Intent(Intent.ACTION_VIEW);
-        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            Uri contentUri = FileProvider.getUriForFile(
-                context,
-                context.getPackageName() + ".provider",
-                apkFile
-            );
-            intent.setDataAndType(contentUri, "application/vnd.android.package-archive");
-        } else {
-            intent.setDataAndType(Uri.fromFile(apkFile), "application/vnd.android.package-archive");
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && !context.getPackageManager().canRequestPackageInstalls()) {
+                Toast.makeText(context, "Разрешите установку обновлений Colgram из неизвестных источников", Toast.LENGTH_LONG).show();
+                Intent perm = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + context.getPackageName()));
+                perm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(perm);
+                return;
+            }
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Uri contentUri = FileProvider.getUriForFile(
+                        context,
+                        context.getPackageName() + ".provider",
+                        apkFile
+                );
+                intent.setDataAndType(contentUri, "application/vnd.android.package-archive");
+            } else {
+                intent.setDataAndType(Uri.fromFile(apkFile), "application/vnd.android.package-archive");
+            }
+            context.startActivity(intent);
+        } catch (Throwable t) {
+            Toast.makeText(context, "Не удалось запустить установщик: " + t.getMessage(), Toast.LENGTH_LONG).show();
         }
-        context.startActivity(intent);
     }
 }

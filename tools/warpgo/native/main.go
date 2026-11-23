@@ -1783,15 +1783,17 @@ type h2raw struct {
 }
 
 func dialH2Raw(ctx context.Context, addr string, cert tls.Certificate) (*h2raw, error) {
+	dialCtx, cancelDial := context.WithTimeout(ctx, 4*time.Second)
+	defer cancelDial()
 	d := net.Dialer{Control: protectSocket}
-	raw, err := d.DialContext(ctx, "tcp", addr)
+	raw, err := d.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	stop := context.AfterFunc(dialCtx, func() { _ = raw.Close() })
 	defer stop()
-	tc := tls.Client(raw, masqueTLSConfig(cert, "h2"))
-	if err := tc.HandshakeContext(ctx); err != nil {
+	tc := tls.Client(&helloRecordConn{Conn: raw, host: edgeSNI}, masqueTLSConfig(cert, "h2"))
+	if err := tc.HandshakeContext(dialCtx); err != nil {
 		raw.Close()
 		return nil, err
 	}
@@ -1884,7 +1886,7 @@ func (c *h2raw) awaitSettings(ctx context.Context) (bool, error) {
 				case 0x8:
 					allowed = val == 1
 				case 0x3:
-					c.inflow = int32(val)
+					androidLog(fmt.Sprintf("colgram_masque: edge SETTINGS MAX_CONCURRENT_STREAMS %d", val))
 				case 0x4:
 					// The edge's INITIAL_WINDOW_SIZE, which is the ceiling on what it will accept in DATA on
 					// the tunnel stream before it sends a WINDOW_UPDATE. This client tracks no outbound
@@ -2169,6 +2171,20 @@ func (c *h2raw) answerPing(payload []byte) {
 	c.conn.Write(frameH2(0x6, 0x1, 0, payload))
 }
 
+func (c *h2raw) sendPing(opaque [8]byte) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_, err := c.conn.Write(frameH2(0x6, 0, 0, opaque[:]))
+	return err
+}
+
+func (c *h2raw) ackSettings() error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_, err := c.conn.Write(frameH2(0x4, 0x1, 0, nil))
+	return err
+}
+
 func head(b []byte, n int) []byte {
 	if len(b) < n {
 		n = len(b)
@@ -2356,18 +2372,37 @@ func (cs *h2CapsuleStream) SendDatagram(data []byte) error {
 }
 
 func (cs *h2CapsuleStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	awaitingPing := false
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
-		cs.h2.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		wait := 18 * time.Second
+		if awaitingPing {
+			wait = 10 * time.Second
+		}
+		cs.h2.conn.SetReadDeadline(time.Now().Add(wait))
 		typ, flags, stream, payload, err := cs.h2.readFrame()
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() && !awaitingPing && ctx.Err() == nil {
+				var opaque [8]byte
+				copy(opaque[:], "cgmping!")
+				if pingErr := cs.h2.sendPing(opaque); pingErr == nil {
+					awaitingPing = true
+					continue
+				}
+			}
 			return nil, err
 		}
+		awaitingPing = false
 		switch typ {
+		case 0x4: // SETTINGS
+			if flags&0x1 == 0 {
+				_ = cs.h2.ackSettings()
+			}
+			continue
 		case 0x0: // DATA
 			if stream != cs.h2.sid {
 				continue
@@ -3981,6 +4016,7 @@ func dialQuic(ctx context.Context, udpConn *net.UDPConn, addr string, cert tls.C
 		EnableDatagrams:         true,
 		InitialPacketSize:       1200,
 		DisablePathMTUDiscovery: true,
+		KeepAlivePeriod:         15 * time.Second,
 		MaxIdleTimeout:          60 * time.Second,
 	})
 }
@@ -4646,6 +4682,8 @@ var (
 type longSession struct {
 	progress sessionProgressRecord
 	tun      *tunnel
+	cert     tls.Certificate
+	udpConn  *net.UDPConn
 	addr     string
 	bind     string
 	packets  *ipPacketQueue
@@ -4715,6 +4753,117 @@ func colgram_masque_close_owned(owner C.longlong) {
 	sessionOwners.closeIfCurrent(int64(owner), colgram_masque_close_session)
 }
 
+func h2FallbackAddrs(primary string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(a string) {
+		if a != "" && !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	add(primary)
+	host, _, err := net.SplitHostPort(primary)
+	if err == nil {
+		ip := net.ParseIP(host)
+		if ip != nil && ip.IsLoopback() {
+			return out
+		}
+	}
+	add(net.JoinHostPort(edgeH2IP, edgeH2Port))
+	add("162.159.198.1:443")
+	add("162.159.193.10:443")
+	add("162.159.197.4:443")
+	return out
+}
+
+func dialLongCarrier(ctx, carrierCtx context.Context, srcIP net.IP, cert tls.Certificate, addr, bind string, stage func(string, string)) (*tunnel, *net.UDPConn, string, error) {
+	local := &net.UDPAddr{}
+	if bind != "" {
+		local.IP = net.ParseIP(bind).To4()
+	}
+	tryQuic := func(targetAddr string, timeout time.Duration) (*quic.Conn, *net.UDPConn, error) {
+		uc, uerr := listenProtectedUDP("udp4", local)
+		if uerr != nil {
+			return nil, nil, uerr
+		}
+		qCtx, cancelQ := context.WithTimeout(carrierCtx, timeout)
+		qc, err := dialQuic(qCtx, uc, targetAddr, cert)
+		cancelQ()
+		if err != nil {
+			uc.Close()
+			return nil, nil, err
+		}
+		return qc, uc, nil
+	}
+	if stage != nil {
+		stage("dialing", "to "+addr)
+	}
+	tryH2 := func(cause string) (*tunnel, error) {
+		if stage != nil {
+			stage("dialing-h2", "trying TCP+TLS+H2")
+		}
+		var h2err error
+		for _, h2Addr := range h2FallbackAddrs(addr) {
+			if carrierCtx.Err() != nil {
+				h2err = carrierCtx.Err()
+				break
+			}
+			cs, err := openH2Session(carrierCtx, cert, h2Addr)
+			if err == nil {
+				androidLog(fmt.Sprintf("colgram_masque: %s -> connected over H2 via %s", cause, h2Addr))
+				return &tunnel{srcIP: srcIP, stream: cs}, nil
+			}
+			androidLog(fmt.Sprintf("colgram_masque: H2 dial %s failed (%s): %v", h2Addr, cause, err))
+			h2err = err
+		}
+		if carrierCtx.Err() != nil {
+			h2err = carrierCtx.Err()
+		}
+		return nil, h2err
+	}
+
+	qconn, udpConn, qerr := tryQuic(addr, 4*time.Second)
+	if qerr != nil && ctx.Err() == nil && carrierCtx.Err() == nil {
+		if host, port, err := net.SplitHostPort(addr); err == nil && host == edgeIP && port == "443" {
+			qconn, udpConn, qerr = tryQuic(net.JoinHostPort(host, "4500"), 2500*time.Millisecond)
+		}
+	}
+	if qerr != nil {
+		if ctx.Err() != nil {
+			return nil, nil, "edge", ctx.Err()
+		}
+		h2Tun, h2err := tryH2("quic failed")
+		if h2Tun != nil {
+			return h2Tun, nil, "", nil
+		}
+		return nil, nil, "edge", h2err
+	}
+	tun := &tunnel{conn: qconn, srcIP: srcIP}
+	h3c := (&http3.Transport{EnableDatagrams: true, AdditionalSettings: map[uint64]uint64{0x8: 1}}).NewClientConn(qconn)
+	tun.h3 = h3c
+	stream, err := openConnect(carrierCtx, h3c)
+	if err != nil {
+		tun.close()
+		udpConn.Close()
+		androidLog(fmt.Sprintf("colgram_masque: h3 connect failed (%v); trying H2", err))
+		if ctx.Err() != nil {
+			return nil, nil, "connect", ctx.Err()
+		}
+		if h2Tun, h2err := tryH2("h3 connect failed"); h2Tun != nil {
+			return h2Tun, nil, "", nil
+		} else if h2err != nil {
+			return nil, nil, "connect", fmt.Errorf("h3: %v; h2: %w", err, h2err)
+		}
+		if carrierCtx.Err() != nil {
+			err = carrierCtx.Err()
+		}
+		return nil, nil, "connect", err
+	}
+	tun.stream = &h3Stream{s: stream}
+	return tun, udpConn, "", nil
+}
+
 func openSessionForOwner(bind, edge *C.char, owner int64) {
 	sessionStartMu.Lock()
 	defer sessionStartMu.Unlock()
@@ -4769,61 +4918,36 @@ func openSessionForOwner(bind, edge *C.char, owner int64) {
 			addr = net.JoinHostPort(e, "443")
 		}
 	}
-	local := &net.UDPAddr{}
-	if b := C.GoString(bind); b != "" {
-		local.IP = net.ParseIP(b).To4()
-	}
-	udpConn, err := listenProtectedUDP("udp4", local)
+	bindStr := C.GoString(bind)
+	tun, udpConn, failWhere, err := dialLongCarrier(ctx, carrierCtx, srcIP, cert, addr, bindStr, stage)
 	if err != nil {
-		fail("edge", err)
+		if ctx.Err() == nil {
+			fail(failWhere, err)
+		}
 		return
-	}
-	stage("dialing", "to "+addr)
-	var tun *tunnel
-	quicCtx, cancelQUIC := context.WithTimeout(carrierCtx, 5*time.Second)
-	qconn, qerr := dialQuic(quicCtx, udpConn, addr, cert)
-	cancelQUIC()
-	if qerr != nil {
-		udpConn.Close()
-		if ctx.Err() != nil {
-			return
-		}
-		stage("dialing-h2", "trying TCP+TLS+H2")
-		h2addr := addr // Respect an explicit relay/edge override for both carriers.
-		cs, h2err := openH2Session(carrierCtx, cert, h2addr)
-		if h2err != nil {
-			if carrierCtx.Err() != nil {
-				h2err = carrierCtx.Err()
-			}
-			fail("edge", h2err)
-			return
-		}
-		tun = &tunnel{srcIP: srcIP, stream: cs}
-	} else {
-		tun = &tunnel{conn: qconn, srcIP: srcIP}
-		h3c := (&http3.Transport{EnableDatagrams: true, AdditionalSettings: map[uint64]uint64{0x8: 1}}).NewClientConn(qconn)
-		tun.h3 = h3c
-		stream, err := openConnect(carrierCtx, h3c)
-		if err != nil {
-			tun.close()
-			udpConn.Close()
-			if carrierCtx.Err() != nil {
-				err = carrierCtx.Err()
-			}
-			fail("connect", err)
-			return
-		}
-		tun.stream = &h3Stream{s: stream}
 	}
 	sessionMu.Lock()
 	if sessionEpoch != epoch || ctx.Err() != nil || (owner != 0 && !sessionOwners.isCurrent(owner)) {
 		sessionMu.Unlock()
 		tun.close()
-		udpConn.Close()
+		if udpConn != nil {
+			udpConn.Close()
+		}
 		return
 	}
-	s := &longSession{tun: tun, addr: addr, bind: C.GoString(bind), packets: newIPPacketQueue(256), ctx: ctx,
-		cancel: func() { cancel(); udpConn.Close() }}
+	var s *longSession
+	s = &longSession{tun: tun, cert: cert, udpConn: udpConn, addr: addr, bind: bindStr,
+		packets: newIPPacketQueue(256), ctx: ctx,
+		cancel: func() {
+			cancel()
+			tun.sendMu.Lock()
+			u := s.udpConn
+			s.udpConn = nil
+			tun.sendMu.Unlock()
+			if u != nil {
+				u.Close()
+			}
+		}}
 	s.progress.set("open", "carrying complete IP packets to "+addr)
 	session = s
 	sessionMu.Unlock()
@@ -4832,14 +4956,66 @@ func openSessionForOwner(bind, edge *C.char, owner int64) {
 	stage("open", "carrying complete IP packets to "+addr)
 }
 
+func (s *longSession) reconnectCarrier(ctx context.Context) error {
+	backoffs := []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond, 3 * time.Second, 5 * time.Second}
+	var lastErr error
+	for _, wait := range backoffs {
+		if err := waitForContext(ctx, wait); err != nil {
+			return err
+		}
+		carrierCtx, cancelCarrier := context.WithTimeout(ctx, carrierBudget)
+		nextTun, nextUdp, _, err := dialLongCarrier(ctx, carrierCtx, s.tun.srcIP, s.cert, s.addr, s.bind, nil)
+		cancelCarrier()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		s.tun.sendMu.Lock()
+		oldStream := s.tun.stream
+		oldConn := s.tun.conn
+		oldUdp := s.udpConn
+		s.tun.stream = nextTun.stream
+		s.tun.conn = nextTun.conn
+		s.tun.h3 = nextTun.h3
+		s.udpConn = nextUdp
+		s.tun.sendMu.Unlock()
+		if oldConn != nil {
+			_ = oldConn.CloseWithError(0, "reconnecting")
+		}
+		if cs, ok := oldStream.(*h2CapsuleStream); ok && cs.h2 != nil && cs.h2.conn != nil {
+			_ = cs.h2.conn.Close()
+		}
+		if oldUdp != nil {
+			_ = oldUdp.Close()
+		}
+		androidLog(fmt.Sprintf("colgram_masque: carrier reconnected to %s", s.addr))
+		return nil
+	}
+	return lastErr
+}
+
 func (s *longSession) pump(ctx context.Context) {
 	for {
-		data, err := s.tun.stream.ReceiveDatagram(ctx)
-		if err != nil {
-			if ctx.Err() == nil {
-				s.progress.set("failed", err.Error())
-			}
+		s.tun.sendMu.Lock()
+		stream := s.tun.stream
+		s.tun.sendMu.Unlock()
+		if stream == nil {
 			return
+		}
+		data, err := stream.ReceiveDatagram(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			androidLog(fmt.Sprintf("colgram_masque: carrier receive ended (%v); attempting recovery", err))
+			if recErr := s.reconnectCarrier(ctx); recErr != nil {
+				if ctx.Err() == nil {
+					s.progress.set("failed", err.Error())
+				}
+				return
+			}
+			s.progress.set("open", "carrying complete IP packets to "+s.addr)
+			continue
 		}
 		if !validIPv4(data) {
 			continue

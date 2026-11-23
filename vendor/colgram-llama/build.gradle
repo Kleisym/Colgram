@@ -1,0 +1,32 @@
+apply plugin: 'com.android.library'
+
+dependencies {
+    implementation 'androidx.annotation:annotation:1.8.1'
+    api files('libs/sherpa-onnx-classes.jar')
+}
+
+android {
+    namespace 'org.colgram.llama'
+    compileSdkVersion 36
+
+    defaultConfig {
+        minSdkVersion 24
+        targetSdkVersion 35
+
+        ndk {
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java']
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}

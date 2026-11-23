@@ -22,21 +22,33 @@ public class ColgramDnsResolver {
     private static final String GOOGLE_DOH = "https://dns.google/resolve?name=";
 
     /**
-     * Resolves a hostname to a list of IP addresses via DoH.
+     * Resolves a hostname to a list of IP addresses via SNI-pinned DoH ({@link ColgramDohResolver}),
+     * preventing plaintext DNS or unpinned system fallback leaks.
      */
     public static List<InetAddress> resolve(String hostname) {
         List<InetAddress> addresses = new ArrayList<>();
         if (!ColgramConfig.isDohEnabled() || hostname == null) {
             return addresses;
         }
-
-        // Try Cloudflare DoH first
-        addresses = queryDoh(CLOUDFLARE_DOH + hostname + "&type=A");
-        if (addresses.isEmpty()) {
-            // Fallback to Google DoH
-            addresses = queryDoh(GOOGLE_DOH + hostname + "&type=A");
+        InetAddress[] resolved = ColgramDohResolver.resolve(hostname);
+        if (resolved != null) {
+            for (InetAddress addr : resolved) {
+                if (addr != null && addr.getAddress() != null && addr.getAddress().length == 4) {
+                    addresses.add(addr);
+                }
+            }
+            if (addresses.isEmpty()) {
+                for (InetAddress addr : resolved) {
+                    if (addr != null) addresses.add(addr);
+                }
+            }
         }
-
+        if (addresses.isEmpty() && !ColgramConfig.isStrictProxySecurityEnabled()) {
+            addresses = queryDoh(CLOUDFLARE_DOH + hostname + "&type=A");
+            if (addresses.isEmpty()) {
+                addresses = queryDoh(GOOGLE_DOH + hostname + "&type=A");
+            }
+        }
         return addresses;
     }
 

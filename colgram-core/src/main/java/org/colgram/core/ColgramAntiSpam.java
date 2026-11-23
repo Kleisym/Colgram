@@ -211,7 +211,10 @@ public final class ColgramAntiSpam {
                 pyStr(password) + ", " + pyStr(dir) + ")\n" +
                 "print(_a.get_status())\n";
         try {
-            String out = ColgramPythonEngine.executeCode(script);
+            String out = ColgramPythonEngine.executePluginCode(script);
+            if (out == null) {
+                return "CPython еще не готов, повторите через пару секунд";
+            }
             setEnabled(context, account, true);
             Log.i(TAG, "anti-spam start requested: " + out);
             return null;
@@ -224,8 +227,12 @@ public final class ColgramAntiSpam {
     /** Stop the userbot. Returns null on success, or a failure string. */
     public static String stop(Context context, int account) {
         try {
-            String out = ColgramPythonEngine.executeCode(
+            String out = ColgramPythonEngine.executePluginCode(
                     "import colgram_antispam as _a\nprint(_a.stop())\n");
+            if (out == null) {
+                out = ColgramPythonEngine.executeCode(
+                        "import colgram_antispam as _a\nprint(_a.stop())\n");
+            }
             setEnabled(context, account, false);
             Log.i(TAG, "anti-spam stop requested: " + out);
             return null;

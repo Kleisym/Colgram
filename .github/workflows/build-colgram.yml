@@ -56,12 +56,14 @@ jobs:
           fi
           cd Telegram-Src
           git submodule update --init --depth 1 TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
-          # Record which base actually got built. On a specific tag this is the tag;
-          # on 'latest' fall back to the commit we landed on so the release is still
-          # traceable to an exact upstream revision.
-          UPSTREAM_TAG=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          # Record the real upstream Telegram base version (from gradle.properties APP_VERSION_NAME)
+          # instead of a short git commit SHA so ColgramUpdater semver comparison works even on cron/latest builds.
+          RAW_VER=$(grep '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2 | tr -d '\r' | sed 's/-colgram.*//')
+          TAG_VER=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          UPSTREAM_TAG="${RAW_VER:-$TAG_VER}"
           echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
-          echo "Base Telegram Tag: $UPSTREAM_TAG"
+          echo "UPSTREAM_REF=$TAG_VER" >> $GITHUB_ENV
+          echo "Base Telegram Version: $UPSTREAM_TAG (ref: $TAG_VER)"
 
           # Keep the requested tag separately from the resolved one, so the release
           # notes can show both what was asked for and what was actually checked out.
@@ -86,6 +88,10 @@ jobs:
           cd Telegram-Src
           chmod +x gradlew
           ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --build-cache --parallel -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled"
+
+      - name: Verify Core Compilation & Host Security/Update JVM Tests
+        run: |
+          python3 scripts/host_verify.py --jvm-tests --android-sdk "$ANDROID_HOME"
 
       - name: Audit the built APK for trackers
         # The source audit above cannot catch what it does not look at. Firebase reached every
@@ -149,7 +155,7 @@ jobs:
           if printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > /tmp/ks.probe 2>/dev/null; then
             SIZE=$(stat -c%s /tmp/ks.probe)
             MAGIC=$(head -c 2 /tmp/ks.probe | od -An -tx1 | tr -d ' \n')
-            echo "::notice title=signing decode::OK, $SIZE bytes, first bytes ${MAG}"
+            echo "::notice title=signing decode::OK, $SIZE bytes, first bytes ${MAGIC}"
             if keytool -list -keystore /tmp/ks.probe -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
               echo "::notice title=signing open::opens with the stored password, default type"
             elif keytool -list -keystore /tmp/ks.probe -storetype PKCS12 -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
@@ -218,7 +224,7 @@ jobs:
           # the file disagree apksigner reports it as a keystore problem and nothing else, so the
           # two bytes here say which of the two it was.
           MAGIC=$(head -c 2 colgram.keystore | od -An -tx1 | tr -d ' \n')
-          echo "::notice title=keystore format::first bytes ${MAG}, size $(stat -c%s colgram.keystore)"
+          echo "::notice title=keystore format::first bytes ${MAGIC}, size $(stat -c%s colgram.keystore)"
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
           echo "Using apksigner at: $APKSIGNER"
           
@@ -262,29 +268,43 @@ jobs:
             exit 1
           fi
 
+      - name: Generate APK Checksum
+        id: apk_sha
+        run: |
+          sha256sum colgram-signed-release.apk > colgram-signed-release.apk.sha256
+          SHA=$(cut -d' ' -f1 colgram-signed-release.apk.sha256)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "::notice title=apk sha256::$SHA"
+
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Colgram-Release-APK
-          path: colgram-signed-release.apk
+          path: |
+            colgram-signed-release.apk
+            colgram-signed-release.apk.sha256
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         uses: softprops/action-gh-release@v1
         with:
-          files: colgram-signed-release.apk
+          files: |
+            colgram-signed-release.apk
+            colgram-signed-release.apk.sha256
           tag_name: colgram-${{ env.UPSTREAM_TAG }}-${{ github.run_number }}
           name: Colgram v${{ env.UPSTREAM_TAG }} (Build ${{ github.run_number }})${{ inputs.release_label && format(' {0}', inputs.release_label) || '' }}
           body: |
             ## Colgram Automated Release
-            - **Telegram Base**: `${{ env.UPSTREAM_TAG }}` (Official `DrKLO/Telegram`)
+            - **Telegram Base**: `${{ env.UPSTREAM_TAG }}` (`${{ env.UPSTREAM_REF }}`, Official `DrKLO/Telegram`)
             - **Requested version**: `${{ env.REQUESTED_TAG }}`
-            - **Hardware Cloaking**: Enabled (Spoofed device & OS info)
-            - **Anti-Delete Vault**: Active (Preserves deleted messages & edit logs)
+            - **APK SHA-256**: `${{ steps.apk_sha.outputs.sha256 }}`
+            - **Defender Bot Guard**: Built-in 12-vector leak & hole auto-sealer (`ColgramSecurityDefender`)
+            - **Hardware Cloaking**: Enabled (MTProto + Mini App/WebView User-Agent spoofing)
+            - **Anti-Delete Vault & Unlimited Storage**: Active (Preserves deleted messages, edit logs & media cache)
             - **Ghost Mode**: Silent read, stealth typing, offline status, FLAG_SECURE bypass
             - **Storage Sandbox**: Scoped to isolated folder
-            - **Built-in MTProto**: Fake-TLS anti-censorship pool active
-            - **Telemetry**: 100% Stripped (No Firebase / Play Services / HMS)
+            - **Built-in Anti-DPI & Call/Browser Isolation**: Active (WebRTC P2P blocked when strict/defender active)
+            - **Telemetry**: 100% Stripped (No Firebase / Play Services / HMS / AppCenter / Sentry)
 
             ### Install
             Download `colgram-signed-release.apk` below and install it. The build is

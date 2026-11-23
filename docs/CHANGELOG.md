@@ -1,5 +1,31 @@
 # Colgram — Changelog
 
+## 2026-11-23 — Colgram 12.10.6
+
+### 1. Двухуровневый обход блокировок (L1 WSS/DPI + L2 L3-Relay Cascade)
+- **Уровень 1 (`ColgramTelegramWsBridge` + `ColgramDpiBypass`)**: локальный `TLS 1.3 WSS`-мост на `127.0.0.1:9876` к `kws1..5.web.telegram.org` с подменой SNI на домены из белого списка (`max.ru`, `vk.com`, `gosuslugi.ru`, `ya.ru`, `ozon.ru`, `sberbank.ru`), строгой проверкой SAN официальных сертификатов Telegram (`*.web.telegram.org`, `*.telegram.org`), `MODE_MULTI_SPLIT_SNI` десинхронизацией `ClientHello`, `DoT :853` и 3-поточным `DoH` (`1.1.1.1`, `8.8.8.8`, `77.88.8.8`). Рукопожатие MTProto (`7TL_pong`) на Wi-Fi с ТСПУ — `~354 мс`.
+- **Уровень 2 (Мобильные сети 4G/LTE с L3-блоком IP Telegram на вышке)**: автодетектор L3-блока за `~5 с` и каскад L3-релеев с 2-байтовой сегментацией `SOCKS5 CONNECT` / `HTTP CONNECT` (`TCP_NODELAY` + пауза `16 мс`) и внутренним сплитом TLS/WSS. Проверено на MegaFon/Yota 4G LTE (`TECNO_LI6`): авто-обход за `~10 с`, RTT до DC2 `~440 мс`.
+- **Встроенный `ByeDPI`**: локальный прокси для внешних приложений (YouTube, Discord, браузеры, звонки) наряду с `Cloudflare WARP` (`:colgram_masque`) и `Sing-box` (`VLESS`, `VMess`, `Trojan`, `Reality`, `Hysteria2`).
+
+### 2. Koliti AI (`Qwen3.5-2B-UD-Q4_K_XL` + Vision + Sherpa-ONNX)
+- Встроенное офлайн-ядро `unsloth/Qwen3.5-2B-UD-Q4_K_XL` (`imatrix`) + мультимодальный проектор `mmproj-F16`.
+- Нативный движок `llama.cpp` (`libcolgram_llama.so`), скомпилированный с `ARMv8.2 DotProd + FP16 + KleidiAI`.
+- Анализ изображений с учётом EXIF-поворота (`ExifInterface` + `ARGB_8888`), офлайн-распознавание и синтез речи (`Sherpa-ONNX`), прямое управление функциями клиента из чата (`ColgramAiChatBridge`) и потокобезопасное чтение SQLite через `storageQueue`.
+
+### 3. Бесконечное хранилище, SHA-256 дедупликация и `.nomedia`-изоляция
+- Снятие лимитов кэша (`ColgramUnlimitedMemory`) и защита сжатых файлов от повторного скачивания в `FileLoadOperation` через GZIP-индекс `ColgramStorageIndex`.
+- Контентная SHA-256 дедупликация (`>= 64 КБ`) между чатами, пересылками и историей (`ColgramStorageOptimizer`).
+- Однопроходное сжатие фото с сохранением EXIF-ориентации и цвета `ARGB_8888`, GZIP-архивация истории Koliti (`500` сессий × `2000` сообщений) и HTML-экспортов.
+- Полная `.nomedia`-изоляция во всех 24 каталогах песочницы `Android/data/org.colgram.messenger.web/files/Colgram` и автоочистка старых записей `MediaStore` (`2351 -> 0` на `TECNO_LI6`, `192 -> 0` на `MuMu`).
+- Фоновый `ColgramBootJobService` (каждые 6 часов с контролем температуры и зарядки) и аварийный `Virtual Cloud Guard` при `< 1.5 ГБ` свободного места.
+
+### 4. Приватность, Aero Design Studio и верификация
+- Скрытые аккаунты под паролем `AES-256-GCM`, автоскрытие номера при входе, `Anti-Delete Vault` с историей правок, `Ghost Mode`, AI-антиспам `Colemailer` и временная почта.
+- 8 стеклянных пресетов в `ColgramDesignStudioActivity`, аппаратные видео-обои `.mp4`, плавающий `QuickBar` и совместимость с Python-плагинами `exteraGram`.
+- Верификация релиза: `201/201` файлов прошли синтаксический контроль, `26/26` JVM тест-классов (`API 34`), `167/167` контрактных Python-тестов, `0` падений при холодном старте на `TECNO_LI6` и `MuMu`.
+
+---
+
 ## 2026-10-06
 
 ### Доказано сквозным путём: обходник несёт трафик

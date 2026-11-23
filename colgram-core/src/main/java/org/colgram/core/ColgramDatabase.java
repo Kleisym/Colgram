@@ -5,9 +5,13 @@ import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import android.os.Looper;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * ColgramDatabase — Secure local SQLite storage for preserving deleted messages
@@ -15,13 +19,19 @@ import java.util.List;
  */
 public class ColgramDatabase extends SQLiteOpenHelper {
     private static final String DATABASE_NAME = "colgram_vault.db";
-    private static final int DATABASE_VERSION = 3;
+    private static final int DATABASE_VERSION = 5;
 
     // Table: Deleted Messages
     public static final String TABLE_DELETED = "deleted_messages";
     public static final String COL_DEL_DIALOG_ID = "dialog_id";
     public static final String COL_DEL_MSG_ID = "message_id";
     public static final String COL_DEL_TIMESTAMP = "deleted_at";
+
+    // Table: Deleted / Cleared Dialogs
+    public static final String TABLE_DELETED_DIALOGS = "deleted_dialogs";
+    public static final String COL_DEL_DLG_ID = "dialog_id";
+    public static final String COL_DEL_DLG_TIMESTAMP = "deleted_at";
+    public static final String COL_DEL_DLG_TITLE = "title";
 
     // Table: Message Edit History
     public static final String TABLE_EDITS = "message_edits";
@@ -30,6 +40,7 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     public static final String COL_EDIT_MSG_ID = "message_id";
     public static final String COL_EDIT_TIMESTAMP = "edit_timestamp";
     public static final String COL_EDIT_PREV_TEXT = "previous_text";
+    public static final String COL_EDIT_ENTITIES = "entities";
 
     // Table: Per-user notification blocks
     public static final String TABLE_BLOCKED_USERS = "blocked_notify_users";
@@ -62,9 +73,16 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     private static ColgramDatabase instance;
 
+    private final Set<String> deletedMessagesCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private final Set<Long> deletedDialogsCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private final Object cacheLoadLock = new Object();
+    private volatile boolean deletedCachesLoaded = false;
+    private volatile boolean deletedCacheLoadStarted = false;
+
     public static synchronized ColgramDatabase getInstance(Context context) {
         if (instance == null && context != null) {
             instance = new ColgramDatabase(context.getApplicationContext());
+            instance.startPreloadDeletedCachesAsync();
         }
         return instance;
     }
@@ -74,7 +92,100 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     }
 
     @Override
+    public void onConfigure(SQLiteDatabase db) {
+        super.onConfigure(db);
+        try {
+            db.enableWriteAheadLogging();
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Reclaims free SQLite pages and truncates the WAL journal on Colgram's own colgram_vault.db.
+     * Strictly touches only ColgramDatabase, never Telegram databases.
+     */
+    public void compactOwnDatabase() {
+        try {
+            SQLiteDatabase db = getWritableDatabase();
+            Cursor c1 = db.rawQuery("PRAGMA incremental_vacuum(200)", null);
+            if (c1 != null) c1.close();
+            Cursor c2 = db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null);
+            if (c2 != null) c2.close();
+        } catch (Throwable ignored) {}
+    }
+
+    private static String deletedKey(long dialogId, int messageId) {
+        return dialogId + ":" + messageId;
+    }
+
+    /** Normalizes Unix timestamps in seconds or milliseconds to epoch milliseconds. */
+    public static long normalizeEpochMillis(long ts) {
+        return ColgramHookHandler.normalizeEpochMillis(ts);
+    }
+
+    private void startPreloadDeletedCachesAsync() {
+        if (deletedCachesLoaded || deletedCacheLoadStarted) return;
+        synchronized (cacheLoadLock) {
+            if (deletedCachesLoaded || deletedCacheLoadStarted) return;
+            deletedCacheLoadStarted = true;
+        }
+        Thread t = new Thread(this::ensureDeletedCachesLoadedSync, "colgram-vault-preload");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void ensureDeletedCachesLoadedSync() {
+        if (deletedCachesLoaded) return;
+        synchronized (cacheLoadLock) {
+            if (deletedCachesLoaded) return;
+            try {
+                SQLiteDatabase db = getReadableDatabase();
+                Cursor msgCur = db.query(TABLE_DELETED,
+                        new String[]{COL_DEL_DIALOG_ID, COL_DEL_MSG_ID},
+                        null, null, null, null, null);
+                if (msgCur != null) {
+                    try {
+                        while (msgCur.moveToNext()) {
+                            deletedMessagesCache.add(deletedKey(msgCur.getLong(0), msgCur.getInt(1)));
+                        }
+                    } finally {
+                        msgCur.close();
+                    }
+                }
+                Cursor dlgCur = db.query(TABLE_DELETED_DIALOGS,
+                        new String[]{COL_DEL_DLG_ID},
+                        null, null, null, null, null);
+                if (dlgCur != null) {
+                    try {
+                        while (dlgCur.moveToNext()) {
+                            deletedDialogsCache.add(dlgCur.getLong(0));
+                        }
+                    } finally {
+                        dlgCur.close();
+                    }
+                }
+            } catch (Exception ignored) {
+                // Keep empty/partial cache if DB isn't ready yet; mark loaded so UI stays lock-free.
+            } finally {
+                deletedCachesLoaded = true;
+            }
+        }
+    }
+
+    private void prepareCacheForLookup() {
+        if (deletedCachesLoaded) return;
+        // Never block the main/UI thread on SQLite during ChatMessageCell/DialogCell bind/draw.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            startPreloadDeletedCachesAsync();
+        } else {
+            ensureDeletedCachesLoadedSync();
+        }
+    }
+
+    @Override
     public void onCreate(SQLiteDatabase db) {
+        try {
+            db.execSQL("PRAGMA auto_vacuum = INCREMENTAL;");
+        } catch (Throwable ignored) {}
         // Table storing IDs of deleted messages
         db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_DELETED + " ("
                 + COL_DEL_DIALOG_ID + " INTEGER, "
@@ -89,7 +200,8 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                 + COL_EDIT_DIALOG_ID + " INTEGER, "
                 + COL_EDIT_MSG_ID + " INTEGER, "
                 + COL_EDIT_TIMESTAMP + " INTEGER, "
-                + COL_EDIT_PREV_TEXT + " TEXT"
+                + COL_EDIT_PREV_TEXT + " TEXT, "
+                + COL_EDIT_ENTITIES + " TEXT"
                 + ");");
 
         // Index for fast lookup by dialog and message id
@@ -118,6 +230,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_media_lookup ON " + TABLE_MEDIA
                 + " (" + COL_MEDIA_DIALOG_ID + ", " + COL_MEDIA_MSG_ID + ");");
+
+        db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_DELETED_DIALOGS + " ("
+                + COL_DEL_DLG_ID + " INTEGER PRIMARY KEY, "
+                + COL_DEL_DLG_TIMESTAMP + " INTEGER, "
+                + COL_DEL_DLG_TITLE + " TEXT"
+                + ");");
     }
 
     @Override
@@ -145,6 +263,20 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                     + ");");
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_media_lookup ON " + TABLE_MEDIA
                     + " (" + COL_MEDIA_DIALOG_ID + ", " + COL_MEDIA_MSG_ID + ");");
+        }
+        // v3 -> v4: retained deleted/cleared dialogs
+        if (oldVersion < 4) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_DELETED_DIALOGS + " ("
+                    + COL_DEL_DLG_ID + " INTEGER PRIMARY KEY, "
+                    + COL_DEL_DLG_TIMESTAMP + " INTEGER, "
+                    + COL_DEL_DLG_TITLE + " TEXT"
+                    + ");");
+        }
+        // v4 -> v5: store Telegram entities (custom emoji + formatting) with each text edit revision
+        if (oldVersion < 5) {
+            try {
+                db.execSQL("ALTER TABLE " + TABLE_EDITS + " ADD COLUMN " + COL_EDIT_ENTITIES + " TEXT");
+            } catch (Exception ignored) {}
         }
     }
 
@@ -213,6 +345,8 @@ public class ColgramDatabase extends SQLiteOpenHelper {
      * Records a message as deleted by the other party.
      */
     public void markMessageDeleted(long dialogId, int messageId) {
+        if (messageId == 0) return;
+        deletedMessagesCache.add(deletedKey(dialogId, messageId));
         try {
             SQLiteDatabase db = getWritableDatabase();
             ContentValues values = new ContentValues();
@@ -225,23 +359,98 @@ public class ColgramDatabase extends SQLiteOpenHelper {
         }
     }
 
+    /** Removes a message from the deleted tombstone cache and DB (e.g. local self-delete or double-delete purge). */
+    public void removeMessageDeleted(long dialogId, int messageId) {
+        if (messageId == 0) return;
+        deletedMessagesCache.remove(deletedKey(dialogId, messageId));
+        if (dialogId > 0) {
+            deletedMessagesCache.remove(deletedKey(0L, messageId));
+        }
+        try {
+            if (dialogId > 0) {
+                getWritableDatabase().delete(TABLE_DELETED,
+                        "(" + COL_DEL_DIALOG_ID + "=? OR " + COL_DEL_DIALOG_ID + "=0) AND " + COL_DEL_MSG_ID + "=?",
+                        new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
+            } else {
+                getWritableDatabase().delete(TABLE_DELETED,
+                        COL_DEL_DIALOG_ID + "=? AND " + COL_DEL_MSG_ID + "=?",
+                        new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     /**
-     * Checks if a message was marked as deleted.
+     * Checks if a message was marked as deleted in O(1) memory without blocking the UI thread.
      */
     public boolean isMessageDeleted(long dialogId, int messageId) {
-        try {
-            SQLiteDatabase db = getReadableDatabase();
-            Cursor cursor = db.query(TABLE_DELETED,
-                    new String[]{COL_DEL_MSG_ID},
-                    COL_DEL_DIALOG_ID + "=? AND " + COL_DEL_MSG_ID + "=?",
-                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, null);
-            boolean exists = (cursor != null && cursor.getCount() > 0);
-            if (cursor != null) cursor.close();
-            return exists;
-        } catch (Exception e) {
-            return false;
+        if (messageId == 0) return false;
+        prepareCacheForLookup();
+        if (deletedMessagesCache.contains(deletedKey(dialogId, messageId))) {
+            return true;
         }
+        return dialogId > 0 && deletedMessagesCache.contains(deletedKey(0L, messageId));
+    }
+
+    /** Returns all preserved deleted message IDs for a dialog so SQLite sync/reload never wipes them. */
+    public java.util.List<Integer> getDeletedMessageIdsForDialog(long dialogId) {
+        java.util.List<Integer> ids = new java.util.ArrayList<>();
+        if (dialogId == 0) return ids;
+        try {
+            String where = dialogId > 0
+                    ? "(" + COL_DEL_DIALOG_ID + "=? OR " + COL_DEL_DIALOG_ID + "=0)"
+                    : (COL_DEL_DIALOG_ID + "=?");
+            android.database.Cursor c = getReadableDatabase().query(
+                    true,
+                    TABLE_DELETED,
+                    new String[]{COL_DEL_MSG_ID},
+                    where,
+                    new String[]{String.valueOf(dialogId)},
+                    null, null, null, null);
+            if (c != null) {
+                try {
+                    while (c.moveToNext()) {
+                        ids.add(c.getInt(0));
+                    }
+                } finally {
+                    c.close();
+                }
+            }
+        } catch (Throwable ignored) {}
+        return ids;
+    }
+
+    /** Records a dialog whose history was remotely deleted/cleared but preserved locally. */
+    public void markDialogDeleted(long dialogId, String title) {
+        if (dialogId == 0) return;
+        deletedDialogsCache.add(dialogId);
+        try {
+            SQLiteDatabase db = getWritableDatabase();
+            ContentValues values = new ContentValues();
+            values.put(COL_DEL_DLG_ID, dialogId);
+            values.put(COL_DEL_DLG_TIMESTAMP, System.currentTimeMillis());
+            values.put(COL_DEL_DLG_TITLE, title == null ? "" : title);
+            db.insertWithOnConflict(TABLE_DELETED_DIALOGS, null, values, SQLiteDatabase.CONFLICT_REPLACE);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Clears the preserved-deleted marker from a dialog when the user dismisses it locally. */
+    public void clearDialogDeleted(long dialogId) {
+        if (dialogId == 0) return;
+        deletedDialogsCache.remove(dialogId);
+        try {
+            getWritableDatabase().delete(TABLE_DELETED_DIALOGS,
+                    COL_DEL_DLG_ID + "=?", new String[]{String.valueOf(dialogId)});
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Returns true if this dialog is preserved locally after remote deletion in O(1) memory. */
+    public boolean isDialogDeleted(long dialogId) {
+        if (dialogId == 0) return false;
+        prepareCacheForLookup();
+        return deletedDialogsCache.contains(dialogId);
     }
 
     /**
@@ -249,23 +458,34 @@ public class ColgramDatabase extends SQLiteOpenHelper {
      * Skips duplicates so repeated update packets do not inflate the history.
      */
     public void saveMessageEdit(long dialogId, int messageId, String previousText, long editTimestamp) {
+        saveMessageEdit(dialogId, messageId, previousText, null, editTimestamp);
+    }
+
+    public void saveMessageEdit(long dialogId, int messageId, String previousText, String previousEntitiesJson, long editTimestamp) {
         if (previousText == null || previousText.trim().isEmpty()) return;
 
         try {
             SQLiteDatabase db = getWritableDatabase();
+            long tsMs = normalizeEpochMillis(editTimestamp);
+            String normEntities = previousEntitiesJson == null ? "" : previousEntitiesJson;
 
-            // Deduplicate: skip if this exact revision is already the last one stored.
+            // Deduplicate against the newest inserted row by _id DESC (not timestamp, which can tie within <1s).
             Cursor last = db.query(TABLE_EDITS,
-                    new String[]{COL_EDIT_PREV_TEXT},
+                    new String[]{COL_EDIT_PREV_TEXT, COL_EDIT_TIMESTAMP, COL_EDIT_ENTITIES},
                     COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?",
                     new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_EDIT_TIMESTAMP + " DESC", "1");
+                    null, null, COL_EDIT_ID + " DESC", "1");
             if (last != null) {
                 if (last.moveToFirst()) {
                     String existing = last.getString(0);
-                    if (previousText.equals(existing)) {
+                    long lastTs = normalizeEpochMillis(last.getLong(1));
+                    String existingEnt = last.isNull(2) ? "" : last.getString(2);
+                    if (previousText.equals(existing) && normEntities.equals(existingEnt)) {
                         last.close();
                         return;
+                    }
+                    if (tsMs <= lastTs) {
+                        tsMs = lastTs + 1L;
                     }
                 }
                 last.close();
@@ -275,7 +495,10 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             values.put(COL_EDIT_DIALOG_ID, dialogId);
             values.put(COL_EDIT_MSG_ID, messageId);
             values.put(COL_EDIT_PREV_TEXT, previousText);
-            values.put(COL_EDIT_TIMESTAMP, editTimestamp > 0 ? editTimestamp : System.currentTimeMillis());
+            values.put(COL_EDIT_TIMESTAMP, tsMs);
+            if (!normEntities.isEmpty()) {
+                values.put(COL_EDIT_ENTITIES, normEntities);
+            }
             db.insert(TABLE_EDITS, null, values);
         } catch (Exception e) {
             // Silently handle
@@ -285,10 +508,16 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     public static class MessageEditEntry {
         public final long timestamp;
         public final String text;
+        public final String entitiesJson;
 
         public MessageEditEntry(long timestamp, String text) {
+            this(timestamp, text, null);
+        }
+
+        public MessageEditEntry(long timestamp, String text, String entitiesJson) {
             this.timestamp = timestamp;
             this.text = text;
+            this.entitiesJson = entitiesJson;
         }
     }
 
@@ -338,17 +567,19 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
         try {
             SQLiteDatabase db = getWritableDatabase();
+            long tsMs = normalizeEpochMillis(capturedAt);
 
-            // Dedupe against the newest stored revision for this message.
+            // Dedupe against the newest inserted revision by _id DESC so rapid <1s media swaps preserve order.
             Cursor last = db.query(TABLE_MEDIA,
-                    new String[]{COL_MEDIA_REMOTE_ID, COL_MEDIA_FILE_NAME},
+                    new String[]{COL_MEDIA_REMOTE_ID, COL_MEDIA_FILE_NAME, COL_MEDIA_TIMESTAMP},
                     COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
                     new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_MEDIA_TIMESTAMP + " DESC", "1");
+                    null, null, COL_MEDIA_ID + " DESC", "1");
             if (last != null) {
                 if (last.moveToFirst()) {
                     long existingRemote = last.getLong(0);
                     String existingName = last.isNull(1) ? null : last.getString(1);
+                    long lastTs = normalizeEpochMillis(last.getLong(2));
                     // Same attachment id AND same name => nothing actually changed.
                     if (remoteId != 0 && existingRemote == remoteId) {
                         last.close();
@@ -358,6 +589,9 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                         last.close();
                         return;
                     }
+                    if (tsMs <= lastTs) {
+                        tsMs = lastTs + 1L;
+                    }
                 }
                 last.close();
             }
@@ -365,7 +599,7 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             ContentValues values = new ContentValues();
             values.put(COL_MEDIA_DIALOG_ID, dialogId);
             values.put(COL_MEDIA_MSG_ID, messageId);
-            values.put(COL_MEDIA_TIMESTAMP, capturedAt > 0 ? capturedAt : System.currentTimeMillis());
+            values.put(COL_MEDIA_TIMESTAMP, tsMs);
             values.put(COL_MEDIA_TYPE, mediaType);
             values.put(COL_MEDIA_PATH, localPath);
             values.put(COL_MEDIA_FILE_NAME, fileName);
@@ -388,12 +622,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                             COL_MEDIA_FILE_NAME, COL_MEDIA_SIZE, COL_MEDIA_MIME},
                     COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
                     new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_MEDIA_TIMESTAMP + " ASC");
+                    null, null, COL_MEDIA_TIMESTAMP + " ASC, " + COL_MEDIA_ID + " ASC");
 
             if (cursor != null) {
                 while (cursor.moveToNext()) {
                     out.add(new MediaRevision(
-                            cursor.getLong(0),
+                            normalizeEpochMillis(cursor.getLong(0)),
                             cursor.getInt(1),
                             cursor.isNull(2) ? null : cursor.getString(2),
                             cursor.isNull(3) ? null : cursor.getString(3),
@@ -450,16 +684,17 @@ public class ColgramDatabase extends SQLiteOpenHelper {
         try {
             SQLiteDatabase db = getReadableDatabase();
             Cursor cursor = db.query(TABLE_EDITS,
-                    new String[]{COL_EDIT_TIMESTAMP, COL_EDIT_PREV_TEXT},
+                    new String[]{COL_EDIT_TIMESTAMP, COL_EDIT_PREV_TEXT, COL_EDIT_ENTITIES},
                     COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?",
                     new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_EDIT_TIMESTAMP + " ASC");
+                    null, null, COL_EDIT_TIMESTAMP + " ASC, " + COL_EDIT_ID + " ASC");
 
             if (cursor != null) {
                 while (cursor.moveToNext()) {
-                    long ts = cursor.getLong(0);
+                    long ts = normalizeEpochMillis(cursor.getLong(0));
                     String text = cursor.getString(1);
-                    history.add(new MessageEditEntry(ts, text));
+                    String entJson = cursor.isNull(2) ? null : cursor.getString(2);
+                    history.add(new MessageEditEntry(ts, text, entJson));
                 }
                 cursor.close();
             }

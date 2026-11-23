@@ -46,45 +46,224 @@ import javax.net.ssl.SSLSession;
 public final class ColgramDohResolver {
 
     private static final String TAG = "ColgramDoh";
-    private static final int CONNECT_TIMEOUT_MS = 4000;
-    private static final int READ_TIMEOUT_MS = 5000;
+    private static final int CONNECT_TIMEOUT_MS = 1800;
+    private static final int CELLULAR_CONNECT_TIMEOUT_MS = 2400;
+    private static final int READ_TIMEOUT_MS = 2000;
+    private static final int CELLULAR_READ_TIMEOUT_MS = 2500;
+    private static final long RACE_WAVE_DEADLINE_MS = 3800L;
     private static final long CACHE_TTL_MS = 30_000L;
+    private static final long CUT_COOLDOWN_MS = 30_000L;
+    private static final String[] SPOOFED_RU_SNIS = {"vk.com", "max.ru"};
 
-    /** One DoH endpoint: where to connect, and what to ask for. */
+    /** Distinct exception thrown when TCP connect itself fails so we never retry TLS modes on a dead IP. */
+    private static final class TcpConnectException extends java.io.IOException {
+        TcpConnectException(String message, Throwable cause) {
+            super(message, cause);
+        }
+        TcpConnectException(String message) {
+            super(message);
+        }
+    }
+
+    /** One DoH/DoT endpoint: where to connect, what protocol to speak, and what cert to verify. */
     public static final class Endpoint {
         public final String ip;
         public final String sni;
         /** The name the certificate is verified against. */
         public final String verifyName;
+        /** 443 for RFC 8484 HTTP/1.1 DoH, 853 for RFC 7858 DNS-over-TLS. */
+        public final int port;
+        /** True when this endpoint speaks RFC 7858 DNS-over-TLS on port 853. */
+        public final boolean dot;
+        /** True when this endpoint accepts spoofed RU-whitelist SNI (vk.com/max.ru) while returning a CA-valid verifyName cert. */
+        public final boolean supportsSpoofedSni;
+        /** Provider diversity key so concurrent races span independent networks/ASNs. */
+        public final String providerGroup;
 
         Endpoint(String ip, String sni, String verifyName) {
+            this(ip, sni, verifyName, 443, false, false, verifyName);
+        }
+
+        Endpoint(String ip, String sni, String verifyName, int port, boolean dot,
+                 boolean supportsSpoofedSni, String providerGroup) {
             this.ip = ip;
             this.sni = sni;
             this.verifyName = verifyName;
+            this.port = port;
+            this.dot = dot;
+            this.supportsSpoofedSni = supportsSpoofedSni;
+            this.providerGroup = providerGroup != null ? providerGroup : verifyName;
+        }
+
+        String key() {
+            return ip + ":" + port;
         }
     }
 
     /**
-     * Endpoints, in the order they are tried.
-    
-     * The pinned IP is the point of the exercise: connecting to a literal address means the SNI
-     * is whatever we say it is, and does not depend on resolving a name that may itself be cut.
-     * several providers, not just one, because the block is applied per-resolver and varies by
-     * ISP and region.
+     * Live-verified IPv4 DoH (HTTP/1.1) and DoT (RFC 7858:853) endpoints ordered in diverse triplets.
+     *
+     * Dead/HTTP2-only endpoints (stale Comss 83.220.169.155, Quad9 9.9.9.9/149.112.112.112 HTTP 505,
+     * Mullvad 194.242.2.2 timeout, Yandex 77.88.8.8:443 HTTP/2-only) are excluded.
      */
     private static final Endpoint[] ENDPOINTS = {
-            new Endpoint("1.1.1.1", "cloudflare-dns.com", "cloudflare-dns.com"),
-            new Endpoint("1.0.0.1", "cloudflare-dns.com", "cloudflare-dns.com"),
-            new Endpoint("8.8.8.8", "dns.google", "dns.google"),
-            new Endpoint("8.8.4.4", "dns.google", "dns.google"),
-            new Endpoint("94.140.14.14", "adguard-dns.com", "adguard-dns.com"),
+            // Wave 1 triplet: Comss RU (DoH, spoofed SNI) + Yandex (DoT:853, spoofed SNI) + AdGuard (DoH)
+            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            new Endpoint("77.88.8.8", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
+            new Endpoint("94.140.14.14", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
+            // Wave 2 triplet: Cloudflare + Google + Comss backup
+            new Endpoint("1.1.1.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
+            new Endpoint("8.8.8.8", "dns.google", "dns.google", 443, false, true, "google"),
+            new Endpoint("141.133.183.77", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            // Wave 3 triplet: AliDNS (spoofed SNI) + ControlD + DNS.SB (spoofed SNI)
+            new Endpoint("223.5.5.5", "dns.alidns.com", "dns.alidns.com", 443, false, true, "alidns"),
+            new Endpoint("76.76.2.0", "freedns.controld.com", "freedns.controld.com", 443, false, false, "controld"),
+            new Endpoint("45.11.45.11", "doh.dns.sb", "doh.dns.sb", 443, false, true, "dnssb"),
+            // Wave 4 triplet: Comss + Yandex DoT backup + AdGuard backup
+            new Endpoint("212.109.195.93", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            new Endpoint("77.88.8.1", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
+            new Endpoint("94.140.15.15", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
+            // Wave 5 backups: Cloudflare + Google + Comss
+            new Endpoint("1.0.0.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
+            new Endpoint("8.8.4.4", "dns.google", "dns.google", 443, false, true, "google"),
+            new Endpoint("155.212.172.101", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            new Endpoint("212.109.221.20", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
     };
+
+    /** Uncensored IPv6 DoH/DoT endpoints interleaved automatically on dual-stack 4G/LTE networks. */
+    private static final Endpoint[] IPV6_ENDPOINTS = {
+            new Endpoint("2a10:50c0::ad1:ff", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
+            new Endpoint("2001:4860:4860::8888", "dns.google", "dns.google", 443, false, true, "google"),
+            new Endpoint("2606:4700:4700::1111", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
+            new Endpoint("2a02:6b8::feed:0ff", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
+    };
+
+    /**
+     * Encrypted Russian-whitelisted RFC 7858 DNS-over-TLS (port 853) fallback (CA-verified against
+     * *.dot.dns.yandex.net, accepts both real SNI and spoofed vk.com SNI).
+     */
+    private static final Endpoint EMERGENCY_RU_DOT =
+            new Endpoint("77.88.8.8", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex");
+    private static final Endpoint EMERGENCY_RU_DOT_SECONDARY =
+            new Endpoint("77.88.8.1", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex");
+
+    private static final String[] EMERGENCY_UDP_DNS = {"141.133.184.24", "77.88.8.8", "94.140.14.14", "8.8.8.8"};
+
+    static Endpoint[] configuredEndpoints() {
+        return ENDPOINTS.clone();
+    }
+
+    static Endpoint emergencyRuDotEndpoint() {
+        return EMERGENCY_RU_DOT;
+    }
+
+    private static volatile long lastIpv6CheckAt = 0L;
+    private static volatile boolean cachedGlobalIpv6 = false;
+    private static final long IPV6_CHECK_CACHE_MS = 5_000L;
+
+    /**
+     * Returns true when a real physical network interface (excluding loopback and VPN/TUN) holds
+     * a globally routable IPv6 address (non-link-local, non-ULA). Enables Dual-Stack IPv6 TUN +
+     * Happy Eyeballs + IPv6 DoH automatically on Russian dual-stack 4G/LTE towers while keeping
+     * IPv4-only networks strictly IPv4-only.
+     */
+    public static boolean hasGlobalRoutableIpv6() {
+        long now = System.currentTimeMillis();
+        if (now - lastIpv6CheckAt < IPV6_CHECK_CACHE_MS) {
+            return cachedGlobalIpv6;
+        }
+        boolean found = false;
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifaces =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (ifaces != null && ifaces.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifaces.nextElement();
+                if (ni == null || !ni.isUp() || ni.isLoopback()) continue;
+                String name = ni.getName();
+                if (name != null) {
+                    String lower = name.toLowerCase(java.util.Locale.US);
+                    if (lower.startsWith("tun") || lower.startsWith("colgram")
+                            || lower.startsWith("ppp") || lower.startsWith("wg")
+                            || lower.startsWith("dummy")) {
+                        continue;
+                    }
+                }
+                java.util.Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                while (addrs != null && addrs.hasMoreElements()) {
+                    InetAddress addr = addrs.nextElement();
+                    if (!(addr instanceof java.net.Inet6Address)) continue;
+                    if (addr.isLoopbackAddress() || addr.isLinkLocalAddress()
+                            || addr.isSiteLocalAddress() || addr.isAnyLocalAddress()
+                            || addr.isMulticastAddress()) {
+                        continue;
+                    }
+                    byte[] raw = addr.getAddress();
+                    if (raw != null && raw.length == 16) {
+                        int firstByte = raw[0] & 0xFF;
+                        // Exclude ULA fc00::/7 (private VPN/local IPv6)
+                        if ((firstByte & 0xFE) == 0xFC) continue;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+        } catch (Throwable ignored) {
+        }
+        cachedGlobalIpv6 = found;
+        lastIpv6CheckAt = now;
+        return found;
+    }
+
+    private static List<Endpoint> activeEndpoints() {
+        boolean v6 = hasGlobalRoutableIpv6();
+        List<Endpoint> out = new ArrayList<>(ENDPOINTS.length + (v6 ? IPV6_ENDPOINTS.length : 0));
+        if (!v6) {
+            for (Endpoint ep : ENDPOINTS) out.add(ep);
+            return out;
+        }
+        // Interleave IPv6 DoH early (every 2 IPv4 endpoints) so IPv4-blackholed dual-stack 4G wins on Wave 1!
+        int v6Idx = 0;
+        for (int i = 0; i < ENDPOINTS.length; i++) {
+            out.add(ENDPOINTS[i]);
+            if ((i == 1 || i == 3 || i == 5) && v6Idx < IPV6_ENDPOINTS.length) {
+                out.add(IPV6_ENDPOINTS[v6Idx++]);
+            }
+        }
+        while (v6Idx < IPV6_ENDPOINTS.length) {
+            out.add(IPV6_ENDPOINTS[v6Idx++]);
+        }
+        return out;
+    }
+
+    /** Optional socket protector (e.g. VpnService::protect) for protected DoH inside TUN. */
+    public interface SocketProtector {
+        boolean protect(java.net.Socket socket);
+    }
+
+    /** Optional datagram socket protector for emergency UDP/53 DNS fallback inside TUN. */
+    public interface DatagramProtector {
+        boolean protect(java.net.DatagramSocket socket);
+    }
+
+    private static volatile boolean cellularNetwork = false;
+
+    public static void setCellularNetwork(boolean cellular) {
+        cellularNetwork = cellular;
+    }
 
     private static final Map<String, long[]> cache = new ConcurrentHashMap<>();
     private static final Map<String, String[]> answers = new ConcurrentHashMap<>();
-    /** Endpoints that timed out or were reset; skipped until {@link #resetHealth()}. */
-    private static final List<String> cut = new ArrayList<>();
+    /** Endpoints temporarily skipped after timeout/reset until their cooldown expires. */
+    private static final Map<String, Long> cutUntil = new ConcurrentHashMap<>();
     private static volatile String lastResolver;
+    private static volatile Endpoint lastWorkingEndpoint;
+    private static final java.util.concurrent.ExecutorService DOH_RACE_POOL =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "colgram-doh-race");
+                t.setDaemon(true);
+                return t;
+            });
 
     private ColgramDohResolver() {}
 
@@ -96,6 +275,10 @@ public final class ColgramDohResolver {
      * an explicit entry point rather than a global override. ColgramHttp calls it before every
      * request, and {@link #prefetch} warms the cache for names the app is about to need.
      */
+    /**
+     * Resolve a name using DoH first when enabled so ISP/system DNS never sees queried domains,
+     * falling back to system DNS only when DoH fails and strict proxy security allows it.
+     */
     public static InetAddress[] resolveOrSystem(String hostname) {
         InetAddress[] viaDoh = resolve(hostname);
         if (viaDoh != null && viaDoh.length > 0) return viaDoh;
@@ -104,26 +287,15 @@ public final class ColgramDohResolver {
     }
 
     /**
-     * One address for `hostname`, or null when neither resolver can answer.
-     *
-     * The single-address shape is what a connection needs: the caller wants one place to dial,
-     * not a list. Returns null rather than an empty array so a caller can tell "nothing to pin"
-     * from "pinned, use the platform path".
+     * One address for `hostname`, or null when no permitted resolver can answer.
      */
     public static InetAddress resolveOrNull(String hostname) {
         InetAddress[] viaDoh = resolve(hostname);
-        // Prefer an address this device can actually reach.
-        //
-        // The first answer is not always usable, and taking it blind sends the request down a path that
-        // does not exist here:
-        //
-        //   Failed to connect to api.cloudflareclient.com/[2a06:98c1:3123:8000::]:443
-        //
-        // Cloudflare answers with a v6 record first and this device has no global v6 route, so every
-        // attempt through it fails before a v4 answer is ever tried. Choosing by family - v4 first, then
-        // anything - costs one loop and removes the whole class of failure.
         InetAddress usable = pickReachable(viaDoh);
         if (usable != null) return usable;
+        if (ColgramConfig.isDohEnabled() && ColgramConfig.isStrictProxySecurityEnabled()) {
+            return null;
+        }
         InetAddress[] system = resolveSystem(hostname);
         return pickReachable(system);
     }
@@ -166,54 +338,472 @@ public final class ColgramDohResolver {
         }
     }
 
-    public static synchronized void resetHealth() {
-        cut.clear();
+    public static void resetHealth() {
+        cutUntil.clear();
         lastResolver = null;
+        lastWorkingEndpoint = null;
+        lastIpv6CheckAt = 0L;
     }
 
     public static String activeResolver() {
         return lastResolver;
     }
 
+    private static boolean isCut(String ip, long now) {
+        Long until = cutUntil.get(ip);
+        if (until == null) return false;
+        if (now >= until) {
+            cutUntil.remove(ip, until);
+            return false;
+        }
+        return true;
+    }
+
+    private static void markCut(String ip, long now) {
+        cutUntil.put(ip, now + CUT_COOLDOWN_MS);
+    }
+
+    /** True when the host string is a literal IP or loopback name (requires no DNS lookup). */
+    public static boolean isIpLiteral(String host) {
+        if (host == null) return false;
+        String trimmed = host.trim();
+        if (trimmed.isEmpty()) return false;
+        if (trimmed.startsWith("[") && trimmed.endsWith("]") && trimmed.length() > 2) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        }
+        if ("localhost".equalsIgnoreCase(trimmed)) return true;
+        if (trimmed.indexOf(':') >= 0) {
+            for (int i = 0; i < trimmed.length(); i++) {
+                char c = trimmed.charAt(i);
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+                        || (c >= 'A' && c <= 'F') || c == ':' || c == '.')) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        String[] parts = trimmed.split("\\.", -1);
+        if (parts.length != 4) return false;
+        for (String p : parts) {
+            if (p.isEmpty() || p.length() > 3) return false;
+            for (int i = 0; i < p.length(); i++) {
+                char c = p.charAt(i);
+                if (c < '0' || c > '9') return false;
+            }
+            int v = Integer.parseInt(p);
+            if (v < 0 || v > 255) return false;
+        }
+        return true;
+    }
+
+    public static boolean isLoopbackHost(String host) {
+        if (host == null) return false;
+        String h = host.trim().toLowerCase(java.util.Locale.ROOT);
+        return "localhost".equals(h) || "::1".equals(h) || "0:0:0:0:0:0:0:1".equals(h) || h.startsWith("127.");
+    }
+
     /**
-     * Resolve one name, system first, then DoH.
-     *
-     * The system answer is preferred when it exists because it is the cheapest and the platform
-     * keeps its own cache; DoH is the fallback for exactly the case that matters, a system
-     * resolver that has been cut or is returning nothing.
+     * Resolve one name: DoH FIRST when enabled so DNS queries stay encrypted, falling back to
+     * system DNS only when DoH is disabled or all DoH endpoints failed and strict mode is off.
      */
     public static InetAddress[] resolve(String hostname) {
-        if (hostname == null || hostname.isEmpty()) return null;
-        InetAddress[] system = resolveSystem(hostname);
-        if (system != null && system.length > 0) return system;
-
-        String key = hostname.toLowerCase(java.util.Locale.ROOT);
-        long[] stamp = cache.get(key);
-        String[] cached = answers.get(key);
-        if (stamp != null && cached != null && System.currentTimeMillis() - stamp[0] < CACHE_TTL_MS) {
-            return toAddresses(cached);
+        if (hostname == null) return null;
+        String cleaned = hostname.trim();
+        if (cleaned.isEmpty()) return null;
+        if (isIpLiteral(cleaned)) {
+            InetAddress[] literal = resolveSystem(cleaned);
+            if (literal != null && literal.length > 0) return literal;
         }
 
-        for (Endpoint endpoint : ENDPOINTS) {
-            if (cut.contains(endpoint.ip)) continue;
-            byte[] reply;
+        if (ColgramConfig.isDohEnabled()) {
+            String key = cleaned.toLowerCase(java.util.Locale.ROOT);
+            long now = System.currentTimeMillis();
+            long[] stamp = cache.get(key);
+            String[] cached = answers.get(key);
+            if (stamp != null && cached != null && now - stamp[0] < CACHE_TTL_MS) {
+                return toAddresses(cached);
+            }
+
+            InetAddress[] result = queryEndpoints(key, cleaned, now, false);
+            if (result != null) return result;
+            if (!cutUntil.isEmpty()) {
+                cutUntil.clear();
+                result = queryEndpoints(key, cleaned, System.currentTimeMillis(), true);
+                if (result != null) return result;
+            }
+            if (ColgramConfig.isStrictProxySecurityEnabled()) {
+                return null;
+            }
+        }
+        return resolveSystem(cleaned);
+    }
+
+    /**
+     * Resolve both A (IPv4) and AAAA (IPv6) records via DoH, keeping IPv4 first and IPv6 as
+     * fallback (critical on dual-stack mobile carriers that filter IPv4 Telegram edges).
+     */
+    public static InetAddress[] resolveWithIpv6(String hostname) {
+        if (hostname == null) return null;
+        String cleaned = hostname.trim();
+        if (cleaned.isEmpty()) return null;
+        if (isIpLiteral(cleaned)) return resolveSystem(cleaned);
+        List<InetAddress> merged = new ArrayList<>();
+        InetAddress[] v4 = resolve(cleaned);
+        if (v4 != null) {
+            for (InetAddress a : v4) {
+                if (a != null && !merged.contains(a)) merged.add(a);
+            }
+        }
+        if (ColgramConfig.isDohEnabled()) {
+            InetAddress[] v6 = queryEndpointsQtype(cleaned.toLowerCase(java.util.Locale.ROOT), cleaned, 28, null);
+            if (v6 != null) {
+                for (InetAddress a : v6) {
+                    if (a != null && !merged.contains(a)) merged.add(a);
+                }
+            }
+        }
+        if (merged.isEmpty()) {
+            InetAddress[] sys = resolveSystem(cleaned);
+            if (sys != null) {
+                for (InetAddress a : sys) {
+                    if (a != null && !merged.contains(a)) merged.add(a);
+                }
+            }
+        }
+        return merged.isEmpty() ? null : merged.toArray(new InetAddress[0]);
+    }
+
+    /** Resolve an A record using a VPN-protected socket so TUN traffic never loops on DNS. */
+    public static InetAddress resolveProtected(String hostname, SocketProtector protector) {
+        return resolveProtected(hostname, protector, null);
+    }
+
+    /** Resolve an A record using VPN-protected native ByeDPI / SNI-fragmented DoH sockets. */
+    public static InetAddress resolveProtected(String hostname, SocketProtector protector,
+                                               ColgramNativeDesync.FdProtector fdProtector) {
+        if (hostname == null) return null;
+        String cleaned = hostname.trim();
+        if (cleaned.isEmpty()) return null;
+        if (isIpLiteral(cleaned)) {
+            InetAddress[] lit = resolveSystem(cleaned);
+            return (lit != null && lit.length > 0) ? lit[0] : null;
+        }
+        String key = cleaned.toLowerCase(java.util.Locale.ROOT);
+        long now = System.currentTimeMillis();
+        long[] stamp = cache.get(key);
+        String[] cached = answers.get(key);
+        if (stamp != null && cached != null && now - stamp[0] < CACHE_TTL_MS) {
+            InetAddress picked = pickReachable(toAddresses(cached));
+            if (picked != null) return picked;
+        }
+        InetAddress[] found = queryEndpointsInternal(key, cleaned, now, false, 1, protector, fdProtector);
+        if (found == null && !cutUntil.isEmpty()) {
+            cutUntil.clear();
+            found = queryEndpointsInternal(key, cleaned, System.currentTimeMillis(), true, 1, protector, fdProtector);
+        }
+        return pickReachable(found);
+    }
+
+    /**
+     * Resolves A (and optionally AAAA on dual-stack networks) via VPN-protected DoH so Happy
+     * Eyeballs can connect over IPv6 when a carrier whitelists/drops IPv4.
+     */
+    public static InetAddress[] resolveProtectedAll(String hostname, SocketProtector protector,
+                                                    ColgramNativeDesync.FdProtector fdProtector,
+                                                    boolean includeIpv6) {
+        if (hostname == null) return null;
+        String cleaned = hostname.trim();
+        if (cleaned.isEmpty()) return null;
+        if (isIpLiteral(cleaned)) return resolveSystem(cleaned);
+        List<InetAddress> merged = new ArrayList<>();
+        InetAddress v4 = resolveProtected(cleaned, protector, fdProtector);
+        if (v4 != null) merged.add(v4);
+        if (includeIpv6 && hasGlobalRoutableIpv6()) {
+            InetAddress[] v6 = queryEndpointsInternal(
+                    cleaned.toLowerCase(java.util.Locale.ROOT), cleaned,
+                    System.currentTimeMillis(), false, 28, protector, fdProtector);
+            if (v6 != null) {
+                for (InetAddress a : v6) {
+                    if (a != null && !merged.contains(a)) merged.add(a);
+                }
+            }
+        }
+        return merged.isEmpty() ? null : merged.toArray(new InetAddress[0]);
+    }
+
+    /**
+     * Forwards a raw RFC 1035 wire-format DNS query through resilient multi-provider DoH/DoT (with
+     * pinned fastest server + concurrent 3-way diverse provider race under a 3.8s wave deadline +
+     * spoofed RU-whitelist SNI + RFC 7858 Yandex DoT:853), falling back to protected UDP/53.
+     */
+    public static byte[] queryRawWireProtected(byte[] wireQuery, SocketProtector sockProtector,
+                                               ColgramNativeDesync.FdProtector fdProtector,
+                                               DatagramProtector udpProtector) {
+        if (wireQuery == null || wireQuery.length < 12) return null;
+        long now = System.currentTimeMillis();
+
+        // 1. Fast path: try the pinned last-working DoH/DoT provider first (<150ms typical)
+        Endpoint pinned = lastWorkingEndpoint;
+        if (pinned != null && !isCut(pinned.key(), now)) {
             try {
-                reply = query(endpoint, hostname);
+                long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2500L : 1900L);
+                byte[] reply = queryWire(pinned, wireQuery, sockProtector, fdProtector, fastDeadline, null);
+                if (reply != null && reply.length >= 12) {
+                    cutUntil.remove(pinned.key());
+                    lastResolver = pinned.key();
+                    return reply;
+                }
             } catch (Throwable t) {
-                Log.i(TAG, endpoint.ip + " cut or unreachable: " + t.getClass().getSimpleName());
-                cut.add(endpoint.ip);
-                continue;
+                Log.d(TAG, "pinned DoH/DoT " + pinned.key() + " failed: " + t.getClass().getSimpleName());
             }
-            if (reply == null) {
-                cut.add(endpoint.ip);
-                continue;
+            markCut(pinned.key(), System.currentTimeMillis());
+            if (lastWorkingEndpoint == pinned) lastWorkingEndpoint = null;
+        }
+
+        // 2. Concurrent 3-way race across diverse healthy providers (e.g. Comss + Yandex DoT:853 + AdGuard/CF/Google)
+        List<Endpoint> remaining = buildHealthyCandidates(pinned, now, false);
+        java.util.Set<String> triedKeys = new java.util.HashSet<>();
+        if (pinned != null) triedKeys.add(pinned.key());
+
+        for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
+            List<Endpoint> wave = pickDiverseWave(remaining, 3);
+            for (Endpoint ep : wave) triedKeys.add(ep.key());
+            byte[] raced = raceEndpointsWave(wave, wireQuery, sockProtector, fdProtector,
+                    RACE_WAVE_DEADLINE_MS, 0);
+            if (raced != null && raced.length >= 12) {
+                return raced;
             }
-            String[] found = parseARecords(reply);
-            if (found.length == 0) continue;
-            lastResolver = endpoint.ip;
-            cache.put(key, new long[]{System.currentTimeMillis()});
-            answers.put(key, found);
-            return toAddresses(found);
+        }
+
+        // 3. Last-resort encrypted Russian-whitelisted RFC 7858 DoT:853 if not already tried
+        Endpoint[] ruFallbacks = {EMERGENCY_RU_DOT, EMERGENCY_RU_DOT_SECONDARY};
+        for (Endpoint ruDot : ruFallbacks) {
+            if (triedKeys.contains(ruDot.key())) continue;
+            try {
+                long dotDeadline = System.currentTimeMillis() + 2600L;
+                byte[] ruReply = queryWire(ruDot, wireQuery, sockProtector, fdProtector, dotDeadline, null);
+                if (ruReply != null && ruReply.length >= 12) {
+                    lastResolver = ruDot.key();
+                    lastWorkingEndpoint = ruDot;
+                    return ruReply;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // 4. Emergency fallback: protected plain UDP/53 so DNS never suffers total blackout
+        return queryEmergencyUdp(wireQuery, udpProtector);
+    }
+
+    private static List<Endpoint> buildHealthyCandidates(Endpoint exclude, long now, boolean ignoreCut) {
+        List<Endpoint> allActive = activeEndpoints();
+        List<Endpoint> candidates = new ArrayList<>(allActive.size());
+        for (Endpoint ep : allActive) {
+            if (ep == exclude) continue;
+            if (!ignoreCut && isCut(ep.key(), now)) continue;
+            candidates.add(ep);
+        }
+        if (candidates.isEmpty()) {
+            cutUntil.clear();
+            for (Endpoint ep : allActive) {
+                if (ep != exclude) candidates.add(ep);
+            }
+        }
+        return candidates;
+    }
+
+    /** Picks up to {@code maxCount} endpoints from distinct providerGroups for a concurrent race wave. */
+    static List<Endpoint> pickDiverseWave(List<Endpoint> remaining, int maxCount) {
+        List<Endpoint> wave = new ArrayList<>(maxCount);
+        java.util.Set<String> usedGroups = new java.util.HashSet<>();
+        java.util.Iterator<Endpoint> it = remaining.iterator();
+        while (it.hasNext() && wave.size() < maxCount) {
+            Endpoint ep = it.next();
+            if (usedGroups.add(ep.providerGroup)) {
+                wave.add(ep);
+                it.remove();
+            }
+        }
+        it = remaining.iterator();
+        while (it.hasNext() && wave.size() < maxCount) {
+            wave.add(it.next());
+            it.remove();
+        }
+        return wave;
+    }
+
+    /**
+     * Races up to 3 diverse DoH/DoT endpoints concurrently under {@code deadlineMs}.
+     * When {@code requireQtype > 0}, prefers an answer containing records of that qtype (1=A, 28=AAAA).
+     * Cancels all losing open sockets as soon as a winner finishes.
+     */
+    private static byte[] raceEndpointsWave(final List<Endpoint> wave, final byte[] wireQuery,
+                                            final SocketProtector sockProtector,
+                                            final ColgramNativeDesync.FdProtector fdProtector,
+                                            final long deadlineMs, final int requireQtype) {
+        if (wave == null || wave.isEmpty()) return null;
+        final long deadlineAt = System.currentTimeMillis() + deadlineMs;
+        if (wave.size() == 1) {
+            Endpoint ep = wave.get(0);
+            try {
+                byte[] reply = queryWire(ep, wireQuery, sockProtector, fdProtector, deadlineAt, null);
+                if (reply != null && reply.length >= 12) {
+                    cutUntil.remove(ep.key());
+                    lastWorkingEndpoint = ep;
+                    lastResolver = ep.key();
+                    return reply;
+                }
+            } catch (Throwable ignored) {}
+            markCut(ep.key(), System.currentTimeMillis());
+            return null;
+        }
+
+        final java.util.concurrent.atomic.AtomicReference<byte[]> winner = new java.util.concurrent.atomic.AtomicReference<>();
+        final java.util.concurrent.atomic.AtomicReference<byte[]> emptyValidReply = new java.util.concurrent.atomic.AtomicReference<>();
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(wave.size());
+        final java.util.List<java.net.Socket> activeSockets =
+                java.util.Collections.synchronizedList(new ArrayList<java.net.Socket>(wave.size()));
+
+        for (final Endpoint ep : wave) {
+            DOH_RACE_POOL.execute(() -> {
+                try {
+                    if (winner.get() != null) return;
+                    byte[] reply = queryWire(ep, wireQuery, sockProtector, fdProtector, deadlineAt, activeSockets);
+                    if (reply != null && reply.length >= 12) {
+                        cutUntil.remove(ep.key());
+                        boolean acceptable = true;
+                        if (requireQtype == 1) {
+                            acceptable = parseARecords(reply).length > 0;
+                        } else if (requireQtype == 28) {
+                            acceptable = parseRecords(reply, true).length > 0;
+                        }
+                        if (acceptable) {
+                            if (winner.compareAndSet(null, reply)) {
+                                lastWorkingEndpoint = ep;
+                                lastResolver = ep.key();
+                                latch.countDown();
+                            }
+                            return;
+                        }
+                        // Valid DNS reply with 0 records (e.g. AAAA absent) — endpoint is healthy, don't cut it
+                        emptyValidReply.compareAndSet(null, reply);
+                        return;
+                    }
+                    markCut(ep.key(), System.currentTimeMillis());
+                } catch (Throwable ignored) {
+                    if (winner.get() == null) {
+                        markCut(ep.key(), System.currentTimeMillis());
+                    }
+                } finally {
+                    if (remaining.decrementAndGet() == 0) {
+                        latch.countDown();
+                    }
+                }
+            });
+        }
+        try {
+            latch.await(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        synchronized (activeSockets) {
+            for (java.net.Socket s : activeSockets) {
+                try { s.close(); } catch (Throwable ignored) {}
+            }
+            activeSockets.clear();
+        }
+        byte[] win = winner.get();
+        return win != null ? win : emptyValidReply.get();
+    }
+
+    private static byte[] queryEmergencyUdp(byte[] wireQuery, DatagramProtector udpProtector) {
+        for (String dnsIp : EMERGENCY_UDP_DNS) {
+            java.net.DatagramSocket sock = null;
+            try {
+                sock = new java.net.DatagramSocket();
+                if (udpProtector != null && !udpProtector.protect(sock)) continue;
+                sock.setSoTimeout(cellularNetwork ? 2000 : 1400);
+                InetAddress target = InetAddress.getByName(dnsIp);
+                sock.send(new java.net.DatagramPacket(wireQuery, wireQuery.length, target, 53));
+                byte[] buf = new byte[4096];
+                java.net.DatagramPacket resp = new java.net.DatagramPacket(buf, buf.length);
+                sock.receive(resp);
+                if (resp.getLength() >= 12) {
+                    lastResolver = dnsIp + ":53";
+                    return java.util.Arrays.copyOf(buf, resp.getLength());
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (sock != null) { try { sock.close(); } catch (Throwable ignored) {} }
+            }
+        }
+        return null;
+    }
+
+    private static InetAddress[] queryEndpoints(String key, String hostname, long now, boolean ignoreCut) {
+        return queryEndpointsInternal(key, hostname, now, ignoreCut, 1, null, null);
+    }
+
+    private static InetAddress[] queryEndpointsQtype(String key, String hostname, int qtype, SocketProtector protector) {
+        return queryEndpointsInternal(key, hostname, System.currentTimeMillis(), false, qtype, protector, null);
+    }
+
+    private static InetAddress[] queryEndpointsInternal(String key, String hostname, long now,
+                                                        boolean ignoreCut, int qtype,
+                                                        SocketProtector protector,
+                                                        ColgramNativeDesync.FdProtector fdProtector) {
+        byte[] wireQuery;
+        try {
+            wireQuery = buildQuery(hostname, qtype);
+        } catch (Throwable badName) {
+            return null;
+        }
+
+        // 1. Fast path: pinned last-working endpoint with bounded budget
+        Endpoint pinned = lastWorkingEndpoint;
+        if (pinned != null && (ignoreCut || !isCut(pinned.key(), now))) {
+            try {
+                long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2400L : 1800L);
+                byte[] reply = queryWire(pinned, wireQuery, protector, fdProtector, fastDeadline, null);
+                if (reply != null && reply.length >= 12) {
+                    cutUntil.remove(pinned.key());
+                    String[] found = qtype == 28 ? parseRecords(reply, true) : parseARecords(reply);
+                    if (found.length > 0) {
+                        lastResolver = pinned.key();
+                        if (qtype == 1) {
+                            cache.put(key, new long[]{System.currentTimeMillis()});
+                            answers.put(key, found);
+                        }
+                        return toAddresses(found);
+                    }
+                    // Valid empty AAAA answer on a healthy resolver
+                    if (qtype == 28) return null;
+                }
+            } catch (Throwable t) {
+                Log.i(TAG, pinned.key() + " cut or unreachable: " + t.getClass().getSimpleName());
+                markCut(pinned.key(), System.currentTimeMillis());
+                if (lastWorkingEndpoint == pinned) lastWorkingEndpoint = null;
+            }
+        }
+
+        // 2. Concurrent 3-way diverse waves (max 2 waves under 3.8s each — eliminates 20s/320s hangs!)
+        List<Endpoint> remaining = buildHealthyCandidates(pinned, now, ignoreCut);
+        for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
+            List<Endpoint> wave = pickDiverseWave(remaining, 3);
+            byte[] reply = raceEndpointsWave(wave, wireQuery, protector, fdProtector,
+                    RACE_WAVE_DEADLINE_MS, qtype);
+            if (reply != null && reply.length >= 12) {
+                String[] found = qtype == 28 ? parseRecords(reply, true) : parseARecords(reply);
+                if (found.length > 0) {
+                    if (qtype == 1) {
+                        cache.put(key, new long[]{System.currentTimeMillis()});
+                        answers.put(key, found);
+                    }
+                    return toAddresses(found);
+                }
+                if (qtype == 28) return null;
+            }
         }
         return null;
     }
@@ -230,85 +820,526 @@ public final class ColgramDohResolver {
         return out.isEmpty() ? null : out.toArray(new InetAddress[0]);
     }
 
-    /** RFC 8484 POST, with the address pinned so the SNI is under our control. */
-    private static byte[] query(Endpoint endpoint, String hostname) throws Exception {
-        byte[] request = buildQuery(hostname);
-        HttpURLConnection connection = null;
-        try {
-            URL url = new URL("https://" + endpoint.ip + "/dns-query");
-            connection = (HttpURLConnection) url.openConnection();
-            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            connection.setReadTimeout(READ_TIMEOUT_MS);
-            connection.setInstanceFollowRedirects(false);
-            connection.setRequestMethod("POST");
-            // Host must match the SNI, or Cloudflare answers 400 rather than a DNS message.
-            connection.setRequestProperty("Host", endpoint.sni);
-            connection.setRequestProperty("Content-Type", "application/dns-message");
-            connection.setRequestProperty("Accept", "application/dns-message");
-            connection.setDoOutput(true);
-            if (connection instanceof HttpsURLConnection) {
-                HttpsURLConnection secure = (HttpsURLConnection) connection;
-                SSLContext ssl = SSLContext.getInstance("TLS");
-                ssl.init(null, null, null);
-                secure.setSSLSocketFactory(ssl.getSocketFactory());
-                final String expect = endpoint.verifyName;
-                secure.setHostnameVerifier(new HostnameVerifier() {
-                    @Override
-                    public boolean verify(String ignored, SSLSession session) {
-                        // The handshake already completed with the pinned address; the question is
-                        // whether the peer presented a certificate for the name we asked for.
-                        return matches(session, expect);
-                    }
-                });
+    /**
+     * SSLSocketFactory that connects to an optional pinned IP (with optional VPN protection) using
+     * Conscrypt engine-socket mode and carrier-safe multi-split SNI segmentation (zero MSG_OOB,
+     * zero TTL=1, zero tiny MSS), defeating TSPU SNI-cuts while preserving full TLS verification.
+     */
+    public static javax.net.ssl.SSLSocketFactory createSniFragmentingFactory(
+            final String pinnedIp, final String sniHost, final SocketProtector protector) throws Exception {
+        final javax.net.ssl.SSLSocketFactory delegate = ColgramNativeDesync.createEngineSslSocketFactory();
+        return new javax.net.ssl.SSLSocketFactory() {
+            private java.net.Socket wrapFragmented(java.net.Socket raw, String host, int port, boolean autoClose)
+                    throws java.io.IOException {
+                raw.setTcpNoDelay(true);
+                java.net.Socket sniFrag = (raw instanceof ColgramNativeDesync.NativeSocket)
+                        ? ColgramNativeDesync.wrapForFirstTlsHello(
+                                (ColgramNativeDesync.NativeSocket) raw,
+                                ColgramNativeDesync.MODE_MULTI_SPLIT_SNI, 0, true, true, cellularNetwork, 0)
+                        : new SniFragmentingSocket(raw);
+                String targetSni = (sniHost != null && !sniHost.isEmpty()) ? sniHost : host;
+                javax.net.ssl.SSLSocket tls = (javax.net.ssl.SSLSocket) delegate.createSocket(
+                        sniFrag, targetSni, port, autoClose);
+                hardenTlsSocket(tls);
+                return tls;
             }
-            OutputStream out = connection.getOutputStream();
-            out.write(request);
-            out.flush();
-            if (connection.getResponseCode() != 200) return null;
-            InputStream in = connection.getInputStream();
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-            byte[] chunk = new byte[512];
-            int read;
-            while ((read = in.read(chunk)) != -1) buffer.write(chunk, 0, read);
-            return buffer.toByteArray();
-        } finally {
-            if (connection != null) connection.disconnect();
+
+            private java.net.Socket openRaw(String host, int port) throws java.io.IOException {
+                String targetIp = (pinnedIp != null && !pinnedIp.isEmpty()) ? pinnedIp : host;
+                int timeoutMs = cellularNetwork ? CELLULAR_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
+                android.net.VpnService sysVpn = (protector == null) ? ColgramDpiBypass.activeSystemDpiVpn() : null;
+                if (ColgramNativeDesync.isAvailable() && isIpLiteral(targetIp) && (protector == null || sysVpn != null)) {
+                    try {
+                        ColgramNativeDesync.FdProtector fdProt = sysVpn != null ? sysVpn::protect : null;
+                        return ColgramNativeDesync.connect(targetIp, port, timeoutMs, 0, 0, fdProt);
+                    } catch (Throwable ignored) {
+                        // Fall through to standard Java socket + SNI fragmentation
+                    }
+                }
+                java.net.Socket raw = new java.net.Socket(java.net.Proxy.NO_PROXY);
+                raw.setTcpNoDelay(true);
+                if (protector != null && !protector.protect(raw)) {
+                    try { raw.close(); } catch (Throwable ignored) {}
+                    throw new java.io.IOException("DoH socket protection failed");
+                } else if (sysVpn != null && !sysVpn.protect(raw)) {
+                    try { raw.close(); } catch (Throwable ignored) {}
+                    throw new java.io.IOException("System DPI socket protection failed");
+                }
+                raw.connect(new java.net.InetSocketAddress(targetIp, port), timeoutMs);
+                return raw;
+            }
+
+            @Override public String[] getDefaultCipherSuites() { return delegate.getDefaultCipherSuites(); }
+            @Override public String[] getSupportedCipherSuites() { return delegate.getSupportedCipherSuites(); }
+            @Override public java.net.Socket createSocket() throws java.io.IOException {
+                return delegate.createSocket();
+            }
+            @Override public java.net.Socket createSocket(java.net.Socket s, String host, int port, boolean autoClose)
+                    throws java.io.IOException {
+                return wrapFragmented(s, host, port, autoClose);
+            }
+            @Override public java.net.Socket createSocket(String host, int port) throws java.io.IOException {
+                return wrapFragmented(openRaw(host, port), host, port, true);
+            }
+            @Override public java.net.Socket createSocket(String host, int port, InetAddress localHost, int localPort)
+                    throws java.io.IOException {
+                return wrapFragmented(openRaw(host, port), host, port, true);
+            }
+            @Override public java.net.Socket createSocket(InetAddress host, int port) throws java.io.IOException {
+                return wrapFragmented(openRaw(host.getHostAddress(), port), host.getHostName(), port, true);
+            }
+            @Override public java.net.Socket createSocket(InetAddress address, int port, InetAddress localAddress, int localPort)
+                    throws java.io.IOException {
+                return wrapFragmented(openRaw(address.getHostAddress(), port), address.getHostName(), port, true);
+            }
+        };
+    }
+
+    /** Transparent wrapper that splits only the very first TLS ClientHello across its SNI midpoint. */
+    private static final class SniFragmentingSocket extends java.net.Socket {
+        private final java.net.Socket base;
+        private volatile OutputStream wrappedOut;
+
+        SniFragmentingSocket(java.net.Socket base) { this.base = base; }
+        @Override public InputStream getInputStream() throws java.io.IOException { return base.getInputStream(); }
+        @Override public void connect(java.net.SocketAddress ep, int timeout) throws java.io.IOException { base.connect(ep, timeout); }
+        @Override public boolean isConnected() { return base.isConnected(); }
+        @Override public boolean isBound() { return base.isBound(); }
+        @Override public boolean isClosed() { return base.isClosed(); }
+        @Override public boolean isInputShutdown() { return base.isInputShutdown(); }
+        @Override public boolean isOutputShutdown() { return base.isOutputShutdown(); }
+        @Override public void shutdownInput() throws java.io.IOException { base.shutdownInput(); }
+        @Override public void shutdownOutput() throws java.io.IOException { base.shutdownOutput(); }
+        @Override public void setSoTimeout(int timeout) throws java.net.SocketException { base.setSoTimeout(timeout); }
+        @Override public int getSoTimeout() throws java.net.SocketException { return base.getSoTimeout(); }
+        @Override public void setTcpNoDelay(boolean on) throws java.net.SocketException { base.setTcpNoDelay(on); }
+        @Override public boolean getTcpNoDelay() throws java.net.SocketException { return base.getTcpNoDelay(); }
+        @Override public void setSoLinger(boolean on, int linger) throws java.net.SocketException { base.setSoLinger(on, linger); }
+        @Override public int getSoLinger() throws java.net.SocketException { return base.getSoLinger(); }
+        @Override public void setReuseAddress(boolean on) throws java.net.SocketException { base.setReuseAddress(on); }
+        @Override public boolean getReuseAddress() throws java.net.SocketException { return base.getReuseAddress(); }
+        @Override public void setKeepAlive(boolean on) throws java.net.SocketException { base.setKeepAlive(on); }
+        @Override public boolean getKeepAlive() throws java.net.SocketException { return base.getKeepAlive(); }
+        @Override public void setSendBufferSize(int size) throws java.net.SocketException { base.setSendBufferSize(size); }
+        @Override public int getSendBufferSize() throws java.net.SocketException { return base.getSendBufferSize(); }
+        @Override public void setReceiveBufferSize(int size) throws java.net.SocketException { base.setReceiveBufferSize(size); }
+        @Override public int getReceiveBufferSize() throws java.net.SocketException { return base.getReceiveBufferSize(); }
+        @Override public void setOOBInline(boolean on) throws java.net.SocketException { base.setOOBInline(on); }
+        @Override public boolean getOOBInline() throws java.net.SocketException { return base.getOOBInline(); }
+        @Override public InetAddress getInetAddress() { return base.getInetAddress(); }
+        @Override public int getPort() { return base.getPort(); }
+        @Override public InetAddress getLocalAddress() { return base.getLocalAddress(); }
+        @Override public int getLocalPort() { return base.getLocalPort(); }
+        @Override public java.net.SocketAddress getRemoteSocketAddress() { return base.getRemoteSocketAddress(); }
+        @Override public java.net.SocketAddress getLocalSocketAddress() { return base.getLocalSocketAddress(); }
+        @Override public void close() throws java.io.IOException { base.close(); }
+
+        @Override
+        public OutputStream getOutputStream() throws java.io.IOException {
+            OutputStream existing = wrappedOut;
+            if (existing != null) return existing;
+            final OutputStream raw = base.getOutputStream();
+            OutputStream fresh = new OutputStream() {
+                private boolean firstHelloSent;
+
+                @Override public synchronized void write(int b) throws java.io.IOException {
+                    write(new byte[]{(byte) b}, 0, 1);
+                }
+
+                @Override public synchronized void write(byte[] b, int off, int len) throws java.io.IOException {
+                    if (!firstHelloSent && len >= 11 && (b[off] & 0xFF) == 22 && b[off + 1] == 3 && (b[off + 5] & 0xFF) == 1) {
+                        firstHelloSent = true;
+                        byte[] copy = new byte[len];
+                        System.arraycopy(b, off, copy, 0, len);
+                        byte[][] pieces = ColgramTlsMimic.fragment(copy, new java.util.Random());
+                        for (int i = 0; i < pieces.length; i++) {
+                            raw.write(pieces[i]);
+                            raw.flush();
+                            if (i + 1 < pieces.length) {
+                                try { Thread.sleep(2L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                            }
+                        }
+                        return;
+                    }
+                    firstHelloSent = true;
+                    raw.write(b, off, len);
+                }
+
+                @Override public void flush() throws java.io.IOException { raw.flush(); }
+                @Override public void close() throws java.io.IOException { raw.close(); }
+            };
+            wrappedOut = fresh;
+            return fresh;
         }
     }
 
     /**
-     * Certificate name check without pulling in X509 parsing.
-     *
-     * Deliberately narrow: the caller already dialled a pinned address, so this guards against an
-     * impostor on that address, not against the platform's own trust store. The platform chain is
-     * still verified by the default SSLSocketFactory above - only the name comparison is ours.
+     * SSLSocketFactory that preserves the real TLS SNI hostname when connecting via a pinned DoH IP
+     * over our local SOCKS5 DPI proxy (127.0.0.1), using Conscrypt engine-socket mode.
+     */
+    public static javax.net.ssl.SSLSocketFactory createSniOverrideFactory(final String sniHost) throws Exception {
+        final javax.net.ssl.SSLSocketFactory delegate = ColgramNativeDesync.createEngineSslSocketFactory();
+        return new javax.net.ssl.SSLSocketFactory() {
+            private String effectiveHost(String host) {
+                return (sniHost != null && !sniHost.isEmpty()) ? sniHost : host;
+            }
+            @Override public String[] getDefaultCipherSuites() { return delegate.getDefaultCipherSuites(); }
+            @Override public String[] getSupportedCipherSuites() { return delegate.getSupportedCipherSuites(); }
+            @Override public java.net.Socket createSocket(java.net.Socket s, String host, int port, boolean autoClose)
+                    throws java.io.IOException {
+                javax.net.ssl.SSLSocket tls = (javax.net.ssl.SSLSocket) delegate.createSocket(
+                        s, effectiveHost(host), port, autoClose);
+                hardenTlsSocket(tls);
+                return tls;
+            }
+            @Override public java.net.Socket createSocket(String host, int port) throws java.io.IOException {
+                return delegate.createSocket(host, port);
+            }
+            @Override public java.net.Socket createSocket(String host, int port, InetAddress localHost, int localPort)
+                    throws java.io.IOException {
+                return delegate.createSocket(host, port, localHost, localPort);
+            }
+            @Override public java.net.Socket createSocket(InetAddress host, int port) throws java.io.IOException {
+                return delegate.createSocket(host, port);
+            }
+            @Override public java.net.Socket createSocket(InetAddress address, int port, InetAddress localAddress, int localPort)
+                    throws java.io.IOException {
+                return delegate.createSocket(address, port, localAddress, localPort);
+            }
+        };
+    }
+
+    private static byte[] queryWire(Endpoint endpoint, byte[] request,
+                                    SocketProtector protector,
+                                    ColgramNativeDesync.FdProtector fdProtector,
+                                    long deadlineAt,
+                                    List<java.net.Socket> activeSockets) throws Exception {
+        if (protector == null && fdProtector == null) {
+            android.net.VpnService sysVpn = ColgramDpiBypass.activeSystemDpiVpn();
+            if (sysVpn != null) {
+                protector = sysVpn::protect;
+                fdProtector = sysVpn::protect;
+            }
+        }
+        boolean canNative = ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null);
+        // Spoofed RU-whitelist SNI (vk.com / max.ru) first on endpoints proven to accept it while
+        // still verifying the real CA-signed certificate against endpoint.verifyName!
+        if (endpoint.supportsSpoofedSni) {
+            String primarySni = SPOOFED_RU_SNIS[0];
+            try {
+                byte[] res = querySingleAttempt(endpoint, request, protector, fdProtector,
+                        primarySni, canNative, deadlineAt, activeSockets);
+                if (res != null && res.length >= 12) return res;
+            } catch (TcpConnectException tcpFail) {
+                // Fail fast: never retry TLS modes against a TCP-unreachable IP!
+                throw tcpFail;
+            } catch (Throwable tlsOrHttpErr) {
+                // Fall back once to real SNI (or secondary spoofed SNI for AliDNS) if time remains
+                if (System.currentTimeMillis() + 500L >= deadlineAt) {
+                    throw tlsOrHttpErr instanceof Exception ? (Exception) tlsOrHttpErr
+                            : new java.io.IOException(tlsOrHttpErr);
+                }
+            }
+            String fallbackSni = "alidns".equals(endpoint.providerGroup) ? SPOOFED_RU_SNIS[1] : endpoint.sni;
+            return querySingleAttempt(endpoint, request, protector, fdProtector,
+                    fallbackSni, false, deadlineAt, activeSockets);
+        }
+
+        // Real-SNI-only endpoints (AdGuard, ControlD): carrier-safe MODE_MULTI_SPLIT_SNI first, then Java SNI split
+        if (canNative) {
+            try {
+                byte[] res = querySingleAttempt(endpoint, request, protector, fdProtector,
+                        endpoint.sni, true, deadlineAt, activeSockets);
+                if (res != null && res.length >= 12) return res;
+            } catch (TcpConnectException tcpFail) {
+                throw tcpFail;
+            } catch (Throwable tlsOrHttpErr) {
+                if (System.currentTimeMillis() + 500L >= deadlineAt) {
+                    throw tlsOrHttpErr instanceof Exception ? (Exception) tlsOrHttpErr
+                            : new java.io.IOException(tlsOrHttpErr);
+                }
+            }
+        }
+        return querySingleAttempt(endpoint, request, protector, fdProtector,
+                endpoint.sni, false, deadlineAt, activeSockets);
+    }
+
+    private static byte[] querySingleAttempt(Endpoint endpoint, byte[] request,
+                                             SocketProtector protector,
+                                             ColgramNativeDesync.FdProtector fdProtector,
+                                             String tlsSni, boolean useNativeMultiSplit,
+                                             long deadlineAt,
+                                             List<java.net.Socket> activeSockets) throws Exception {
+        long remaining = deadlineAt - System.currentTimeMillis();
+        if (remaining < 350L) {
+            throw new TcpConnectException("DoH/DoT deadline exceeded for " + endpoint.key());
+        }
+        int connectTimeout = (int) Math.min(
+                cellularNetwork ? CELLULAR_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS,
+                Math.max(400L, remaining));
+        java.net.Socket raw = null;
+        javax.net.ssl.SSLSocket ssl = null;
+        try {
+            java.net.Socket transport;
+            if (useNativeMultiSplit && ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null)) {
+                ColgramNativeDesync.NativeSocket nativeSock;
+                try {
+                    nativeSock = ColgramNativeDesync.connect(
+                            endpoint.ip, endpoint.port, connectTimeout, 0, 0, fdProtector);
+                } catch (Throwable connectErr) {
+                    throw new TcpConnectException("Native TCP connect failed to " + endpoint.key(), connectErr);
+                }
+                raw = nativeSock;
+                if (activeSockets != null) activeSockets.add(raw);
+                transport = ColgramNativeDesync.wrapForFirstTlsHello(
+                        nativeSock, ColgramNativeDesync.MODE_MULTI_SPLIT_SNI, 0, true, true, cellularNetwork, 0);
+            } else {
+                raw = new java.net.Socket(java.net.Proxy.NO_PROXY);
+                raw.setTcpNoDelay(true);
+                if (protector != null && !protector.protect(raw)) {
+                    throw new TcpConnectException("DoH/DoT socket protection failed for " + endpoint.key());
+                }
+                try {
+                    raw.connect(new java.net.InetSocketAddress(endpoint.ip, endpoint.port), connectTimeout);
+                } catch (Throwable connectErr) {
+                    throw new TcpConnectException("TCP connect failed to " + endpoint.key(), connectErr);
+                }
+                if (activeSockets != null) activeSockets.add(raw);
+                transport = new SniFragmentingSocket(raw);
+            }
+
+            long remAfterConnect = deadlineAt - System.currentTimeMillis();
+            if (remAfterConnect < 250L) {
+                throw new java.net.SocketTimeoutException("DoH/DoT post-connect deadline exceeded");
+            }
+            int readTimeout = (int) Math.min(
+                    cellularNetwork ? CELLULAR_READ_TIMEOUT_MS : READ_TIMEOUT_MS,
+                    Math.max(350L, remAfterConnect));
+            raw.setSoTimeout(readTimeout);
+
+            javax.net.ssl.SSLSocketFactory engineFactory = ColgramNativeDesync.createEngineSslSocketFactory();
+            ssl = (javax.net.ssl.SSLSocket) engineFactory.createSocket(transport, tlsSni, endpoint.port, true);
+            hardenTlsSocket(ssl);
+            ssl.setSoTimeout(readTimeout);
+            ssl.startHandshake();
+            if (!matches(ssl.getSession(), endpoint.verifyName)) {
+                throw new javax.net.ssl.SSLPeerUnverifiedException("DoH/DoT cert mismatch for " + endpoint.verifyName);
+            }
+
+            if (endpoint.dot) {
+                // RFC 7858 DNS-over-TLS: 2-byte big-endian length prefix + wire DNS message
+                OutputStream out = ssl.getOutputStream();
+                byte[] framed = new byte[2 + request.length];
+                framed[0] = (byte) ((request.length >>> 8) & 0xFF);
+                framed[1] = (byte) (request.length & 0xFF);
+                System.arraycopy(request, 0, framed, 2, request.length);
+                out.write(framed);
+                out.flush();
+                return readDotResponse(ssl.getInputStream());
+            }
+
+            OutputStream out = ssl.getOutputStream();
+            String hdr = "POST /dns-query HTTP/1.1\r\n"
+                    + "Host: " + endpoint.sni + "\r\n"
+                    + "Content-Type: application/dns-message\r\n"
+                    + "Accept: application/dns-message\r\n"
+                    + "Content-Length: " + request.length + "\r\n"
+                    + "Connection: close\r\n\r\n";
+            out.write(hdr.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            out.write(request);
+            out.flush();
+
+            InputStream in = ssl.getInputStream();
+            ByteArrayOutputStream rawResp = new ByteArrayOutputStream();
+            byte[] buf = new byte[1024];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                rawResp.write(buf, 0, n);
+                if (rawResp.size() > 65536) break;
+            }
+            byte[] all = rawResp.toByteArray();
+            int headerEnd = findHttpHeaderEnd(all);
+            if (headerEnd < 0) return null;
+            String headStr = new String(all, 0, headerEnd, java.nio.charset.StandardCharsets.ISO_8859_1);
+            int firstCr = headStr.indexOf('\r');
+            String statusLine = firstCr > 0 ? headStr.substring(0, firstCr) : headStr;
+            if (!statusLine.contains(" 200")) return null;
+            boolean chunked = headStr.toLowerCase(java.util.Locale.ROOT).contains("transfer-encoding: chunked");
+            byte[] body = java.util.Arrays.copyOfRange(all, headerEnd + 4, all.length);
+            return chunked ? decodeChunked(body) : body;
+        } finally {
+            if (activeSockets != null && raw != null) activeSockets.remove(raw);
+            if (ssl != null) { try { ssl.close(); } catch (Throwable ignored) {} }
+            if (raw != null) { try { raw.close(); } catch (Throwable ignored) {} }
+        }
+    }
+
+    /** Reads a single RFC 7858 DNS-over-TLS length-prefixed response frame. */
+    static byte[] readDotResponse(InputStream in) throws java.io.IOException {
+        byte[] lenBuf = new byte[2];
+        int got = 0;
+        while (got < 2) {
+            int r = in.read(lenBuf, got, 2 - got);
+            if (r < 0) return null;
+            got += r;
+        }
+        int respLen = ((lenBuf[0] & 0xFF) << 8) | (lenBuf[1] & 0xFF);
+        if (respLen < 12 || respLen > 65535) return null;
+        byte[] msg = new byte[respLen];
+        int pos = 0;
+        while (pos < respLen) {
+            int r = in.read(msg, pos, respLen - pos);
+            if (r < 0) return null;
+            pos += r;
+        }
+        return msg;
+    }
+
+    private static int findHttpHeaderEnd(byte[] data) {
+        for (int i = 0; i <= data.length - 4; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') return i;
+        }
+        return -1;
+    }
+
+    private static byte[] decodeChunked(byte[] body) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int i = 0;
+        while (i < body.length) {
+            int crlf = -1;
+            for (int j = i; j < body.length - 1; j++) {
+                if (body[j] == '\r' && body[j + 1] == '\n') { crlf = j; break; }
+            }
+            if (crlf < 0) break;
+            String sizeHex = new String(body, i, crlf - i, java.nio.charset.StandardCharsets.US_ASCII).trim();
+            int semi = sizeHex.indexOf(';');
+            if (semi >= 0) sizeHex = sizeHex.substring(0, semi).trim();
+            int chunkLen;
+            try { chunkLen = Integer.parseInt(sizeHex, 16); } catch (NumberFormatException e) { break; }
+            if (chunkLen <= 0) break;
+            int dataStart = crlf + 2;
+            if (dataStart + chunkLen > body.length) break;
+            out.write(body, dataStart, chunkLen);
+            i = dataStart + chunkLen + 2;
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * RFC 6125 strict hostname / IP verification against X509 SANs (and Subject CN only when SANs are absent).
      */
     private static boolean matches(SSLSession session, String name) {
         try {
             java.security.cert.Certificate[] chain = session.getPeerCertificates();
             if (chain.length == 0) return false;
             if (!(chain[0] instanceof java.security.cert.X509Certificate)) return false;
-            java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate) chain[0];
-            String subject = cert.getSubjectX500Principal().getName();
-            String san = String.valueOf(cert.getSubjectAlternativeNames());
-            String needle = name.toLowerCase(java.util.Locale.ROOT);
-            return subject.toLowerCase(java.util.Locale.ROOT).contains(needle)
-                    || san.toLowerCase(java.util.Locale.ROOT).contains(needle);
+            return matchesCertificateName((java.security.cert.X509Certificate) chain[0], name);
         } catch (Throwable t) {
-            // No certificate to inspect means no basis for trust, so refuse rather than allow.
             return false;
         }
     }
 
-    /** A minimal wire-format A query. */
-    private static byte[] buildQuery(String hostname) {
+    static boolean matchesCertificateName(java.security.cert.X509Certificate cert, String expected) {
+        if (cert == null || expected == null || expected.trim().isEmpty()) return false;
+        String host = expected.trim().toLowerCase(java.util.Locale.ROOT);
+        boolean expectingIp = isIpLiteral(host);
+        boolean hasDnsSan = false;
+        try {
+            java.util.Collection<List<?>> sans = cert.getSubjectAlternativeNames();
+            if (sans != null) {
+                for (List<?> entry : sans) {
+                    if (entry == null || entry.size() < 2 || !(entry.get(0) instanceof Integer)) continue;
+                    int type = (Integer) entry.get(0);
+                    Object val = entry.get(1);
+                    if (!(val instanceof String)) continue;
+                    String sanVal = ((String) val).trim().toLowerCase(java.util.Locale.ROOT);
+                    if (type == 2) {
+                        hasDnsSan = true;
+                        if (!expectingIp && matchesDnsPattern(sanVal, host)) return true;
+                    } else if (type == 7 && expectingIp && host.equals(sanVal)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
+        if (hasDnsSan || expectingIp) return false;
+        String cn = extractCommonName(cert.getSubjectX500Principal().getName(
+                javax.security.auth.x500.X500Principal.RFC2253));
+        return cn != null && matchesDnsPattern(cn.toLowerCase(java.util.Locale.ROOT), host);
+    }
+
+    static boolean matchesDnsPattern(String pattern, String host) {
+        if (pattern == null || host == null || pattern.isEmpty() || host.isEmpty()) return false;
+        if (pattern.equals(host)) return true;
+        if (!pattern.startsWith("*.")) return false;
+        String suffix = pattern.substring(2);
+        // Reject public suffix wildcards like "*.com" or empty suffixes
+        if (suffix.isEmpty() || suffix.indexOf('.') < 0 || suffix.startsWith("*")) return false;
+        int dot = host.indexOf('.');
+        if (dot <= 0) return false;
+        String tail = host.substring(dot + 1);
+        return suffix.equals(tail);
+    }
+
+    static String extractCommonName(String dn) {
+        if (dn == null || dn.isEmpty()) return null;
+        int i = 0;
+        int len = dn.length();
+        while (i < len) {
+            while (i < len && (dn.charAt(i) == ',' || dn.charAt(i) == '+' || dn.charAt(i) == ' ')) i++;
+            int eq = dn.indexOf('=', i);
+            if (eq <= i) break;
+            String attr = dn.substring(i, eq).trim();
+            StringBuilder val = new StringBuilder();
+            i = eq + 1;
+            while (i < len) {
+                char c = dn.charAt(i);
+                if (c == '\\' && i + 1 < len) {
+                    val.append(dn.charAt(i + 1));
+                    i += 2;
+                    continue;
+                }
+                if (c == ',' || c == '+') break;
+                val.append(c);
+                i++;
+            }
+            if ("CN".equalsIgnoreCase(attr)) {
+                return val.toString().trim();
+            }
+        }
+        return null;
+    }
+
+    /** Harden an SSLSocket with modern TLS protocols when supported by the runtime. */
+    public static void hardenTlsSocket(javax.net.ssl.SSLSocket ssl) {
+        if (ssl == null) return;
+        try {
+            String[] supported = ssl.getSupportedProtocols();
+            if (supported == null) return;
+            List<String> preferred = new ArrayList<>(2);
+            for (String p : supported) {
+                if ("TLSv1.3".equals(p)) preferred.add(0, p);
+                else if ("TLSv1.2".equals(p)) preferred.add(p);
+            }
+            if (!preferred.isEmpty()) {
+                ssl.setEnabledProtocols(preferred.toArray(new String[0]));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** A minimal wire-format DNS query (qtype 1 = A, 28 = AAAA). */
+    private static byte[] buildQuery(String hostname, int qtype) {
         java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
         int id = (int) (System.nanoTime() & 0xffff);
-        body.write(id >> 8); body.write(id & 0xff);
-        body.write(0x01); body.write(0x00);          // recursion desired
-        body.write(0x00); body.write(0x01);          // one question
-        body.write(0x00); body.write(0x00); body.write(0x00); body.write(0x00);
-        body.write(0x00); body.write(0x00);          // QCLASS IN
+        body.write(id >> 8); body.write(id & 0xff);    // ID
+        body.write(0x01); body.write(0x00);            // flags: recursion desired
+        body.write(0x00); body.write(0x01);            // QDCOUNT = 1
+        body.write(0x00); body.write(0x00);            // ANCOUNT = 0
+        body.write(0x00); body.write(0x00);            // NSCOUNT = 0
+        body.write(0x00); body.write(0x00);            // ARCOUNT = 0
         for (String label : hostname.split("\\.")) {
             byte[] bytes = label.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             if (bytes.length == 0 || bytes.length > 63) {
@@ -318,60 +1349,60 @@ public final class ColgramDohResolver {
             body.write(bytes, 0, bytes.length);
         }
         body.write(0x00);                              // root
-        body.write(0x00); body.write(0x01);          // QTYPE A
-        body.write(0x00); body.write(0x01);          // QCLASS IN
-        byte[] query = body.toByteArray();
-        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(12 + query.length);
-        buffer.putShort((short) id);
-        buffer.put((byte) 0x01).put((byte) 0x00);      // flags
-        buffer.putShort((short) 1);                   // QDCOUNT
-        buffer.putShort((short) 0);                   // ANCOUNT
-        buffer.putShort((short) 0);                   // NSCOUNT
-        buffer.putShort((short) 0);                   // ARCOUNT
-        buffer.put(query, 4, query.length);           // the question, minus the header we built
-        return buffer.array();
+        body.write((qtype >> 8) & 0xff); body.write(qtype & 0xff); // QTYPE
+        body.write(0x00); body.write(0x01);            // QCLASS IN
+        return body.toByteArray();
     }
 
     /** Extract A records from a wire-format reply. */
     static String[] parseARecords(byte[] message) {
+        return parseRecords(message, false);
+    }
+
+    /** Extract A (or AAAA when ipv6Only=true) records from a wire-format reply. */
+    static String[] parseRecords(byte[] message, boolean ipv6Only) {
         List<String> found = new ArrayList<>();
         if (message == null || message.length < 12) return new String[0];
         java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message);
+        buffer.position(4);
         int questions = buffer.getShort() & 0xffff;
         int answers = buffer.getShort() & 0xffff;
         buffer.position(12);
         try {
-            // Each question is a name FOLLOWED BY qtype and qclass. Skipping only the name left
-            // the cursor two bytes short, so the first answer was read as type 256 and the
-            // parser silently returned nothing - which looked exactly like a resolver that had
-            // been cut, and would have sent the app round the pool for no reason.
             for (int i = 0; i < questions; i++) {
                 skipName(buffer);
+                if (buffer.remaining() < 4) break;
                 buffer.position(buffer.position() + 4); // QTYPE + QCLASS
             }
             for (int i = 0; i < answers; i++) {
-                // A record whose length runs past the end of the datagram. Any address read
-                // before it is already in `found`, so leaving the loop here is the whole answer -
-                // asking for bytes that are not there is what produced the BufferUnderflowException
-                // this replaces, even though the A record had already been read successfully.
                 if (buffer.remaining() < 11) {
                     break;
                 }
                 skipName(buffer);
+                if (buffer.remaining() < 10) {
+                    break;
+                }
                 int type = buffer.getShort() & 0xffff;
                 int clazz = buffer.getShort() & 0xffff;
                 long ttl = buffer.getInt() & 0xffffffffL;
                 int length = buffer.getShort() & 0xffff;
                 int start = buffer.position();
-                if (type == 1 && clazz == 1 && length == 4) {
+                if (start + length > buffer.limit()) {
+                    break;
+                }
+                if (!ipv6Only && type == 1 && clazz == 1 && length == 4) {
                     String ip = (buffer.get() & 0xff) + "." + (buffer.get() & 0xff) + "."
                             + (buffer.get() & 0xff) + "." + (buffer.get() & 0xff);
                     if (!found.contains(ip)) found.add(ip);
+                } else if (ipv6Only && type == 28 && clazz == 1 && length == 16) {
+                    byte[] raw6 = new byte[16];
+                    buffer.get(raw6);
+                    String ip6 = InetAddress.getByAddress(raw6).getHostAddress();
+                    if (!found.contains(ip6)) found.add(ip6);
                 }
                 buffer.position(start + length);
             }
         } catch (Throwable t) {
-            // A truncated or compressed reply still yields whatever was read before the throw.
             Log.i(TAG, "reply parse stopped early: " + t.getClass().getSimpleName());
         }
         return found.toArray(new String[0]);
@@ -379,11 +1410,15 @@ public final class ColgramDohResolver {
 
     /** Skip a possibly compressed name. */
     private static void skipName(java.nio.ByteBuffer buffer) {
-        while (true) {
+        while (buffer.hasRemaining()) {
             int len = buffer.get() & 0xff;
             if (len == 0) return;
             if ((len & 0xc0) == 0xc0) {
-                buffer.get();
+                if (buffer.hasRemaining()) buffer.get();
+                return;
+            }
+            if (buffer.remaining() < len) {
+                buffer.position(buffer.limit());
                 return;
             }
             buffer.position(buffer.position() + len);

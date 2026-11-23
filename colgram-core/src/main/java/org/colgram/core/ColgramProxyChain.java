@@ -57,17 +57,26 @@ public final class ColgramProxyChain {
         public final int port;
         /** true = SOCKS5, false = HTTP CONNECT. */
         public final boolean socks;
+        public final String username;
+        public final String password;
         public volatile int rttMs = -1;
         public volatile boolean dead;
 
         public Relay(String host, int port, boolean socks) {
+            this(host, port, socks, null, null);
+        }
+
+        public Relay(String host, int port, boolean socks, String username, String password) {
             this.host = host;
             this.port = port;
             this.socks = socks;
+            this.username = username == null ? "" : username;
+            this.password = password == null ? "" : password;
         }
 
         public String key() {
-            return (socks ? "socks5://" : "connect://") + host + ":" + port;
+            String userPrefix = username.isEmpty() ? "" : username + "@";
+            return (socks ? "socks5://" : "connect://") + userPrefix + host + ":" + port;
         }
 
         @Override
@@ -547,29 +556,37 @@ public final class ColgramProxyChain {
                     int portAt;
                     if (atyp == 3) {
                         int nameLen = body[0] & 0xff;
+                        if (1 + nameLen + 2 > len) continue;
                         host = new String(body, 1, nameLen, "US-ASCII");
                         portAt = 1 + nameLen;
                     } else {
-                        byte[] addrBytes = new byte[atyp == 1 ? 4 : 16];
+                        int addrLen = atyp == 1 ? 4 : 16;
+                        if (addrLen + 2 > len) continue;
+                        byte[] addrBytes = new byte[addrLen];
                         System.arraycopy(body, 0, addrBytes, 0, addrBytes.length);
                         host = InetAddress.getByAddress(addrBytes).getHostAddress();
-                        portAt = atyp == 1 ? 4 : 16;
+                        portAt = addrLen;
                     }
                     int port = ((body[portAt] & 0xff) << 8) | (body[portAt + 1] & 0xff);
+                    int payloadOffset = portAt + 2;
+                    int payloadLen = len - payloadOffset;
+                    if (payloadLen <= 0) continue;
 
                     Socket relay = connectThrough(uplink, host, port, CONNECT_TIMEOUT_MS);
                     if (relay == null) continue;
-                    // One short-lived stream per datagram pair is what a relay can offer; the point is
-                    // that the client's association itself now completes, which is what it never did.
-                    relay.getOutputStream().write(body, portAt + 2, body.length - portAt - 2);
+                    relay.getOutputStream().write(body, payloadOffset, payloadLen);
                     relay.getOutputStream().flush();
                     relay.setSoTimeout(CONNECT_TIMEOUT_MS);
                     InputStream in = relay.getInputStream();
-                    byte[] chunk = new byte[65535];
+                    byte[] chunk = new byte[65500];
                     int n = in.read(chunk);
                     if (n > 0) {
-                        udp.send(new DatagramPacket(chunk, n, InetAddress.getByName("127.0.0.1"),
-                                client.getLocalPort()));
+                        byte[] hdr = new byte[10 + n];
+                        hdr[3] = 1;
+                        hdr[8] = (byte) ((port >> 8) & 0xff);
+                        hdr[9] = (byte) (port & 0xff);
+                        System.arraycopy(chunk, 0, hdr, 10, n);
+                        udp.send(new DatagramPacket(hdr, hdr.length, client.getInetAddress(), client.getLocalPort()));
                     }
                     relay.close();
                 }
@@ -661,35 +678,58 @@ public final class ColgramProxyChain {
         }
     }
 
+    private static InetSocketAddress resolveEndpoint(String host, int port) {
+        if (ColgramConfig.isDohEnabled() && !ColgramDohResolver.isIpLiteral(host)) {
+            InetAddress resolved = ColgramDohResolver.resolveOrNull(host);
+            if (resolved != null) {
+                return new InetSocketAddress(resolved, port);
+            }
+            if (ColgramConfig.isStrictProxySecurityEnabled()) {
+                return InetSocketAddress.createUnresolved(host, port);
+            }
+        }
+        return new InetSocketAddress(host, port);
+    }
+
     /**
-     * One tunnelled connection. SOCKS5 goes through java.net.Proxy; HTTP CONNECT is spoken by
-     * hand because the platform's HTTP stack will not hand back the raw socket afterwards.
+     * One tunnelled connection. SOCKS5 goes through java.net.Proxy with unresolved target
+     * (ATYP=3 remote DNS so the device never leaks queries); HTTP CONNECT is spoken directly
+     * because the platform's HTTP stack will not hand back the raw socket afterwards.
      */
     private static Socket connectThrough(Relay relay, String host, int port, int timeoutMs) {
+        if (relay == null || host == null || host.isEmpty() || port <= 0) return null;
         try {
-            InetSocketAddress target = new InetSocketAddress(host, port);
+            InetSocketAddress relayAddr = resolveEndpoint(relay.host, relay.port);
+            if (relayAddr.isUnresolved()) return null;
             if (relay.socks) {
-                Socket socket = new Socket(new Proxy(Proxy.Type.SOCKS,
-                        new InetSocketAddress(relay.host, relay.port)));
+                // Always speak RFC 1928 SOCKS5 CONNECT directly with TCP_NODELAY + 2-byte
+                // segmentation via ColgramSocks5Codec (never java.net.Proxy, whose single-packet
+                // CONNECT to 149.154.* / 91.108.* is dropped by MegaFon/Yota LTE TSPU).
+                Socket socket = new Socket(Proxy.NO_PROXY);
                 try {
-                    socket.connect(target, timeoutMs);
+                    socket.setTcpNoDelay(true);
+                    socket.connect(relayAddr, timeoutMs);
+                    socket.setSoTimeout(timeoutMs);
+                    if (!ColgramSocks5Codec.requestConnectHost(
+                            socket.getOutputStream(), socket.getInputStream(),
+                            host, port, relay.username, relay.password)) {
+                        closeQuietly(socket);
+                        return null;
+                    }
+                    socket.setSoTimeout(0);
                     return socket;
                 } catch (Throwable t) {
                     closeQuietly(socket);
                     return null;
                 }
             }
-            Socket socket = new Socket();
+            Socket socket = new Socket(Proxy.NO_PROXY);
             try {
-                socket.connect(new InetSocketAddress(relay.host, relay.port), timeoutMs);
+                socket.setTcpNoDelay(true);
+                socket.connect(relayAddr, timeoutMs);
                 socket.setSoTimeout(timeoutMs);
                 OutputStream out = socket.getOutputStream();
-                String request = "CONNECT " + host + ":" + port + " HTTP/1.1\r\n"
-                        + "Host: " + host + ":" + port + "\r\n"
-                        + "User-Agent: Colgram/1.0\r\n"
-                        + "\r\n";
-                out.write(request.getBytes("UTF-8"));
-                out.flush();
+                ColgramSocks5Codec.writeHttpConnectSegmented(out, host, port, relay.username, relay.password);
                 if (!readConnectOk(socket.getInputStream())) {
                     closeQuietly(socket);
                     return null;

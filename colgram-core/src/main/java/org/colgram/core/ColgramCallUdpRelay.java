@@ -65,12 +65,16 @@ final class ColgramCallUdpRelay {
                 if (frame == null) continue;
                 client = sender;
                 try {
-                    InetSocketAddress target = frame.destination();
+                    InetSocketAddress target = frame.destination(vpn);
                     if (target.isUnresolved() || target.getAddress().isAnyLocalAddress()
                             || target.getAddress().isLoopbackAddress() || target.getAddress().isMulticastAddress()) continue;
                     DatagramSocket upstream = upstreams.get(target);
                     if (upstream == null) {
                         if (upstreams.size() >= MAX_PEERS) continue;
+                        // Do not send low-TTL UDP decoys from a separate ephemeral socket/port:
+                        // stateful TSPU tracks UDP flows by 5-tuple, so a mismatched source port
+                        // burns latency/FDs with zero DPI effect, and raw fd extraction from Java
+                        // DatagramSocket risks bionic fdsan / Android hidden-API failures.
                         upstream = new DatagramSocket(null);
                         try {
                             if (!vpn.protect(upstream)) throw new IOException("UDP socket protection failed");
@@ -145,8 +149,23 @@ final class ColgramCallUdpRelay {
         }
 
         InetSocketAddress destination() throws IOException {
-            if (hostname) return new InetSocketAddress(
-                    InetAddress.getByName(new String(address, StandardCharsets.US_ASCII)), port);
+            return destination(null);
+        }
+
+        InetSocketAddress destination(VpnService vpn) throws IOException {
+            if (hostname) {
+                String host = new String(address, StandardCharsets.US_ASCII);
+                if (ColgramConfig.isDohEnabled() && !ColgramDohResolver.isIpLiteral(host)) {
+                    InetAddress doh = vpn != null
+                            ? ColgramDohResolver.resolveProtected(host, vpn::protect, vpn::protect)
+                            : ColgramDohResolver.resolveOrNull(host);
+                    if (doh != null) return new InetSocketAddress(doh, port);
+                    if (ColgramConfig.isStrictProxySecurityEnabled()) {
+                        return InetSocketAddress.createUnresolved(host, port);
+                    }
+                }
+                return new InetSocketAddress(InetAddress.getByName(host), port);
+            }
             return new InetSocketAddress(InetAddress.getByAddress(address), port);
         }
 

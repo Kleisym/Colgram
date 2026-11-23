@@ -148,14 +148,13 @@ public class ColgramFileImport {
     /** The private inbox. Inside the app sandbox, so it needs no permission whatsoever. */
     public static File getInboxDir(Context context) {
         File dir = new File(context.getFilesDir(), "colgram_inbox");
-        if (!dir.exists()) {
-            dir.mkdirs();
-        }
+        ColgramStorageSandbox.ensureDirWithNoMedia(dir);
         return dir;
     }
 
     /**
-     * Copy one picked document into the inbox.
+     * Copy one picked document into the inbox, deduplicating against existing inbox files by SHA-256
+     * and opportunistically pruning unreferenced inbox copies older than 7 days.
      *
      * Returns null on any failure so the caller can simply skip it - a partial import is better
      * than an aborted one.
@@ -164,7 +163,12 @@ public class ColgramFileImport {
         if (context == null || uri == null) return null;
         InputStream in = null;
         OutputStream out = null;
+        File tmp = null;
         try {
+            File inboxDir = getInboxDir(context);
+            ColgramStorageOptimizer.pruneRegenerableWaste(
+                    null, inboxDir, ColgramStorageOptimizer.getActiveTelegramFilePaths(), System.currentTimeMillis());
+
             String name = displayName(context, uri);
             if (name == null || name.isEmpty()) {
                 name = "import_" + System.currentTimeMillis();
@@ -172,24 +176,58 @@ public class ColgramFileImport {
             // Sanitise: a display name can contain path separators, and it is attacker-controlled
             // as far as we are concerned (any app can publish a document provider).
             name = name.replace('/', '_').replace('\\', '_');
-            File dest = uniqueFile(getInboxDir(context), name);
+            tmp = new File(inboxDir, ".import_" + System.currentTimeMillis() + "_" + Math.abs(name.hashCode()) + ".cgtmp");
 
             in = context.getContentResolver().openInputStream(uri);
             if (in == null) return null;
-            out = new FileOutputStream(dest);
+            out = new FileOutputStream(tmp);
             byte[] buf = new byte[64 * 1024];
             int n;
             while ((n = in.read(buf)) != -1) {
                 out.write(buf, 0, n);
             }
             out.flush();
-            return dest;
+            out.close();
+            out = null;
+
+            long len = tmp.length();
+            String sha = ColgramStorageOptimizer.computeSha256(tmp);
+            if (!sha.isEmpty() && len > 0L) {
+                File[] existing = inboxDir.listFiles();
+                if (existing != null) {
+                    for (File cand : existing) {
+                        if (cand != null && cand.isFile() && !cand.equals(tmp)
+                                && !cand.getName().endsWith(".cgtmp") && cand.length() == len) {
+                            ColgramStorageIndex.Entry e = ColgramStorageIndex.getEntry(cand);
+                            String candSha = (e != null && e.matchesFileOnDisk(cand) && !e.sha256.isEmpty())
+                                    ? e.sha256 : ColgramStorageOptimizer.computeSha256(cand);
+                            if (sha.equals(candSha)) {
+                                //noinspection ResultOfMethodCallIgnored
+                                tmp.delete();
+                                ColgramUnlimitedMemory.recordDedupSaved(context, 1, len);
+                                return cand;
+                            }
+                        }
+                    }
+                }
+            }
+
+            File dest = uniqueFile(inboxDir, name);
+            if (ColgramStorageOptimizer.atomicReplaceFile(tmp, dest)) {
+                if (!sha.isEmpty()) {
+                    ColgramStorageIndex.recordEntry(dest, len, dest.length(), sha, ColgramStorageIndex.STATE_SKIPPED_OPTIMAL);
+                    ColgramStorageIndex.flush();
+                }
+                return dest;
+            }
+            return null;
         } catch (Throwable t) {
             Log.w(TAG, "copy failed for " + uri + ": " + t);
             return null;
         } finally {
             try { if (in != null) in.close(); } catch (Throwable ignored) {}
             try { if (out != null) out.close(); } catch (Throwable ignored) {}
+            try { if (tmp != null && tmp.exists()) tmp.delete(); } catch (Throwable ignored) {}
         }
     }
 

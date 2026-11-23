@@ -27,6 +27,8 @@ public final class ColgramIntroArtView extends View {
     private final Path path = new Path();
     private final Path avatarClip = new Path();
     private final RectF rect = new RectF();
+    private final android.graphics.Matrix cardGradMatrix = new android.graphics.Matrix();
+    private final LinearGradient cardGradient = new LinearGradient(0f, 1f, 1f, 0f, RED_DARK, RED_LIGHT, Shader.TileMode.CLAMP);
     private final Drawable avatar;
     private final Drawable cloud;
 
@@ -170,14 +172,16 @@ public final class ColgramIntroArtView extends View {
             if (distance >= 1f) {
                 continue;
             }
-            int save = canvas.saveLayerAlpha(-24, -20, 264, 200, Math.round((1f - distance) * 255));
+            int save = distance < 0.002f
+                    ? canvas.save()
+                    : canvas.saveLayerAlpha(-24, -20, 264, 200, Math.round((1f - distance) * 255));
             float offset = pageProgress - page;
             canvas.translate(-offset * 52, 0);
             float zoom = 1f - .12f * distance;
             canvas.scale(zoom, zoom, 120, 90);
             float pulse = (float) Math.sin(entryProgress * Math.PI) + distance * .65f;
             switch (page) {
-                case 0: drawWelcome(canvas); break;
+                case 0: drawWelcome(canvas, pulse); break;
                 case 1: drawFast(canvas, pulse, offset); break;
                 case 2: drawFree(canvas, pulse, offset); break;
                 case 3: drawPowerful(canvas, pulse, offset); break;
@@ -189,7 +193,13 @@ public final class ColgramIntroArtView extends View {
         canvas.restoreToCount(outerSave);
     }
 
-    private void drawWelcome(Canvas canvas) {
+    private void drawWelcome(Canvas canvas, float pulse) {
+        if (pulse > 0.02f) {
+            stroke(blend(background, RED, Math.min(0.45f, 0.16f + pulse * 0.24f)), 2.5f);
+            float expand = 4f + pulse * 4f;
+            rect.set(56 - expand, 26 - expand, 184 + expand, 154 + expand);
+            canvas.drawRoundRect(rect, 32, 32, paint);
+        }
         int save = canvas.save();
         canvas.clipPath(avatarClip);
         fill(Color.BLACK);
@@ -375,7 +385,11 @@ public final class ColgramIntroArtView extends View {
 
     private void gradientCard(Canvas canvas, float x, float y, float width, float height, float radius) {
         fill(RED);
-        paint.setShader(new LinearGradient(x, y + height, x + width, y, RED_DARK, RED_LIGHT, Shader.TileMode.CLAMP));
+        cardGradMatrix.reset();
+        cardGradMatrix.setScale(Math.max(1f, width), Math.max(1f, height));
+        cardGradMatrix.postTranslate(x, y);
+        cardGradient.setLocalMatrix(cardGradMatrix);
+        paint.setShader(cardGradient);
         rect.set(x, y, x + width, y + height);
         canvas.drawRoundRect(rect, radius, radius, paint);
         paint.setShader(null);

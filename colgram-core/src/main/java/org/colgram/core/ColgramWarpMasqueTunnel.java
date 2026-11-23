@@ -214,17 +214,29 @@ private static volatile String udpRelay;
                     else if ("dialing".equals(stage)) startupStage = "Подключение к шлюзу Cloudflare";
                     else if ("trace".equals(stage)) startupStage = "Проверка трафика WARP";
                 } else if (code == ColgramWarpState.UP) {
+                    boolean firstUp = !up;
                     startupStage = null;
                     String text = data == null ? null : data.getString("trace");
                     lastTrace = Collections.unmodifiableMap(ColgramMasqueNative.parseTrace(text == null ? "" : text));
                     up = true;
                     persist(serviceContext, lastTrace, true);
+                    if (firstUp) {
+                        ColgramDpiBypass.clearConnectionFailureBackoff();
+                    }
                     done.countDown();
                 } else if (code == ColgramWarpState.FAILED || code == ColgramWarpState.STOPPED) {
+                    boolean wasUp = up;
                     startupStage = null;
                     up = false;
                     if (code == ColgramWarpState.FAILED) lastFailure = data == null ? "WARP остановлен" : data.getString("error");
                     persist(serviceContext, lastTrace, false);
+                    if (wasUp) {
+                        ColgramDpiBypass.clearConnectionFailureBackoff();
+                        final Context ctxForNotify = serviceContext;
+                        if (ctxForNotify != null) {
+                            ColgramProxyManager.onOverlayTransportChanged(ctxForNotify, ColgramRouteEpoch.snapshot());
+                        }
+                    }
                     done.countDown();
                 }
                 ColgramProxyManager.notifyProxySettingsChanged();

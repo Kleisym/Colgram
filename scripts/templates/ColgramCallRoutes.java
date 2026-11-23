@@ -33,6 +33,7 @@ import java.lang.ref.WeakReference;
 /** One explicit media route for each private call; never silently falls back. */
 public final class ColgramCallRoutes {
     private static final String MODE_KEY = "colgram_private_call_route";
+    private static final String MODE_DEFAULT_MIGRATED_KEY = "colgram_call_route_local_dpi_default_v1";
     private static final String SOCKS_KEY = "colgram_private_call_socks";
     public static final int CONSENT = 9186;
     public static final String EXTRA_TICKET = "colgram_private_call_route_ticket";
@@ -49,7 +50,16 @@ public final class ColgramCallRoutes {
     }
 
     public static Mode mode() {
-        return ColgramCallRoutePolicy.fromPreference(prefs().getString(MODE_KEY, null));
+        SharedPreferences p = prefs();
+        String saved = p.getString(MODE_KEY, null);
+        if (saved == null || (!p.getBoolean(MODE_DEFAULT_MIGRATED_KEY, false) && "CURRENT".equalsIgnoreCase(saved.trim()))) {
+            p.edit()
+                    .putString(MODE_KEY, Mode.LOCAL_DPI.name())
+                    .putBoolean(MODE_DEFAULT_MIGRATED_KEY, true)
+                    .apply();
+            return Mode.LOCAL_DPI;
+        }
+        return ColgramCallRoutePolicy.fromPreference(saved);
     }
 
     public static String summary() {
@@ -72,7 +82,10 @@ public final class ColgramCallRoutes {
     }
 
     private static void save(Mode mode, Runnable onChange) {
-        prefs().edit().putString(MODE_KEY, mode.name()).apply();
+        prefs().edit()
+                .putString(MODE_KEY, mode.name())
+                .putBoolean(MODE_DEFAULT_MIGRATED_KEY, true)
+                .apply();
         if (onChange != null) onChange.run();
     }
 

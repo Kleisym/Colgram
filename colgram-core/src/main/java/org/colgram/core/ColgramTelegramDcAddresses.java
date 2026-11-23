@@ -6,11 +6,11 @@ import java.net.InetAddress;
 public final class ColgramTelegramDcAddresses {
 
     private static final String[][] DC_ADDRESSES = {
-            {"149.154.175.50", "2001:b28:f23d:f001:0:0:0:a"},
-            {"149.154.167.51", "95.161.76.100", "2001:67c:4e8:f002:0:0:0:a"},
-            {"149.154.175.100", "2001:b28:f23d:f003:0:0:0:a"},
-            {"149.154.167.91", "2001:67c:4e8:f004:0:0:0:a"},
-            {"149.154.171.5", "2001:b28:f23f:f005:0:0:0:a"}
+            {"149.154.175.50", "149.154.175.53", "149.154.175.40", "2001:b28:f23d:f001:0:0:0:a"},
+            {"149.154.167.51", "95.161.76.100", "149.154.167.41", "149.154.167.50", "149.154.167.40", "2001:67c:4e8:f002:0:0:0:a"},
+            {"149.154.175.100", "149.154.174.100", "149.154.175.117", "2001:b28:f23d:f003:0:0:0:a"},
+            {"149.154.167.91", "149.154.167.92", "194.221.250.50", "2001:67c:4e8:f004:0:0:0:a"},
+            {"149.154.171.5", "91.108.56.100", "91.108.56.130", "149.154.170.96", "2001:b28:f23f:f005:0:0:0:a"}
     };
 
     private ColgramTelegramDcAddresses() {}
@@ -20,6 +20,33 @@ public final class ColgramTelegramDcAddresses {
         byte[] address = new byte[4];
         for (int i = 0; i < address.length; i++) address[i] = (byte) Integer.parseInt(octets[i]);
         return address;
+    }
+
+    /** Return 1-based Telegram production DC id (1..5), or 0 when unknown. */
+    public static int dcIdFor(String host) {
+        if (host == null || host.isEmpty()) return 0;
+        String normalized = host.trim();
+        for (int i = 0; i < DC_ADDRESSES.length; i++) {
+            for (String address : DC_ADDRESSES[i]) {
+                if (sameAddress(normalized, address)) return i + 1;
+            }
+        }
+        String lower = normalized.toLowerCase(java.util.Locale.US);
+        if (lower.startsWith("149.154.175.10") || lower.startsWith("149.154.175.11")) return 3;
+        if (lower.startsWith("149.154.175.")) return 1;
+        if (lower.startsWith("149.154.174.")) return 3;
+        if (lower.startsWith("149.154.167.9")) return 4;
+        if (lower.startsWith("149.154.167.") || lower.startsWith("95.161.76.") || lower.startsWith("185.76.151.")) return 2;
+        if (lower.startsWith("194.221.250.") || lower.startsWith("149.154.164.")
+                || lower.startsWith("149.154.165.") || lower.startsWith("149.154.166.")) return 4;
+        if (lower.startsWith("149.154.170.") || lower.startsWith("149.154.171.")
+                || lower.startsWith("91.108.56.")) return 5;
+        if (lower.startsWith("2001:b28:f23d:f001:")) return 1;
+        if (lower.startsWith("2001:67c:4e8:f002:")) return 2;
+        if (lower.startsWith("2001:b28:f23d:f003:")) return 3;
+        if (lower.startsWith("2001:67c:4e8:f004:")) return 4;
+        if (lower.startsWith("2001:b28:f23f:f005:")) return 5;
+        return 0;
     }
 
     /**
@@ -37,13 +64,10 @@ public final class ColgramTelegramDcAddresses {
     }
 
     public static boolean isKnownAddress(String host) {
-        if (host == null) return false;
-        for (String[] dc : DC_ADDRESSES) {
-            for (String address : dc) {
-                if (sameAddress(host, address)) return true;
-            }
-        }
-        return false;
+        if (host == null || host.isEmpty()) return false;
+        if (dcIdFor(host) > 0) return true;
+        String lower = host.trim().toLowerCase(java.util.Locale.US);
+        return lower.startsWith("149.154.") || lower.startsWith("91.108.") || lower.startsWith("185.76.151.");
     }
 
     private static boolean sameAddress(String first, String second) {

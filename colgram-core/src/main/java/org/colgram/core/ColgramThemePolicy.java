@@ -98,6 +98,92 @@ public final class ColgramThemePolicy {
         return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
     }
 
+    /** Picks crisp white or dark charcoal ink depending on actual fill contrast (never same-on-same). */
+    public static int contrastInkOn(int bgArgb) {
+        int solid = opaque(bgArgb, 0xff202b36);
+        double whiteContrast = contrast(WHITE, solid);
+        double darkContrast = contrast(0xff101418, solid);
+        return (whiteContrast >= 2.45 || whiteContrast >= darkContrast) ? WHITE : 0xff101418;
+    }
+
+    /** Repairs dark foregrounds on dark surfaces without corrupting saturated accent/button/badge fills. */
+    public static boolean shouldTreatAsDarkForeground(int lightDefaultColor,
+                                                      boolean explicitForegroundKey,
+                                                      boolean explicitFillOrAccentKey) {
+        if (explicitFillOrAccentKey) {
+            return false;
+        }
+        if (explicitForegroundKey) {
+            return true;
+        }
+        if ((lightDefaultColor >>> 24) < 0x20) {
+            return false;
+        }
+        return perceivedLuma(lightDefaultColor) < 128 && chroma(lightDefaultColor) < 40;
+    }
+
+    /**
+     * Identifies genuine neutral light surface holes (white/light-gray backgrounds) so dark themes
+     * never leave bright white strips behind white text, WITHOUT erasing saturated status dots,
+     * green online circles (#4ecc5e), checkmarks, waveform fills, or sender name colors!
+     */
+    public static boolean shouldTreatAsLightSurface(int lightDefaultColor,
+                                                    boolean explicitForegroundKey,
+                                                    boolean explicitFillOrAccentKey) {
+        if (explicitFillOrAccentKey || explicitForegroundKey) {
+            return false;
+        }
+        if ((lightDefaultColor >>> 24) < 0x20) {
+            return false;
+        }
+        return perceivedLuma(lightDefaultColor) >= 196 && chroma(lightDefaultColor) < 24;
+    }
+
+    /** Guards text/icon paints against BOTH black-on-black and white-on-white on any surface. */
+    public static int ensureReadableOnSurface(int fgArgb, int bgArgb, int lightInk, int darkInk, double minContrast) {
+        int alpha = fgArgb >>> 24;
+        if (alpha < 0x20) {
+            return fgArgb;
+        }
+        int solidBg = opaque(bgArgb, WHITE);
+        if (contrast(fgArgb, solidBg) >= minContrast) {
+            return fgArgb;
+        }
+        int chosen = contrast(lightInk, solidBg) >= contrast(darkInk, solidBg) ? lightInk : darkInk;
+        if (alpha >= 0xff) {
+            return chosen | 0xff000000;
+        }
+        return (chosen & 0x00ffffff) | (alpha << 24);
+    }
+
+    /** Guards a foreground that may appear on EITHER of two surfaces (e.g. windowWhite or windowGray). */
+    public static int ensureReadableOnSurfaces(int fgArgb, int bgA, int bgB, int lightInk, int darkInk, double minContrast) {
+        int alpha = fgArgb >>> 24;
+        if (alpha < 0x20) {
+            return fgArgb;
+        }
+        int solidA = opaque(bgA, WHITE);
+        int solidB = opaque(bgB, WHITE);
+        double curWorst = Math.min(contrast(fgArgb, solidA), contrast(fgArgb, solidB));
+        if (curWorst >= minContrast) {
+            return fgArgb;
+        }
+        double lightWorst = Math.min(contrast(lightInk, solidA), contrast(lightInk, solidB));
+        double darkWorst = Math.min(contrast(darkInk, solidA), contrast(darkInk, solidB));
+        int chosen = lightWorst >= darkWorst ? lightInk : darkInk;
+        if (alpha >= 0xff) {
+            return chosen | 0xff000000;
+        }
+        return (chosen & 0x00ffffff) | (alpha << 24);
+    }
+
+    public static int perceivedLuma(int color) {
+        int r = (color >>> 16) & 255;
+        int g = (color >>> 8) & 255;
+        int b = color & 255;
+        return (r * 299 + g * 587 + b * 114) / 1000;
+    }
+
     private static int fitFill(int fill, int end, int surface) {
         final int onFill = opposite(end);
         for (int step = 0; step <= 32; step++) {
@@ -124,6 +210,10 @@ public final class ColgramThemePolicy {
 
     private static int opposite(int blackOrWhite) {
         return blackOrWhite == BLACK ? WHITE : BLACK;
+    }
+
+    public static boolean isDarkColor(int color) {
+        return luminance(color) < 0.25;
     }
 
     private static double luminance(int color) {

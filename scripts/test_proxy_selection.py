@@ -52,7 +52,8 @@ class ProxySelectionTest(unittest.TestCase):
         self.assertIn("https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt", self.source)
         self.assertIn("https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt", self.source)
         direct_fetch = method(self.source, "private static String httpGet(", "private static int fetchProxiesLinkList(")
-        self.assertIn("openConnection(java.net.Proxy.NO_PROXY)", direct_fetch)
+        self.assertIn("httpGetOnce(url, java.net.Proxy.NO_PROXY", direct_fetch)
+        self.assertIn("openConnection(proxy)", direct_fetch)
         self.assertIn("setInstanceFollowRedirects(false)", direct_fetch)
         self.assertNotIn("ColgramHttp.getFast", direct_fetch)
 
