@@ -719,6 +719,251 @@ public final class ColgramAiEngineTest {
                 "Compact system prompt must omit tool guide when tools not needed");
     }
 
+    private static void testResumableModelDownloadEngine() {
+        final int totalLen = 98304; // > 65536 isValidGgufFile minimum
+        final byte[] payload = new byte[totalLen];
+        payload[0] = 'G';
+        payload[1] = 'G';
+        payload[2] = 'U';
+        payload[3] = 'F';
+        for (int i = 4; i < totalLen; i++) {
+            payload[i] = (byte) ((i * 31 + 7) & 0xFF);
+        }
+
+        java.nio.file.Path tmpDir = null;
+        try {
+            tmpDir = java.nio.file.Files.createTempDirectory("colgram_dl_test_");
+
+            // 1) Cross-URL 302 redirect -> 200 full GGUF + live DownloadObserver snapshots
+            ColgramAiModelManager.resetDownloadStateForTest();
+            try (java.net.ServerSocket ss = new java.net.ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress())) {
+                final int port = ss.getLocalPort();
+                Thread srv = new Thread(() -> {
+                    for (int req = 0; req < 2; req++) {
+                        try (java.net.Socket s = ss.accept()) {
+                            java.io.BufferedReader br = new java.io.BufferedReader(
+                                    new java.io.InputStreamReader(s.getInputStream(), "US-ASCII"));
+                            String line = br.readLine();
+                            String rest;
+                            while ((rest = br.readLine()) != null && !rest.isEmpty()) {}
+                            java.io.OutputStream out = s.getOutputStream();
+                            if (line != null && line.contains("/redirect.gguf")) {
+                                String hdr = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:" + port + "/cdn/model.gguf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                out.write(hdr.getBytes("US-ASCII"));
+                            } else {
+                                String hdr = "HTTP/1.1 200 OK\r\nContent-Length: " + totalLen + "\r\nConnection: close\r\n\r\n";
+                                out.write(hdr.getBytes("US-ASCII"));
+                                out.write(payload);
+                            }
+                            out.flush();
+                        } catch (Throwable ignored) {}
+                    }
+                }, "dl-test-redirect");
+                srv.setDaemon(true);
+                srv.start();
+
+                final java.util.concurrent.atomic.AtomicInteger obsActiveCount = new java.util.concurrent.atomic.AtomicInteger(0);
+                ColgramAiModelManager.DownloadObserver obs = st -> {
+                    if (st.active && st.downloadedBytes > 0) {
+                        obsActiveCount.incrementAndGet();
+                    }
+                };
+                ColgramAiModelManager.addDownloadObserver(obs);
+                java.io.File out1 = new java.io.File(tmpDir.toFile(), "redirect_ok.gguf");
+                ColgramAiModelManager.downloadFileForTest(
+                        "http://127.0.0.1:" + port + "/redirect.gguf",
+                        out1, totalLen, null, 0, "m1", "Model 1", null);
+                ColgramAiModelManager.removeDownloadObserver(obs);
+                check(ColgramAiModelManager.isValidGgufFile(out1), "Redirect download must produce valid GGUF");
+                check(java.util.Arrays.equals(payload, java.nio.file.Files.readAllBytes(out1.toPath())),
+                        "Redirect downloaded bytes mismatch");
+                check(obsActiveCount.get() > 0, "DownloadObserver must receive live progress snapshots");
+                check(!ColgramAiModelManager.getDownloadState().active, "DownloadState must return idle after completion");
+            }
+
+            // 2) Mid-stream drop at 32768 B -> auto-retry Range: bytes=32768- (206) resume
+            ColgramAiModelManager.resetDownloadStateForTest();
+            try (java.net.ServerSocket ss = new java.net.ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress())) {
+                final int port = ss.getLocalPort();
+                final java.util.List<String> seenRanges = new java.util.ArrayList<>();
+                Thread srv = new Thread(() -> {
+                    for (int req = 0; req < 2; req++) {
+                        try (java.net.Socket s = ss.accept()) {
+                            java.io.BufferedReader br = new java.io.BufferedReader(
+                                    new java.io.InputStreamReader(s.getInputStream(), "US-ASCII"));
+                            br.readLine();
+                            String range = null;
+                            String line;
+                            while ((line = br.readLine()) != null && !line.isEmpty()) {
+                                if (line.toLowerCase(java.util.Locale.US).startsWith("range:")) {
+                                    range = line.substring(6).trim();
+                                }
+                            }
+                            seenRanges.add(range == null ? "" : range);
+                            java.io.OutputStream out = s.getOutputStream();
+                            if (req == 0) {
+                                String hdr = "HTTP/1.1 200 OK\r\nContent-Length: " + totalLen + "\r\nConnection: close\r\n\r\n";
+                                out.write(hdr.getBytes("US-ASCII"));
+                                out.write(payload, 0, 32768);
+                                out.flush();
+                            } else {
+                                int off = 32768;
+                                int rem = totalLen - off;
+                                String hdr = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes " + off + "-" + (totalLen - 1) + "/" + totalLen + "\r\nContent-Length: " + rem + "\r\nConnection: close\r\n\r\n";
+                                out.write(hdr.getBytes("US-ASCII"));
+                                out.write(payload, off, rem);
+                                out.flush();
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }, "dl-test-resume");
+                srv.setDaemon(true);
+                srv.start();
+
+                java.io.File out2 = new java.io.File(tmpDir.toFile(), "resumed.gguf");
+                ColgramAiModelManager.downloadFileForTest(
+                        "http://127.0.0.1:" + port + "/resumed.gguf",
+                        out2, totalLen, null, 0, "m2", "Model 2", null);
+                check(seenRanges.size() == 2 && "bytes=32768-".equals(seenRanges.get(1)),
+                        "Expected second attempt to resume at bytes=32768-, saw: " + seenRanges);
+                check(java.util.Arrays.equals(payload, java.nio.file.Files.readAllBytes(out2.toPath())),
+                        "Resumed file bytes must match original payload");
+            }
+
+            // 3) Stalled download + fast cancelDownload() abort (<1500ms) + .part kept + late observer restoration
+            ColgramAiModelManager.resetDownloadStateForTest();
+            try (java.net.ServerSocket ss = new java.net.ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress())) {
+                final int port = ss.getLocalPort();
+                Thread srv = new Thread(() -> {
+                    try (java.net.Socket s = ss.accept()) {
+                        java.io.BufferedReader br = new java.io.BufferedReader(
+                                new java.io.InputStreamReader(s.getInputStream(), "US-ASCII"));
+                        String line;
+                        while ((line = br.readLine()) != null && !line.isEmpty()) {}
+                        java.io.OutputStream out = s.getOutputStream();
+                        String hdr = "HTTP/1.1 200 OK\r\nContent-Length: " + totalLen + "\r\nConnection: close\r\n\r\n";
+                        out.write(hdr.getBytes("US-ASCII"));
+                        out.write(payload, 0, 16384);
+                        out.flush();
+                        Thread.sleep(20000L);
+                    } catch (Throwable ignored) {}
+                }, "dl-test-stall");
+                srv.setDaemon(true);
+                srv.start();
+
+                final java.util.concurrent.CountDownLatch gotFirstBytes = new java.util.concurrent.CountDownLatch(1);
+                ColgramAiModelManager.DownloadObserver progressObs = st -> {
+                    if (st.active && st.downloadedBytes >= 16384L) {
+                        gotFirstBytes.countDown();
+                    }
+                };
+                ColgramAiModelManager.addDownloadObserver(progressObs);
+                final java.io.File out3 = new java.io.File(tmpDir.toFile(), "stalled.gguf");
+                final Throwable[] dlErr = new Throwable[1];
+                Thread dlThread = new Thread(() -> {
+                    try {
+                        ColgramAiModelManager.downloadFileForTest(
+                                "http://127.0.0.1:" + port + "/stalled.gguf",
+                                out3, totalLen, null, 0, "m3", "Model 3", null);
+                    } catch (Throwable t) {
+                        dlErr[0] = t;
+                    }
+                }, "dl-test-worker");
+                dlThread.start();
+                check(gotFirstBytes.await(5, java.util.concurrent.TimeUnit.SECONDS), "Timed out waiting for initial partial bytes");
+                long tCancelStart = System.currentTimeMillis();
+                ColgramAiModelManager.cancelDownload();
+                dlThread.join(2500L);
+                long cancelElapsed = System.currentTimeMillis() - tCancelStart;
+                check(!dlThread.isAlive() && cancelElapsed < 2000L,
+                        "cancelDownload must unblock stalled socket fast (<2000ms), elapsed=" + cancelElapsed);
+                check(dlErr[0] == null, "User cancel must exit cleanly without error: " + dlErr[0]);
+                java.io.File part3 = new java.io.File(tmpDir.toFile(), "stalled.gguf.part");
+                check(part3.isFile() && part3.length() >= 16384L,
+                        "Cancelled download must keep .part file on disk for later resume");
+                final ColgramAiModelManager.DownloadState[] lateSeen = new ColgramAiModelManager.DownloadState[1];
+                ColgramAiModelManager.addDownloadObserver(st -> lateSeen[0] = st);
+                check(lateSeen[0] != null && !lateSeen[0].active && lateSeen[0].pausedByUser
+                                && lateSeen[0].downloadedBytes >= 16384L,
+                        "Late-registered observer must restore paused partial progress state");
+            }
+
+            // 4) SOCKS5 ATYP=0x03 (DOMAIN) framing without local DNS + Range resume
+            ColgramAiModelManager.resetDownloadStateForTest();
+            try (java.net.ServerSocket socksSs = new java.net.ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress())) {
+                final int socksPort = socksSs.getLocalPort();
+                final java.util.List<String> socksTargets = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+                Thread socksSrv = new Thread(() -> {
+                    for (int connIdx = 0; connIdx < 2; connIdx++) {
+                        final int idx = connIdx;
+                        try (java.net.Socket s = socksSs.accept()) {
+                            java.io.InputStream in = s.getInputStream();
+                            java.io.OutputStream out = s.getOutputStream();
+                            int ver = in.read();
+                            int nm = in.read();
+                            for (int i = 0; i < nm; i++) in.read();
+                            if (ver != 5) continue;
+                            out.write(new byte[]{0x05, 0x00});
+                            out.flush();
+                            byte[] hdr = new byte[4];
+                            for (int i = 0; i < 4; i++) hdr[i] = (byte) in.read();
+                            int atyp = hdr[3] & 0xFF;
+                            check(atyp == 0x03, "Expected SOCKS5 ATYP=0x03 DOMAIN, got: " + atyp);
+                            int dlen = in.read();
+                            byte[] dbuf = new byte[dlen];
+                            for (int i = 0; i < dlen; i++) dbuf[i] = (byte) in.read();
+                            int pHi = in.read();
+                            int pLo = in.read();
+                            String targetHost = new String(dbuf, "UTF-8") + ":" + ((pHi << 8) | pLo);
+                            socksTargets.add(targetHost);
+                            out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80});
+                            out.flush();
+
+                            java.io.BufferedReader br = new java.io.BufferedReader(
+                                    new java.io.InputStreamReader(in, "US-ASCII"));
+                            String line;
+                            while ((line = br.readLine()) != null && !line.isEmpty()) {}
+                            if (idx == 0) {
+                                out.write(("HTTP/1.1 200 OK\r\nContent-Length: " + totalLen + "\r\nConnection: close\r\n\r\n").getBytes("US-ASCII"));
+                                out.write(payload, 0, 24576);
+                            } else {
+                                int off = 24576;
+                                int rem = totalLen - off;
+                                out.write(("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes " + off + "-" + (totalLen - 1) + "/" + totalLen + "\r\nContent-Length: " + rem + "\r\nConnection: close\r\n\r\n").getBytes("US-ASCII"));
+                                out.write(payload, off, rem);
+                            }
+                            out.flush();
+                        } catch (Throwable ignored) {}
+                    }
+                }, "dl-test-socks5");
+                socksSrv.setDaemon(true);
+                socksSrv.start();
+
+                java.io.File out4 = new java.io.File(tmpDir.toFile(), "socks5.gguf");
+                ColgramAiModelManager.downloadFileForTest(
+                        "http://mock.koliti.local:8443/koliti-core-v3.gguf",
+                        out4, totalLen, "127.0.0.1", socksPort, "m4", "Model 4", null);
+                check(socksTargets.size() == 2
+                                && "mock.koliti.local:8443".equals(socksTargets.get(0))
+                                && "mock.koliti.local:8443".equals(socksTargets.get(1)),
+                        "SOCKS5 ATYP=0x03 must forward unresolved hostname:port, saw: " + socksTargets);
+                check(java.util.Arrays.equals(payload, java.nio.file.Files.readAllBytes(out4.toPath())),
+                        "SOCKS5 resumed payload mismatch");
+            }
+        } catch (Exception e) {
+            throw new AssertionError("Resumable downloader test failed: " + e.getMessage(), e);
+        } finally {
+            ColgramAiModelManager.resetDownloadStateForTest();
+            if (tmpDir != null) {
+                try {
+                    java.nio.file.Files.walk(tmpDir)
+                            .sorted(java.util.Comparator.reverseOrder())
+                            .forEach(p -> { try { java.nio.file.Files.deleteIfExists(p); } catch (Throwable ignored) {} });
+                } catch (Throwable ignored) {}
+            }
+        }
+    }
+
     public static void main(String[] args) {
         testCatalogAndBudget();
         testBm25BigContextRetrieval();
@@ -727,6 +972,7 @@ public final class ColgramAiEngineTest {
         testNativeBridgeHostSafety();
         testAutonomousPlannerAndSynthesizer();
         testKolitiVoiceLogic();
+        testResumableModelDownloadEngine();
         System.out.println("ColgramAiEngineTest: PASS");
     }
 

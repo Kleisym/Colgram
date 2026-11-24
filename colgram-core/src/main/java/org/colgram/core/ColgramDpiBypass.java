@@ -97,6 +97,7 @@ public class ColgramDpiBypass {
 
     private static final String[] RU_WHITELIST_PROBE_HOSTS = {"vk.com", "ya.ru"};
     private static final long L3_WHITELIST_CACHE_MS = 20_000L;
+    private static final long L3_WHITELIST_DETECTED_CACHE_MS = 120_000L;
     private static final long L3_RELAY_ACTIVE_WINDOW_MS = 90_000L;
     private static final long L3_RELAY_PENALTY_MS = 180_000L;
     private static final int L3_RELAY_CONNECT_TIMEOUT_MS = 2500;
@@ -296,7 +297,8 @@ public class ColgramDpiBypass {
      */
     public static boolean probeStrictL3WhitelistStatus() {
         long now = safeElapsedRealtime();
-        if (l3WhitelistCheckedAt > 0L && now - l3WhitelistCheckedAt < L3_WHITELIST_CACHE_MS) {
+        long cacheWindow = strictL3WhitelistDetected ? L3_WHITELIST_DETECTED_CACHE_MS : L3_WHITELIST_CACHE_MS;
+        if (l3WhitelistCheckedAt > 0L && now - l3WhitelistCheckedAt < cacheWindow) {
             return strictL3WhitelistDetected;
         }
         boolean includeIpv6 = hasGlobalIpv6Safe();
@@ -327,7 +329,8 @@ public class ColgramDpiBypass {
 
     private static void triggerL3WhitelistProbeAsync() {
         long now = safeElapsedRealtime();
-        if (l3WhitelistCheckedAt > 0L && now - l3WhitelistCheckedAt < L3_WHITELIST_CACHE_MS) return;
+        long cacheWindow = strictL3WhitelistDetected ? L3_WHITELIST_DETECTED_CACHE_MS : L3_WHITELIST_CACHE_MS;
+        if (l3WhitelistCheckedAt > 0L && now - l3WhitelistCheckedAt < cacheWindow) return;
         if (!l3ProbeInFlight.compareAndSet(false, true)) return;
         workerPool.execute(() -> {
             try {
@@ -1303,8 +1306,15 @@ public class ColgramDpiBypass {
             if (targetSocket == null) {
                 if (call == null) {
                     if (wsCapableDest) triggerL3WhitelistProbeAsync();
-                    // Never allow an unchecked SOCKS5 error return to turn into a 1-ms spin loop.
-                    sleep(REJECT_RETRY_DELAY_MS);
+                    // Pace dead-endpoint rejects under L3 whitelists or thermal/background pressure so
+                    // background tgnet probes don't spin radio/CPU while working WSS/L3 relays stay fast.
+                    long paceMs = REJECT_RETRY_DELAY_MS;
+                    if (strictL3WhitelistDetected && wsCapableDest) {
+                        boolean eco = !ColgramUiBridge.isAppInForeground()
+                                || ColgramPowerGuard.isThermalThrottled(appContext);
+                        paceMs = Math.max(REJECT_RETRY_DELAY_MS, eco ? 1800L : 850L);
+                    }
+                    sleep(paceMs);
                 }
                 // Per-retry noise from tgnet hammering the listener; a Log.w here floods
                 // logcat a hundred lines a second on a network where the DCs refuse TCP.

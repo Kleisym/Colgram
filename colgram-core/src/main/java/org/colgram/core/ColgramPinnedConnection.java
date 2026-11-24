@@ -45,14 +45,17 @@ final class ColgramPinnedConnection {
     static HttpsURLConnection create(HttpsURLConnection original, URL url, InetAddress address,
                                      java.net.Proxy proxy) {
         try {
+            int connectTimeoutMs = original.getConnectTimeout() > 0
+                    ? original.getConnectTimeout() : CONNECT_TIMEOUT_MS;
+            int readTimeoutMs = original.getReadTimeout() > 0
+                    ? original.getReadTimeout() : READ_TIMEOUT_MS;
             HttpsURLConnection copy = (HttpsURLConnection)
                     (proxy == null ? url.openConnection(java.net.Proxy.NO_PROXY) : url.openConnection(proxy));
-            copy.setSSLSocketFactory(pinning(original.getSSLSocketFactory(), url, address, proxy));
+            copy.setSSLSocketFactory(pinning(
+                    original.getSSLSocketFactory(), url, address, proxy, connectTimeoutMs, readTimeoutMs));
             copy.setHostnameVerifier(original.getHostnameVerifier());
-            copy.setConnectTimeout(original.getConnectTimeout() > 0
-                    ? original.getConnectTimeout() : CONNECT_TIMEOUT_MS);
-            copy.setReadTimeout(original.getReadTimeout() > 0
-                    ? original.getReadTimeout() : READ_TIMEOUT_MS);
+            copy.setConnectTimeout(connectTimeoutMs);
+            copy.setReadTimeout(readTimeoutMs);
             copy.setInstanceFollowRedirects(original.getInstanceFollowRedirects());
             copy.setUseCaches(original.getUseCaches());
             copy.setDoInput(original.getDoInput());
@@ -77,7 +80,8 @@ final class ColgramPinnedConnection {
      * has to be verified against that same name, or a filtered resolver turns into an impostor.
      */
     private static SSLSocketFactory pinning(final SSLSocketFactory delegate, final URL url,
-                                            final InetAddress address, final java.net.Proxy proxy) {
+                                            final InetAddress address, final java.net.Proxy proxy,
+                                            final int connectTimeoutMs, final int readTimeoutMs) {
         return new SSLSocketFactory() {
             @Override
             public String[] getDefaultCipherSuites() {
@@ -103,38 +107,38 @@ final class ColgramPinnedConnection {
 
             @Override
             public Socket createSocket(String host, int port) throws IOException {
-                return dial(delegate, url, address, port, proxy);
+                return dial(delegate, url, address, port, proxy, connectTimeoutMs, readTimeoutMs);
             }
 
             @Override
             public Socket createSocket(String host, int port, InetAddress local, int localPort)
                     throws IOException {
-                return dial(delegate, url, address, port, proxy);
+                return dial(delegate, url, address, port, proxy, connectTimeoutMs, readTimeoutMs);
             }
 
             @Override
             public Socket createSocket(InetAddress host, int port) throws IOException {
-                return dial(delegate, url, address, port, proxy);
+                return dial(delegate, url, address, port, proxy, connectTimeoutMs, readTimeoutMs);
             }
 
             @Override
             public Socket createSocket(InetAddress host, int port, InetAddress local, int localPort)
                     throws IOException {
-                return dial(delegate, url, address, port, proxy);
+                return dial(delegate, url, address, port, proxy, connectTimeoutMs, readTimeoutMs);
             }
         };
     }
 
     private static Socket dial(SSLSocketFactory delegate, URL url, InetAddress address, int port,
-                               java.net.Proxy proxy) throws IOException {
+                               java.net.Proxy proxy, int connectTimeoutMs, int readTimeoutMs) throws IOException {
         int target = port > 0 ? port : url.getDefaultPort();
         Socket raw = proxy != null && proxy.type() == java.net.Proxy.Type.SOCKS
                 ? new Socket(proxy) : new Socket();
         InetSocketAddress remote = (proxy != null && proxy.type() == java.net.Proxy.Type.SOCKS)
                 ? InetSocketAddress.createUnresolved(url.getHost(), target)
                 : new InetSocketAddress(address, target);
-        raw.connect(remote, CONNECT_TIMEOUT_MS);
-        raw.setSoTimeout(READ_TIMEOUT_MS);
+        raw.connect(remote, connectTimeoutMs);
+        raw.setSoTimeout(readTimeoutMs);
         Socket wrapped = delegate.createSocket(raw, sniFor(url.getHost()), target, true);
         if (wrapped instanceof javax.net.ssl.SSLSocket) {
             ColgramDohResolver.hardenTlsSocket((javax.net.ssl.SSLSocket) wrapped);

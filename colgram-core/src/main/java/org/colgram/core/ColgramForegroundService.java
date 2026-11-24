@@ -370,7 +370,9 @@ public class ColgramForegroundService extends Service {
     }
 
     private void ensureHumanAccountBackgroundSync() {
-        if (!ColgramConfig.isAlwaysBackgroundEnabled() || ColgramPowerGuard.shouldThrottle(this)) {
+        if (ColgramUiBridge.isAppInForeground()
+                || !ColgramConfig.isAlwaysBackgroundEnabled()
+                || ColgramPowerGuard.shouldThrottle(this)) {
             return;
         }
         long now = android.os.SystemClock.elapsedRealtime();

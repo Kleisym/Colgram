@@ -161,6 +161,14 @@ public final class ColgramAiSheet {
     private String detectedUserLang = "ru";
     private final java.util.concurrent.atomic.AtomicBoolean cleanedUp = new java.util.concurrent.atomic.AtomicBoolean(false);
     private Runnable pendingWelcomeRunnable;
+    private boolean embeddedUnpackRequested = false;
+    private final ColgramAiModelManager.DownloadObserver downloadObserver = state -> AndroidUtilities.runOnUIThread(() -> {
+        if (cleanedUp.get()) return;
+        Activity act = resolveValidActivity(parentFragment);
+        if (act != null) {
+            syncCoreInstallBanner(act);
+        }
+    });
 
     private static Activity resolveValidActivity(BaseFragment parentFragment) {
         Activity act = (parentFragment != null && parentFragment.getParentActivity() != null)
@@ -476,34 +484,8 @@ public final class ColgramAiSheet {
         coreInstallProgress.getProgressDrawable().setColorFilter(ACCENT_CRIMSON, PorterDuff.Mode.SRC_IN);
         coreInstallBanner.addView(coreInstallProgress, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 4, 0, 8, 0, 0));
 
-        boolean localCoreReady = ColgramAiModelManager.resolveActiveModel(act).isReady()
-                && !ColgramAiModelManager.needsEmbeddedUpgrade(act);
-        boolean hasEmbedded = ColgramAiModelManager.hasEmbeddedAssets(act);
-        if (localCoreReady) {
-            coreInstallBanner.setVisibility(View.GONE);
-        } else if (hasEmbedded) {
-            coreInstallBanner.setVisibility(View.GONE);
-            ColgramAiModelManager.ensureEmbeddedReadyAsync(act, new ColgramAiModelManager.DownloadListener() {
-                @Override
-                public void onProgress(String phase, long downloadedBytes, long totalBytes, double speedMbPerSec) {
-                    int pct = totalBytes > 0 ? (int) Math.min(100L, (downloadedBytes * 100L) / totalBytes) : 0;
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (!busyGenerating) statusLine.setText("Обновление ядра • " + pct + "%");
-                    });
-                }
-
-                @Override
-                public void onComplete(boolean success, String message) {
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (!busyGenerating) statusLine.setText(ColgramAiEngine.getInstance().buildStatusSummary(act));
-                    });
-                }
-            });
-        } else {
-            ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(act));
-            coreInstallText.setText(activeSpec.title + " • " + ColgramAiModelManager.formatSizeMb(activeSpec.approxModelBytes) + " + Vision");
-            coreInstallBanner.setVisibility(View.VISIBLE);
-        }
+        syncCoreInstallBanner(act);
+        ColgramAiModelManager.addDownloadObserver(downloadObserver);
         root.addView(coreInstallBanner, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 6));
 
         // Responsive, Scroll-Locked Conversation Viewport (flexes cleanly with keyboard & attachment preview strip)
@@ -655,6 +637,7 @@ public final class ColgramAiSheet {
         sheet.setCustomView(root);
         final Runnable cleanupAction = () -> {
             if (cleanedUp.compareAndSet(false, true)) {
+                ColgramAiModelManager.removeDownloadObserver(downloadObserver);
                 if (pendingWelcomeRunnable != null) {
                     root.removeCallbacks(pendingWelcomeRunnable);
                     pendingWelcomeRunnable = null;
@@ -1538,44 +1521,117 @@ public final class ColgramAiSheet {
         }
     }
 
+    private void syncCoreInstallBanner(Activity act) {
+        if (act == null || coreInstallBanner == null) return;
+        boolean localCoreReady = ColgramAiModelManager.resolveActiveModel(act).isReady()
+                && !ColgramAiModelManager.needsEmbeddedUpgrade(act);
+        boolean hasEmbedded = ColgramAiModelManager.hasEmbeddedAssets(act);
+        ColgramAiModelManager.DownloadState st = ColgramAiModelManager.getDownloadState();
+        boolean downloading = ColgramAiModelManager.isDownloading() || st.active;
+        ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(act));
+
+        if (localCoreReady && !downloading) {
+            coreInstallBanner.setVisibility(View.GONE);
+            if (!busyGenerating) {
+                statusLine.setText(ColgramAiEngine.getInstance().buildStatusSummary(act));
+            }
+            return;
+        }
+        if (hasEmbedded && !downloading) {
+            coreInstallBanner.setVisibility(View.GONE);
+            if (!embeddedUnpackRequested) {
+                embeddedUnpackRequested = true;
+                ColgramAiModelManager.ensureEmbeddedReadyAsync(act, null);
+            }
+            return;
+        }
+        if (downloading) {
+            if (st.extracting || ColgramAiModelManager.isExtractingEmbedded()) {
+                coreInstallBanner.setVisibility(View.GONE);
+                int pct = st.percent();
+                if (!busyGenerating) {
+                    statusLine.setText(pct >= 0 ? ("Обновление ядра • " + pct + "%") : "Обновление ядра…");
+                }
+                return;
+            }
+            coreInstallBanner.setVisibility(View.VISIBLE);
+            coreInstallAction.setText("Пауза");
+            coreInstallProgress.setVisibility(View.VISIBLE);
+            int pct = st.percent();
+            coreInstallProgress.setIndeterminate(pct < 0);
+            if (pct >= 0) {
+                coreInstallProgress.setProgress(pct);
+            }
+            String stage = st.phase.isEmpty() ? ("Загрузка " + activeSpec.title + "…") : st.phase;
+            if (pct >= 0 && st.totalBytes > 0) {
+                String sz = ColgramAiModelManager.formatSizeMb(st.downloadedBytes)
+                        + "/" + ColgramAiModelManager.formatSizeMb(st.totalBytes);
+                if (st.speedMbPerSec > 0.05) {
+                    coreInstallText.setText(String.format(Locale.US, "%s • %d%% (%s • %.1f МБ/с)",
+                            stage, pct, sz, st.speedMbPerSec));
+                } else {
+                    coreInstallText.setText(String.format(Locale.US, "%s • %d%% (%s)", stage, pct, sz));
+                }
+            } else {
+                coreInstallText.setText(stage);
+            }
+            if (!busyGenerating) {
+                statusLine.setText(pct >= 0 ? ("Загрузка Koliti • " + pct + "%") : "Загрузка Koliti…");
+            }
+            return;
+        }
+
+        // Lite APK, not currently downloading
+        coreInstallBanner.setVisibility(View.VISIBLE);
+        long partialBytes = ColgramAiModelManager.getPartialBytes(act, activeSpec);
+        boolean hasErr = !TextUtils.isEmpty(st.lastError) && !st.pausedByUser
+                && (st.modelId.isEmpty() || st.modelId.equals(activeSpec.id));
+        if (partialBytes > 0L) {
+            long total = activeSpec.approxModelBytes > 0L ? activeSpec.approxModelBytes : partialBytes;
+            int pct = (int) Math.min(99L, (partialBytes * 100L) / Math.max(1L, total));
+            coreInstallProgress.setVisibility(View.VISIBLE);
+            coreInstallProgress.setIndeterminate(false);
+            coreInstallProgress.setProgress(pct);
+            coreInstallText.setText((hasErr ? (shorten(st.lastError, 26) + " • ") : "Пауза • ")
+                    + ColgramAiModelManager.formatSizeMb(partialBytes) + "/" + ColgramAiModelManager.formatSizeMb(total));
+            coreInstallAction.setText("Продолжить");
+        } else if (hasErr) {
+            coreInstallProgress.setVisibility(View.GONE);
+            coreInstallText.setText(shorten(st.lastError, 52));
+            coreInstallAction.setText("Повторить");
+        } else {
+            coreInstallProgress.setVisibility(View.GONE);
+            coreInstallText.setText(activeSpec.title + " • " + ColgramAiModelManager.formatSizeMb(activeSpec.approxModelBytes) + " + Vision");
+            coreInstallAction.setText("Установить");
+        }
+        if (!busyGenerating) {
+            statusLine.setText(ColgramAiEngine.getInstance().buildStatusSummary(act));
+        }
+    }
+
     private void triggerCoreDownload(Activity act) {
         if (ColgramAiModelManager.isDownloading()) {
             ColgramAiModelManager.cancelDownload();
-            coreInstallAction.setText("Установить");
-            coreInstallProgress.setVisibility(View.GONE);
-            coreInstallText.setText("Загрузка приостановлена");
+            syncCoreInstallBanner(act);
             return;
         }
         ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(act));
-        coreInstallAction.setText("Пауза");
-        coreInstallProgress.setVisibility(View.VISIBLE);
-        coreInstallProgress.setIndeterminate(true);
-        coreInstallText.setText("Загрузка " + activeSpec.title + "…");
-        ColgramAiModelManager.startDownloadAsync(act, activeSpec, true, new ColgramAiModelManager.DownloadListener() {
+        final Context appCtx = act.getApplicationContext() != null ? act.getApplicationContext() : act;
+        ColgramAiModelManager.startDownloadAsync(appCtx, activeSpec, true, new ColgramAiModelManager.DownloadListener() {
             @Override
             public void onProgress(String stage, long downloadedBytes, long totalBytes, double speedMbSec) {
-                AndroidUtilities.runOnUIThread(() -> {
-                    coreInstallProgress.setIndeterminate(totalBytes <= 0);
-                    if (totalBytes > 0) {
-                        int pct = (int) Math.min(100, (downloadedBytes * 100L) / totalBytes);
-                        coreInstallProgress.setProgress(pct);
-                        coreInstallText.setText(String.format(Locale.US, "%s • %d%% • %.1f МБ/с", stage, pct, speedMbSec));
-                    } else {
-                        coreInstallText.setText(stage);
-                    }
-                });
+                // Live UI progress pushed via global downloadObserver
             }
 
             @Override
             public void onComplete(boolean success, String message) {
                 AndroidUtilities.runOnUIThread(() -> {
-                    if (success) {
-                        coreInstallBanner.setVisibility(View.GONE);
-                        statusLine.setText(ColgramAiEngine.getInstance().buildStatusSummary(act));
-                    } else {
-                        coreInstallAction.setText("Повторить");
-                        coreInstallProgress.setVisibility(View.GONE);
-                        coreInstallText.setText(message != null ? shorten(message, 52) : "Прервано");
+                    Activity curAct = resolveValidActivity(parentFragment);
+                    if (curAct != null) {
+                        Toast.makeText(curAct, success ? ("Готово: " + activeSpec.title) : message, Toast.LENGTH_LONG).show();
+                    }
+                    if (!cleanedUp.get() && curAct != null) {
+                        syncCoreInstallBanner(curAct);
                     }
                 });
             }
@@ -1584,12 +1640,22 @@ public final class ColgramAiSheet {
 
     private void startDotPulse() {
         stopDotPulse();
+        Context ctx = liveDot != null ? liveDot.getContext() : null;
+        if (org.colgram.core.ColgramPowerGuard.isPowerSaveMode(ctx)
+                || org.colgram.core.ColgramPowerGuard.isThermalThrottled(ctx)) {
+            if (liveDot != null) liveDot.setAlpha(1.0f);
+            return;
+        }
+        final long[] lastDotFrameMs = new long[]{0L};
         dotPulseAnimator = ValueAnimator.ofFloat(0.6f, 1.0f);
         dotPulseAnimator.setDuration(1400L);
         dotPulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
         dotPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
         dotPulseAnimator.setInterpolator(new LinearInterpolator());
         dotPulseAnimator.addUpdateListener(a -> {
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - lastDotFrameMs[0] < 50L) return;
+            lastDotFrameMs[0] = now;
             float v = (float) a.getAnimatedValue();
             liveDot.setAlpha(v);
         });

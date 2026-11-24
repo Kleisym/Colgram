@@ -840,12 +840,15 @@ public class ColgramProxyManager {
             }
             if (state == TG_STATE_UPDATING) {
                 localBaseUnconnectedTicks = 0;
-                if (++localBaseUpdatingTicks >= 4) {
+                int updatingLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 6 : 4;
+                if (++localBaseUpdatingTicks >= updatingLimit) {
                     localBaseUpdatingTicks = 0;
-                    Log.w(TAG, "local base stuck in TG_STATE_UPDATING for 40s; clearing transient cooldowns and nudging tgnet");
+                    Log.w(TAG, "local base stuck in TG_STATE_UPDATING; clearing transient cooldowns and nudging tgnet");
                     localRouteUnavailableUntil = 0L;
                     ColgramDpiBypass.clearTransientCooldowns();
-                    executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
+                    if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+                        executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
+                    }
                     tgnetCheckConnection();
                     requestFreshDcAddresses("local base updating stalled");
                     if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
@@ -853,11 +856,14 @@ public class ColgramProxyManager {
                 return;
             }
             localBaseUpdatingTicks = 0;
-            if (++localBaseUnconnectedTicks >= 3) {
+            int unconnectedLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 5 : 3;
+            if (++localBaseUnconnectedTicks >= unconnectedLimit) {
                 localBaseUnconnectedTicks = 0;
                 localRouteUnavailableUntil = 0L;
                 ColgramDpiBypass.clearTransientCooldowns();
-                executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
+                if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+                    executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
+                }
                 tgnetCheckConnection();
                 requestFreshDcAddresses("local base stalled");
                 if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();

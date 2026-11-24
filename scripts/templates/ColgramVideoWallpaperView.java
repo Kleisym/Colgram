@@ -176,12 +176,15 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     }
 
     private boolean shouldBePlaying() {
+        Context ctx = getContext();
         return !pausedByHost
                 && windowVisible
                 && isAttachedToWindow()
                 && getVisibility() == View.VISIBLE
                 && videoPath != null
-                && !videoPath.isEmpty();
+                && !videoPath.isEmpty()
+                && !org.colgram.core.ColgramPowerGuard.isPowerSaveMode(ctx)
+                && !org.colgram.core.ColgramPowerGuard.isThermalThrottled(ctx);
     }
 
     private void cancelScheduledChecks() {

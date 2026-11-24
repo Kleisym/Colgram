@@ -95,15 +95,29 @@ public class ColgramAiActivity extends BaseFragment {
     private int resetCustomRow;
     private int footerShadowRow;
 
-    private String liveDownloadStage = "";
-    private int liveDownloadPct = 0;
-    private double liveDownloadSpeed = 0.0;
+    private boolean lastObservedDownloading = false;
+    private final ColgramAiModelManager.DownloadObserver downloadObserver = state -> AndroidUtilities.runOnUIThread(() -> {
+        if (listView == null || adapter == null) return;
+        boolean flippedToDone = lastObservedDownloading && !state.active;
+        lastObservedDownloading = state.active;
+        if (flippedToDone) {
+            refreshRow(heroRow);
+        }
+        refreshRow(coreCardRow);
+    });
 
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
         updateRows();
+        ColgramAiModelManager.addDownloadObserver(downloadObserver);
         return true;
+    }
+
+    @Override
+    public void onFragmentDestroy() {
+        ColgramAiModelManager.removeDownloadObserver(downloadObserver);
+        super.onFragmentDestroy();
     }
 
     private void updateRows() {
@@ -369,9 +383,7 @@ public class ColgramAiActivity extends BaseFragment {
     private void startOrToggleCoreDownload(Context ctx) {
         if (ColgramAiModelManager.isDownloading()) {
             ColgramAiModelManager.cancelDownload();
-            liveDownloadStage = "";
-            liveDownloadPct = 0;
-            refreshUi();
+            refreshRow(coreCardRow);
             return;
         }
         ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(ctx));
@@ -379,28 +391,21 @@ public class ColgramAiActivity extends BaseFragment {
     }
 
     private void startDownloadForSpec(Context ctx, ColgramAiModels.ModelSpec spec) {
-        liveDownloadStage = "Подготовка " + spec.title + "…";
-        liveDownloadPct = 0;
-        refreshUi();
-
-        ColgramAiModelManager.startDownloadAsync(ctx, spec, true, new ColgramAiModelManager.DownloadListener() {
+        final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+        ColgramAiModelManager.startDownloadAsync(appCtx, spec, true, new ColgramAiModelManager.DownloadListener() {
             @Override
             public void onProgress(String stage, long downloadedBytes, long totalBytes, double speedMbSec) {
-                AndroidUtilities.runOnUIThread(() -> {
-                    liveDownloadStage = stage;
-                    liveDownloadSpeed = speedMbSec;
-                    liveDownloadPct = totalBytes > 0 ? (int) Math.min(100, (downloadedBytes * 100L) / totalBytes) : 0;
-                    refreshRow(coreCardRow);
-                });
+                // Live UI state is pushed via global downloadObserver so exiting/reopening preserves progress
             }
 
             @Override
             public void onComplete(boolean success, String message) {
                 AndroidUtilities.runOnUIThread(() -> {
-                    liveDownloadStage = "";
-                    liveDownloadPct = 0;
-                    Toast.makeText(ctx, success ? ("Готово: " + spec.title) : ("Ошибка загрузки: " + message), Toast.LENGTH_LONG).show();
-                    refreshUi();
+                    Activity act = getParentActivity();
+                    if (act != null && !act.isFinishing() && !act.isDestroyed()) {
+                        Toast.makeText(act, success ? ("Готово: " + spec.title) : message, Toast.LENGTH_LONG).show();
+                        refreshUi();
+                    }
                 });
             }
         });
@@ -794,26 +799,41 @@ public class ColgramAiActivity extends BaseFragment {
 
             ColgramAiModels.ModelSpec spec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(ctx));
             ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);
-            boolean downloading = ColgramAiModelManager.isDownloading();
+            ColgramAiModelManager.DownloadState st = ColgramAiModelManager.getDownloadState();
+            boolean downloading = ColgramAiModelManager.isDownloading() || st.active;
             boolean hasEmbedded = ColgramAiModelManager.hasEmbeddedAssets(ctx);
             boolean specEmbedded = spec.hasBundledAssets() && hasEmbedded;
             boolean hasCustom = !TextUtils.isEmpty(ColgramAiConfig.getCustomModelPath(ctx)) && paths.isReady();
             boolean activeFileReady = hasCustom || ColgramAiModelManager.isModelDownloaded(ctx, spec);
             boolean activeVisionReady = hasCustom ? paths.hasVision() : ColgramAiModelManager.isVisionDownloaded(ctx, spec);
+            long partialBytes = ColgramAiModelManager.getPartialBytes(ctx, spec);
 
             titleTv.setText(hasCustom ? paths.displayName : spec.title);
             descTv.setText(spec.subtitle);
 
             if (downloading) {
+                int pct = st.percent();
                 progressBar.setVisibility(VISIBLE);
-                progressBar.setIndeterminate(liveDownloadPct <= 0);
-                progressBar.setProgress(liveDownloadPct);
+                progressBar.setIndeterminate(pct < 0);
+                if (pct >= 0) {
+                    progressBar.setProgress(pct);
+                }
                 statusTv.setTextColor(pal.semanticCrimson);
-                statusTv.setText(liveDownloadPct > 0
-                        ? String.format(Locale.US, "%s — %d%% (%.1f МБ/с)", liveDownloadStage, liveDownloadPct, liveDownloadSpeed)
-                        : (liveDownloadStage.isEmpty() ? "Подготовка ядра…" : liveDownloadStage));
-                boolean extracting = ColgramAiModelManager.isExtractingEmbedded();
-                primaryBtn.setText(extracting ? "Подготовка…" : "Остановить загрузку");
+                String stage = st.phase.isEmpty() ? "Подготовка ядра…" : st.phase;
+                if (pct >= 0 && st.totalBytes > 0) {
+                    String sizePart = ColgramAiModelManager.formatSizeMb(st.downloadedBytes)
+                            + " / " + ColgramAiModelManager.formatSizeMb(st.totalBytes);
+                    if (st.speedMbPerSec > 0.05) {
+                        statusTv.setText(String.format(Locale.US, "%s — %d%% (%s · %.1f МБ/с)",
+                                stage, pct, sizePart, st.speedMbPerSec));
+                    } else {
+                        statusTv.setText(String.format(Locale.US, "%s — %d%% (%s)", stage, pct, sizePart));
+                    }
+                } else {
+                    statusTv.setText(stage);
+                }
+                boolean extracting = st.extracting || ColgramAiModelManager.isExtractingEmbedded();
+                primaryBtn.setText(extracting ? "Подготовка…" : "Пауза");
                 primaryBtn.setOnClickListener(v -> {
                     if (!extracting) startOrToggleCoreDownload(ctx);
                 });
@@ -847,11 +867,33 @@ public class ColgramAiActivity extends BaseFragment {
                 primaryBtn.setText("Активировать встроенное ядро");
                 primaryBtn.setOnClickListener(v -> startOrToggleCoreDownload(ctx));
                 secondaryBtn.setVisibility(GONE);
+            } else if (partialBytes > 0L) {
+                long total = spec.approxModelBytes > 0L ? spec.approxModelBytes : partialBytes;
+                int pct = (int) Math.min(99L, (partialBytes * 100L) / Math.max(1L, total));
+                progressBar.setVisibility(VISIBLE);
+                progressBar.setIndeterminate(false);
+                progressBar.setProgress(pct);
+                boolean hasErr = !TextUtils.isEmpty(st.lastError) && !st.pausedByUser
+                        && (st.modelId.isEmpty() || st.modelId.equals(spec.id));
+                statusTv.setTextColor(hasErr ? pal.semanticCrimson : Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+                statusTv.setText((hasErr ? ("Пауза (" + st.lastError + ") • ") : "Приостановлено • ")
+                        + ColgramAiModelManager.formatSizeMb(partialBytes) + " из " + ColgramAiModelManager.formatSizeMb(total)
+                        + " (" + pct + "%)");
+                primaryBtn.setText("Продолжить загрузку");
+                primaryBtn.setOnClickListener(v -> startOrToggleCoreDownload(ctx));
+                secondaryBtn.setVisibility(VISIBLE);
+                secondaryBtn.setText("Сбросить");
+                secondaryBtn.setOnClickListener(v -> {
+                    ColgramAiModelManager.clearPartialDownload(ctx, spec);
+                    refreshUi();
+                });
             } else {
                 progressBar.setVisibility(GONE);
-                statusTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
-                statusTv.setText("Веса не загружены • Загрузка напрямую с GitHub (с докачкой)");
-                primaryBtn.setText("Скачать " + spec.title);
+                boolean hasErr = !TextUtils.isEmpty(st.lastError) && !st.pausedByUser
+                        && (st.modelId.isEmpty() || st.modelId.equals(spec.id));
+                statusTv.setTextColor(hasErr ? pal.semanticCrimson : Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+                statusTv.setText(hasErr ? ("Ошибка: " + st.lastError) : "Веса не загружены • Загрузка напрямую с GitHub (с докачкой)");
+                primaryBtn.setText(hasErr ? "Повторить загрузку" : ("Скачать " + spec.title));
                 primaryBtn.setOnClickListener(v -> startOrToggleCoreDownload(ctx));
                 secondaryBtn.setVisibility(GONE);
             }

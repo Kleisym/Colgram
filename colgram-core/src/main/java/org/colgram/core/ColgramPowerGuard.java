@@ -6,6 +6,7 @@ import android.content.IntentFilter;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.PowerManager;
+import android.os.SystemClock;
 
 /**
  * Battery-, screen-, and Doze-aware eco governor for Colgram's 24/7 background engine.
@@ -17,8 +18,43 @@ import android.os.PowerManager;
 public final class ColgramPowerGuard {
 
     private static final int THROTTLE_BELOW_PERCENT = 20;
+    private static final long BATTERY_CACHE_MS = 15_000L;
+
+    private static volatile long cachedBatteryUpdatedAtMs = 0L;
+    private static volatile boolean cachedCharging = false;
+    private static volatile int cachedBatteryPercent = 100;
+    private static volatile int cachedTempTenthsC = 0;
 
     private ColgramPowerGuard() {
+    }
+
+    private static void refreshBatterySnapshotIfNeeded(Context context) {
+        if (context == null) return;
+        long now;
+        try {
+            now = SystemClock.elapsedRealtime();
+        } catch (Throwable ignored) {
+            now = System.currentTimeMillis();
+        }
+        long prev = cachedBatteryUpdatedAtMs;
+        if (prev > 0L && now - prev >= 0L && now - prev < BATTERY_CACHE_MS) {
+            return;
+        }
+        try {
+            Intent battery = context.registerReceiver(null,
+                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if (battery == null) return;
+            int status = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+            int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+            int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+            cachedCharging = status == BatteryManager.BATTERY_STATUS_CHARGING
+                    || status == BatteryManager.BATTERY_STATUS_FULL
+                    || plugged != 0;
+            cachedBatteryPercent = (level >= 0 && scale > 0) ? (level * 100 / scale) : 100;
+            cachedTempTenthsC = battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
+            cachedBatteryUpdatedAtMs = now;
+        } catch (Throwable ignored) {}
     }
 
     /** True when the device display is currently on / user-interactive. */
@@ -86,18 +122,8 @@ public final class ColgramPowerGuard {
     /** True when the device is currently plugged into AC, USB, or wireless charging. */
     public static boolean isCharging(Context context) {
         if (context == null) return false;
-        try {
-            Intent battery = context.registerReceiver(null,
-                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-            if (battery == null) return false;
-            int status = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-            int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
-            return status == BatteryManager.BATTERY_STATUS_CHARGING
-                    || status == BatteryManager.BATTERY_STATUS_FULL
-                    || plugged != 0;
-        } catch (Throwable t) {
-            return false;
-        }
+        refreshBatterySnapshotIfNeeded(context);
+        return cachedCharging;
     }
 
     /**
@@ -114,50 +140,32 @@ public final class ColgramPowerGuard {
                 }
             } catch (Throwable ignored) {}
         }
-        try {
-            Intent battery = context.registerReceiver(null,
-                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-            if (battery != null) {
-                int tempTenthsC = battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
-                if (tempTenthsC >= 400) {
-                    return true;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return false;
+        refreshBatterySnapshotIfNeeded(context);
+        return cachedTempTenthsC >= 400;
     }
 
     /** True when background loops should stretch their intervals (low battery or Power Saver). */
     public static boolean shouldThrottle(Context context) {
         if (context == null) return false;
         if (isPowerSaveMode(context)) return true;
-        try {
-            Intent battery = context.registerReceiver(null,
-                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-            if (battery == null) return false;
-            int status = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-            if (status == BatteryManager.BATTERY_STATUS_CHARGING
-                    || status == BatteryManager.BATTERY_STATUS_FULL) {
-                return false;
-            }
-            int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-            int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
-            if (level < 0 || scale <= 0) return false;
-            return (level * 100 / scale) <= THROTTLE_BELOW_PERCENT;
-        } catch (Throwable t) {
-            return false;
-        }
+        refreshBatterySnapshotIfNeeded(context);
+        if (cachedCharging) return false;
+        return cachedBatteryPercent <= THROTTLE_BELOW_PERCENT;
     }
 
     /**
      * Adaptive eco multiplier for periodic background heartbeats:
      * - 1x (60s) when screen is ON and battery is healthy
      * - 5x (5m) when screen is OFF (pocket/idle; native MTProto socket stays connected in kernel)
+     * - 6x (6m) when the device is warm (>= 40C or THERMAL_STATUS_MODERATE)
      * - 8x (8m) when Power Saver, Doze, or low battery (<= 20%) is active
      */
     public static int intervalFactor(Context context) {
         if (shouldThrottle(context) || isDeviceIdle(context)) {
             return 8;
+        }
+        if (isThermalThrottled(context)) {
+            return 6;
         }
         if (!isScreenInteractive(context)) {
             return 5;
