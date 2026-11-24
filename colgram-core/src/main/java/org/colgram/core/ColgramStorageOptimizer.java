@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -202,9 +203,23 @@ public final class ColgramStorageOptimizer {
         return cleaned;
     }
 
+    private static File[] sortedChildren(File dir) {
+        if (dir == null) return null;
+        File[] children = dir.listFiles();
+        if (children != null && children.length > 1) {
+            Arrays.sort(children, (a, b) -> {
+                if (a == b) return 0;
+                if (a == null) return 1;
+                if (b == null) return -1;
+                return a.getName().compareTo(b.getName());
+            });
+        }
+        return children;
+    }
+
     private static int sweepOrphanTmpRecursive(File dir, int depth, long nowMs) {
         if (dir == null || !dir.isDirectory() || depth > 6) return 0;
-        File[] children = dir.listFiles();
+        File[] children = sortedChildren(dir);
         if (children == null) return 0;
         int cleaned = 0;
         for (File child : children) {
@@ -243,7 +258,7 @@ public final class ColgramStorageOptimizer {
                                                  int maxFiles, List<File> out) {
         if (dir == null || !dir.isDirectory() || depth > 5 || out.size() >= maxFiles) return;
         if (depth > 0 && isExcludedDirectoryName(dir.getName())) return;
-        File[] children = dir.listFiles();
+        File[] children = sortedChildren(dir);
         if (children == null) return;
         for (File child : children) {
             if (out.size() >= maxFiles) return;
@@ -423,7 +438,7 @@ public final class ColgramStorageOptimizer {
                                                      long nowMs, Map<Long, List<File>> bySize) {
         if (dir == null || !dir.isDirectory() || depth > 5) return;
         if (depth > 0 && isExcludedDirectoryName(dir.getName())) return;
-        File[] children = dir.listFiles();
+        File[] children = sortedChildren(dir);
         if (children == null) return;
         for (File child : children) {
             if (child == null) continue;
@@ -562,7 +577,7 @@ public final class ColgramStorageOptimizer {
         long srcLen = src.length();
         String sha = computeSha256(src);
         if (!sha.isEmpty()) {
-            File[] existing = targetDir.listFiles();
+            File[] existing = sortedChildren(targetDir);
             if (existing != null) {
                 for (File cand : existing) {
                     if (cand != null && cand.isFile() && cand.length() == srcLen) {
@@ -615,7 +630,7 @@ public final class ColgramStorageOptimizer {
             }
         }
         if (inboxDir != null && inboxDir.isDirectory()) {
-            File[] inboxFiles = inboxDir.listFiles();
+            File[] inboxFiles = sortedChildren(inboxDir);
             if (inboxFiles != null) {
                 for (File f : inboxFiles) {
                     if (f == null || !f.isFile() || ".nomedia".equals(f.getName())) continue;
@@ -639,7 +654,7 @@ public final class ColgramStorageOptimizer {
         long reclaimed = 0L;
         List<File> surviving = new ArrayList<>();
         long survivingBytes = 0L;
-        File[] files = acacheDir.listFiles();
+        File[] files = sortedChildren(acacheDir);
         if (files == null) return 0L;
         for (File f : files) {
             if (f == null || ".nomedia".equals(f.getName())) continue;
@@ -680,7 +695,7 @@ public final class ColgramStorageOptimizer {
 
     private static long pruneStaleTempFilesRecursive(File dir, int depth, Set<String> activePaths, long nowMs) {
         if (dir == null || !dir.isDirectory() || depth > 5) return 0L;
-        File[] children = dir.listFiles();
+        File[] children = sortedChildren(dir);
         if (children == null) return 0L;
         long reclaimed = 0L;
         for (File child : children) {
@@ -791,7 +806,7 @@ public final class ColgramStorageOptimizer {
                 || dn.contains("plugins")) {
             return;
         }
-        File[] children = dir.listFiles();
+        File[] children = sortedChildren(dir);
         if (children == null) return;
         for (File child : children) {
             if (child == null) continue;
