@@ -51,6 +51,11 @@ public class ColgramForegroundService extends Service {
     private static final String TAG = "ColgramFgService";
     private static final String CHANNEL_ID = "colgram_background";
     private static final int NOTIFICATION_ID = 771001;
+    public static final String ACTION_DOZE_KEEPALIVE = "org.colgram.action.DOZE_KEEPALIVE";
+    private static final int DOZE_KEEPALIVE_REQUEST_CODE = 771009;
+    /** Quiet Doze-proof alarm keepalive every 5 minutes for reliable screen-off delivery & Anti-Delete without heating. */
+    private static final long DOZE_KEEPALIVE_INTERVAL_MS = 300_000L;
+    private static final long DOZE_WAKELOCK_MS = 4_000L;
 
     /** Lightweight passive 30-second bypass/poller check interval. */
     private static final long HEARTBEAT_MS = 30_000L;
@@ -62,6 +67,8 @@ public class ColgramForegroundService extends Service {
     private static volatile ColgramForegroundService activeInstance;
     private static volatile long lastDefenderSweepAtMs = 0L;
     private static volatile long screenOffSinceMs = 0L;
+    private static final java.util.concurrent.atomic.AtomicBoolean dozePulseInFlight =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     public static boolean isServiceRunning() {
         return serviceRunning;
@@ -78,23 +85,28 @@ public class ColgramForegroundService extends Service {
         serviceRunning = true;
         activeInstance = this;
         ensureForeground();
-        // Register persistent self-healing JobScheduler watchdog so OEM killers / Android 15 6h quota
-        // can never permanently stop Colgram's 24/7 background engine.
+        // Register persistent self-healing JobScheduler watchdog + Doze-proof 3m keepalive pulse
+        // so OEM killers / screen-off Doze can never silently stall incoming messages or Anti-Delete.
         if (ColgramConfig.isAlwaysBackgroundEnabled()) {
             try {
                 ColgramBootJobService.scheduleProxyRefresh(getApplicationContext());
             } catch (Throwable ignored) {}
+            scheduleDozeKeepalive(getApplicationContext());
         }
     }
 
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        // Drop idle Koliti GGUF RAM footprint when backgrounded so OEM LMK sees a tiny ~80 MB resident process.
-        if (level >= TRIM_MEMORY_UI_HIDDEN) {
+        // DO NOT unload Koliti weights on normal background switch (TRIM_MEMORY_UI_HIDDEN=20):
+        // only release GGUF weights under genuine critical OS memory pressure so reopening Koliti
+        // stays instant instead of triggering a 10-15s cold disk reload.
+        if (level == TRIM_MEMORY_RUNNING_CRITICAL || level >= TRIM_MEMORY_COMPLETE) {
             try {
                 ColgramAiEngine.getInstance().unloadIfIdleInBackground();
             } catch (Throwable ignored) {}
+        }
+        if (level >= TRIM_MEMORY_UI_HIDDEN) {
             try {
                 ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
             } catch (Throwable ignored) {}
@@ -110,6 +122,9 @@ public class ColgramForegroundService extends Service {
         ensureForeground();
         ensurePollers();
         startHeartbeat();
+        if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+            scheduleDozeKeepalive(getApplicationContext());
+        }
         return START_STICKY;
     }
 
@@ -340,9 +355,6 @@ public class ColgramForegroundService extends Service {
                 });
             }
             if (!ColgramUiBridge.isAppInForeground()) {
-                try {
-                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
-                } catch (Throwable ignored) {}
                 return;
             }
             long now = android.os.SystemClock.elapsedRealtime();
@@ -366,17 +378,12 @@ public class ColgramForegroundService extends Service {
         if (!screenOn) {
             if (screenOffSinceMs == 0L) {
                 screenOffSinceMs = now;
-            } else if (now - screenOffSinceMs > 180_000L) {
-                // Screen has been off > 3 min: unload idle LLM weights so OEM RAM killers leave Colgram alive.
-                try {
-                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
-                } catch (Throwable ignored) {}
             }
         } else {
             screenOffSinceMs = 0L;
         }
-        // Zero-drain eco cadence: 5 min when screen is ON, 15 min when screen is OFF (native MTProto socket stays awake in kernel).
-        long minIntervalMs = screenOn ? 300_000L : 900_000L;
+        // Zero-drain eco cadence: 5 min when screen is ON, 3 min Doze-aware tick when screen is OFF.
+        long minIntervalMs = screenOn ? 300_000L : DOZE_KEEPALIVE_INTERVAL_MS;
         if (lastHumanSyncAtMs != 0L && now - lastHumanSyncAtMs < minIntervalMs) {
             return;
         }
@@ -399,6 +406,8 @@ public class ColgramForegroundService extends Service {
                 }
                 Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
                 if (cm != null) {
+                    try { cmClass.getMethod("setPushConnectionEnabled", boolean.class).invoke(cm, true); } catch (Throwable ignored) {}
+                    try { cmClass.getMethod("resumeNetworkMaybe").invoke(cm); } catch (Throwable ignored) {}
                     cmClass.getMethod("checkConnection").invoke(cm);
                 }
                 if (screenOn && handler != null) {
@@ -498,18 +507,98 @@ public class ColgramForegroundService extends Service {
         ColgramForegroundService inst = activeInstance;
         if (inst == null || inst.handler == null) return;
         inst.handler.post(() -> {
-            // Keep START_STICKY service, passive 30s bypass watchdog, and 127.0.0.1:9876 ALWAYS alive
-            // in background so chats, notifications, media, and Anti-Delete Vault continue 24/7.
+            // Keep START_STICKY service, passive 30s bypass watchdog, 3m Doze keepalive, and
+            // 127.0.0.1:9876 ALWAYS alive in background so chats, notifications, and Anti-Delete continue 24/7.
+            // Do NOT unload Koliti weights on normal background switch (only on critical memory trim).
             inst.startHeartbeat();
+            if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+                scheduleDozeKeepalive(inst.getApplicationContext());
+            }
             if (!ColgramUiBridge.isAppInForeground()) {
-                try {
-                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
-                } catch (Throwable ignored) {}
                 try {
                     ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(inst);
                 } catch (Throwable ignored) {}
             }
         });
+    }
+
+    /** Schedules a lightweight Doze-proof 3-minute AlarmManager keepalive pulse via ColgramBootReceiver. */
+    public static void scheduleDozeKeepalive(Context context) {
+        if (context == null || !ColgramConfig.isAlwaysBackgroundEnabled()) return;
+        Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        try {
+            android.app.AlarmManager am = (android.app.AlarmManager) app.getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Intent intent = new Intent(app, ColgramBootReceiver.class);
+            intent.setAction(ACTION_DOZE_KEEPALIVE);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= 23) {
+                flags |= PendingIntent.FLAG_IMMUTABLE;
+            }
+            PendingIntent pi = PendingIntent.getBroadcast(app, DOZE_KEEPALIVE_REQUEST_CODE, intent, flags);
+            long triggerAt = android.os.SystemClock.elapsedRealtime() + DOZE_KEEPALIVE_INTERVAL_MS;
+            if (Build.VERSION.SDK_INT >= 23) {
+                am.setAndAllowWhileIdle(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            } else {
+                am.set(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "scheduleDozeKeepalive failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Executed on the 3-minute Doze keepalive tick: acquires a brief 4s PARTIAL_WAKE_LOCK only for
+     * the pulse, confirms fixed loopback 127.0.0.1:9876 is bound, ensures push connections stay ON,
+     * and wakes tgnet via resumeNetworkMaybe() so messages & Anti-Delete save even with screen OFF.
+     */
+    public static void handleDozeKeepalivePulse(Context context) {
+        if (context == null) return;
+        final Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        ColgramConfig.init(app);
+        if (!ColgramConfig.isAlwaysBackgroundEnabled()) return;
+        scheduleDozeKeepalive(app);
+        if (!dozePulseInFlight.compareAndSet(false, true)) return;
+        PowerManager.WakeLock wl = null;
+        try {
+            PowerManager pm = (PowerManager) app.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "colgram:doze_keepalive");
+                wl.setReferenceCounted(false);
+                wl.acquire(DOZE_WAKELOCK_MS);
+            }
+        } catch (Throwable ignored) {}
+        final PowerManager.WakeLock wakeLock = wl;
+        Thread t = new Thread(() -> {
+            try {
+                if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                    ColgramDpiBypass.restartIfDeadAndWait(2000L);
+                }
+                Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+                for (int a = 0; a < 5; a++) {
+                    Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, a);
+                    if (uc == null) continue;
+                    Boolean activated = (Boolean) ucClass.getMethod("isClientActivated").invoke(uc);
+                    if (activated == null || !activated) continue;
+                    Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
+                    if (cm != null) {
+                        try { cmClass.getMethod("setPushConnectionEnabled", boolean.class).invoke(cm, true); } catch (Throwable ignored) {}
+                        try { cmClass.getMethod("resumeNetworkMaybe").invoke(cm); } catch (Throwable ignored) {}
+                    }
+                }
+            } catch (Throwable err) {
+                Log.w(TAG, "doze keepalive tick failed: " + err.getMessage());
+            } finally {
+                dozePulseInFlight.set(false);
+                if (wakeLock != null) {
+                    try { if (wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {}
+                }
+            }
+        }, "colgram-doze-pulse");
+        t.setDaemon(true);
+        t.setPriority(Thread.MIN_PRIORITY + 1);
+        t.start();
     }
 
     /** Resumes lightweight foreground heartbeat and triggers instant <1s reconnect on UI return. */
@@ -541,6 +630,8 @@ public class ColgramForegroundService extends Service {
                 if (!activated) continue;
                 Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
                 if (cm != null) {
+                    try { cmClass.getMethod("setPushConnectionEnabled", boolean.class).invoke(cm, true); } catch (Throwable ignored) {}
+                    try { cmClass.getMethod("resumeNetworkMaybe").invoke(cm); } catch (Throwable ignored) {}
                     cmClass.getMethod("checkConnection").invoke(cm);
                 }
             }

@@ -98,15 +98,17 @@ public class ColgramDpiBypass {
     private static final String[] RU_WHITELIST_PROBE_HOSTS = {"vk.com", "ya.ru"};
     private static final long L3_WHITELIST_CACHE_MS = 20_000L;
     private static final long L3_RELAY_ACTIVE_WINDOW_MS = 90_000L;
-    private static final long L3_RELAY_PENALTY_MS = 90_000L;
+    private static final long L3_RELAY_PENALTY_MS = 180_000L;
     private static final int L3_RELAY_CONNECT_TIMEOUT_MS = 2500;
     private static final int L3_CELLULAR_RELAY_CONNECT_TIMEOUT_MS = 3200;
-    private static final int L3_RELAY_MAX_CANDIDATES = 6;
+    private static final int L3_RELAY_MAX_CANDIDATES = 4;
     private static final int L3_DIRECT_RECOVERY_PROBE_MS = 900;
+    private static final long L3_ZERO_RELAY_WARP_TRIGGER_MS = 8_000L;
     private static final int SOCKET_BUFFER_BYTES = 262144;
     private static final int STREAM_COPY_BUFFER_BYTES = 65536;
     private static volatile long l3WhitelistCheckedAt = 0L;
     private static volatile boolean strictL3WhitelistDetected = false;
+    private static volatile long strictL3ZeroRelaysSinceMs = 0L;
     private static volatile long lastL3RelaySuccessAt = 0L;
     private static volatile String activeL3RelayLabel = "";
     private static final java.util.concurrent.atomic.AtomicInteger l3RawMtprotoSilentStreak =
@@ -164,6 +166,7 @@ public class ColgramDpiBypass {
     /** Called whenever any direct Layer-1 Telegram TCP/WSS path succeeds; snaps back to 100% pure local bypass. */
     static void onDirectLayer1Success() {
         strictL3WhitelistDetected = false;
+        strictL3ZeroRelaysSinceMs = 0L;
         activeL3RelayLabel = "";
         lastL3RelaySuccessAt = 0L;
         l3RawMtprotoSilentStreak.set(0);
@@ -442,12 +445,32 @@ public class ColgramDpiBypass {
         final long generation = ++listenerGeneration;
         ServerSocket candidate = null;
         try {
-            candidate = new ServerSocket();
-            candidate.setReuseAddress(true);
-            try {
-                candidate.bind(new InetSocketAddress("127.0.0.1", LOCAL_PORT));
-            } catch (java.net.BindException occupied) {
-                closeQuietly(candidate);
+            // Pin ONE permanent fixed loopback port (127.0.0.1:9876) with SO_REUSEADDR and brief
+            // retries so transient TIME_WAIT never causes ephemeral port rotation or tgnet resets.
+            java.net.BindException lastBindError = null;
+            for (int attempt = 0; attempt < 4; attempt++) {
+                candidate = new ServerSocket();
+                candidate.setReuseAddress(true);
+                try {
+                    candidate.bind(new InetSocketAddress("127.0.0.1", LOCAL_PORT));
+                    lastBindError = null;
+                    break;
+                } catch (java.net.BindException occupied) {
+                    lastBindError = occupied;
+                    closeQuietly(candidate);
+                    candidate = null;
+                    if (attempt < 3) {
+                        try { Thread.sleep(80L); } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+            if (candidate == null) {
+                Log.w(TAG, "Fixed port " + LOCAL_PORT + " held externally ("
+                        + (lastBindError != null ? lastBindError.getMessage() : "busy")
+                        + "); falling back to ephemeral loopback once");
                 candidate = new ServerSocket();
                 candidate.setReuseAddress(true);
                 candidate.bind(new InetSocketAddress("127.0.0.1", 0));
@@ -1710,7 +1733,7 @@ public class ColgramDpiBypass {
         final boolean[] finished = new boolean[1];
         final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
         final java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(top.size());
-        final long[] delaysMs = {0L, 120L, 240L};
+        final long[] delaysMs = {0L, 60L, 120L, 180L};
 
         for (int i = 0; i < top.size(); i++) {
             final ColgramProxyChain.Relay relay = top.get(i);
@@ -2101,7 +2124,17 @@ public class ColgramDpiBypass {
         try {
             relays = ColgramProxyManager.getReachableRelays();
             if (relays.isEmpty()) {
+                long nowMs = safeElapsedRealtime();
+                if (strictL3ZeroRelaysSinceMs == 0L) {
+                    strictL3ZeroRelaysSinceMs = nowMs;
+                }
                 ColgramProxyManager.triggerImmediateL3RelayRefresh();
+                if (nowMs - strictL3ZeroRelaysSinceMs >= L3_ZERO_RELAY_WARP_TRIGGER_MS) {
+                    strictL3ZeroRelaysSinceMs = nowMs;
+                    ColgramProxyManager.triggerEmergencyWarpProbeIfAvailable();
+                }
+            } else {
+                strictL3ZeroRelaysSinceMs = 0L;
             }
         } catch (Throwable ignored) {}
 

@@ -35,6 +35,10 @@ public class ColgramBootReceiver extends BroadcastReceiver {
             return;
         }
         String action = intent.getAction();
+        if (ColgramForegroundService.ACTION_DOZE_KEEPALIVE.equals(action)) {
+            ColgramForegroundService.handleDozeKeepalivePulse(context.getApplicationContext());
+            return;
+        }
         if (ColgramBypassNotice.ACTION_ENABLE_BYPASS.equals(action)) {
             // The "Включить обход" button on the blocked notice. This is the consent: Colgram
             // never turns the proxy on by itself, but once he asks, it should happen immediately

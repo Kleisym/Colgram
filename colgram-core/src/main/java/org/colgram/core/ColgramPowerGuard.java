@@ -67,6 +67,22 @@ public final class ColgramPowerGuard {
         }
     }
 
+    /**
+     * Cleanly offers Android's battery-optimization exemption ONCE per install on first foreground
+     * launch (only if not yet granted) so OEM killers (HiOS/MIUI/OneUI) never freeze Colgram in sleep.
+     */
+    public static void offerBatteryExemptionOnce(Context context) {
+        if (context == null || Build.VERSION.SDK_INT < 23) return;
+        if (isBatteryExemptionGranted(context)) return;
+        try {
+            Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            android.content.SharedPreferences prefs = app.getSharedPreferences("colgram_power_guard", Context.MODE_PRIVATE);
+            if (prefs.getBoolean("battery_opt_prompted_v1", false)) return;
+            prefs.edit().putBoolean("battery_opt_prompted_v1", true).apply();
+            ColgramForegroundService.requestBatteryExemption(context);
+        } catch (Throwable ignored) {}
+    }
+
     /** True when the device is currently plugged into AC, USB, or wireless charging. */
     public static boolean isCharging(Context context) {
         if (context == null) return false;

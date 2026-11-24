@@ -190,6 +190,7 @@ public final class ColgramAiOrbView extends View {
         }
         wakeDx[0] = Math.max(-dp(16), Math.min(dp(16), -vx * 0.20f));
         wakeDy[0] = Math.max(-dp(16), Math.min(dp(16), -vy * 0.20f));
+        syncAnimatorState();
         invalidate();
     }
 
@@ -201,6 +202,7 @@ public final class ColgramAiOrbView extends View {
         if (orbAnimator != null) {
             orbAnimator.setDuration(durationForState(state));
         }
+        syncAnimatorState();
         invalidate();
     }
 
@@ -219,9 +221,24 @@ public final class ColgramAiOrbView extends View {
         }
     }
 
+    private boolean hasActiveWake() {
+        if (dragging) return true;
+        if (Math.hypot(velocityX, velocityY) > 0.6f) return true;
+        for (int i = 0; i < wakeDx.length; i++) {
+            if (Math.abs(wakeDx[i]) > 0.35f || Math.abs(wakeDy[i]) > 0.35f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void syncAnimatorState() {
         boolean powerSave = org.colgram.core.ColgramPowerGuard.isPowerSaveMode(getContext());
-        boolean shouldRun = !hostPaused && isAttachedToWindow() && windowVisible && getVisibility() == VISIBLE && !powerSave;
+        // 100% static (0 invalidations/sec, 0.0% CPU/GPU) while IDLE with no active drag/flight wake;
+        // animates ONLY while Koliti is actively generating/searching/flying or being dragged!
+        boolean activeMotion = (state != State.IDLE) || hasActiveWake();
+        boolean shouldRun = !hostPaused && isAttachedToWindow() && windowVisible
+                && getVisibility() == VISIBLE && !powerSave && activeMotion;
         if (shouldRun && orbAnimator == null) {
             orbAnimator = ValueAnimator.ofFloat(0f, 1f);
             orbAnimator.setDuration(durationForState(state));
@@ -229,15 +246,27 @@ public final class ColgramAiOrbView extends View {
             orbAnimator.setInterpolator(new LinearInterpolator());
             orbAnimator.addUpdateListener(a -> {
                 long nowMs = android.os.SystemClock.uptimeMillis();
-                long minStep = (state == State.IDLE) ? 33L : 0L;
-                if (minStep > 0L && nowMs - lastFrameInvalidateMs < minStep) {
+                if (nowMs - lastFrameInvalidateMs < 24L) {
                     return;
                 }
                 lastFrameInvalidateMs = nowMs;
                 phase = (float) a.getAnimatedValue();
+                velocityX *= 0.80f;
+                velocityY *= 0.80f;
                 for (int i = 0; i < wakeDx.length; i++) {
-                    wakeDx[i] *= 0.84f;
-                    wakeDy[i] *= 0.84f;
+                    wakeDx[i] *= 0.80f;
+                    wakeDy[i] *= 0.80f;
+                }
+                if (state == State.IDLE && !hasActiveWake()) {
+                    velocityX = 0f;
+                    velocityY = 0f;
+                    for (int i = 0; i < wakeDx.length; i++) {
+                        wakeDx[i] = 0f;
+                        wakeDy[i] = 0f;
+                    }
+                    invalidate();
+                    syncAnimatorState();
+                    return;
                 }
                 invalidate();
             });
@@ -342,6 +371,7 @@ public final class ColgramAiOrbView extends View {
                 }
             }
             dragging = false;
+            syncAnimatorState();
             return true;
         }
         return super.onTouchEvent(ev);

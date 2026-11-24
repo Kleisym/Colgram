@@ -481,9 +481,7 @@ public final class ColgramAeroStyler {
         private int cachedWidth;
         private boolean cachedDark;
         private boolean cachedCyber;
-        private ValueAnimator anim;
-        private float phase = 0f;
-        private long lastDrawMs = 0L;
+        private final float phase = 0.5f;
 
         AccentHairlineStrip(Context ctx) {
             super(ctx);
@@ -492,57 +490,10 @@ public final class ColgramAeroStyler {
             wavePaint.setStrokeWidth(Math.max(1.2f, dp(1.35f)));
         }
 
-        private void updateAnimState(boolean visible) {
-            boolean powerSave = org.colgram.core.ColgramPowerGuard.isPowerSaveMode(getContext())
-                    || !org.telegram.messenger.ApplicationLoader.isScreenOn
-                    || org.telegram.messenger.ApplicationLoader.mainInterfacePaused;
-            if (visible && isAttachedToWindow() && !powerSave) {
-                if (anim == null) {
-                    anim = ValueAnimator.ofFloat(0f, 1f);
-                    anim.setDuration(4200L);
-                    anim.setRepeatCount(ValueAnimator.INFINITE);
-                    anim.setInterpolator(new LinearInterpolator());
-                    anim.addUpdateListener(a -> {
-                        long nowMs = android.os.SystemClock.uptimeMillis();
-                        if (nowMs - lastDrawMs < 40L) return;
-                        lastDrawMs = nowMs;
-                        phase = (float) a.getAnimatedValue();
-                        invalidate();
-                    });
-                    anim.start();
-                } else if (anim.isPaused()) {
-                    anim.resume();
-                }
-            } else if (anim != null && anim.isRunning()) {
-                anim.pause();
-            }
-        }
-
         @Override
         protected void onAttachedToWindow() {
             super.onAttachedToWindow();
-            updateAnimState(getVisibility() == VISIBLE && getWindowVisibility() == VISIBLE);
-        }
-
-        @Override
-        protected void onDetachedFromWindow() {
-            super.onDetachedFromWindow();
-            if (anim != null) {
-                anim.cancel();
-                anim = null;
-            }
-        }
-
-        @Override
-        protected void onWindowVisibilityChanged(int visibility) {
-            super.onWindowVisibilityChanged(visibility);
-            updateAnimState(visibility == VISIBLE && getVisibility() == VISIBLE);
-        }
-
-        @Override
-        protected void onVisibilityChanged(View changedView, int visibility) {
-            super.onVisibilityChanged(changedView, visibility);
-            updateAnimState(visibility == VISIBLE && getWindowVisibility() == VISIBLE);
+            invalidate();
         }
 
         private int cachedAccent;
@@ -606,16 +557,8 @@ public final class ColgramAeroStyler {
         }
     }
 
-    /** Zero-allocation living wave/aurora backdrop for the main menu (DialogsActivity) & onboarding. */
+    /** Zero-allocation static ambient wave/aurora backdrop for the main menu (DialogsActivity) & onboarding. */
     public static final class AmbientMenuBackdropView extends View {
-        private boolean tickPending;
-        private final Runnable frameTick = () -> {
-            tickPending = false;
-            if (isAttachedToWindow() && getWindowVisibility() == VISIBLE) {
-                invalidate();
-            }
-        };
-
         public AmbientMenuBackdropView(Context ctx) {
             super(ctx);
             setWillNotDraw(false);
@@ -627,24 +570,6 @@ public final class ColgramAeroStyler {
         protected void onAttachedToWindow() {
             super.onAttachedToWindow();
             invalidate();
-        }
-
-        @Override
-        protected void onDetachedFromWindow() {
-            super.onDetachedFromWindow();
-            tickPending = false;
-            removeCallbacks(frameTick);
-        }
-
-        @Override
-        protected void onWindowVisibilityChanged(int visibility) {
-            super.onWindowVisibilityChanged(visibility);
-            if (visibility == VISIBLE) {
-                invalidate();
-            } else {
-                tickPending = false;
-                removeCallbacks(frameTick);
-            }
         }
 
         @Override
@@ -664,12 +589,8 @@ public final class ColgramAeroStyler {
             int accent = Theme.getColor(Theme.key_featuredStickers_addButton);
             org.colgram.core.ColgramLiveWallpaper.drawMainMenuAmbient(
                     canvas, w, h, accent, dark, cyber,
-                    org.colgram.core.ColgramLiveWallpaper.currentAnimationSeconds(),
+                    0f,
                     AndroidUtilities.density);
-            if (!tickPending) {
-                tickPending = true;
-                postDelayed(frameTick, 33L);
-            }
         }
     }
 

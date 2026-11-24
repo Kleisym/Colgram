@@ -522,7 +522,7 @@ index 92dcf62c..1d1a9064 100644
          }
      }
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java b/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
-index 5405be7f..e7180858 100644
+index 5405be7f..4f362ae5 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java
 @@ -250,7 +250,8 @@ public class ApplicationLoader extends Application {
@@ -628,12 +628,22 @@ index 5405be7f..e7180858 100644
          //if (BuildConfig.DEBUG_PRIVATE_VERSION) {
          //    Choreographer60FpsContent.getInstance().addFrameCallback(debugEverySecondChecks, 1);
          //}
-@@ -374,18 +454,46 @@ public class ApplicationLoader extends Application {
+@@ -374,18 +454,58 @@ public class ApplicationLoader extends Application {
          }
          if (enabled) {
              try {
 -                applicationContext.startService(new Intent(applicationContext, NotificationsService.class));
 +                if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {
++                    for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
++                        try {
++                            if (UserConfig.getInstance(a).isClientActivated()) {
++                                ConnectionsManager.getInstance(a).setPushConnectionEnabled(true);
++                            }
++                        } catch (Throwable ignored) {}
++                    }
++                    try {
++                        applicationContext.startService(new Intent(applicationContext, NotificationsService.class));
++                    } catch (Throwable ignored) {}
 +                    if (!applicationInited) {
 +                        AndroidUtilities.runOnUIThread(() -> {
 +                            try {
@@ -641,12 +651,14 @@ index 5405be7f..e7180858 100644
 +                                        && (org.colgram.core.ColgramUiBridge.isAppInForeground()
 +                                                || org.colgram.core.ColgramPowerGuard.isBatteryExemptionGranted(applicationContext))) {
 +                                    org.colgram.core.ColgramForegroundService.start(applicationContext);
++                                    org.colgram.core.ColgramForegroundService.scheduleDozeKeepalive(applicationContext);
 +                                }
 +                            } catch (Throwable ignored) {}
 +                        }, 3500L);
 +                    } else if (org.colgram.core.ColgramUiBridge.isAppInForeground()
 +                            || org.colgram.core.ColgramPowerGuard.isBatteryExemptionGranted(applicationContext)) {
 +                        org.colgram.core.ColgramForegroundService.start(applicationContext);
++                        org.colgram.core.ColgramForegroundService.scheduleDozeKeepalive(applicationContext);
 +                    }
 +                } else {
 +                    applicationContext.startService(new Intent(applicationContext, NotificationsService.class));
@@ -678,7 +690,7 @@ index 5405be7f..e7180858 100644
          try {
              LocaleController.getInstance().onDeviceConfigurationChange(newConfig);
              AndroidUtilities.checkDisplaySize(applicationContext, newConfig);
-@@ -396,6 +504,34 @@ public class ApplicationLoader extends Application {
+@@ -396,6 +516,34 @@ public class ApplicationLoader extends Application {
          }
      }
  
@@ -5640,7 +5652,7 @@ index 206aaa8c..e88dd313 100755
 +    }
  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
-index c3a70edf..2452561e 100644
+index c3a70edf..c3f00a35 100644
 --- a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
 +++ b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
 @@ -205,6 +205,8 @@ public class ConnectionsManager extends BaseController {
@@ -5855,7 +5867,19 @@ index c3a70edf..2452561e 100644
          String installer = "";
          try {
              Context context = ApplicationLoader.applicationContext;
-@@ -789,6 +895,7 @@ public class ConnectionsManager extends BaseController {
+@@ -772,6 +878,11 @@ public class ConnectionsManager extends BaseController {
+             if (lastPauseTime == 0) {
+                 lastPauseTime = System.currentTimeMillis();
+             }
++            if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {
++                try {
++                    native_setPushConnectionEnabled(currentAccount, true);
++                } catch (Throwable ignored) {}
++            }
+             native_pauseNetwork(currentAccount);
+         } else {
+             if (appPaused) {
+@@ -789,6 +900,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onUnparsedMessageReceived(long address, final int currentAccount, long messageId) {
@@ -5863,7 +5887,7 @@ index c3a70edf..2452561e 100644
          try {
              NativeByteBuffer buff = NativeByteBuffer.wrap(address);
              buff.setDataSourceType(TLDataSourceType.NETWORK);
-@@ -796,6 +903,9 @@ public class ConnectionsManager extends BaseController {
+@@ -796,6 +908,9 @@ public class ConnectionsManager extends BaseController {
              int constructor = buff.readInt32(true);
              final TLObject message = TLClassStore.Instance().TLdeserialize(buff, constructor, true);
              FileLog.dumpUnparsedMessage(message, messageId, currentAccount);
@@ -5873,7 +5897,7 @@ index c3a70edf..2452561e 100644
              if (message instanceof TLRPC.Updates) {
                  if (BuildVars.LOGS_ENABLED) {
                      FileLog.d("java received " + message);
-@@ -813,14 +923,17 @@ public class ConnectionsManager extends BaseController {
+@@ -813,14 +928,17 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onUpdate(final int currentAccount) {
@@ -5891,7 +5915,7 @@ index c3a70edf..2452561e 100644
          AndroidUtilities.runOnUIThread(() -> {
              getInstance(currentAccount).connectionState = state;
              AccountInstance.getInstance(currentAccount).getNotificationCenter().postNotificationName(NotificationCenter.didUpdateConnectionState);
-@@ -828,6 +941,7 @@ public class ConnectionsManager extends BaseController {
+@@ -828,6 +946,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onLogout(final int currentAccount) {
@@ -5899,7 +5923,7 @@ index c3a70edf..2452561e 100644
          AndroidUtilities.runOnUIThread(() -> {
              AccountInstance accountInstance = AccountInstance.getInstance(currentAccount);
              if (accountInstance.getUserConfig().getClientUserId() != 0) {
-@@ -838,6 +952,7 @@ public class ConnectionsManager extends BaseController {
+@@ -838,6 +957,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static int getInitFlags() {
@@ -5907,7 +5931,7 @@ index c3a70edf..2452561e 100644
          int flags = 0;
          EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);
          if (detector.detect()) {
-@@ -850,6 +965,7 @@ public class ConnectionsManager extends BaseController {
+@@ -850,6 +970,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onBytesSent(int amount, int networkType, final int currentAccount) {
@@ -5915,7 +5939,7 @@ index c3a70edf..2452561e 100644
          try {
              AccountInstance.getInstance(currentAccount).getStatsController().incrementSentBytesCount(networkType, StatsController.TYPE_TOTAL, amount);
          } catch (Exception e) {
-@@ -858,6 +974,7 @@ public class ConnectionsManager extends BaseController {
+@@ -858,6 +979,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onRequestNewServerIpAndPort(final int second, final int currentAccount) {
@@ -5923,7 +5947,7 @@ index c3a70edf..2452561e 100644
          Utilities.globalQueue.postRunnable(() -> {
              boolean networkOnline = ApplicationLoader.isNetworkOnline();
              Utilities.stageQueue.postRunnable(() -> {
-@@ -891,10 +1008,35 @@ public class ConnectionsManager extends BaseController {
+@@ -891,10 +1013,35 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onProxyError() {
@@ -5960,7 +5984,7 @@ index c3a70edf..2452561e 100644
          AndroidUtilities.runOnUIThread(() -> {
              ResolvedDomain resolvedDomain = dnsCache.get(hostName);
              if (resolvedDomain != null && SystemClock.elapsedRealtime() - resolvedDomain.ttl < 5 * 60 * 1000) {
-@@ -918,6 +1060,7 @@ public class ConnectionsManager extends BaseController {
+@@ -918,6 +1065,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onBytesReceived(int amount, int networkType, final int currentAccount) {
@@ -5968,7 +5992,7 @@ index c3a70edf..2452561e 100644
          try {
              StatsController.getInstance(currentAccount).incrementReceivedBytesCount(networkType, StatsController.TYPE_TOTAL, amount);
          } catch (Exception e) {
-@@ -926,6 +1069,7 @@ public class ConnectionsManager extends BaseController {
+@@ -926,6 +1074,7 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onUpdateConfig(long address, final int currentAccount) {
@@ -5976,7 +6000,7 @@ index c3a70edf..2452561e 100644
          try {
              NativeByteBuffer buff = NativeByteBuffer.wrap(address);
              buff.reused = true;
-@@ -939,6 +1083,7 @@ public class ConnectionsManager extends BaseController {
+@@ -939,9 +1088,12 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onInternalPushReceived(final int currentAccount) {
@@ -5984,7 +6008,33 @@ index c3a70edf..2452561e 100644
          KeepAliveJob.startJob();
      }
  
-@@ -977,7 +1122,8 @@ public class ConnectionsManager extends BaseController {
++    private static volatile String colgramLastProxySignature = null;
++
+     public static void setProxySettings(boolean enabled, ProxySettings settings) {
+         String address = "";
+         int port = 0;
+@@ -969,6 +1121,20 @@ public class ConnectionsManager extends BaseController {
+             WebProxyTransport.stop();
+         }
+ 
++        // Prevent redundant native_setProxySettings calls when tgnet is already pointed at the exact
++        // same endpoint (e.g. fixed loopback 127.0.0.1:9876), avoiding unnecessary DC resets & "Updating..." loops.
++        final String effectiveAddr = (enabled && settings != null && settings.isValid()) ? (address == null ? "" : address) : "";
++        final int effectivePort = (enabled && settings != null && settings.isValid()) ? port : 1080;
++        final String effectiveUser = (enabled && settings != null && settings.isValid() && username != null) ? username : "";
++        final String effectivePass = (enabled && settings != null && settings.isValid() && password != null) ? password : "";
++        final String effectiveSecret = (enabled && settings != null && settings.isValid() && secret != null) ? secret : "";
++        final String signature = (enabled && settings != null && settings.isValid() ? "1|" : "0|")
++                + effectiveAddr + "|" + effectivePort + "|" + effectiveUser + "|" + effectivePass + "|" + effectiveSecret;
++        if (signature.equals(colgramLastProxySignature)) {
++            return;
++        }
++        colgramLastProxySignature = signature;
++
+         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+             if (enabled && settings != null && settings.isValid()) {
+                 native_setProxySettings(a, address, port, username, password, secret);
+@@ -977,7 +1143,8 @@ public class ConnectionsManager extends BaseController {
              }
              AccountInstance accountInstance = AccountInstance.getInstance(a);
              if (accountInstance.getUserConfig().isClientActivated()) {
@@ -5994,7 +6044,7 @@ index c3a70edf..2452561e 100644
              }
          }
      }
-@@ -1114,6 +1260,12 @@ public class ConnectionsManager extends BaseController {
+@@ -1114,6 +1281,12 @@ public class ConnectionsManager extends BaseController {
                  }
              }
              if (hasIpv6) {
@@ -6007,7 +6057,7 @@ index c3a70edf..2452561e 100644
                  if (forceTryIpV6) {
                      return USE_IPV6_ONLY;
                  }
-@@ -1149,12 +1301,27 @@ public class ConnectionsManager extends BaseController {
+@@ -1149,12 +1322,27 @@ public class ConnectionsManager extends BaseController {
          }
  
          protected ResolvedDomain doInBackground(Void... voids) {
@@ -6036,7 +6086,7 @@ index c3a70edf..2452561e 100644
                  httpConnection.addRequestProperty("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 10_0 like Mac OS X) AppleWebKit/602.1.38 (KHTML, like Gecko) Version/10.0 Mobile/14A5297c Safari/602.1");
                  httpConnection.addRequestProperty("Host", "dns.google.com");
                  httpConnection.setConnectTimeout(1000);
-@@ -1207,7 +1374,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1207,7 +1395,7 @@ public class ConnectionsManager extends BaseController {
  
                  }
              }
@@ -6045,7 +6095,7 @@ index c3a70edf..2452561e 100644
                  try {
                      InetAddress address = InetAddress.getByName(currentHostName);
                      ArrayList<String> addresses = new ArrayList<>(1);
-@@ -1246,6 +1413,42 @@ public class ConnectionsManager extends BaseController {
+@@ -1246,6 +1434,42 @@ public class ConnectionsManager extends BaseController {
              currentAccount = instance;
          }
  
@@ -6088,7 +6138,7 @@ index c3a70edf..2452561e 100644
          protected NativeByteBuffer doInBackground(Void... voids) {
              ByteArrayOutputStream outbuf = null;
              InputStream httpConnectionStream = null;
-@@ -1258,11 +1461,8 @@ public class ConnectionsManager extends BaseController {
+@@ -1258,11 +1482,8 @@ public class ConnectionsManager extends BaseController {
                  for (int a = 0; a < len; a++) {
                      padding.append(characters.charAt(Utilities.random.nextInt(characters.length())));
                  }
@@ -6102,7 +6152,7 @@ index c3a70edf..2452561e 100644
                  httpConnection.connect();
                  httpConnectionStream = httpConnection.getInputStream();
                  responseDate = (int) (httpConnection.getDate() / 1000);
-@@ -1378,12 +1578,9 @@ public class ConnectionsManager extends BaseController {
+@@ -1378,12 +1599,9 @@ public class ConnectionsManager extends BaseController {
                  for (int a = 0; a < len; a++) {
                      padding.append(characters.charAt(Utilities.random.nextInt(characters.length())));
                  }
@@ -6117,7 +6167,7 @@ index c3a70edf..2452561e 100644
                  httpConnection.connect();
                  httpConnectionStream = httpConnection.getInputStream();
                  responseDate = (int) (httpConnection.getDate() / 1000);
-@@ -1475,6 +1672,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1475,6 +1693,7 @@ public class ConnectionsManager extends BaseController {
      public static long lastPremiumFloodWaitShown = 0;
      @Keep
      public static void onPremiumFloodWait(final int currentAccount, final int requestToken, boolean isUpload) {
@@ -6125,7 +6175,7 @@ index c3a70edf..2452561e 100644
          AndroidUtilities.runOnUIThread(() -> {
              if (UserConfig.selectedAccount != currentAccount) {
                  return;
-@@ -1504,6 +1702,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1504,6 +1723,7 @@ public class ConnectionsManager extends BaseController {
  
      @Keep
      public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
@@ -6133,7 +6183,7 @@ index c3a70edf..2452561e 100644
          AndroidUtilities.runOnUIThread(() -> {
              long start = System.currentTimeMillis();
              FileLog.d("account"+currentAccount+": server requests integrity classic check with project = "+project+" nonce = " + nonce);
-@@ -1543,6 +1742,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1543,6 +1763,7 @@ public class ConnectionsManager extends BaseController {
  
      @Keep
      public static void onCaptchaCheck(final int currentAccount, final int requestToken, final String action, final String key_id) {
@@ -6330,7 +6380,7 @@ index 9b9d066f..4729d2de 100644
          getPreviewColors(0, 0);
          getPreviewColors(0, 1);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
-index 3638979f..ce8fb17c 100644
+index 3638979f..446627f0 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
 @@ -157,6 +157,13 @@ public class Theme {
@@ -6629,7 +6679,7 @@ index 3638979f..ce8fb17c 100644
      public static int getColor(int key) {
          return getColor(key, null, false);
      }
-@@ -8984,7 +9193,1689 @@ public class Theme {
+@@ -8984,7 +9193,1701 @@ public class Theme {
          return getColor(key, isDefault, false);
      }
  
@@ -7069,29 +7119,24 @@ index 3638979f..ce8fb17c 100644
 +                    ? colgramEffectiveOutBubbleSelected(colgramCyber, provider)
 +                    : colgramEffectiveOutBubble(colgramCyber, provider);
 +            return org.colgram.core.ColgramThemePolicy.resolveBubbleInk(
-+                    color, outBg, 0xffffffff, 0xff14181e, 4.5);
++                    color, outBg, 0xffffffff, 0xff0a0d12, 4.5);
 +        }
 +        if (colgramIsOutSecondaryWhiteKey(key)) {
 +            int outBg = colgramIsSelectedOutKey(key)
 +                    ? colgramEffectiveOutBubbleSelected(colgramCyber, provider)
 +                    : colgramEffectiveOutBubble(colgramCyber, provider);
 +            return org.colgram.core.ColgramThemePolicy.resolveBubbleInk(
-+                    color, outBg, 0xe6ffffff, 0xff2b3340, 4.5);
++                    color, outBg, 0xebffffff, 0xff0a0d12, 4.5);
 +        }
 +        if (key == key_chat_messageLinkOut) {
 +            int outBg = colgramEffectiveOutBubble(colgramCyber, provider);
 +            return org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
-+                    color, outBg, 0xffb3e5ff, 0xff15528a, 4.5);
++                    color, outBg, 0xffffffff, 0xff15528a, 4.5);
 +        }
 +        if (key == key_chat_mediaTimeText || key == key_chat_mediaSentCheck
 +                || key == key_chat_mediaSentClock || key == key_chat_mediaViews
 +                || key == key_chat_mediaMenu) {
-+            int mediaBg = colgramEffectiveColor(key_chat_mediaTimeBackground, colgramCyber, provider);
-+            if ((mediaBg >>> 24) < 0x40) {
-+                mediaBg = 0xa812141c;
-+            }
-+            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, mediaBg, 0xffffffff, 0xff101418, 4.5);
++            return 0xffffffff;
 +        }
 +        if (key == key_chat_botKeyboardButtonText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
@@ -7103,14 +7148,12 @@ index 3638979f..ce8fb17c 100644
 +                    color, colgramEffectiveColor(key_chat_unreadMessagesStartBackground, colgramCyber, provider),
 +                    0xffeef0f4, 0xff14181e, 4.5);
 +        }
-+        if (key == key_chat_serviceText || key == key_chat_serviceLink || key == key_chat_serviceIcon) {
-+            if (colgramCyber) return 0xffffffff;
++        if (key == key_chat_serviceText || key == key_chat_serviceLink || key == key_chat_serviceIcon
++                || key == key_chat_stickerReplyLine || key == key_chat_stickerReplyNameText
++                || key == key_chat_stickerReplyMessageText) {
++            if (colgramCyber || colgramDarkSurface) return 0xffffffff;
 +            int svcBg = colgramEffectiveColor(key_chat_serviceBackground, false, provider);
-+            if ((svcBg >>> 24) < 0x30) {
-+                svcBg = colgramDarkSurface ? 0xff161a22 : 0xff3b4656;
-+            }
-+            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, svcBg, 0xffffffff, 0xff101418, 4.5);
++            return org.colgram.core.ColgramThemePolicy.resolveServiceOverlayInk(svcBg);
 +        }
 +        if (colgramDarkSurface && colgramLooksLikeForeground(key)) {
 +            boolean isCyberAccent = colgramCyber && ((color & 0x00ffffff) == (COLGRAM_CYBER_ACCENT & 0x00ffffff));
@@ -7329,7 +7372,7 @@ index 3638979f..ce8fb17c 100644
 +        for (int k : outPrimaryKeys) {
 +            int surface = colgramIsSelectedOutKey(k) ? outSelBg : outBg;
 +            colors.put(k, org.colgram.core.ColgramThemePolicy.resolveBubbleInk(
-+                    colgramMapColor(colors, k), surface, 0xffffffff, 0xff14181e, 4.5));
++                    colgramMapColor(colors, k), surface, 0xffffffff, 0xff0a0d12, 4.5));
 +        }
 +        int[] outSecondaryKeys = new int[]{
 +                key_chat_outTimeText, key_chat_outTimeSelectedText, key_chat_outViews,
@@ -7347,10 +7390,26 @@ index 3638979f..ce8fb17c 100644
 +        for (int k : outSecondaryKeys) {
 +            int surface = colgramIsSelectedOutKey(k) ? outSelBg : outBg;
 +            colors.put(k, org.colgram.core.ColgramThemePolicy.resolveBubbleInk(
-+                    colgramMapColor(colors, k), surface, 0xe6ffffff, 0xff2b3340, 4.5));
++                    colgramMapColor(colors, k), surface, 0xebffffff, 0xff0a0d12, 4.5));
 +        }
 +        colors.put(key_chat_messageLinkOut, org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
-+                colgramMapColor(colors, key_chat_messageLinkOut), outBg, 0xffb3e5ff, 0xff15528a, 4.5));
++                colgramMapColor(colors, key_chat_messageLinkOut), outBg, 0xffffffff, 0xff15528a, 4.5));
++        // No-bubble / sticker reply box & media/sticker overlay checks: always crisp white on dark/translucent pills.
++        int svcBg = colgramMapColor(colors, key_chat_serviceBackground);
++        int svcOverlayInk = (cyber || darkSurface)
++                ? 0xffffffff
++                : org.colgram.core.ColgramThemePolicy.resolveServiceOverlayInk(svcBg);
++        colors.put(key_chat_serviceText, svcOverlayInk);
++        colors.put(key_chat_serviceLink, svcOverlayInk);
++        colors.put(key_chat_serviceIcon, svcOverlayInk);
++        colors.put(key_chat_stickerReplyLine, 0xffffffff);
++        colors.put(key_chat_stickerReplyNameText, 0xffffffff);
++        colors.put(key_chat_stickerReplyMessageText, 0xffffffff);
++        colors.put(key_chat_mediaTimeText, 0xffffffff);
++        colors.put(key_chat_mediaSentCheck, 0xffffffff);
++        colors.put(key_chat_mediaSentClock, 0xffffffff);
++        colors.put(key_chat_mediaViews, 0xffffffff);
++        colors.put(key_chat_mediaMenu, 0xffffffff);
 +
 +        // 2. Incoming bubble contrast
 +        int inBg = colgramMapColor(colors, key_chat_inBubble);
@@ -8018,7 +8077,10 @@ index 3638979f..ce8fb17c 100644
 +        if (key == key_chat_mediaTimeBackground) {
 +            return 0xa812141c;
 +        }
-+        if (key == key_chat_mediaTimeText) {
++        if (key == key_chat_mediaTimeText || key == key_chat_mediaSentCheck
++                || key == key_chat_mediaSentClock || key == key_chat_mediaViews
++                || key == key_chat_mediaMenu || key == key_chat_stickerReplyLine
++                || key == key_chat_stickerReplyNameText || key == key_chat_stickerReplyMessageText) {
 +            return 0xffffffff;
 +        }
 +        if (key == key_chats_name || key == key_chats_nameArchived || key == key_profile_title
@@ -8320,7 +8382,7 @@ index 3638979f..ce8fb17c 100644
          if (!ignoreAnimation && animatingColors != null) {
              int index = animatingColors.indexOfKey(key);
              if (index >= 0) {
-@@ -9445,7 +11336,7 @@ public class Theme {
+@@ -9445,7 +11348,7 @@ public class Theme {
                              File f = FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(wallpaperDocument, true);
                              patternBitmap = SvgHelper.getBitmap(f, w, h, false, SvgHelper.ScaleMode.ByWidth);
                          } else {
@@ -8329,7 +8391,7 @@ index 3638979f..ce8fb17c 100644
                          }
                          if (patternBitmap != null) {
                              FileOutputStream stream = null;
-@@ -9465,7 +11356,12 @@ public class Theme {
+@@ -9465,7 +11368,12 @@ public class Theme {
                      motionBackgroundDrawable.setPhase(previousPhase);
                      settings.wallpaper = motionBackgroundDrawable;
                  } else if (gradientToColor1 == 0 || gradientToColor1 == backgroundColor) {
@@ -8343,7 +8405,7 @@ index 3638979f..ce8fb17c 100644
                  } else {
                      final int[] colors = {backgroundColor, gradientToColor1};
                      final BackgroundGradientDrawable.Orientation orientation = BackgroundGradientDrawable.getGradientOrientation(rotation);
-@@ -9614,13 +11510,49 @@ public class Theme {
+@@ -9614,13 +11522,49 @@ public class Theme {
      }
  
      public static Drawable createDefaultWallpaper(int w, int h) {
@@ -8396,7 +8458,7 @@ index 3638979f..ce8fb17c 100644
          return motionBackgroundDrawable;
      }
  
-@@ -9954,10 +11886,37 @@ public class Theme {
+@@ -9954,10 +11898,37 @@ public class Theme {
      }
  
      public static Drawable getThemeDrawable(String drawableKey) {
@@ -8434,7 +8496,7 @@ index 3638979f..ce8fb17c 100644
          Drawable drawable = resourcesProvider != null ? resourcesProvider.getDrawable(key) : null;
          return drawable != null ? drawable : defaultChatDrawables.get(key);
      }
-@@ -9974,6 +11933,31 @@ public class Theme {
+@@ -9974,6 +11945,31 @@ public class Theme {
          if (Objects.equals(paintKey, Theme.key_paint_divider)) {
              return dividerPaint;
          }
@@ -8794,7 +8856,7 @@ index 3b3f7110..2ebfb68b 100644
  
          final TL_keyboard.TL_inlineButtonTypeUrl buttonTypeUrl = TLKeyboardHelper.getType(button, TL_keyboard.TL_inlineButtonTypeUrl.class);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
-index 006e5ddc..f8975302 100644
+index 006e5ddc..412158f0 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
 @@ -1832,6 +1832,77 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
@@ -9068,7 +9130,32 @@ index 006e5ddc..f8975302 100644
          if (currentMessageObject.isStakedDice()) {
              currentTimeString = TextUtils.concat("💎", StarsIntroActivity.formatTON(currentMessageObject.getStakedDiceAmount()), "  ", currentTimeString);
              currentTimeString = StarsIntroActivity.replaceDiamond(currentTimeString, 0.55f, null, 0, dp(-.33f), 1.05f);
-@@ -22727,6 +22904,36 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -22664,15 +22841,20 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+ 
+             int rippleColor = ColorUtils.setAlphaComponent(replyLine.getColor(), 0x1e);
+             if (currentMessageObject.shouldDrawWithoutBackground()) {
+-                Theme.chat_replyLinePaint.setColor(getThemedColor(Theme.key_chat_stickerReplyLine));
++                boolean forceWhiteOverlay = org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled()
++                        || org.colgram.core.ColgramConfig.isCyberThemeEnabled();
++                int stickerReplyInk = forceWhiteOverlay ? 0xffffffff : getThemedColor(Theme.key_chat_stickerReplyNameText);
++                int stickerReplyMsgInk = forceWhiteOverlay ? 0xffffffff : getThemedColor(Theme.key_chat_stickerReplyMessageText);
++                int stickerReplyLineInk = forceWhiteOverlay ? 0xffffffff : getThemedColor(Theme.key_chat_stickerReplyLine);
++                Theme.chat_replyLinePaint.setColor(stickerReplyLineInk);
+                 int oldAlpha = Theme.chat_replyLinePaint.getAlpha();
+                 Theme.chat_replyLinePaint.setAlpha((int) (oldAlpha * timeAlpha * replyForwardAlpha));
+                 rippleColor = ColorUtils.setAlphaComponent(Theme.chat_replyLinePaint.getColor(), Color.alpha(rippleColor));
+-                Theme.chat_replyNamePaint.setColor(getThemedColor(Theme.key_chat_stickerReplyNameText));
++                Theme.chat_replyNamePaint.setColor(stickerReplyInk);
+                 oldAlpha = Theme.chat_replyNamePaint.getAlpha();
+                 Theme.chat_replyNamePaint.setAlpha((int) (oldAlpha * timeAlpha * replyForwardAlpha));
+-                Theme.chat_replyTextPaint.setColor(getThemedColor(Theme.key_chat_stickerReplyMessageText));
+-                Theme.chat_replyTextPaint.linkColor = getThemedColor(Theme.key_chat_stickerReplyMessageText);
++                Theme.chat_replyTextPaint.setColor(stickerReplyMsgInk);
++                Theme.chat_replyTextPaint.linkColor = stickerReplyMsgInk;
+                 oldAlpha = Theme.chat_replyTextPaint.getAlpha();
+                 Theme.chat_replyTextPaint.setAlpha((int) (oldAlpha * timeAlpha * replyForwardAlpha));
+                 if (needDrawReplyBackground) {
+@@ -22727,6 +22909,40 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                          Theme.chat_replyTextPaint.linkColor = ColorUtils.blendARGB(color, Theme.adaptHue(color, Theme.chat_replyNamePaint.getColor()), Utilities.clamp(blendPressed * 2, 1f, 0f));
                      }
                  }
@@ -9094,18 +9181,38 @@ index 006e5ddc..f8975302 100644
 +                    int replySurface = (replyTintBg >>> 24) >= 0x08
 +                            ? org.colgram.core.ColgramThemePolicy.compositeOver(replyTintBg, bubbleBase)
 +                            : bubbleBase;
-+                    int safeReplyName = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
-+                            Theme.chat_replyNamePaint.getColor(), replySurface, 0xffffffff, 0xff14181e, 4.5);
++                    int safeReplyName = currentMessageObject.isOutOwner()
++                            ? org.colgram.core.ColgramThemePolicy.resolveBubbleInk(
++                                    Theme.chat_replyNamePaint.getColor(), replySurface, 0xffffffff, 0xff0a0d12, 4.5)
++                            : org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
++                                    Theme.chat_replyNamePaint.getColor(), replySurface, 0xffffffff, 0xff0a0d12, 4.5);
 +                    Theme.chat_replyNamePaint.setColor(safeReplyName);
 +                    int safeReplyText = org.colgram.core.ColgramThemePolicy.resolveBubbleInk(
-+                            Theme.chat_replyTextPaint.getColor(), replySurface, 0xffeef4fc, 0xff1a2028, 4.5);
++                            Theme.chat_replyTextPaint.getColor(), replySurface,
++                            currentMessageObject.isOutOwner() ? 0xebffffff : 0xffeef4fc, 0xff0a0d12, 4.5);
 +                    Theme.chat_replyTextPaint.setColor(safeReplyText);
 +                    Theme.chat_replyTextPaint.linkColor = safeReplyText;
 +                }
              }
              Theme.chat_quoteTextPaint.setColor(Theme.chat_replyTextPaint.getColor());
              Theme.chat_quoteTextPaint.linkColor = Theme.chat_replyTextPaint.linkColor;
-@@ -24833,9 +25040,11 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -24790,6 +25006,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+                 }
+                 if (currentMessageObject.shouldDrawWithoutBackground()) {
+                     drawable = getThemedDrawable(Theme.key_drawable_msgStickerCheck);
++                    colgramSyncCheckDrawableColor(drawable, 0xffffffff);
+                     if (drawCheck1) {
+                         if (moveCheck) {
+                             canvas.translate(dp(4.8f) * (1f - progress), 0);
+@@ -24800,6 +25017,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+                     }
+                     drawable.setAlpha((int) (255 * timeAlpha * alpha));
+                 } else {
++                    colgramSyncCheckDrawableColor(Theme.chat_msgMediaCheckDrawable, 0xffffffff);
+                     if (drawCheck1) {
+                         if (moveCheck) {
+                             canvas.translate(dp(4.8f) * (1f - progress), 0);
+@@ -24833,9 +25051,11 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                          canvas.translate(dp(4) * (1f - progress), 0);
                      }
                      drawable = getThemedDrawable(drawSelectionBackground ? Theme.key_drawable_msgOutCheckReadSelected : Theme.key_drawable_msgOutCheckRead);
@@ -9117,7 +9224,15 @@ index 006e5ddc..f8975302 100644
                      setDrawableBounds(drawable, layoutWidth - dp(18.5f) - drawable.getIntrinsicWidth() + offsetX, layoutHeight - dp(pinnedBottom || pinnedTop ? 9 : 8) - drawable.getIntrinsicHeight() + timeYOffset);
                  }
                  drawable.setAlpha((int) (255 * alpha));
-@@ -24869,6 +25078,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -24856,6 +25076,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+         if (drawCheck1) {
+             if (shouldDrawTimeOnMedia()) {
+                 Drawable drawable = currentMessageObject.shouldDrawWithoutBackground() ? getThemedDrawable(Theme.key_drawable_msgStickerHalfCheck) : Theme.chat_msgMediaHalfCheckDrawable;
++                colgramSyncCheckDrawableColor(drawable, 0xffffffff);
+                 setDrawableBounds(drawable, layoutWidth - dp(bigRadius ? 23.5f : 21.5f) - drawable.getIntrinsicWidth() + offsetX, timeY - drawable.getIntrinsicHeight() + timeYOffset);
+                 drawable.setAlpha((int) (255 * timeAlpha * alpha));
+                 if (useScale || moveCheck) {
+@@ -24869,6 +25090,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                  drawable.setAlpha(255);
              } else {
                  Drawable drawable = getThemedDrawable(drawSelectionBackground ? Theme.key_drawable_msgOutHalfCheckSelected : Theme.key_drawable_msgOutHalfCheck);
@@ -9125,7 +9240,7 @@ index 006e5ddc..f8975302 100644
                  setDrawableBounds(drawable, layoutWidth - dp(18) - drawable.getIntrinsicWidth(), layoutHeight - dp(pinnedBottom || pinnedTop ? 9 : 8) - drawable.getIntrinsicHeight() + timeYOffset);
                  drawable.setAlpha((int) (255 * alpha));
                  if (useScale || moveCheck) {
-@@ -28036,6 +28246,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -28036,6 +28258,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
  
      @Override
      public void setAlpha(float alpha) {
@@ -9135,7 +9250,7 @@ index 006e5ddc..f8975302 100644
          if ((alpha == 1f) != (getAlpha() == 1)) {
              invalidate();
          }
-@@ -29149,6 +29362,25 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+@@ -29149,6 +29374,35 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
          return Theme.getColor(key, resourcesProvider);
      }
  
@@ -9150,7 +9265,17 @@ index 006e5ddc..f8975302 100644
 +                && !org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
 +            return;
 +        }
-+        int wantColor = getThemedColor(colorKey);
++        colgramSyncCheckDrawableColor(drawable, getThemedColor(colorKey));
++    }
++
++    private void colgramSyncCheckDrawableColor(Drawable drawable, int wantColor) {
++        if (drawable == null) {
++            return;
++        }
++        if (!org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled()
++                && !org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
++            return;
++        }
 +        if (colgramLastCheckFilter == null || colgramLastCheckColor != wantColor) {
 +            colgramLastCheckColor = wantColor;
 +            colgramLastCheckFilter = new PorterDuffColorFilter(wantColor, PorterDuff.Mode.MULTIPLY);
@@ -13923,7 +14048,7 @@ index 0dd0f1a2..5cc1466f 100644
  
          @Override
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java
-index d9d6c04f..9e13e5e5 100644
+index d9d6c04f..464b96ba 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java
 @@ -88,6 +88,7 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
@@ -13934,7 +14059,7 @@ index d9d6c04f..9e13e5e5 100644
      SnowflakesEffect snowflakesEffect;
      public View backgroundView;
      boolean attached;
-@@ -341,13 +342,68 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
+@@ -341,13 +342,42 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
              }
              if (themeAnimationValue != 1f) {
                  backgroundView.invalidate();
@@ -13952,38 +14077,12 @@ index d9d6c04f..9e13e5e5 100644
 +                        canvas, getMeasuredWidth(), getMeasuredHeight(),
 +                        Theme.getColor(Theme.key_featuredStickers_addButton),
 +                        Theme.isCurrentThemeDark(),
-+                        org.colgram.core.ColgramLiveWallpaper.currentAnimationSeconds(),
++                        0f,
 +                        AndroidUtilities.density);
-+                scheduleColgramWaveTick();
              }
          }
  
-+        private boolean colgramWaveTickPending;
 +        private boolean colgramSuppressInvalidateCallback;
-+        private final Runnable colgramWaveTick = () -> {
-+            colgramWaveTickPending = false;
-+            if (!isAttachedToWindow() || getWindowVisibility() != VISIBLE) return;
-+            colgramSuppressInvalidateCallback = true;
-+            try {
-+                super.invalidate();
-+            } finally {
-+                colgramSuppressInvalidateCallback = false;
-+            }
-+        };
-+
-+        private void scheduleColgramWaveTick() {
-+            if (!colgramWaveTickPending) {
-+                colgramWaveTickPending = true;
-+                postDelayed(colgramWaveTick, 33L);
-+            }
-+        }
-+
-+        @Override
-+        protected void onDetachedFromWindow() {
-+            super.onDetachedFromWindow();
-+            colgramWaveTickPending = false;
-+            removeCallbacks(colgramWaveTick);
-+        }
 +
          @Override
          public void invalidate() {
@@ -14004,7 +14103,7 @@ index d9d6c04f..9e13e5e5 100644
          }
      }
  
-@@ -375,13 +431,13 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
+@@ -375,13 +405,13 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
          if (attached && backgroundDrawable instanceof ChatBackgroundDrawable) {
              ((ChatBackgroundDrawable) backgroundDrawable).onDetachedFromWindow(backgroundView);
          }
@@ -14021,7 +14120,7 @@ index d9d6c04f..9e13e5e5 100644
          if (attached && backgroundDrawable instanceof MotionBackgroundDrawable) {
              ((MotionBackgroundDrawable) backgroundDrawable).onAttachedToWindow();
          }
-@@ -459,6 +515,9 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
+@@ -459,6 +489,9 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
              parallaxEffect.setEnabled(true);
          }
          paused = false;
@@ -16528,7 +16627,7 @@ index b3cd7c50..ca2ecad3 100644
      }
  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
-index dc29adcd..91b6be74 100644
+index dc29adcd..93bba23b 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
 @@ -380,6 +380,48 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
@@ -16931,7 +17030,25 @@ index dc29adcd..91b6be74 100644
  
          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
              ApplicationLoader.canDrawOverlays = Settings.canDrawOverlays(this);
-@@ -7335,7 +7631,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7044,6 +7340,17 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+         if (ApplicationLoader.applicationLoaderInstance != null) {
+             ApplicationLoader.applicationLoaderInstance.onResume();
+         }
++        if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {
++            try {
++                org.colgram.core.ColgramForegroundService.start(this);
++                org.colgram.core.ColgramForegroundService.scheduleDozeKeepalive(this);
++            } catch (Throwable ignored) {}
++            AndroidUtilities.runOnUIThread(() -> {
++                if (!isFinishing() && !isDestroyed()) {
++                    org.colgram.core.ColgramPowerGuard.offerBatteryExemptionOnce(LaunchActivity.this);
++                }
++            }, 3000L);
++        }
+         if (whenResumed != null) {
+             whenResumed.run();
+             whenResumed = null;
+@@ -7335,7 +7642,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              fragment.showDialog(dialog);
              dialog.setCanceledOnTouchOutside(false);
          } else if (id == NotificationCenter.didSetNewTheme) {
@@ -16942,7 +17059,7 @@ index dc29adcd..91b6be74 100644
              if (!nightTheme) {
                  try {
                      setTaskDescription(new ActivityManager.TaskDescription(null, null, Theme.getColor(Theme.key_actionBarDefault) | 0xff000000));
-@@ -7344,10 +7642,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7344,10 +7653,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                  }
              }
              boolean checkNavigationBarColor = true;
@@ -21503,10 +21620,8 @@ index d3a1ae4c..f777e22e 100644
 -        android:angle="90"
 -        android:startColor="#289AD1"
 -        android:endColor="#38AEEB" />
--</shape>
-\ No newline at end of file
 +    <solid android:color="#000000" />
-+</shape>
+ </shape>
 diff --git a/TMessagesProj/src/main/res/drawable/icon_plane.xml b/TMessagesProj/src/main/res/drawable/icon_plane.xml
 index 8afd524e..5109d389 100644
 --- a/TMessagesProj/src/main/res/drawable/icon_plane.xml

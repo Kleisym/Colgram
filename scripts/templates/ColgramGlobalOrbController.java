@@ -260,7 +260,10 @@ public final class ColgramGlobalOrbController {
         }
     }
 
+    private boolean hostPaused;
+
     public void setHostPaused(boolean paused) {
+        this.hostPaused = paused;
         if (detached) return;
         if (paused && springAnimator != null) {
             springAnimator.cancel();
@@ -478,6 +481,21 @@ public final class ColgramGlobalOrbController {
 
     private void startSpringFlight() {
         if (detached) return;
+        if (hostPaused) {
+            curX = targetX;
+            curY = targetY;
+            velX = 0f;
+            velY = 0f;
+            orbView.setX(curX);
+            orbView.setY(curY);
+            orbView.setFlightVelocity(0f, 0f);
+            orbView.setState(ColgramAiOrbView.State.IDLE);
+            if (springAnimator != null) {
+                springAnimator.cancel();
+                springAnimator = null;
+            }
+            return;
+        }
         if (springAnimator != null && springAnimator.isRunning()) {
             return;
         }

@@ -70,6 +70,7 @@ public class ColgramBootJobService extends JobService {
             JobInfo job = new JobInfo.Builder(STORAGE_OPTIMIZE_JOB_ID,
                     new ComponentName(context.getPackageName(), ColgramBootJobService.class.getName()))
                     .setPeriodic(STORAGE_OPTIMIZE_INTERVAL_MS)
+                    .setRequiresCharging(true)
                     .setPersisted(true)
                     .build();
             int result = js.schedule(job);
@@ -155,7 +156,6 @@ public class ColgramBootJobService extends JobService {
                     if (ColgramConfig.isDefenderEnabled() && ColgramUiBridge.isAppInForeground()) {
                         ColgramSecurityDefender.runFullAuditAndHeal(app, "periodic-job");
                     }
-                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
                     ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(app);
                 } catch (Throwable ignored) {
                 } finally {

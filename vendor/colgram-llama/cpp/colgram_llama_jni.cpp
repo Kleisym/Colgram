@@ -719,11 +719,11 @@ Java_org_colgram_core_ColgramNativeLlama_nativeInit(
     }
 
     // Create persistent native ggml threadpools:
-    // - g_tp_decode: strictly pinned 1-to-1 to big performance cores (zero A55 barrier stalls!)
+    // - g_tp_decode: strictly pinned 1-to-1 to big performance cores at HIGH priority (zero A55 barrier stalls!)
     // - g_tp_batch: multi-core prompt prefill pool (paused to 0% CPU during single-token decode & idle!)
     {
         struct ggml_threadpool_params tpp_dec = ggml_threadpool_params_default(decodeThreads);
-        tpp_dec.prio = GGML_SCHED_PRIO_NORMAL;
+        tpp_dec.prio = GGML_SCHED_PRIO_HIGH;
         tpp_dec.poll = 50;
         tpp_dec.paused = true;
         if (g_topology.pin_decode_big) {
@@ -750,6 +750,7 @@ Java_org_colgram_core_ColgramNativeLlama_nativeInit(
             llama_attach_threadpool(g_ctx, g_tp_decode, g_tp_batch ? g_tp_batch : g_tp_decode);
         }
     }
+    ThreadpoolPauseGuard initPauseGuard;
 
     g_n_ctx = static_cast<int>(llama_n_ctx(g_ctx));
     g_n_batch = static_cast<int>(cparams.n_batch);

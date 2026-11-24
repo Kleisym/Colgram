@@ -89,13 +89,50 @@ public final class ColgramThemePolicyTest {
                 0xffffffff, 0xff272f38, 0xff85caff);
         require(original.background == 0xff272f38 && original.link == 0xff85caff, "honors usable hint colors");
 
-        // 1. Outgoing saturated purple/blue bubbles (L < 0.55): muddy dark grey-blue timestamps/checks become crisp white
-        int purpleBubble = ColgramThemePolicy.averageSurfaceColor(0xff6b52c9, 0xff5a66d8, 0, 0);
-        require(ColgramThemePolicy.relativeLuminance(purpleBubble) < 0.55, "purple/blue bubble luminance < 0.55");
-        require(ColgramThemePolicy.resolveBubbleInk(0xff354656, purpleBubble, 0xffffffff, 0xff283644, 4.5) == 0xffffffff,
-                "outgoing checkmarks forced pure white on saturated bubble");
-        require(ColgramThemePolicy.resolveBubbleInk(0xff354656, purpleBubble, 0xe6ffffff, 0xff283644, 4.5) == 0xe6ffffff,
-                "outgoing time text forced crisp 0xE6FFFFFF on saturated bubble");
+        // 1. Outgoing saturated purple/blue bubbles (L < 0.58): ALWAYS crisp WHITE text, reply quotes, checkmarks, and timestamps!
+        int[] saturatedColoredBubbles = {
+                ColgramThemePolicy.averageSurfaceColor(0xff6b52c9, 0xff5a66d8, 0, 0),
+                0xff8251e2, // Telegram purple outgoing bubble
+                0xff8a58e8, // Telegram bright purple outgoing bubble
+                0xff9662ee, // Telegram vivid violet outgoing bubble
+                0xff2a82da  // Telegram saturated blue outgoing bubble
+        };
+        for (int sb : saturatedColoredBubbles) {
+            require(ColgramThemePolicy.relativeLuminance(sb) < 0.58,
+                    "saturated colored bubble luminance < 0.58: " + String.format("#%08x", sb));
+            require(ColgramThemePolicy.resolveBubbleInk(0xff0a0d12, sb, 0xffffffff, 0xff0a0d12, 4.5) == 0xffffffff,
+                    "text/checkmarks forced pure white on saturated bubble " + String.format("#%08x", sb));
+            require(ColgramThemePolicy.resolveBubbleInk(0xff354656, sb, 0xffffffff, 0xff283644, 4.5) == 0xffffffff,
+                    "muddy checkmarks forced pure white on saturated bubble " + String.format("#%08x", sb));
+            require(ColgramThemePolicy.resolveBubbleInk(0xff354656, sb, 0xebffffff, 0xff0a0d12, 4.5) == 0xebffffff,
+                    "time/views text forced crisp 0xEBFFFFFF on saturated bubble " + String.format("#%08x", sb));
+            require(ColgramThemePolicy.resolveBubbleInk(0xff354656, sb, 0xe6ffffff, 0xff283644, 4.5) == 0xe6ffffff,
+                    "outgoing time text forced crisp 0xE6FFFFFF on saturated bubble " + String.format("#%08x", sb));
+            int replyTint = ColgramThemePolicy.compositeOver(0x26ffffff, sb);
+            require(ColgramThemePolicy.resolveBubbleInk(0xff0a0d12, replyTint, 0xffffffff, 0xff0a0d12, 4.5) == 0xffffffff,
+                    "reply name forced white on saturated bubble " + String.format("#%08x", sb));
+            require(ColgramThemePolicy.resolveBubbleInk(0xff0a0d12, replyTint, 0xebffffff, 0xff0a0d12, 4.5) == 0xebffffff,
+                    "reply message forced crisp white on saturated bubble " + String.format("#%08x", sb));
+            int accentOnPurple = ColgramThemePolicy.ensureAccentReadable(0xff5238a8, sb, 0xffffffff, 0xff0a0d12, 4.5);
+            require(ColgramThemePolicy.perceivedLuma(accentOnPurple) > 200,
+                    "accent on saturated bubble lightens toward white, never black: " + String.format("#%08x", accentOnPurple));
+        }
+
+        // 1B. Light/pastel/white bubbles (L >= 0.58) use crisp dark ink, while dark translucent chat_serviceBackground ALWAYS uses WHITE!
+        int[] lightBubbles = {0xffeeffde, 0xffe6f2fc, 0xffffffff};
+        for (int lb : lightBubbles) {
+            require(ColgramThemePolicy.relativeLuminance(lb) >= 0.58, "light bubble luminance >= 0.58");
+            int darkInk = ColgramThemePolicy.resolveBubbleInk(0xffffffff, lb, 0xffffffff, 0xff0a0d12, 4.5);
+            require(ColgramThemePolicy.perceivedLuma(darkInk) < 40,
+                    "light/pastel bubble returns dark ink, got " + String.format("#%08x", darkInk));
+            contrast(darkInk, lb, 4.5, "dark ink on light bubble " + String.format("#%08x", lb));
+        }
+        require(ColgramThemePolicy.resolveServiceOverlayInk(0x9926323d) == 0xffffffff,
+                "dark translucent chat_serviceBackground (#9926323D) ALWAYS yields WHITE text/reply/checkmarks");
+        require(ColgramThemePolicy.resolveServiceOverlayInk(0x661a2430) == 0xffffffff,
+                "translucent service background yields WHITE");
+        require(ColgramThemePolicy.resolveServiceOverlayInk(0x66a0b0c0) == 0xffffffff,
+                "light-tinted translucent service background still yields WHITE over wallpaper");
 
         // 2. Mid-grey & light-grey Aero bubbles must NOT force white ink onto mid-grey/light-grey!
         int[] greyBubbles = {0xff6e747c, 0xff808080, 0xff9a9fa8, 0xffb8b8b8, 0xffe6f2fc, 0xfff0f0f0};

@@ -24,6 +24,7 @@ public final class ColgramAiConfig {
     private static final String KEY_IDLE_UNLOAD_SEC = "idle_unload_sec";
     private static final String KEY_IDLE_UNLOAD_MIGRATED_V2 = "idle_unload_migrated_v2";
     private static final String KEY_IDLE_UNLOAD_MIGRATED_V3 = "idle_unload_migrated_v3";
+    private static final String KEY_IDLE_UNLOAD_MIGRATED_V4 = "idle_unload_migrated_v4";
     private static final String KEY_TEMPERATURE_PCT = "temperature_pct";
     private static final String KEY_KV_MIGRATED_Q8 = "kv_migrated_q8_v1";
     private static final String KEY_VOICE_OVER_ENABLED = "voice_over_enabled";
@@ -159,22 +160,22 @@ public final class ColgramAiConfig {
     }
 
     public static int getIdleUnloadSeconds(Context ctx) {
-        if (ctx == null) return 60;
+        if (ctx == null) return 600;
         SharedPreferences p = prefs(ctx);
-        if (!p.getBoolean(KEY_IDLE_UNLOAD_MIGRATED_V3, false)) {
-            int cur = p.getInt(KEY_IDLE_UNLOAD_SEC, 60);
-            if (cur == 900 || cur <= 0) {
-                p.edit().putInt(KEY_IDLE_UNLOAD_SEC, 60).putBoolean(KEY_IDLE_UNLOAD_MIGRATED_V3, true).apply();
-                return 60;
+        if (!p.getBoolean(KEY_IDLE_UNLOAD_MIGRATED_V4, false)) {
+            int cur = p.getInt(KEY_IDLE_UNLOAD_SEC, 600);
+            if (cur == 60 || cur == 900 || cur <= 0) {
+                p.edit().putInt(KEY_IDLE_UNLOAD_SEC, 600).putBoolean(KEY_IDLE_UNLOAD_MIGRATED_V4, true).apply();
+                return 600;
             }
-            p.edit().putBoolean(KEY_IDLE_UNLOAD_MIGRATED_V3, true).apply();
+            p.edit().putBoolean(KEY_IDLE_UNLOAD_MIGRATED_V4, true).apply();
         }
-        return p.getInt(KEY_IDLE_UNLOAD_SEC, 60);
+        return p.getInt(KEY_IDLE_UNLOAD_SEC, 600);
     }
 
     public static void setIdleUnloadSeconds(Context ctx, int seconds) {
         if (ctx != null) prefs(ctx).edit().putInt(KEY_IDLE_UNLOAD_SEC, Math.max(0, seconds))
-                .putBoolean(KEY_IDLE_UNLOAD_MIGRATED_V3, true).apply();
+                .putBoolean(KEY_IDLE_UNLOAD_MIGRATED_V4, true).apply();
     }
 
     public static float getTemperature(Context ctx) {

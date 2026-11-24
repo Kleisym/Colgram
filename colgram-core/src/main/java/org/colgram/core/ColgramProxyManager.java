@@ -226,18 +226,19 @@ public class ColgramProxyManager {
         });
     }
 
-    // Background-priority bounded pools so proxy scanning NEVER preempts Android's UI/RenderThread.
-    private static final ExecutorService executor = newBgPool(8, "colgram-proxy");
-    /** Feed downloads are independent; keep enough concurrency so 46+ feeds don't queue behind slow hosts. */
-    private static final ExecutorService sourceFetchers = newBgPool(24, "colgram-feed");
-    // Separate from the background pool: a large relay sweep must not starve a user selection.
-    private static final int SELECTION_TCP_PARALLEL = 24;
+    // Background-priority bounded pools so proxy scanning NEVER overheats CPU/LTE radio or preempts UI.
+    private static final ExecutorService executor = newBgPool(6, "colgram-proxy");
+    /** Bounded feed concurrency (6 threads) prevents LTE modem spikes while finishing live feeds in <2s. */
+    private static final ExecutorService sourceFetchers = newBgPool(6, "colgram-feed");
+    // Separate from the background pool: capped to 8 (6 on cellular) to stay cool on mobile radio.
+    private static final int SELECTION_TCP_PARALLEL = 8;
+    private static final int CELLULAR_TCP_PARALLEL = 6;
     private static final ExecutorService selectionTcpWorkers = newBgPool(SELECTION_TCP_PARALLEL, "colgram-tcp");
     private static final java.util.concurrent.Semaphore selectionTcpSlots =
             new java.util.concurrent.Semaphore(SELECTION_TCP_PARALLEL);
-    private static final long SOURCE_BATCH_TIMEOUT_MS = 10_000L;
-    private static final int SOURCE_IO_TIMEOUT_MS = 4_500;
-    private static final int SOURCE_MAX_BYTES = 1024 * 1024;
+    private static final long SOURCE_BATCH_TIMEOUT_MS = 7_500L;
+    private static final int SOURCE_IO_TIMEOUT_MS = 4_000;
+    private static final int SOURCE_MAX_BYTES = 512 * 1024;
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(() -> {
             try {
@@ -263,9 +264,9 @@ public class ColgramProxyManager {
     /** Reachable tunnels used only to chain to blocked pool entries. Never shown as proxies. */
     private static final List<ColgramProxyChain.Relay> relayPool = Collections.synchronizedList(new ArrayList<>());
     /**
-     * Background-priority parallel TCP sweep finishes ~200 candidates smoothly without starving UI.
+     * Background-priority bounded parallel TCP sweep (max 6 threads) keeps cellular radio & CPU cool.
      */
-    private static final ExecutorService sweeper = newBgPool(16, "colgram-sweep");
+    private static final ExecutorService sweeper = newBgPool(6, "colgram-sweep");
     private static final AtomicBoolean sweeping = new AtomicBoolean(false);
     private static final AtomicBoolean sweepAgain = new AtomicBoolean(false);
     private static final AtomicBoolean autoConnectPending = new AtomicBoolean(false);
@@ -294,65 +295,50 @@ public class ColgramProxyManager {
     private static final AtomicBoolean networkCallbackRegistered = new AtomicBoolean(false);
     private static volatile Object networkCallback;
 
-    // Refreshed public feeds; an entry is not called working until Telegram's native
-    // checkProxy handshake succeeds. Russia/CIS-reachable Gcore & Fastly jsDelivr CDN mirrors
-    // lead ahead of standard jsDelivr / raw.githubusercontent.com so feeds still load under TSPU!
+    // Live-verified fast RU/CIS-reachable public feeds (tested HTTP 200 < 800ms); an entry is never
+    // marked working until Telegram's protocol check succeeds.
     private static final String[] PROXY_SOURCES_MTPROTO_LINKS = {
-        "https://gcore.jsdelivr.net/gh/tgmtproxy/telegram-mtproto-proxy-list@main/proxies.txt",
+        "https://fastly.jsdelivr.net/gh/ALIILAPRO/MTProtoProxy@main/mtproto.txt",
+        "https://fastly.jsdelivr.net/gh/SoliSpirit/mtproto@master/all_proxies.txt",
+        "https://cdn.jsdelivr.net/gh/neobxod/mtproto-for-telegram@master/all_proxies.txt",
         "https://gcore.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@main/all_proxies.txt",
+        "https://fastly.jsdelivr.net/gh/tgmtproxy/telegram-mtproto-proxy-list@main/proxies.txt",
+        "https://zakky8.github.io/mtproto-proxy-pro/censorship_resistant.txt",
         "https://gcore.jsdelivr.net/gh/SoliSpirit/mtproto@master/all_proxies.txt",
         "https://gcore.jsdelivr.net/gh/ALIILAPRO/MTProtoProxy@main/mtproto.txt",
-        "https://fastly.jsdelivr.net/gh/tgmtproxy/telegram-mtproto-proxy-list@main/proxies.txt",
+        "https://gcore.jsdelivr.net/gh/tgmtproxy/telegram-mtproto-proxy-list@main/proxies.txt",
         "https://fastly.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@main/all_proxies.txt",
-        "https://fastly.jsdelivr.net/gh/SoliSpirit/mtproto@master/all_proxies.txt",
-        "https://cdn.jsdelivr.net/gh/tgmtproxy/telegram-mtproto-proxy-list@main/proxies.txt",
-        "https://cdn.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@main/all_proxies.txt",
         "https://cdn.jsdelivr.net/gh/SoliSpirit/mtproto@master/all_proxies.txt",
         "https://cdn.jsdelivr.net/gh/ALIILAPRO/MTProtoProxy@main/mtproto.txt",
-        "https://cdn.jsdelivr.net/gh/neobxod/mtproto-for-telegram@master/all_proxies.txt",
-        "https://zakky8.github.io/mtproto-proxy-pro/censorship_resistant.txt",
-        "https://raw.githubusercontent.com/tgmtproxy/telegram-mtproto-proxy-list/main/proxies.txt",
-        "https://zakky8.github.io/mtproto-proxy-pro/all_proxies.txt",
-        "https://raw.githubusercontent.com/dubblebyte/free-mtproto-proxies/main/all_proxies.txt",
-        "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
         "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
-        "https://raw.githubusercontent.com/neobxod/mtproto-for-telegram/master/all_proxies.txt",
+        "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
+        "https://raw.githubusercontent.com/dubblebyte/free-mtproto-proxies/main/all_proxies.txt",
+        "https://raw.githubusercontent.com/tgmtproxy/telegram-mtproto-proxy-list/main/proxies.txt",
     };
     private static final String[] PROXY_SOURCES_MTPROTO_JSON = {
-        "https://gcore.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@master/proxies.json",
         "https://fastly.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@master/proxies.json",
+        "https://gcore.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@master/proxies.json",
         "https://cdn.jsdelivr.net/gh/dubblebyte/free-mtproto-proxies@master/proxies.json",
-        "https://raw.githubusercontent.com/dubblebyte/free-mtproto-proxies/master/proxies.json",
         "https://zakky8.github.io/mtproto-proxy-pro/proxies.json",
     };
     private static final String[] PROXY_SOURCES_SOCKS = {
+        "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=ipport&format=text&timeout=5000",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all",
+        "https://fastly.jsdelivr.net/gh/vakhov/fresh-proxy-list@master/socks5.txt",
         "https://gcore.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
+        "https://proxylist.geonode.com/api/proxy-list?protocols=socks5&limit=80&page=1&sort_by=lastChecked&sort_type=desc",
         "https://gcore.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
-        "https://gcore.jsdelivr.net/gh/hookzof/socks5_list@master/proxy.txt",
+        "https://api.openproxylist.xyz/socks5.txt",
+        "https://proxyspace.pro/socks5.txt",
+        "https://fastly.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
+        "https://fastly.jsdelivr.net/gh/ErcinDedeoglu/proxies@main/proxies/socks5.txt",
         "https://gcore.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/socks5.txt",
         "https://gcore.jsdelivr.net/gh/Zaeem20/FREE_PROXIES_LIST@master/socks5.txt",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
-        "https://www.proxy-list.download/api/v1/get?type=socks5",
-        "https://fastly.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
-        "https://fastly.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
-        "https://fastly.jsdelivr.net/gh/hookzof/socks5_list@master/proxy.txt",
+        "https://cdn.jsdelivr.net/gh/vakhov/fresh-proxy-list@master/socks5.txt",
         "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
         "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
         "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt",
-        "https://cdn.jsdelivr.net/gh/hookzof/socks5_list@master/proxy.txt",
-        "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt",
-        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
-        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
-        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
-        "https://proxyspace.pro/socks5.txt",
-        "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5_all.txt"
     };
 
     /** Reachable public tunnels let us test and, if needed, chain a Telegram proxy. */
@@ -625,6 +611,9 @@ public class ColgramProxyManager {
         directRouteCheckedAt = 0L;
         localRouteUnavailableUntil = 0L;
         final boolean networkSwitched = "network available".equals(reason) || "cellular transport changed".equals(reason);
+        if (manual || networkSwitched) {
+            lastCatalogCycleFinishedAtMs = 0L;
+        }
         mainHandler.post(() -> {
             if (networkSwitched && active != null && active.autoSelected && !active.isLocalDpi()
                     && !ColgramConfig.isAutoProxyEnabled() && !ColgramConfig.isWarpEnabled()
@@ -723,22 +712,18 @@ public class ColgramProxyManager {
                         if (!ColgramUiBridge.isAppInForeground()) return;
                         ProxyItem active = currentActiveProxy;
                         if (active != null && active.isLocalDpi()) {
-                            if (isTelegramConnected() && ColgramDpiBypass.isBound()) return;
-                            int ping = testProxy(active.address, active.port, 3000);
-                            if (ping < 0 || !ColgramDpiBypass.isBound()) {
-                                Log.w(TAG, "local DPI listener unhealthy (ping=" + ping
-                                        + ", bound=" + ColgramDpiBypass.isBound() + "); attempting recovery");
-                                if (ColgramDpiBypass.restartIfDeadAndWait(5000)) {
-                                    localRouteUnavailableUntil = 0L;
-                                    mainHandler.post(() -> ensureLocalBaseRoute(appContext));
-                                } else {
-                                    Log.e(TAG, "local DPI listener still not bound after recovery");
-                                }
+                            // Never unbind/rebind or rotate 127.0.0.1:9876 while bound; all failover
+                            // runs silently inside ColgramDpiBypass without resetting tgnet!
+                            if (ColgramDpiBypass.isBound()) return;
+                            Log.w(TAG, "local DPI listener not bound; restarting fixed port 9876");
+                            if (ColgramDpiBypass.restartIfDeadAndWait(3000)) {
+                                localRouteUnavailableUntil = 0L;
+                                mainHandler.post(() -> ensureLocalBaseRoute(appContext));
                             }
                             return;
                         }
                     } catch (Throwable ignored) {}
-                }, 30, 30, TimeUnit.SECONDS);
+                }, 30, 45, TimeUnit.SECONDS);
             }
             if (watchdogTask == null || watchdogTask.isCancelled() || watchdogTask.isDone()) {
                 watchdogTask = scheduler.scheduleWithFixedDelay(() -> {
@@ -857,7 +842,6 @@ public class ColgramProxyManager {
                     tgnetCheckConnection();
                     requestFreshDcAddresses("local base updating stalled");
                     if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
-                    else applyEmergencyVerifiedProxyIfL3Blocked();
                 }
                 return;
             }
@@ -870,7 +854,6 @@ public class ColgramProxyManager {
                 tgnetCheckConnection();
                 requestFreshDcAddresses("local base stalled");
                 if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
-                else applyEmergencyVerifiedProxyIfL3Blocked();
             }
             return;
         }
@@ -1229,6 +1212,7 @@ public class ColgramProxyManager {
     /** Manual "check now": a parallel TCP sweep + full source & catalog refresh. */
     public static void checkPoolNow() {
         lastHealthyCatalogCheckAtMs = 0L;
+        lastCatalogCycleFinishedAtMs = 0L;
         manualCatalogScanRequested = true;
         if (appContext != null) {
             executor.execute(() -> fetchAndVerifyAllSources(true));
@@ -1237,11 +1221,12 @@ public class ColgramProxyManager {
         sweepFast(null);
     }
 
-    /** Called when user opens the proxy screen: ensures catalog fills up if fewer than 12 live proxies exist. */
+    /** Called when user opens the proxy screen: ensures catalog fills up if fewer than 10 live proxies exist. */
     public static void ensureCatalogPopulated() {
         if (appContext == null || !ColgramConfig.isBuiltinProxyEnabled() || isProxySelectionPending()) return;
-        if (getSelectableProxies().size() >= 12) return;
+        if (getSelectableProxies().size() >= 10) return;
         lastHealthyCatalogCheckAtMs = 0L;
+        lastCatalogCycleFinishedAtMs = 0L;
         manualCatalogScanRequested = true;
         if (verifiedPool.isEmpty() || lastSourceFetchAt == 0L) {
             executor.execute(() -> fetchAndVerifyAllSources(true));
@@ -1814,11 +1799,14 @@ public class ColgramProxyManager {
                 proberRunning.set(false);
                 return;
             }
-            if (!manualCatalogScanRequested && scheduledCatalogCheck == null && !isProxySelectionPending()
-                    && isTelegramConnected() && (currentActiveProxy == null || currentActiveProxy.isLocalDpi())
-                    && (!ColgramDpiBypass.isStrictL3WhitelistDetected() || getReachableRelays().size() >= 2)) {
-                mainHandler.postDelayed(this, 60_000L * ColgramPowerGuard.intervalFactor(appContext));
-                return;
+            if (!manualCatalogScanRequested && scheduledCatalogCheck == null && !isProxySelectionPending()) {
+                if (isInAutoCatalogCooldown()
+                        || (isTelegramConnected() && (currentActiveProxy == null || currentActiveProxy.isLocalDpi())
+                            && (!ColgramDpiBypass.isStrictL3WhitelistDetected() || getReachableRelays().size() >= 2))
+                        || getSelectableProxies().size() >= AUTO_CATALOG_STOP_TARGET) {
+                    proberRunning.set(false);
+                    return;
+                }
             }
             if (isProxySelectionPending()) {
                 mainHandler.postDelayed(this, PROBE_GAP_MS);
@@ -3112,23 +3100,26 @@ public static void reportProxyFailure() {
 
     /** Start independent providers early and make parsed candidates available without a batch join. */
     private static void fetchSourceFeedsConcurrently() {
-        final SourceBatch batch = new SourceBatch(PROXY_SOURCES_MTPROTO_LINKS.length
-                + PROXY_SOURCES_MTPROTO_JSON.length + PROXY_SOURCES_SOCKS.length);
+        final int mtLimit = Math.min(6, PROXY_SOURCES_MTPROTO_LINKS.length);
+        final int socksLimit = Math.min(6, PROXY_SOURCES_SOCKS.length);
+        final int jsonLimit = Math.min(2, PROXY_SOURCES_MTPROTO_JSON.length);
+        final SourceBatch batch = new SourceBatch(mtLimit + jsonLimit + socksLimit);
         lastSourceBatch = batch;
-        final List<Runnable> tasks = new ArrayList<>();
-        int count = Math.max(PROXY_SOURCES_SOCKS.length, PROXY_SOURCES_MTPROTO_LINKS.length);
+        final List<Runnable> tasks = new ArrayList<>(mtLimit + jsonLimit + socksLimit);
+        int count = Math.max(socksLimit, mtLimit);
         for (int i = 0; i < count; i++) {
-            if (i < PROXY_SOURCES_MTPROTO_LINKS.length) tasks.add(feedTask(batch,
-                    PROXY_SOURCES_MTPROTO_LINKS[i], 160, ColgramProxyManager::fetchProxiesLinkList));
-            if (i < PROXY_SOURCES_SOCKS.length) tasks.add(feedTask(batch,
-                    PROXY_SOURCES_SOCKS[i], 160, ColgramProxyManager::fetchSocksList));
+            if (i < mtLimit) tasks.add(feedTask(batch,
+                    PROXY_SOURCES_MTPROTO_LINKS[i], 140, ColgramProxyManager::fetchProxiesLinkList));
+            if (i < socksLimit) tasks.add(feedTask(batch,
+                    PROXY_SOURCES_SOCKS[i], 140, ColgramProxyManager::fetchSocksList));
         }
-        for (String url : PROXY_SOURCES_MTPROTO_JSON)
-            tasks.add(feedTask(batch, url, 160, ColgramProxyManager::fetchProxiesJson));
+        for (int i = 0; i < jsonLimit; i++) {
+            tasks.add(feedTask(batch, PROXY_SOURCES_MTPROTO_JSON[i], 140, ColgramProxyManager::fetchProxiesJson));
+        }
         runSourceFetchTasks(tasks, "proxy feed");
-        for (String url : PROXY_SOURCES_MTPROTO_LINKS) batch.outcomes.putIfAbsent(url, "TIMEOUT (batch deadline)");
-        for (String url : PROXY_SOURCES_MTPROTO_JSON) batch.outcomes.putIfAbsent(url, "TIMEOUT (batch deadline)");
-        for (String url : PROXY_SOURCES_SOCKS) batch.outcomes.putIfAbsent(url, "TIMEOUT (batch deadline)");
+        for (int i = 0; i < mtLimit; i++) batch.outcomes.putIfAbsent(PROXY_SOURCES_MTPROTO_LINKS[i], "TIMEOUT (batch deadline)");
+        for (int i = 0; i < jsonLimit; i++) batch.outcomes.putIfAbsent(PROXY_SOURCES_MTPROTO_JSON[i], "TIMEOUT (batch deadline)");
+        for (int i = 0; i < socksLimit; i++) batch.outcomes.putIfAbsent(PROXY_SOURCES_SOCKS[i], "TIMEOUT (batch deadline)");
     }
 
     public static String getSourceDiagnostics() {
@@ -3890,10 +3881,33 @@ public static void reportProxyFailure() {
         return null;
     }
 
-    /** Public SOCKS5 host:port lists are only candidate input, not verified routes. */
+    /** Public SOCKS5 host:port or Geonode JSON lists are only candidate input, not verified routes. */
     private static int fetchSocksList(String sourceUrl, String body, int limit) {
         if (body == null || body.isEmpty()) return 0;
         List<ProxyItem> candidates = new ArrayList<>();
+        String trimmed = body.trim();
+        if (trimmed.startsWith("{")) {
+            try {
+                JSONObject root = new JSONObject(trimmed);
+                JSONArray data = root.optJSONArray("data");
+                if (data != null) {
+                    for (int i = 0; i < data.length(); i++) {
+                        JSONObject row = data.optJSONObject(i);
+                        if (row == null) continue;
+                        String ip = row.optString("ip", "").trim();
+                        int port = row.optInt("port", 0);
+                        if (port <= 0) {
+                            try { port = Integer.parseInt(row.optString("port", "0").trim()); }
+                            catch (NumberFormatException ignored) {}
+                        }
+                        if (port >= 1 && port <= 65535 && ColgramProxyPolicy.isPublicHost(ip)) {
+                            candidates.add(new ProxyItem(ip, port, "", 0));
+                        }
+                    }
+                    if (!candidates.isEmpty()) return selectFeedWindow(candidates, limit);
+                }
+            } catch (Exception ignored) {}
+        }
         for (String line : body.split("\\r?\\n")) {
             ColgramProxyPolicy.Endpoint endpoint = ColgramProxyPolicy.parseEndpoint(line, "socks5",
                     sourceUrl.contains("/zloi-user/hideip.me/"));
@@ -4019,6 +4033,13 @@ public static void reportProxyFailure() {
             return;
         }
         long now = SystemClock.elapsedRealtime();
+        if (proxy.isLocalDpi() && currentActiveProxy != null && currentActiveProxy.isLocalDpi()
+                && currentActiveProxy.effectivePort() == proxy.effectivePort()
+                && ColgramDpiBypass.isBound()) {
+            // Permanent fixed loopback 127.0.0.1:9876 is already active: NEVER re-apply
+            // setProxySettings and tear down all 5 tgnet DCs ("Обновление..." loop).
+            return;
+        }
         if (proxy == currentActiveProxy && now - lastApplyAt < 10000L) {
             // The same node asked for twice inside one grace window. Every alive verdict posts an
             // auto-connect, and re-pushing the proxy tears Telegram's connections down again for
@@ -4191,21 +4212,26 @@ public static void reportProxyFailure() {
     }
 
     private static final long PROXY_SELECTION_TIMEOUT_MS = 25_000L;
-    private static final int MAX_SELECTION_TCP_CHECKS = 240;
-    private static final int MAX_SELECTION_GUEST_CHECKS = 60;
-    private static final int SELECTION_TCP_TIMEOUT_MS = 2_000;
+    private static final int MAX_SELECTION_TCP_CHECKS = 140;
+    private static final int MAX_SELECTION_GUEST_CHECKS = 32;
+    private static final int SELECTION_TCP_TIMEOUT_MS = 1_800;
     private static final int CELLULAR_SELECTION_TCP_TIMEOUT_MS = 2_000;
-    private static final int MAX_BACKGROUND_TCP_CHECKS = 900;
-    private static final int MAX_BACKGROUND_GUEST_CHECKS = 120;
-    private static final int BACKGROUND_PROXY_TARGET_COUNT = 20;
-    private static final long BACKGROUND_PROXY_CHECK_WINDOW_MS = 110_000L;
+    private static final int MAX_BACKGROUND_TCP_CHECKS = 120;
+    private static final int MAX_CELLULAR_BACKGROUND_TCP_CHECKS = 60;
+    private static final int MAX_BACKGROUND_GUEST_CHECKS = 60;
+    private static final int AUTO_CATALOG_STOP_TARGET = 5;
+    private static final int BACKGROUND_PROXY_TARGET_COUNT = 12;
+    private static final long BACKGROUND_PROXY_CHECK_WINDOW_MS = 15_000L;
+    private static final long MANUAL_CATALOG_CHECK_WINDOW_MS = 25_000L;
+    private static final long AUTO_CATALOG_COOLDOWN_WIFI_MS = 10L * 60_000L;
+    private static final long AUTO_CATALOG_COOLDOWN_CELLULAR_MS = 20L * 60_000L;
     private static final long BACKGROUND_PROXY_BUSY_RETRY_MS = 4_000L;
-    private static final long BACKGROUND_PROXY_IDLE_MS = 25_000L;
-    private static final long BACKGROUND_PROXY_READY_MS = 180_000L;
-    private static final long BACKGROUND_PROXY_FEED_INTERVAL_MS = 10 * 60_000L;
-    private static final long BACKGROUND_PROXY_TCP_RECHECK_MS = 5 * 60_000L;
-    private static final long BACKGROUND_PROXY_NEGATIVE_RECHECK_MS = 5 * 60_000L;
-    private static final long BACKGROUND_PROXY_POSITIVE_RECHECK_MS = 300_000L;
+    private static final long BACKGROUND_PROXY_IDLE_MS = 10L * 60_000L;
+    private static final long BACKGROUND_PROXY_READY_MS = 10L * 60_000L;
+    private static final long BACKGROUND_PROXY_FEED_INTERVAL_MS = 10L * 60_000L;
+    private static final long BACKGROUND_PROXY_TCP_RECHECK_MS = 10L * 60_000L;
+    private static final long BACKGROUND_PROXY_NEGATIVE_RECHECK_MS = 10L * 60_000L;
+    private static final long BACKGROUND_PROXY_POSITIVE_RECHECK_MS = 10L * 60_000L;
     private static final ColgramOperationGate proxySelectionGate = new ColgramOperationGate();
     private static volatile ProxySelection proxySelection;
     private static volatile ProxySelection backgroundProxySelection;
@@ -4226,11 +4252,31 @@ public static void reportProxyFailure() {
     }
 
     private static volatile long lastHealthyCatalogCheckAtMs = 0L;
+    private static volatile long lastCatalogCycleFinishedAtMs = 0L;
+
+    private static long autoCatalogCooldownMs() {
+        return ColgramDpiBypass.isCellularNetwork()
+                ? AUTO_CATALOG_COOLDOWN_CELLULAR_MS
+                : AUTO_CATALOG_COOLDOWN_WIFI_MS;
+    }
+
+    private static boolean isInAutoCatalogCooldown() {
+        long finishedAt = lastCatalogCycleFinishedAtMs;
+        if (finishedAt <= 0L) return false;
+        long now = safeClockMs();
+        return now >= finishedAt && (now - finishedAt) < autoCatalogCooldownMs();
+    }
 
     private static boolean backgroundRelayOrProxyWorkNeeded(boolean manual) {
         if (manual || scheduledCatalogCheck != null || manualCatalogScanRequested) return true;
         if (!ColgramUiBridge.isAppInForeground()) return false;
-        if (getSelectableProxies().size() < 10) return true;
+        // Hard thermal/battery cooldown after ANY automatic cycle (10m Wi-Fi / 20m cellular),
+        // even if fewer than 5 proxies passed — never spin the LTE modem & CPU endlessly!
+        if (isInAutoCatalogCooldown()) return false;
+        if (getSelectableProxies().size() >= AUTO_CATALOG_STOP_TARGET) {
+            boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
+            if (!l3Blocked || getReachableRelays().size() >= 2) return false;
+        }
         boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
         if (l3Blocked && getReachableRelays().size() < 2) return true;
         if (isTelegramConnected() && (!l3Blocked || getReachableRelays().size() >= 2)) return false;
@@ -4241,16 +4287,15 @@ public static void reportProxyFailure() {
     private static boolean catalogChecksAllowed() {
         if (scheduledCatalogCheck != null || manualCatalogScanRequested) return true;
         if (!ColgramUiBridge.isAppInForeground()) return false;
+        if (isInAutoCatalogCooldown()) return false;
         if (!backgroundRelayOrProxyWorkNeeded(false)) return false;
-        // Never abort an in-flight catalog scan after finding just 1 proxy; let it fill up to the target pool.
         if (backgroundProxySelection != null) {
-            return getSelectableProxies().size() < BACKGROUND_PROXY_TARGET_COUNT;
+            return getSelectableProxies().size() < AUTO_CATALOG_STOP_TARGET;
         }
-        // Avoid continuous :colgram_proxy_probe churning only once we already have a healthy pool of verified proxies.
         long now = SystemClock.elapsedRealtime();
         if (currentActiveProxy != null && ColgramDpiBypass.isBound()
-                && getSelectableProxies().size() >= BACKGROUND_PROXY_TARGET_COUNT
-                && lastHealthyCatalogCheckAtMs > 0L && (now - lastHealthyCatalogCheckAtMs) < 15L * 60_000L) {
+                && getSelectableProxies().size() >= AUTO_CATALOG_STOP_TARGET
+                && lastHealthyCatalogCheckAtMs > 0L && (now - lastHealthyCatalogCheckAtMs) < autoCatalogCooldownMs()) {
             return false;
         }
         return true;
@@ -4367,7 +4412,7 @@ public static void reportProxyFailure() {
             token = -1L;
             routeEpoch = -1L;
             requested = null;
-            deadline = started + BACKGROUND_PROXY_CHECK_WINDOW_MS;
+            deadline = started + (manualCatalogScanRequested ? MANUAL_CATALOG_CHECK_WINDOW_MS : BACKGROUND_PROXY_CHECK_WINDOW_MS);
             guestEligible = true;
             catalogOnly = true;
         }
@@ -4589,22 +4634,24 @@ public static void reportProxyFailure() {
                         return;
                     }
                     selection.lastSortAt = tickNow;
-                    if (getSelectableProxies().size() >= BACKGROUND_PROXY_TARGET_COUNT && !hasDue && !selection.guestPending) {
-                        finishBackgroundProxyCheck(selection, BACKGROUND_PROXY_READY_MS);
+                    int stopTarget = manualCatalogScanRequested ? BACKGROUND_PROXY_TARGET_COUNT : AUTO_CATALOG_STOP_TARGET;
+                    if (getSelectableProxies().size() >= stopTarget && !hasDue && !selection.guestPending) {
+                        finishBackgroundProxyCheck(selection, autoCatalogCooldownMs());
                         return;
                     }
                     scheduleSelectionTcp(selection, candidates);
-                    // Strongly prefer fast FakeTLS MTProto proxies (3:1 over SOCKS5) sorted by
-                    // lowest measured TCP RTT, so working MTProto nodes populate fast instead of
-                    // stalling behind hundreds of slow/dead free SOCKS5 lists.
+                    // Interleave 50/50 FakeTLS MTProto and SOCKS5 sorted by lowest measured TCP RTT so
+                    // BOTH censorship-resistant MTProto proxies AND SOCKS5 L3 relays verify in <8s.
                     boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
                     boolean launchedAnyThisTick = false;
+                    boolean cellularNow = ColgramDpiBypass.isCellularNetwork();
                     while (selection.guestInFlight < ColgramGuestProxyProbe.MAX_PARALLEL
+                            && (!cellularNow || selection.guestInFlight < 3)
                             && selection.guestAttempts < MAX_BACKGROUND_GUEST_CHECKS
-                            && selection.deadline - tickNow >= ColgramGuestProxyProbe.CHECK_TIMEOUT_MS) {
-                        int preferredType = l3Blocked
-                                ? ((selection.guestAttempts % 4) == 3 ? 1 : 0)
-                                : ((selection.guestAttempts % 4) == 3 ? 0 : 1);
+                            && selection.deadline - tickNow >= 2_500L) {
+                        int preferredType = (selection.guestAttempts % 2) == 0
+                                ? (l3Blocked ? 0 : 1)
+                                : (l3Blocked ? 1 : 0);
                         boolean launchedThisPass = false;
                         for (int pass = 0; pass < 2 && !launchedThisPass; pass++) {
                             int type = pass == 0 ? preferredType : 1 - preferredType;
@@ -4624,11 +4671,8 @@ public static void reportProxyFailure() {
                                 if (pinnedAddress == null) continue;
                                 ProxyItem candidate = pinSelectionCandidate(source, pinnedAddress);
                                 if (selection.guestAttempted.contains(candidate)) continue;
-                                // Prefer SOCKS5 under L3-blocking, else FakeTLS MTProto and lowest TCP RTT
                                 int rtt = source.tcpMs >= 0 ? source.tcpMs : 3000;
-                                int bonus = l3Blocked
-                                        ? (source.type == 0 ? 0 : 800)
-                                        : ((source.type == 1 && source.fakeTls) ? 0 : 800);
+                                int bonus = (source.type == 1 && source.fakeTls) ? 0 : (source.type == 0 ? 150 : 600);
                                 int score = bonus + rtt;
                                 if (score < bestScore) {
                                     bestScore = score;
@@ -4653,13 +4697,13 @@ public static void reportProxyFailure() {
                     int readyCount = getSelectableProxies().size();
                     boolean tcpDrained = selection.tcpFinished == selection.tcpAttempted.size()
                             && (selection.tcpAttempted.size() > 0 || verifiedPool.size() <= 1);
+                    if (readyCount >= stopTarget && !selection.guestPending) {
+                        finishBackgroundProxyCheck(selection, autoCatalogCooldownMs());
+                        return;
+                    }
                     if (!selection.guestPending && !launchedAnyThisTick && tcpDrained
-                            && !fetchingSources.get() && tickNow - selection.started >= 12_000L
-                            && (selection.guestAttempts >= MAX_BACKGROUND_GUEST_CHECKS
-                                || (readyCount >= 8 && tickNow - selection.started >= 25_000L)
-                                || tickNow - selection.started >= 55_000L)) {
-                        finishBackgroundProxyCheck(selection,
-                                readyCount < 10 ? BACKGROUND_PROXY_IDLE_MS : BACKGROUND_PROXY_READY_MS);
+                            && !fetchingSources.get() && tickNow - selection.started >= 6_000L) {
+                        finishBackgroundProxyCheck(selection, autoCatalogCooldownMs());
                         return;
                     }
                     mainHandler.postDelayed(selection.tick, 500L);
@@ -4700,9 +4744,12 @@ public static void reportProxyFailure() {
                             if (measured.type == 0) measured.socksConnectOk = true;
                             measured.failedVerdicts = 0;
                             rememberAlive();
+                            // Keep 127.0.0.1:9876 pinned (zero port churn): newly verified SOCKS5 relays
+                            // immediately feed ColgramDpiBypass's internal Layer-2 L3 cascade!
                             if (ColgramDpiBypass.isStrictL3WhitelistDetected()
                                     && !ColgramDpiBypass.isL3RelayCascadeActive()
-                                    && !isTelegramConnected() && !isUserProxyDisabled()) {
+                                    && !isTelegramConnected() && !isUserProxyDisabled()
+                                    && ColgramConfig.isAutoProxyEnabled()) {
                                 applyEmergencyVerifiedProxyIfL3Blocked();
                             }
                         } else {
@@ -4739,21 +4786,27 @@ public static void reportProxyFailure() {
         if (backgroundProxySelection != selection) return;
         mainHandler.removeCallbacks(selection.tick);
         backgroundProxySelection = null;
+        boolean wasManual = manualCatalogScanRequested;
         manualCatalogScanRequested = false;
+        long finishedNow = SystemClock.elapsedRealtime();
+        lastCatalogCycleFinishedAtMs = finishedNow;
         int freshCount = getSelectableProxies().size();
-        if (freshCount >= BACKGROUND_PROXY_TARGET_COUNT) {
-            lastHealthyCatalogCheckAtMs = SystemClock.elapsedRealtime();
+        if (freshCount >= AUTO_CATALOG_STOP_TARGET) {
+            lastHealthyCatalogCheckAtMs = finishedNow;
         }
         rememberRelays();
-        prewarmWifiSocksRelaysAsync();
+        if (!ColgramDpiBypass.isCellularNetwork() && !ColgramPowerGuard.shouldThrottle(appContext)) {
+            prewarmWifiSocksRelaysAsync();
+        }
         backgroundProxyStatus = "Фоновая проверка · " + selectionProgress(selection);
         Log.i(TAG, "PROXY_BACKGROUND " + selectionDiagnostic(selection)
-                + " fresh=" + freshCount + " route_changed=false"
-                + " proxy_enabled=" + isProxyEnabled(appContext));
+                + " fresh=" + freshCount + " manual=" + wasManual
+                + " route_changed=false proxy_enabled=" + isProxyEnabled(appContext));
         publishPoolToStock();
         notifyProxySettingsChanged();
         finishScheduledCatalogCheck(true);
-        scheduleBackgroundProxyCheck(delayMs);
+        long nextDelay = Math.max(delayMs, autoCatalogCooldownMs());
+        scheduleBackgroundProxyCheck(nextDelay);
     }
 
     /** Explicit public-proxy mode: no endpoint reaches JNI until its protocol check succeeds. */
@@ -4963,16 +5016,22 @@ public static void reportProxyFailure() {
             direct.add(item);
         }
         // Reserve slots for fresh feed rows even if old endpoints refuse immediately.
-        int budget = selection.catalogOnly ? MAX_BACKGROUND_TCP_CHECKS : MAX_SELECTION_TCP_CHECKS;
-        // Prioritize FakeTLS MTProto (3:1 over SOCKS5) so working censorship-resistant MTProto
-        // proxies are discovered first instead of stalling on large dead public SOCKS5 lists.
+        final boolean cellular = ColgramDpiBypass.isCellularNetwork();
+        int budget = selection.catalogOnly
+                ? (cellular ? MAX_CELLULAR_BACKGROUND_TCP_CHECKS : MAX_BACKGROUND_TCP_CHECKS)
+                : MAX_SELECTION_TCP_CHECKS;
+        // Cap concurrent cellular TCP probes to max 6 threads so 4G LTE radio & CPU stay cool,
+        // and interleave 50/50 FakeTLS MTProto and SOCKS5 candidates for fast discovery.
+        final int minReservedPermits = cellular
+                ? Math.max(2, SELECTION_TCP_PARALLEL - CELLULAR_TCP_PARALLEL)
+                : (selection.catalogOnly ? 2 : 0);
         final boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
         while (!direct.isEmpty() && selection.tcpAttempted.size() < budget
-                && (!selection.catalogOnly || selectionTcpSlots.availablePermits() > 6)
+                && selectionTcpSlots.availablePermits() > minReservedPermits
                 && selectionTcpSlots.tryAcquire()) {
-            int preferredType = l3Blocked
-                    ? ((selection.tcpAttempted.size() % 4) == 3 ? 1 : 0)
-                    : ((selection.tcpAttempted.size() % 4) == 3 ? 0 : 1);
+            int preferredType = (selection.tcpAttempted.size() % 2) == 0
+                    ? (l3Blocked ? 0 : 1)
+                    : (l3Blocked ? 1 : 0);
             int index = 0;
             if (!isFreshProtocolVerified(direct.get(0))) {
                 int fallbackIdx = -1;
@@ -6049,12 +6108,53 @@ public static void reportProxyFailure() {
         return c;
     }
 
-    private static final long L3_RELAY_REFRESH_COOLDOWN_MS = 15_000L;
-    private static final long DEAD_RELAY_TTL_MS = 90_000L;
+    private static final long L3_RELAY_REFRESH_COOLDOWN_MS = 60_000L;
+    private static final long DEAD_RELAY_TTL_MS = 180_000L;
+    private static final long L3_EMERGENCY_WARP_COOLDOWN_MS = 120_000L;
     private static final int TIER2_RELAY_RTT_OFFSET_MS = 600;
     private static volatile long lastL3RelayRefreshAt = 0L;
+    private static volatile long lastEmergencyWarpProbeAt = 0L;
     private static final java.util.Map<String, Long> deadRelayUntil =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * When strict-L3 LTE has zero live relays for >= 8s, checks whether built-in WARP/MASQUE is
+     * already VPN-consented and available as an emergency Layer-3 fallback (never interrupts UI or
+     * steals focus if VPN consent hasn't been granted).
+     */
+    public static void triggerEmergencyWarpProbeIfAvailable() {
+        final Context ctx = appContext;
+        if (ctx == null || ColgramConfig.isWarpEnabled() || ColgramWarpTunnel.isUp()
+                || !ColgramWarpTunnel.isBackendAvailable()) {
+            return;
+        }
+        long now = safeClockMs();
+        if (lastEmergencyWarpProbeAt > 0L && now - lastEmergencyWarpProbeAt < L3_EMERGENCY_WARP_COOLDOWN_MS) {
+            return;
+        }
+        lastEmergencyWarpProbeAt = now;
+        try {
+            if (android.net.VpnService.prepare(ctx) != null) {
+                // User has not granted Android VPN consent yet; stay on Layer-2 relay discovery without prompting.
+                Log.i(TAG, "strict-L3 0-relay 8s: WARP/MASQUE available (awaiting VPN consent)");
+                return;
+            }
+            Log.w(TAG, "strict-L3 0-relay 8s: triggering emergency WARP/MASQUE L3 fallback");
+            final long epoch = ColgramRouteEpoch.snapshot();
+            executor.execute(() -> {
+                try {
+                    if (ColgramDpiBypass.isStrictL3WhitelistDetected()
+                            && getReachableRelays().isEmpty()
+                            && !isTelegramConnected()
+                            && !ColgramWarpTunnel.isUp()) {
+                        ColgramWarpTunnel.bringUp(ctx, epoch);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "emergency WARP/MASQUE L3 fallback unavailable: " + t.getMessage());
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
 
     private static long safeClockMs() {
         try {
@@ -6229,7 +6329,7 @@ public static void reportProxyFailure() {
         if (lastL3RelayRefreshAt > 0L && now - lastL3RelayRefreshAt < L3_RELAY_REFRESH_COOLDOWN_MS) return;
         lastL3RelayRefreshAt = now;
         fastProbeCachedRelaysForL3();
-        if (backgroundProxySelection == null) {
+        if (backgroundProxySelection == null && !isInAutoCatalogCooldown()) {
             lastHealthyCatalogCheckAtMs = 0L;
             scheduleBackgroundProxyCheck(0L);
         }
@@ -6254,7 +6354,7 @@ public static void reportProxyFailure() {
                 if (isRelayDead(p.address, p.port)) continue;
                 if (p.socksGreetedOk && p.socksConnectOk) continue;
                 socksTargets.add(p);
-                if (socksTargets.size() >= 24) break;
+                if (socksTargets.size() >= 12) break;
             }
         }
         for (final ProxyItem item : socksTargets) {

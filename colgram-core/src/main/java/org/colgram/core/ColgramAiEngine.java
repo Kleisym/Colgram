@@ -701,10 +701,10 @@ public final class ColgramAiEngine {
         st.imgArr = processedImagePaths.isEmpty() ? null : processedImagePaths.toArray(new String[0]);
 
         int reasoningTier = ColgramAiContextEngine.classifyReasoningTier(req.userQuery);
-        int thinkingBudget = reasoningTier <= 1 ? 448 : 640;
-        int fastBudget = isSongAsk ? 200 : (reasoningTier == 0 ? 220 : 448);
-        st.baseMaxTokens = effectiveLocalDraft ? 200
-                : (st.remoteTargetOverride ? 260
+        int thinkingBudget = reasoningTier <= 1 ? 384 : 512;
+        int fastBudget = isSongAsk ? 192 : (reasoningTier == 0 ? 192 : 256);
+        st.baseMaxTokens = effectiveLocalDraft ? 192
+                : (st.remoteTargetOverride ? 256
                 : (st.baseNativeThinking ? thinkingBudget
                 : (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN ? 768 : fastBudget)));
         st.baseTemp = ColgramAiConfig.getTemperature(ctx);

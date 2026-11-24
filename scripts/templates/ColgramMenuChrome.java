@@ -291,7 +291,8 @@ public final class ColgramMenuChrome {
         }
 
         private void syncAnim() {
-            boolean run = isAttachedToWindow() && getVisibility() == VISIBLE;
+            boolean run = isAttachedToWindow() && getVisibility() == VISIBLE && getWindowVisibility() == VISIBLE
+                    && !org.telegram.messenger.ApplicationLoader.mainInterfacePaused;
             if (run && anim == null) {
                 anim = ValueAnimator.ofFloat(0f, (float) (Math.PI * 2.0));
                 anim.setDuration(980L);
@@ -306,6 +307,12 @@ public final class ColgramMenuChrome {
                 anim.cancel();
                 anim = null;
             }
+        }
+
+        @Override
+        protected void onWindowVisibilityChanged(int visibility) {
+            super.onWindowVisibilityChanged(visibility);
+            syncAnim();
         }
 
         @Override
@@ -597,26 +604,14 @@ public final class ColgramMenuChrome {
         }
 
         private void syncWaveAnim(boolean visible) {
-            boolean powerSave = org.colgram.core.ColgramPowerGuard.isPowerSaveMode(getContext());
-            if (visible && isAttachedToWindow() && !powerSave) {
-                if (waveAnim == null) {
-                    waveAnim = ValueAnimator.ofFloat(0f, 1f);
-                    waveAnim.setDuration(5200L);
-                    waveAnim.setRepeatCount(ValueAnimator.INFINITE);
-                    waveAnim.setInterpolator(new LinearInterpolator());
-                    waveAnim.addUpdateListener(a -> {
-                        long nowMs = android.os.SystemClock.uptimeMillis();
-                        if (nowMs - lastWaveDrawMs < 38L) return;
-                        lastWaveDrawMs = nowMs;
-                        wavePhase = (float) a.getAnimatedValue();
-                        card.invalidate();
-                    });
-                    waveAnim.start();
-                } else if (waveAnim.isPaused()) {
-                    waveAnim.resume();
-                }
-            } else if (waveAnim != null && waveAnim.isRunning()) {
-                waveAnim.pause();
+            // Static crisp wave phase (0.35f) -> 0 invalidations/sec, 0% idle GPU/CPU drain.
+            if (waveAnim != null) {
+                waveAnim.cancel();
+                waveAnim = null;
+            }
+            wavePhase = 0.35f;
+            if (visible && isAttachedToWindow()) {
+                card.invalidate();
             }
         }
 

@@ -49,6 +49,15 @@ public final class ColgramThemePolicyTest {
         check(ColgramThemePolicy.contrast(checkOnMidGrey, 0xff787e88) >= 4.5,
                 "checkmark ink on mid-grey must achieve >= 4.5");
         check(ColgramThemePolicy.perceivedLuma(0xffffffff) > 250, "white luma near 255");
+        // Purple/blue outgoing bubbles & dark translucent service overlays MUST produce crisp WHITE ink!
+        for (int b : new int[]{0xff8251e2, 0xff8a58e8, 0xff9662ee, 0xff2a82da}) {
+            check(ColgramThemePolicy.resolveBubbleInk(0xff0a0d12, b, 0xffffffff, 0xff0a0d12, 4.5) == 0xffffffff,
+                    "bubble " + String.format("#%08x", b) + " must force WHITE primary/check ink");
+            check(ColgramThemePolicy.resolveBubbleInk(0xff0a0d12, b, 0xebffffff, 0xff0a0d12, 4.5) == 0xebffffff,
+                    "bubble " + String.format("#%08x", b) + " must force 0xEBFFFFFF time/reply ink");
+        }
+        check(ColgramThemePolicy.resolveServiceOverlayInk(0x9926323d) == 0xffffffff,
+                "dark translucent chat_serviceBackground (#9926323D) must force WHITE");
         System.out.println("ColgramThemePolicyTest: PASS");
     }
 }

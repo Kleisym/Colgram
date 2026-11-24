@@ -50,7 +50,7 @@ public final class ColgramAiModelManager {
     }
 
     /** Bumped whenever the bundled APK koliti_core.gguf weights are upgraded so old phones auto-refresh. */
-    public static final int EMBEDDED_CORE_REVISION = 2;
+    public static final int EMBEDDED_CORE_REVISION = 3;
 
     private static final AtomicBoolean CANCEL_FLAG = new AtomicBoolean(false);
     private static final Object EXTRACT_LOCK = new Object();

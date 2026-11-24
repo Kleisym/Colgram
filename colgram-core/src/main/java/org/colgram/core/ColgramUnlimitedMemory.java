@@ -374,17 +374,18 @@ public final class ColgramUnlimitedMemory {
     }
 
     /**
-     * Invoked by ColgramBootJobService or startup maintenance. Respects battery & thermal guardrails.
+     * Invoked by ColgramBootJobService or startup maintenance.
+     * STRICT thermal & battery guardrail: automatic background SHA-256 deduplication and JPEG
+     * compression ONLY run while plugged in / charging and cool (never burning CPU on battery!).
      */
     public static ColgramStorageOptimizer.SweepResult runScheduledMaintenanceSync(Context context, boolean fromIdleJob) {
         if (context == null) return new ColgramStorageOptimizer.SweepResult();
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
-        if (ColgramPowerGuard.shouldThrottle(appCtx) || ColgramPowerGuard.isThermalThrottled(appCtx)) {
+        if (!ColgramPowerGuard.isCharging(appCtx) || ColgramPowerGuard.isThermalThrottled(appCtx)) {
             return new ColgramStorageOptimizer.SweepResult();
         }
-        boolean chargingAndScreenOff = ColgramPowerGuard.isCharging(appCtx)
-                && !ColgramPowerGuard.isScreenInteractive(appCtx);
-        int batchLimit = (fromIdleJob && chargingAndScreenOff) ? CHARGING_FILES_PER_SWEEP : DEFAULT_FILES_PER_SWEEP;
+        boolean screenOff = !ColgramPowerGuard.isScreenInteractive(appCtx);
+        int batchLimit = (fromIdleJob && screenOff) ? CHARGING_FILES_PER_SWEEP : DEFAULT_FILES_PER_SWEEP;
         return runOptimizationInternal(appCtx, false, batchLimit);
     }
 

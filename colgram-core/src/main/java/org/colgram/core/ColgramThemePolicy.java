@@ -5,6 +5,9 @@ public final class ColgramThemePolicy {
     private static final int BLACK = 0xff000000;
     private static final int WHITE = 0xffffffff;
     private static final int DEEP_DARK_INK = 0xff0a0d12;
+    private static final double LIGHT_BUBBLE_LUMINANCE = 0.58;
+    private static final int SATURATED_BUBBLE_CHROMA = 40;
+    private static final double DARK_NEUTRAL_LUMINANCE = 0.175;
     private static final double TEXT = 4.5;
     private static final double CONTROL = 3.0;
 
@@ -216,6 +219,24 @@ public final class ColgramThemePolicy {
             return fgArgb;
         }
         int solidBg = solidSurface(bgArgb);
+        boolean saturatedColoredBg = chroma(solidBg) >= SATURATED_BUBBLE_CHROMA
+                && luminance(solidBg) < LIGHT_BUBBLE_LUMINANCE;
+        if (saturatedColoredBg) {
+            int effFg = opaque(fgArgb, solidBg);
+            if (luminance(effFg) > luminance(solidBg) && contrast(fgArgb, solidBg) >= minContrast) {
+                return fgArgb;
+            }
+            int baseOpaque = fgArgb | 0xff000000;
+            if (chroma(baseOpaque) >= 18) {
+                for (int step = 1; step <= 24; step++) {
+                    int candidate = mix(baseOpaque, WHITE, step / 24.0);
+                    if (contrast(candidate, solidBg) >= minContrast) {
+                        return candidate;
+                    }
+                }
+            }
+            return (perceivedLuma(fallbackLight) >= 220) ? fallbackLight : WHITE;
+        }
         if (contrast(fgArgb, solidBg) >= minContrast) {
             return fgArgb;
         }
@@ -281,29 +302,55 @@ public final class ColgramThemePolicy {
 
     /**
      * Resolves readable primary or secondary text/icon ink for outgoing or incoming chat bubbles.
-     * - Dark or saturated bubbles where {@code onDarkInk} meets {@code minContrast} receive crisp
-     *   light/white ink so purple/blue/emerald/dark bubbles never inherit muddy dark-grey checks.
-     * - Mid-grey and light bubbles use WCAG contrast selection (never forcing white onto mid-grey!).
+     * - ANY colored/saturated bubble (purple, violet, blue, indigo, crimson, teal, dark-green) with
+     *   relative luminance {@code < 0.58} ALWAYS receives crisp WHITE ink ({@code onDarkInk}, e.g.
+     *   {@code 0xFFFFFFFF} for text/reply/checkmarks and {@code 0xEBFFFFFF} for timestamps/views)
+     *   because human perception (Helmholtz-Kohlrausch) reads saturated bubbles as dark even when
+     *   pure WCAG 2.0 sRGB luminance scores black marginally higher.
+     * - Dark neutral bubbles ({@code L <= 0.175}) receive crisp WHITE ink meeting {@code minContrast}.
+     * - Genuinely light/pastel/white bubbles ({@code L >= 0.58}) and mid-light neutral greys use
+     *   WCAG contrast selection returning crisp dark ink ({@code 0xFF0A0D12} / {@code onLightInk}).
      */
     public static int resolveBubbleInk(int fgArgb, int bubbleBgArgb, int onDarkInk, int onLightInk, double minContrast) {
         int solidBg = solidSurface(bubbleBgArgb);
         double bgLum = luminance(solidBg);
-        double darkInkContrast = contrast(onDarkInk, solidBg);
-        boolean preferWhiteSide = (bgLum < 0.22 || contrast(WHITE, solidBg) >= contrast(BLACK, solidBg))
-                && (darkInkContrast >= minContrast || contrast(WHITE, solidBg) >= minContrast);
-        if (preferWhiteSide) {
+        int bgChroma = chroma(solidBg);
+        int crispLight = (perceivedLuma(onDarkInk) >= 220) ? onDarkInk : WHITE;
+        if (bgChroma >= SATURATED_BUBBLE_CHROMA && bgLum < LIGHT_BUBBLE_LUMINANCE) {
+            if ((fgArgb >>> 24) >= 0xd8 && perceivedLuma(fgArgb) >= 245 && chroma(fgArgb) < 16
+                    && (fgArgb >>> 24) >= (crispLight >>> 24)) {
+                return fgArgb;
+            }
+            return crispLight;
+        }
+        if (bgLum <= DARK_NEUTRAL_LUMINANCE) {
             if ((fgArgb >>> 24) >= 0x20) {
                 int effFg = opaque(fgArgb, solidBg);
                 if (luminance(effFg) > bgLum && contrast(fgArgb, solidBg) >= Math.max(minContrast, 6.5)) {
                     return fgArgb;
                 }
             }
-            if (darkInkContrast >= minContrast) {
-                return onDarkInk;
+            if (contrast(crispLight, solidBg) >= minContrast) {
+                return crispLight;
             }
             return WHITE;
         }
         return ensureReadableOnSurface(fgArgb, solidBg, WHITE, onLightInk, minContrast);
+    }
+
+    /**
+     * Resolves crisp text/icon/checkmark ink for no-bubble sticker reply boxes, floating date pills,
+     * and media overlays drawn against {@code chat_serviceBackground}. Always returns pure WHITE
+     * ({@code 0xFFFFFFFF}) on any translucent, dark, or colored service pill ({@code L < 0.58}),
+     * never inheriting dark bubble ink onto dark translucent wallpaper overlays.
+     */
+    public static int resolveServiceOverlayInk(int serviceBgArgb) {
+        int alpha = serviceBgArgb >>> 24;
+        if (alpha < 0xd8) {
+            return WHITE;
+        }
+        int solidBg = solidSurfaceOver(serviceBgArgb, 0xff16181e);
+        return luminance(solidBg) < LIGHT_BUBBLE_LUMINANCE ? WHITE : DEEP_DARK_INK;
     }
 
     /**
