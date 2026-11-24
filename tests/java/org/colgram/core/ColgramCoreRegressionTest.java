@@ -227,7 +227,8 @@ public final class ColgramCoreRegressionTest {
         // Verify native payload preparation & cellular vs Wi-Fi Wave 1/2/3 replay plans
         ColgramNativeDesync.PreparedDesync prep =
                 ColgramNativeDesync.prepareTlsOrRawPayload(pqCh, 0, pqCh.length, true, true, true, 0);
-        check(prep.payload.length == pqCh.length + 5, "2-record -r1+s TLS split adds 1 extra 5B record header");
+        check(prep.payload.length == pqCh.length + 10,
+                "3-record SNI+1 & SLD TLS split adds 2 extra 5B record headers: " + (prep.payload.length - pqCh.length));
         check(prep.split1 > 100 && prep.split1 < prep.payload.length, "valid native split1 offset");
         check(prep.fakePayload != null && prep.fakePayload.length <= prep.split1, "valid decoy fake payload");
 

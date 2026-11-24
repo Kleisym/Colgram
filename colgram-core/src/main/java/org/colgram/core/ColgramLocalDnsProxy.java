@@ -31,7 +31,8 @@ final class ColgramLocalDnsProxy implements Closeable {
     private static final String TAG = "ColgramLocalDns";
     private static final int MAX_PACKET = 4096;
     private static final int MAX_CACHE = 1024;
-    private static final long CACHE_TTL_MS = 45_000L;
+    private static final long CACHE_TTL_MS = 120_000L;
+    private static final long GOOGLEVIDEO_CACHE_TTL_MS = 60_000L;
 
     interface WireForwarder {
         byte[] forward(byte[] wireQuery);
@@ -108,7 +109,7 @@ final class ColgramLocalDnsProxy implements Closeable {
 
     private void handleQuery(byte[] query, InetAddress clientAddr, int clientPort) {
         Question q = parseQuestion(query);
-        if (ipv4Only && q != null && q.qtype == 28) {
+        if (q != null && (q.qtype == 65 || q.qtype == 64 || (ipv4Only && q.qtype == 28))) {
             sendReply(buildEmptyNoErrorReply(query), clientAddr, clientPort);
             return;
         }
@@ -143,10 +144,21 @@ final class ColgramLocalDnsProxy implements Closeable {
         out[0] = query[0];
         out[1] = query[1];
         if (key != null && (out[3] & 0x0F) == 0) {
-            if (cache.size() >= MAX_CACHE) cache.clear();
-            cache.put(key, new CacheEntry(out.clone(), System.currentTimeMillis() + CACHE_TTL_MS));
+            long putNow = System.currentTimeMillis();
+            if (cache.size() >= MAX_CACHE) {
+                cache.entrySet().removeIf(entry -> putNow >= entry.getValue().expiresAt);
+                if (cache.size() >= MAX_CACHE) {
+                    cache.clear();
+                }
+            }
+            long ttlMs = isGoogleVideoHost(q.name) ? GOOGLEVIDEO_CACHE_TTL_MS : CACHE_TTL_MS;
+            cache.put(key, new CacheEntry(out.clone(), putNow + ttlMs));
         }
         sendReply(out, clientAddr, clientPort);
+    }
+
+    private static boolean isGoogleVideoHost(String name) {
+        return name != null && (name.equals("googlevideo.com") || name.endsWith(".googlevideo.com"));
     }
 
     private void sendReply(byte[] reply, InetAddress addr, int port) {

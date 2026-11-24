@@ -281,12 +281,17 @@ public final class ColgramNativeDesync {
         if (looksTls) {
             if (tlsRecordSplit) {
                 byte[][] recs = sniPlusOne
-                        ? ColgramTlsMimic.splitTlsRecordAtSniOffset(work, 1)
+                        ? ColgramTlsMimic.splitTlsRecordAtSniAndSld(work, 1)
                         : ColgramTlsMimic.splitTlsRecordAtSni(work, 2);
-                if (recs != null && recs.length == 2) {
-                    byte[] combined = new byte[recs[0].length + recs[1].length];
-                    System.arraycopy(recs[0], 0, combined, 0, recs[0].length);
-                    System.arraycopy(recs[1], 0, combined, recs[0].length, recs[1].length);
+                if (recs != null && recs.length >= 2) {
+                    int totalLen = 0;
+                    for (byte[] rec : recs) totalLen += rec.length;
+                    byte[] combined = new byte[totalLen];
+                    int pos = 0;
+                    for (byte[] rec : recs) {
+                        System.arraycopy(rec, 0, combined, pos, rec.length);
+                        pos += rec.length;
+                    }
                     work = combined;
                     split1 = recs[0].length;
                 } else {
@@ -294,7 +299,7 @@ public final class ColgramNativeDesync {
                     if (sni != null) {
                         split1 = sniPlusOne
                                 ? Math.min(work.length - 1, sni[0] + 1)
-                                : sni[0] + Math.max(1, (sni[1] - sni[0]) / 2);
+                                : ColgramTlsMimic.findSldMidpoint(work, sni[0], sni[1]);
                     }
                 }
             } else {
@@ -302,7 +307,7 @@ public final class ColgramNativeDesync {
                 if (sni != null) {
                     split1 = sniPlusOne
                             ? Math.min(work.length - 1, sni[0] + 1)
-                            : sni[0] + Math.max(1, (sni[1] - sni[0]) / 2);
+                            : ColgramTlsMimic.findSldMidpoint(work, sni[0], sni[1]);
                 }
             }
         } else {

@@ -531,20 +531,61 @@ public final class ColgramDohResolver {
         return merged.isEmpty() ? null : merged.toArray(new InetAddress[0]);
     }
 
+    static boolean prefersEcsDns(String hostname) {
+        if (hostname == null || hostname.isEmpty()) return false;
+        String h = hostname.trim().toLowerCase(java.util.Locale.ROOT);
+        while (h.endsWith(".")) h = h.substring(0, h.length() - 1);
+        return h.equals("googlevideo.com") || h.endsWith(".googlevideo.com")
+                || h.equals("youtube.com") || h.endsWith(".youtube.com")
+                || h.equals("ytimg.com") || h.endsWith(".ytimg.com")
+                || h.equals("ggpht.com") || h.endsWith(".ggpht.com")
+                || h.equals("youtu.be")
+                || h.equals("discord.media") || h.endsWith(".discord.media");
+    }
+
+    static String extractQueryHostname(byte[] msg) {
+        if (msg == null || msg.length < 17) return null;
+        int qdCount = ((msg[4] & 0xFF) << 8) | (msg[5] & 0xFF);
+        if (qdCount < 1) return null;
+        int pos = 12;
+        StringBuilder name = new StringBuilder(64);
+        while (pos < msg.length) {
+            int labelLen = msg[pos++] & 0xFF;
+            if (labelLen == 0) break;
+            if ((labelLen & 0xC0) != 0 || pos + labelLen > msg.length) return null;
+            if (name.length() > 0) name.append('.');
+            for (int i = 0; i < labelLen; i++) {
+                name.append((char) (msg[pos++] & 0xFF));
+            }
+        }
+        return name.length() > 0 ? name.toString().toLowerCase(java.util.Locale.ROOT) : null;
+    }
+
+    static List<Endpoint> orderedCandidatesForHost(String hostname) {
+        return buildHealthyCandidates(null, System.currentTimeMillis(), true, prefersEcsDns(hostname));
+    }
+
     /**
      * Forwards a raw RFC 1035 wire-format DNS query through resilient multi-provider DoH/DoT (with
-     * pinned fastest server + concurrent 3-way diverse provider race under a 3.8s wave deadline +
-     * spoofed RU-whitelist SNI + RFC 7858 Yandex DoT:853), falling back to protected UDP/53.
+     * Google ECS prioritization for YouTube/GoogleVideo/Discord Media, pinned fastest server +
+     * concurrent 3-way diverse provider race under a 3.8s wave deadline + spoofed RU-whitelist SNI
+     * + RFC 7858 Yandex DoT:853), falling back to protected UDP/53.
      */
     public static byte[] queryRawWireProtected(byte[] wireQuery, SocketProtector sockProtector,
                                                ColgramNativeDesync.FdProtector fdProtector,
                                                DatagramProtector udpProtector) {
         if (wireQuery == null || wireQuery.length < 12) return null;
         long now = System.currentTimeMillis();
+        String queryHost = extractQueryHostname(wireQuery);
+        boolean preferGoogleEcs = prefersEcsDns(queryHost);
 
-        // 1. Fast path: try the pinned last-working DoH/DoT provider first (<150ms typical)
+        // 1. Fast path: try the pinned last-working DoH/DoT provider first (<150ms typical),
+        //    but never short-circuit ECS-sensitive media/video hosts onto a non-ECS resolver!
         Endpoint pinned = lastWorkingEndpoint;
-        if (pinned != null && !isCut(pinned.key(), now)) {
+        Endpoint pinnedTried = null;
+        if (pinned != null && !isCut(pinned.key(), now)
+                && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
+            pinnedTried = pinned;
             try {
                 long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2500L : 1900L);
                 byte[] reply = queryWire(pinned, wireQuery, sockProtector, fdProtector, fastDeadline, null);
@@ -560,10 +601,22 @@ public final class ColgramDohResolver {
             if (lastWorkingEndpoint == pinned) lastWorkingEndpoint = null;
         }
 
-        // 2. Concurrent 3-way race across diverse healthy providers (e.g. Comss + Yandex DoT:853 + AdGuard/CF/Google)
-        List<Endpoint> remaining = buildHealthyCandidates(pinned, now, false);
+        // 2. Concurrent waves across healthy providers (Google ECS wave first for YouTube/Discord media)
+        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, false, preferGoogleEcs);
         java.util.Set<String> triedKeys = new java.util.HashSet<>();
-        if (pinned != null) triedKeys.add(pinned.key());
+        if (pinnedTried != null) triedKeys.add(pinnedTried.key());
+
+        if (preferGoogleEcs) {
+            List<Endpoint> ecsWave = extractGoogleWave(remaining, 3);
+            if (!ecsWave.isEmpty()) {
+                for (Endpoint ep : ecsWave) triedKeys.add(ep.key());
+                byte[] ecsReply = raceEndpointsWave(ecsWave, wireQuery, sockProtector, fdProtector,
+                        cellularNetwork ? 2500L : 2000L, 0);
+                if (ecsReply != null && ecsReply.length >= 12) {
+                    return ecsReply;
+                }
+            }
+        }
 
         for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
             List<Endpoint> wave = pickDiverseWave(remaining, 3);
@@ -595,7 +648,25 @@ public final class ColgramDohResolver {
         return queryEmergencyUdp(wireQuery, udpProtector);
     }
 
+    private static List<Endpoint> extractGoogleWave(List<Endpoint> remaining, int maxCount) {
+        List<Endpoint> googleWave = new ArrayList<>(maxCount);
+        java.util.Iterator<Endpoint> it = remaining.iterator();
+        while (it.hasNext() && googleWave.size() < maxCount) {
+            Endpoint ep = it.next();
+            if ("google".equals(ep.providerGroup)) {
+                googleWave.add(ep);
+                it.remove();
+            }
+        }
+        return googleWave;
+    }
+
     private static List<Endpoint> buildHealthyCandidates(Endpoint exclude, long now, boolean ignoreCut) {
+        return buildHealthyCandidates(exclude, now, ignoreCut, false);
+    }
+
+    private static List<Endpoint> buildHealthyCandidates(Endpoint exclude, long now, boolean ignoreCut,
+                                                         boolean preferGoogleEcs) {
         List<Endpoint> allActive = activeEndpoints();
         List<Endpoint> candidates = new ArrayList<>(allActive.size());
         for (Endpoint ep : allActive) {
@@ -608,6 +679,16 @@ public final class ColgramDohResolver {
             for (Endpoint ep : allActive) {
                 if (ep != exclude) candidates.add(ep);
             }
+        }
+        if (preferGoogleEcs && !candidates.isEmpty()) {
+            List<Endpoint> ordered = new ArrayList<>(candidates.size());
+            for (Endpoint ep : candidates) {
+                if ("google".equals(ep.providerGroup)) ordered.add(ep);
+            }
+            for (Endpoint ep : candidates) {
+                if (!"google".equals(ep.providerGroup)) ordered.add(ep);
+            }
+            return ordered;
         }
         return candidates;
     }
@@ -760,9 +841,13 @@ public final class ColgramDohResolver {
             return null;
         }
 
-        // 1. Fast path: pinned last-working endpoint with bounded budget
+        boolean preferGoogleEcs = prefersEcsDns(hostname);
+        // 1. Fast path: pinned last-working endpoint with bounded budget (skip non-ECS pinned for YouTube/media)
         Endpoint pinned = lastWorkingEndpoint;
-        if (pinned != null && (ignoreCut || !isCut(pinned.key(), now))) {
+        Endpoint pinnedTried = null;
+        if (pinned != null && (ignoreCut || !isCut(pinned.key(), now))
+                && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
+            pinnedTried = pinned;
             try {
                 long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2400L : 1800L);
                 byte[] reply = queryWire(pinned, wireQuery, protector, fdProtector, fastDeadline, null);
@@ -787,8 +872,26 @@ public final class ColgramDohResolver {
             }
         }
 
-        // 2. Concurrent 3-way diverse waves (max 2 waves under 3.8s each — eliminates 20s/320s hangs!)
-        List<Endpoint> remaining = buildHealthyCandidates(pinned, now, ignoreCut);
+        // 2. Concurrent waves (Google ECS first for YouTube/media, then 3-way diverse waves under 3.8s each)
+        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, ignoreCut, preferGoogleEcs);
+        if (preferGoogleEcs) {
+            List<Endpoint> ecsWave = extractGoogleWave(remaining, 3);
+            if (!ecsWave.isEmpty()) {
+                byte[] ecsReply = raceEndpointsWave(ecsWave, wireQuery, protector, fdProtector,
+                        cellularNetwork ? 2500L : 2000L, qtype);
+                if (ecsReply != null && ecsReply.length >= 12) {
+                    String[] found = qtype == 28 ? parseRecords(ecsReply, true) : parseARecords(ecsReply);
+                    if (found.length > 0) {
+                        if (qtype == 1) {
+                            cache.put(key, new long[]{System.currentTimeMillis()});
+                            answers.put(key, found);
+                        }
+                        return toAddresses(found);
+                    }
+                    if (qtype == 28) return null;
+                }
+            }
+        }
         for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
             List<Endpoint> wave = pickDiverseWave(remaining, 3);
             byte[] reply = raceEndpointsWave(wave, wireQuery, protector, fdProtector,

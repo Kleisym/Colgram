@@ -725,14 +725,14 @@ public class ColgramDpiBypass {
         CallListener(boolean systemWide) throws java.io.IOException {
             this.systemWide = systemWide;
             this.dualStack = systemWide && ColgramDohResolver.hasGlobalRoutableIpv6();
-            this.clients = new java.util.concurrent.Semaphore(systemWide ? 192 : 32);
+            this.clients = new java.util.concurrent.Semaphore(systemWide ? 512 : 64);
             java.security.SecureRandom random = new java.security.SecureRandom();
             byte[] secret = new byte[24];
             random.nextBytes(secret);
             username = systemWide ? "colgram-sysdpi" : "colgram-call";
             password = android.util.Base64.encodeToString(secret, android.util.Base64.NO_WRAP);
             java.util.Arrays.fill(secret, (byte) 0);
-            listener = new ServerSocket(0, systemWide ? 64 : 16, InetAddress.getByName("127.0.0.1"));
+            listener = new ServerSocket(0, systemWide ? 128 : 32, InetAddress.getByName("127.0.0.1"));
             ColgramLocalDnsProxy dns = null;
             if (systemWide) {
                 try {
@@ -818,12 +818,13 @@ public class ColgramDpiBypass {
 
         Socket connect(String host, int port) {
             String key = baseDomainKey(host);
+            boolean noMssClamp = isStreamingOrVoiceDomain(key);
             boolean confirmed = isHostStrategyConfirmed(key, cellularNetwork);
             int initStrat = pickStrategyForHost(key);
-            // NEVER force tiny SYN(MSS=88) or WCLAMP=2048 on initial connect for unconfirmed hosts:
-            // many Russian 4G LTE PGWs drop SYN packets with MSS=88 before Wave 1 can even race!
-            int mss = confirmed ? mssClampForStrategy(initStrat) : 0;
-            int wclamp = confirmed ? windowClampForStrategy(initStrat) : 0;
+            // NEVER force tiny SYN(MSS=88) or WCLAMP=2048 on initial connect for unconfirmed hosts
+            // or streaming/voice domains: Russian 4G LTE PGWs drop MSS=88 SYNs and streams need full MSS!
+            int mss = (confirmed && !noMssClamp) ? mssClampForStrategy(initStrat) : 0;
+            int wclamp = (confirmed && !noMssClamp) ? windowClampForStrategy(initStrat) : 0;
             return connect(host, port, mss, wclamp);
         }
 
@@ -878,7 +879,7 @@ public class ColgramDpiBypass {
             Socket socket = new Socket();
             if (!track(socket)) return null;
             try {
-                socket.setTcpNoDelay(true);
+                tuneSocketBuffers(socket);
                 if (!owner.protect(socket)) throw new java.io.IOException("Socket protection failed");
                 socket.connect(new InetSocketAddress(host, port), budgetMs);
                 return socket;
@@ -959,7 +960,7 @@ public class ColgramDpiBypass {
             Socket socket = new Socket();
             if (!track(socket)) return null;
             try {
-                socket.setTcpNoDelay(true);
+                tuneSocketBuffers(socket);
                 if (!owner.protect(socket)) throw new java.io.IOException("Socket protection failed");
                 socket.connect(new InetSocketAddress(ipLiteral, port), budgetMs);
                 return socket;
@@ -1519,12 +1520,12 @@ public class ColgramDpiBypass {
         InetSocketAddress primary = resolveBypassEndpoint(host, port);
         if (primary == null) return null;
         String key = baseDomainKey(host);
+        boolean noMssClamp = isStreamingOrVoiceDomain(key);
         boolean confirmed = isHostStrategyConfirmed(key, cellularNetwork);
         int initStrat = pickStrategyForHost(key);
-        // Always use standard RFC TCP SYN (mss=0, wclamp=0) on unconfirmed hosts so LTE PGWs
-        // that blackhole SYN(MSS=88) never kill the connection before Wave 1 races!
-        int mss = confirmed ? mssClampForStrategy(initStrat) : 0;
-        int wclamp = confirmed ? windowClampForStrategy(initStrat) : 0;
+        // Always use standard RFC TCP SYN (mss=0, wclamp=0) on unconfirmed or streaming/voice hosts.
+        int mss = (confirmed && !noMssClamp) ? mssClampForStrategy(initStrat) : 0;
+        int wclamp = (confirmed && !noMssClamp) ? windowClampForStrategy(initStrat) : 0;
         android.net.VpnService sysVpn = activeSystemDpiVpn;
         ColgramDohResolver.SocketProtector sockProt = sysVpn != null ? sysVpn::protect : null;
         ColgramNativeDesync.FdProtector fdProt = sysVpn != null ? sysVpn::protect : null;
@@ -2595,6 +2596,51 @@ public class ColgramDpiBypass {
         return prevDot > 0 ? h.substring(prevDot + 1) : h;
     }
 
+    private static final String[] STREAMING_OR_VOICE_DOMAINS = {
+            "googlevideo.com", "youtube.com", "ytimg.com", "ggpht.com", "youtu.be",
+            "discord.com", "discordapp.com", "discord.media", "discordapp.net",
+            "twitch.tv", "ttvnw.net", "instagram.com", "cdninstagram.com", "fbcdn.net"
+    };
+
+    private static final String[] DOMESTIC_DIRECT_DOMAINS = {
+            "vk.com", "userapi.com", "vk.me",
+            "ya.ru", "yandex.net", "yastatic.net",
+            "mail.ru", "gosuslugi.ru", "sberbank.ru",
+            "ozon.ru", "wildberries.ru", "avito.ru",
+            "tbank.ru", "alfabank.ru", "rutube.ru",
+            "kinopoisk.ru", "dzen.ru", "2gis.ru", "dns-shop.ru"
+    };
+
+    private static String normalizeDomainArg(String host) {
+        if (host == null) return "";
+        String h = host.trim().toLowerCase(java.util.Locale.US);
+        while (h.endsWith(".")) h = h.substring(0, h.length() - 1);
+        return h;
+    }
+
+    private static boolean matchesDomainList(String normalizedHost, String[] domains) {
+        if (normalizedHost.isEmpty()) return false;
+        for (String d : domains) {
+            if (normalizedHost.equals(d) || normalizedHost.endsWith("." + d)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean isStreamingOrVoiceDomain(String hostKey) {
+        return matchesDomainList(normalizeDomainArg(hostKey), STREAMING_OR_VOICE_DOMAINS);
+    }
+
+    static boolean isDomesticDirectHost(String host) {
+        String h = normalizeDomainArg(host);
+        if (h.isEmpty() || ColgramDohResolver.isIpLiteral(h)) return false;
+        if (h.endsWith(".ru") || h.endsWith(".xn--p1ai") || h.endsWith(".su")) {
+            return true;
+        }
+        return matchesDomainList(h, DOMESTIC_DIRECT_DOMAINS);
+    }
+
     /**
      * Builds an ordered, deduplicated strategy plan (up to {@code maxAttempts}) for in-session
      * transparent replay: starts with the host's pinned strategy for this network type, then the
@@ -2604,23 +2650,30 @@ public class ColgramDpiBypass {
         int cap = Math.max(1, Math.min(maxAttempts, STRATEGY_COUNT));
         int[] out = new int[cap];
         int count = 0;
+        boolean skipMssClamp = isStreamingOrVoiceDomain(hostKey);
         int[] ladder = !nativeAvail ? JAVA_ONLY_LADDER : (cellular ? CELLULAR_LADDER : WIFI_LADDER);
 
         HostStrategyState hostState = (hostKey != null && !hostKey.isEmpty())
                 ? hostStrategies.get(scopedHostKey(hostKey, cellular))
                 : null;
-        if (hostState != null && isStrategyAllowed(hostState.strategy, nativeAvail)) {
+        if (hostState != null
+                && isStrategyAllowed(hostState.strategy, nativeAvail)
+                && (!skipMssClamp || mssClampForStrategy(hostState.strategy) == 0)) {
             out[count++] = hostState.strategy;
         }
 
         int netPref = cellular ? cellularPreferredStrategy : wifiPreferredStrategy;
-        if (count < cap && isStrategyAllowed(netPref, nativeAvail) && !containsInt(out, count, netPref)) {
+        if (count < cap
+                && isStrategyAllowed(netPref, nativeAvail)
+                && (!skipMssClamp || mssClampForStrategy(netPref) == 0)
+                && !containsInt(out, count, netPref)) {
             out[count++] = netPref;
         }
 
         for (int candidate : ladder) {
             if (count >= cap) break;
-            if (!containsInt(out, count, candidate)) {
+            if ((!skipMssClamp || mssClampForStrategy(candidate) == 0)
+                    && !containsInt(out, count, candidate)) {
                 out[count++] = candidate;
             }
         }
@@ -2653,17 +2706,21 @@ public class ColgramDpiBypass {
         return cell && ColgramNativeDesync.isAvailable() ? cellularPreferredStrategy : pickStrategy();
     }
 
-    private static void reportHostStrategyResult(String hostKey, int strategy, boolean carried) {
+    static void reportHostStrategyResult(String hostKey, int strategy, boolean carried) {
         reportHostStrategyResult(hostKey, strategy, carried, false);
     }
 
-    private static void reportHostStrategyResult(String hostKey, int strategy, boolean carried, boolean promoteGlobal) {
+    static void reportHostStrategyResult(String hostKey, int strategy, boolean carried, boolean promoteGlobal) {
         boolean cell = cellularNetwork;
-        if (carried && (promoteGlobal || (cell && strategy != STRATEGY_SPLIT_1))) {
+        if (carried && mssClampForStrategy(strategy) == 0
+                && (promoteGlobal || (cell && strategy != STRATEGY_SPLIT_1))) {
             if (cell) cellularPreferredStrategy = strategy;
             else wifiPreferredStrategy = strategy;
         }
         if (hostKey == null || hostKey.isEmpty()) return;
+        if (carried && mssClampForStrategy(strategy) > 0 && isStreamingOrVoiceDomain(hostKey)) {
+            return;
+        }
         String scoped = scopedHostKey(hostKey, cell);
         HostStrategyState state = hostStrategies.get(scoped);
         if (state == null) {
@@ -3069,7 +3126,7 @@ public class ColgramDpiBypass {
         if (sni != null) {
             int sniStart = sni[0];
             int sniEnd = sni[1];
-            int sniMid = sniStart + Math.max(1, (sniEnd - sniStart) / 2);
+            int sniMid = ColgramTlsMimic.findSldMidpoint(buf, sniStart, sniEnd);
             switch (strategy) {
                 case STRATEGY_SPLIT_1: {
                     // 1-byte TCP split + SNI middle split (100% byte-preserving; instant on Wi-Fi)
@@ -3771,6 +3828,12 @@ public class ColgramDpiBypass {
             String sniHost = looksTls ? ColgramTlsMimic.extractSniHostname(firstPayload, firstPayload.length) : null;
             String hostKey = (sniHost != null && !sniHost.isEmpty()) ? baseDomainKey(sniHost) : baseDomainKey(destHost);
 
+            if (call != null && call.systemWide
+                    && isDomesticDirectHost(sniHost != null ? sniHost : destHost)) {
+                pipeDomesticDirectSession(client, dest, call, generation, firstPayload);
+                return;
+            }
+
             if (!overlayActive && firstPayload.length > 1 && (looksTls || looksHttp)) {
                 runReplayableTlsOrHttpSession(client, dest, call, generation, destHost, destPort,
                         firstPayload, looksTls, sniHost, hostKey);
@@ -3779,6 +3842,115 @@ public class ColgramDpiBypass {
             pipeStandardOrWsSession(client, dest, call, generation, telegram, destHost, destPort,
                     overlayActive, firstPayload, looksTls, hostKey, isMedia);
         });
+    }
+
+    private static final int POST_HALF_CLOSE_TIMEOUT_MS = 15_000;
+
+    private static void awaitHalfCloseDrain(Socket upstream,
+                                            java.util.concurrent.atomic.AtomicBoolean t2cDone,
+                                            java.util.concurrent.CountDownLatch t2cLatch,
+                                            java.util.concurrent.atomic.AtomicLong lastRxAt) {
+        try { upstream.setSoTimeout(POST_HALF_CLOSE_TIMEOUT_MS); } catch (Throwable ignored) {}
+        try { upstream.shutdownOutput(); } catch (Throwable ignored) {}
+        long waitAnchor = Math.max(System.currentTimeMillis(), lastRxAt.get());
+        while (!t2cDone.get()) {
+            long activity = Math.max(waitAnchor, lastRxAt.get());
+            long remaining = POST_HALF_CLOSE_TIMEOUT_MS - (System.currentTimeMillis() - activity);
+            if (remaining <= 0L) {
+                closeQuietly(upstream);
+                break;
+            }
+            try {
+                if (t2cLatch.await(remaining, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                closeQuietly(upstream);
+                break;
+            }
+        }
+    }
+
+    private static void relayBidirectional(final Socket client, final Socket upstream,
+                                           final CallListener call, final long generation) {
+        final java.util.concurrent.atomic.AtomicBoolean t2cDone =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        final java.util.concurrent.CountDownLatch t2cLatch =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicLong lastRxAt =
+                new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
+
+        workerPool.execute(() -> {
+            boolean cleanEof = false;
+            try {
+                InputStream cin = client.getInputStream();
+                OutputStream dout = upstream.getOutputStream();
+                byte[] buf = new byte[STREAM_COPY_BUFFER_BYTES];
+                int n;
+                while ((n = cin.read(buf)) != -1) {
+                    dout.write(buf, 0, n);
+                    flushIfDrained(cin, dout);
+                    if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(n);
+                }
+                cleanEof = true;
+            } catch (Throwable err) {
+                closeQuietly(upstream);
+                closeQuietly(client);
+            } finally {
+                if (cleanEof) {
+                    awaitHalfCloseDrain(upstream, t2cDone, t2cLatch, lastRxAt);
+                } else {
+                    closeQuietly(upstream);
+                    closeQuietly(client);
+                }
+            }
+        });
+
+        try {
+            InputStream din = upstream.getInputStream();
+            OutputStream cout = client.getOutputStream();
+            byte[] buf = new byte[STREAM_COPY_BUFFER_BYTES];
+            int n;
+            while ((n = din.read(buf)) != -1) {
+                lastRxAt.set(System.currentTimeMillis());
+                cout.write(buf, 0, n);
+                flushIfDrained(din, cout);
+                if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(n);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            t2cDone.set(true);
+            t2cLatch.countDown();
+            closeQuietly(upstream);
+            closeQuietly(client);
+            if (call != null) call.done(client, upstream);
+            if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
+        }
+    }
+
+    private static void pipeDomesticDirectSession(final Socket client, final Socket dest,
+                                                  final CallListener call, final long generation,
+                                                  final byte[] firstPayload) {
+        tuneSocketBuffers(client);
+        tuneSocketBuffers(dest);
+        try {
+            if (firstPayload != null && firstPayload.length > 0) {
+                OutputStream dout = dest.getOutputStream();
+                dout.write(firstPayload, 0, firstPayload.length);
+                dout.flush();
+                if (call == null && isCurrentListener(generation)) {
+                    toTargetBytes.addAndGet(firstPayload.length);
+                }
+            }
+        } catch (Throwable err) {
+            closeQuietly(dest);
+            closeQuietly(client);
+            if (call != null) call.done(client, dest);
+            if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
+            return;
+        }
+        relayBidirectional(client, dest, call, generation);
     }
 
     private static void runReplayableTlsOrHttpSession(final Socket client, final Socket initialDest,
@@ -3794,10 +3966,11 @@ public class ColgramDpiBypass {
         final int maxAttempts = cellular ? 9 : 6;
         final int[] plan = buildReplayPlan(hostKey, cellular, nativeAvail, maxAttempts);
         final String destKey = baseDomainKey(destHost);
+        final boolean noMssClamp = isStreamingOrVoiceDomain(hostKey) || isStreamingOrVoiceDomain(destKey);
         final boolean destConfirmed = isHostStrategyConfirmed(destKey, cellular);
         final int initStrat = pickStrategyForHost(destKey);
-        final int initMss = destConfirmed ? mssClampForStrategy(initStrat) : 0;
-        final int initWc = destConfirmed ? windowClampForStrategy(initStrat) : 0;
+        final int initMss = (destConfirmed && !noMssClamp) ? mssClampForStrategy(initStrat) : 0;
+        final int initWc = (destConfirmed && !noMssClamp) ? windowClampForStrategy(initStrat) : 0;
         final boolean hostConfirmed = isHostStrategyConfirmed(hostKey, cellular);
         final ParallelReplayDialer dialer = (mssClamp, wclamp) -> (call != null)
                 ? call.connectDirectIp(resolvedIp, destPort, mssClamp, wclamp)
@@ -3866,40 +4039,7 @@ public class ColgramDpiBypass {
         }
 
         // Bidirectional full-speed relay on the winning upstream socket
-        workerPool.execute(() -> {
-            try {
-                InputStream cin = client.getInputStream();
-                OutputStream dout = winner.getOutputStream();
-                byte[] buf = new byte[STREAM_COPY_BUFFER_BYTES];
-                int n;
-                while ((n = cin.read(buf)) != -1) {
-                    dout.write(buf, 0, n);
-                    flushIfDrained(cin, dout);
-                    if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(n);
-                }
-            } catch (Throwable ignored) {
-            } finally {
-                try { winner.shutdownOutput(); } catch (Throwable ignored) {}
-            }
-        });
-
-        try {
-            InputStream din = winner.getInputStream();
-            OutputStream cout = client.getOutputStream();
-            byte[] buf = new byte[STREAM_COPY_BUFFER_BYTES];
-            int n;
-            while ((n = din.read(buf)) != -1) {
-                cout.write(buf, 0, n);
-                flushIfDrained(din, cout);
-                if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(n);
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            closeQuietly(winner);
-            closeQuietly(client);
-            if (call != null) call.done(client, winner);
-            if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
-        }
+        relayBidirectional(client, winner, call, generation);
     }
 
     private static void pipeStandardOrWsSession(final Socket client, final Socket dest, final CallListener call,
@@ -3932,6 +4072,12 @@ public class ColgramDpiBypass {
                 new java.util.concurrent.atomic.AtomicReference<>();
         final boolean l3HandoffCapable = !overlayActive && isEligibleForL3RelayCascade(destHost, destPort);
         final int chosenStrategyVal = pickStrategyForHost(hostKey);
+        final java.util.concurrent.atomic.AtomicBoolean t2cDone =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        final java.util.concurrent.CountDownLatch t2cLatch =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicLong lastRxAt =
+                new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
         final java.io.ByteArrayOutputStream wsReplayBuf =
                 (wsCapable || l3HandoffCapable) ? new java.io.ByteArrayOutputStream(512) : null;
         final boolean[] replayActive = new boolean[]{(wsCapable && !looksTls && firstPayload.length >= 64)
@@ -3943,6 +4089,7 @@ public class ColgramDpiBypass {
         // Client -> Target
         workerPool.execute(() -> {
             boolean clientClosed = false;
+            boolean cleanClientEof = false;
             boolean c2sAttachedHandoff = false;
             try {
                 InputStream cin = client.getInputStream();
@@ -3983,6 +4130,7 @@ public class ColgramDpiBypass {
                     }
                     if (len == -1) {
                         clientClosed = true;
+                        cleanClientEof = true;
                         clientSideClosed.set(true);
                         break;
                     }
@@ -4086,12 +4234,18 @@ public class ColgramDpiBypass {
                         closeClientAndHandoff = false;
                     }
                 }
-                if (closeClientAndHandoff) {
+                if (cleanClientEof && firstReplySeen.get() && ownedWs == null && ownedL3 == null) {
+                    awaitHalfCloseDrain(dest, t2cDone, t2cLatch, lastRxAt);
                     closeQuietly(client);
-                    closeQuietly(ownedWs);
-                    closeQuietly(ownedL3);
+                    closeQuietly(dest);
+                } else {
+                    if (closeClientAndHandoff) {
+                        closeQuietly(client);
+                        closeQuietly(ownedWs);
+                        closeQuietly(ownedL3);
+                    }
+                    closeQuietly(dest);
                 }
-                closeQuietly(dest);
             }
         });
 
@@ -4121,6 +4275,7 @@ public class ColgramDpiBypass {
                 if (dest instanceof ColgramNativeDesync.NativeSocket) {
                     ((ColgramNativeDesync.NativeSocket) dest).unclampWindow();
                 }
+                lastRxAt.set(System.currentTimeMillis());
                 firstReplySeen.set(true);
                 if (telegram) onDirectLayer1Success();
                 synchronized (handoffLock) {
@@ -4140,6 +4295,7 @@ public class ColgramDpiBypass {
                 cout.write(buffer, 0, len);
                 cout.flush();
                 while ((len = din.read(buffer)) != -1) {
+                    lastRxAt.set(System.currentTimeMillis());
                     fromTarget.addAndGet(len);
                     if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(len);
                     cout.write(buffer, 0, len);
@@ -4161,6 +4317,8 @@ public class ColgramDpiBypass {
                 recordSilentEndpoint(dest, telegram, overlayActive);
             }
         } finally {
+            t2cDone.set(true);
+            t2cLatch.countDown();
             closeQuietly(dest);
             boolean l3Carried = false;
             if ((wsCapable || l3HandoffCapable) && fromTarget.get() == 0L && !firstReplySeen.get() && !clientSideClosed.get()) {

@@ -19,8 +19,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /** RFC 1928 UDP relay for the authenticated, call-only local listener. */
 final class ColgramCallUdpRelay {
     private static final int MAX_PACKET = 65507;
-    private static final int MAX_PEERS = 32;
-    private static final int IDLE_MS = 45_000;
+    private static final int MAX_PEERS = 128;
+    private static final int IDLE_MS = 180_000;
 
     private ColgramCallUdpRelay() { }
 

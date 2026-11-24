@@ -333,10 +333,68 @@ public final class ColgramTlsMimic {
         return 5 + recordLen;
     }
 
+    private static final java.util.Set<String> TWO_PART_CCTLD_SECOND_LABELS =
+            new java.util.HashSet<>(Arrays.asList("co", "com", "org", "net", "gov", "edu", "ac", "or", "ne"));
+
+    /**
+     * Computes the midpoint offset inside the Second-Level Domain (SLD) of an SNI span [sniStart, sniEnd).
+     * On long CDN hostnames like "rr3---sn-jvhnu5g-c35z.googlevideo.com", the full-hostname midpoint falls
+     * before "googlevideo.com", leaving the root domain unbroken; SLD midpoint cuts directly inside
+     * "googlevideo" ("googl|evideo.com"), and also handles 2-part ccTLDs like ".co.uk".
+     */
+    public static int findSldMidpoint(byte[] data, int sniStart, int sniEnd) {
+        int fallback = sniStart + Math.max(1, (sniEnd - sniStart) / 2);
+        if (data == null || sniStart < 0 || sniEnd > data.length || sniEnd <= sniStart + 2) {
+            return fallback;
+        }
+        int lastDot = -1;
+        for (int i = sniEnd - 1; i >= sniStart; i--) {
+            if (data[i] == (byte) '.') {
+                lastDot = i;
+                break;
+            }
+        }
+        if (lastDot <= sniStart + 1) return fallback;
+
+        int prevDot = sniStart - 1;
+        for (int i = lastDot - 1; i >= sniStart; i--) {
+            if (data[i] == (byte) '.') {
+                prevDot = i;
+                break;
+            }
+        }
+
+        int sldEnd = lastDot;
+        int sldStart = prevDot + 1;
+        int tldLen = sniEnd - (lastDot + 1);
+        int sldLen = sldEnd - sldStart;
+        if (tldLen == 2 && prevDot > sniStart && sldLen >= 2 && sldLen <= 3) {
+            String secondLabel = new String(data, sldStart, sldLen, StandardCharsets.US_ASCII)
+                    .toLowerCase(java.util.Locale.ROOT);
+            if (TWO_PART_CCTLD_SECOND_LABELS.contains(secondLabel)) {
+                int prevPrevDot = sniStart - 1;
+                for (int i = prevDot - 1; i >= sniStart; i--) {
+                    if (data[i] == (byte) '.') {
+                        prevPrevDot = i;
+                        break;
+                    }
+                }
+                if (prevDot - (prevPrevDot + 1) >= 2) {
+                    sldEnd = prevDot;
+                    sldStart = prevPrevDot + 1;
+                    sldLen = sldEnd - sldStart;
+                }
+            }
+        }
+        if (sldLen < 2) return fallback;
+        return sldStart + Math.max(1, sldLen / 2);
+    }
+
     /**
      * Splits a complete TLS ClientHello record into 2 or 3 RFC-valid 0x16 TLS records sliced
-     * directly inside the SNI hostname extension. Preserves any trailing bytes pipelined after
-     * the ClientHello record. Returns null when data does not hold a complete ClientHello with SNI.
+     * directly inside the SNI hostname (at the SLD midpoint, and near SNI start for 3-record mode).
+     * Preserves any trailing bytes pipelined after the ClientHello record. Returns null when data
+     * does not hold a complete ClientHello with SNI.
      */
     public static byte[][] splitTlsRecordAtSni(byte[] data, int parts) {
         if (data == null) return null;
@@ -346,24 +404,54 @@ public final class ColgramTlsMimic {
         if (sni == null) return null;
         int sniStart = sni[0];
         int sniEnd = sni[1];
-        int sniMid = sniStart + Math.max(1, (sniEnd - sniStart) / 2);
+        int sldMid = findSldMidpoint(data, sniStart, sniEnd);
         int trailingLen = data.length - recEnd;
 
         if (parts >= 3 && sniEnd - sniStart >= 4) {
-            int cut1 = Math.min(sniStart + 2, sniMid - 1);
-            if (cut1 > 6 && sniMid > cut1 && sniMid < recEnd - 1) {
+            int cut1 = Math.min(sniStart + 2, sldMid - 1);
+            if (cut1 > 6 && sldMid > cut1 && sldMid < recEnd - 1) {
                 byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, cut1 - 5, null, 0, 0);
-                byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, cut1, sniMid - cut1, null, 0, 0);
-                byte[] r3 = buildTlsRecord(data[0], data[1], data[2], data, sniMid, recEnd - sniMid,
+                byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, cut1, sldMid - cut1, null, 0, 0);
+                byte[] r3 = buildTlsRecord(data[0], data[1], data[2], data, sldMid, recEnd - sldMid,
                         trailingLen > 0 ? data : null, recEnd, trailingLen);
                 return new byte[][]{r1, r2, r3};
             }
         }
-        if (sniMid <= 6 || sniMid >= recEnd - 1) return null;
-        byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, sniMid - 5, null, 0, 0);
-        byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, sniMid, recEnd - sniMid,
+        if (sldMid <= 6 || sldMid >= recEnd - 1) return null;
+        byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, sldMid - 5, null, 0, 0);
+        byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, sldMid, recEnd - sldMid,
                 trailingLen > 0 ? data : null, recEnd, trailingLen);
         return new byte[][]{r1, r2};
+    }
+
+    /**
+     * Splits a complete TLS ClientHello record into 3 RFC-valid 0x16 TLS records at
+     * {@code sniStart + offsetAfterSniStart} AND the SLD midpoint when
+     * {@code sldMid > sniStart + offsetAfterSniStart + 1}, falling back to a 2-record split via
+     * {@link #splitTlsRecordAtSniOffset(byte[], int)} for short 2-label hostnames.
+     */
+    public static byte[][] splitTlsRecordAtSniAndSld(byte[] data, int offsetAfterSniStart) {
+        if (data == null) return null;
+        int recEnd = expectedClientHelloLength(data, data.length);
+        if (recEnd < 0 || data.length < recEnd) return null;
+        int[] sni = findTlsSniSpan(data, recEnd);
+        if (sni == null) return null;
+        int sniStart = sni[0];
+        int sniEnd = sni[1];
+        int sniLen = sniEnd - sniStart;
+        if (sniLen < 2) return null;
+        int off = Math.max(1, Math.min(offsetAfterSniStart, sniLen - 1));
+        int cut1 = sniStart + off;
+        int sldMid = findSldMidpoint(data, sniStart, sniEnd);
+        if (sldMid > cut1 + 1 && cut1 > 6 && sldMid < recEnd - 1) {
+            int trailingLen = data.length - recEnd;
+            byte[] r1 = buildTlsRecord(data[0], data[1], data[2], data, 5, cut1 - 5, null, 0, 0);
+            byte[] r2 = buildTlsRecord(data[0], data[1], data[2], data, cut1, sldMid - cut1, null, 0, 0);
+            byte[] r3 = buildTlsRecord(data[0], data[1], data[2], data, sldMid, recEnd - sldMid,
+                    trailingLen > 0 ? data : null, recEnd, trailingLen);
+            return new byte[][]{r1, r2, r3};
+        }
+        return splitTlsRecordAtSniOffset(data, offsetAfterSniStart);
     }
 
     /**
@@ -443,19 +531,19 @@ public final class ColgramTlsMimic {
      * Split the first packet into TCP segments without modifying a single byte.
      *
      * For TLS/FakeTLS ClientHellos containing an SNI hostname, ALWAYS slices at byte 1 AND right
-     * across the middle of the SNI domain (`[0..1)`, `[1..sniMid)`, `[sniMid..end)`) so TSPU/RKN
-     * never sees the complete SNI in one TCP segment while preserving TLS transcripts & FakeTLS HMAC.
+     * across the SLD midpoint (`[0..1)`, `[1..sldMid)`, `[sldMid..end)`) so TSPU/RKN never sees
+     * the complete registered domain in one TCP segment while preserving TLS transcripts & FakeTLS HMAC.
      */
     public static byte[][] fragment(byte[] data, Random rnd) {
         if (data == null || data.length < 16) return new byte[][]{data};
         int[] sni = findTlsSniSpan(data, data.length);
         if (sni != null) {
-            int sniMid = sni[0] + Math.max(1, (sni[1] - sni[0]) / 2);
-            if (sniMid > 1 && sniMid < data.length) {
+            int sldMid = findSldMidpoint(data, sni[0], sni[1]);
+            if (sldMid > 1 && sldMid < data.length) {
                 return new byte[][]{
                         Arrays.copyOfRange(data, 0, 1),
-                        Arrays.copyOfRange(data, 1, sniMid),
-                        Arrays.copyOfRange(data, sniMid, data.length)};
+                        Arrays.copyOfRange(data, 1, sldMid),
+                        Arrays.copyOfRange(data, sldMid, data.length)};
             }
         }
         int pieces = 2 + (rnd != null ? rnd.nextInt(2) : 0);
