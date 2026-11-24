@@ -247,6 +247,143 @@ public final class ColgramYoutubeBypassTest {
             ColgramDpiBypass.resetStrategyStateForTest(false, ColgramDpiBypass.STRATEGY_SPLIT_1);
         }
 
+        // 5. Round 2 upgrades: MAX_SAFE_FAKE_TTL=12, TTL8 promoted ahead of TTL3 in Wave 2,
+        //    singleflight DNS coalescing, HTTP/1.1 Keep-Alive framing, Discord/STUN detection, fast HTTP break
+        check(ColgramNativeDesync.MAX_SAFE_FAKE_TTL == 12, "ColgramNativeDesync.MAX_SAFE_FAKE_TTL == 12");
+        int[] cellLadder2 = ColgramDpiBypass.activeLadderFor(true, true);
+        int[] wifiLadder2 = ColgramDpiBypass.activeLadderFor(false, true);
+        int cellTtl8Idx = -1, cellTtl3Idx = -1;
+        for (int i = 0; i < cellLadder2.length; i++) {
+            if (cellLadder2[i] == ColgramDpiBypass.STRATEGY_NATIVE_FAKE_TTL8_TLSREC) cellTtl8Idx = i;
+            if (cellLadder2[i] == ColgramDpiBypass.STRATEGY_NATIVE_FAKE_TTL3_TLSREC) cellTtl3Idx = i;
+        }
+        check(cellTtl8Idx >= 3 && cellTtl8Idx <= 5 && cellTtl8Idx < cellTtl3Idx,
+                "CELLULAR_LADDER promotes FAKE_TTL8 into Wave 2 ahead of FAKE_TTL3");
+        int wifiTtl8Idx = -1, wifiTtl3Idx = -1;
+        for (int i = 0; i < wifiLadder2.length; i++) {
+            if (wifiLadder2[i] == ColgramDpiBypass.STRATEGY_NATIVE_FAKE_TTL8_TLSREC) wifiTtl8Idx = i;
+            if (wifiLadder2[i] == ColgramDpiBypass.STRATEGY_NATIVE_FAKE_TTL3_TLSREC) wifiTtl3Idx = i;
+        }
+        check(wifiTtl8Idx >= 3 && wifiTtl8Idx <= 5 && wifiTtl8Idx < wifiTtl3Idx,
+                "WIFI_LADDER promotes FAKE_TTL8 into Wave 2 ahead of FAKE_TTL3");
+
+        // 5a. LocalDnsProxy singleflight coalescing: 10 concurrent identical queries -> 1 upstream lookup
+        final AtomicInteger coalesceUpstreamCount = new AtomicInteger(0);
+        try (ColgramLocalDnsProxy coalesceProxy = new ColgramLocalDnsProxy(true, wireQ -> {
+            coalesceUpstreamCount.incrementAndGet();
+            try { Thread.sleep(60); } catch (InterruptedException ignored) {}
+            byte[] resp = Arrays.copyOf(wireQ, wireQ.length + 16);
+            resp[2] = (byte) 0x81; resp[3] = (byte) 0x80; resp[7] = 1;
+            return resp;
+        })) {
+            final int proxyPort = coalesceProxy.port();
+            final java.util.concurrent.CountDownLatch startGate = new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.CountDownLatch doneGate = new java.util.concurrent.CountDownLatch(10);
+            final AtomicInteger matchedReplies = new AtomicInteger(0);
+            for (int t = 0; t < 10; t++) {
+                final int txid = 0x4100 + t;
+                Thread th = new Thread(() -> {
+                    try (DatagramSocket s = new DatagramSocket()) {
+                        s.setSoTimeout(3000);
+                        byte[] q = buildDnsQuery(txid, "rr1---sn-coalesce.googlevideo.com", 1);
+                        startGate.await();
+                        s.send(new DatagramPacket(q, q.length, InetAddress.getLoopbackAddress(), proxyPort));
+                        byte[] rb = new byte[512];
+                        DatagramPacket rp = new DatagramPacket(rb, rb.length);
+                        s.receive(rp);
+                        if (((rb[0] & 0xFF) == (txid >> 8)) && ((rb[1] & 0xFF) == (txid & 0xFF))
+                                && (rb[3] & 0x0F) == 0 && rb[7] == 1) {
+                            matchedReplies.incrementAndGet();
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        doneGate.countDown();
+                    }
+                });
+                th.setDaemon(true);
+                th.start();
+            }
+            startGate.countDown();
+            doneGate.await(4, java.util.concurrent.TimeUnit.SECONDS);
+            check(coalesceUpstreamCount.get() == 1 && matchedReplies.get() == 10,
+                    "Singleflight coalescing turned 10 concurrent identical DNS queries into 1 upstream call (got="
+                            + coalesceUpstreamCount.get() + ", ok=" + matchedReplies.get() + ")");
+        }
+
+        // 5b. HTTP/1.1 Keep-Alive DoH response framing (Content-Length + chunked on same stream, and Connection: close)
+        byte[] dnsPayload1 = new byte[14];
+        dnsPayload1[0] = 0x11; dnsPayload1[1] = 0x22; dnsPayload1[2] = (byte) 0x81; dnsPayload1[3] = (byte) 0x80;
+        byte[] dnsPayload2 = new byte[16];
+        dnsPayload2[0] = 0x33; dnsPayload2[1] = 0x44; dnsPayload2[2] = (byte) 0x81; dnsPayload2[3] = (byte) 0x80;
+        ByteArrayOutputStream twoHttp = new ByteArrayOutputStream();
+        twoHttp.write(("HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: "
+                + dnsPayload1.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        twoHttp.write(dnsPayload1);
+        String chunkHex = Integer.toHexString(dnsPayload2.length);
+        twoHttp.write(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunkHex + "\r\n")
+                .getBytes(StandardCharsets.US_ASCII));
+        twoHttp.write(dnsPayload2);
+        twoHttp.write("\r\n0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+        java.io.ByteArrayInputStream kaStream = new java.io.ByteArrayInputStream(twoHttp.toByteArray());
+        boolean[] ka1 = new boolean[1];
+        byte[] parsed1 = ColgramDohResolver.readHttp11KeepAliveResponse(kaStream, ka1);
+        check(Arrays.equals(dnsPayload1, parsed1) && ka1[0],
+                "HTTP/1.1 Content-Length response parsed cleanly with keepAlive=true");
+        boolean[] ka2 = new boolean[1];
+        byte[] parsed2 = ColgramDohResolver.readHttp11KeepAliveResponse(kaStream, ka2);
+        check(Arrays.equals(dnsPayload2, parsed2) && ka2[0],
+                "HTTP/1.1 sequential chunked response on same pooled stream parsed cleanly with keepAlive=true");
+        ByteArrayOutputStream closeHttp = new ByteArrayOutputStream();
+        closeHttp.write(("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
+                + dnsPayload1.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        closeHttp.write(dnsPayload1);
+        boolean[] ka3 = new boolean[1];
+        byte[] parsed3 = ColgramDohResolver.readHttp11KeepAliveResponse(
+                new java.io.ByteArrayInputStream(closeHttp.toByteArray()), ka3);
+        check(Arrays.equals(dnsPayload1, parsed3) && !ka3[0],
+                "HTTP/1.1 Connection: close returns keepAlive=false");
+
+        // 5c. Discord IP Discovery & STUN Binding Request classifiers (and SRTP exclusion)
+        byte[] discordDisc = new byte[74];
+        discordDisc[0] = 0x00; discordDisc[1] = 0x01; discordDisc[2] = 0x00; discordDisc[3] = 0x46;
+        check(ColgramCallUdpRelay.isDiscordIpDiscovery(discordDisc, 0, discordDisc.length),
+                "detects exact 74B Discord IP Discovery");
+        check(!ColgramCallUdpRelay.isDiscordIpDiscovery(new byte[72], 0, 72),
+                "rejects non-74B Discord packet");
+        byte[] stunBind = new byte[20];
+        stunBind[0] = 0x00; stunBind[1] = 0x01;
+        stunBind[4] = 0x21; stunBind[5] = 0x12; stunBind[6] = (byte) 0xA4; stunBind[7] = 0x42;
+        check(ColgramCallUdpRelay.isStunBindingRequest(stunBind, 0, stunBind.length),
+                "detects STUN Binding Request magic cookie 0x2112A442");
+        byte[] srtpAudio = new byte[64];
+        srtpAudio[0] = (byte) 0x80; srtpAudio[1] = 0x78;
+        check(!ColgramCallUdpRelay.isDiscordIpDiscovery(srtpAudio, 0, srtpAudio.length)
+                        && !ColgramCallUdpRelay.isStunBindingRequest(srtpAudio, 0, srtpAudio.length),
+                "SRTP audio frames excluded from UDP decoy injection");
+
+        // 5d. ColgramInitialPacketReader returns immediately on short <64B HTTP request (no 250ms stall)
+        try (java.net.ServerSocket ss = new java.net.ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            final int httpPort = ss.getLocalPort();
+            final byte[] shortHttp = "GET / HTTP/1.1\r\nHost: x.ru\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+            Thread cliThread = new Thread(() -> {
+                try (java.net.Socket c = new java.net.Socket(InetAddress.getLoopbackAddress(), httpPort)) {
+                    c.setTcpNoDelay(true);
+                    c.getOutputStream().write(shortHttp);
+                    c.getOutputStream().flush();
+                    Thread.sleep(350);
+                } catch (Throwable ignored) {}
+            });
+            cliThread.setDaemon(true);
+            cliThread.start();
+            try (java.net.Socket acc = ss.accept()) {
+                long tStart = System.currentTimeMillis();
+                byte[] got = ColgramInitialPacketReader.readInitialPacket(acc, 2048, 8192, 250, 250);
+                long dt = System.currentTimeMillis() - tStart;
+                check(Arrays.equals(shortHttp, got) && dt < 150L,
+                        "readInitialPacket exits immediately on short HTTP header in " + dt + "ms");
+            }
+        }
+
         System.out.println("ColgramYoutubeBypassTest: " + checks + " checks PASS");
     }
 }

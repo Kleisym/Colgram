@@ -2435,6 +2435,7 @@ public class ColgramDpiBypass {
         ColgramTelegramWsBridge.setCellularNetwork(cellular);
         ColgramDohResolver.setCellularNetwork(cellular);
         if (changed) {
+            ColgramDohResolver.clearConnectionPool();
             synchronized (ColgramDpiBypass.class) {
                 currentStrategy = cellular ? cellularPreferredStrategy : wifiPreferredStrategy;
                 strategyCycleSteps = 0;
@@ -2459,12 +2460,12 @@ public class ColgramDpiBypass {
     static final int STRATEGY_NATIVE_FAKE_TTL5_TLSREC    = 2;  // Native sendfile fake RU SNI (max.ru) TTL=5 + 2-rec
     static final int STRATEGY_NATIVE_OOB_DISORDER_TLSREC = 3;  // Fallback mobile -o1 -d1 -r1+s (byte-1 OOB + TTL=1)
     static final int STRATEGY_NATIVE_FAKE_TTL3_TLSREC    = 4;  // Native sendfile fake (vk.com) TTL=3 + 2-rec
-    static final int STRATEGY_NATIVE_FAKE_TTL8_TLSREC    = 5;  // Native sendfile fake (gosuslugi.ru) capped TTL=5 + 2-rec
+    static final int STRATEGY_NATIVE_FAKE_TTL8_TLSREC    = 5;  // Native sendfile fake (gosuslugi.ru) TTL=8 + 2-rec
     static final int STRATEGY_NATIVE_MSS_CLAMP_TLSREC    = 6;  // Dedicated fallback: TCP_MAXSEG=88 + windowClamp=2048 + 2-rec TLS SNI split
     static final int STRATEGY_NATIVE_DISORDER_SNI        = 7;  // Native byte-preserving IP_TTL=1 disorder at SNI mid (-d1+s)
     static final int STRATEGY_TLS_2REC_SNI               = 8;  // Pure RFC-valid 2-record TLS SNI split (carrier-safe)
     static final int STRATEGY_TLS_3REC_SNI               = 9;  // Pure RFC-valid 3-record TLS SNI split (carrier-safe)
-    static final int STRATEGY_NATIVE_FAKE_TTL10_DISORDER = 10; // Fallback: fake (yandex.ru) capped TTL=4 + mid IP_TTL=1 disorder
+    static final int STRATEGY_NATIVE_FAKE_TTL10_DISORDER = 10; // Fallback: fake (yandex.ru) TTL=10 + mid IP_TTL=1 disorder
     static final int STRATEGY_NATIVE_MSS64_OOB1_TLSREC   = 11; // Dedicated fallback: TCP_MAXSEG=88 (clamped >=88) + OOB + -r1+s + wclamp
     static final int STRATEGY_NATIVE_OOB1_ONLY_TLSREC    = 12; // Demoted parallel lane: -o1 -r1+s (never sole cellular default!)
     static final int STRATEGY_NATIVE_MULTI_SPLIT_TLSREC  = 13; // Carrier-safe cellular default: MODE_MULTI_SPLIT_SNI (0 OOB, 0 TTL=1, 0 MSS, 0 wclamp)
@@ -2474,18 +2475,18 @@ public class ColgramDpiBypass {
             STRATEGY_SPLIT_1,
             STRATEGY_NATIVE_MULTI_SPLIT_TLSREC,
             STRATEGY_TLS_2REC_SNI,
-            // Wave 2: OOB1, MSS=88 fallback, disorder
+            // Wave 2: OOB1, disorder, multi-hop fake TTL=8 (gosuslugi.ru)
             STRATEGY_NATIVE_OOB1_ONLY_TLSREC,
-            STRATEGY_NATIVE_MSS_CLAMP_TLSREC,
             STRATEGY_NATIVE_DISORDER_TLSREC,
-            // Wave 3: fake TTL=5, OOB+disorder, fake TTL=3
+            STRATEGY_NATIVE_FAKE_TTL8_TLSREC,
+            // Wave 3: fake TTL=5 (max.ru), MSS=88 fallback, OOB+disorder
             STRATEGY_NATIVE_FAKE_TTL5_TLSREC,
+            STRATEGY_NATIVE_MSS_CLAMP_TLSREC,
             STRATEGY_NATIVE_OOB_DISORDER_TLSREC,
-            STRATEGY_NATIVE_FAKE_TTL3_TLSREC,
+            STRATEGY_NATIVE_FAKE_TTL10_DISORDER,
             STRATEGY_TLS_3REC_SNI,
             STRATEGY_NATIVE_DISORDER_SNI,
-            STRATEGY_NATIVE_FAKE_TTL8_TLSREC,
-            STRATEGY_NATIVE_FAKE_TTL10_DISORDER,
+            STRATEGY_NATIVE_FAKE_TTL3_TLSREC,
             STRATEGY_NATIVE_MSS64_OOB1_TLSREC
     };
 
@@ -2495,18 +2496,18 @@ public class ColgramDpiBypass {
             STRATEGY_NATIVE_MULTI_SPLIT_TLSREC,
             STRATEGY_TLS_2REC_SNI,
             STRATEGY_NATIVE_OOB1_ONLY_TLSREC,
-            // Wave 2: MSS=88+wclamp dedicated fallback, -d1 -r1+s disorder, fake TTL=5 (max.ru)
-            STRATEGY_NATIVE_MSS_CLAMP_TLSREC,
+            // Wave 2: -d1 -r1+s disorder, multi-hop fake TTL=8 (gosuslugi.ru), fake TTL=5 (max.ru)
             STRATEGY_NATIVE_DISORDER_TLSREC,
+            STRATEGY_NATIVE_FAKE_TTL8_TLSREC,
             STRATEGY_NATIVE_FAKE_TTL5_TLSREC,
-            // Wave 3: -o1 -d1 -r1+s, low-hop fake TTL=3 (vk.com), 3-record TLS SNI split
+            // Wave 3: -o1 -d1 -r1+s, fake TTL=10 + disorder (yandex.ru), MSS=88+wclamp fallback
             STRATEGY_NATIVE_OOB_DISORDER_TLSREC,
-            STRATEGY_NATIVE_FAKE_TTL3_TLSREC,
+            STRATEGY_NATIVE_FAKE_TTL10_DISORDER,
+            STRATEGY_NATIVE_MSS_CLAMP_TLSREC,
             STRATEGY_TLS_3REC_SNI,
+            STRATEGY_NATIVE_FAKE_TTL3_TLSREC,
             STRATEGY_SPLIT_1,
             STRATEGY_NATIVE_DISORDER_SNI,
-            STRATEGY_NATIVE_FAKE_TTL8_TLSREC,
-            STRATEGY_NATIVE_FAKE_TTL10_DISORDER,
             STRATEGY_NATIVE_MSS64_OOB1_TLSREC
     };
 
@@ -3086,8 +3087,8 @@ public class ColgramDpiBypass {
                     ns.sendDesynced(buf, 0, len, ColgramNativeDesync.MODE_FAKE_TTL, 3, true, false, cell, 1);
                     return;
                 case STRATEGY_NATIVE_FAKE_TTL8_TLSREC:
-                    // LTE-safe sendfile fake gosuslugi.ru (capped TTL<=5) + 2-record SNI split
-                    ns.sendDesynced(buf, 0, len, ColgramNativeDesync.MODE_FAKE_TTL, 5, true, false, cell, 3);
+                    // LTE-safe sendfile fake gosuslugi.ru (TTL=8 for multi-hop TSPU) + 2-record SNI split
+                    ns.sendDesynced(buf, 0, len, ColgramNativeDesync.MODE_FAKE_TTL, 8, true, false, cell, 3);
                     return;
                 case STRATEGY_NATIVE_MSS_CLAMP_TLSREC:
                     // TCP_MAXSEG=88 + 2-record SNI split
@@ -3098,8 +3099,8 @@ public class ColgramDpiBypass {
                     ns.sendDesynced(buf, 0, len, ColgramNativeDesync.MODE_DISORDER, 1, false, false, cell, 0);
                     return;
                 case STRATEGY_NATIVE_FAKE_TTL10_DISORDER:
-                    // Fallback: fake yandex.ru (capped TTL<=5) + middle-slice IP_TTL=1 disorder
-                    ns.sendDesynced(buf, 0, len, ColgramNativeDesync.MODE_FAKE_TTL_DISORDER, 4, true, false, cell, 2);
+                    // Fallback: fake yandex.ru (TTL=10 for deep carrier TSPU) + middle-slice IP_TTL=1 disorder
+                    ns.sendDesynced(buf, 0, len, ColgramNativeDesync.MODE_FAKE_TTL_DISORDER, 10, true, false, cell, 2);
                     return;
                 case STRATEGY_NATIVE_MSS64_OOB1_TLSREC:
                     // TCP_MAXSEG=88 (clamped >=88) + byte-1 MSG_OOB + SNI+1 2-record split
@@ -3615,7 +3616,7 @@ public class ColgramDpiBypass {
         }
 
         // 2. Staggered 3-way parallel waves across remaining strategies
-        final long[] staggerMs = {0L, 100L, 220L};
+        final long[] staggerMs = {0L, 80L, 180L};
         for (int waveStart = startIdx; waveStart < plan.length; waveStart += 3) {
             long now = System.currentTimeMillis();
             if (now + 700L >= deadline) break;
@@ -3976,7 +3977,7 @@ public class ColgramDpiBypass {
                 ? call.connectDirectIp(resolvedIp, destPort, mssClamp, wclamp)
                 : connectDirectIp(resolvedIp, destPort, mssClamp, wclamp);
 
-        int waveTimeout = cellular ? 2600 : 1800;
+        int waveTimeout = cellular ? 2200 : 1500;
         long totalBudget = cellular ? 9500L : 6500L;
 
         ReplayOutcome outcome = executeParallelReplayPlan(initialDest, initMss, initWc,

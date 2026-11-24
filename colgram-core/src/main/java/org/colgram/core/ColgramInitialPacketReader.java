@@ -73,7 +73,7 @@ public final class ColgramInitialPacketReader {
                             if (buf.size() >= targetLen) break;
                             long extended = System.nanoTime() + Math.max(1, tlsRestTimeoutMs) * 1_000_000L;
                             if (extended > deadlineNanos) deadlineNanos = extended;
-                        } else if (buf.size() >= 64) {
+                        } else if (buf.size() >= 64 || (buf.size() >= 16 && containsHttpHeaderEnd(snap))) {
                             // Non-TLS protocol (e.g. 64B MTProto obfuscated2 init or HTTP GET):
                             // do not stall waiting for extra bytes after the initial write.
                             break;
@@ -87,5 +87,16 @@ public final class ColgramInitialPacketReader {
             socket.setSoTimeout(previousTimeout);
         }
         return buf.toByteArray();
+    }
+
+    private static boolean containsHttpHeaderEnd(byte[] data) {
+        if (data == null || data.length < 4) return false;
+        for (int i = 0; i <= data.length - 4; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n'
+                    && data[i + 2] == '\r' && data[i + 3] == '\n') {
+                return true;
+            }
+        }
+        return false;
     }
 }

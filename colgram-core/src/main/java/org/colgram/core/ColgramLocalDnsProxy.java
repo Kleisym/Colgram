@@ -9,13 +9,16 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -24,15 +27,27 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Replaces sing-box's single-provider `final: "sys-dns-adguard"` (which suffers total DNS blackout
  * on any mobile carrier that blocks/throttles 94.140.14.14) with a resilient multi-provider
  * protected DoH racer (AdGuard, Google, Quad9, Cloudflare, Mullvad, ControlD, DNS.SB over native
- * ByeDPI desynced sockets + protected UDP/53 last-resort fallback) backed by a fast TTL cache.
+ * ByeDPI desynced sockets + protected UDP/53 last-resort fallback) backed by a fast TTL cache,
+ * stale-while-revalidate, singleflight query coalescing, and fast domestic UDP/53 bypass.
  */
 final class ColgramLocalDnsProxy implements Closeable {
 
     private static final String TAG = "ColgramLocalDns";
     private static final int MAX_PACKET = 4096;
-    private static final int MAX_CACHE = 1024;
-    private static final long CACHE_TTL_MS = 120_000L;
-    private static final long GOOGLEVIDEO_CACHE_TTL_MS = 60_000L;
+    private static final int MAX_CACHE = 4096;
+    private static final long CACHE_TTL_MS = 300_000L;
+    private static final long GOOGLEVIDEO_CACHE_TTL_MS = 120_000L;
+    private static final long STALE_GRACE_MS = 300_000L;
+    private static final long GOOGLEVIDEO_STALE_GRACE_MS = 30_000L;
+    private static final long COALESCE_WAIT_MS = 5500L;
+    private static final String[] PREWARM_DOMAINS = {
+            "www.youtube.com",
+            "youtubei.googleapis.com",
+            "i.ytimg.com",
+            "discord.com",
+            "gateway.discord.gg",
+            "instagram.com"
+    };
 
     interface WireForwarder {
         byte[] forward(byte[] wireQuery);
@@ -41,10 +56,12 @@ final class ColgramLocalDnsProxy implements Closeable {
     private static final class CacheEntry {
         final byte[] reply;
         final long expiresAt;
+        final long staleUntil;
 
-        CacheEntry(byte[] reply, long expiresAt) {
+        CacheEntry(byte[] reply, long expiresAt, long staleUntil) {
             this.reply = reply;
             this.expiresAt = expiresAt;
+            this.staleUntil = staleUntil;
         }
     }
 
@@ -52,7 +69,9 @@ final class ColgramLocalDnsProxy implements Closeable {
     private final boolean ipv4Only;
     private final WireForwarder customForwarder;
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
-    private final Semaphore inflight = new Semaphore(48);
+    private final ConcurrentHashMap<String, CompletableFuture<byte[]>> inflightByKey =
+            new ConcurrentHashMap<>();
+    private final Semaphore inflight = new Semaphore(128);
     private final ExecutorService workers = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "colgram-local-dns");
         t.setDaemon(true);
@@ -78,6 +97,53 @@ final class ColgramLocalDnsProxy implements Closeable {
 
     void attach(VpnService service) {
         this.vpn = service;
+        if (customForwarder == null && service != null && !closed.get()) {
+            workers.execute(this::prewarmHotDomains);
+        }
+    }
+
+    private void prewarmHotDomains() {
+        for (String host : PREWARM_DOMAINS) {
+            if (closed.get() || vpn == null) return;
+            String key = host + "|1";
+            CacheEntry existing = cache.get(key);
+            long now = System.currentTimeMillis();
+            if (existing != null && now < existing.expiresAt) continue;
+            byte[] q = buildSimpleAQuery(host);
+            if (q != null) {
+                resolveCoalesced(key, new Question(host, 1), q);
+            }
+        }
+    }
+
+    private static byte[] buildSimpleAQuery(String hostname) {
+        if (hostname == null || hostname.isEmpty()) return null;
+        java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream(64);
+        int id = (int) (System.nanoTime() & 0xFFFF);
+        body.write(id >> 8);
+        body.write(id & 0xFF);
+        body.write(0x01);
+        body.write(0x00);
+        body.write(0x00);
+        body.write(0x01);
+        body.write(0x00);
+        body.write(0x00);
+        body.write(0x00);
+        body.write(0x00);
+        body.write(0x00);
+        body.write(0x00);
+        for (String label : hostname.split("\\.")) {
+            byte[] bytes = label.getBytes(StandardCharsets.UTF_8);
+            if (bytes.length == 0 || bytes.length > 63) return null;
+            body.write(bytes.length);
+            body.write(bytes, 0, bytes.length);
+        }
+        body.write(0x00);
+        body.write(0x00);
+        body.write(0x01);
+        body.write(0x00);
+        body.write(0x01);
+        return body.toByteArray();
     }
 
     private void serveLoop() {
@@ -117,25 +183,26 @@ final class ColgramLocalDnsProxy implements Closeable {
         long now = System.currentTimeMillis();
         if (key != null) {
             CacheEntry hit = cache.get(key);
-            if (hit != null && now < hit.expiresAt && hit.reply.length >= 12) {
-                byte[] patched = hit.reply.clone();
-                patched[0] = query[0];
-                patched[1] = query[1];
-                sendReply(patched, clientAddr, clientPort);
-                return;
+            if (hit != null && hit.reply.length >= 12) {
+                if (now < hit.expiresAt) {
+                    byte[] patched = hit.reply.clone();
+                    patched[0] = query[0];
+                    patched[1] = query[1];
+                    sendReply(patched, clientAddr, clientPort);
+                    return;
+                }
+                if (now < hit.staleUntil) {
+                    byte[] patched = hit.reply.clone();
+                    patched[0] = query[0];
+                    patched[1] = query[1];
+                    sendReply(patched, clientAddr, clientPort);
+                    triggerBackgroundRefresh(key, q, query.clone());
+                    return;
+                }
             }
         }
 
-        byte[] reply;
-        if (customForwarder != null) {
-            reply = customForwarder.forward(query);
-        } else {
-            VpnService owner = vpn;
-            if (owner == null || closed.get()) return;
-            reply = ColgramDohResolver.queryRawWireProtected(
-                    query, owner::protect, owner::protect, owner::protect);
-        }
-
+        byte[] reply = resolveCoalesced(key, q, query);
         if (reply == null || reply.length < 12) {
             sendReply(buildServFailReply(query), clientAddr, clientPort);
             return;
@@ -143,18 +210,74 @@ final class ColgramLocalDnsProxy implements Closeable {
         byte[] out = reply.clone();
         out[0] = query[0];
         out[1] = query[1];
-        if (key != null && (out[3] & 0x0F) == 0) {
-            long putNow = System.currentTimeMillis();
-            if (cache.size() >= MAX_CACHE) {
-                cache.entrySet().removeIf(entry -> putNow >= entry.getValue().expiresAt);
-                if (cache.size() >= MAX_CACHE) {
-                    cache.clear();
-                }
-            }
-            long ttlMs = isGoogleVideoHost(q.name) ? GOOGLEVIDEO_CACHE_TTL_MS : CACHE_TTL_MS;
-            cache.put(key, new CacheEntry(out.clone(), putNow + ttlMs));
-        }
         sendReply(out, clientAddr, clientPort);
+    }
+
+    private void triggerBackgroundRefresh(final String key, final Question q, final byte[] queryCopy) {
+        if (key == null || closed.get() || inflightByKey.containsKey(key)) return;
+        workers.execute(() -> {
+            if (!closed.get()) {
+                resolveCoalesced(key, q, queryCopy);
+            }
+        });
+    }
+
+    private byte[] resolveCoalesced(String key, Question q, byte[] query) {
+        if (key == null) {
+            return lookupUpstream(q, query);
+        }
+        CompletableFuture<byte[]> created = new CompletableFuture<>();
+        CompletableFuture<byte[]> existing = inflightByKey.putIfAbsent(key, created);
+        if (existing != null) {
+            try {
+                return existing.get(COALESCE_WAIT_MS, TimeUnit.MILLISECONDS);
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+        try {
+            byte[] result = lookupUpstream(q, query);
+            if (result != null && result.length >= 12 && (result[3] & 0x0F) == 0) {
+                cacheReply(key, q, result);
+            }
+            created.complete(result);
+            return result;
+        } catch (Throwable t) {
+            created.complete(null);
+            return null;
+        } finally {
+            inflightByKey.remove(key, created);
+        }
+    }
+
+    private byte[] lookupUpstream(Question q, byte[] query) {
+        if (customForwarder != null) {
+            return customForwarder.forward(query);
+        }
+        VpnService owner = vpn;
+        if (owner == null || closed.get()) return null;
+        if (q != null && ColgramDpiBypass.isDomesticDirectHost(q.name)) {
+            byte[] fastUdp = ColgramDohResolver.queryFastDomesticUdp(query, owner::protect);
+            if (fastUdp != null && fastUdp.length >= 12) {
+                return fastUdp;
+            }
+        }
+        return ColgramDohResolver.queryRawWireProtected(
+                query, owner::protect, owner::protect, owner::protect);
+    }
+
+    private void cacheReply(String key, Question q, byte[] reply) {
+        long putNow = System.currentTimeMillis();
+        if (cache.size() >= MAX_CACHE) {
+            cache.entrySet().removeIf(entry -> putNow >= entry.getValue().staleUntil);
+            if (cache.size() >= MAX_CACHE) {
+                cache.clear();
+            }
+        }
+        boolean gv = q != null && isGoogleVideoHost(q.name);
+        long ttlMs = gv ? GOOGLEVIDEO_CACHE_TTL_MS : CACHE_TTL_MS;
+        long staleMs = gv ? GOOGLEVIDEO_STALE_GRACE_MS : STALE_GRACE_MS;
+        cache.put(key, new CacheEntry(reply.clone(), putNow + ttlMs, putNow + ttlMs + staleMs));
     }
 
     private static boolean isGoogleVideoHost(String name) {
@@ -224,6 +347,11 @@ final class ColgramLocalDnsProxy implements Closeable {
         if (!closed.compareAndSet(false, true)) return;
         vpn = null;
         cache.clear();
+        for (CompletableFuture<byte[]> f : inflightByKey.values()) {
+            f.complete(null);
+        }
+        inflightByKey.clear();
+        ColgramDohResolver.clearConnectionPool();
         try {
             socket.close();
         } catch (Throwable ignored) {

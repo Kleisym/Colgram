@@ -51,8 +51,11 @@ public final class ColgramDohResolver {
     private static final int READ_TIMEOUT_MS = 2000;
     private static final int CELLULAR_READ_TIMEOUT_MS = 2500;
     private static final long RACE_WAVE_DEADLINE_MS = 3800L;
-    private static final long CACHE_TTL_MS = 30_000L;
+    private static final long CACHE_TTL_MS = 180_000L;
     private static final long CUT_COOLDOWN_MS = 30_000L;
+    private static final int MAX_POOLED_PER_ENDPOINT = 2;
+    private static final long POOL_IDLE_TTL_MS = 45_000L;
+    private static final long POOL_MAX_AGE_MS = 120_000L;
     private static final String[] SPOOFED_RU_SNIS = {"vk.com", "max.ru"};
 
     /** Distinct exception thrown when TCP connect itself fails so we never retry TLS modes on a dead IP. */
@@ -249,7 +252,90 @@ public final class ColgramDohResolver {
     private static volatile boolean cellularNetwork = false;
 
     public static void setCellularNetwork(boolean cellular) {
+        boolean changed = (cellularNetwork != cellular);
         cellularNetwork = cellular;
+        if (changed) {
+            clearConnectionPool();
+        }
+    }
+
+    private static final class PooledTlsConn {
+        final String poolKey;
+        final java.net.Socket raw;
+        final javax.net.ssl.SSLSocket ssl;
+        final java.io.BufferedInputStream in;
+        final OutputStream out;
+        final boolean dot;
+        final long createdAt;
+        volatile long lastUsedAt;
+
+        PooledTlsConn(String poolKey, java.net.Socket raw, javax.net.ssl.SSLSocket ssl,
+                      java.io.BufferedInputStream in, OutputStream out, boolean dot, long now) {
+            this.poolKey = poolKey;
+            this.raw = raw;
+            this.ssl = ssl;
+            this.in = in;
+            this.out = out;
+            this.dot = dot;
+            this.createdAt = now;
+            this.lastUsedAt = now;
+        }
+
+        boolean isUsable(long now) {
+            if (raw.isClosed() || ssl.isClosed()) return false;
+            if (now - lastUsedAt > POOL_IDLE_TTL_MS) return false;
+            if (now - createdAt > POOL_MAX_AGE_MS) return false;
+            return true;
+        }
+
+        void closeQuietly() {
+            try { ssl.close(); } catch (Throwable ignored) {}
+            try { raw.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static final ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn>> tlsPool =
+            new ConcurrentHashMap<>();
+
+    public static void clearConnectionPool() {
+        for (java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q : tlsPool.values()) {
+            PooledTlsConn c;
+            while ((c = q.pollFirst()) != null) {
+                c.closeQuietly();
+            }
+        }
+        tlsPool.clear();
+    }
+
+    private static PooledTlsConn pollPooledConn(String poolKey) {
+        java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q = tlsPool.get(poolKey);
+        if (q == null) return null;
+        long now = System.currentTimeMillis();
+        PooledTlsConn conn;
+        while ((conn = q.pollFirst()) != null) {
+            if (conn.isUsable(now)) {
+                return conn;
+            }
+            conn.closeQuietly();
+        }
+        return null;
+    }
+
+    private static void returnPooledConn(PooledTlsConn conn) {
+        if (conn == null) return;
+        long now = System.currentTimeMillis();
+        if (!conn.isUsable(now)) {
+            conn.closeQuietly();
+            return;
+        }
+        conn.lastUsedAt = now;
+        java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q =
+                tlsPool.computeIfAbsent(conn.poolKey, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        if (q.size() >= MAX_POOLED_PER_ENDPOINT) {
+            conn.closeQuietly();
+            return;
+        }
+        q.offerFirst(conn);
     }
 
     private static final Map<String, long[]> cache = new ConcurrentHashMap<>();
@@ -340,6 +426,7 @@ public final class ColgramDohResolver {
 
     public static void resetHealth() {
         cutUntil.clear();
+        clearConnectionPool();
         lastResolver = null;
         lastWorkingEndpoint = null;
         lastIpv6CheckAt = 0L;
@@ -798,6 +885,33 @@ public final class ColgramDohResolver {
         return win != null ? win : emptyValidReply.get();
     }
 
+    static byte[] queryFastDomesticUdp(byte[] wireQuery, DatagramProtector udpProtector) {
+        if (wireQuery == null || wireQuery.length < 12) return null;
+        String[] fastDomesticDns = {"77.88.8.8", "77.88.8.1"};
+        for (String dnsIp : fastDomesticDns) {
+            java.net.DatagramSocket sock = null;
+            try {
+                sock = new java.net.DatagramSocket();
+                if (udpProtector != null && !udpProtector.protect(sock)) continue;
+                sock.setSoTimeout(650);
+                InetAddress target = InetAddress.getByName(dnsIp);
+                sock.send(new java.net.DatagramPacket(wireQuery, wireQuery.length, target, 53));
+                byte[] buf = new byte[4096];
+                java.net.DatagramPacket resp = new java.net.DatagramPacket(buf, buf.length);
+                sock.receive(resp);
+                int len = resp.getLength();
+                if (len >= 12 && (buf[3] & 0x0F) == 0) {
+                    lastResolver = dnsIp + ":53-fast";
+                    return java.util.Arrays.copyOf(buf, len);
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (sock != null) { try { sock.close(); } catch (Throwable ignored) {} }
+            }
+        }
+        return null;
+    }
+
     private static byte[] queryEmergencyUdp(byte[] wireQuery, DatagramProtector udpProtector) {
         for (String dnsIp : EMERGENCY_UDP_DNS) {
             java.net.DatagramSocket sock = null;
@@ -1124,6 +1238,11 @@ public final class ColgramDohResolver {
                 fdProtector = sysVpn::protect;
             }
         }
+        String poolKey = endpoint.key() + "|" + ((protector != null || fdProtector != null) ? "P" : "D");
+        byte[] pooledReply = tryPooledQuery(endpoint, poolKey, request, deadlineAt, activeSockets);
+        if (pooledReply != null && pooledReply.length >= 12) {
+            return pooledReply;
+        }
         boolean canNative = ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null);
         // Spoofed RU-whitelist SNI (vk.com / max.ru) first on endpoints proven to accept it while
         // still verifying the real CA-signed certificate against endpoint.verifyName!
@@ -1167,6 +1286,85 @@ public final class ColgramDohResolver {
                 endpoint.sni, false, deadlineAt, activeSockets);
     }
 
+    private static byte[] tryPooledQuery(Endpoint endpoint, String poolKey, byte[] request,
+                                         long deadlineAt, List<java.net.Socket> activeSockets) {
+        PooledTlsConn conn = pollPooledConn(poolKey);
+        if (conn == null) return null;
+        long remaining = deadlineAt - System.currentTimeMillis();
+        if (remaining < 200L) {
+            returnPooledConn(conn);
+            return null;
+        }
+        boolean tracked = false;
+        try {
+            int readTimeout = (int) Math.min(
+                    cellularNetwork ? CELLULAR_READ_TIMEOUT_MS : READ_TIMEOUT_MS,
+                    Math.max(300L, remaining));
+            conn.raw.setSoTimeout(readTimeout);
+            conn.ssl.setSoTimeout(readTimeout);
+            if (activeSockets != null) {
+                synchronized (activeSockets) {
+                    activeSockets.add(conn.raw);
+                }
+                tracked = true;
+            }
+            sendWireRequest(endpoint, conn.out, request, true);
+            boolean[] ka = new boolean[1];
+            byte[] reply = endpoint.dot
+                    ? readDotResponse(conn.in)
+                    : readHttp11KeepAliveResponse(conn.in, ka);
+            boolean keepAlive = endpoint.dot || ka[0];
+            boolean openAfter = !conn.raw.isClosed() && !conn.ssl.isClosed();
+            if (tracked) {
+                synchronized (activeSockets) {
+                    activeSockets.remove(conn.raw);
+                    openAfter = !conn.raw.isClosed() && !conn.ssl.isClosed();
+                }
+                tracked = false;
+            }
+            if (reply != null && reply.length >= 12) {
+                if (keepAlive && openAfter) {
+                    returnPooledConn(conn);
+                } else {
+                    conn.closeQuietly();
+                }
+                return reply;
+            }
+            conn.closeQuietly();
+            return null;
+        } catch (Throwable ignored) {
+            if (tracked && activeSockets != null) {
+                synchronized (activeSockets) {
+                    activeSockets.remove(conn.raw);
+                }
+            }
+            conn.closeQuietly();
+            return null;
+        }
+    }
+
+    private static void sendWireRequest(Endpoint endpoint, OutputStream out,
+                                        byte[] request, boolean keepAlive) throws java.io.IOException {
+        if (endpoint.dot) {
+            byte[] framed = new byte[2 + request.length];
+            framed[0] = (byte) ((request.length >>> 8) & 0xFF);
+            framed[1] = (byte) (request.length & 0xFF);
+            System.arraycopy(request, 0, framed, 2, request.length);
+            out.write(framed);
+            out.flush();
+            return;
+        }
+        String hdr = "POST /dns-query HTTP/1.1\r\n"
+                + "Host: " + endpoint.sni + "\r\n"
+                + "Content-Type: application/dns-message\r\n"
+                + "Accept: application/dns-message\r\n"
+                + "Content-Length: " + request.length + "\r\n"
+                + "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n";
+        out.write(hdr.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        out.write(request);
+        out.flush();
+    }
+
     private static byte[] querySingleAttempt(Endpoint endpoint, byte[] request,
                                              SocketProtector protector,
                                              ColgramNativeDesync.FdProtector fdProtector,
@@ -1180,6 +1378,7 @@ public final class ColgramDohResolver {
         int connectTimeout = (int) Math.min(
                 cellularNetwork ? CELLULAR_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS,
                 Math.max(400L, remaining));
+        String poolKey = endpoint.key() + "|" + ((protector != null || fdProtector != null) ? "P" : "D");
         java.net.Socket raw = null;
         javax.net.ssl.SSLSocket ssl = null;
         try {
@@ -1193,7 +1392,11 @@ public final class ColgramDohResolver {
                     throw new TcpConnectException("Native TCP connect failed to " + endpoint.key(), connectErr);
                 }
                 raw = nativeSock;
-                if (activeSockets != null) activeSockets.add(raw);
+                if (activeSockets != null) {
+                    synchronized (activeSockets) {
+                        activeSockets.add(raw);
+                    }
+                }
                 transport = ColgramNativeDesync.wrapForFirstTlsHello(
                         nativeSock, ColgramNativeDesync.MODE_MULTI_SPLIT_SNI, 0, true, true, cellularNetwork, 0);
             } else {
@@ -1207,7 +1410,11 @@ public final class ColgramDohResolver {
                 } catch (Throwable connectErr) {
                     throw new TcpConnectException("TCP connect failed to " + endpoint.key(), connectErr);
                 }
-                if (activeSockets != null) activeSockets.add(raw);
+                if (activeSockets != null) {
+                    synchronized (activeSockets) {
+                        activeSockets.add(raw);
+                    }
+                }
                 transport = new SniFragmentingSocket(raw);
             }
 
@@ -1229,52 +1436,181 @@ public final class ColgramDohResolver {
                 throw new javax.net.ssl.SSLPeerUnverifiedException("DoH/DoT cert mismatch for " + endpoint.verifyName);
             }
 
-            if (endpoint.dot) {
-                // RFC 7858 DNS-over-TLS: 2-byte big-endian length prefix + wire DNS message
-                OutputStream out = ssl.getOutputStream();
-                byte[] framed = new byte[2 + request.length];
-                framed[0] = (byte) ((request.length >>> 8) & 0xFF);
-                framed[1] = (byte) (request.length & 0xFF);
-                System.arraycopy(request, 0, framed, 2, request.length);
-                out.write(framed);
-                out.flush();
-                return readDotResponse(ssl.getInputStream());
-            }
-
             OutputStream out = ssl.getOutputStream();
-            String hdr = "POST /dns-query HTTP/1.1\r\n"
-                    + "Host: " + endpoint.sni + "\r\n"
-                    + "Content-Type: application/dns-message\r\n"
-                    + "Accept: application/dns-message\r\n"
-                    + "Content-Length: " + request.length + "\r\n"
-                    + "Connection: close\r\n\r\n";
-            out.write(hdr.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-            out.write(request);
-            out.flush();
+            java.io.BufferedInputStream bin = new java.io.BufferedInputStream(ssl.getInputStream(), 4096);
+            sendWireRequest(endpoint, out, request, true);
 
-            InputStream in = ssl.getInputStream();
-            ByteArrayOutputStream rawResp = new ByteArrayOutputStream();
-            byte[] buf = new byte[1024];
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                rawResp.write(buf, 0, n);
-                if (rawResp.size() > 65536) break;
+            boolean[] ka = new boolean[1];
+            byte[] reply = endpoint.dot
+                    ? readDotResponse(bin)
+                    : readHttp11KeepAliveResponse(bin, ka);
+            boolean keepAlive = endpoint.dot || ka[0];
+            if (reply != null && reply.length >= 12 && keepAlive) {
+                boolean openAfter = !raw.isClosed() && !ssl.isClosed();
+                if (activeSockets != null) {
+                    synchronized (activeSockets) {
+                        activeSockets.remove(raw);
+                        openAfter = !raw.isClosed() && !ssl.isClosed();
+                    }
+                }
+                if (openAfter) {
+                    returnPooledConn(new PooledTlsConn(
+                            poolKey, raw, ssl, bin, out, endpoint.dot, System.currentTimeMillis()));
+                    ssl = null;
+                    raw = null;
+                }
             }
-            byte[] all = rawResp.toByteArray();
-            int headerEnd = findHttpHeaderEnd(all);
-            if (headerEnd < 0) return null;
-            String headStr = new String(all, 0, headerEnd, java.nio.charset.StandardCharsets.ISO_8859_1);
-            int firstCr = headStr.indexOf('\r');
-            String statusLine = firstCr > 0 ? headStr.substring(0, firstCr) : headStr;
-            if (!statusLine.contains(" 200")) return null;
-            boolean chunked = headStr.toLowerCase(java.util.Locale.ROOT).contains("transfer-encoding: chunked");
-            byte[] body = java.util.Arrays.copyOfRange(all, headerEnd + 4, all.length);
-            return chunked ? decodeChunked(body) : body;
+            return reply;
         } finally {
-            if (activeSockets != null && raw != null) activeSockets.remove(raw);
+            if (activeSockets != null && raw != null) {
+                synchronized (activeSockets) {
+                    activeSockets.remove(raw);
+                }
+            }
             if (ssl != null) { try { ssl.close(); } catch (Throwable ignored) {} }
             if (raw != null) { try { raw.close(); } catch (Throwable ignored) {} }
         }
+    }
+
+    /**
+     * Reads one HTTP/1.1 (or HTTP/1.0) DoH response with exact Content-Length / chunked framing
+     * so persistent TLS sockets can be returned cleanly to the Keep-Alive pool.
+     */
+    static byte[] readHttp11KeepAliveResponse(InputStream in, boolean[] outKeepAlive) throws java.io.IOException {
+        if (outKeepAlive != null && outKeepAlive.length > 0) outKeepAlive[0] = false;
+        ByteArrayOutputStream hdrBuf = new ByteArrayOutputStream(512);
+        int match = 0;
+        while (hdrBuf.size() < 16384) {
+            int b = in.read();
+            if (b < 0) return null;
+            hdrBuf.write(b);
+            if (b == '\r') {
+                match = (match == 2) ? 3 : 1;
+            } else if (b == '\n') {
+                if (match == 1) match = 2;
+                else if (match == 3) break;
+                else match = 0;
+            } else {
+                match = 0;
+            }
+        }
+        if (match != 3 || hdrBuf.size() < 4) return null;
+        byte[] hdrBytes = hdrBuf.toByteArray();
+        String headStr = new String(hdrBytes, 0, hdrBytes.length - 4, java.nio.charset.StandardCharsets.ISO_8859_1);
+        String[] lines = headStr.split("\\r?\\n");
+        if (lines.length == 0) return null;
+        String statusLine = lines[0];
+        if (!statusLine.contains(" 200")) return null;
+        boolean http10 = statusLine.startsWith("HTTP/1.0");
+        boolean chunked = false;
+        boolean connClose = false;
+        boolean connKeepAlive = false;
+        int contentLength = -1;
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            int colon = line.indexOf(':');
+            if (colon <= 0) continue;
+            String name = line.substring(0, colon).trim().toLowerCase(java.util.Locale.ROOT);
+            String val = line.substring(colon + 1).trim();
+            if ("content-length".equals(name)) {
+                try {
+                    int parsed = Integer.parseInt(val);
+                    if (parsed >= 0) contentLength = parsed;
+                } catch (NumberFormatException ignored) {}
+            } else if ("transfer-encoding".equals(name)) {
+                if (val.toLowerCase(java.util.Locale.ROOT).contains("chunked")) {
+                    chunked = true;
+                }
+            } else if ("connection".equals(name)) {
+                String lv = val.toLowerCase(java.util.Locale.ROOT);
+                if (lv.contains("close")) connClose = true;
+                if (lv.contains("keep-alive")) connKeepAlive = true;
+            }
+        }
+        boolean canKeepAlive = http10 ? connKeepAlive : !connClose;
+        if (chunked) {
+            byte[] body = readChunkedBodyKeepAlive(in);
+            if (body == null) return null;
+            if (outKeepAlive != null && outKeepAlive.length > 0) outKeepAlive[0] = canKeepAlive;
+            return body;
+        }
+        if (contentLength >= 0) {
+            if (contentLength > 65536) return null;
+            byte[] body = readExactBytes(in, contentLength);
+            if (body == null) return null;
+            if (outKeepAlive != null && outKeepAlive.length > 0) outKeepAlive[0] = canKeepAlive;
+            return body;
+        }
+        ByteArrayOutputStream rawBody = new ByteArrayOutputStream();
+        byte[] buf = new byte[1024];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            int toWrite = Math.min(n, 65536 - rawBody.size());
+            if (toWrite > 0) rawBody.write(buf, 0, toWrite);
+            if (rawBody.size() >= 65536) break;
+        }
+        return rawBody.toByteArray();
+    }
+
+    private static byte[] readExactBytes(InputStream in, int len) throws java.io.IOException {
+        byte[] out = new byte[len];
+        int pos = 0;
+        while (pos < len) {
+            int r = in.read(out, pos, len - pos);
+            if (r < 0) return null;
+            pos += r;
+        }
+        return out;
+    }
+
+    private static byte[] readChunkedBodyKeepAlive(InputStream in) throws java.io.IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        while (true) {
+            String sizeLine = readLineCrlf(in, 256);
+            if (sizeLine == null) return null;
+            String hex = sizeLine.trim();
+            int semi = hex.indexOf(';');
+            if (semi >= 0) hex = hex.substring(0, semi).trim();
+            if (hex.isEmpty()) return null;
+            int chunkLen;
+            try {
+                chunkLen = Integer.parseInt(hex, 16);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+            if (chunkLen < 0) return null;
+            if (chunkLen == 0) {
+                while (true) {
+                    String trailer = readLineCrlf(in, 1024);
+                    if (trailer == null) return null;
+                    if (trailer.isEmpty()) break;
+                }
+                return out.toByteArray();
+            }
+            if (out.size() + chunkLen > 65536) return null;
+            byte[] chunk = readExactBytes(in, chunkLen);
+            if (chunk == null) return null;
+            out.write(chunk);
+            String crlf = readLineCrlf(in, 16);
+            if (crlf == null || !crlf.isEmpty()) return null;
+        }
+    }
+
+    private static String readLineCrlf(InputStream in, int maxLen) throws java.io.IOException {
+        StringBuilder sb = new StringBuilder(32);
+        while (sb.length() < maxLen) {
+            int b = in.read();
+            if (b < 0) return null;
+            if (b == '\n') {
+                int len = sb.length();
+                if (len > 0 && sb.charAt(len - 1) == '\r') {
+                    sb.setLength(len - 1);
+                }
+                return sb.toString();
+            }
+            sb.append((char) (b & 0xFF));
+        }
+        return null;
     }
 
     /** Reads a single RFC 7858 DNS-over-TLS length-prefixed response frame. */
@@ -1296,36 +1632,6 @@ public final class ColgramDohResolver {
             pos += r;
         }
         return msg;
-    }
-
-    private static int findHttpHeaderEnd(byte[] data) {
-        for (int i = 0; i <= data.length - 4; i++) {
-            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') return i;
-        }
-        return -1;
-    }
-
-    private static byte[] decodeChunked(byte[] body) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        int i = 0;
-        while (i < body.length) {
-            int crlf = -1;
-            for (int j = i; j < body.length - 1; j++) {
-                if (body[j] == '\r' && body[j + 1] == '\n') { crlf = j; break; }
-            }
-            if (crlf < 0) break;
-            String sizeHex = new String(body, i, crlf - i, java.nio.charset.StandardCharsets.US_ASCII).trim();
-            int semi = sizeHex.indexOf(';');
-            if (semi >= 0) sizeHex = sizeHex.substring(0, semi).trim();
-            int chunkLen;
-            try { chunkLen = Integer.parseInt(sizeHex, 16); } catch (NumberFormatException e) { break; }
-            if (chunkLen <= 0) break;
-            int dataStart = crlf + 2;
-            if (dataStart + chunkLen > body.length) break;
-            out.write(body, dataStart, chunkLen);
-            i = dataStart + chunkLen + 2;
-        }
-        return out.toByteArray();
     }
 
     /**

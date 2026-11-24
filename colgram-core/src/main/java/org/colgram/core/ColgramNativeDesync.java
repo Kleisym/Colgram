@@ -44,6 +44,7 @@ public final class ColgramNativeDesync {
     public static final int MODE_OOB_BYTE1_ONLY     = 9;
     public static final int MODE_SPLIT_BYTE1        = 10;
     public static final int MODE_MULTI_SPLIT_SNI    = 11;
+    public static final int MAX_SAFE_FAKE_TTL       = 12;
 
     private static volatile SSLSocketFactory cachedEngineSslFactory;
 
@@ -420,7 +421,7 @@ public final class ColgramNativeDesync {
                                  int decoyVariant) throws IOException {
             if (closed.get()) throw new IOException("NativeSocket closed");
             boolean needFake = (nativeMode == MODE_FAKE_TTL || nativeMode == MODE_FAKE_TTL_DISORDER);
-            int safeTtl = needFake ? Math.max(1, Math.min(5, fakeTtl > 0 ? fakeTtl : 3)) : fakeTtl;
+            int safeTtl = needFake ? Math.max(1, Math.min(MAX_SAFE_FAKE_TTL, fakeTtl > 0 ? fakeTtl : 3)) : fakeTtl;
             PreparedDesync prep = prepareTlsOrRawPayload(
                     payload, off, len, tlsRecordSplit, sniPlusOne, needFake, decoyVariant);
             int rc = nativeSendDesync(handle, prep.payload, 0, prep.payload.length,

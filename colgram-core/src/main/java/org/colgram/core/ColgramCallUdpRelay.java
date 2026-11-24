@@ -21,15 +21,37 @@ final class ColgramCallUdpRelay {
     private static final int MAX_PACKET = 65507;
     private static final int MAX_PEERS = 128;
     private static final int IDLE_MS = 180_000;
+    private static final int UDP_SOCKET_BUFFER_BYTES = 262144;
+    private static final long VOICE_DECOY_COOLDOWN_MS = 15_000L;
 
     private ColgramCallUdpRelay() { }
+
+    static boolean isDiscordIpDiscovery(byte[] buf, int off, int len) {
+        return buf != null && off >= 0 && len == 74 && off + len <= buf.length
+                && buf[off] == 0x00 && buf[off + 1] == 0x01
+                && buf[off + 2] == 0x00 && buf[off + 3] == 0x46;
+    }
+
+    static boolean isStunBindingRequest(byte[] buf, int off, int len) {
+        return buf != null && off >= 0 && len >= 20 && off + len <= buf.length
+                && buf[off] == 0x00 && buf[off + 1] == 0x01
+                && buf[off + 4] == 0x21 && buf[off + 5] == 0x12
+                && buf[off + 6] == (byte) 0xA4 && buf[off + 7] == 0x42;
+    }
+
+    private static void tuneUdpBuffers(DatagramSocket sock) {
+        try { sock.setReceiveBufferSize(UDP_SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+        try { sock.setSendBufferSize(UDP_SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+    }
 
     static void serve(VpnService vpn, Socket control, InputStream in, OutputStream out)
             throws IOException {
         if (vpn == null) throw new IOException("Call VPN has stopped");
         Map<InetSocketAddress, DatagramSocket> upstreams = new ConcurrentHashMap<>();
+        Map<InetSocketAddress, Long> decoyCooldown = new ConcurrentHashMap<>();
         InetAddress loopback = control.getLocalAddress();
         try (DatagramSocket relay = new DatagramSocket(new InetSocketAddress(loopback, 0))) {
+            tuneUdpBuffers(relay);
             // RFC 1928: returned BND.ADDR/BND.PORT is the actual client UDP destination.
             int port = relay.getLocalPort();
             out.write(new byte[]{5, 0, 0, 1, 127, 0, 0, 1, (byte) (port >>> 8), (byte) port});
@@ -49,6 +71,9 @@ final class ColgramCallUdpRelay {
             guard.start();
 
             byte[] bytes = new byte[MAX_PACKET];
+            byte[] decoyBuf = new byte[64];
+            DatagramPacket decoyPkt = new DatagramPacket(decoyBuf, decoyBuf.length);
+            DatagramPacket upstreamSendPkt = new DatagramPacket(bytes, 0, 0);
             DatagramPacket request = new DatagramPacket(bytes, bytes.length);
             InetSocketAddress client = null;
             while (!relay.isClosed()) {
@@ -71,12 +96,11 @@ final class ColgramCallUdpRelay {
                     DatagramSocket upstream = upstreams.get(target);
                     if (upstream == null) {
                         if (upstreams.size() >= MAX_PEERS) continue;
-                        // Do not send low-TTL UDP decoys from a separate ephemeral socket/port:
-                        // stateful TSPU tracks UDP flows by 5-tuple, so a mismatched source port
-                        // burns latency/FDs with zero DPI effect, and raw fd extraction from Java
-                        // DatagramSocket risks bionic fdsan / Android hidden-API failures.
+                        // Same-socket decoy reuse below keeps the exact 5-tuple without raw fd extraction
+                        // or bionic fdsan / Android hidden-API hazards.
                         upstream = new DatagramSocket(null);
                         try {
+                            tuneUdpBuffers(upstream);
                             if (!vpn.protect(upstream)) throw new IOException("UDP socket protection failed");
                             upstream.connect(target);
                             upstream.setSoTimeout(IDLE_MS);
@@ -87,8 +111,21 @@ final class ColgramCallUdpRelay {
                         upstreams.put(target, upstream);
                         readReplies(upstream, target, relay, sender, upstreams);
                     }
-                    upstream.send(new DatagramPacket(bytes, frame.payloadOffset,
-                            request.getLength() - frame.payloadOffset));
+                    int payloadLen = request.getLength() - frame.payloadOffset;
+                    if (payloadLen > 0 && (isDiscordIpDiscovery(bytes, frame.payloadOffset, payloadLen)
+                            || isStunBindingRequest(bytes, frame.payloadOffset, payloadLen))) {
+                        long nowMs = System.currentTimeMillis();
+                        Long lastBurst = decoyCooldown.get(target);
+                        if (lastBurst == null || nowMs - lastBurst >= VOICE_DECOY_COOLDOWN_MS) {
+                            if (decoyCooldown.size() > MAX_PEERS * 2) decoyCooldown.clear();
+                            decoyCooldown.put(target, nowMs);
+                            for (int d = 0; d < 3; d++) {
+                                upstream.send(decoyPkt);
+                            }
+                        }
+                    }
+                    upstreamSendPkt.setData(bytes, frame.payloadOffset, payloadLen);
+                    upstream.send(upstreamSendPkt);
                 } catch (IOException | RuntimeException unreachable) {
                     // A datagram target failure cannot redirect the association onto another route.
                 }
@@ -102,17 +139,20 @@ final class ColgramCallUdpRelay {
             DatagramSocket relay, InetSocketAddress client,
             Map<InetSocketAddress, DatagramSocket> upstreams) {
         Thread reader = new Thread(() -> {
-            byte[] bytes = new byte[MAX_PACKET];
-            DatagramPacket reply = new DatagramPacket(bytes, bytes.length);
             byte[] header = responseHeader(target);
+            byte[] bytes = new byte[MAX_PACKET];
+            System.arraycopy(header, 0, bytes, 0, header.length);
+            final int maxPayload = MAX_PACKET - header.length;
+            DatagramPacket reply = new DatagramPacket(bytes, header.length, maxPayload);
+            DatagramPacket sendPkt = new DatagramPacket(bytes, 0, 0, client);
             try {
                 while (!relay.isClosed()) {
-                    reply.setLength(bytes.length);
+                    reply.setData(bytes, header.length, maxPayload);
                     upstream.receive(reply);
-                    if (header.length + reply.getLength() > MAX_PACKET) continue;
-                    byte[] response = Arrays.copyOf(header, header.length + reply.getLength());
-                    System.arraycopy(bytes, reply.getOffset(), response, header.length, reply.getLength());
-                    relay.send(new DatagramPacket(response, response.length, client));
+                    int payloadLen = reply.getLength();
+                    if (payloadLen <= 0 || header.length + payloadLen > MAX_PACKET) continue;
+                    sendPkt.setData(bytes, 0, header.length + payloadLen);
+                    relay.send(sendPkt);
                 }
             } catch (IOException ended) {
                 // Control close or idle timeout.

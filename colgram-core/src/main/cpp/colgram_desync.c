@@ -30,7 +30,7 @@
 #define MAX_CONNS 2048
 #define DEFAULT_TTL_FALLBACK 64
 #define MIN_LINUX_TCP_MSS 88
-#define MAX_SAFE_FAKE_TTL 5
+#define MAX_SAFE_FAKE_TTL 12
 
 /* Native desync modes — kept strictly synchronized with ColgramNativeDesync.java */
 #define MODE_PLAIN               0
@@ -64,6 +64,61 @@ typedef struct {
 static pthread_mutex_t g_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static ConnSlot g_slots[MAX_CONNS];
 static atomic_uint g_tmp_seq = 1;
+
+typedef struct {
+    uint8_t *ptr;
+    size_t cap;
+} ThreadScratch;
+
+static pthread_key_t g_tls_buf_key;
+static pthread_once_t g_tls_buf_once = PTHREAD_ONCE_INIT;
+static atomic_int g_tls_key_ready = 0;
+
+static void destroy_thread_scratch(void *arg) {
+    ThreadScratch *s = (ThreadScratch *)arg;
+    if (s != NULL) {
+        free(s->ptr);
+        free(s);
+    }
+}
+
+static void init_tls_buf_key(void) {
+    if (pthread_key_create(&g_tls_buf_key, destroy_thread_scratch) == 0) {
+        atomic_store_explicit(&g_tls_key_ready, 1, memory_order_release);
+    }
+}
+
+static uint8_t *acquire_thread_scratch(size_t need, int *out_heap_fallback) {
+    *out_heap_fallback = 0;
+    if (need == 0) need = 1;
+    if (need <= 65536) {
+        pthread_once(&g_tls_buf_once, init_tls_buf_key);
+        if (atomic_load_explicit(&g_tls_key_ready, memory_order_acquire) != 0) {
+            ThreadScratch *s = (ThreadScratch *)pthread_getspecific(g_tls_buf_key);
+            if (s == NULL) {
+                s = (ThreadScratch *)calloc(1, sizeof(ThreadScratch));
+                if (s != NULL && pthread_setspecific(g_tls_buf_key, s) != 0) {
+                    free(s);
+                    s = NULL;
+                }
+            }
+            if (s != NULL) {
+                if (s->cap < need) {
+                    uint8_t *grown = (uint8_t *)realloc(s->ptr, need);
+                    if (grown != NULL) {
+                        s->ptr = grown;
+                        s->cap = need;
+                    }
+                }
+                if (s->cap >= need && s->ptr != NULL) {
+                    return s->ptr;
+                }
+            }
+        }
+    }
+    *out_heap_fallback = 1;
+    return (uint8_t *)malloc(need);
+}
 
 static jlong make_handle(uint32_t slot, uint32_t gen) {
     return (jlong)((((uint64_t)gen) << 16) | ((uint64_t)(slot & 0xFFFFu)));
@@ -190,7 +245,7 @@ static void wait_tx_pushed(DesyncConn *conn, uint32_t min_unacked, int cellular)
         }
         usleep(1000);
     }
-    usleep(cellular ? 18000 : 4000);
+    usleep(cellular ? 10000 : 2500);
 }
 
 static int send_all(DesyncConn *conn, const uint8_t *buf, size_t len, int flags) {
@@ -720,7 +775,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
         }
     }
     int is_cell = cellular ? 1 : 0;
-    int delay_us = is_cell ? 6000 : 2000;
+    int delay_us = is_cell ? 1500 : 500;
     int rc = 0;
 
     if (total <= 2 || mode == MODE_PLAIN) {
@@ -948,7 +1003,8 @@ Java_org_colgram_core_ColgramNativeDesync_nativeRead(JNIEnv *env, jclass clazz,
 
     size_t want = (size_t)len;
     if (want > 65536) want = 65536;
-    uint8_t *tmp = (uint8_t *)malloc(want);
+    int heap_fallback = 0;
+    uint8_t *tmp = acquire_thread_scratch(want, &heap_fallback);
     if (tmp == NULL) {
         conn_release(conn);
         return -3;
@@ -987,7 +1043,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeRead(JNIEnv *env, jclass clazz,
         break;
     }
 
-    free(tmp);
+    if (heap_fallback) free(tmp);
     conn_release(conn);
     return (jint)result;
 }
@@ -1005,14 +1061,15 @@ Java_org_colgram_core_ColgramNativeDesync_nativeWrite(JNIEnv *env, jclass clazz,
     DesyncConn *conn = conn_acquire(handle);
     if (conn == NULL) return -2;
 
-    uint8_t *tmp = (uint8_t *)malloc((size_t)len);
+    int heap_fallback = 0;
+    uint8_t *tmp = acquire_thread_scratch((size_t)len, &heap_fallback);
     if (tmp == NULL) {
         conn_release(conn);
         return -3;
     }
     (*env)->GetByteArrayRegion(env, jBuf, off, len, (jbyte *)tmp);
     int rc = send_all(conn, tmp, (size_t)len, 0);
-    free(tmp);
+    if (heap_fallback) free(tmp);
     conn_release(conn);
     return (jint)rc;
 }

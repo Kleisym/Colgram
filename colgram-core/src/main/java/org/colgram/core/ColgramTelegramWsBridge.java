@@ -774,7 +774,7 @@ public final class ColgramTelegramWsBridge {
                             ns, ColgramNativeDesync.MODE_MSS_SPLIT, 0, true, false, cell, 0);
                 case FRAG_NATIVE_FAKE_TTL8_TLSREC:
                     return ColgramNativeDesync.wrapForFirstTlsHello(
-                            ns, ColgramNativeDesync.MODE_FAKE_TTL, 5, true, false, cell, 3);
+                            ns, ColgramNativeDesync.MODE_FAKE_TTL, 8, true, false, cell, 3);
                 case FRAG_NATIVE_MSS64_OOB1_TLSREC:
                     return ColgramNativeDesync.wrapForFirstTlsHello(
                             ns, ColgramNativeDesync.MODE_MSS_OOB_BYTE1, 0, true, true, cell, 4);
