@@ -1,5 +1,5 @@
 diff --git a/TMessagesProj/build.gradle b/TMessagesProj/build.gradle
-index 85a9f842..cf671c11 100644
+index 85a9f842..1cb46006 100644
 --- a/TMessagesProj/build.gradle
 +++ b/TMessagesProj/build.gradle
 @@ -38,6 +38,11 @@ configurations.all {
@@ -62,7 +62,7 @@ index 85a9f842..cf671c11 100644
  
      buildTypes {
 diff --git a/TMessagesProj/config/debug/AndroidManifest.xml b/TMessagesProj/config/debug/AndroidManifest.xml
-index bd5fe417..412763bd 100644
+index bd5fe417..59e5eef0 100644
 --- a/TMessagesProj/config/debug/AndroidManifest.xml
 +++ b/TMessagesProj/config/debug/AndroidManifest.xml
 @@ -22,7 +22,7 @@
@@ -101,7 +101,7 @@ index bd5fe417..412763bd 100644
  
  </manifest>
 diff --git a/TMessagesProj/config/debug/AndroidManifest_SDK23.xml b/TMessagesProj/config/debug/AndroidManifest_SDK23.xml
-index 6f23df28..7cb58bff 100644
+index 6f23df28..d69e8126 100644
 --- a/TMessagesProj/config/debug/AndroidManifest_SDK23.xml
 +++ b/TMessagesProj/config/debug/AndroidManifest_SDK23.xml
 @@ -29,7 +29,7 @@
@@ -140,7 +140,7 @@ index 6f23df28..7cb58bff 100644
  
  </manifest>
 diff --git a/TMessagesProj/config/release/AndroidManifest.xml b/TMessagesProj/config/release/AndroidManifest.xml
-index 970518a5..412763bd 100644
+index 970518a5..59e5eef0 100644
 --- a/TMessagesProj/config/release/AndroidManifest.xml
 +++ b/TMessagesProj/config/release/AndroidManifest.xml
 @@ -22,7 +22,7 @@
@@ -179,7 +179,7 @@ index 970518a5..412763bd 100644
  
  </manifest>
 diff --git a/TMessagesProj/config/release/AndroidManifest_SDK23.xml b/TMessagesProj/config/release/AndroidManifest_SDK23.xml
-index 4e250e0a..b0664f28 100644
+index 4e250e0a..bb05c632 100644
 --- a/TMessagesProj/config/release/AndroidManifest_SDK23.xml
 +++ b/TMessagesProj/config/release/AndroidManifest_SDK23.xml
 @@ -30,7 +30,7 @@
@@ -218,7 +218,7 @@ index 4e250e0a..b0664f28 100644
  
  </manifest>
 diff --git a/TMessagesProj/config/release/AndroidManifest_standalone.xml b/TMessagesProj/config/release/AndroidManifest_standalone.xml
-index 53e0fa79..8f4a1792 100644
+index 53e0fa79..aad6542a 100644
 --- a/TMessagesProj/config/release/AndroidManifest_standalone.xml
 +++ b/TMessagesProj/config/release/AndroidManifest_standalone.xml
 @@ -36,7 +36,7 @@
@@ -263,7 +263,7 @@ index 53e0fa79..8f4a1792 100644
  
  </manifest>
 diff --git a/TMessagesProj/src/main/AndroidManifest.xml b/TMessagesProj/src/main/AndroidManifest.xml
-index 6f6d377d..93416645 100644
+index 6f6d377d..bf3b0342 100644
 --- a/TMessagesProj/src/main/AndroidManifest.xml
 +++ b/TMessagesProj/src/main/AndroidManifest.xml
 @@ -22,6 +22,8 @@
@@ -456,7 +456,7 @@ index 6f6d377d..93416645 100644
  
  </manifest>
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java b/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java
-index 083d15ee..016e2501 100644
+index 083d15ee..ac84f93b 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java
 @@ -4736,16 +4736,12 @@ public class AndroidUtilities {
@@ -786,7 +786,7 @@ index f63e6a8d..79feda3b 100644
                  } else {
                      maxCacheSize = maxCacheGb * 1024L * 1024L * 1000L;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java b/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
-index 4ed7e649..11901a81 100644
+index 4ed7e649..6f039686 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
 @@ -26,11 +26,11 @@ public class BuildVars {
@@ -1103,7 +1103,7 @@ index 4d0dac30..a5723756 100644
                  FileLog.d("debug_loading: delete existing file cause file size mismatch " + cacheFileFinal.getName() + " totalSize=" + totalBytesCount + " existingFileSize=" + cacheFileFinal.length());
              }
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
-index 87465e90..7d32612d 100644
+index 87465e90..b963b1d3 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java
 @@ -258,10 +258,14 @@ public class FileLoader extends BaseController {
@@ -1347,7 +1347,7 @@ index b220465b..31788e78 100644
      }
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FlagSecureReason.java b/TMessagesProj/src/main/java/org/telegram/messenger/FlagSecureReason.java
-index 9b56bbf2..c9428e1d 100644
+index 9b56bbf2..aa50078f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/FlagSecureReason.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/FlagSecureReason.java
 @@ -74,6 +74,7 @@ public class FlagSecureReason {
@@ -1536,7 +1536,7 @@ index 0a607423..c85c4814 100644
                  setImage(videoLocation, "avatar", location, filter, null, null, strippedBitmap, 0, null, parentObject, 0);
                  animatedFileDrawableRepeatMaxCount = 3;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java b/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java
-index 6c37252d..ffc0186d 100644
+index 6c37252d..678c591a 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/LiteMode.java
 @@ -108,7 +108,11 @@ public class LiteMode {
@@ -2335,7 +2335,7 @@ index 905b514d..9cc31721 100644
                  media instanceof TLRPC.TL_messageMediaPhoto ||
                  media instanceof TLRPC.TL_messageMediaDocument && !isStickerMessage(message) && !isAnimatedStickerMessage(message) ||
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
-index 7a0b35b1..db21adf7 100644
+index 7a0b35b1..03042aca 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 @@ -402,6 +402,49 @@ public class MessagesController extends BaseController implements NotificationCe
@@ -4052,7 +4052,7 @@ index 7a0b35b1..db21adf7 100644
          }
      }
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
-index 98e066ea..f0c652b2 100644
+index 98e066ea..bd1e1967 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
 @@ -286,9 +286,9 @@ public class MessagesStorage extends BaseController {
@@ -4482,7 +4482,7 @@ index 78e5a2de..1d8ab633 100644
      public static StringBuilder log = new StringBuilder();
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/NotificationsController.java b/TMessagesProj/src/main/java/org/telegram/messenger/NotificationsController.java
-index d6901d26..d776ff1a 100644
+index d6901d26..3d03f043 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/NotificationsController.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/NotificationsController.java
 @@ -1071,6 +1071,16 @@ public class NotificationsController extends BaseController implements Notificat
@@ -4503,7 +4503,7 @@ index d6901d26..d776ff1a 100644
                          messageObject.messageOwner.action instanceof TLRPC.TL_messageActionSetMessagesTTL ||
                          messageObject.messageOwner.silent && (messageObject.messageOwner.action instanceof TLRPC.TL_messageActionContactSignUp || messageObject.messageOwner.action instanceof TLRPC.TL_messageActionUserJoined)) ||
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/PushListenerController.java b/TMessagesProj/src/main/java/org/telegram/messenger/PushListenerController.java
-index 5b6422ad..ecd010de 100644
+index 5b6422ad..086040d5 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/PushListenerController.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/PushListenerController.java
 @@ -1694,7 +1694,21 @@ public class PushListenerController {
@@ -4641,7 +4641,7 @@ index a8a2558c..95fab60d 100644
                      return null;
                  } else if (serviceMessage.action instanceof TLRPC.TL_decryptedMessageActionReadMessages) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
-index 4a6661d1..7bed60b6 100644
+index 4a6661d1..f57bb1cd 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
 @@ -1773,10 +1773,98 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
@@ -5304,7 +5304,7 @@ index 98c56d06..66aeaba3 100755
      canvas.setBitmap(null);
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java b/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
-index 0f79e448..6a314856 100644
+index 0f79e448..daae4f86 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
 @@ -24,8 +24,8 @@ import java.util.Arrays;
@@ -5375,7 +5375,7 @@ index 0f79e448..6a314856 100644
          if (user == null) {
              return false;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/browser/Browser.java b/TMessagesProj/src/main/java/org/telegram/messenger/browser/Browser.java
-index ebc0553f..e488c84a 100644
+index ebc0553f..24c86663 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/browser/Browser.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/browser/Browser.java
 @@ -368,6 +368,10 @@ public class Browser {
@@ -6017,7 +6017,7 @@ index 3456752d..30c96b2f 100644
                  NotificationCenter.getGlobalInstance()
                      .postNotificationName(NotificationCenter.tlSchemeParseException, tlParseException);
 diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java b/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java
-index 75534ac7..218bd147 100644
+index 75534ac7..34247fa3 100644
 --- a/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java
 +++ b/TMessagesProj/src/main/java/org/telegram/tgnet/TLRPC.java
 @@ -50520,6 +50520,27 @@ public class TLRPC {
@@ -6049,7 +6049,7 @@ index 75534ac7..218bd147 100644
          public static final int constructor = 0xb7e085fe;
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/tl/TL_bots.java b/TMessagesProj/src/main/java/org/telegram/tgnet/tl/TL_bots.java
-index 1043426a..10eb5620 100644
+index 1043426a..24e8c618 100644
 --- a/TMessagesProj/src/main/java/org/telegram/tgnet/tl/TL_bots.java
 +++ b/TMessagesProj/src/main/java/org/telegram/tgnet/tl/TL_bots.java
 @@ -297,6 +297,8 @@ public class TL_bots {
@@ -6115,7 +6115,7 @@ index fbd906e4..5bfc198d 100644
                      @Override
                      public void onAnimationStart(Animator animation) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/BaseFragment.java b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/BaseFragment.java
-index dc4244bc..1638386d 100644
+index dc4244bc..35284f83 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/BaseFragment.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/BaseFragment.java
 @@ -619,6 +619,14 @@ public abstract class BaseFragment {
@@ -6183,7 +6183,7 @@ index 9b9d066f..4729d2de 100644
          getPreviewColors(0, 0);
          getPreviewColors(0, 1);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
-index 3638979f..1fde1639 100644
+index 3638979f..8abb3db1 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
 @@ -157,6 +157,10 @@ public class Theme {
@@ -7953,7 +7953,7 @@ index cd393c4d..d4a8fc88 100644
      }
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java
-index 6e17b577..d2f22a36 100644
+index 6e17b577..3eaabfe6 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java
 @@ -89,6 +89,11 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
@@ -8210,7 +8210,7 @@ index 3b3f7110..2ebfb68b 100644
  
          final TL_keyboard.TL_inlineButtonTypeUrl buttonTypeUrl = TLKeyboardHelper.getType(button, TL_keyboard.TL_inlineButtonTypeUrl.class);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
-index 006e5ddc..b118a9f5 100644
+index 006e5ddc..01674b39 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
 @@ -1832,6 +1832,77 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
@@ -8769,7 +8769,7 @@ index 790e4493..21b4a37c 100644
          if (!getIsPinned() && reordering || drawReorder == reordering) {
              if (!getIsPinned()) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogsEmptyCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogsEmptyCell.java
-index 92c73af2..d5a58c83 100644
+index 92c73af2..25f73cbe 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogsEmptyCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogsEmptyCell.java
 @@ -157,6 +157,15 @@ public class DialogsEmptyCell extends LinearLayout {
@@ -8837,7 +8837,7 @@ index af32ccff..a04ac36a 100644
          } else if (contact != null) {
              avatarDrawable.setInfo(0, contact.first_name, contact.last_name);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/SessionCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/SessionCell.java
-index 5b14ce08..0175b0c4 100644
+index 5b14ce08..163534bb 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/SessionCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/SessionCell.java
 @@ -207,6 +207,10 @@ public class SessionCell extends FrameLayout {
@@ -9066,7 +9066,7 @@ index 71233cd9..d1dbb325 100644
              if (LocaleController.isRTL) {
                  params.rightMargin = AndroidUtilities.dp(58);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/WallpaperCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/WallpaperCell.java
-index a4f9d6ce..4a14ae51 100644
+index a4f9d6ce..83884ddc 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/WallpaperCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/WallpaperCell.java
 @@ -182,7 +182,7 @@ public class WallpaperCell extends FrameLayout {
@@ -9079,7 +9079,7 @@ index a4f9d6ce..4a14ae51 100644
                          imageView.setImageBitmap(wallPaper.defaultCache);
                          imageView.getImageReceiver().setAlpha(Math.abs(wallPaper.intensity));
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChangeBioActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChangeBioActivity.java
-index 48188d52..659460c0 100644
+index 48188d52..8b4066ca 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChangeBioActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChangeBioActivity.java
 @@ -196,7 +196,24 @@ public class ChangeBioActivity extends BaseFragment {
@@ -9109,7 +9109,7 @@ index 48188d52..659460c0 100644
          }
          String currentName = userFull.about;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChangeNameActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChangeNameActivity.java
-index 1ba26f5c..c1702784 100644
+index 1ba26f5c..519bb83e 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChangeNameActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChangeNameActivity.java
 @@ -178,6 +178,11 @@ public class ChangeNameActivity extends BaseFragment {
@@ -9125,7 +9125,7 @@ index 1ba26f5c..c1702784 100644
          req.flags = 3;
          currentUser.first_name = req.first_name = newFirst;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChangeUsernameActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChangeUsernameActivity.java
-index 4b426706..35eec630 100644
+index 4b426706..b2b4e6c9 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChangeUsernameActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChangeUsernameActivity.java
 @@ -1382,6 +1382,12 @@ public class ChangeUsernameActivity extends BaseFragment {
@@ -9142,7 +9142,7 @@ index 4b426706..35eec630 100644
          req.username = username;
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-index fcd1abc9..44ee9ea2 100644
+index fcd1abc9..8e9fab2b 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 @@ -489,6 +489,10 @@ public class ChatActivity extends BaseFragment implements
@@ -10762,7 +10762,7 @@ index fcd1abc9..44ee9ea2 100644
  
      private void checkUi_chatListViewVisible() {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java
-index 181e0eba..05aae7b8 100644
+index 181e0eba..9816ea7a 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java
 @@ -286,7 +286,7 @@ public class AlertsCreator {
@@ -11014,7 +11014,7 @@ index 03153508..e398970a 100644
          } else {
              paint.setColor(ThemeColors.TELEGRAM_COLOR);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/BulletinFactory.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/BulletinFactory.java
-index 42c3cd50..b4be045e 100644
+index 42c3cd50..2538ba59 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/BulletinFactory.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/BulletinFactory.java
 @@ -89,7 +89,7 @@ public final class BulletinFactory {
@@ -11270,7 +11270,7 @@ index a8f99730..abc3a905 100644
                  drawableColor = color;
                  drawable.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN));
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java
-index 28534c59..c6d95dac 100644
+index 28534c59..3ab02af2 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java
 @@ -625,6 +625,13 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
@@ -12992,7 +12992,7 @@ index 9d7ace88..ad4a849c 100644
                          views.get(j).setVisibility(View.GONE);
                          if (views.get(j) instanceof ChatMessageCell) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/ThemeSmallPreviewView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/ThemeSmallPreviewView.java
-index 85a43625..ba785dd6 100644
+index 85a43625..fda48823 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/ThemeSmallPreviewView.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/ThemeSmallPreviewView.java
 @@ -235,15 +235,22 @@ public class ThemeSmallPreviewView extends FrameLayout implements NotificationCe
@@ -13261,7 +13261,7 @@ index 1c4f424a..d6852b1e 100644
 +	}
  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ContactsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ContactsActivity.java
-index 4411ecda..ac5ab716 100644
+index 4411ecda..2f0ed237 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ContactsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ContactsActivity.java
 @@ -1282,6 +1282,7 @@ public class ContactsActivity extends BaseFragment implements FactorAnimator.Tar
@@ -13273,7 +13273,7 @@ index 4411ecda..ac5ab716 100644
          if (activity == null || !UserConfig.getInstance(currentAccount).syncContacts || activity.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED/* && activity.checkSelfPermission(Manifest.permission.WRITE_CONTACTS) == PackageManager.PERMISSION_GRANTED*/) {
              return;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java
-index 910de86e..3f5ba3d5 100644
+index 910de86e..d512229c 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java
 @@ -82,6 +82,8 @@ public class DataSettingsActivity extends BaseFragment {
@@ -13371,7 +13371,7 @@ index 910de86e..3f5ba3d5 100644
              } else if (position == mediaDownloadSectionRow || position == streamSectionRow || position == callsSectionRow || position == usageSectionRow || position == proxySectionRow || position == autoplayHeaderRow || position == saveToGallerySectionRow) {
                  return 2;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
-index 095448f3..adb4da01 100644
+index 095448f3..ff2d3cd7 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
 @@ -508,6 +508,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
@@ -14195,7 +14195,7 @@ index 4000f5b4..a5294c9a 100644
                      AndroidUtilities.logFlagSecure();
                  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/IntroActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/IntroActivity.java
-index b3cd7c50..ca2ecad3 100644
+index b3cd7c50..8f02627f 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/IntroActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/IntroActivity.java
 @@ -19,31 +19,17 @@ import android.content.Context;
@@ -15744,7 +15744,7 @@ index dc29adcd..06fca4b0 100644
              boolean instant = false;
              if (args[2] != null) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java
-index a3916cca..e8d0b166 100644
+index a3916cca..d5257016 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java
 @@ -330,8 +330,8 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
@@ -16517,7 +16517,7 @@ index 67bb2aa9..02506b60 100644
          return themeDescriptions;
      }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java
-index d21d71c3..bfa3db16 100644
+index d21d71c3..6d436895 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java
 @@ -102,6 +102,7 @@ public class NotificationsSettingsActivity extends BaseFragment implements Notif
@@ -16737,7 +16737,7 @@ index bf5ce097..ae67e121 100644
                  windowLayoutParams.flags |= WindowManager.LayoutParams.FLAG_SECURE;
                  AndroidUtilities.logFlagSecure();
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java
-index 1220c6f2..cdc072b7 100644
+index 1220c6f2..d684619b 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java
 @@ -721,6 +721,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
@@ -17008,7 +17008,7 @@ index 1220c6f2..cdc072b7 100644
                  return VIEW_TYPE_TEXT;
              } else if (position == notificationsDividerRow) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
-index d222504b..a16bc574 100644
+index d222504b..59e014c4 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
 @@ -72,9 +72,12 @@ import org.telegram.ui.Components.SlideChooseView;
@@ -18059,7 +18059,7 @@ index d222504b..a16bc574 100644
          return themeDescriptions;
      }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
-index 08f074f7..529614a3 100644
+index 08f074f7..315fa48d 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
 @@ -221,25 +221,20 @@ public class ProxySettingsActivity extends BaseFragment {
@@ -18338,7 +18338,7 @@ index c43df675..18d23247 100644
                  cell.makeVisibleAfterChange = true;
  //                AndroidUtilities.runOnUIThread(() -> {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/SessionBottomSheet.java b/TMessagesProj/src/main/java/org/telegram/ui/SessionBottomSheet.java
-index 7fade708..2588696d 100644
+index 7fade708..f9c791fd 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/SessionBottomSheet.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/SessionBottomSheet.java
 @@ -89,6 +89,10 @@ public class SessionBottomSheet extends BottomSheet {
@@ -18353,7 +18353,7 @@ index 7fade708..2588696d 100644
          StringBuilder stringBuilder = new StringBuilder();
          if (session.device_model.length() != 0) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
-index b7791265..58c58d3c 100644
+index b7791265..64d9e978 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
 @@ -349,6 +349,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
@@ -18591,7 +18591,7 @@ index 8ce1270e..c5a83f4a 100644
                      AndroidUtilities.logFlagSecure();
                  } else {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java
-index ef0c2648..9cf417a5 100644
+index ef0c2648..db6c5ae9 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java
 @@ -2705,55 +2705,47 @@ public class ThemePreviewActivity extends BaseFragment implements DownloadContro
@@ -18714,7 +18714,7 @@ index ef0c2648..9cf417a5 100644
              } else if (currentWallpaper instanceof WallpapersListActivity.FileWallpaper) {
                  if (currentWallpaperBitmap != null) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/UserInfoActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/UserInfoActivity.java
-index 42e770a6..5180280f 100644
+index 42e770a6..a8d826f0 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/UserInfoActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/UserInfoActivity.java
 @@ -43,6 +43,7 @@ import org.telegram.tgnet.ConnectionsManager;
@@ -19029,7 +19029,7 @@ index 0eab55e2..8026aabe 100644
              } else if (position == sectionRow || position == resetSectionRow) {
                  return 1;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/WebviewActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/WebviewActivity.java
-index adbf3aa5..d362352c 100644
+index adbf3aa5..5d6c268d 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/WebviewActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/WebviewActivity.java
 @@ -233,6 +233,7 @@ public class WebviewActivity extends BaseFragment {
@@ -19115,7 +19115,7 @@ index f9996f32..3995f4f6 100644
              try {
                  obj.put("available", false);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/bots/BotWebViewSheet.java b/TMessagesProj/src/main/java/org/telegram/ui/bots/BotWebViewSheet.java
-index 32305410..e4de8ce9 100644
+index 32305410..157d124d 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/bots/BotWebViewSheet.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/bots/BotWebViewSheet.java
 @@ -227,6 +227,7 @@ public class BotWebViewSheet extends Dialog implements NotificationCenter.Notifi
@@ -19566,3 +19566,320 @@ index 7bd03c94..35a657bc 100644
          final WebSettings settings = webView.getSettings();
          settings.setAllowContentAccess(false);
          settings.setDatabaseEnabled(false);
+diff --git a/TMessagesProj/src/main/res/drawable/icon_background.xml b/TMessagesProj/src/main/res/drawable/icon_background.xml
+index a2d43618..91c5fe14 100644
+--- a/TMessagesProj/src/main/res/drawable/icon_background.xml
++++ b/TMessagesProj/src/main/res/drawable/icon_background.xml
+@@ -1,5 +1,4 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+-    <item android:drawable="@drawable/icon_background_sa" />
+-    <item android:drawable="@mipmap/icon_background_clip" />
+-</layer-list>
+\ No newline at end of file
++<shape xmlns:android="http://schemas.android.com/apk/res/android">
++    <solid android:color="#000000" />
++</shape>
+diff --git a/TMessagesProj/src/main/res/drawable/icon_background_sa.xml b/TMessagesProj/src/main/res/drawable/icon_background_sa.xml
+index d3a1ae4c..91c5fe14 100644
+--- a/TMessagesProj/src/main/res/drawable/icon_background_sa.xml
++++ b/TMessagesProj/src/main/res/drawable/icon_background_sa.xml
+@@ -1,8 +1,4 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <shape xmlns:android="http://schemas.android.com/apk/res/android">
+-    <gradient
+-        android:type="linear"
+-        android:angle="90"
+-        android:startColor="#289AD1"
+-        android:endColor="#38AEEB" />
++    <solid android:color="#000000" />
+ </shape>
+diff --git a/TMessagesProj/src/main/res/drawable/icon_plane.xml b/TMessagesProj/src/main/res/drawable/icon_plane.xml
+index 8afd524e..5109d389 100644
+--- a/TMessagesProj/src/main/res/drawable/icon_plane.xml
++++ b/TMessagesProj/src/main/res/drawable/icon_plane.xml
+@@ -4,9 +4,7 @@
+     android:viewportWidth="90"
+     android:viewportHeight="90">
+   <path
+-      android:pathData="M30.3652 44.5699C38.1874 41.1615 43.4013 38.9115 46.0124 37.8254C53.4624 34.7226 55.0096 34.1838 56.0179 34.1671C56.2402 34.1643 56.7374 34.2171 57.0596 34.4782C57.329 34.7004 57.404 34.9976 57.4402 35.206C57.4763 35.4143 57.5207 35.8921 57.4846 36.2643C57.0818 40.5088 55.3346 50.8143 54.4457 55.5699C54.0707 57.581 53.329 58.256 52.6124 58.3227C51.054 58.4643 49.8707 57.2921 48.3624 56.3004C46.0013 54.7532 44.6679 53.7865 42.3763 52.2754C39.7263 50.5282 41.4429 49.5699 42.954 48.0004C43.3485 47.5893 50.2124 41.3393 50.3457 40.7726C50.3624 40.7004 50.3763 40.4365 50.2207 40.2977C50.0624 40.1588 49.8318 40.206 49.6652 40.2449C49.429 40.2977 45.6568 42.7921 38.3485 47.731C37.279 48.4671 36.3068 48.8254 35.4402 48.806C34.4818 48.7865 32.6374 48.2643 31.2679 47.8171C29.5874 47.2726 28.5013 46.9893 28.6179 46.0615C28.679 45.5782 29.2624 45.081 30.3652 44.5699Z"
+-      android:strokeWidth="1"
++      android:pathData="M45,22C32.3,22 22,32.3 22,45C22,57.7 32.3,68 45,68C52.6,68 59.3,64.3 63.5,58.6L55.8,53.0C53.3,56.5 49.4,58.6 45,58.6C37.5,58.6 31.4,52.5 31.4,45C31.4,37.5 37.5,31.4 45,31.4C49.4,31.4 53.3,33.5 55.8,37.0L63.5,31.4C59.3,25.7 52.6,22 45,22ZM57.5,40.5A4.5,4.5 0 1,0 57.5,49.5A4.5,4.5 0 1,0 57.5,40.5Z"
+       android:fillColor="#FFFFFF"
+-      android:fillType="evenOdd"
+-      android:strokeColor="#00000000"/>
++      android:fillType="evenOdd"/>
+ </vector>
+diff --git a/TMessagesProj/src/main/res/raw/qr_logo.svg b/TMessagesProj/src/main/res/raw/qr_logo.svg
+index 838dc03d..d14a2b47 100644
+--- a/TMessagesProj/src/main/res/raw/qr_logo.svg
++++ b/TMessagesProj/src/main/res/raw/qr_logo.svg
+@@ -1 +1 @@
+-<?xml version="1.0" encoding="UTF-8"?><svg width="150px" height="150px" viewBox="0 0 150 150" version="1.1" xmlns="http://www.w3.org/2000/svg"><circle id="Oval" fill="#50A7EA" cx="75" cy="75" r="75" /><path d="M34.5683277,73.8430636 C56.3115551,64.3878175 70.8104456,58.1543406 78.0649991,55.1426329 C98.7782235,46.5435952 103.082254,45.0498502 105.887561,45 C106.504562,44.9896775 107.884131,45.1422996 108.777757,45.8660431 C109.532318,46.4771579 109.739928,47.3026872 109.839276,47.8820912 C109.938624,48.4614952 110.062336,49.7813922 109.963994,50.8127214 C108.841537,62.584148 103.984684,91.1502959 101.513793,104.334495 C100.468266,109.913224 98.4095915,111.783744 96.4165562,111.966799 C92.0852292,112.36462 88.796216,109.109774 84.6011139,106.365037 C78.0366073,102.070066 74.3280787,99.3964336 67.9560884,95.2053353 C60.592151,90.3617961 65.3658852,87.6997027 69.5625716,83.3490972 C70.6608644,82.210523 89.7447909,64.8850757 90.1141609,63.3133861 C90.1603568,63.1168201 90.2032288,62.3841149 89.7671159,61.9972197 C89.331003,61.6103245 88.687338,61.7426276 88.2228513,61.8478494 C87.5644556,61.9969982 77.0775713,68.9153185 56.7621985,82.6028104 C53.7855313,84.6429505 51.0893586,85.6369753 48.6736804,85.5848846 C46.010589,85.5274589 40.8878694,84.0819826 37.079654,82.8464252 C32.4087227,81.3309638 28.6963596,80.5297284 29.019623,77.956006 C29.1879986,76.6154522 31.0375668,75.2444714 34.5683277,73.8430636 Z" id="Path-3" fill="#FFFFFF" /></svg>
+\ No newline at end of file
++<?xml version="1.0" encoding="UTF-8"?><svg width="150px" height="150px" viewBox="0 0 150 150" version="1.1" xmlns="http://www.w3.org/2000/svg"><circle id="Oval" fill="#000000" cx="75" cy="75" r="75" /><path d="M34.5683277,73.8430636 C56.3115551,64.3878175 70.8104456,58.1543406 78.0649991,55.1426329 C98.7782235,46.5435952 103.082254,45.0498502 105.887561,45 C106.504562,44.9896775 107.884131,45.1422996 108.777757,45.8660431 C109.532318,46.4771579 109.739928,47.3026872 109.839276,47.8820912 C109.938624,48.4614952 110.062336,49.7813922 109.963994,50.8127214 C108.841537,62.584148 103.984684,91.1502959 101.513793,104.334495 C100.468266,109.913224 98.4095915,111.783744 96.4165562,111.966799 C92.0852292,112.36462 88.796216,109.109774 84.6011139,106.365037 C78.0366073,102.070066 74.3280787,99.3964336 67.9560884,95.2053353 C60.592151,90.3617961 65.3658852,87.6997027 69.5625716,83.3490972 C70.6608644,82.210523 89.7447909,64.8850757 90.1141609,63.3133861 C90.1603568,63.1168201 90.2032288,62.3841149 89.7671159,61.9972197 C89.331003,61.6103245 88.687338,61.7426276 88.2228513,61.8478494 C87.5644556,61.9969982 77.0775713,68.9153185 56.7621985,82.6028104 C53.7855313,84.6429505 51.0893586,85.6369753 48.6736804,85.5848846 C46.010589,85.5274589 40.8878694,84.0819826 37.079654,82.8464252 C32.4087227,81.3309638 28.6963596,80.5297284 29.019623,77.956006 C29.1879986,76.6154522 31.0375668,75.2444714 34.5683277,73.8430636 Z" id="Path-3" fill="#FFFFFF" /></svg>
+\ No newline at end of file
+diff --git a/TMessagesProj/src/main/res/values-night/styles.xml b/TMessagesProj/src/main/res/values-night/styles.xml
+index e5a85d92..f0d1665a 100644
+--- a/TMessagesProj/src/main/res/values-night/styles.xml
++++ b/TMessagesProj/src/main/res/values-night/styles.xml
+@@ -22,9 +22,9 @@
+         <item name="android:colorPrimary">#232d3a</item>
+         <item name="android:navigationBarColor">#000000</item>
+         <item name="android:forceDarkAllowed">false</item>
+-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>
++        <item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_startup_avatar</item>
+         <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>
+-        <item name="android:windowSplashScreenBackground">#1f2732</item>
++        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+     </style>
+ 
+     <style name="ActionBar.Transparent.TMessages.Start" parent="android:style/Widget.Material.Light.ActionBar">
+diff --git a/TMessagesProj/src/main/res/values-ru/strings.xml b/TMessagesProj/src/main/res/values-ru/strings.xml
+index 24c56292..2ae66719 100644
+--- a/TMessagesProj/src/main/res/values-ru/strings.xml
++++ b/TMessagesProj/src/main/res/values-ru/strings.xml
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="AppName">Telegram</string>
+-    <string name="AppNameBeta">Telegram Beta</string>
++    <string name="AppName">Colgram</string>
++    <string name="AppNameBeta">Colgram Beta</string>
+     <string name="LanguageName">Русский</string>
+     <string name="English">Английский</string>
+     <string name="LanguageNameInEnglish">Russian</string>
+@@ -209,18 +209,18 @@
+     <string name="CheckYourNewEmailSubtitle">Введите код, который пришёл на указанный Вами адрес %1$s.</string>
+     <string name="LoginOrSingInWithGoogle">или</string>
+     <!--Intro view-->
+-    <string name="Page1Title">Telegram</string>
++    <string name="Page1Title">Colgram</string>
+     <string name="Page2Title">Быстрый</string>
+     <string name="Page3Title">Бесплатный</string>
+     <string name="Page4Title">Безопасный</string>
+     <string name="Page5Title">Мощный</string>
+     <string name="Page6Title">Облачный</string>
+     <string name="Page1Message">Самый **быстрый** мессенджер в мире.\n**Бесплатный** и **безопасный**.</string>
+-    <string name="Page2Message">**Telegram** доставляет сообщения быстрее\nлюбого другого приложения.</string>
+-    <string name="Page3Message">**Telegram** предоставляет бесплатное безлимитное облачное хранилище для чатов и медиа.\n</string>
+-    <string name="Page4Message">**Telegram** защищает Вашу переписку от злоумышленников.</string>
+-    <string name="Page5Message">**Telegram** не ограничивает размер\n Ваших медиафайлов и чатов.</string>
+-    <string name="Page6Message">В **Telegram** можно переписываться с любого количества устройств.</string>
++    <string name="Page2Message">**Colgram** доставляет сообщения быстрее\nлюбого другого приложения.</string>
++    <string name="Page3Message">**Colgram** предоставляет бесплатное безлимитное облачное хранилище для чатов и медиа.\n</string>
++    <string name="Page4Message">**Colgram** защищает Вашу переписку от злоумышленников.</string>
++    <string name="Page5Message">**Colgram** не ограничивает размер\n Ваших медиафайлов и чатов.</string>
++    <string name="Page6Message">В **Colgram** можно переписываться с любого количества устройств.</string>
+     <string name="StartMessaging">Начать общение</string>
+     <!--date formatters-->
+     <string name="formatterBoostExpired">dd MMM yyyy</string>
+diff --git a/TMessagesProj/src/main/res/values-v31/styles.xml b/TMessagesProj/src/main/res/values-v31/styles.xml
+index acec6de2..134822a8 100644
+--- a/TMessagesProj/src/main/res/values-v31/styles.xml
++++ b/TMessagesProj/src/main/res/values-v31/styles.xml
+@@ -28,9 +28,9 @@
+         <item name="android:navigationBarColor">#000000</item>
+         <item name="android:textViewStyle">@style/MyTextViewStyle</item>
+         <item name="android:forceDarkAllowed">false</item>
+-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/tg_splash_320</item>
++        <item name="android:windowSplashScreenAnimatedIcon">@drawable/colgram_startup_avatar</item>
+         <item name="android:windowSplashScreenAnimationDuration">@integer/splash_screen_duration</item>
+-        <item name="android:windowSplashScreenBackground">?android:windowBackground</item>
++        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+     </style>
+ 
+     <style name="Theme.TMessages" parent="Theme.AppCompat.Light">
+diff --git a/TMessagesProj/src/main/res/values/ids.xml b/TMessagesProj/src/main/res/values/ids.xml
+index cc49d135..2834a956 100644
+--- a/TMessagesProj/src/main/res/values/ids.xml
++++ b/TMessagesProj/src/main/res/values/ids.xml
+@@ -44,6 +44,11 @@
+     <item name="menu_privacy" type="id"/>
+     <item name="menu_add_to_home_screen_bot" type="id"/>
+     <item name="menu_collapse_bot" type="id"/>
++    <item name="colgram_menu_pin_miniapp" type="id"/>
++    <item name="colgram_menu_text_regex" type="id"/>
++    <item name="colgram_menu_text_case" type="id"/>
++    <item name="colgram_menu_text_layout" type="id"/>
++    <item name="colgram_menu_text_clean" type="id"/>
+     <item name="menu_share_bot" type="id"/>
+ 
+     <!-- there are required for focusing order customization on the passcode screen -->
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index 1013bb6d..643a2562 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="AppName">Telegram</string>
+-    <string name="AppNameBeta">Telegram Beta</string>
++    <string name="AppName">Colgram</string>
++    <string name="AppNameBeta">Colgram Beta</string>
+     <string name="LanguageName">English</string>
+     <string name="English">English</string>
+     <string name="LanguageNameInEnglish">English</string>
+@@ -4199,18 +4199,18 @@
+     <string name="ViewMessageStatistic">Message Statistic</string>
+     <string name="ViewMessage">Open Message</string>
+     <!--Intro view-->
+-    <string name="Page1Title">Telegram</string>
++    <string name="Page1Title">Colgram</string>
+     <string name="Page2Title">Fast</string>
+     <string name="Page3Title">Free</string>
+     <string name="Page4Title">Secure</string>
+     <string name="Page5Title">Powerful</string>
+     <string name="Page6Title">Cloud-Based</string>
+     <string name="Page1Message">The world\'s **fastest** messaging app.\nIt is **free** and **secure**.</string>
+-    <string name="Page2Message">**Telegram** delivers messages faster than\nany other application.</string>
+-    <string name="Page3Message">**Telegram** provides free unlimited cloud storage for chats and media.</string>
+-    <string name="Page4Message">**Telegram** keeps your messages safe\nfrom hacker attacks.</string>
+-    <string name="Page5Message">**Telegram** has no limits on\nthe size of your media and chats.</string>
+-    <string name="Page6Message">**Telegram** lets you access your messages\nfrom multiple devices.</string>
++    <string name="Page2Message">**Colgram** delivers messages faster than\nany other application.</string>
++    <string name="Page3Message">**Colgram** provides free unlimited cloud storage for chats and media.</string>
++    <string name="Page4Message">**Colgram** keeps your messages safe\nfrom hacker attacks.</string>
++    <string name="Page5Message">**Colgram** has no limits on\nthe size of your media and chats.</string>
++    <string name="Page6Message">**Colgram** lets you access your messages\nfrom multiple devices.</string>
+     <string name="StartMessaging">Start Messaging</string>
+     <!-- VoIP -->
+     <string name="AccountSettings">Account Settings</string>
+@@ -11235,4 +11235,7 @@
+     <string name="RoundVideoComposition">Composition</string>
+     <string name="RoundVideoCompositionEnabled">Round video styling</string>
+     <string name="RoundVideoCompositionInfo">Disable styling to record a plain square without outside-circle blur, dimming or Telegram overlays.</string>
++
++    <!-- Colgram: label on a message retained by the anti-delete vault. -->
++    <string name="ColgramDeletedMessage">Deleted</string>
+ </resources>
+diff --git a/TMessagesProj/src/main/res/xml/provider_paths.xml b/TMessagesProj/src/main/res/xml/provider_paths.xml
+index 4bb92699..cb51a64a 100644
+--- a/TMessagesProj/src/main/res/xml/provider_paths.xml
++++ b/TMessagesProj/src/main/res/xml/provider_paths.xml
+@@ -1,7 +1,9 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <paths>
+     <external-path name="media" path="."/>
++    <files-path name="colgram_files" path="."/>
+     <files-path name="logs" path="/logs/"/>
+     <files-path name="cache" path="/cache/"/>
+     <root-path name="external_files" path="/storage/" />
++    <files-path name="media_history" path="/media_history/"/>
+ </paths>
+\ No newline at end of file
+diff --git a/TMessagesProj_AppStandalone/build.gradle b/TMessagesProj_AppStandalone/build.gradle
+index d463225a..f23b1457 100644
+--- a/TMessagesProj_AppStandalone/build.gradle
++++ b/TMessagesProj_AppStandalone/build.gradle
+@@ -1,4 +1,5 @@
+ apply plugin: 'com.android.application'
++apply plugin: 'com.chaquo.python'
+ apply plugin: 'org.telegram.build-app-plugin'
+ 
+ repositories {
+@@ -15,6 +16,13 @@ configurations.all {
+     exclude group: 'androidx.recyclerview', module: 'recyclerview'
+ }
+ 
++
++chaquopy {
++    defaultConfig {
++        version = "3.11"
++    }
++}
++
+ dependencies {
+     implementation project(':TMessagesProj')
+     implementation 'androidx.fragment:fragment:1.8.9'
+@@ -24,10 +32,16 @@ dependencies {
+ }
+ 
+ android {
++    packagingOptions {
++        jniLibs {
++            pickFirsts += ['**/*.so']
++        }
++    }
++
+     compileSdkVersion 36
+     buildToolsVersion '36.0.0'
+ 
+-    defaultConfig.applicationId = APP_PACKAGE
++    defaultConfig.applicationId = "org.colgram.messenger"
+ 
+     sourceSets.main.jniLibs.srcDirs = ['../TMessagesProj/jni/']
+ 
+@@ -45,7 +59,7 @@ android {
+     }
+ 
+     androidResources {
+-        noCompress += "pack"
++        noCompress += ["pack", "gguf", "onnx"]
+         localeFilters += ["zz"]
+     }
+ 
+@@ -130,7 +144,7 @@ android {
+     }
+ 
+     defaultConfig {
+-        minSdkVersion 21
++        minSdkVersion 24
+         targetSdkVersion 36
+         versionName APP_VERSION_NAME
+         ndkVersion "27.2.12479018"
+diff --git a/TMessagesProj_AppStandalone/src/main/AndroidManifest.xml b/TMessagesProj_AppStandalone/src/main/AndroidManifest.xml
+index 79135bfa..9fd20954 100644
+--- a/TMessagesProj_AppStandalone/src/main/AndroidManifest.xml
++++ b/TMessagesProj_AppStandalone/src/main/AndroidManifest.xml
+@@ -3,7 +3,7 @@
+     xmlns:tools="http://schemas.android.com/tools"
+     android:installLocation="auto">
+ 
+-    <application android:name="org.telegram.messenger.ApplicationLoaderImpl" tools:replace="name">
++    <application android:name="org.telegram.messenger.ApplicationLoaderImpl" android:icon="@mipmap/ic_launcher_sa" android:roundIcon="@mipmap/ic_launcher_sa" android:label="Colgram" tools:replace="name,icon,roundIcon,label">
+         <service
+             android:name="org.telegram.messenger.GoogleVoiceClientService"
+             android:exported="true"
+diff --git a/TMessagesProj_AppTests/build.gradle b/TMessagesProj_AppTests/build.gradle
+index 0dd2a44b..1486b18f 100644
+--- a/TMessagesProj_AppTests/build.gradle
++++ b/TMessagesProj_AppTests/build.gradle
+@@ -18,12 +18,16 @@ configurations.all {
+ }
+ 
+ dependencies {
++    androidTestImplementation project(':colgram-core')
++    androidTestImplementation project(':colgram-singbox')
+     implementation project(':TMessagesProj')
+     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+ 
+     androidTestImplementation 'junit:junit:4.13.2'
+     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+     androidTestImplementation 'androidx.test:runner:1.5.2'
++    androidTestImplementation 'androidx.test:core:1.5.0'
++    androidTestImplementation 'androidx.test.uiautomator:uiautomator:2.3.0'
+     androidTestImplementation "org.jetbrains.kotlin:kotlin-test:1.9.20"
+     androidTestImplementation "org.jetbrains.kotlin:kotlin-test-junit:1.9.20"
+     androidTestImplementation "com.appmattus.fixture:fixture:1.2.0"
+@@ -100,7 +104,7 @@ android {
+     }
+ 
+     sourceSets.debug {
+-        manifest.srcFile '../TMessagesProj/config/release/AndroidManifest.xml'
++        manifest.srcFile 'src/debug/AndroidManifest.xml'
+     }
+     sourceSets.standalone {
+         manifest.srcFile '../TMessagesProj/config/release/AndroidManifest.xml'
+diff --git a/build.gradle b/build.gradle
+index f7c8fcb7..968b4dbc 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -6,6 +6,7 @@ buildscript {
+         maven { url 'https://developer.huawei.com/repo/' }
+     }
+     dependencies {
++        classpath 'com.chaquo.python:gradle:15.0.1'
+         classpath 'com.android.tools.build:gradle:8.13.2'
+         classpath 'com.google.gms:google-services:4.3.15'
+         classpath 'com.huawei.agconnect:agcp:1.9.1.301'

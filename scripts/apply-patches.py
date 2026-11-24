@@ -8,6 +8,7 @@ Directly hooks Telegram source without line number dependencies.
 import os
 import re
 import sys
+import json
 import shutil
 import zipfile
 import urllib.request
@@ -6712,6 +6713,13 @@ def sync_llama_module(repo_path, root_dir):
             shutil.rmtree(jni_dst)
         shutil.copytree(jni_src, jni_dst)
 
+    libs_src = os.path.join(source_dir, "libs")
+    libs_dst = os.path.join(target_dir, "libs")
+    if os.path.isdir(libs_src):
+        if os.path.exists(libs_dst):
+            shutil.rmtree(libs_dst)
+        shutil.copytree(libs_src, libs_dst)
+
     settings_path = os.path.join(repo_path, "settings.gradle")
     if os.path.isfile(settings_path):
         with open(settings_path, "r", encoding="utf-8") as sf:
@@ -8038,6 +8046,158 @@ def normalize_variant_manifests(repo_path):
                     target.write(fixed)
 
 
+def sync_colgram_extra_templates_and_assets(repo_path, root_dir):
+    """Copy Colgram UI/messenger-package Java templates and Koliti/brand/widget resources."""
+    template_dir = os.path.join(root_dir, "scripts", "templates")
+    ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
+    os.makedirs(ui_dest_dir, exist_ok=True)
+    for name in (
+        "ColgramBotLoginBottomSheet.java",
+        "ColgramQRLoginBottomSheet.java",
+        "ColgramIntroArtView.java",
+        "ColgramMenuChrome.java",
+        "ColgramConfettiView.java",
+        "ColgramColaSlideView.java",
+        "ColgramEasterEggs.java",
+        "ColgramAeroStyler.java",
+        "ColgramGlobalOrbController.java",
+        "ColgramAiOrbView.java",
+        "ColgramAiChatBridge.java",
+        "ColgramAiSheet.java",
+        "ColgramAiActivity.java",
+        "ColgramSettingsActivity.java",
+        "ColgramDefenderActivity.java",
+        "ColgramCallRoutes.java",
+        "ColgramBrowserRoutes.java",
+        "ColgramPluginsActivity.java",
+        "ColgramTempMailActivity.java",
+        "ColgramVersionsActivity.java",
+        "ColgramEditHistorySheet.java",
+        "ColgramAntiSpamActivity.java",
+        "ColgramFloatWindowManager.java",
+        "ColgramFilesActivity.java",
+        "ColgramAutoReplyActivity.java",
+        "ColgramAccountSwitcherHelper.java",
+        "ColgramVideoWallpaperView.java",
+        "ColgramDesignStudioActivity.java",
+        "ColgramGlobalSearchView.java",
+        "ColgramQuickBarView.java",
+        "ColgramMessageSeenSheet.java",
+        "ColgramSubscriptionControls.java",
+    ):
+        src = os.path.join(template_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(ui_dest_dir, name))
+
+    # Bundled default Python plugins + catalog.json
+    plugin_src_dir = os.path.join(root_dir, "plugins")
+    plugin_dst_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "assets", "plugins")
+    if os.path.isdir(plugin_src_dir):
+        os.makedirs(plugin_dst_dir, exist_ok=True)
+        for fname in sorted(os.listdir(plugin_src_dir)):
+            if fname.endswith(".py") or fname == "catalog.json":
+                shutil.copy2(os.path.join(plugin_src_dir, fname), os.path.join(plugin_dst_dir, fname))
+
+    messenger_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger")
+    os.makedirs(messenger_dir, exist_ok=True)
+    for name in (
+        "ColgramNativeColemailerBridge.java",
+        "ColgramNotificationListenerService.java",
+        "ColgramQuickWidgetProvider.java",
+    ):
+        src = os.path.join(template_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(messenger_dir, name))
+
+    assets_dir = os.path.join(root_dir, "assets")
+    main_res = os.path.join(repo_path, "TMessagesProj", "src", "main", "res")
+    sa_res = os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "res")
+
+    # Audio assets -> res/raw/
+    audio_src_dir = os.path.join(assets_dir, "koliti_audio")
+    raw_dst_dir = os.path.join(main_res, "raw")
+    if os.path.isdir(audio_src_dir):
+        os.makedirs(raw_dst_dir, exist_ok=True)
+        for fn in os.listdir(audio_src_dir):
+            src = os.path.join(audio_src_dir, fn)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(raw_dst_dir, fn))
+
+    # Drawable-nodpi Koliti & Colgram brand logos
+    nodpi_dst = os.path.join(main_res, "drawable-nodpi")
+    os.makedirs(nodpi_dst, exist_ok=True)
+    for fn in ("koliti_avatar.png", "colgram_brand_logo.png"):
+        src = os.path.join(assets_dir, fn)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(nodpi_dst, fn))
+
+    # Extra XML/PNG resources (widget, splash, drawable)
+    res_src_dir = os.path.join(assets_dir, "res")
+    copy_pairs = [
+        (os.path.join(res_src_dir, "layout", "colgram_quick_widget.xml"),
+         os.path.join(main_res, "layout", "colgram_quick_widget.xml")),
+        (os.path.join(res_src_dir, "xml", "colgram_quick_widget_info.xml"),
+         os.path.join(main_res, "xml", "colgram_quick_widget_info.xml")),
+        (os.path.join(res_src_dir, "drawable", "colgram_splash_bg.xml"),
+         os.path.join(main_res, "drawable", "colgram_splash_bg.xml")),
+        (os.path.join(res_src_dir, "drawable", "colgram_splash_bg.xml"),
+         os.path.join(sa_res, "drawable", "colgram_splash_bg.xml")),
+        (os.path.join(res_src_dir, "drawable", "tg_splash_320.xml"),
+         os.path.join(main_res, "drawable", "tg_splash_320.xml")),
+        (os.path.join(res_src_dir, "drawable", "tg_splash_320.xml"),
+         os.path.join(sa_res, "drawable", "tg_splash_320.xml")),
+        (os.path.join(res_src_dir, "drawable", "colgram_plane_splash.png"),
+         os.path.join(main_res, "drawable", "colgram_plane_splash.png")),
+        (os.path.join(res_src_dir, "drawable", "colgram_deleted_message_14.xml"),
+         os.path.join(main_res, "drawable", "colgram_deleted_message_14.xml")),
+        (os.path.join(assets_dir, "colgram_plane_splash.png"),
+         os.path.join(sa_res, "drawable", "colgram_plane_splash.png")),
+    ]
+    for src, dst in copy_pairs:
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+    print(" [+] Synced extra Colgram messenger templates and resources")
+
+
+def apply_pinned_consolidated_patch(repo_path, root_dir):
+    """Apply the consolidated Colgram 12.10.6 upstream delta cleanly on a fresh pinned checkout."""
+    patch_path = os.path.join(root_dir, "patches", "010-colgram-12.10.6-consolidated.patch")
+    manifest_path = os.path.join(root_dir, "config", "telegram-native.json")
+    if not os.path.isfile(patch_path) or not os.path.isfile(manifest_path):
+        return False
+    with open(manifest_path, "r", encoding="utf-8") as mf:
+        pinned_commit = json.load(mf).get("telegram_commit", "").strip()
+    head_proc = subprocess.run(
+        ["git", "-C", repo_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True
+    )
+    if head_proc.returncode != 0:
+        return False
+    head = head_proc.stdout.strip()
+    if not pinned_commit or head != pinned_commit:
+        return False
+    launch_path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LaunchActivity.java")
+    if os.path.isfile(launch_path):
+        with open(launch_path, "r", encoding="utf-8", errors="ignore") as lf:
+            if "colgramSyncAllPanesAfterTheme" in lf.read():
+                print(" [=] Consolidated 12.10.6 upstream delta already applied")
+                return True
+    check = subprocess.run(
+        ["git", "-C", repo_path, "apply", "--check", "--ignore-whitespace", patch_path],
+        capture_output=True, text=True
+    )
+    if check.returncode == 0:
+        subprocess.run(
+            ["git", "-C", repo_path, "apply", "--ignore-whitespace", "--whitespace=nowarn", patch_path],
+            check=True
+        )
+        print(" [+] Applied consolidated Colgram 12.10.6 upstream delta cleanly")
+        return True
+    print(f" [!] Consolidated patch skipped (tree already customized): {check.stderr.strip()[:200]}")
+    return False
+
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
@@ -8050,6 +8210,8 @@ def main():
         sys.exit(1)
 
     clone_required_submodules(target_repo)
+    consolidated_applied = apply_pinned_consolidated_patch(target_repo, root_dir)
+    download_official_binaries(target_repo)
     configure_package_and_branding(target_repo)
     stamp_build_version(target_repo)
     apply_custom_app_icon(target_repo, custom_icon)
@@ -8058,29 +8220,23 @@ def main():
         target_repo,
         os.path.join(root_dir, "vendor", "colgram-wireguard"),
     )
-    # download_official_binaries is what ADDS the in-tree WireGuard dependency line, and
-    # sync_singbox_module anchors the sing-box dependency onto that same line. Running the sync
-    # first meant it looked for an anchor a pristine checkout does not have yet, recorded
-    # "Colgram sing-box build.gradle anchor" as a miss, and failed the run - on the first pass
-    # only, so a second pass over the same tree succeeded and made it look intermittent. The
-    # sing-box engine therefore never reached the APK, which left the subscription row able to
-    # promise a VPN it could not start. Order the two the only way that works on a fresh clone.
-    download_official_binaries(target_repo)
     sync_singbox_module(target_repo, root_dir)
     sync_llama_module(target_repo, root_dir)
+    sync_colgram_extra_templates_and_assets(target_repo, root_dir)
     inject_warp_device_test_support(target_repo, root_dir)
     inject_singbox_device_test_support(target_repo, root_dir)
     inject_core_device_test_support(target_repo, root_dir)
     inject_subscription_share_activity(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
-    inject_hooks(target_repo)
+    if not consolidated_applied:
+        inject_hooks(target_repo)
     inject_masque_process_isolation(target_repo)
     from guest_proxy_patches import apply as inject_guest_proxy_probe
     inject_guest_proxy_probe(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]
-    stale = [m for m in ALLOWED_MISSES if m not in PATCH_MISSES]
+    stale = [] if consolidated_applied else [m for m in ALLOWED_MISSES if m not in PATCH_MISSES]
     if PATCH_MISSES:
         print(f"\n[*] {len(PATCH_MISSES)} patch(es) did not apply:")
         for miss in PATCH_MISSES:

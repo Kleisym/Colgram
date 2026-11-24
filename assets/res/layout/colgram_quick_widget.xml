@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    style="@style/TMessages.AppWidget.Background"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="10dp"
+    android:theme="@style/Theme.TMessages.AppWidget">
+
+    <LinearLayout
+        android:id="@+id/widget_header"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@drawable/list_selector_ex"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingLeft="4dp"
+        android:paddingRight="4dp"
+        android:paddingBottom="6dp">
+
+        <TextView
+            android:id="@+id/widget_title"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif-medium"
+            android:maxLines="1"
+            android:text="Colgram"
+            android:textColor="@color/widget_name"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/widget_status_badge"
+            style="@style/TMessages.AppWidget.Badge"
+            android:layout_width="wrap_content"
+            android:layout_height="22dp"
+            android:text="DPI: ВКЛ"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/btn_widget_proxy"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/list_selector_ex"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="2"
+            android:padding="4dp"
+            android:text="Прокси\nОбход"
+            android:textColor="@color/widget_name"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/btn_widget_privacy"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/list_selector_ex"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="2"
+            android:padding="4dp"
+            android:text="Приват\nЗащита"
+            android:textColor="@color/widget_name"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/btn_widget_tempmail"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/list_selector_ex"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="2"
+            android:padding="4dp"
+            android:text="Почта\nTempMail"
+            android:textColor="@color/widget_name"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/btn_widget_antispam"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/list_selector_ex"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="2"
+            android:padding="4dp"
+            android:text="Антиспам\nColemailer"
+            android:textColor="@color/widget_name"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/btn_widget_saved"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/list_selector_ex"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="2"
+            android:padding="4dp"
+            android:text="Сейв\nФайлы"
+            android:textColor="@color/widget_name"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/btn_widget_plugins"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@drawable/list_selector_ex"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="2"
+            android:padding="4dp"
+            android:text="Плагины\nPython"
+            android:textColor="@color/widget_name"
+            android:textSize="12sp" />
+    </LinearLayout>
+</LinearLayout>

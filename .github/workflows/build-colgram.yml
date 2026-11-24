@@ -46,10 +46,16 @@ jobs:
       - name: Clone Telegram Upstream (Official Base)
         run: |
           TARGET_VERSION="${{ inputs.telegram_version || 'latest' }}"
-          echo "Target Telegram version: $TARGET_VERSION"
-          if [ "$TARGET_VERSION" = "latest" ] || [ -z "$TARGET_VERSION" ]; then
-            echo "Cloning latest Telegram release from DrKLO/Telegram..."
-            git clone --depth 1 --no-tags --single-branch https://github.com/DrKLO/Telegram.git Telegram-Src
+          PINNED_COMMIT=$(python3 -c "import json; print(json.load(open('config/telegram-native.json'))['telegram_commit'])")
+          echo "Target Telegram version: $TARGET_VERSION (pinned commit: $PINNED_COMMIT)"
+          if [ "$TARGET_VERSION" = "latest" ] || [ "$TARGET_VERSION" = "pinned" ] || [ -z "$TARGET_VERSION" ]; then
+            echo "Cloning pinned Telegram release $PINNED_COMMIT from DrKLO/Telegram..."
+            git init Telegram-Src
+            cd Telegram-Src
+            git remote add origin https://github.com/DrKLO/Telegram.git
+            git fetch --depth 1 origin "$PINNED_COMMIT"
+            git checkout --detach FETCH_HEAD
+            cd ..
           else
             echo "Cloning specific Telegram version $TARGET_VERSION from DrKLO/Telegram..."
             git clone --depth 1 --no-tags --single-branch --branch "$TARGET_VERSION" https://github.com/DrKLO/Telegram.git Telegram-Src
@@ -68,6 +74,19 @@ jobs:
           # Keep the requested tag separately from the resolved one, so the release
           # notes can show both what was asked for and what was actually checked out.
           echo "REQUESTED_TAG=$TARGET_VERSION" >> $GITHUB_ENV
+
+      - name: Ensure Android SDK Platforms & Licenses
+        run: |
+          SDK_MGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDK_MGR" ]; then
+            yes | "$SDK_MGR" --licenses >/dev/null 2>&1 || true
+            if [ ! -f "$ANDROID_HOME/platforms/android-34/android.jar" ]; then
+              "$SDK_MGR" "platforms;android-34"
+            fi
+            if [ ! -f "$ANDROID_HOME/platforms/android-36/android.jar" ]; then
+              "$SDK_MGR" "platforms;android-36" "build-tools;36.0.0"
+            fi
+          fi
 
       - name: Apply Colgram Core & Surgical Patches
         # COLGRAM_BUILD_STAMP makes every release identifiable on a phone. Without it all
