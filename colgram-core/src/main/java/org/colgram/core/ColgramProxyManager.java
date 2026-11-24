@@ -230,9 +230,9 @@ public class ColgramProxyManager {
     private static final ExecutorService executor = newBgPool(6, "colgram-proxy");
     /** Bounded feed concurrency (6 threads) prevents LTE modem spikes while finishing live feeds in <2s. */
     private static final ExecutorService sourceFetchers = newBgPool(6, "colgram-feed");
-    // Separate from the background pool: capped to 8 (6 on cellular) to stay cool on mobile radio.
-    private static final int SELECTION_TCP_PARALLEL = 8;
-    private static final int CELLULAR_TCP_PARALLEL = 6;
+    // Separate from the background pool: allows up to 10 concurrent TCP slots for fast 4G/LTE discovery.
+    private static final int SELECTION_TCP_PARALLEL = 10;
+    private static final int CELLULAR_TCP_PARALLEL = 10;
     private static final ExecutorService selectionTcpWorkers = newBgPool(SELECTION_TCP_PARALLEL, "colgram-tcp");
     private static final java.util.concurrent.Semaphore selectionTcpSlots =
             new java.util.concurrent.Semaphore(SELECTION_TCP_PARALLEL);
@@ -343,6 +343,12 @@ public class ColgramProxyManager {
 
     /** Reachable public tunnels let us test and, if needed, chain a Telegram proxy. */
     private static final String[] RELAY_SOURCES_HTTP = {
+        "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+        "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/http.txt",
+        "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/http.txt",
+        "https://cdn.jsdelivr.net/gh/Zaeem20/FREE_PROXIES_LIST@master/http.txt",
+        "https://cdn.jsdelivr.net/gh/iplocate/free-proxy-list@main/protocols/http.txt",
+        "https://cdn.jsdelivr.net/gh/vakhov/fresh-proxy-list@master/http.txt",
         "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
         "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -423,6 +429,7 @@ public class ColgramProxyManager {
         if (context == null || !initialized.compareAndSet(false, true)) return;
         appContext = context.getApplicationContext();
         ColgramDpiBypass.setAppContext(appContext);
+        ColgramTelegramDcAddresses.init(appContext);
         // Handed to the MASQUE client so its availability probe can answer from the package without
         // loading the library into this process - see ColgramMasqueNative.isAvailableForProbe().
         ColgramMasqueNative.setProbeContext(appContext);
@@ -1803,7 +1810,7 @@ public class ColgramProxyManager {
                 if (isInAutoCatalogCooldown()
                         || (isTelegramConnected() && (currentActiveProxy == null || currentActiveProxy.isLocalDpi())
                             && (!ColgramDpiBypass.isStrictL3WhitelistDetected() || getReachableRelays().size() >= 2))
-                        || getSelectableProxies().size() >= AUTO_CATALOG_STOP_TARGET) {
+                        || hasMetCatalogStopTarget(getSelectableProxies(), AUTO_CATALOG_STOP_TARGET)) {
                     proberRunning.set(false);
                     return;
                 }
@@ -4220,8 +4227,9 @@ public static void reportProxyFailure() {
     private static final int MAX_CELLULAR_BACKGROUND_TCP_CHECKS = 60;
     private static final int MAX_BACKGROUND_GUEST_CHECKS = 60;
     private static final int AUTO_CATALOG_STOP_TARGET = 5;
+    private static final int AUTO_CATALOG_FAST_TARGET = 3;
     private static final int BACKGROUND_PROXY_TARGET_COUNT = 12;
-    private static final long BACKGROUND_PROXY_CHECK_WINDOW_MS = 15_000L;
+    private static final long BACKGROUND_PROXY_CHECK_WINDOW_MS = 24_000L;
     private static final long MANUAL_CATALOG_CHECK_WINDOW_MS = 25_000L;
     private static final long AUTO_CATALOG_COOLDOWN_WIFI_MS = 10L * 60_000L;
     private static final long AUTO_CATALOG_COOLDOWN_CELLULAR_MS = 20L * 60_000L;
@@ -4267,13 +4275,29 @@ public static void reportProxyFailure() {
         return now >= finishedAt && (now - finishedAt) < autoCatalogCooldownMs();
     }
 
+    private static int countFastSelectableProxies(List<ProxyItem> selectable) {
+        if (selectable == null || selectable.isEmpty()) return 0;
+        int fast = 0;
+        for (ProxyItem p : selectable) {
+            if (p != null && p.pingMs >= 0 && p.pingMs <= ColgramProxyPolicy.FAST_PING_THRESHOLD_MS) {
+                fast++;
+            }
+        }
+        return fast;
+    }
+
+    private static boolean hasMetCatalogStopTarget(List<ProxyItem> selectable, int stopTarget) {
+        return selectable != null && selectable.size() >= stopTarget
+                && countFastSelectableProxies(selectable) >= AUTO_CATALOG_FAST_TARGET;
+    }
+
     private static boolean backgroundRelayOrProxyWorkNeeded(boolean manual) {
         if (manual || scheduledCatalogCheck != null || manualCatalogScanRequested) return true;
         if (!ColgramUiBridge.isAppInForeground()) return false;
         // Hard thermal/battery cooldown after ANY automatic cycle (10m Wi-Fi / 20m cellular),
         // even if fewer than 5 proxies passed — never spin the LTE modem & CPU endlessly!
         if (isInAutoCatalogCooldown()) return false;
-        if (getSelectableProxies().size() >= AUTO_CATALOG_STOP_TARGET) {
+        if (hasMetCatalogStopTarget(getSelectableProxies(), AUTO_CATALOG_STOP_TARGET)) {
             boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
             if (!l3Blocked || getReachableRelays().size() >= 2) return false;
         }
@@ -4290,11 +4314,11 @@ public static void reportProxyFailure() {
         if (isInAutoCatalogCooldown()) return false;
         if (!backgroundRelayOrProxyWorkNeeded(false)) return false;
         if (backgroundProxySelection != null) {
-            return getSelectableProxies().size() < AUTO_CATALOG_STOP_TARGET;
+            return !hasMetCatalogStopTarget(getSelectableProxies(), AUTO_CATALOG_STOP_TARGET);
         }
         long now = SystemClock.elapsedRealtime();
         if (currentActiveProxy != null && ColgramDpiBypass.isBound()
-                && getSelectableProxies().size() >= AUTO_CATALOG_STOP_TARGET
+                && hasMetCatalogStopTarget(getSelectableProxies(), AUTO_CATALOG_STOP_TARGET)
                 && lastHealthyCatalogCheckAtMs > 0L && (now - lastHealthyCatalogCheckAtMs) < autoCatalogCooldownMs()) {
             return false;
         }
@@ -4532,6 +4556,7 @@ public static void reportProxyFailure() {
         if (candidates == null || candidates.size() <= 1) return;
         sortCandidates(candidates);
         final boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
+        final boolean cellular = ColgramDpiBypass.isCellularNetwork();
         final java.util.Set<ProxyItem> expiringSoon = new java.util.HashSet<>();
         final java.util.Set<ProxyItem> due = new java.util.HashSet<>();
         for (ProxyItem candidate : candidates) {
@@ -4553,8 +4578,10 @@ public static void reportProxyFailure() {
                     : (tcp == 0L || (item.catalogPinnedAddress != null && proto == 0L)) ? 1
                     : due.contains(item) ? 2 : 3;
             // When mobile tower L3-drops Telegram SYNs, prioritize SOCKS5 (type == 0) candidates so
-            // Layer-2 L3 relays populate within 2-4 seconds.
-            long l3TypePriority = l3Blocked ? (item.type == 0 ? 0L : 1L) : 0L;
+            // Layer-2 L3 relays populate within 2-4 seconds; otherwise on cellular prioritize FakeTLS MTProto.
+            long l3TypePriority = l3Blocked
+                    ? (item.type == 0 ? 0L : 1L)
+                    : (cellular ? ((item.type == 1 && item.fakeTls) ? 0L : (item.type == 0 ? 1L : 2L)) : 0L);
             snapshot.put(item, new long[]{tier, l3TypePriority, tcp, origIdx++});
         }
         candidates.sort((a, b) -> {
@@ -4635,23 +4662,27 @@ public static void reportProxyFailure() {
                     }
                     selection.lastSortAt = tickNow;
                     int stopTarget = manualCatalogScanRequested ? BACKGROUND_PROXY_TARGET_COUNT : AUTO_CATALOG_STOP_TARGET;
-                    if (getSelectableProxies().size() >= stopTarget && !hasDue && !selection.guestPending) {
+                    if (hasMetCatalogStopTarget(getSelectableProxies(), stopTarget) && !hasDue && !selection.guestPending) {
                         finishBackgroundProxyCheck(selection, autoCatalogCooldownMs());
                         return;
                     }
                     scheduleSelectionTcp(selection, candidates);
-                    // Interleave 50/50 FakeTLS MTProto and SOCKS5 sorted by lowest measured TCP RTT so
-                    // BOTH censorship-resistant MTProto proxies AND SOCKS5 L3 relays verify in <8s.
+                    // On cellular without strict L3 whitelist: prioritize FakeTLS MTProto (~75% MTProto / 25% SOCKS5)
+                    // with guestInFlight up to MAX_PARALLEL (5). Keep SOCKS5 priority when strict L3 whitelist IS detected.
                     boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
                     boolean launchedAnyThisTick = false;
                     boolean cellularNow = ColgramDpiBypass.isCellularNetwork();
                     while (selection.guestInFlight < ColgramGuestProxyProbe.MAX_PARALLEL
-                            && (!cellularNow || selection.guestInFlight < 3)
                             && selection.guestAttempts < MAX_BACKGROUND_GUEST_CHECKS
                             && selection.deadline - tickNow >= 2_500L) {
-                        int preferredType = (selection.guestAttempts % 2) == 0
-                                ? (l3Blocked ? 0 : 1)
-                                : (l3Blocked ? 1 : 0);
+                        int preferredType;
+                        if (l3Blocked) {
+                            preferredType = (selection.guestAttempts % 2) == 0 ? 0 : 1;
+                        } else if (cellularNow) {
+                            preferredType = (selection.guestAttempts % 4) != 3 ? 1 : 0;
+                        } else {
+                            preferredType = (selection.guestAttempts % 2) == 0 ? 1 : 0;
+                        }
                         boolean launchedThisPass = false;
                         for (int pass = 0; pass < 2 && !launchedThisPass; pass++) {
                             int type = pass == 0 ? preferredType : 1 - preferredType;
@@ -4694,10 +4725,9 @@ public static void reportProxyFailure() {
                         selection.lastUiStatusAt = tickNow;
                         backgroundProxyStatus = "Проверяю в фоне · " + selectionProgress(selection);
                     }
-                    int readyCount = getSelectableProxies().size();
                     boolean tcpDrained = selection.tcpFinished == selection.tcpAttempted.size()
                             && (selection.tcpAttempted.size() > 0 || verifiedPool.size() <= 1);
-                    if (readyCount >= stopTarget && !selection.guestPending) {
+                    if (hasMetCatalogStopTarget(getSelectableProxies(), stopTarget) && !selection.guestPending) {
                         finishBackgroundProxyCheck(selection, autoCatalogCooldownMs());
                         return;
                     }
@@ -5020,18 +5050,23 @@ public static void reportProxyFailure() {
         int budget = selection.catalogOnly
                 ? (cellular ? MAX_CELLULAR_BACKGROUND_TCP_CHECKS : MAX_BACKGROUND_TCP_CHECKS)
                 : MAX_SELECTION_TCP_CHECKS;
-        // Cap concurrent cellular TCP probes to max 6 threads so 4G LTE radio & CPU stay cool,
-        // and interleave 50/50 FakeTLS MTProto and SOCKS5 candidates for fast discovery.
+        // Allow up to 10 concurrent TCP slots on cellular when discovering proxies; on cellular
+        // without strict L3 whitelist prioritize FakeTLS MTProto (~75% MTProto / 25% SOCKS5).
         final int minReservedPermits = cellular
-                ? Math.max(2, SELECTION_TCP_PARALLEL - CELLULAR_TCP_PARALLEL)
+                ? Math.max(0, SELECTION_TCP_PARALLEL - CELLULAR_TCP_PARALLEL)
                 : (selection.catalogOnly ? 2 : 0);
         final boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
         while (!direct.isEmpty() && selection.tcpAttempted.size() < budget
                 && selectionTcpSlots.availablePermits() > minReservedPermits
                 && selectionTcpSlots.tryAcquire()) {
-            int preferredType = (selection.tcpAttempted.size() % 2) == 0
-                    ? (l3Blocked ? 0 : 1)
-                    : (l3Blocked ? 1 : 0);
+            int preferredType;
+            if (l3Blocked) {
+                preferredType = (selection.tcpAttempted.size() % 2) == 0 ? 0 : 1;
+            } else if (cellular) {
+                preferredType = (selection.tcpAttempted.size() % 4) != 3 ? 1 : 0;
+            } else {
+                preferredType = (selection.tcpAttempted.size() % 2) == 0 ? 1 : 0;
+            }
             int index = 0;
             if (!isFreshProtocolVerified(direct.get(0))) {
                 int fallbackIdx = -1;
@@ -5466,7 +5501,7 @@ public static void reportProxyFailure() {
      */
     private static final java.util.Set<String> harvestedEndpoints =
             java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<String>());
-    private static final int HARVEST_MEMORY_LIMIT = 4000;
+    private static final int HARVEST_MEMORY_LIMIT = 1500;
 
     private static void rememberHarvested(String address, int port) {
         // Two feed threads reach this at once, and synchronizedSet only guards a single operation
@@ -5666,6 +5701,8 @@ public static void reportProxyFailure() {
             java.lang.reflect.Constructor<?> constructor = piClass.getConstructor(psClass);
             Method addProxy = scClass.getDeclaredMethod("addProxy", piClass);
             java.util.Set<String> managed = readProxyIdentities(KEY_MANAGED_PROXIES);
+            java.util.List<String> recentManaged = new ArrayList<>();
+            long publishedAtMs = SystemClock.elapsedRealtime();
             int published = 0;
             for (ProxyItem p : selectable) {
                 if (!isPubliclySelectable(p)) continue;
@@ -5675,11 +5712,29 @@ public static void reportProxyFailure() {
                 Object info = addProxy.invoke(null, constructor.newInstance(settings));
                 if (info == null) continue;
                 info.getClass().getField("available").setBoolean(info, true);
+                info.getClass().getField("checking").setBoolean(info, false);
                 info.getClass().getField("ping").setLong(info, p.pingMs);
-                info.getClass().getField("availableCheckTime").setLong(info, p.lastCheckAt);
-                if (!isManuallySavedProxy(p)) managed.add(proxyIdentity(p));
+                info.getClass().getField("availableCheckTime").setLong(info, publishedAtMs);
+                if (!isManuallySavedProxy(p)) {
+                    String id = proxyIdentity(p);
+                    managed.add(id);
+                    recentManaged.add(id);
+                }
                 published++;
             }
+            if (managed.size() > HARVEST_MEMORY_LIMIT) {
+                java.util.Set<String> trimmed = new java.util.LinkedHashSet<>(HARVEST_MEMORY_LIMIT);
+                for (String id : recentManaged) {
+                    if (trimmed.size() >= HARVEST_MEMORY_LIMIT) break;
+                    trimmed.add(id);
+                }
+                for (String id : managed) {
+                    if (trimmed.size() >= HARVEST_MEMORY_LIMIT) break;
+                    trimmed.add(id);
+                }
+                managed = trimmed;
+            }
+            sortStockProxyListAscendingByPing(scClass, piClass);
             ctx.getSharedPreferences(PROXY_PREFS, Context.MODE_PRIVATE).edit()
                     .putStringSet(KEY_MANAGED_PROXIES, managed).apply();
             scClass.getDeclaredMethod("saveProxyList").invoke(null);
@@ -5688,6 +5743,40 @@ public static void reportProxyFailure() {
             // Stock rotation has no ownership token and must not race an explicit Direct/WARP.
         } catch (Throwable error) {
             Log.e(TAG, "publishPoolToStock error", error);
+        }
+    }
+
+    private static void sortStockProxyListAscendingByPing(Class<?> scClass, Class<?> piClass) {
+        try {
+            Object listObj = scClass.getDeclaredField("proxyList").get(null);
+            Object currentObj = scClass.getDeclaredField("currentProxy").get(null);
+            if (!(listObj instanceof List)) return;
+            @SuppressWarnings("unchecked")
+            List<Object> stockList = (List<Object>) listObj;
+            final Field availField = piClass.getField("available");
+            final Field pingField = piClass.getField("ping");
+            synchronized (stockList) {
+                stockList.sort((a, b) -> {
+                    if (a == b) return 0;
+                    if (a == currentObj) return -1;
+                    if (b == currentObj) return 1;
+                    if (a == null) return 1;
+                    if (b == null) return -1;
+                    try {
+                        boolean availA = availField.getBoolean(a);
+                        boolean availB = availField.getBoolean(b);
+                        if (availA != availB) return availA ? -1 : 1;
+                        long pingA = pingField.getLong(a);
+                        long pingB = pingField.getLong(b);
+                        long effA = pingA > 0L ? pingA : Long.MAX_VALUE;
+                        long effB = pingB > 0L ? pingB : Long.MAX_VALUE;
+                        return Long.compare(effA, effB);
+                    } catch (Throwable ignored) {
+                        return 0;
+                    }
+                });
+            }
+        } catch (Throwable ignored) {
         }
     }
 

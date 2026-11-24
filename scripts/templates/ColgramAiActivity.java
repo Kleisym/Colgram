@@ -51,10 +51,9 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * Koliti Studio — single-model control center for Koliti Core 4B:
- * - Manage compact imatrix Qwen3.5-4B Hybrid Gated DeltaNet + Vision (mmproj) weights
- * - Live download progress, RAM unload, thermal CPU threads, quantized KV cache & FlashAttention
- * - Zero multi-model clutter, zero emoji spam
+ * Koliti Studio — control center for Koliti v3 optimized local models:
+ * - Manage optimized Koliti v3 weights (Core, Turbo, Pro) + Vision projector directly from Colgram Releases
+ * - Live download progress with resume, RAM unload, thermal CPU threads, quantized KV cache & FlashAttention
  */
 public class ColgramAiActivity extends BaseFragment {
 
@@ -72,6 +71,7 @@ public class ColgramAiActivity extends BaseFragment {
     private int rowCount;
     private int heroRow;
     private int coreCardRow;
+    private int modelPickerRow;
     private int designCustomizeRow;
     private int idleSleepRow;
     private int coreInfoRow;
@@ -110,6 +110,7 @@ public class ColgramAiActivity extends BaseFragment {
         rowCount = 0;
         heroRow = rowCount++;
         coreCardRow = rowCount++;
+        modelPickerRow = rowCount++;
         designCustomizeRow = rowCount++;
         idleSleepRow = rowCount++;
         coreInfoRow = rowCount++;
@@ -173,6 +174,10 @@ public class ColgramAiActivity extends BaseFragment {
         Context ctx = getParentActivity();
         if (ctx == null) return;
 
+        if (position == modelPickerRow) {
+            showModelTierPickerDialog(ctx);
+            return;
+        }
         if (position == designCustomizeRow) {
             presentFragment(new ColgramDesignStudioActivity());
             return;
@@ -305,11 +310,11 @@ public class ColgramAiActivity extends BaseFragment {
             return;
         }
         if (position == importGgufRow) {
-            launchFilePicker(REQ_PICK_GGUF, "Выберите свой .gguf файл");
+            launchFilePicker(REQ_PICK_GGUF, "Выберите свой файл модели");
             return;
         }
         if (position == importMmprojRow) {
-            launchFilePicker(REQ_PICK_MMPROJ, "Выберите Vision mmproj .gguf");
+            launchFilePicker(REQ_PICK_MMPROJ, "Выберите свой файл Vision-модуля");
             return;
         }
         if (position == resetCustomRow) {
@@ -317,9 +322,48 @@ public class ColgramAiActivity extends BaseFragment {
             ColgramAiConfig.setCustomMmprojPath(ctx, "");
             ColgramAiConfig.setActiveModelId(ctx, ColgramAiModels.KOLITI_MODEL_ID);
             ColgramAiEngine.getInstance().unloadModelAsync();
-            Toast.makeText(ctx, "Возвращено встроенное ядро Koliti Core Ultra", Toast.LENGTH_SHORT).show();
+            Toast.makeText(ctx, "Возвращена модель " + ColgramAiModels.primary().title, Toast.LENGTH_SHORT).show();
             refreshUi();
         }
+    }
+
+    private void showModelTierPickerDialog(Context ctx) {
+        if (ColgramAiModelManager.isDownloading()) {
+            Toast.makeText(ctx, "Сначала дождитесь завершения или остановите загрузку", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final java.util.List<ColgramAiModels.ModelSpec> specs = ColgramAiModels.catalog();
+        final String activeId = ColgramAiConfig.getActiveModelId(ctx);
+        final boolean hasEmbedded = ColgramAiModelManager.hasEmbeddedAssets(ctx);
+        final String[] labels = new String[specs.size()];
+        for (int i = 0; i < specs.size(); i++) {
+            ColgramAiModels.ModelSpec s = specs.get(i);
+            boolean installed = ColgramAiModelManager.isModelDownloaded(ctx, s);
+            boolean embedded = s.hasBundledAssets() && hasEmbedded;
+            String state = installed ? "установлена" : (embedded ? "встроена в APK" : "скачать с GitHub");
+            String mark = s.id.equals(activeId) ? "✓ " : "";
+            labels[i] = mark + s.title + "\n"
+                    + ColgramAiModelManager.formatSizeMb(s.approxModelBytes)
+                    + (s.supportsVision() ? " + Vision" : "")
+                    + " • " + state;
+        }
+        showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
+                .setTitle("Выбор модели Колити")
+                .setItems(labels, (d, which) -> {
+                    ColgramAiModels.ModelSpec chosen = specs.get(which);
+                    ColgramAiConfig.setCustomModelPath(ctx, "");
+                    ColgramAiConfig.setCustomMmprojPath(ctx, "");
+                    ColgramAiConfig.setActiveModelId(ctx, chosen.id);
+                    ColgramAiEngine.getInstance().unloadModelAsync();
+                    if (ColgramAiModelManager.isModelDownloaded(ctx, chosen)) {
+                        Toast.makeText(ctx, "Активная модель: " + chosen.title, Toast.LENGTH_SHORT).show();
+                        refreshUi();
+                    } else {
+                        startDownloadForSpec(ctx, chosen);
+                    }
+                })
+                .setNegativeButton("Отмена", null)
+                .create());
     }
 
     private void startOrToggleCoreDownload(Context ctx) {
@@ -330,7 +374,8 @@ public class ColgramAiActivity extends BaseFragment {
             refreshUi();
             return;
         }
-        startDownloadForSpec(ctx, ColgramAiModels.primary());
+        ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(ctx));
+        startDownloadForSpec(ctx, activeSpec);
     }
 
     private void startDownloadForSpec(Context ctx, ColgramAiModels.ModelSpec spec) {
@@ -366,7 +411,7 @@ public class ColgramAiActivity extends BaseFragment {
         long mb = Math.max(1L, (spec.approxModelBytes + spec.approxMmprojBytes) / (1024L * 1024L));
         showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
                 .setTitle("Удалить веса " + spec.title + "?")
-                .setMessage("Освободится ~" + mb + " МБ памяти. Вы сможете загрузить модель повторно в любой момент или переключиться на встроенную Koliti Core Ultra.")
+                .setMessage("Освободится ~" + mb + " МБ памяти. Вы сможете загрузить модель повторно в любой момент или переключиться на " + ColgramAiModels.primary().title + ".")
                 .setPositiveButton("Удалить", (d, w) -> {
                     ColgramAiEngine.getInstance().unloadModelAsync();
                     ColgramAiModelManager.deleteModelFiles(ctx, spec);
@@ -747,13 +792,16 @@ public class ColgramAiActivity extends BaseFragment {
                     0x28E11D48);
             secondaryBtn.setTextColor(dark ? 0xFFFDA4AF : pal.semanticCrimson);
 
-            ColgramAiModels.ModelSpec spec = ColgramAiModels.primary();
+            ColgramAiModels.ModelSpec spec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(ctx));
             ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);
             boolean downloading = ColgramAiModelManager.isDownloading();
             boolean hasEmbedded = ColgramAiModelManager.hasEmbeddedAssets(ctx);
-            boolean activeFileReady = paths.isReady();
+            boolean specEmbedded = spec.hasBundledAssets() && hasEmbedded;
+            boolean hasCustom = !TextUtils.isEmpty(ColgramAiConfig.getCustomModelPath(ctx)) && paths.isReady();
+            boolean activeFileReady = hasCustom || ColgramAiModelManager.isModelDownloaded(ctx, spec);
+            boolean activeVisionReady = hasCustom ? paths.hasVision() : ColgramAiModelManager.isVisionDownloaded(ctx, spec);
 
-            titleTv.setText(org.colgram.core.ColgramDesignConfig.getKolitiDisplayName() + " Core Ultra");
+            titleTv.setText(hasCustom ? paths.displayName : spec.title);
             descTv.setText(spec.subtitle);
 
             if (downloading) {
@@ -764,9 +812,10 @@ public class ColgramAiActivity extends BaseFragment {
                 statusTv.setText(liveDownloadPct > 0
                         ? String.format(Locale.US, "%s — %d%% (%.1f МБ/с)", liveDownloadStage, liveDownloadPct, liveDownloadSpeed)
                         : (liveDownloadStage.isEmpty() ? "Подготовка ядра…" : liveDownloadStage));
-                primaryBtn.setText(hasEmbedded ? "Подготовка…" : "Остановить загрузку");
+                boolean extracting = ColgramAiModelManager.isExtractingEmbedded();
+                primaryBtn.setText(extracting ? "Подготовка…" : "Остановить загрузку");
                 primaryBtn.setOnClickListener(v -> {
-                    if (!hasEmbedded) startOrToggleCoreDownload(ctx);
+                    if (!extracting) startOrToggleCoreDownload(ctx);
                 });
                 secondaryBtn.setVisibility(GONE);
             } else if (activeFileReady) {
@@ -774,8 +823,8 @@ public class ColgramAiActivity extends BaseFragment {
                 statusTv.setTextColor(pal.semanticEmerald);
                 boolean inRam = ColgramAiEngine.getInstance().isModelLoaded();
                 String loadedNote = inRam ? " • Активно в RAM" : " • Спит (0 МБ в RAM / 0% CPU)";
-                statusTv.setText((hasEmbedded ? "Встроено офлайн" : "Установлено локально")
-                        + (paths.hasVision() ? " (Текст + Vision)" : " (Текст)") + loadedNote);
+                statusTv.setText((specEmbedded ? "Встроено офлайн" : "Установлено локально")
+                        + (activeVisionReady ? " (Текст + Vision)" : " (Текст)") + loadedNote);
                 primaryBtn.setText(inRam ? "Усыпить сейчас (0 МБ)" : "Открыть чат с " + org.colgram.core.ColgramDesignConfig.getKolitiDisplayName());
                 primaryBtn.setOnClickListener(v -> {
                     if (ColgramAiEngine.getInstance().isModelLoaded()) {
@@ -788,10 +837,10 @@ public class ColgramAiActivity extends BaseFragment {
                         ColgramAiSheet.show(ColgramAiActivity.this, null, null);
                     }
                 });
-                secondaryBtn.setVisibility(hasEmbedded ? GONE : VISIBLE);
+                secondaryBtn.setVisibility(specEmbedded ? GONE : VISIBLE);
                 secondaryBtn.setText("Удалить");
                 secondaryBtn.setOnClickListener(v -> confirmDeleteCore(ctx));
-            } else if (hasEmbedded) {
+            } else if (specEmbedded) {
                 progressBar.setVisibility(GONE);
                 statusTv.setTextColor(pal.semanticCyan);
                 statusTv.setText("Встроено в APK (0 МБ интернета) • Готово к мгновенной распаковке");
@@ -801,8 +850,8 @@ public class ColgramAiActivity extends BaseFragment {
             } else {
                 progressBar.setVisibility(GONE);
                 statusTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
-                statusTv.setText("Веса не загружены • Доступна загрузка с докачкой");
-                primaryBtn.setText("Скачать Koliti Core Ultra");
+                statusTv.setText("Веса не загружены • Загрузка напрямую с GitHub (с докачкой)");
+                primaryBtn.setText("Скачать " + spec.title);
                 primaryBtn.setOnClickListener(v -> startOrToggleCoreDownload(ctx));
                 secondaryBtn.setVisibility(GONE);
             }
@@ -986,7 +1035,7 @@ public class ColgramAiActivity extends BaseFragment {
                     h.setText("Поведение и производительность");
                     ColgramMenuChrome.styleHeader(h, ColgramMenuChrome.COLOR_CRIMSON, 0xFFFB7185);
                 } else {
-                    h.setText("Ручное подключение весов (GGUF)");
+                    h.setText("Ручное подключение локальной модели");
                     ColgramMenuChrome.styleHeader(h, ColgramMenuChrome.COLOR_SLATE, 0xFF94A3B8);
                 }
             } else if (type == 2) {
@@ -1012,7 +1061,11 @@ public class ColgramAiActivity extends BaseFragment {
                 }
             } else if (type == 3) {
                 TextDetailSettingsCell d = (TextDetailSettingsCell) holder.itemView;
-                if (position == designCustomizeRow) {
+                if (position == modelPickerRow) {
+                    ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(mContext));
+                    String val = activeSpec.title + " • " + ColgramAiModels.catalog().size() + " оптимизированных версии";
+                    ColgramMenuChrome.applyDetailIcon(d, "Модель Колити", val, R.drawable.msg_bot, ColgramMenuChrome.COLOR_CRIMSON, true);
+                } else if (position == designCustomizeRow) {
                     int sz = org.colgram.core.ColgramDesignConfig.getKolitiOrbSizeDp();
                     boolean hasCustomAva = !TextUtils.isEmpty(org.colgram.core.ColgramDesignConfig.getKolitiCustomAvatarPath());
                     String val = "Размер кнопки: " + sz + "dp • " + (hasCustomAva ? "Свой аватар" : "Стандартный аватар") + " • Конструктор дизайна";
@@ -1046,12 +1099,12 @@ public class ColgramAiActivity extends BaseFragment {
                     ColgramMenuChrome.applyDetailIcon(d, "Потоки CPU", th == 0 ? "Авто (быстрые big-ядра)" : th + " потока", R.drawable.msg_settings, ColgramMenuChrome.COLOR_AMBER, false);
                 } else if (position == importGgufRow) {
                     String custom = ColgramAiConfig.getCustomModelPath(mContext);
-                    ColgramMenuChrome.applyDetailIcon(d, "Подключить свой .gguf", TextUtils.isEmpty(custom) ? "По умолчанию используется встроенная Koliti Core Ultra" : new File(custom).getName(), R.drawable.msg_download, ColgramMenuChrome.COLOR_SLATE, true);
+                    ColgramMenuChrome.applyDetailIcon(d, "Подключить свой файл модели", TextUtils.isEmpty(custom) ? ("По умолчанию: " + ColgramAiModels.primary().title) : new File(custom).getName(), R.drawable.msg_download, ColgramMenuChrome.COLOR_SLATE, true);
                 } else if (position == importMmprojRow) {
                     String mm = ColgramAiConfig.getCustomMmprojPath(mContext);
                     ColgramMenuChrome.applyDetailIcon(d, "Подключить Vision mmproj", TextUtils.isEmpty(mm) ? "Встроенный Vision-энкодер для фото и видео" : new File(mm).getName(), R.drawable.msg_media, ColgramMenuChrome.COLOR_SLATE, true);
                 } else if (position == resetCustomRow) {
-                    ColgramMenuChrome.applyDetailIcon(d, "Сбросить к Koliti Core Ultra", "Вернуть встроенное ядро и настройки", R.drawable.msg_clear, ColgramMenuChrome.COLOR_ROSE, false);
+                    ColgramMenuChrome.applyDetailIcon(d, "Сбросить к " + ColgramAiModels.primary().title, "Вернуть оптимизированное ядро по умолчанию", R.drawable.msg_clear, ColgramMenuChrome.COLOR_ROSE, false);
                 }
             } else if (type == 4) {
                 ((KolitiSystemInfoCardView) holder.itemView).bind(mContext);

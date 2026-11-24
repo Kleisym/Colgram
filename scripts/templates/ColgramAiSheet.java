@@ -500,7 +500,8 @@ public final class ColgramAiSheet {
                 }
             });
         } else {
-            coreInstallText.setText("Ядро Koliti Core Ultra • 1.25 ГБ + Vision");
+            ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(act));
+            coreInstallText.setText(activeSpec.title + " • " + ColgramAiModelManager.formatSizeMb(activeSpec.approxModelBytes) + " + Vision");
             coreInstallBanner.setVisibility(View.VISIBLE);
         }
         root.addView(coreInstallBanner, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 6));
@@ -1545,11 +1546,12 @@ public final class ColgramAiSheet {
             coreInstallText.setText("Загрузка приостановлена");
             return;
         }
+        ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(act));
         coreInstallAction.setText("Пауза");
         coreInstallProgress.setVisibility(View.VISIBLE);
         coreInstallProgress.setIndeterminate(true);
-        coreInstallText.setText("Подготовка Koliti Core Ultra…");
-        ColgramAiModelManager.startDownloadAsync(act, ColgramAiModels.primary(), true, new ColgramAiModelManager.DownloadListener() {
+        coreInstallText.setText("Загрузка " + activeSpec.title + "…");
+        ColgramAiModelManager.startDownloadAsync(act, activeSpec, true, new ColgramAiModelManager.DownloadListener() {
             @Override
             public void onProgress(String stage, long downloadedBytes, long totalBytes, double speedMbSec) {
                 AndroidUtilities.runOnUIThread(() -> {

@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 /** Bounded anonymous MTProto lanes; each owns a distinct cache, account slot and RPC. */
 public final class ColgramGuestProxyService extends Service {
     private static final long RPC_TIMEOUT_MS = 9_500L;
+    private static final long RTT_RPC_TIMEOUT_MS = 2_500L;
     private static final long IDLE_STOP_MS = 25_000L;
     private static final AtomicInteger TOKENS = new AtomicInteger(600_000);
     private static final boolean[] initialized = new boolean[ColgramGuestProxyProbe.MAX_PARALLEL];
@@ -115,11 +116,25 @@ public final class ColgramGuestProxyService extends Service {
         final Messenger reply;
         final long started = SystemClock.elapsedRealtime();
         final Runnable timeout = () -> finish(-1L, ColgramGuestProxyProbe.TIMEOUT);
+        final Runnable rttTimeout = () -> finish(fallbackEstimateMs(), "TG_CONFIG_OK");
         volatile int token;
+        volatile int stage = 1;
+        volatile long configSentAt;
+        volatile long configElapsedMs;
+        volatile long rttSentAt;
         Probe(int account, long ticket, Messenger reply) {
             this.account = account; this.ticket = ticket; this.reply = reply;
         }
         boolean current() { return probes.get(account) == this; }
+        long fallbackEstimateMs() {
+            long base = configElapsedMs;
+            if (base <= 0L && configSentAt > 0L) {
+                base = Math.max(1L, SystemClock.elapsedRealtime() - configSentAt);
+            }
+            if (base <= 0L) return 250L;
+            // Cold TL_help_getConfig includes TCP + 3-step DH keygen (~4 RTTs); estimate 1 RTT cleanly.
+            return Math.max(25L, Math.min(1_800L, base / 4L));
+        }
         void resolve(Bundle target) {
             main.postDelayed(timeout, RPC_TIMEOUT_MS);
             String host = target.getString("host", "");
@@ -166,16 +181,42 @@ public final class ColgramGuestProxyService extends Service {
                 TLRPC.TL_help_getConfig request = new TLRPC.TL_help_getConfig();
                 NativeByteBuffer buffer = new NativeByteBuffer(request.getObjectSize());
                 request.serializeToStream(buffer);
+                stage = 1;
                 token = TOKENS.incrementAndGet();
+                configSentAt = SystemClock.elapsedRealtime();
                 int flags = ConnectionsManager.RequestFlagEnableUnauthorized | ConnectionsManager.RequestFlagWithoutLogin;
                 ConnectionsManager.native_sendRequest(account, buffer.address, flags,
                         ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true, token);
             } catch (Exception | LinkageError error) { finish(-1L, "TG_PROBE_UNAVAILABLE"); }
         }
+        void measureNearestDcRtt() {
+            main.removeCallbacks(timeout);
+            long elapsedTotal = SystemClock.elapsedRealtime() - started;
+            long remainingForRtt = (ColgramGuestProxyProbe.CHECK_TIMEOUT_MS - 1_200L) - elapsedTotal;
+            if (remainingForRtt < 350L) {
+                finish(fallbackEstimateMs(), "TG_CONFIG_OK");
+                return;
+            }
+            try {
+                TLRPC.TL_help_getNearestDc nearest = new TLRPC.TL_help_getNearestDc();
+                NativeByteBuffer buffer = new NativeByteBuffer(nearest.getObjectSize());
+                nearest.serializeToStream(buffer);
+                stage = 2;
+                token = TOKENS.incrementAndGet();
+                rttSentAt = SystemClock.elapsedRealtime();
+                main.postDelayed(rttTimeout, Math.min(RTT_RPC_TIMEOUT_MS, remainingForRtt));
+                int flags = ConnectionsManager.RequestFlagEnableUnauthorized | ConnectionsManager.RequestFlagWithoutLogin;
+                ConnectionsManager.native_sendRequest(account, buffer.address, flags,
+                        ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true, token);
+            } catch (Throwable error) {
+                finish(fallbackEstimateMs(), "TG_CONFIG_OK");
+            }
+        }
         void finish(long time, String reason) {
             if (!probes.compareAndSet(account, this, null)) return;
             android.util.Log.d("ColgramGuestProbe", "finish account=" + account + " time=" + time + " reason=" + reason);
             main.removeCallbacks(timeout);
+            main.removeCallbacks(rttTimeout);
             int request = token; token = 0;
             if (initialized[account]) {
                 ConnectionsManager.native_setNetworkAvailable(account, false, 1, false);
@@ -189,25 +230,53 @@ public final class ColgramGuestProxyService extends Service {
 
     /** Called on tgnet's thread while the response buffer is still owned by the engine. */
     public static void onRequestComplete(int account, int request, long pointer) {
+        final long completedAt = SystemClock.elapsedRealtime();
         ColgramGuestProxyService active = service;
         if (active == null || account < 0 || account >= ColgramGuestProxyProbe.MAX_PARALLEL) return;
         Probe probe = active.probes.get(account);
         if (probe == null || probe.token != request) return;
-        boolean accepted = false;
-        try {
-            if (pointer != 0) {
-                NativeByteBuffer response = NativeByteBuffer.wrap(pointer);
-                response.reused = true;
-                TLRPC.TL_config config = TLRPC.TL_config.TLdeserialize(response, response.readInt32(true), true);
-                accepted = config != null && !config.dc_options.isEmpty();
-            }
-        } catch (RuntimeException ignored) { }
-        boolean verified = accepted;
-        active.main.post(() -> {
-            if (!probe.current() || probe.token != request) return;
-            probe.finish(verified ? Math.max(1L, SystemClock.elapsedRealtime() - probe.started) : -1L,
-                    verified ? "TG_CONFIG_OK" : "TG_CONFIG_REJECTED");
-        });
+        final int completedStage = probe.stage;
+        if (completedStage == 1) {
+            boolean accepted = false;
+            try {
+                if (pointer != 0) {
+                    NativeByteBuffer response = NativeByteBuffer.wrap(pointer);
+                    response.reused = true;
+                    TLRPC.TL_config config = TLRPC.TL_config.TLdeserialize(response, response.readInt32(true), true);
+                    accepted = config != null && !config.dc_options.isEmpty();
+                }
+            } catch (RuntimeException ignored) { }
+            final boolean verified = accepted;
+            final long configMs = probe.configSentAt > 0L ? Math.max(1L, completedAt - probe.configSentAt) : 0L;
+            active.main.post(() -> {
+                if (!probe.current() || probe.token != request) return;
+                if (!verified) {
+                    probe.finish(-1L, "TG_CONFIG_REJECTED");
+                    return;
+                }
+                probe.configElapsedMs = configMs;
+                probe.measureNearestDcRtt();
+            });
+            return;
+        }
+        if (completedStage == 2) {
+            boolean nearestOk = false;
+            try {
+                if (pointer != 0) {
+                    NativeByteBuffer response = NativeByteBuffer.wrap(pointer);
+                    response.reused = true;
+                    TLRPC.TL_nearestDc nearest = TLRPC.TL_nearestDc.TLdeserialize(response, response.readInt32(true), true);
+                    nearestOk = nearest != null;
+                }
+            } catch (RuntimeException ignored) { }
+            final boolean ok = nearestOk;
+            final long rttMs = probe.rttSentAt > 0L ? Math.max(1L, completedAt - probe.rttSentAt) : -1L;
+            active.main.post(() -> {
+                if (!probe.current() || probe.token != request) return;
+                long reported = (ok && rttMs > 0L) ? rttMs : probe.fallbackEstimateMs();
+                probe.finish(reported, "TG_CONFIG_OK");
+            });
+        }
     }
     private static void deliver(Messenger messenger, long time, String reason) {
         Message result = Message.obtain(null, ColgramGuestProxyProbe.RESULT);

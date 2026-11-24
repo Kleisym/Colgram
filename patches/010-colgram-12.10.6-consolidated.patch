@@ -1086,26 +1086,35 @@ index a350abf4..9302dd31 100644
                          case PRIVACY_RULES_TYPE_VOICE_MESSAGES:
                              voiceMessagesRules = rules.rules;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
-index 4d0dac30..a5723756 100644
+index 4d0dac30..481cf0be 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
-@@ -286,10 +286,14 @@ public class FileLoadOperation {
+@@ -286,10 +286,21 @@ public class FileLoadOperation {
      }
  
      private void updateParams() {
 -        if ((preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams) && !forceSmallChunk) {
 +        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();
-+        if ((boost || preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams) && !forceSmallChunk) {
++        boolean experimental = preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams;
++        boolean bigOrStory = isStory || totalBytesCount >= bigFileSizeFrom;
++        if ((experimental || (boost && bigOrStory)) && !forceSmallChunk) {
              downloadChunkSizeBig = 1024 * 512;
-             maxDownloadRequests = 8;
-             maxDownloadRequestsBig = 8;
+-            maxDownloadRequests = 8;
+-            maxDownloadRequestsBig = 8;
++            maxDownloadRequests = boost ? 6 : 8;
++            maxDownloadRequestsBig = boost ? 6 : 8;
 +            if (boost) {
 +                maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);
 +            }
++        } else if (boost && !forceSmallChunk) {
++            downloadChunkSizeBig = 1024 * 128;
++            maxDownloadRequests = 6;
++            maxDownloadRequestsBig = 6;
++            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);
          } else {
              downloadChunkSizeBig = 1024 * 128;
              maxDownloadRequests = 4;
-@@ -1005,7 +1009,7 @@ public class FileLoadOperation {
+@@ -1005,7 +1016,7 @@ public class FileLoadOperation {
              }
          }
          boolean finalFileExist = cacheFileFinalReady = cacheFileFinal.exists();
@@ -5652,7 +5661,7 @@ index 206aaa8c..e88dd313 100755
 +    }
  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
-index c3a70edf..c3f00a35 100644
+index c3a70edf..437b7590 100644
 --- a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
 +++ b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
 @@ -205,6 +205,8 @@ public class ConnectionsManager extends BaseController {
@@ -5992,7 +6001,7 @@ index c3a70edf..c3f00a35 100644
          try {
              StatsController.getInstance(currentAccount).incrementReceivedBytesCount(networkType, StatsController.TYPE_TOTAL, amount);
          } catch (Exception e) {
-@@ -926,6 +1074,7 @@ public class ConnectionsManager extends BaseController {
+@@ -926,11 +1074,35 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onUpdateConfig(long address, final int currentAccount) {
@@ -6000,7 +6009,35 @@ index c3a70edf..c3f00a35 100644
          try {
              NativeByteBuffer buff = NativeByteBuffer.wrap(address);
              buff.reused = true;
-@@ -939,9 +1088,12 @@ public class ConnectionsManager extends BaseController {
+             final TLRPC.TL_config message = TLRPC.TL_config.TLdeserialize(buff, buff.readInt32(true), true);
+             if (message != null) {
++                try {
++                    if (message.dc_options != null && !message.dc_options.isEmpty()) {
++                        int count = message.dc_options.size();
++                        int[] ids = new int[count];
++                        String[] ips = new String[count];
++                        boolean[] mediaOnly = new boolean[count];
++                        boolean[] cdn = new boolean[count];
++                        boolean[] ipv6 = new boolean[count];
++                        for (int i = 0; i < count; i++) {
++                            TLRPC.TL_dcOption opt = message.dc_options.get(i);
++                            if (opt != null) {
++                                ids[i] = opt.id;
++                                ips[i] = opt.ip_address;
++                                mediaOnly[i] = opt.media_only;
++                                cdn[i] = opt.cdn;
++                                ipv6[i] = opt.ipv6;
++                            }
++                        }
++                        org.colgram.core.ColgramTelegramDcAddresses.updateFromDcOptions(
++                                ApplicationLoader.applicationContext, ids, ips, mediaOnly, cdn, ipv6);
++                    }
++                } catch (Throwable ignored) {
++                }
+                 Utilities.stageQueue.postRunnable(() -> AccountInstance.getInstance(currentAccount).getMessagesController().updateConfig(message));
+             }
+         } catch (Exception e) {
+@@ -939,9 +1111,12 @@ public class ConnectionsManager extends BaseController {
      }
  
      public static void onInternalPushReceived(final int currentAccount) {
@@ -6013,7 +6050,7 @@ index c3a70edf..c3f00a35 100644
      public static void setProxySettings(boolean enabled, ProxySettings settings) {
          String address = "";
          int port = 0;
-@@ -969,6 +1121,20 @@ public class ConnectionsManager extends BaseController {
+@@ -969,6 +1144,20 @@ public class ConnectionsManager extends BaseController {
              WebProxyTransport.stop();
          }
  
@@ -6034,7 +6071,7 @@ index c3a70edf..c3f00a35 100644
          for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
              if (enabled && settings != null && settings.isValid()) {
                  native_setProxySettings(a, address, port, username, password, secret);
-@@ -977,7 +1143,8 @@ public class ConnectionsManager extends BaseController {
+@@ -977,7 +1166,8 @@ public class ConnectionsManager extends BaseController {
              }
              AccountInstance accountInstance = AccountInstance.getInstance(a);
              if (accountInstance.getUserConfig().isClientActivated()) {
@@ -6044,7 +6081,7 @@ index c3a70edf..c3f00a35 100644
              }
          }
      }
-@@ -1114,6 +1281,12 @@ public class ConnectionsManager extends BaseController {
+@@ -1114,6 +1304,12 @@ public class ConnectionsManager extends BaseController {
                  }
              }
              if (hasIpv6) {
@@ -6057,7 +6094,7 @@ index c3a70edf..c3f00a35 100644
                  if (forceTryIpV6) {
                      return USE_IPV6_ONLY;
                  }
-@@ -1149,12 +1322,27 @@ public class ConnectionsManager extends BaseController {
+@@ -1149,12 +1345,27 @@ public class ConnectionsManager extends BaseController {
          }
  
          protected ResolvedDomain doInBackground(Void... voids) {
@@ -6086,7 +6123,7 @@ index c3a70edf..c3f00a35 100644
                  httpConnection.addRequestProperty("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 10_0 like Mac OS X) AppleWebKit/602.1.38 (KHTML, like Gecko) Version/10.0 Mobile/14A5297c Safari/602.1");
                  httpConnection.addRequestProperty("Host", "dns.google.com");
                  httpConnection.setConnectTimeout(1000);
-@@ -1207,7 +1395,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1207,7 +1418,7 @@ public class ConnectionsManager extends BaseController {
  
                  }
              }
@@ -6095,7 +6132,7 @@ index c3a70edf..c3f00a35 100644
                  try {
                      InetAddress address = InetAddress.getByName(currentHostName);
                      ArrayList<String> addresses = new ArrayList<>(1);
-@@ -1246,6 +1434,42 @@ public class ConnectionsManager extends BaseController {
+@@ -1246,6 +1457,42 @@ public class ConnectionsManager extends BaseController {
              currentAccount = instance;
          }
  
@@ -6138,7 +6175,7 @@ index c3a70edf..c3f00a35 100644
          protected NativeByteBuffer doInBackground(Void... voids) {
              ByteArrayOutputStream outbuf = null;
              InputStream httpConnectionStream = null;
-@@ -1258,11 +1482,8 @@ public class ConnectionsManager extends BaseController {
+@@ -1258,11 +1505,8 @@ public class ConnectionsManager extends BaseController {
                  for (int a = 0; a < len; a++) {
                      padding.append(characters.charAt(Utilities.random.nextInt(characters.length())));
                  }
@@ -6152,7 +6189,7 @@ index c3a70edf..c3f00a35 100644
                  httpConnection.connect();
                  httpConnectionStream = httpConnection.getInputStream();
                  responseDate = (int) (httpConnection.getDate() / 1000);
-@@ -1378,12 +1599,9 @@ public class ConnectionsManager extends BaseController {
+@@ -1378,12 +1622,9 @@ public class ConnectionsManager extends BaseController {
                  for (int a = 0; a < len; a++) {
                      padding.append(characters.charAt(Utilities.random.nextInt(characters.length())));
                  }
@@ -6167,7 +6204,7 @@ index c3a70edf..c3f00a35 100644
                  httpConnection.connect();
                  httpConnectionStream = httpConnection.getInputStream();
                  responseDate = (int) (httpConnection.getDate() / 1000);
-@@ -1475,6 +1693,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1475,6 +1716,7 @@ public class ConnectionsManager extends BaseController {
      public static long lastPremiumFloodWaitShown = 0;
      @Keep
      public static void onPremiumFloodWait(final int currentAccount, final int requestToken, boolean isUpload) {
@@ -6175,7 +6212,7 @@ index c3a70edf..c3f00a35 100644
          AndroidUtilities.runOnUIThread(() -> {
              if (UserConfig.selectedAccount != currentAccount) {
                  return;
-@@ -1504,6 +1723,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1504,6 +1746,7 @@ public class ConnectionsManager extends BaseController {
  
      @Keep
      public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
@@ -6183,7 +6220,7 @@ index c3a70edf..c3f00a35 100644
          AndroidUtilities.runOnUIThread(() -> {
              long start = System.currentTimeMillis();
              FileLog.d("account"+currentAccount+": server requests integrity classic check with project = "+project+" nonce = " + nonce);
-@@ -1543,6 +1763,7 @@ public class ConnectionsManager extends BaseController {
+@@ -1543,6 +1786,7 @@ public class ConnectionsManager extends BaseController {
  
      @Keep
      public static void onCaptchaCheck(final int currentAccount, final int requestToken, final String action, final String key_id) {
@@ -16627,16 +16664,16 @@ index b3cd7c50..ca2ecad3 100644
      }
  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
-index dc29adcd..93bba23b 100644
+index dc29adcd..d2892b4c 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
-@@ -380,6 +380,48 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -380,6 +380,90 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
      private final LiteMode.BatteryReceiver batteryReceiver = new LiteMode.BatteryReceiver();
      private WindowAnimatedInsetsProvider rootAnimatedInsetsListener;
  
 +    public static void colgramSyncCompanionPanesForTheme(Theme.ThemeInfo theme, boolean nightTheme) {
 +        LaunchActivity la = instance;
-+        if (la == null || theme == null || la.isFinishing()) return;
++        if (la == null || theme == null || la.isFinishing() || la.isDestroyed()) return;
 +        try {
 +            if (la.actionBarLayout != null) {
 +                la.actionBarLayout.animateThemedValues(theme, theme.currentAccentId, nightTheme, true);
@@ -16653,8 +16690,16 @@ index dc29adcd..93bba23b 100644
 +    }
 +
 +    public static void colgramSyncAllPanesAfterTheme(Theme.ThemeInfo theme, boolean nightTheme) {
++        colgramSyncAllPanesAfterThemeInternal(theme, nightTheme, 0);
++    }
++
++    private static void colgramSyncAllPanesAfterThemeInternal(Theme.ThemeInfo theme, boolean nightTheme, int attempt) {
 +        LaunchActivity la = instance;
-+        if (la == null || theme == null || la.isFinishing()) return;
++        if (la == null || la.isFinishing() || la.isDestroyed() || theme == null) return;
++        if (la.actionBarLayout != null && la.actionBarLayout.isTransitionAnimationInProgress() && attempt < 5) {
++            AndroidUtilities.runOnUIThread(() -> colgramSyncAllPanesAfterThemeInternal(theme, nightTheme, attempt + 1), 260L);
++            return;
++        }
 +        try {
 +            if (la.actionBarLayout != null) {
 +                la.actionBarLayout.animateThemedValues(theme, theme.currentAccentId, nightTheme, true);
@@ -16676,10 +16721,52 @@ index dc29adcd..93bba23b 100644
 +        } catch (Throwable ignored) {}
 +    }
 +
++    private void colgramEnsureActivatedAccount() {
++        UserConfig.getInstance(0).loadConfig();
++        if (currentAccount < 0 || currentAccount >= UserConfig.MAX_ACCOUNT_COUNT) {
++            currentAccount = (UserConfig.selectedAccount >= 0 && UserConfig.selectedAccount < UserConfig.MAX_ACCOUNT_COUNT)
++                    ? UserConfig.selectedAccount : 0;
++        }
++        UserConfig curCfg = UserConfig.getInstance(currentAccount);
++        curCfg.loadConfig();
++        if (curCfg.isClientActivated()) {
++            if (UserConfig.selectedAccount != currentAccount) {
++                UserConfig.selectedAccount = currentAccount;
++                UserConfig.getInstance(0).saveConfig(false);
++            }
++            return;
++        }
++        if (UserConfig.selectedAccount >= 0 && UserConfig.selectedAccount < UserConfig.MAX_ACCOUNT_COUNT) {
++            UserConfig selCfg = UserConfig.getInstance(UserConfig.selectedAccount);
++            selCfg.loadConfig();
++            if (selCfg.isClientActivated()) {
++                currentAccount = UserConfig.selectedAccount;
++                return;
++            }
++        }
++        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
++            UserConfig cfg = UserConfig.getInstance(a);
++            cfg.loadConfig();
++            if (cfg.isClientActivated()) {
++                currentAccount = UserConfig.selectedAccount = a;
++                UserConfig.getInstance(0).saveConfig(false);
++                return;
++            }
++        }
++    }
++
      public static LaunchActivity instance;
  
      public boolean voipLaunchedInBackground;
-@@ -504,6 +546,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -410,6 +494,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+         AndroidUtilities.checkDisplaySize(this, getResources().getConfiguration());
+         currentAccount = UserConfig.selectedAccount;
+         registerReceiver(batteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
++        colgramEnsureActivatedAccount();
+         if (!UserConfig.getInstance(currentAccount).isClientActivated()) {
+             Intent intent = getIntent();
+             boolean isProxy = false;
+@@ -504,6 +589,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                      });
                      wasPortrait = portrait;
                  }
@@ -16689,7 +16776,7 @@ index dc29adcd..93bba23b 100644
              }
          });
          drawerLayoutContainer.setClipChildren(false);
-@@ -548,8 +593,12 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -548,8 +636,12 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              if (getLastFragment() != null && getLastFragment().getLastStoryViewer() != null) {
                  getLastFragment().getLastStoryViewer().updatePlayingMode();
              }
@@ -16702,7 +16789,16 @@ index dc29adcd..93bba23b 100644
          Theme.loadWallpaper(true);
  
          checkCurrentAccount();
-@@ -995,10 +1044,52 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -582,6 +674,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+ 
+         LiteMode.addOnPowerSaverAppliedListener(onPowerSaverCallback = this::onPowerSaver);
+         if (actionBarLayout.getFragmentStack().isEmpty() && (layersActionBarLayout == null || layersActionBarLayout.getFragmentStack().isEmpty())) {
++            colgramEnsureActivatedAccount();
++            checkCurrentAccount();
+             if (!UserConfig.getInstance(currentAccount).isClientActivated()) {
+                 actionBarLayout.addFragmentToStack(getClientNotActivatedFragment());
+             } else {
+@@ -995,10 +1089,52 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              }
  
              backgroundTablet = new SizeNotifierFrameLayout(this) {
@@ -16755,7 +16851,7 @@ index dc29adcd..93bba23b 100644
              };
              backgroundTablet.setOccupyStatusBar(false);
              backgroundTablet.setBackgroundImage(Theme.getCachedWallpaper(), Theme.isWallpaperMotion());
-@@ -1014,6 +1105,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -1014,6 +1150,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              rightActionBarLayout.setIsRightLayout();
              rightActionBarLayout.setFragmentStack(rightFragmentsStack);
              rightActionBarLayout.setDelegate(this);
@@ -16767,7 +16863,7 @@ index dc29adcd..93bba23b 100644
              launchLayout.addView(rightActionBarLayout.getView());
  
              shadowTablet = new FrameLayout(this);
-@@ -1504,6 +1600,67 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -1504,6 +1645,67 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
          return handleIntent(intent, isNew, restore, fromPassword, null, true, false);
      }
  
@@ -16835,7 +16931,18 @@ index dc29adcd..93bba23b 100644
      @SuppressLint("Range")
      private boolean handleIntent(Intent intent, boolean isNew, boolean restore, boolean fromPassword, Browser.Progress progress, boolean rebuildFragments, boolean openedTelegram) {
          if (GiftInfoBottomSheet.handleIntent(intent, progress)) {
-@@ -1545,6 +1702,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -1530,6 +1732,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+         String action = intent.getAction();
+         final int[] intentAccount = new int[]{intent.getIntExtra("currentAccount", UserConfig.selectedAccount)};
+         switchToAccount(intentAccount[0], true);
++        if (currentAccount < 0 || currentAccount >= UserConfig.MAX_ACCOUNT_COUNT || !UserConfig.getInstance(currentAccount).isClientActivated()) {
++            colgramEnsureActivatedAccount();
++            checkCurrentAccount();
++        }
+         final boolean isVoipIntent = action != null && action.equals("voip");
+         final boolean isVoipAnswerIntent = action != null && action.equals("voip_answer");
+         if ((isVoipIntent || isVoipAnswerIntent) && !isNew && ApplicationLoader.mainInterfacePaused) {
+@@ -1545,6 +1751,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                  return false;
              }
          }
@@ -16845,7 +16952,18 @@ index dc29adcd..93bba23b 100644
          boolean pushOpened = false;
          long push_user_id = 0;
          long push_chat_id = 0;
-@@ -5956,6 +6116,43 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -3293,6 +3502,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+             }
+         }
+         if (!pushOpened && !isNew) {
++            if (currentAccount < 0 || currentAccount >= UserConfig.MAX_ACCOUNT_COUNT || !UserConfig.getInstance(currentAccount).isClientActivated()) {
++                colgramEnsureActivatedAccount();
++                checkCurrentAccount();
++            }
+             if (AndroidUtilities.isTablet()) {
+                 if (!UserConfig.getInstance(currentAccount).isClientActivated()) {
+                     if (layersActionBarLayout.getFragmentStack().isEmpty()) {
+@@ -5956,6 +6169,43 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
  
      private boolean firstAppUpdateCheck = true;
      public void checkAppUpdate(boolean force, Browser.Progress progress) {
@@ -16889,7 +17007,7 @@ index dc29adcd..93bba23b 100644
          if (!ApplicationLoader.isStandaloneBuild() && !ApplicationLoader.isBetaBuild()) {
              return;
          }
-@@ -6052,6 +6249,57 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -6052,6 +6302,57 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
          }
      }
  
@@ -16947,7 +17065,7 @@ index dc29adcd..93bba23b 100644
      public Dialog showAlertDialog(AlertDialog.Builder builder) {
          try {
              AlertDialog dialog = builder.show();
-@@ -6623,6 +6871,43 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -6623,6 +6924,43 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              }
              UserConfig.getInstance(currentAccount).saveConfig(false);
          }
@@ -16991,7 +17109,7 @@ index dc29adcd..93bba23b 100644
          if (requestCode == 105) {
              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                  if (ApplicationLoader.canDrawOverlays = Settings.canDrawOverlays(this)) {
-@@ -6769,6 +7054,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -6769,6 +7107,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              VoIPFragment.onPause();
          }
          SpoilerEffect2.pause(true);
@@ -17001,7 +17119,7 @@ index dc29adcd..93bba23b 100644
          //if (refreshRateController != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
          //    refreshRateController.stop();
          //}
-@@ -6852,6 +7140,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -6852,6 +7193,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
  
      @Override
      protected void onDestroy() {
@@ -17012,7 +17130,7 @@ index dc29adcd..93bba23b 100644
          isActive = false;
          activeInstanceCount--;
          unregisterReceiver(batteryReceiver);
-@@ -7012,6 +7304,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7012,6 +7357,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                  overlay.onResume();
              }
          }
@@ -17022,7 +17140,7 @@ index dc29adcd..93bba23b 100644
          ConnectionsManager.getInstance(currentAccount).setAppPaused(false, false);
          updateCurrentConnectionState(currentAccount);
          if (PhotoViewer.hasInstance() && PhotoViewer.getInstance().isVisible()) {
-@@ -7031,6 +7326,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7031,6 +7379,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              showUpdateActivity(UserConfig.selectedAccount, SharedConfig.pendingAppUpdate, true);
          }
          checkAppUpdate(false, null);
@@ -17030,7 +17148,7 @@ index dc29adcd..93bba23b 100644
  
          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
              ApplicationLoader.canDrawOverlays = Settings.canDrawOverlays(this);
-@@ -7044,6 +7340,17 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7044,6 +7393,17 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
          if (ApplicationLoader.applicationLoaderInstance != null) {
              ApplicationLoader.applicationLoaderInstance.onResume();
          }
@@ -17048,7 +17166,7 @@ index dc29adcd..93bba23b 100644
          if (whenResumed != null) {
              whenResumed.run();
              whenResumed = null;
-@@ -7335,7 +7642,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7335,7 +7695,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              fragment.showDialog(dialog);
              dialog.setCanceledOnTouchOutside(false);
          } else if (id == NotificationCenter.didSetNewTheme) {
@@ -17059,7 +17177,7 @@ index dc29adcd..93bba23b 100644
              if (!nightTheme) {
                  try {
                      setTaskDescription(new ActivityManager.TaskDescription(null, null, Theme.getColor(Theme.key_actionBarDefault) | 0xff000000));
-@@ -7344,10 +7653,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7344,10 +7706,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                  }
              }
              boolean checkNavigationBarColor = true;
@@ -17070,7 +17188,7 @@ index dc29adcd..93bba23b 100644
              }
 -            checkSystemBarColors(args.length > 2 && (boolean) args[2], true, checkNavigationBarColor && !isNavigationBarColorFrozen && !actionBarLayout.isTransitionAnimationInProgress());
 +            boolean full = args.length > 2 && args[2] instanceof Boolean && (Boolean) args[2];
-+            checkSystemBarColors(full, true, checkNavigationBarColor && !isNavigationBarColorFrozen && !actionBarLayout.isTransitionAnimationInProgress());
++            checkSystemBarColors(full, true, checkNavigationBarColor && !isNavigationBarColorFrozen && actionBarLayout != null && !actionBarLayout.isTransitionAnimationInProgress());
          } else if (id == NotificationCenter.needSetDayNightTheme) {
              boolean instant = false;
              if (args[2] != null) {
@@ -17687,7 +17805,7 @@ index 28e3b765..2d324de4 100644
                  presentFragment(PasscodeActivity.determineOpenFragment());
              } else if (position == cacheRow) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/MainTabsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/MainTabsActivity.java
-index 67bb2aa9..0dfa3f01 100644
+index 67bb2aa9..bc446890 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/MainTabsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/MainTabsActivity.java
 @@ -9,8 +9,11 @@ import android.animation.Animator;
@@ -17733,7 +17851,47 @@ index 67bb2aa9..0dfa3f01 100644
      private View fadeView;
  
      public MainTabsActivity() {
-@@ -274,6 +289,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -126,13 +141,16 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+             iBlur3SourceTabGlass.setupRenderer(new RenderNodeWithHash.Renderer() {
+                 @Override
+                 public void renderNodeCalculateHash(IBlur3Hash hash) {
++                    if (fragmentView == null || contentView == null) {
++                        return;
++                    }
+                     hash.add(getThemedColor(Theme.key_windowBackgroundWhite));
+                     hash.add(SharedConfig.chatBlurEnabled());
+ 
+                     for (int a = 0, N = fragmentsArr.size(); a < N; a++) {
+                         final FragmentState state = fragmentsArr.valueAt(a);
+-                        final BaseFragment fragment = state.fragment;
+-                        if (fragment.fragmentView == null) {
++                        final BaseFragment fragment = state != null ? state.fragment : null;
++                        if (fragment == null || fragment.fragmentView == null) {
+                             continue;
+                         }
+                         if (!ViewPositionWatcher.computeRectInParent(fragment.fragmentView, contentView, fragmentPosition)) {
+@@ -156,6 +174,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+                 @Override
+                 public void renderNodeUpdateDisplayList(Canvas canvas) {
++                    if (fragmentView == null || contentView == null) {
++                        return;
++                    }
+                     final int width = fragmentView.getMeasuredWidth();
+                     final int height = fragmentView.getMeasuredHeight();
+ 
+@@ -163,8 +184,8 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+                     for (int a = 0, N = fragmentsArr.size(); a < N; a++) {
+                         final FragmentState state = fragmentsArr.valueAt(a);
+-                        final BaseFragment fragment = state.fragment;
+-                        if (fragment.fragmentView == null) {
++                        final BaseFragment fragment = state != null ? state.fragment : null;
++                        if (fragment == null || fragment.fragmentView == null) {
+                             continue;
+                         }
+                         if (!ViewPositionWatcher.computeRectInParent(fragment.fragmentView, contentView, fragmentPosition)) {
+@@ -274,12 +295,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          blur3_updateColors();
          checkContactsTabBadge();
          checkUnreadCount(true);
@@ -17741,7 +17899,54 @@ index 67bb2aa9..0dfa3f01 100644
  
          showAccountChangeHint();
      }
-@@ -361,11 +377,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+     private void checkContactsTabBadge() {
+-        if (tabsView != null && tabs[INDEX_CONTACTS] != null) {
++        if (tabsView != null && tabs != null && tabs.length > INDEX_CONTACTS && tabs[INDEX_CONTACTS] != null) {
+             final boolean hasPermission = Build.VERSION.SDK_INT >= 23 && ContactsController.hasContactsPermission();
+             if (hasPermission) {
+                 MessagesController.getGlobalNotificationsSettings().edit().putBoolean("askAboutContacts2", true).apply();
+@@ -300,6 +322,30 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+         }
+     }
+ 
++    @Override
++    public void clearViews() {
++        if (accountSwitchHint != null) {
++            AndroidUtilities.removeFromParent(accountSwitchHint);
++            accountSwitchHint = null;
++        }
++        super.clearViews();
++        colgramDockShell = null;
++        colgramDockPager = null;
++        colgramPageDotsView = null;
++        colgramDockBackground = null;
++        colgramGlassFactory = null;
++        colgramExtraTabHolders.clear();
++        tabsView = null;
++        tabsViewWrapper = null;
++        tabsViewBackground = null;
++        updateLayoutWrapper = null;
++        updateLayout = null;
++        fadeView = null;
++        tabs = null;
++        contentView = null;
++        viewPager = null;
++    }
++
+     @Override
+     public View createView(Context context) {
+         super.createView(context);
+@@ -331,7 +377,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+             final int position = indexToPosition(index);
+             tabs[index].setOnClickListener(v -> {
+-                if (viewPager.isManualScrolling() || viewPager.isTouch()) {
++                if (viewPager == null || viewPager.isManualScrolling() || viewPager.isTouch()) {
+                     return;
+                 }
+ 
+@@ -361,11 +407,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          BlurredBackgroundDrawableViewFactory iBlur3FactoryGlass = new BlurredBackgroundDrawableViewFactory(iBlur3SourceTabGlass != null ? iBlur3SourceTabGlass : iBlur3SourceColor);
          iBlur3FactoryGlass.setSourceRootView(viewPositionWatcher, contentView);
          iBlur3FactoryGlass.setLiquidGlassEffectAllowed(LiteMode.isEnabled(LiteMode.FLAG_LIQUID_GLASS));
@@ -17755,7 +17960,7 @@ index 67bb2aa9..0dfa3f01 100644
  
          BlurredBackgroundDrawableViewFactory iBlur3FactoryFade = new BlurredBackgroundDrawableViewFactory(iBlur3SourceColor);
          iBlur3FactoryFade.setSourceRootView(viewPositionWatcher, contentView);
-@@ -386,6 +404,8 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -386,6 +434,8 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          updateLayoutWrapper = new UpdateLayoutWrapper(context);
          contentView.addView(updateLayoutWrapper, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.BOTTOM));
  
@@ -17764,7 +17969,16 @@ index 67bb2aa9..0dfa3f01 100644
          updateLayout = ApplicationLoader.applicationLoaderInstance.takeUpdateLayout(getParentActivity(), updateLayoutWrapper);
          if (updateLayout != null) {
              updateLayout.updateAppUpdateViews(currentAccount, false);
-@@ -573,12 +593,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -397,7 +447,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+     }
+ 
+     private void checkUnreadCount(boolean animated) {
+-        if (tabsView == null) {
++        if (tabsView == null || tabs == null || tabs.length <= INDEX_CHATS || tabs[INDEX_CHATS] == null) {
+             return;
+         }
+ 
+@@ -573,12 +623,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
              final float left = x + dp(5);
              final float centerY = (top + bottom) / 2f + dp(1);
              final float halfHeight = dp(HEIGHT_DP) / 2f;
@@ -17781,7 +17995,17 @@ index 67bb2aa9..0dfa3f01 100644
              AndroidUtilities.rectTmp.set(left, centerY - halfHeight, left + counterWidth, centerY + halfHeight);
              canvas.drawRoundRect(AndroidUtilities.rectTmp, halfHeight, halfHeight, backgroundPaint);
              final Paint.FontMetrics fontMetrics = textPaint.getFontMetrics();
-@@ -621,28 +642,6 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -588,6 +639,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+     }
+ 
+     private void openFolder(int folderId) {
++        if (viewPager == null) {
++            return;
++        }
+         if (viewPager.getCurrentPosition() == POSITION_CHATS && dialogsActivity != null) {
+             dialogsActivity.scrollToFolder(folderId);
+         } else {
+@@ -621,28 +675,6 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          });
  
          ItemOptions o = ItemOptions.makeOptions(this, button);
@@ -17810,7 +18034,7 @@ index 67bb2aa9..0dfa3f01 100644
  
          if (BuildConfig.DEBUG_PRIVATE_VERSION) {
              o.add(R.drawable.menu_download_round, "Dump Canvas", () -> AndroidUtilities.runOnUIThread(this::dumpCanvas, 1000));
-@@ -650,9 +649,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -650,9 +682,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
  
          if (accountNumbers.size() > 0) {
              if (o.getItemsCount() > 0) o.addGap();
@@ -17826,7 +18050,7 @@ index 67bb2aa9..0dfa3f01 100644
                  btn.setOnClickListener(v -> {
                      if (currentAccount == account) return;
                      o.dismiss();
-@@ -660,9 +663,11 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -660,9 +696,11 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
                          LaunchActivity.instance.switchToAccount(account, true);
                      }
                  });
@@ -17839,7 +18063,7 @@ index 67bb2aa9..0dfa3f01 100644
  
          o.setBlur(true);
          o.translate(0, -dp(4));
-@@ -677,49 +682,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -677,54 +715,12 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
      }
  
      public LinearLayout accountView(int account, boolean selected) {
@@ -17890,21 +18114,114 @@ index 67bb2aa9..0dfa3f01 100644
      }
  
      @Override
-@@ -852,6 +815,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
-             GlassTabView tab = tabs[a];
-             tab.setSelected(indexToPosition(a) == position, animated);
+     protected void onViewPagerScrollEnd() {
+-        if (tabsView != null) {
++        if (tabsView != null && viewPager != null) {
+             selectTab(viewPager.getCurrentPosition(), true);
+             setGestureSelectedOverride(0, false);
          }
+@@ -751,7 +747,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+     protected void onViewPagerTabAnimationUpdate(boolean manual) {
+         final boolean isDragByGesture = !manual;
+ 
+-        if (tabsView != null) {
++        if (tabsView != null && viewPager != null) {
+             final float position = viewPager.getPositionAnimated();
+             setGestureSelectedOverride(position, isDragByGesture);
+             if (isDragByGesture) {
+@@ -761,7 +757,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+         checkUi_fadeView();
+         blur3_invalidateBlur();
+-        contentView.invalidate();
++        if (contentView != null) {
++            contentView.invalidate();
++        }
+     }
+ 
+ 
+@@ -782,7 +780,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+         final boolean result = super.onBackPressed(invoked);
+         if (result) {
+             final int startPosition = getStartPosition();
+-            if (viewPager.getCurrentPosition() != startPosition) {
++            if (viewPager != null && viewPager.getCurrentPosition() != startPosition) {
+                 if (invoked) {
+                     viewPager.scrollToPosition(startPosition);
+                 }
+@@ -848,19 +846,39 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+     public GlassTabView[] tabs;
+ 
+     public void selectTab(int position, boolean animated) {
++        if (tabs == null) {
++            return;
++        }
+         for (int a = 0; a < tabs.length; a++) {
+             GlassTabView tab = tabs[a];
+-            tab.setSelected(indexToPosition(a) == position, animated);
++            if (tab != null) {
++                tab.setSelected(indexToPosition(a) == position, animated);
++            }
++        }
 +        if (animated && colgramDockPager != null && colgramDockPager.getVisibility() == View.VISIBLE
 +                && colgramDockPager.getCurrentPage() != 0) {
 +            colgramDockPager.setCurrentPage(0, true);
 +        }
 +        if (ColgramGlobalOrbController.getInstance() != null) {
 +            ColgramGlobalOrbController.getInstance().scheduleRelayout();
-+        }
+         }
      }
  
      public void setGestureSelectedOverride(float animatedPosition, boolean allow) {
-@@ -1013,6 +983,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
++        if (tabs == null) {
++            return;
++        }
+         for (int index = 0; index < tabs.length; index++) {
++            if (tabs[index] == null) {
++                continue;
++            }
+             final int position = indexToPosition(index);
+             final float visibility = Math.max(0, 1f - Math.abs(position - animatedPosition));
+             tabs[index].setGestureSelectedOverride(visibility, allow);
+         }
+-        tabsView.invalidate();
++        if (tabsView != null) {
++            tabsView.invalidate();
++        }
+     }
+ 
+ 
+@@ -917,6 +935,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+         insetRight = systemInsets.right;
+ 
+         navigationBarHeight = systemInsets.bottom;
++        if (updateLayoutWrapper == null || fadeView == null || viewPager == null || tabsViewWrapper == null) {
++            return super.onApplyWindowInsets(v, insets);
++        }
+         final boolean isUpdateLayoutVisible = updateLayoutWrapper.isUpdateLayoutVisible();
+         final int updateLayoutHeight = isUpdateLayoutVisible ? dp(UpdateLayoutWrapper.HEIGHT) : 0;
+         updateLayoutWrapper.setPadding(0, 0, 0, navigationBarHeight);
+@@ -989,7 +1010,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+                 updateLayout.updateAppUpdateViews(currentAccount, LaunchActivity.instance.getMainFragmentsStackSize() == 1);
+             }
+         } else if (id == NotificationCenter.needSetDayNightTheme) {
+-            clearAllHiddenFragments();
++            if (viewPager != null) {
++                clearAllHiddenFragments();
++            }
+         } else if (id == NotificationCenter.callTabsVisibleToggled) {
+             final boolean callTabsVisible = getUserConfig().showCallsTab;
+             checkUi_callTabVisible(callTabsVisible, true);
+@@ -1001,7 +1024,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+                 dropFragmentAtPosition(POSITION_CALLS_OR_SETTINGS);
+             }
+         } else if (id == NotificationCenter.mainUserInfoChanged) {
+-            if (tabs != null && tabs[INDEX_PROFILE] != null) {
++            if (tabs != null && tabs.length > INDEX_PROFILE && tabs[INDEX_PROFILE] != null) {
+                 tabs[INDEX_PROFILE].updateUserAvatar(currentAccount);
+             }
+         } else if (id == NotificationCenter.contactsPermissionBadgeCheck) {
+@@ -1013,6 +1036,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
  
      @Override
      public boolean onFragmentCreate() {
@@ -17912,15 +18229,20 @@ index 67bb2aa9..0dfa3f01 100644
          observersGroup = NotificationCenter.getInstance(currentAccount)
              .createObserversGroup(this)
              .add(NotificationCenter.fileLoaded)
-@@ -1032,6 +1003,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -1032,6 +1056,12 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
  
      @Override
      public void onFragmentDestroy() {
 +        ColgramBottomBarConfig.removeChangeListener(colgramBottomBarListener);
++        colgramExtraTabHolders.clear();
++        if (accountSwitchHint != null) {
++            AndroidUtilities.removeFromParent(accountSwitchHint);
++            accountSwitchHint = null;
++        }
          Bulletin.removeDelegate(this);
          Bulletin.removeDelegate(contentView);
  
-@@ -1070,7 +1042,10 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -1070,7 +1100,10 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
      }
  
      private void checkUi_tabsPosition() {
@@ -17932,7 +18254,7 @@ index 67bb2aa9..0dfa3f01 100644
          final int updateLayoutHeight = isUpdateLayoutVisible ? dp(UpdateLayoutWrapper.HEIGHT) : 0;
          final int normalY = -(updateLayoutHeight);
          final int hiddenY = normalY + dp(40);
-@@ -1079,10 +1054,25 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -1079,16 +1112,35 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          final float scale = lerp(0.85f, 1f, factor);
  
          tabsViewWrapper.setTranslationY(lerp(hiddenY, normalY, factor));
@@ -17962,7 +18284,20 @@ index 67bb2aa9..0dfa3f01 100644
      }
  
      private void checkUi_callTabVisible(boolean callTabsVisible, boolean animated) {
-@@ -1099,6 +1089,12 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+-        if (tabsView != null) {
+-            tabsView.setViewVisible(tabs[INDEX_SETTINGS], !callTabsVisible, animated);
+-            tabsView.setViewVisible(tabs[INDEX_CALLS], callTabsVisible, animated);
++        if (tabsView != null && tabs != null && tabs.length > INDEX_CALLS) {
++            if (tabs[INDEX_SETTINGS] != null) {
++                tabsView.setViewVisible(tabs[INDEX_SETTINGS], !callTabsVisible, animated);
++            }
++            if (tabs[INDEX_CALLS] != null) {
++                tabsView.setViewVisible(tabs[INDEX_CALLS], callTabsVisible, animated);
++            }
+         }
+     }
+ 
+@@ -1099,6 +1151,12 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          ThemeDescription.ThemeDescriptionDelegate cellDelegate = this::blur3_updateColors;
          themeDescriptions.add(new ThemeDescription(null, 0, null, null, null, cellDelegate, Theme.key_windowBackgroundWhite));
          themeDescriptions.add(new ThemeDescription(null, 0, null, null, null, cellDelegate, Theme.key_dialogBackground));
@@ -17975,8 +18310,15 @@ index 67bb2aa9..0dfa3f01 100644
  
          return themeDescriptions;
      }
-@@ -1164,7 +1160,10 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
-                 if (getContext() == null || tabs == null) return;
+@@ -1161,10 +1219,16 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+         if (accountSwitchHint == null && HintsController.Hint.AccountSwitchHint.show()) {
+             AndroidUtilities.runOnUIThread(() -> {
+-                if (getContext() == null || tabs == null) return;
++                if (getContext() == null || isFinishing() || fragmentView == null || contentView == null
++                        || tabsView == null || tabs == null || tabs.length <= INDEX_PROFILE || tabs[INDEX_PROFILE] == null) {
++                    return;
++                }
  
                  final View v = tabs[INDEX_PROFILE];
 -                final float translate = (contentView.getWidth() - ((tabsView.getX() + v.getX()) + v.getWidth()) + v.getWidth() / 2f) / AndroidUtilities.density;
@@ -17987,7 +18329,16 @@ index 67bb2aa9..0dfa3f01 100644
  
                  accountSwitchHint = new HintView2(getContext(), HintView2.DIRECTION_BOTTOM);
                  accountSwitchHint.setTranslationY(-navigationBarHeight + dp(4));
-@@ -1223,6 +1222,13 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+@@ -1193,7 +1257,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
+ 
+     private final RectF fragmentPosition = new RectF();
+     private void blur3_invalidateBlur() {
+-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || iBlur3SourceTabGlass == null || fragmentView == null) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || iBlur3SourceTabGlass == null || fragmentView == null || contentView == null) {
+             return;
+         }
+ 
+@@ -1223,9 +1287,502 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
          if (tabsView != null) {
              tabsView.invalidate();
          }
@@ -18000,14 +18351,17 @@ index 67bb2aa9..0dfa3f01 100644
 +        refreshColgramExtraTabsState();
          if (tabs != null) {
              for (GlassTabView tabView : tabs) {
-                 tabView.updateColorsLottie();
-@@ -1230,6 +1236,490 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
-         }
-     }
- 
+-                tabView.updateColorsLottie();
++                if (tabView != null) {
++                    tabView.updateColorsLottie();
++                }
++            }
++        }
++    }
++
 +    private void rebuildColgramBottomDock() {
 +        final Context context = getContext();
-+        if (context == null || tabsViewWrapper == null || tabsView == null) {
++        if (context == null || isFinishing() || tabsViewWrapper == null || tabsView == null) {
 +            return;
 +        }
 +        final java.util.List<String> extraIds = ColgramBottomBarConfig.getEnabledIds();
@@ -18485,13 +18839,9 @@ index 67bb2aa9..0dfa3f01 100644
 +                pillRect.set(x, cy - r, x + w, cy + r);
 +                canvas.drawRoundRect(pillRect, r, r, paint);
 +                x += w + gap;
-+            }
-+        }
-+    }
-+
-     @Override
-     public EdgeToEdgeSupportMode getEdgeToEdgeSupportMode() {
-         return EdgeToEdgeSupportMode.FULL;
+             }
+         }
+     }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java
 index d21d71c3..bfa3db16 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/NotificationsSettingsActivity.java
@@ -18984,7 +19334,7 @@ index 1220c6f2..cdc072b7 100644
                  return VIEW_TYPE_TEXT;
              } else if (position == notificationsDividerRow) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
-index d222504b..3691c7f7 100644
+index d222504b..d4d72eed 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
 @@ -72,9 +72,12 @@ import org.telegram.ui.Components.SlideChooseView;
@@ -19608,7 +19958,7 @@ index d222504b..3691c7f7 100644
          if (useProxySettings && SharedConfig.currentProxy != null && SharedConfig.proxyList.size() > 1 && IS_PROXY_ROTATION_AVAILABLE) {
              rotationRow = rowCount++;
              if (SharedConfig.proxyRotationEnabled) {
-@@ -613,11 +1022,28 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -613,15 +1022,37 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
          } else {
              useProxyShadowRow = -1;
          }
@@ -19638,7 +19988,43 @@ index d222504b..3691c7f7 100644
  
              boolean checking = false;
              if (!wasCheckedAllList) {
-@@ -669,27 +1095,68 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+                 for (SharedConfig.ProxyInfo info : proxyList) {
++                    if (org.colgram.core.ColgramProxyManager.usesCatalogVerifier(info)
++                            && info.available && info.ping > 0) {
++                        info.checking = false;
++                        continue;
++                    }
+                     if (info.checking || info.availableCheckTime == 0) {
+                         checking = true;
+                         break;
+@@ -632,18 +1063,16 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+                 }
+             }
+ 
+-            boolean isChecking = checking;
+             Collections.sort(proxyList, (o1, o2) -> {
+-                long bias1 = SharedConfig.currentProxy == o1 ? -200000 : 0;
+-                if (!o1.available) {
+-                    bias1 += 100000;
++                if (o1 == o2) return 0;
++                if (SharedConfig.currentProxy == o1) return -1;
++                if (SharedConfig.currentProxy == o2) return 1;
++                if (o1.available != o2.available) {
++                    return o1.available ? -1 : 1;
+                 }
+-                long bias2 = SharedConfig.currentProxy == o2 ? -200000 : 0;
+-                if (!o2.available) {
+-                    bias2 += 100000;
+-                }
+-                return Long.compare(isChecking && o1 != SharedConfig.currentProxy ? SharedConfig.proxyList.indexOf(o1) * 10000L : o1.ping + bias1,
+-                        isChecking && o2 != SharedConfig.currentProxy ? SharedConfig.proxyList.indexOf(o2) * 10000L : o2.ping + bias2);
++                long p1 = o1.ping > 0 ? o1.ping : Long.MAX_VALUE;
++                long p2 = o2.ping > 0 ? o2.ping : Long.MAX_VALUE;
++                return Long.compare(p1, p2);
+             });
+         }
+ 
+@@ -669,27 +1098,68 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
      }
  
      private void checkProxyList() {
@@ -19718,7 +20104,7 @@ index d222504b..3691c7f7 100644
      @Override
      protected void onDialogDismiss(Dialog dialog) {
          DownloadController.getInstance(currentAccount).checkAutodownloadSettings();
-@@ -698,11 +1165,20 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -698,11 +1168,20 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
      @Override
      public void onResume() {
          super.onResume();
@@ -19739,7 +20125,19 @@ index d222504b..3691c7f7 100644
      @Override
      public void didReceivedNotification(int id, int account, Object... args) {
          if (id == NotificationCenter.proxyChangedByRotation) {
-@@ -775,7 +1251,8 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -752,6 +1231,11 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+                 boolean checking = false;
+                 if (!wasCheckedAllList) {
+                     for (SharedConfig.ProxyInfo info : proxyList) {
++                        if (org.colgram.core.ColgramProxyManager.usesCatalogVerifier(info)
++                                && info.available && info.ping > 0) {
++                            info.checking = false;
++                            continue;
++                        }
+                         if (info.checking || info.availableCheckTime == 0) {
+                             checking = true;
+                             break;
+@@ -775,7 +1259,8 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
              VIEW_TYPE_TEXT_CHECK = 3,
              VIEW_TYPE_INFO = 4,
              VIEW_TYPE_PROXY_DETAIL = 5,
@@ -19749,7 +20147,7 @@ index d222504b..3691c7f7 100644
  
          public static final int PAYLOAD_CHECKED_CHANGED = 0;
          public static final int PAYLOAD_SELECTION_CHANGED = 1;
-@@ -832,39 +1309,169 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -832,39 +1317,169 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
          @Override
          public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
              switch (holder.getItemViewType()) {
@@ -19922,7 +20320,7 @@ index d222504b..3691c7f7 100644
                          cell.setText(getString(R.string.ProxyRotationTimeoutInfo));
                      }
                      break;
-@@ -911,7 +1518,13 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -911,7 +1526,13 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
              } else if (holder.getItemViewType() == VIEW_TYPE_TEXT_CHECK && payloads.contains(PAYLOAD_CHECKED_CHANGED)) {
                  TextCheckCell checkCell = (TextCheckCell) holder.itemView;
                  if (position == useProxyRow) {
@@ -19937,7 +20335,7 @@ index d222504b..3691c7f7 100644
                  } else if (position == rotationRow) {
                      checkCell.setChecked(SharedConfig.proxyRotationEnabled);
                  }
-@@ -927,7 +1540,13 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -927,7 +1548,13 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                  TextCheckCell checkCell = (TextCheckCell) holder.itemView;
                  int position = holder.getAdapterPosition();
                  if (position == useProxyRow) {
@@ -19952,7 +20350,7 @@ index d222504b..3691c7f7 100644
                  } else if (position == rotationRow) {
                      checkCell.setChecked(SharedConfig.proxyRotationEnabled);
                  }
-@@ -937,13 +1556,19 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -937,13 +1564,19 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
          @Override
          public boolean isEnabled(RecyclerView.ViewHolder holder) {
              int position = holder.getAdapterPosition();
@@ -19973,7 +20371,7 @@ index d222504b..3691c7f7 100644
                  case VIEW_TYPE_SHADOW:
                      view = new ShadowSectionCell(mContext);
                      break;
-@@ -979,7 +1604,9 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -979,7 +1612,9 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
          @Override
          public long getItemId(int position) {
              // Random stable ids, could be anything non-repeating
@@ -19984,7 +20382,7 @@ index d222504b..3691c7f7 100644
                  return -1;
              } else if (position == proxyShadowRow) {
                  return -2;
-@@ -995,6 +1622,32 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -995,6 +1630,32 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                  return -9;
              } else if (position == rotationTimeoutRow) {
                  return -10;
@@ -20017,7 +20415,7 @@ index d222504b..3691c7f7 100644
              } else if (position == rotationTimeoutInfoRow) {
                  return -11;
              } else if (position >= proxyStartRow && position < proxyEndRow) {
-@@ -1006,11 +1659,15 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -1006,11 +1667,15 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
  
          @Override
          public int getItemViewType(int position) {
@@ -20036,7 +20434,7 @@ index d222504b..3691c7f7 100644
                  return VIEW_TYPE_TEXT_CHECK;
              } else if (position == connectionsHeaderRow) {
                  return VIEW_TYPE_HEADER;
-@@ -1060,6 +1717,17 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+@@ -1060,6 +1725,17 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
  
          themeDescriptions.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER, new Class[]{TextInfoPrivacyCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
          themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{TextInfoPrivacyCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText4));
@@ -20349,10 +20747,65 @@ index 7fade708..2588696d 100644
          StringBuilder stringBuilder = new StringBuilder();
          if (session.device_model.length() != 0) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
-index b7791265..98f77e54 100644
+index b7791265..0227f5f4 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
-@@ -349,6 +349,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -222,11 +222,43 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+     @Override
+     public void clearViews() {
+         if (ignoreClearViews) return;
++        if (actionBarVisibleAnimator != null) {
++            actionBarVisibleAnimator.cancel();
++            actionBarVisibleAnimator = null;
++        }
++        if (avatarAnimation != null) {
++            avatarAnimation.cancel();
++            avatarAnimation = null;
++        }
++        animatorSearchPageVisible.setValue(false, false);
++        query = null;
+         super.clearViews();
++        contentView = null;
++        listView = null;
++        actionBarBackground = null;
++        searchItem = null;
++        otherItem = null;
++        topView = null;
++        avatarContainer = null;
++        avatarView = null;
++        avatarProgressView = null;
++        cameraButton = null;
++        cameraBackground = null;
++        cameraImageView = null;
++        titleView = null;
++        subtitleView = null;
++        versionView = null;
++        navigationBar = null;
++        if (imageUpdater != null) {
++            imageUpdater.parentFragment = null;
++            imageUpdater = null;
++        }
+     }
+ 
+     @Override
+     public View createView(Context context) {
++        animatorSearchPageVisible.setValue(false, false);
++        query = null;
+         contentView = new SizeNotifierFrameLayout(context) {
+             @Override
+             protected void dispatchDraw(Canvas canvas) {
+@@ -339,7 +371,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+         search = new ProfileActivity.SearchAdapter(this, context) {
+             @Override
+             public void notifyDataSetChanged() {
+-                listView.adapter.update(true);
++                if (listView != null && listView.adapter != null) {
++                    listView.adapter.update(true);
++                }
+             }
+         };
+         search.loadFaqWebPage();
+@@ -349,6 +383,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
          listView.setSections();
          listView.setPadding(0, AndroidUtilities.statusBarHeight + dp(12), 0, AndroidUtilities.navigationBarHeight + additionNavigationBarHeight);
          listView.setClipToPadding(false);
@@ -20360,7 +20813,38 @@ index b7791265..98f77e54 100644
          listView.addOnScrollListener(new RecyclerView.OnScrollListener() {
              @Override
              public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
-@@ -532,12 +533,20 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -497,6 +532,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+ 
+     @Override
+     public void onFragmentDestroy() {
++        if (actionBarVisibleAnimator != null) {
++            actionBarVisibleAnimator.cancel();
++            actionBarVisibleAnimator = null;
++        }
++        if (avatarAnimation != null) {
++            avatarAnimation.cancel();
++            avatarAnimation = null;
++        }
+         super.onFragmentDestroy();
+ 
+         getNotificationCenter().removeObserver(this, NotificationCenter.updateInterfaces);
+@@ -508,13 +551,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+     public void didReceivedNotification(int id, int account, Object... args) {
+         if (id == NotificationCenter.starBalanceUpdated) {
+             setInfo();
+-            if (listView != null) {
++            if (listView != null && listView.adapter != null) {
+                 listView.adapter.update(true);
+             }
+         } else if (id == NotificationCenter.updateInterfaces) {
+             setInfo();
+         } else if (id == NotificationCenter.newSuggestionsAvailable) {
+-            if (listView != null) {
++            if (listView != null && listView.adapter != null) {
+                 listView.adapter.update(true);
+             }
+         }
+@@ -532,12 +575,20 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
          avatarView.setForUserOrChat(user, avatarDrawable);
          titleView.setText(UserObject.getUserName(user));
          final StringBuilder sb = new StringBuilder();
@@ -20384,7 +20868,52 @@ index b7791265..98f77e54 100644
          }
          subtitleView.setText(sb);
  
-@@ -650,8 +659,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -546,6 +597,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+ 
+ 
+     public void updateColors() {
++        if (actionBar == null || contentView == null || titleView == null || subtitleView == null
++                || searchItem == null || navigationBar == null || actionBarBackground == null || listView == null) {
++            return;
++        }
+         actionBar.setTitleColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
+         actionBar.setItemsColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText), false);
+         contentView.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundGray));
+@@ -563,7 +618,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+     private boolean actionBarVisible;
+     private ValueAnimator actionBarVisibleAnimator;
+     private float top() {
+-        if (listView.getChildCount() > 0) {
++        if (listView != null && listView.getChildCount() > 0) {
+             final View firstChild = listView.getChildAt(0);
+             if (listView.getChildAdapterPosition(firstChild) > 0)
+                 return 0;
+@@ -575,6 +630,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+         updateActionBarVisible(false, true);
+     }
+     private void updateActionBarVisible(boolean force, boolean animated) {
++        if (actionBar == null || searchItem == null || listView == null || actionBarBackground == null) {
++            return;
++        }
+         final boolean visible;
+         if (searchItem.isSearchFieldVisible2()) {
+             visible = true;
+@@ -601,8 +659,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+             actionBarVisibleAnimator = ValueAnimator.ofFloat(actionBar.getTitlesContainer().getAlpha(), visible ? 1.0f : 0.0f);
+             actionBarVisibleAnimator.addUpdateListener(a -> {
+                 final float t = (float) a.getAnimatedValue();
+-                actionBar.getTitlesContainer().setAlpha(t);
+-                actionBarBackground.setAlpha(t);
++                if (actionBar != null && actionBar.getTitlesContainer() != null) {
++                    actionBar.getTitlesContainer().setAlpha(t);
++                }
++                if (actionBarBackground != null) {
++                    actionBarBackground.setAlpha(t);
++                }
+             });
+             actionBarVisibleAnimator.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
+             actionBarVisibleAnimator.setDuration(420);
+@@ -650,8 +712,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
              ));
              items.add(UItem.asShadow(null));
          } else if (suggestions.contains("VALIDATE_PHONE_NUMBER") && getUserConfig().getCurrentUser() != null) {
@@ -20398,7 +20927,7 @@ index b7791265..98f77e54 100644
                  replaceSingleTag(getString(R.string.CheckPhoneNumberInfo), () -> {
                      Browser.openUrl(getContext(), getString(R.string.CheckPhoneNumberLearnMoreUrl));
                  }),
-@@ -678,10 +691,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -678,10 +744,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
          }
  
          if (accountNumbers.size() > 0) {
@@ -20407,13 +20936,14 @@ index b7791265..98f77e54 100644
 -            for (int i = 0; i < accountNumbers.size(); ++i) {
 -                items.add(AccountCell.Factory.of(i, accountNumbers.get(i)));
 +            for (int i = 0; i < sortedAccounts.size(); ++i) {
-+                items.add(AccountCell.Factory.of(i, sortedAccounts.get(i)));
++                int accSlot = sortedAccounts.get(i);
++                items.add(AccountCell.Factory.of(1000 + accSlot, accSlot));
              }
 +            items.add(SettingCell.Factory.of(106, 0xFF3F51B5, 0xFF1A237E, R.drawable.msg_secret, "Сейф аккаунтов (без лимита)", "Хранилище AES-256 и закрепление аккаунтов"));
              items.add(UItem.asShadow(null));
          }
  
-@@ -695,6 +710,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -695,6 +764,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
          items.add(SettingCell.Factory.of(9, IconBackgroundColors.ORANGE_DEEP.top, IconBackgroundColors.ORANGE_DEEP.bottom, R.drawable.settings_power, getString(R.string.SettingsPowerSaving), getString(R.string.SettingsPowerSavingInfo)));
          items.add(SettingCell.Factory.of(10, IconBackgroundColors.PURPLE.top, IconBackgroundColors.PURPLE.bottom, R.drawable.settings_language, getString(R.string.SettingsLanguage), LocaleController.getCurrentLanguageName()));
  
@@ -20428,7 +20958,7 @@ index b7791265..98f77e54 100644
          items.add(UItem.asShadow(null));
  
          if (!getMessagesController().premiumFeaturesBlocked()) {
-@@ -756,7 +779,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -756,7 +833,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
          items.add(UItem.asCustomShadow(versionView));
      }
  
@@ -20442,7 +20972,7 @@ index b7791265..98f77e54 100644
          if (AndroidUtilities.isTablet() && LaunchActivity.instance != null && LaunchActivity.instance.getRightActionBarLayout() != null) {
              final INavigationLayout layout = LaunchActivity.instance.getRightActionBarLayout();
              if (!layout.getFragmentStack().isEmpty()) {
-@@ -770,6 +799,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -770,9 +853,15 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
          } else {
              presentFragment(fragment);
          }
@@ -20452,7 +20982,13 @@ index b7791265..98f77e54 100644
      }
  
      private void onClick(UItem item, View view, int position, float x, float y) {
-@@ -839,6 +871,33 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
++        if (item == null || isFinishing() || getParentLayout() == null) {
++            return;
++        }
+         if (item.object instanceof TLRPC.TL_attachMenuBot) {
+             TLRPC.TL_attachMenuBot attachMenuBot = (TLRPC.TL_attachMenuBot) item.object;
+             if (attachMenuBot.inactive || attachMenuBot.side_menu_disclaimer_needed) {
+@@ -839,6 +928,33 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
              case 10:
                  presentSettingFragment(new LanguageSelectActivity());
                  break;
@@ -20486,7 +21022,18 @@ index b7791265..98f77e54 100644
  
              case 11:
                  presentSettingFragment(new PremiumPreviewFragment("settings"));
-@@ -1057,7 +1116,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -964,7 +1080,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+         final Insets systemInsets = AndroidUtilities.getDefaultWindowInsets(insets, false);
+         navigationBarHeight = systemInsets.bottom;
+         final int statusBarHeight = systemInsets.top;
+-        listView.setPadding(0, statusBarHeight + dp(12), 0, navigationBarHeight + additionNavigationBarHeight);
++        if (listView != null) {
++            listView.setPadding(0, statusBarHeight + dp(12), 0, navigationBarHeight + additionNavigationBarHeight);
++        }
+         return WindowInsetsCompat.CONSUMED;
+     }
+ 
+@@ -1057,7 +1175,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
              avatarDrawable.setInfo(account, user);
              avatarView.getImageReceiver().setCurrentAccount(account);
              avatarView.setForUserOrChat(user, avatarDrawable);
@@ -20495,7 +21042,16 @@ index b7791265..98f77e54 100644
  
              botDrawable.setCurrentAccount(account);
              emojiStatusDrawable.setCurrentAccount(account);
-@@ -1485,7 +1544,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -1127,7 +1245,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+ 
+     @Override
+     public boolean onBackPressed(boolean invoked) {
+-        if (actionBar.isSearchFieldVisible()) {
++        if (actionBar != null && actionBar.isSearchFieldVisible()) {
+             if (invoked) actionBar.closeSearchField();
+             return false;
+         }
+@@ -1485,7 +1603,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
              } else if (which == 4) { // Logs
                  BuildVars.LOGS_ENABLED = !BuildVars.LOGS_ENABLED;
                  SharedPreferences sharedPreferences = ApplicationLoader.applicationContext.getSharedPreferences("systemConfig", Context.MODE_PRIVATE);
@@ -20504,7 +21060,7 @@ index b7791265..98f77e54 100644
                  listView.adapter.update(true);
                  if (BuildVars.LOGS_ENABLED) {
                      FileLog.d("app start time = " + ApplicationLoader.startTime);
-@@ -1504,7 +1563,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -1504,7 +1622,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                  editor.remove("archivehint").remove("proximityhint").remove("archivehint_l").remove("searchpostsnew").remove("speedhint").remove("gifhint").remove("reminderhint").remove("soundHint").remove("themehint").remove("bganimationhint").remove("filterhint").remove("n_0").remove("storyprvhint").remove("storyhint").remove("storyhint2").remove("storydualhint").remove("storysvddualhint").remove("stories_camera").remove("dualcam").remove("dualmatrix").remove("dual_available").remove("archivehint").remove("askNotificationsAfter").remove("askNotificationsDuration").remove("viewoncehint").remove("voicepausehint").remove("taptostorysoundhint").remove("nothanos").remove("voiceoncehint").remove("savedhint").remove("savedsearchhint").remove("savedsearchtaghint").remove("newppsms").remove("monetizationadshint").remove("seekSpeedHintShowed").remove("unsupport_video/av01").remove("statusgiftpage").remove("multistorieshint").remove("trimvoicehint").remove("taptostoryhighlighthint").remove("proxycheckstatusip").remove("callmiconstart").remove("showchattagsinfo").remove("language_showed2").remove("aihintshown").remove("savedmsgschatshint").apply();
                  HintsController.resetAll();
                  SharedPrefsHelper.cleanupAccount(currentAccount);
@@ -20513,7 +21069,7 @@ index b7791265..98f77e54 100644
                  MessagesController.getGlobalNotificationsSettings().edit().remove("disable_sharing_learn").remove("askedAboutFSILockscreen").apply();
                  SharedConfig.textSelectionHintShows = 0;
                  SharedConfig.lockRecordAudioVideoHint = 0;
-@@ -1565,6 +1624,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+@@ -1565,6 +1683,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                  WebStorage.getInstance().deleteAllData();
                  try {
                      WebView webView = new WebView(ApplicationLoader.applicationContext);
@@ -20521,6 +21077,41 @@ index b7791265..98f77e54 100644
                      webView.clearHistory();
                      webView.destroy();
                  } catch (Exception e) {
+@@ -2040,8 +2159,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+     }
+ 
+     private void checkUi_menuItems() {
+-        FragmentFloatingButton.setAnimatedVisibility(otherItem, 1f - animatorSearchPageVisible.getFloatValue());
+-        FragmentFloatingButton.setAnimatedVisibility(actionBar.getBackButton(), lerp(hasMainTabs ? 0f : 1f, 1f, animatorSearchPageVisible.getFloatValue()));
++        if (otherItem != null) {
++            FragmentFloatingButton.setAnimatedVisibility(otherItem, 1f - animatorSearchPageVisible.getFloatValue());
++        }
++        if (actionBar != null && actionBar.getBackButton() != null) {
++            FragmentFloatingButton.setAnimatedVisibility(actionBar.getBackButton(), lerp(hasMainTabs ? 0f : 1f, 1f, animatorSearchPageVisible.getFloatValue()));
++        }
+     }
+ 
+ 
+@@ -2062,7 +2185,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+     }
+ 
+     private void blur3_InvalidateBlur() {
+-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || scrollableViewNoiseSuppressor == null) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || scrollableViewNoiseSuppressor == null || fragmentView == null || actionBar == null) {
+             return;
+         }
+ 
+@@ -2085,7 +2208,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
+ 
+     @Override
+     public void onParentScrollToTop() {
+-        listView.smoothScrollToPosition(0);
++        if (listView != null) {
++            listView.smoothScrollToPosition(0);
++        }
+     }
+ 
+     @Override
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Stories/DialogStoriesCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Stories/DialogStoriesCell.java
 index ac5d4b7e..28442e5a 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Stories/DialogStoriesCell.java

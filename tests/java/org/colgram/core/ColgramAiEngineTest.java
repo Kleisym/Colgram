@@ -17,21 +17,77 @@ public final class ColgramAiEngineTest {
 
     private static void testCatalogAndBudget() {
         List<ColgramAiModels.ModelSpec> specs = ColgramAiModels.catalog();
-        check(specs.size() == 1, "Expected single unified Koliti Core model, got: " + specs.size());
+        check(specs.size() == 3, "Expected 3 optimized Koliti v3 catalog tiers, got: " + specs.size());
 
         ColgramAiModels.ModelSpec koliti = ColgramAiModels.primary();
         check(ColgramAiModels.KOLITI_MODEL_ID.equals(koliti.id), "Expected koliti-core-ultra id");
-        check("Koliti Core Ultra".equals(koliti.title), "Expected Koliti Core Ultra title");
+        check("Колити Ядро v3 (Оптимизированная)".equals(koliti.title), "Expected branded Koliti Core v3 title: " + koliti.title);
         check(koliti.hasBundledAssets(), "Expected bundled offline GGUF assets");
         check("koliti_core.gguf".equals(koliti.filename), "Expected koliti_core.gguf filename");
         check("koliti_vision.gguf".equals(koliti.mmprojFilename), "Expected koliti_vision.gguf filename");
         check(koliti.supportsVision(), "Expected vision projector support");
+        check("https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-core-v3.gguf".equals(koliti.modelDownloadUrl()),
+                "Unexpected core download URL: " + koliti.modelDownloadUrl());
+        check("https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-vision-v3.gguf".equals(koliti.mmprojDownloadUrl()),
+                "Unexpected core vision URL: " + koliti.mmprojDownloadUrl());
 
-        // Any legacy model id should cleanly resolve to the single Koliti Core Ultra model.
+        // Verify ALL catalog models use Kleisym/Colgram koliti-models-v3 GitHub Release (ZERO huggingface.co / < 2 GiB / clean UI branding)
+        final long GH_ASSET_LIMIT = 2_147_483_648L;
+        for (ColgramAiModels.ModelSpec spec : specs) {
+            String mUrl = spec.modelDownloadUrl();
+            String vUrl = spec.mmprojDownloadUrl();
+            check(mUrl.startsWith("https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/") && mUrl.endsWith(".gguf"),
+                    "Model URL must point to Kleisym/Colgram koliti-models-v3: " + mUrl);
+            check(!mUrl.contains("huggingface.co") && !vUrl.contains("huggingface.co"),
+                    "Dead HuggingFace URL forbidden in catalog: " + mUrl + " / " + vUrl);
+            check(spec.approxModelBytes > 0L && spec.approxModelBytes < GH_ASSET_LIMIT,
+                    "Model size must be under GitHub 2 GiB asset limit: " + spec.id);
+            if (spec.supportsVision()) {
+                check(vUrl.startsWith("https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/") && vUrl.endsWith(".gguf"),
+                        "Vision URL must point to Kleisym/Colgram koliti-models-v3: " + vUrl);
+                check(spec.approxMmprojBytes > 0L && spec.approxMmprojBytes < GH_ASSET_LIMIT,
+                        "Vision size must be under GitHub 2 GiB asset limit: " + spec.id);
+            }
+            String uiText = (spec.title + " " + spec.subtitle).toLowerCase(java.util.Locale.ROOT);
+            check(!uiText.contains("qwen") && !uiText.contains("unsloth") && !uiText.contains("huggingface") && !uiText.contains("kleidiai"),
+                    "Raw third-party model/vendor name leaked into UI label: " + uiText);
+        }
+
+        // Verify Turbo & Pro tiers resolve cleanly while legacy IDs still migrate to Koliti Core v3.
+        check(ColgramAiModels.findById(ColgramAiModels.KOLITI_TURBO_MODEL_ID) == ColgramAiModels.KOLITI_TURBO, "Turbo id lookup failed");
+        check(ColgramAiModels.findById(ColgramAiModels.KOLITI_PRO_MODEL_ID) == ColgramAiModels.KOLITI_PRO, "Pro id lookup failed");
         check(ColgramAiModels.findById("deepseek-v4-pro-qwen35-4b-iq3m") == koliti, "Legacy id migration failed");
         check(ColgramAiModels.findById("hauhaucs-qwen35-4b-aggressive") == koliti, "Legacy id migration failed");
         check(ColgramAiModels.findById("koliti-core-4b") == koliti, "Legacy koliti-core-4b migration failed");
-        check(ColgramAiModels.recommendForDeviceRamMb(4096L) == koliti, "Expected unified Koliti recommendation");
+        check(ColgramAiModels.recommendForDeviceRamMb(4096L) == koliti, "Expected Koliti Core for 4GB+ RAM");
+        check(ColgramAiModels.recommendForDeviceRamMb(2048L) == ColgramAiModels.KOLITI_TURBO, "Expected Koliti Turbo for 2GB RAM");
+
+        // Verify cross-host GitHub Release 302 redirect resolution (github.com -> release-assets.githubusercontent.com)
+        try {
+            String crossHost = ColgramAiModelManager.resolveRedirectTarget(
+                    koliti.modelDownloadUrl(),
+                    "https://release-assets.githubusercontent.com/github-production-release-asset/1234/koliti-core-v3.gguf?sig=abc");
+            check(crossHost.startsWith("https://release-assets.githubusercontent.com/"), "Cross-host redirect failed: " + crossHost);
+            String rootRel = ColgramAiModelManager.resolveRedirectTarget(
+                    koliti.modelDownloadUrl(),
+                    "/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-core-v3.gguf");
+            check("https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-core-v3.gguf".equals(rootRel),
+                    "Root-relative redirect failed: " + rootRel);
+            String protoRel = ColgramAiModelManager.resolveRedirectTarget(
+                    koliti.modelDownloadUrl(),
+                    "//objects.githubusercontent.com/assets/koliti-core-v3.gguf");
+            check("https://objects.githubusercontent.com/assets/koliti-core-v3.gguf".equals(protoRel),
+                    "Protocol-relative redirect failed: " + protoRel);
+            boolean rejectedFile = false;
+            try {
+                ColgramAiModelManager.resolveRedirectTarget(koliti.modelDownloadUrl(), "file:///etc/passwd");
+            } catch (java.io.IOException expected) {
+                rejectedFile = true;
+            }
+            check(rejectedFile, "Non-HTTP(S) redirect target must be rejected");
+        } catch (java.io.IOException e) {
+            throw new AssertionError("Redirect target resolution failed: " + e.getMessage(), e);
+        }
 
         check(ColgramAiModels.recommendContextForTotalRamMb(8192L) == 2048, "Default fast text context must be 2048");
         check(ColgramAiModels.recommendContextForVision(8192L) == 3072, "Vision context must expand cleanly to 3072");

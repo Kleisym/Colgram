@@ -436,17 +436,34 @@ public final class ColgramHttp {
 
     /** Opens a configured HTTP(S) connection for binary downloads via active Colgram SOCKS5/DPI/DoH route. */
     public static HttpURLConnection openBinaryStream(String urlStr, int connectTimeoutMs, int readTimeoutMs) throws IOException {
-        ColgramProxyManager.ProxyItem relay = ColgramProxyManager.getCurrentActiveProxy();
-        String socksHost = (relay != null && relay.type == 0) ? relay.address : null;
-        int socksPort = (relay != null && relay.type == 0) ? relay.port : 0;
-        if (socksHost == null && ColgramDpiBypass.isBound()) {
-            socksHost = "127.0.0.1";
-            socksPort = ColgramDpiBypass.activePort();
+        return openBinaryStream(urlStr, connectTimeoutMs, readTimeoutMs, false);
+    }
+
+    /**
+     * Opens a configured HTTP(S) connection for binary downloads.
+     * When {@code directOnly} is true, dials directly with DoH resolution (no loopback proxy overhead);
+     * otherwise uses the active SOCKS5 proxy or local DPI bypass listener when bound.
+     */
+    public static HttpURLConnection openBinaryStream(
+            String urlStr, int connectTimeoutMs, int readTimeoutMs, boolean directOnly) throws IOException {
+        String socksHost = null;
+        int socksPort = 0;
+        if (!directOnly) {
+            ColgramProxyManager.ProxyItem relay = ColgramProxyManager.getCurrentActiveProxy();
+            if (relay != null && relay.type == 0) {
+                socksHost = relay.address;
+                socksPort = relay.port;
+            }
+            if (socksHost == null && ColgramDpiBypass.isBound()) {
+                socksHost = "127.0.0.1";
+                socksPort = ColgramDpiBypass.activePort();
+            }
         }
         HttpURLConnection conn = openConfiguredConnection(urlStr, socksHost, socksPort);
         conn.setConnectTimeout(connectTimeoutMs);
         conn.setReadTimeout(readTimeoutMs);
-        conn.setRequestProperty("User-Agent", "Colgram/Updater");
+        conn.setRequestProperty("User-Agent", "Colgram/3.0");
+        conn.setRequestProperty("Accept", "application/octet-stream, */*");
         return conn;
     }
 

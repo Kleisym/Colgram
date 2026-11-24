@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Embedded + Resumable GGUF Model & Vision Projector (mmproj) Manager.
  * Priority 1: Built-in APK assets/koliti/koliti_core.gguf + koliti_vision.gguf (zero external download!).
  * Priority 2: User-supplied custom GGUF path.
- * Priority 3: Resumable HuggingFace download fallback if embedded assets were stripped.
+ * Priority 3: Resumable download directly from official Colgram GitHub Release
+ *             (Kleisym/Colgram, tag koliti-models-v3) with cross-host redirect handling & DPI/DoH fallback.
  */
 public final class ColgramAiModelManager {
 
@@ -51,6 +52,7 @@ public final class ColgramAiModelManager {
 
     /** Bumped whenever the bundled APK koliti_core.gguf weights are upgraded so old phones auto-refresh. */
     public static final int EMBEDDED_CORE_REVISION = 3;
+    public static final int MAX_REDIRECT_HOPS = 8;
 
     private static final AtomicBoolean CANCEL_FLAG = new AtomicBoolean(false);
     private static final Object EXTRACT_LOCK = new Object();
@@ -118,10 +120,30 @@ public final class ColgramAiModelManager {
         return extracting;
     }
 
+    /** Returns true when the given catalog model's GGUF file is installed and valid on disk. */
+    public static boolean isModelDownloaded(Context ctx, ColgramAiModels.ModelSpec spec) {
+        if (ctx == null || spec == null) return false;
+        return isValidGgufFile(modelFileFor(ctx, spec));
+    }
+
+    /** Returns true when the given catalog model's Vision projector file is installed and valid on disk. */
+    public static boolean isVisionDownloaded(Context ctx, ColgramAiModels.ModelSpec spec) {
+        if (ctx == null || spec == null || !spec.supportsVision()) return false;
+        File vf = mmprojFileFor(ctx, spec);
+        return vf != null && isValidGgufFile(vf);
+    }
+
     /** Returns true when this APK bundles a newer koliti_core.gguf revision than what is extracted on disk. */
     public static boolean needsEmbeddedUpgrade(Context ctx) {
         if (ctx == null || !hasEmbeddedAssets(ctx)) return false;
         if (!ColgramAiConfig.getCustomModelPath(ctx).isEmpty()) return false;
+        String activeId = ColgramAiConfig.getActiveModelId(ctx);
+        if (!ColgramAiModels.KOLITI_MODEL_ID.equals(activeId)) {
+            ColgramAiModels.ModelSpec activeSpec = ColgramAiModels.findById(activeId);
+            if (isModelDownloaded(ctx, activeSpec)) {
+                return false;
+            }
+        }
         File destModel = modelFileFor(ctx, ColgramAiModels.primary());
         return needsEmbeddedCoreUpgrade(ctx, destModel);
     }
@@ -187,7 +209,7 @@ public final class ColgramAiModelManager {
                 ColgramAiConfig.setActiveModelId(ctx, spec.id);
                 if (progressListener != null) {
                     progressListener.onComplete(isValidGgufFile(destModel),
-                            isValidGgufFile(destModel) ? "Встроенное ядро Koliti Core Ultra готово!" : "Не удалось распаковать ядро");
+                            isValidGgufFile(destModel) ? ("Встроенное ядро " + spec.title + " готово!") : "Не удалось распаковать ядро");
                 }
             } catch (Throwable err) {
                 if (progressListener != null) {
@@ -222,7 +244,7 @@ public final class ColgramAiModelManager {
             ResolvedModelPaths existing = resolveActiveModel(appCtx);
             File checkModel = modelFileFor(appCtx, ColgramAiModels.primary());
             if (!needsEmbeddedCoreUpgrade(appCtx, checkModel) && existing.isReady() && existing.hasVision()) {
-                if (listener != null) listener.onComplete(true, "Встроенное ядро Koliti Core Ultra готово!");
+                if (listener != null) listener.onComplete(true, "Встроенное ядро " + ColgramAiModels.primary().title + " готово!");
                 return;
             }
             ensureEmbeddedReadySync(appCtx, listener);
@@ -278,7 +300,7 @@ public final class ColgramAiModelManager {
         if (!isValidGgufFile(partFile)) {
             //noinspection ResultOfMethodCallIgnored
             partFile.delete();
-            throw new IOException("Повреждённый GGUF актив: " + assetPath);
+            throw new IOException("Повреждённый файл модели: " + assetPath);
         }
         renameSafe(partFile, destFile);
         if (listener != null) {
@@ -370,26 +392,30 @@ public final class ColgramAiModelManager {
         Thread t = new Thread(() -> {
             try {
                 File destModel = modelFileFor(ctx, spec);
-                downloadWithResume("Основная модель " + spec.title, spec.modelDownloadUrl(), destModel, listener);
+                downloadWithResume("Модель " + spec.title, spec.modelDownloadUrl(), destModel, listener);
                 if (CANCEL_FLAG.get()) {
                     if (listener != null) listener.onComplete(false, "Загрузка приостановлена (можно продолжить позже)");
                     return;
                 }
                 if (!isValidGgufFile(destModel)) {
-                    throw new IOException("Файл модели повреждён (отсутствует заголовок GGUF)");
+                    throw new IOException("Файл модели повреждён (неверный формат)");
                 }
                 if (includeVision && spec.supportsVision() && !CANCEL_FLAG.get()) {
                     File destMm = mmprojFileFor(ctx, spec);
-                    if (destMm != null) {
+                    if (destMm != null && !tryReuseSharedVisionFile(ctx, spec, destMm, listener)) {
                         downloadWithResume("Vision-проектор (фото/видео)", spec.mmprojDownloadUrl(), destMm, listener);
+                        if (!CANCEL_FLAG.get() && !isValidGgufFile(destMm)) {
+                            throw new IOException("Vision-файл повреждён (неверный формат)");
+                        }
                     }
                 }
                 if (CANCEL_FLAG.get()) {
                     if (listener != null) listener.onComplete(false, "Загрузка приостановлена (можно продолжить позже)");
                 } else {
                     ColgramAiConfig.setCustomModelPath(ctx, "");
+                    ColgramAiConfig.setCustomMmprojPath(ctx, "");
                     ColgramAiConfig.setActiveModelId(ctx, spec.id);
-                    if (listener != null) listener.onComplete(true, "Модель и Vision готовы к работе!");
+                    if (listener != null) listener.onComplete(true, spec.title + " и Vision готовы к работе!");
                 }
             } catch (Throwable err) {
                 String msg = err.getMessage() != null ? err.getMessage() : err.getClass().getSimpleName();
@@ -401,8 +427,73 @@ public final class ColgramAiModelManager {
         t.start();
     }
 
+    /**
+     * Reuses an already-installed identical Vision projector file (same downloadAssetName)
+     * from another catalog tier on disk to avoid re-downloading 223 MB unnecessarily.
+     */
+    private static boolean tryReuseSharedVisionFile(
+            Context ctx,
+            ColgramAiModels.ModelSpec targetSpec,
+            File destMm,
+            DownloadListener listener
+    ) {
+        if (ctx == null || targetSpec == null || destMm == null) return false;
+        if (isValidGgufFile(destMm) && destMm.length() >= Math.max(50_000_000L, targetSpec.approxMmprojBytes - 1024L)) {
+            return true;
+        }
+        String wantAsset = targetSpec.mmprojDownloadAssetName;
+        if (wantAsset == null || wantAsset.isEmpty()) return false;
+        for (ColgramAiModels.ModelSpec other : ColgramAiModels.catalog()) {
+            if (other == targetSpec || !wantAsset.equals(other.mmprojDownloadAssetName)) continue;
+            File srcMm = mmprojFileFor(ctx, other);
+            if (srcMm == null || !isValidGgufFile(srcMm) || srcMm.length() < 50_000_000L) continue;
+            File tmp = new File(destMm.getParentFile(), destMm.getName() + ".copy");
+            try (FileInputStream fis = new FileInputStream(srcMm);
+                 FileOutputStream fos = new FileOutputStream(tmp)) {
+                byte[] buf = new byte[131072];
+                long copied = 0L;
+                long total = srcMm.length();
+                int n;
+                while ((n = fis.read(buf)) != -1) {
+                    if (CANCEL_FLAG.get()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        tmp.delete();
+                        return false;
+                    }
+                    fos.write(buf, 0, n);
+                    copied += n;
+                }
+                fos.flush();
+                if (isValidGgufFile(tmp)) {
+                    renameSafe(tmp, destMm);
+                    if (listener != null) {
+                        listener.onProgress("Vision-проектор (локальная копия)", total, total, 0.0);
+                    }
+                    return true;
+                }
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+            } catch (Throwable ignored) {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasGgufMagic(File f) {
+        if (f == null || !f.isFile() || f.length() < 4L) return false;
+        byte[] hdr = new byte[4];
+        try (FileInputStream fis = new FileInputStream(f)) {
+            return fis.read(hdr) == 4
+                    && hdr[0] == 'G' && hdr[1] == 'G' && hdr[2] == 'U' && hdr[3] == 'F';
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static void downloadWithResume(String phase, String urlStr, File destFile, DownloadListener listener) throws IOException {
-        if (isValidGgufFile(destFile) && destFile.length() > 150_000_000L) {
+        if (isValidGgufFile(destFile) && destFile.length() > 50_000_000L) {
             long remoteLen = probeContentLength(urlStr);
             if (remoteLen > 0 && destFile.length() >= remoteLen) {
                 if (listener != null) listener.onProgress(phase, destFile.length(), remoteLen, 0.0);
@@ -412,8 +503,14 @@ public final class ColgramAiModelManager {
 
         File partFile = new File(destFile.getParentFile(), destFile.getName() + ".part");
         long existing = partFile.isFile() ? partFile.length() : 0L;
+        if (existing >= 4L && !hasGgufMagic(partFile)) {
+            // Wipe corrupt non-GGUF partial file (e.g. captive portal HTML) before retrying cleanly.
+            //noinspection ResultOfMethodCallIgnored
+            partFile.delete();
+            existing = 0L;
+        }
 
-        HttpURLConnection conn = openWithRedirects(urlStr, existing);
+        HttpURLConnection conn = openWithRedirects(urlStr, existing > 0 ? ("bytes=" + existing + "-") : null);
         try {
             int code = conn.getResponseCode();
             if (code == 416 && partFile.isFile() && isValidGgufFile(partFile)) {
@@ -465,6 +562,11 @@ public final class ColgramAiModelManager {
             if (contentLen > 0 && transferred < contentLen) {
                 throw new IOException("Обрыв соединения: скачано " + transferred + " из " + contentLen + " байт");
             }
+            if (!isValidGgufFile(partFile)) {
+                //noinspection ResultOfMethodCallIgnored
+                partFile.delete();
+                throw new IOException("Получен повреждённый файл модели");
+            }
             renameSafe(partFile, destFile);
             if (listener != null) {
                 listener.onProgress(phase, destFile.length(), Math.max(contentLen, destFile.length()), 0.0);
@@ -474,41 +576,76 @@ public final class ColgramAiModelManager {
         }
     }
 
-    private static HttpURLConnection openWithRedirects(String initialUrl, long rangeStart) throws IOException {
+    static String resolveRedirectTarget(String currentUrl, String locationHeader) throws IOException {
+        if (locationHeader == null || locationHeader.trim().isEmpty()) {
+            throw new IOException("Empty redirect location");
+        }
+        java.net.URL base = new java.net.URL(currentUrl);
+        java.net.URL resolved = new java.net.URL(base, locationHeader.trim());
+        String proto = resolved.getProtocol();
+        if (!"https".equalsIgnoreCase(proto) && !"http".equalsIgnoreCase(proto)) {
+            throw new IOException("Unsupported redirect protocol: " + proto);
+        }
+        return resolved.toString();
+    }
+
+    private static HttpURLConnection openWithRedirects(String initialUrl, String rangeHeader) throws IOException {
+        // Try direct+DoH first for full wire speed unless an explicit third-party SOCKS proxy is active;
+        // automatically fail over to Local DPI Bypass (127.0.0.1:9876) / active SOCKS5 on transport error.
+        ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
+        boolean preferProxyFirst = active != null && active.type == 0 && !active.isLocalDpi();
+        boolean[] routes = preferProxyFirst ? new boolean[]{false, true} : new boolean[]{true, false};
+        IOException lastErr = null;
+        for (int r = 0; r < routes.length; r++) {
+            boolean directOnly = routes[r];
+            if (!directOnly && !ColgramDpiBypass.isBound() && !preferProxyFirst) {
+                continue;
+            }
+            try {
+                return openWithRedirectsSingleRoute(initialUrl, rangeHeader, directOnly);
+            } catch (IOException err) {
+                lastErr = err;
+            }
+        }
+        throw lastErr != null ? lastErr : new IOException("Не удалось подключиться к серверу загрузки");
+    }
+
+    private static HttpURLConnection openWithRedirectsSingleRoute(
+            String initialUrl, String rangeHeader, boolean directOnly) throws IOException {
         String current = initialUrl;
-        for (int hop = 0; hop < 7; hop++) {
-            HttpURLConnection conn = ColgramHttp.openBinaryStream(current, 15000, 30000);
+        for (int hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
+            HttpURLConnection conn = ColgramHttp.openBinaryStream(current, 15000, 30000, directOnly);
             conn.setInstanceFollowRedirects(false);
-            if (rangeStart > 0) {
-                conn.setRequestProperty("Range", "bytes=" + rangeStart + "-");
+            if (rangeHeader != null && !rangeHeader.isEmpty()) {
+                conn.setRequestProperty("Range", rangeHeader);
             }
             int code = conn.getResponseCode();
             if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
                 String loc = conn.getHeaderField("Location");
                 conn.disconnect();
-                if (loc == null || loc.isEmpty()) {
-                    throw new IOException("Empty redirect location");
-                }
-                if (loc.startsWith("/")) {
-                    java.net.URL base = new java.net.URL(current);
-                    loc = base.getProtocol() + "://" + base.getAuthority() + loc;
-                }
-                current = loc;
+                current = resolveRedirectTarget(current, loc);
                 continue;
             }
             return conn;
         }
-        throw new IOException("Too many redirects");
+        throw new IOException("Too many redirects (>" + MAX_REDIRECT_HOPS + ")");
     }
 
     private static long probeContentLength(String urlStr) {
+        HttpURLConnection c = null;
         try {
-            HttpURLConnection c = openWithRedirects(urlStr, 0);
-            long len = c.getContentLengthLong();
-            c.disconnect();
-            return len;
+            c = openWithRedirects(urlStr, "bytes=0-0");
+            int code = c.getResponseCode();
+            if (code == 206 || code == 200) {
+                return parseTotalBytes(c, 0L, false);
+            }
+            return -1L;
         } catch (Throwable ignored) {
             return -1L;
+        } finally {
+            if (c != null) {
+                c.disconnect();
+            }
         }
     }
 

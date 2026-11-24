@@ -13,6 +13,9 @@ import java.util.Locale;
 
 /** Android-independent, deterministic rules shared by feed ingestion and proxy selection. */
 public final class ColgramProxyPolicy {
+    public static final int MAX_SELECTABLE_PING_MS = 3_000;
+    public static final int FAST_PING_THRESHOLD_MS = 1_200;
+
     private static final java.util.regex.Pattern COUNTRY_COLUMN_PATTERN =
             java.util.regex.Pattern.compile("^([0-9.]+:[0-9]{1,5}):[A-Za-z][A-Za-z .()'-]{1,79}$");
 
@@ -211,11 +214,13 @@ public final class ColgramProxyPolicy {
         }
 
         int tier(long now) {
-            if (eligibleAt > now) return 4;
-            if (verified && available) return 0;
-            if (ping == -2 || tcp == -2) return 3;
-            if (tcp >= 0) return 1;
-            return 2;
+            if (eligibleAt > now) return 5;
+            if (verified && available) {
+                return (ping >= 0 && ping <= FAST_PING_THRESHOLD_MS) ? 0 : 1;
+            }
+            if (ping == -2 || tcp == -2) return 4;
+            if (tcp >= 0) return 2;
+            return 3;
         }
 
         int latency() {
@@ -234,7 +239,8 @@ public final class ColgramProxyPolicy {
 
     /** TCP-open and a previous process's verdict are not current protocol availability. */
     public static boolean isSelectable(State state, long checkedAt, long now, long maximumAge) {
-        return state != null && state.verified && state.available && state.ping >= 0
+        return state != null && state.verified && state.available
+                && state.ping >= 0 && state.ping <= MAX_SELECTABLE_PING_MS
                 && state.tcp != -2 && state.eligibleAt <= now && checkedAt > 0
                 && checkedAt <= now && maximumAge > 0 && now - checkedAt < maximumAge;
     }

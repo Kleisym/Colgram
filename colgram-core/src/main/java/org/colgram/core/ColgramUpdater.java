@@ -107,7 +107,7 @@ public class ColgramUpdater {
                             JSONObject cand = arr.optJSONObject(i);
                             if (cand == null) continue;
                             JSONArray assets = cand.optJSONArray("assets");
-                            if (assets != null && assets.length() > 0) {
+                            if (assets != null && hasApkAsset(assets)) {
                                 release = cand;
                                 break;
                             }
@@ -221,6 +221,20 @@ public class ColgramUpdater {
                 mainHandler.post(() -> callback.onResult(null, false, msg));
             }
         });
+    }
+
+    private static boolean hasApkAsset(JSONArray assets) {
+        if (assets == null) return false;
+        for (int i = 0; i < assets.length(); i++) {
+            JSONObject asset = assets.optJSONObject(i);
+            if (asset == null) continue;
+            String name = asset.optString("name", "");
+            String dl = asset.optString("browser_download_url", "");
+            if (name.endsWith(".apk") && !dl.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static int[] parseSemver(String version) {

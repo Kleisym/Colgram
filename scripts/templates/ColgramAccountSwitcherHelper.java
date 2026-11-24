@@ -193,12 +193,14 @@ public final class ColgramAccountSwitcherHelper {
 
     /** Always opens LoginActivity for a new account, encrypting & archiving LRU slot when 5 slots are full. */
     public static void openAddAccount(BaseFragment fragment, int currentAccount) {
-        if (fragment == null || fragment.getContext() == null) return;
-        Context ctx = fragment.getContext();
+        if (fragment == null || fragment.isFinishing() || fragment.getContext() == null) return;
+        BaseFragment navHost = fragment.getParentLayout() != null ? fragment : LaunchActivity.getSafeLastFragment();
+        if (navHost == null || navHost.isFinishing() || navHost.getParentLayout() == null) return;
+        Context ctx = fragment.getContext().getApplicationContext();
 
         Integer available = findFreeNativeSlot();
         if (available != null) {
-            fragment.presentFragment(new LoginActivity(available));
+            presentLoginPreservingStack(navHost, available);
             return;
         }
 
@@ -206,14 +208,16 @@ public final class ColgramAccountSwitcherHelper {
         long[] lastUsed = new long[UserConfig.MAX_ACCOUNT_COUNT];
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             UserConfig cfg = UserConfig.getInstance(a);
+            cfg.loadConfig();
             TLRPC.User u = cfg.getCurrentUser();
             long uid = u != null ? u.id : cfg.getClientUserId();
             pinned[a] = ColgramAccountManager.isAccountPinned(ctx, uid, a);
             lastUsed[a] = cfg.loginTime;
         }
+        int activeAccount = UserConfig.isValidAccount(UserConfig.selectedAccount) ? UserConfig.selectedAccount : currentAccount;
         int evictSlot = ColgramAccountVaultPolicy.pickEvictableSlotAllowPinnedFallback(
-                pinned, lastUsed, currentAccount);
-        if (evictSlot < 0) {
+                pinned, lastUsed, activeAccount);
+        if (evictSlot < 0 || evictSlot == activeAccount || evictSlot == UserConfig.selectedAccount) {
             Toast.makeText(ctx, "Нет доступного слота", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -233,13 +237,25 @@ public final class ColgramAccountSwitcherHelper {
         ColgramAccountManager.clearBotTokenForSlot(ctx, evictSlot);
 
         try {
-            BulletinFactory.of(fragment).createSimpleBulletin(
+            BulletinFactory.of(navHost).createSimpleBulletin(
                     R.drawable.msg_secret,
                     "Аккаунт " + evictName + " сохранён в зашифрованный сейф"
             ).show();
         } catch (Throwable ignored) {}
 
-        fragment.presentFragment(new LoginActivity(evictSlot));
+        presentLoginPreservingStack(navHost, evictSlot);
+    }
+
+    private static void presentLoginPreservingStack(BaseFragment navHost, int slot) {
+        if (navHost == null || navHost.isFinishing() || navHost.getParentLayout() == null) return;
+        // Preserve MainTabsActivity on the back stack (removeLast=false) so Back returns without restart.
+        if (!navHost.presentFragment(new LoginActivity(slot), false)) {
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!navHost.isFinishing() && navHost.getParentLayout() != null) {
+                    navHost.presentFragment(new LoginActivity(slot), false);
+                }
+            }, 180L);
+        }
     }
 
     public static boolean archiveNativeSlot(Context context, int slot) {
@@ -267,6 +283,7 @@ public final class ColgramAccountSwitcherHelper {
         HashSet<Long> activeUserIds = new HashSet<>();
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             UserConfig cfg = UserConfig.getInstance(a);
+            cfg.loadConfig();
             if (cfg.isClientActivated()) {
                 activeSlots.add(a);
                 long uid = cfg.getCurrentUser() != null ? cfg.getCurrentUser().id : cfg.getClientUserId();
@@ -316,7 +333,9 @@ public final class ColgramAccountSwitcherHelper {
 
         for (final int slot : activeSlots) {
             LinearLayout row = buildAccountRow(activity, slot, slot == currentAccount, () -> {
-                if (holder[0] == null || !holder[0].isShowing() || fragment.getParentActivity() == null) return;
+                if (holder[0] == null || !holder[0].isShowing()
+                        || fragment.isFinishing() || fragment.getParentActivity() == null
+                        || activity.isFinishing() || activity.isDestroyed()) return;
                 holder[0].dismiss();
                 showAccountVaultSheet(fragment, currentAccount);
             });
@@ -429,7 +448,9 @@ public final class ColgramAccountSwitcherHelper {
                 delBtn.setOnClickListener(v -> {
                     ColgramAccountManager.removeVaultAccount(ctx, entry.vaultKey);
                     if (holder[0] != null) holder[0].dismiss();
-                    showAccountVaultSheet(fragment, currentAccount);
+                    if (!fragment.isFinishing() && !activity.isFinishing() && !activity.isDestroyed()) {
+                        showAccountVaultSheet(fragment, currentAccount);
+                    }
                 });
                 row.addView(delBtn, LayoutHelper.createLinear(28, 28, 2, 0, 0, 0));
 
@@ -581,7 +602,9 @@ public final class ColgramAccountSwitcherHelper {
 
     private static Integer findFreeNativeSlot() {
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
-            if (!UserConfig.getInstance(a).isClientActivated()) {
+            UserConfig cfg = UserConfig.getInstance(a);
+            cfg.loadConfig();
+            if (!cfg.isClientActivated()) {
                 return a;
             }
         }
@@ -592,6 +615,7 @@ public final class ColgramAccountSwitcherHelper {
         HashSet<Long> active = new HashSet<>();
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             UserConfig cfg = UserConfig.getInstance(a);
+            cfg.loadConfig();
             if (cfg.isClientActivated()) {
                 long uid = cfg.getCurrentUser() != null ? cfg.getCurrentUser().id : cfg.getClientUserId();
                 if (uid > 0) active.add(uid);

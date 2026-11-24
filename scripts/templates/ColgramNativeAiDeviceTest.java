@@ -42,7 +42,19 @@ public final class ColgramNativeAiDeviceTest {
         assertTrue(koliti.hasBundledAssets());
         assertEquals("koliti_core.gguf", koliti.filename);
         assertEquals("koliti_vision.gguf", koliti.mmprojFilename);
-        assertEquals(1, ColgramAiModels.catalog().size());
+        assertEquals(3, ColgramAiModels.catalog().size());
+        for (ColgramAiModels.ModelSpec spec : ColgramAiModels.catalog()) {
+            assertTrue("Expected GitHub Release URL: " + spec.modelDownloadUrl(),
+                    spec.modelDownloadUrl().startsWith(ColgramAiModels.RELEASE_BASE_URL));
+            assertFalse("HuggingFace URL forbidden: " + spec.modelDownloadUrl(),
+                    spec.modelDownloadUrl().contains("huggingface.co"));
+            if (spec.supportsVision()) {
+                assertTrue("Expected GitHub Release Vision URL: " + spec.mmprojDownloadUrl(),
+                        spec.mmprojDownloadUrl().startsWith(ColgramAiModels.RELEASE_BASE_URL));
+                assertFalse("HuggingFace Vision URL forbidden: " + spec.mmprojDownloadUrl(),
+                        spec.mmprojDownloadUrl().contains("huggingface.co"));
+            }
+        }
 
         // Verify bundled GGUF weights exist in APK assets and unpack cleanly offline!
         assertTrue("Expected embedded koliti/koliti_core.gguf asset in APK", ColgramAiModelManager.hasEmbeddedAssets(ctx));

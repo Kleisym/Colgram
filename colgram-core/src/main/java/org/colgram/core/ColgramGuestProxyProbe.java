@@ -15,6 +15,7 @@ import android.os.RemoteException;
 /** Account-free pre-login verification; never changes the main application's proxy. */
 public final class ColgramGuestProxyProbe {
     public static final long CHECK_TIMEOUT_MS = 11_000L;
+    public static final long COLD_BIND_TIMEOUT_MS = 25_000L;
     public static final int CHECK = 1;
     public static final int RESULT = 2;
     public static final int CANCEL = 3;
@@ -154,7 +155,7 @@ public final class ColgramGuestProxyProbe {
         }
 
         void bind() {
-            MAIN.postDelayed(timeout, CHECK_TIMEOUT_MS);
+            MAIN.postDelayed(timeout, COLD_BIND_TIMEOUT_MS);
             MAIN.removeCallbacks(sharedIdleUnbind);
             Messenger existing = null;
             boolean needBind = false;
@@ -198,6 +199,8 @@ public final class ColgramGuestProxyProbe {
 
         void dispatchTo(Messenger m) {
             if (finished) return;
+            MAIN.removeCallbacks(timeout);
+            MAIN.postDelayed(timeout, CHECK_TIMEOUT_MS);
             Message request = Message.obtain(null, CHECK);
             request.setData(target);
             request.replyTo = replies;

@@ -84,7 +84,7 @@ public class ColgramDpiBypass {
             java.util.Collections.synchronizedSet(new java.util.HashSet<>());
     private static final java.util.Map<String, Integer> silentEndpointCounts =
             new java.util.concurrent.ConcurrentHashMap<>();
-    private static final int MAX_DC_BUCKETS = 6; // 0 = other, 1..5 = Telegram DC 1..5
+    private static final int MAX_DC_BUCKETS = 12; // 0 = other, 1..5 = generic DC 1..5, 6..10 = media DC 1..5
     private static final java.util.concurrent.atomic.AtomicIntegerArray dcRawReplied =
             new java.util.concurrent.atomic.AtomicIntegerArray(MAX_DC_BUCKETS);
     private static final java.util.concurrent.atomic.AtomicIntegerArray dcRawFailed =
@@ -124,6 +124,9 @@ public class ColgramDpiBypass {
         if (context != null) {
             android.content.Context app = context.getApplicationContext();
             appContext = app != null ? app : context;
+            try {
+                ColgramTelegramDcAddresses.init(appContext);
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -387,8 +390,18 @@ public class ColgramDpiBypass {
     }
 
     private static int dcBucketFor(String host) {
-        int dc = ColgramTelegramDcAddresses.dcIdFor(host);
-        return (dc >= 1 && dc <= 5) ? dc : 0;
+        return dcBucketForSignedDc(ColgramTelegramDcAddresses.signedDcIdFor(host));
+    }
+
+    static int dcBucketForSignedDc(int signedDc) {
+        int norm = ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(signedDc);
+        if (norm < 1 || norm > 5) return 0;
+        return ColgramTelegramWsBridge.Obfuscated2FrameSplitter.isMediaDcId(signedDc) ? (norm + 5) : norm;
+    }
+
+    private static int genericBucketForSignedDc(int signedDc) {
+        int norm = ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(signedDc);
+        return (norm >= 1 && norm <= 5) ? norm : 0;
     }
 
     private static void resetDcTrackers() {
@@ -1106,7 +1119,11 @@ public class ColgramDpiBypass {
             // explicitly protected via VpnService.protect() onto the raw carrier/ISP network, so
             // overlayActive MUST be false — otherwise whole-device local DPI bypass skips all desync!
             boolean overlayActive = (call == null) && isOverlayVpnActive();
-            int dcBucket = dcBucketFor(destHost);
+            int signedDc = ColgramTelegramDcAddresses.signedDcIdFor(destHost);
+            boolean isMedia = signedDc < 0;
+            int dcBucket = dcBucketForSignedDc(signedDc);
+            int genericBucket = genericBucketForSignedDc(signedDc);
+            boolean inheritedGenericWs = isMedia && genericBucket > 0 && dcWsPreferred.get(genericBucket) != 0;
             boolean wsEdgeHost = "149.154.167.220".equals(destHost);
             boolean wsCapableDest = ((call == null && !overlayActive) || (call != null && call.systemWide && !wsEdgeHost))
                     && ColgramTelegramWsBridge.supports(destHost, destPort);
@@ -1115,6 +1132,7 @@ public class ColgramDpiBypass {
             // lives on 149.154.*:443 and MUST be SNI-desynced as TLS, never wrapped inside MTProto WSS!
             boolean skipRawForWs = (call == null) && wsCapableDest && (
                     dcWsPreferred.get(dcBucket) != 0
+                            || inheritedGenericWs
                             || (dcRawReplied.get(dcBucket) == 0
                             && dcRawFailed.get(dcBucket) > 0
                             && (ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
@@ -1136,7 +1154,7 @@ public class ColgramDpiBypass {
                     && (call == null || (call.systemWide && isTelegramDcIp(destHost)))) {
                 triedL3Race = true;
                 L3RaceResult raced = raceLayer2WithFastDirectProbe(destHost, destPort,
-                        call == null && wsCapableDest, l3Protector);
+                        call == null && wsCapableDest, isMedia, l3Protector);
                 if (raced.wsSession != null) {
                     wsSession = raced.wsSession;
                     wsViaL3Relay = raced.viaL3Relay;
@@ -1166,8 +1184,8 @@ public class ColgramDpiBypass {
                     && !(triedL3Race && strictL3WhitelistDetected)) {
                 android.net.VpnService sysVpn = activeSystemDpiVpn;
                 wsSession = (sysVpn != null)
-                        ? ColgramTelegramWsBridge.dialProtected(destHost, destPort, sysVpn::protect, sysVpn::protect)
-                        : ColgramTelegramWsBridge.dial(destHost, destPort);
+                        ? ColgramTelegramWsBridge.dialProtected(destHost, destPort, sysVpn::protect, sysVpn::protect, isMedia)
+                        : ColgramTelegramWsBridge.dial(destHost, destPort, isMedia);
                 if (wsSession != null) {
                     onDirectLayer1Success();
                     dcWsPreferred.set(dcBucket, 1);
@@ -1184,11 +1202,13 @@ public class ColgramDpiBypass {
                 if (peek.length >= 64 && !ColgramTlsMimic.looksLikeClientHello(peek) && !strictL3WhitelistDetected) {
                     final android.net.VpnService owner = call.vpn;
                     int rawDc = ColgramTelegramWsBridge.extractRawDcFromObfuscated2(peek, peek.length);
-                    boolean mediaDc = ColgramTelegramWsBridge.isMediaDcId(rawDc);
+                    boolean validRawDc = ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(rawDc) > 0;
+                    boolean mediaDc = isMedia || (validRawDc && ColgramTelegramWsBridge.isMediaDcId(rawDc));
                     wsSession = ColgramTelegramWsBridge.dialProtected(
                             destHost, destPort, owner::protect, owner::protect, mediaDc);
                     if (wsSession != null) {
-                        int hdrDc = rawDc != 0 ? rawDc : wsSession.dcId;
+                        int hdrDc = validRawDc ? rawDc
+                                : (wsSession.rawDcId != 0 ? wsSession.rawDcId : (mediaDc ? -wsSession.dcId : wsSession.dcId));
                         ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter =
                                 ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(peek, peek.length, hdrDc);
                         if (splitter != null) {
@@ -1222,7 +1242,7 @@ public class ColgramDpiBypass {
             if (targetSocket == null && wsSession == null && l3Eligible && !triedL3Race) {
                 if (call == null && wsCapableDest) triggerL3WhitelistProbeAsync();
                 if (call == null && wsCapableDest && l3RawMtprotoSilentStreak.get() > 0) {
-                    wsSession = dialWssViaL3RelayCascade(destHost, destPort, l3Protector);
+                    wsSession = dialWssViaL3RelayCascade(destHost, destPort, isMedia, l3Protector);
                     if (wsSession != null) wsViaL3Relay = true;
                 }
                 if (targetSocket == null && wsSession == null) {
@@ -1237,7 +1257,7 @@ public class ColgramDpiBypass {
                     }
                 }
                 if (call == null && targetSocket == null && wsSession == null && wsCapableDest) {
-                    wsSession = dialWssViaL3RelayCascade(destHost, destPort, l3Protector);
+                    wsSession = dialWssViaL3RelayCascade(destHost, destPort, isMedia, l3Protector);
                     if (wsSession != null) wsViaL3Relay = true;
                 }
             }
@@ -1308,7 +1328,7 @@ public class ColgramDpiBypass {
             } else {
                 pipeWithAdvancedDesync(client, targetSocket, call, generation,
                         (call == null || call.systemWide) && ColgramTelegramDcAddresses.isKnownAddress(destHost),
-                        destHost, destPort);
+                        destHost, destPort, isMedia);
             }
             handedOff = true;
 
@@ -1899,8 +1919,9 @@ public class ColgramDpiBypass {
      * (evading MegaFon/Yota TSPU in-tunnel SNI DPI while preserving CA + Telegram SAN verification).
      */
     private static String firstIpv4EdgeForDc(int dcId) {
-        if (dcId == 2 || dcId == 4) return "149.154.167.220";
-        String[] ips = ColgramTelegramWsBridge.getVerifiedWssEdgeIpsForDc(dcId);
+        int norm = ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (norm == 2 || norm == 4) return "149.154.167.220";
+        String[] ips = ColgramTelegramWsBridge.getVerifiedWssEdgeIpsForDc(norm);
         if (ips != null) {
             for (String ip : ips) {
                 if (ip != null && ip.indexOf(':') < 0) return ip;
@@ -1910,21 +1931,21 @@ public class ColgramDpiBypass {
     }
 
     private static ColgramTelegramWsBridge.WsSession dialSingleWssOverRelay(
-            ColgramProxyChain.Relay relay, int dcId, String wssHost,
+            ColgramProxyChain.Relay relay, int signedDcId, String wssHost,
             int perRelayTimeout, ColgramDohResolver.SocketProtector finalProtector) {
         String label = relay.host + ":" + relay.port;
         Socket hostSock = dialThroughSingleRelay(relay, wssHost, 443, perRelayTimeout, finalProtector);
         if (hostSock != null) {
             ColgramTelegramWsBridge.WsSession sess =
-                    ColgramTelegramWsBridge.dialViaRelaySocket(hostSock, dcId, wssHost, label);
+                    ColgramTelegramWsBridge.dialViaRelaySocket(hostSock, signedDcId, wssHost, label);
             if (sess != null) return sess;
         }
-        String fallbackIp = firstIpv4EdgeForDc(dcId);
+        String fallbackIp = firstIpv4EdgeForDc(signedDcId);
         if (fallbackIp != null && !fallbackIp.equals(wssHost)) {
             Socket ipSock = dialThroughSingleRelay(relay, fallbackIp, 443, perRelayTimeout, finalProtector);
             if (ipSock != null) {
                 ColgramTelegramWsBridge.WsSession sess =
-                        ColgramTelegramWsBridge.dialViaRelaySocket(ipSock, dcId, wssHost, label);
+                        ColgramTelegramWsBridge.dialViaRelaySocket(ipSock, signedDcId, wssHost, label);
                 if (sess != null) return sess;
             }
         }
@@ -1933,22 +1954,40 @@ public class ColgramDpiBypass {
 
     static ColgramTelegramWsBridge.WsSession dialWssViaL3RelayCascade(
             String destHost, int destPort, ColgramDohResolver.SocketProtector protector) {
+        return dialWssViaL3RelayCascade(destHost, destPort,
+                ColgramTelegramDcAddresses.signedDcIdFor(destHost) < 0, protector);
+    }
+
+    static ColgramTelegramWsBridge.WsSession dialWssViaL3RelayCascade(
+            String destHost, int destPort, boolean preferMediaEdge,
+            ColgramDohResolver.SocketProtector protector) {
         java.util.List<ColgramProxyChain.Relay> relays;
         try {
             relays = ColgramProxyManager.getReachableRelays();
         } catch (Throwable ignored) {
             return null;
         }
-        return dialWssViaL3RelayCascade(destHost, destPort, protector, relays);
+        return dialWssViaL3RelayCascade(destHost, destPort, preferMediaEdge, protector, relays);
     }
 
     static ColgramTelegramWsBridge.WsSession dialWssViaL3RelayCascade(
             String destHost, int destPort, ColgramDohResolver.SocketProtector protector,
             java.util.List<ColgramProxyChain.Relay> relays) {
+        return dialWssViaL3RelayCascade(destHost, destPort,
+                ColgramTelegramDcAddresses.signedDcIdFor(destHost) < 0, protector, relays);
+    }
+
+    static ColgramTelegramWsBridge.WsSession dialWssViaL3RelayCascade(
+            String destHost, int destPort, boolean preferMediaEdge,
+            ColgramDohResolver.SocketProtector protector,
+            java.util.List<ColgramProxyChain.Relay> relays) {
         if (!isEligibleForL3RelayCascade(destHost, destPort)) return null;
-        final int dcId = ColgramTelegramDcAddresses.dcIdFor(destHost);
-        if (dcId < 1 || dcId > 5) return null;
-        final String wssHost = ColgramTelegramWsBridge.primaryWssHostForDc(dcId);
+        final int baseSigned = ColgramTelegramDcAddresses.signedDcIdFor(destHost);
+        final int normDc = ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(baseSigned);
+        if (normDc < 1 || normDc > 5) return null;
+        final boolean media = preferMediaEdge || baseSigned < 0;
+        final int signedDc = media ? -normDc : normDc;
+        final String wssHost = ColgramTelegramWsBridge.primaryWssHostForSignedDc(signedDc);
         java.util.List<ColgramProxyChain.Relay> top = selectL3RelayTopCandidates(relays);
         if (top.isEmpty()) return null;
 
@@ -1959,11 +1998,11 @@ public class ColgramDpiBypass {
             ColgramProxyChain.Relay only = top.get(0);
             String label = only.host + ":" + only.port;
             ColgramTelegramWsBridge.WsSession sess =
-                    dialSingleWssOverRelay(only, dcId, wssHost, perRelayTimeout, finalProtector);
+                    dialSingleWssOverRelay(only, signedDc, wssHost, perRelayTimeout, finalProtector);
             if (sess != null) {
                 lastL3RelaySuccessAt = safeElapsedRealtime();
                 activeL3RelayLabel = label;
-                safeLogI("L3_WSS_RELAY_OK relay=" + label + " host=" + wssHost + " dc=" + dcId);
+                safeLogI("L3_WSS_RELAY_OK relay=" + label + " host=" + wssHost + " dc=" + signedDc);
             } else {
                 markRelayFailed(only.host, only.port);
             }
@@ -1989,7 +2028,7 @@ public class ColgramDpiBypass {
                     synchronized (winnerLock) {
                         if (finished[0] || winner[0] != null) return;
                     }
-                    sess = dialSingleWssOverRelay(relay, dcId, wssHost, perRelayTimeout, finalProtector);
+                    sess = dialSingleWssOverRelay(relay, signedDc, wssHost, perRelayTimeout, finalProtector);
                     if (sess == null) {
                         markRelayFailed(relay.host, relay.port);
                         return;
@@ -2032,7 +2071,7 @@ public class ColgramDpiBypass {
             String label = chosenRelay.host + ":" + chosenRelay.port;
             lastL3RelaySuccessAt = safeElapsedRealtime();
             activeL3RelayLabel = label;
-            safeLogI("L3_WSS_RELAY_OK relay=" + label + " host=" + wssHost + " dc=" + dcId);
+            safeLogI("L3_WSS_RELAY_OK relay=" + label + " host=" + wssHost + " dc=" + signedDc);
         }
         return chosenSess;
     }
@@ -2119,6 +2158,7 @@ public class ColgramDpiBypass {
      */
     private static L3RaceResult raceLayer2WithFastDirectProbe(final String destHost, final int destPort,
                                                               final boolean wsCapableDest,
+                                                              final boolean isMedia,
                                                               final ColgramDohResolver.SocketProtector protector) {
         java.util.List<ColgramProxyChain.Relay> relays = java.util.Collections.emptyList();
         try {
@@ -2229,14 +2269,14 @@ public class ColgramDpiBypass {
                 try {
                     boolean preferWssOverRelay = wsCapableDest && l3RawMtprotoSilentStreak.get() > 0;
                     if (preferWssOverRelay) {
-                        relayWs = dialWssViaL3RelayCascade(destHost, destPort, protector, relaySnapshot);
+                        relayWs = dialWssViaL3RelayCascade(destHost, destPort, isMedia, protector, relaySnapshot);
                     }
                     if (relayWs == null) {
                         relaySock = connectViaL3RelayCascade(destHost, destPort,
                                 l3RelayTimeoutMs(), protector, relaySnapshot);
                     }
                     if (relayWs == null && relaySock == null && wsCapableDest && !preferWssOverRelay) {
-                        relayWs = dialWssViaL3RelayCascade(destHost, destPort, protector, relaySnapshot);
+                        relayWs = dialWssViaL3RelayCascade(destHost, destPort, isMedia, protector, relaySnapshot);
                     }
                     if (relayWs != null || relaySock != null) {
                         synchronized (gate) {
@@ -3302,10 +3342,11 @@ public class ColgramDpiBypass {
                     boolean first = fromTarget.getAndAdd(count) == 0L;
                     if (first) {
                         onDirectLayer1Success();
-                        int bucket = (session.dcId >= 1 && session.dcId <= 5) ? session.dcId : 0;
+                        int bucket = dcBucketForSignedDc(session.rawDcId != 0 ? session.rawDcId : session.dcId);
                         dcWsPreferred.set(bucket, 1);
                         dcBackoffUntil.set(bucket, 0L);
-                        Log.i(TAG, "WS_REPLY_OK dc=" + session.dcId + " edge=" + session.edgeIp
+                        Log.i(TAG, "WS_REPLY_OK dc=" + session.dcId + " rawDc=" + session.rawDcId
+                                + " edge=" + session.edgeIp
                                 + " sni=" + session.sniHost + " bytes=" + count + " (sysdpi-peek)");
                     }
                 });
@@ -3385,17 +3426,18 @@ public class ColgramDpiBypass {
                     } else if (first) {
                         onDirectLayer1Success();
                         if (call == null) publishUpstream(generation, UPSTREAM_REPLY);
-                        int bucket = (session.dcId >= 1 && session.dcId <= 5) ? session.dcId : 0;
+                        int bucket = dcBucketForSignedDc(session.rawDcId != 0 ? session.rawDcId : session.dcId);
                         dcWsPreferred.set(bucket, 1);
                         dcBackoffUntil.set(bucket, 0L);
                         reportStrategyResult(strategy, true, bucket);
-                        Log.i(TAG, "WS_REPLY_OK dc=" + session.dcId + " edge=" + session.edgeIp
+                        Log.i(TAG, "WS_REPLY_OK dc=" + session.dcId + " rawDc=" + session.rawDcId
+                                + " edge=" + session.edgeIp
                                 + " sni=" + session.sniHost + " bytes=" + count
                                 + (call != null ? " (sysdpi)" : ""));
                     }
                     if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(count);
                 });
-                if (!viaL3Relay && totalS2C > 0L && totalS2C < 64L) {
+                if (!viaL3Relay && totalS2C == 0L) {
                     ColgramTelegramWsBridge.deprioritizeEndpoint(session);
                 }
                 Log.d(TAG, "WS_S2C_EOF dc=" + session.dcId + " total=" + totalS2C);
@@ -3406,7 +3448,7 @@ public class ColgramDpiBypass {
                 closeQuietly(session);
                 if (call != null) call.done(client, null);
                 if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
-                int bucket = (session.dcId >= 1 && session.dcId <= 5) ? session.dcId : 0;
+                int bucket = dcBucketForSignedDc(session.rawDcId != 0 ? session.rawDcId : session.dcId);
                 if (!viaL3Relay && call == null && isCurrentListener(generation)) {
                     reportStrategyResult(strategy, fromTarget.get() > 0, bucket);
                 }
@@ -3705,7 +3747,8 @@ public class ColgramDpiBypass {
 
     private static void pipeWithAdvancedDesync(final Socket client, final Socket dest, final CallListener call,
                                                final long generation, final boolean telegram,
-                                               final String destHost, final int destPort) {
+                                               final String destHost, final int destPort,
+                                               final boolean isMedia) {
         // CRITICAL: when call != null, CallListener explicitly called VpnService.protect(dest),
         // bypassing our own TUN straight onto the raw carrier/ISP network where TSPU sits.
         // overlayActive MUST be false whenever call != null, otherwise whole-device local DPI
@@ -3734,7 +3777,7 @@ public class ColgramDpiBypass {
                 return;
             }
             pipeStandardOrWsSession(client, dest, call, generation, telegram, destHost, destPort,
-                    overlayActive, firstPayload, looksTls, hostKey);
+                    overlayActive, firstPayload, looksTls, hostKey, isMedia);
         });
     }
 
@@ -3863,7 +3906,8 @@ public class ColgramDpiBypass {
                                                 final long generation, final boolean telegram,
                                                 final String destHost, final int destPort,
                                                 final boolean overlayActive, final byte[] firstPayload,
-                                                final boolean looksTls, final String hostKey) {
+                                                final boolean looksTls, final String hostKey,
+                                                final boolean isMedia) {
         tuneSocketBuffers(client);
         tuneSocketBuffers(dest);
         final boolean wsCapable = ((call == null && !overlayActive) || (call != null && call.systemWide))
@@ -4135,7 +4179,8 @@ public class ColgramDpiBypass {
                     try {
                         int rawDc = ColgramTelegramWsBridge.extractRawDcFromObfuscated2(
                                 replayBytes, replayBytes.length);
-                        boolean mediaDc = ColgramTelegramWsBridge.isMediaDcId(rawDc);
+                        boolean validRawDc = ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(rawDc) > 0;
+                        boolean mediaDc = isMedia || (validRawDc && ColgramTelegramWsBridge.isMediaDcId(rawDc));
                         if (call != null && call.systemWide && call.vpn != null) {
                             final android.net.VpnService owner = call.vpn;
                             ws = ColgramTelegramWsBridge.dialProtected(
@@ -4145,15 +4190,16 @@ public class ColgramDpiBypass {
                             ws = (sysVpn != null)
                                     ? ColgramTelegramWsBridge.dialProtected(
                                             destHost, destPort, sysVpn::protect, sysVpn::protect, mediaDc)
-                                    : ColgramTelegramWsBridge.dialProtected(
-                                            destHost, destPort, null, null, mediaDc);
+                                    : ColgramTelegramWsBridge.dial(destHost, destPort, mediaDc);
                         }
-                        int hdrDc = ws == null ? 0 : (rawDc != 0 ? rawDc : ws.dcId);
+                        int hdrDc = ws == null ? 0
+                                : (validRawDc ? rawDc : (ws.rawDcId != 0 ? ws.rawDcId : (mediaDc ? -ws.dcId : ws.dcId)));
                         ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter =
                                 ws == null ? null : ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
                                         replayBytes, replayBytes.length, hdrDc);
                         if (ws != null && splitter != null && !clientSideClosed.get()) {
-                            int wsBucket = (ws.dcId >= 1 && ws.dcId <= 5) ? ws.dcId : dcBucketFor(destHost);
+                            int wsBucket = dcBucketForSignedDc(ws.rawDcId != 0 ? ws.rawDcId : ws.dcId);
+                            if (wsBucket == 0) wsBucket = dcBucketFor(destHost);
                             dcWsPreferred.set(wsBucket, 1);
                             dcBackoffUntil.set(wsBucket, 0L);
                             onDirectLayer1Success();
