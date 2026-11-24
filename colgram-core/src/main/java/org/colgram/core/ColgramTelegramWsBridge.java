@@ -1909,7 +1909,10 @@ public final class ColgramTelegramWsBridge {
                                              final ColgramNativeDesync.FdProtector fdProtector,
                                              final int fragMode) {
         if (candidates.isEmpty()) return null;
-        boolean includeIpv6 = ColgramDohResolver.hasGlobalRoutableIpv6() || isIpv6BypassEnabledSafe();
+        boolean isProtected = (protector != null || fdProtector != null
+                || ColgramDpiBypass.activeSystemDpiVpn() != null);
+        boolean includeIpv6 = ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(isProtected)
+                || (isIpv6BypassEnabledSafe() && (isProtected || !ColgramDpiBypass.isOverlayVpnActive()));
         List<EdgeEndpoint> picked = selectRaceEndpoints(candidates, includeIpv6);
         if (picked.isEmpty()) return null;
         EdgeEndpoint ep0 = picked.get(0);

@@ -162,7 +162,68 @@ public final class ColgramDohResolver {
 
     private static volatile long lastIpv6CheckAt = 0L;
     private static volatile boolean cachedGlobalIpv6 = false;
+    private static volatile long lastVpnIpv6CheckAt = 0L;
+    private static volatile boolean cachedGlobalVpnIpv6 = false;
     private static final long IPV6_CHECK_CACHE_MS = 5_000L;
+
+    private static boolean hasGlobalVpnIpv6() {
+        long now = System.currentTimeMillis();
+        if (now - lastVpnIpv6CheckAt < IPV6_CHECK_CACHE_MS) {
+            return cachedGlobalVpnIpv6;
+        }
+        boolean found = false;
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifaces =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (ifaces != null && ifaces.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifaces.nextElement();
+                if (ni == null || !ni.isUp() || ni.isLoopback()) continue;
+                String name = ni.getName();
+                if (name == null) continue;
+                String lower = name.toLowerCase(java.util.Locale.US);
+                if (!lower.startsWith("tun") && !lower.startsWith("colgram")
+                        && !lower.startsWith("ppp") && !lower.startsWith("wg")) {
+                    continue;
+                }
+                java.util.Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                while (addrs != null && addrs.hasMoreElements()) {
+                    InetAddress addr = addrs.nextElement();
+                    if (!(addr instanceof java.net.Inet6Address)) continue;
+                    if (addr.isLoopbackAddress() || addr.isLinkLocalAddress()
+                            || addr.isSiteLocalAddress() || addr.isAnyLocalAddress()
+                            || addr.isMulticastAddress()) {
+                        continue;
+                    }
+                    byte[] raw = addr.getAddress();
+                    if (raw != null && raw.length == 16 && (raw[0] & 0xFE) != 0xFC) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+        } catch (Throwable ignored) {
+        }
+        cachedGlobalVpnIpv6 = found;
+        lastVpnIpv6CheckAt = now;
+        return found;
+    }
+
+    static boolean hasRoutableIpv6ForCurrentSocket(boolean isProtected, boolean globalPhysicalIpv6,
+                                                   boolean overlayVpnActive, boolean globalVpnIpv6) {
+        if (!globalPhysicalIpv6) return false;
+        if (isProtected) return true;
+        if (overlayVpnActive) return globalVpnIpv6;
+        return true;
+    }
+
+    public static boolean hasRoutableIpv6ForCurrentSocket(boolean isProtected) {
+        return hasRoutableIpv6ForCurrentSocket(
+                isProtected,
+                hasGlobalRoutableIpv6(),
+                ColgramDpiBypass.isOverlayVpnActive(),
+                hasGlobalVpnIpv6());
+    }
 
     /**
      * Returns true when a real physical network interface (excluding loopback and VPN/TUN) holds
@@ -219,7 +280,11 @@ public final class ColgramDohResolver {
     }
 
     private static List<Endpoint> activeEndpoints() {
-        boolean v6 = hasGlobalRoutableIpv6();
+        return activeEndpoints(hasRoutableIpv6ForCurrentSocket(false));
+    }
+
+    private static List<Endpoint> activeEndpoints(boolean allowIpv6) {
+        boolean v6 = allowIpv6;
         List<Endpoint> out = new ArrayList<>(ENDPOINTS.length + (v6 ? IPV6_ENDPOINTS.length : 0));
         if (!v6) {
             for (Endpoint ep : ENDPOINTS) out.add(ep);
@@ -605,7 +670,9 @@ public final class ColgramDohResolver {
         List<InetAddress> merged = new ArrayList<>();
         InetAddress v4 = resolveProtected(cleaned, protector, fdProtector);
         if (v4 != null) merged.add(v4);
-        if (includeIpv6 && hasGlobalRoutableIpv6()) {
+        boolean isProtected = (protector != null || fdProtector != null
+                || ColgramDpiBypass.activeSystemDpiVpn() != null);
+        if (includeIpv6 && hasRoutableIpv6ForCurrentSocket(isProtected)) {
             InetAddress[] v6 = queryEndpointsInternal(
                     cleaned.toLowerCase(java.util.Locale.ROOT), cleaned,
                     System.currentTimeMillis(), false, 28, protector, fdProtector);
@@ -665,12 +732,16 @@ public final class ColgramDohResolver {
         long now = System.currentTimeMillis();
         String queryHost = extractQueryHostname(wireQuery);
         boolean preferGoogleEcs = prefersEcsDns(queryHost);
+        boolean isProtected = (sockProtector != null || fdProtector != null
+                || ColgramDpiBypass.activeSystemDpiVpn() != null);
+        boolean allowIpv6 = hasRoutableIpv6ForCurrentSocket(isProtected);
 
         // 1. Fast path: try the pinned last-working DoH/DoT provider first (<150ms typical),
         //    but never short-circuit ECS-sensitive media/video hosts onto a non-ECS resolver!
         Endpoint pinned = lastWorkingEndpoint;
         Endpoint pinnedTried = null;
         if (pinned != null && !isCut(pinned.key(), now)
+                && (allowIpv6 || pinned.ip.indexOf(':') < 0)
                 && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
             pinnedTried = pinned;
             try {
@@ -689,7 +760,7 @@ public final class ColgramDohResolver {
         }
 
         // 2. Concurrent waves across healthy providers (Google ECS wave first for YouTube/Discord media)
-        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, false, preferGoogleEcs);
+        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, false, preferGoogleEcs, allowIpv6);
         java.util.Set<String> triedKeys = new java.util.HashSet<>();
         if (pinnedTried != null) triedKeys.add(pinnedTried.key());
 
@@ -749,12 +820,18 @@ public final class ColgramDohResolver {
     }
 
     private static List<Endpoint> buildHealthyCandidates(Endpoint exclude, long now, boolean ignoreCut) {
-        return buildHealthyCandidates(exclude, now, ignoreCut, false);
+        return buildHealthyCandidates(exclude, now, ignoreCut, false, hasRoutableIpv6ForCurrentSocket(false));
     }
 
     private static List<Endpoint> buildHealthyCandidates(Endpoint exclude, long now, boolean ignoreCut,
                                                          boolean preferGoogleEcs) {
-        List<Endpoint> allActive = activeEndpoints();
+        return buildHealthyCandidates(exclude, now, ignoreCut, preferGoogleEcs,
+                hasRoutableIpv6ForCurrentSocket(false));
+    }
+
+    private static List<Endpoint> buildHealthyCandidates(Endpoint exclude, long now, boolean ignoreCut,
+                                                         boolean preferGoogleEcs, boolean allowIpv6) {
+        List<Endpoint> allActive = activeEndpoints(allowIpv6);
         List<Endpoint> candidates = new ArrayList<>(allActive.size());
         for (Endpoint ep : allActive) {
             if (ep == exclude) continue;
@@ -956,10 +1033,14 @@ public final class ColgramDohResolver {
         }
 
         boolean preferGoogleEcs = prefersEcsDns(hostname);
+        boolean isProtected = (protector != null || fdProtector != null
+                || ColgramDpiBypass.activeSystemDpiVpn() != null);
+        boolean allowIpv6 = hasRoutableIpv6ForCurrentSocket(isProtected);
         // 1. Fast path: pinned last-working endpoint with bounded budget (skip non-ECS pinned for YouTube/media)
         Endpoint pinned = lastWorkingEndpoint;
         Endpoint pinnedTried = null;
         if (pinned != null && (ignoreCut || !isCut(pinned.key(), now))
+                && (allowIpv6 || pinned.ip.indexOf(':') < 0)
                 && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
             pinnedTried = pinned;
             try {
@@ -987,7 +1068,7 @@ public final class ColgramDohResolver {
         }
 
         // 2. Concurrent waves (Google ECS first for YouTube/media, then 3-way diverse waves under 3.8s each)
-        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, ignoreCut, preferGoogleEcs);
+        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, ignoreCut, preferGoogleEcs, allowIpv6);
         if (preferGoogleEcs) {
             List<Endpoint> ecsWave = extractGoogleWave(remaining, 3);
             if (!ecsWave.isEmpty()) {

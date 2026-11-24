@@ -384,6 +384,27 @@ public final class ColgramYoutubeBypassTest {
             }
         }
 
+        // 6. IPv4-only overlay VPN (WARP tun0) & WSS failover contract
+        check(!ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(false, true, true, false),
+                "unprotected socket disables IPv6 under IPv4-only overlay VPN");
+        check(ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(true, true, true, false),
+                "VPN-protected socket keeps physical dual-stack IPv6 even when overlay VPN is IPv4-only");
+        check(ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(false, true, true, true),
+                "dual-stack VPN with global tun IPv6 keeps IPv6 enabled");
+        check(ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(false, true, false, false),
+                "raw dual-stack LTE/Wi-Fi without overlay VPN keeps IPv6 enabled");
+        check(!ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(true, false, false, false),
+                "IPv4-only physical network keeps IPv6 disabled");
+
+        check(ColgramDpiBypass.isWsCapableForSession(false, false, false),
+                "main local bypass keeps WSS failover enabled even under overlay VPN");
+        check(ColgramDpiBypass.isWsCapableForSession(true, true, false),
+                "whole-device DPI keeps WSS failover for Telegram DCs");
+        check(!ColgramDpiBypass.isWsCapableForSession(true, true, true),
+                "whole-device DPI skips WSS wrapping for 149.154.167.220 itself");
+        check(!ColgramDpiBypass.isWsCapableForSession(true, false, false),
+                "call-only SOCKS tunnel does not wrap traffic in WSS");
+
         System.out.println("ColgramYoutubeBypassTest: " + checks + " checks PASS");
     }
 }

@@ -1126,19 +1126,20 @@ public class ColgramDpiBypass {
             int genericBucket = genericBucketForSignedDc(signedDc);
             boolean inheritedGenericWs = isMedia && genericBucket > 0 && dcWsPreferred.get(genericBucket) != 0;
             boolean wsEdgeHost = "149.154.167.220".equals(destHost);
-            boolean wsCapableDest = ((call == null && !overlayActive) || (call != null && call.systemWide && !wsEdgeHost))
+            boolean wsCapableDest = isWsCapableForSession(call != null, call != null && call.systemWide, wsEdgeHost)
                     && ColgramTelegramWsBridge.supports(destHost, destPort);
             // For CallListener (whole-device TUN), NEVER pre-emptively bypass raw TCP before inspecting
             // the client's first packet — HTTPS/TLS to t.me, api.telegram.org, or web.telegram.org also
             // lives on 149.154.*:443 and MUST be SNI-desynced as TLS, never wrapped inside MTProto WSS!
+            // When an overlay VPN (e.g. WARP) is active, try raw TCP once first, then fail over to WSS.
             boolean skipRawForWs = (call == null) && wsCapableDest && (
                     dcWsPreferred.get(dcBucket) != 0
                             || inheritedGenericWs
                             || (dcRawReplied.get(dcBucket) == 0
                             && dcRawFailed.get(dcBucket) > 0
-                            && (ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
-                                    || cellularNetwork
-                                    || dcRawFailed.get(dcBucket) >= 1)));
+                            && (overlayActive
+                                    || ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
+                                    || cellularNetwork)));
             boolean viaL3Relay = false;
             boolean wsViaL3Relay = false;
             boolean triedL3Race = false;
@@ -1452,6 +1453,10 @@ public class ColgramDpiBypass {
         return activeNetworkHasTransportVpn;
     }
 
+    static boolean isWsCapableForSession(boolean isCallTunnel, boolean systemWide, boolean wsEdgeHost) {
+        return !isCallTunnel || (systemWide && !wsEdgeHost);
+    }
+
     static boolean isOverlayVpnActive() {
         // Bypass DPI/WSS handling ONLY when WARP or an EXTERNAL Android VPN is active on the
         // default network (NetworkCapabilities.TRANSPORT_VPN), excluding our own whole-device
@@ -1529,7 +1534,9 @@ public class ColgramDpiBypass {
         android.net.VpnService sysVpn = activeSystemDpiVpn;
         ColgramDohResolver.SocketProtector sockProt = sysVpn != null ? sysVpn::protect : null;
         ColgramNativeDesync.FdProtector fdProt = sysVpn != null ? sysVpn::protect : null;
-        boolean allowIpv6 = ColgramConfig.isIpv6BypassEnabled() || ColgramDohResolver.hasGlobalRoutableIpv6();
+        boolean isProtected = (fdProt != null || sockProt != null);
+        boolean allowIpv6 = ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(isProtected)
+                || (ColgramConfig.isIpv6BypassEnabled() && (isProtected || !isOverlayVpnActive()));
         boolean isTelegramDc = ColgramTelegramDcAddresses.isKnownAddress(host);
         String[] aliases = ColgramTelegramDcAddresses.candidatesFor(host);
 
@@ -4051,7 +4058,7 @@ public class ColgramDpiBypass {
                                                 final boolean isMedia) {
         tuneSocketBuffers(client);
         tuneSocketBuffers(dest);
-        final boolean wsCapable = ((call == null && !overlayActive) || (call != null && call.systemWide))
+        final boolean wsCapable = isWsCapableForSession(call != null, call != null && call.systemWide, "149.154.167.220".equals(destHost))
                 && telegram && ColgramTelegramWsBridge.supports(destHost, destPort);
         final long wsAwaitMs = ColgramTelegramWsBridge.maxDialWallMs() + 800L;
         final java.util.concurrent.atomic.AtomicLong fromTarget =
