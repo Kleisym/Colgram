@@ -342,15 +342,35 @@ public class ColgramPythonEngine {
         }
     }
 
+    /** Thread-local active account while a Python shim callback executes so send/edit/delete never leak across accounts. */
+    private static final ThreadLocal<Integer> activeBridgeAccount = new ThreadLocal<>();
+
+    public static int resolveSelectedAccount() {
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            int acc = (int) ucClass.getField("selectedAccount").get(null);
+            return acc >= 0 && acc < 5 ? acc : 0;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
     /**
      * Invoke a command registered through the exteraGram shim.
      * Returns the handler's string result, or null if the command is unknown.
      */
     public static String runShimCommand(long dialogId, String cmd, String args) {
-        if (cmd == null) return null;
+        return runShimCommand(resolveSelectedAccount(), dialogId, cmd, args);
+    }
+
+    public static String runShimCommand(int account, long dialogId, String cmd, String args) {
+        if (cmd == null || dialogId == 0L) return null;
+        int safeAcc = account >= 0 && account < 5 ? account : resolveSelectedAccount();
         // Real execution path: bring the interpreter up on demand.
         ensureInitialized();
         if (!pythonInitialized || pythonInstance == null) return null;
+        Integer prevAcc = activeBridgeAccount.get();
+        activeBridgeAccount.set(safeAcc);
         try {
             Object mod = getModuleMethod.invoke(pythonInstance, "exteraPlugins");
             // Wire the real bridge actions and the dialog context, so a plugin calling
@@ -364,6 +384,9 @@ public class ColgramPythonEngine {
         } catch (Throwable t) {
             Log.w(TAG, "shim command ." + cmd + " failed: " + t.getMessage());
             return null;
+        } finally {
+            if (prevAcc == null) activeBridgeAccount.remove();
+            else activeBridgeAccount.set(prevAcc);
         }
     }
 
@@ -476,7 +499,12 @@ public class ColgramPythonEngine {
      * Returns true if the command was intercepted and handled.
      */
     public static boolean handleCommand(final long dialogId, final int replyToMsgId, final String text) {
-        if (text == null || !text.startsWith(".")) return false;
+        return handleCommand(resolveSelectedAccount(), dialogId, replyToMsgId, text);
+    }
+
+    public static boolean handleCommand(final int account, final long dialogId, final int replyToMsgId, final String text) {
+        if (text == null || !text.startsWith(".") || dialogId == 0L) return false;
+        final int safeAcc = account >= 0 && account < 5 ? account : resolveSelectedAccount();
 
         String[] parts = text.trim().split("\\s+", 2);
         String cmd = parts[0].substring(1).toLowerCase();
@@ -485,30 +513,30 @@ public class ColgramPythonEngine {
         switch (cmd) {
             case "ping":
                 long start = System.currentTimeMillis();
-                sendMessage(dialogId, "🏓 Pong! `" + (System.currentTimeMillis() - start) + "ms`");
+                sendMessage(safeAcc, dialogId, "🏓 Pong! `" + (System.currentTimeMillis() - start) + "ms`");
                 return true;
 
             case "eval":
             case "py":
                 if (args.isEmpty()) {
-                    sendMessage(dialogId, "⚠️ Usage: `.py <python code>` or `.eval <expr>`");
+                    sendMessage(safeAcc, dialogId, "⚠️ Usage: `.py <python code>` or `.eval <expr>`");
                 } else {
                     executeScript(args, new ScriptCallback() {
                         @Override
                         public void onSuccess(String output) {
-                            sendMessage(dialogId, "🐍 **CPython Output:**\n```\n" + output + "\n```");
+                            sendMessage(safeAcc, dialogId, "🐍 **CPython Output:**\n```\n" + output + "\n```");
                         }
 
                         @Override
                         public void onError(String error) {
-                            sendMessage(dialogId, "❌ **CPython Error:**\n```\n" + error + "\n```");
+                            sendMessage(safeAcc, dialogId, "❌ **CPython Error:**\n```\n" + error + "\n```");
                         }
                     });
                 }
                 return true;
 
             case "id":
-                sendMessage(dialogId, "🆔 **Chat ID:** `" + dialogId + "`");
+                sendMessage(safeAcc, dialogId, "🆔 **Chat ID:** `" + dialogId + "`");
                 return true;
 
             case "del":
@@ -516,7 +544,7 @@ public class ColgramPythonEngine {
                 try {
                     if (!args.isEmpty()) count = Integer.parseInt(args.trim());
                 } catch (Exception ignored) {}
-                deleteLastMessages(dialogId, count);
+                deleteLastMessages(safeAcc, dialogId, count);
                 return true;
 
             case "help":
@@ -528,16 +556,16 @@ public class ColgramPythonEngine {
                         "• `.del <count>` — Delete own messages in bulk\n" +
                         "• `.plugins` — List installed plugins in `/Documents/Colgram/Plugins/`\n" +
                         "• `.help` — Show this guide";
-                sendMessage(dialogId, help);
+                sendMessage(safeAcc, dialogId, help);
                 return true;
 
             case "plugins":
                 String pluginList = ColgramPluginManager.getLoadedPluginsSummary();
-                sendMessage(dialogId, pluginList);
+                sendMessage(safeAcc, dialogId, pluginList);
                 return true;
 
             default:
-                return ColgramPluginManager.dispatchCommand(dialogId, cmd, args);
+                return ColgramPluginManager.dispatchCommand(safeAcc, dialogId, cmd, args);
         }
     }
 
@@ -695,31 +723,22 @@ public class ColgramPythonEngine {
      * UI anchor and would otherwise NPE inside Telegram.
      */
     public static void editMessage(long dialogId, int messageId, String newText) {
-        try {
-            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
+        editMessage(resolveSelectedAccount(), dialogId, messageId, newText);
+    }
 
-            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
-            // getMessage(int, long, int, boolean) does not exist on MessagesController, and never
-            // has - so the lookup returned null, the invoke threw, and editing a message through a
-            // plugin did nothing at all, silently.
-            //
-            // The method of that name is on MessagesStorage and takes two longs:
-            //     public TLRPC.Message getMessage(long dialogId, long msgId)
-            // It blocks on a latch while the database is read, so it belongs off the caller's thread.
+    public static void editMessage(int account, long dialogId, int messageId, String newText) {
+        if (dialogId == 0L || messageId <= 0 || account < 0 || account >= 5 || newText == null) return;
+        try {
+            int currentAccount = account;
+
             Class<?> storageClass = Class.forName("org.telegram.messenger.MessagesStorage");
             Object storage = storageClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
             Object msg = storageClass
                     .getMethod("getMessage", long.class, long.class)
-                    .invoke(storage, dialogId, messageId);
+                    .invoke(storage, dialogId, (long) messageId);
             if (msg == null) return;
 
             Class<?> msgObjClass = Class.forName("org.telegram.messenger.MessageObject");
-            // The constructor that matches what is in hand. There is no
-            // (int, Object, Object, boolean) - the two-argument forms take a StoryItem, and the rest
-            // take a TLRPC.Message plus the user maps this code does not have. This one takes the
-            // message and a null user map, which is what a fetch without a local cache provides.
             Object messageObject = msgObjClass
                     .getConstructor(int.class,
                             Class.forName("org.telegram.tgnet.TLRPC$Message"),
@@ -756,10 +775,14 @@ public class ColgramPythonEngine {
      * Deletes a single message via MessagesController.deleteMessages() reflection.
      */
     public static void deleteMessage(long dialogId, int messageId) {
+        deleteMessage(resolveSelectedAccount(), dialogId, messageId);
+    }
+
+    public static void deleteMessage(int account, long dialogId, int messageId) {
+        if (dialogId == 0L || messageId <= 0 || account < 0 || account >= 5) return;
         try {
             Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
+            int currentAccount = account;
 
             Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
 
@@ -769,9 +792,15 @@ public class ColgramPythonEngine {
             Class<?> encryptedChatClass = Class.forName("org.telegram.tgnet.TLRPC$EncryptedChat");
             // Public overload: (ArrayList, ArrayList, EncryptedChat, long, int, boolean, int)
             // mode 0 == MODE_DEFAULT, forAll=false so it behaves like a normal local delete.
-            mcClass.getMethod("deleteMessages", java.util.ArrayList.class, java.util.ArrayList.class,
-                            encryptedChatClass, long.class, int.class, boolean.class, int.class)
-                    .invoke(mc, ids, null, null, dialogId, 0, false, 0);
+            mainHandler.post(() -> {
+                try {
+                    mcClass.getMethod("deleteMessages", java.util.ArrayList.class, java.util.ArrayList.class,
+                                    encryptedChatClass, long.class, int.class, boolean.class, int.class)
+                            .invoke(mc, ids, null, null, dialogId, 0, false, 0);
+                } catch (Throwable inner) {
+                    Log.w(TAG, "deleteMessage dispatch failed: " + inner.getMessage());
+                }
+            });
         } catch (Throwable t) {
             Log.w(TAG, "deleteMessage via reflection failed: " + t.getMessage());
         }
@@ -829,12 +858,23 @@ public class ColgramPythonEngine {
                 (proxy, method, rawArgs) -> {
                     if ("__call__".equals(method.getName())) {
                         Object[] a = (Object[]) rawArgs[0];
+                        Integer bound = activeBridgeAccount.get();
+                        int acct = bound != null ? bound.intValue() : resolveSelectedAccount();
                         if ("send".equals(kind) && a.length >= 2) {
-                            sendMessage(asLong(a[0]), String.valueOf(a[1]));
+                            long did = asLong(a[0]);
+                            if (did != 0L) {
+                                sendMessage(acct, did, String.valueOf(a[1]));
+                            }
                         } else if ("edit".equals(kind) && a.length >= 3) {
-                            editMessage(asLong(a[0]), (int) asLong(a[1]), String.valueOf(a[2]));
+                            long did = asLong(a[0]);
+                            if (did != 0L) {
+                                editMessage(acct, did, (int) asLong(a[1]), String.valueOf(a[2]));
+                            }
                         } else if ("delete".equals(kind) && a.length >= 2) {
-                            deleteMessage(asLong(a[0]), (int) asLong(a[1]));
+                            long did = asLong(a[0]);
+                            if (did != 0L) {
+                                deleteMessage(acct, did, (int) asLong(a[1]));
+                            }
                         }
                         return null;
                     }
@@ -864,62 +904,56 @@ public class ColgramPythonEngine {
      * Sends a message in Telegram via SendMessagesHelper reflection.
      */
     public static void sendMessage(long dialogId, String message) {
-        try {
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
-            sendMessage(currentAccount, dialogId, message);
-        } catch (Throwable t) {
-            Log.w(TAG, "sendMessage(" + dialogId + ") failed: " + t);
-        }
+        sendMessage(resolveSelectedAccount(), dialogId, message);
+    }
+
+    /** Pure validation gate reusable in host JVM tests (blocks zero, encrypted/folder, service, or invalid account). */
+    public static boolean isValidSendTarget(int account, long dialogId, String message) {
+        return ColgramAutoReplyPolicy.isValidSendTarget(account, dialogId, message);
     }
 
     public static void sendMessage(int account, long dialogId, String message) {
-        try {
-            Class<?> smhClass = Class.forName("org.telegram.messenger.SendMessagesHelper");
-            int safeAccount = account >= 0 && account < 5 ? account : 0;
+        if (!isValidSendTarget(account, dialogId, message)) {
+            Log.w(TAG, "Blocked unsafe sendMessage(acc=" + account + ", dialogId=" + dialogId + ")");
+            return;
+        }
+        final int safeAccount = account;
+        final long targetDialogId = dialogId;
+        final String safeMessage = message;
+        Runnable dispatch = () -> {
+            try {
+                Class<?> smhClass = Class.forName("org.telegram.messenger.SendMessagesHelper");
+                Method getInstance = smhClass.getMethod("getInstance", int.class);
+                Object smh = getInstance.invoke(null, safeAccount);
 
-            Method getInstance = smhClass.getMethod("getInstance", int.class);
-            Object smh = getInstance.invoke(null, safeAccount);
-
-            // SendMessagesHelper has exactly one public sendMessage, and it takes a
-            // SendMessageParams - there is no (CharSequence, long) overload to find.
-            //
-            // The search below therefore never matched: send stayed null, the branch was skipped,
-            // and the auto-reply sent nothing in any build. It looked alive because the switch
-            // flipped a preference and the failure was silent.
-            //
-            // Going through SendMessageParams is also the correct path rather than a workaround:
-            // it is what a typed message uses, so the auto-reply lands in the same queue, shows the
-            // same sending indicator and survives the same retry as one the user typed.
-            Class<?> paramsClass = Class.forName(
-                    "org.telegram.messenger.SendMessagesHelper$SendMessageParams");
-            // The factory, not a hand-filled object.
-            //
-            // SendMessageParams has about fifty fields and the private ones behind them decide
-            // things like searchLinks and notify. Filling three of them by reflection leaves the rest
-            // at their Java defaults, which is not what the sending path expects - of() sets them the
-            // way the rest of the app does, and takes the dialog id as an argument rather than through
-            // a field whose name is not dialogId.
-            Method of = paramsClass.getMethod("of", String.class, long.class);
-            Object params = of.invoke(null, message, dialogId);
-            smhClass.getMethod("sendMessage", paramsClass).invoke(smh, params);
-        } catch (Throwable t) {
-            Log.w(TAG, "sendMessage(acc=" + account + ", " + dialogId + ") failed: " + t);
+                Class<?> paramsClass = Class.forName(
+                        "org.telegram.messenger.SendMessagesHelper$SendMessageParams");
+                Method of = paramsClass.getMethod("of", String.class, long.class);
+                Object params = of.invoke(null, safeMessage, targetDialogId);
+                smhClass.getMethod("sendMessage", paramsClass).invoke(smh, params);
+            } catch (Throwable t) {
+                Log.w(TAG, "sendMessage(acc=" + safeAccount + ", " + targetDialogId + ") failed: " + t);
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            dispatch.run();
+        } else {
+            mainHandler.post(dispatch);
         }
     }
 
-    /**
-     * Deletes recent messages via MessagesController reflection.
-     */
     /**
      * Deletes the most recent `count` outgoing messages from `dialogId` loaded in MessagesController.
      */
     public static void deleteLastMessages(long dialogId, int count) {
-        if (count <= 0) return;
+        deleteLastMessages(resolveSelectedAccount(), dialogId, count);
+    }
+
+    public static void deleteLastMessages(int account, long dialogId, int count) {
+        if (count <= 0 || dialogId == 0L || account < 0 || account >= 5) return;
         try {
             Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            int currentAccount = (int) ucClass.getField("selectedAccount").get(null);
+            int currentAccount = account;
 
             Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, currentAccount);
             Object dialogMap = mcClass.getField("dialogMessage").get(mc);

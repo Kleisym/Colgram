@@ -146,7 +146,7 @@ final class ColgramSocks5Codec {
         System.arraycopy(target, 0, req, 4, target.length);
         req[4 + target.length] = (byte) (port >>> 8);
         req[5 + target.length] = (byte) port;
-        writeSegmented(output, req, 2, 16L);
+        writeSegmented(output, req, 6, 10L);
         if (input.next() != 5 || input.next() != 0 || input.next() != 0) return false;
         int type = input.next();
         int addressLength = type == 1 ? 4 : type == 4 ? 16 : type == 3 ? input.next() : -1;
@@ -210,7 +210,7 @@ final class ColgramSocks5Codec {
         System.arraycopy(hostBytes, 0, req, 5, hostBytes.length);
         req[5 + hostBytes.length] = (byte) (port >>> 8);
         req[6 + hostBytes.length] = (byte) port;
-        writeSegmented(output, req, 2, 16L);
+        writeSegmented(output, req, 6, 10L);
         if (readByte(input) != 5 || readByte(input) != 0 || readByte(input) != 0) return false;
         int type = readByte(input);
         int addressLength = type == 1 ? 4 : type == 4 ? 16 : type == 3 ? readByte(input) : -1;

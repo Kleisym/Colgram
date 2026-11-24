@@ -1074,10 +1074,26 @@ index a350abf4..9302dd31 100644
                          case PRIVACY_RULES_TYPE_VOICE_MESSAGES:
                              voiceMessagesRules = rules.rules;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
-index 4d0dac30..53f664d9 100644
+index 4d0dac30..a5723756 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java
-@@ -1005,7 +1005,7 @@ public class FileLoadOperation {
+@@ -286,10 +286,14 @@ public class FileLoadOperation {
+     }
+ 
+     private void updateParams() {
+-        if ((preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams) && !forceSmallChunk) {
++        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();
++        if ((boost || preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams) && !forceSmallChunk) {
+             downloadChunkSizeBig = 1024 * 512;
+             maxDownloadRequests = 8;
+             maxDownloadRequestsBig = 8;
++            if (boost) {
++                maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);
++            }
+         } else {
+             downloadChunkSizeBig = 1024 * 128;
+             maxDownloadRequests = 4;
+@@ -1005,7 +1009,7 @@ public class FileLoadOperation {
              }
          }
          boolean finalFileExist = cacheFileFinalReady = cacheFileFinal.exists();
@@ -1215,6 +1231,20 @@ index 87465e90..7d32612d 100644
 +        }
 +    }
  }
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java
+index a2011cf6..2454d393 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java
+@@ -91,6 +91,9 @@ public class FileLoaderPriorityQueue {
+         int lastPriority = 0;
+         boolean pauseAllNextOperations = false;
+         int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;
++        if (org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled()) {
++            max = Math.max(max, type == TYPE_LARGE ? 4 : 6);
++        }
+         tmpListOperations.clear();
+         for (int i = 0; i < allOperations.size(); i++) {
+             FileLoadOperation prevOperation = i > 0 ? allOperations.get(i - 1) : null;
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/FileLog.java b/TMessagesProj/src/main/java/org/telegram/messenger/FileLog.java
 index b220465b..31788e78 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/FileLog.java
@@ -2305,7 +2335,7 @@ index 905b514d..9cc31721 100644
                  media instanceof TLRPC.TL_messageMediaPhoto ||
                  media instanceof TLRPC.TL_messageMediaDocument && !isStickerMessage(message) && !isAnimatedStickerMessage(message) ||
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
-index 7a0b35b1..018ab891 100644
+index 7a0b35b1..db21adf7 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java
 @@ -402,6 +402,49 @@ public class MessagesController extends BaseController implements NotificationCe
@@ -3585,14 +3615,26 @@ index 7a0b35b1..018ab891 100644
                  if (newMessageCallback != null && newMessageCallback.onMessageReceived(message)) {
                      newMessageCallback = null;
                  }
-@@ -19410,6 +19983,206 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -19410,6 +19983,219 @@ public class MessagesController extends BaseController implements NotificationCe
                  }
                  updatesOnMainThread.add(baseUpdate);
              } else if (baseUpdate instanceof TL_update.TL_updateEditChannelMessage || baseUpdate instanceof TL_update.TL_updateEditMessage) {
 +                try {
 +                    TLRPC.Message colgramEditMsg = (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) ? ((TL_update.TL_updateEditChannelMessage) baseUpdate).message : ((TL_update.TL_updateEditMessage) baseUpdate).message;
 +                    if (colgramEditMsg != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
-+                        long did = colgramEditMsg.dialog_id != 0 ? colgramEditMsg.dialog_id : (colgramEditMsg.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(colgramEditMsg.peer_id) : 0);
++                        long did = colgramEditMsg.dialog_id;
++                        if (did == 0 && colgramEditMsg.peer_id != null) {
++                            if (colgramEditMsg.peer_id.chat_id != 0) {
++                                did = -colgramEditMsg.peer_id.chat_id;
++                            } else if (colgramEditMsg.peer_id.channel_id != 0) {
++                                did = -colgramEditMsg.peer_id.channel_id;
++                            } else if (colgramEditMsg.from_id == null || colgramEditMsg.out || colgramEditMsg.guestchat_via_from != null) {
++                                did = colgramEditMsg.peer_id.user_id;
++                            } else {
++                                did = colgramEditMsg.from_id.user_id;
++                            }
++                        }
++                        if (did != 0) {
 +
 +                        // One storage read serves BOTH the text and the media capture.
 +                        TLRPC.Message colgramStored = null;
@@ -3787,12 +3829,13 @@ index 7a0b35b1..018ab891 100644
 +                                }
 +                            }
 +                        } catch (Throwable ignoreMedia) {}
++                        }
 +                    }
 +                } catch (Throwable ignore) {}
                  TLRPC.Message message;
                  if (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) {
                      message = ((TL_update.TL_updateEditChannelMessage) baseUpdate).message;
-@@ -19887,6 +20660,24 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -19887,6 +20673,24 @@ public class MessagesController extends BaseController implements NotificationCe
                              getContactsController().setPrivacyRules(update.rules, ContactsController.PRIVACY_RULES_TYPE_FORWARDS);
                          } else if (update.key instanceof TLRPC.TL_privacyKeyPhoneNumber) {
                              getContactsController().setPrivacyRules(update.rules, ContactsController.PRIVACY_RULES_TYPE_PHONE);
@@ -3817,7 +3860,7 @@ index 7a0b35b1..018ab891 100644
                          } else if (update.key instanceof TLRPC.TL_privacyKeyAddedByPhone) {
                              getContactsController().setPrivacyRules(update.rules, ContactsController.PRIVACY_RULES_TYPE_ADDED_BY_PHONE);
                          } else if (update.key instanceof TLRPC.TL_privacyKeyVoiceMessages) {
-@@ -20242,7 +21033,11 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -20242,7 +21046,11 @@ public class MessagesController extends BaseController implements NotificationCe
                              if (dialog == null && chat instanceof TLRPC.TL_channel && !chat.left) {
                                  Utilities.stageQueue.postRunnable(() -> getChannelDifference(update.channel_id, 1, 0, null));
                              } else if (ChatObject.isNotInChat(chat) && dialog != null && (promoDialog == null || promoDialog.id != dialog.id)) {
@@ -3830,7 +3873,7 @@ index 7a0b35b1..018ab891 100644
                              }
                              if (chat instanceof TLRPC.TL_channelForbidden || chat.kicked) {
                                  ChatObject.Call call = getGroupCall(chat.id, false);
-@@ -20281,7 +21076,11 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -20281,7 +21089,11 @@ public class MessagesController extends BaseController implements NotificationCe
                              }
                              TLRPC.Dialog dialog = dialogs_dict.get(-chat.id);
                              if (dialog != null) {
@@ -3843,7 +3886,7 @@ index 7a0b35b1..018ab891 100644
                              }
                          }
                          updateMask |= UPDATE_MASK_CHAT;
-@@ -21095,27 +21894,29 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -21095,27 +21907,29 @@ public class MessagesController extends BaseController implements NotificationCe
                          continue;
                      }
                      getNotificationCenter().postNotificationName(NotificationCenter.messagesDeleted, arrayList, -dialogId, false);
@@ -3892,7 +3935,7 @@ index 7a0b35b1..018ab891 100644
                                          }
                                      }
                                  }
-@@ -21147,23 +21948,31 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -21147,23 +21961,31 @@ public class MessagesController extends BaseController implements NotificationCe
                  }
              }
              if (clearHistoryMessagesFinal != null) {
@@ -3937,7 +3980,7 @@ index 7a0b35b1..018ab891 100644
              }
              if (updateMask != 0) {
                  getNotificationCenter().postNotificationName(NotificationCenter.updateInterfaces, updateMask);
-@@ -21562,6 +22371,10 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -21562,6 +22384,10 @@ public class MessagesController extends BaseController implements NotificationCe
              topicsController.markAllReactionsAsRead(-dialogId, topicId);
          }
          getMessagesStorage().updateUnreadReactionsCount(dialogId, topicId, 0);
@@ -3948,7 +3991,7 @@ index 7a0b35b1..018ab891 100644
          TLRPC.TL_messages_readReactions req = new TLRPC.TL_messages_readReactions();
          req.peer = getInputPeer(dialogId);
  
-@@ -22303,6 +23116,7 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -22303,6 +23129,7 @@ public class MessagesController extends BaseController implements NotificationCe
          if (chatsDict == null && ApplicationLoader.mainInterfacePaused) {
              return;
          }
@@ -3956,7 +3999,7 @@ index 7a0b35b1..018ab891 100644
          dialogsServerOnly.clear();
          dialogsCanAddUsers.clear();
          dialogsMyGroups.clear();
-@@ -22395,7 +23209,8 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -22395,7 +23222,8 @@ public class MessagesController extends BaseController implements NotificationCe
                          }
                      }
                      if (maxDate > Integer.MIN_VALUE) {
@@ -3966,7 +4009,7 @@ index 7a0b35b1..018ab891 100644
                              continue;
                          }
                      }
-@@ -24154,13 +24969,15 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -24154,13 +24982,15 @@ public class MessagesController extends BaseController implements NotificationCe
                  req.hash = 0;
              }
              getConnectionsManager().sendRequest(req, (res, err) -> {
@@ -3987,7 +4030,7 @@ index 7a0b35b1..018ab891 100644
              });
          }
          if (!loadingProfilePeerColors && (profilePeerColors == null || profilePeerColors.needUpdate() || force)) {
-@@ -24171,13 +24988,15 @@ public class MessagesController extends BaseController implements NotificationCe
+@@ -24171,13 +25001,15 @@ public class MessagesController extends BaseController implements NotificationCe
                  req.hash = 0;
              }
              getConnectionsManager().sendRequest(req, (res, err) -> {
@@ -4009,7 +4052,7 @@ index 7a0b35b1..018ab891 100644
          }
      }
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
-index 98e066ea..758e6e5b 100644
+index 98e066ea..f0c652b2 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java
 @@ -286,9 +286,9 @@ public class MessagesStorage extends BaseController {
@@ -4133,18 +4176,17 @@ index 98e066ea..758e6e5b 100644
      }
  
      public void getMessages(long dialogId, long mergeDialogId, boolean loadInfo, int count, int max_id, int offset_date, int minDate, int classGuid, int load_type, int mode, long replyMessageId, int loadIndex, boolean processMessages, boolean isTopic, Timer loaderLogger) {
-@@ -13351,7 +13381,67 @@ public class MessagesStorage extends BaseController {
+@@ -13351,7 +13381,89 @@ public class MessagesStorage extends BaseController {
          }
      }
  
-+    // COLGRAM_PLUGIN_INBOUND_PATCH = 2
++    // COLGRAM_PLUGIN_INBOUND_PATCH = 3
 +    /**
-+     * Hand genuinely-new incoming messages to the Colgram plugin system.
++     * Hand genuinely-new incoming messages (MODE_DEFAULT only) to the Colgram plugin & anti-spam hooks.
 +     *
-+     * Only messages dated within the last two minutes are dispatched, because this method also
-+     * serves history loads; only incoming ones, because a reply we send is itself a message and
-+     * answering it would loop. The cap keeps a large fresh batch from starting one thread per
-+     * message downstream.
++     * Strictly filters out history pages (>120s old), non-default modes (Saved Messages sub-dialogs,
++     * scheduled, quick replies, welcome messages), empty/service messages, Secret Chats, Folders,
++     * Saved Messages (selfId), and bot accounts from Colemailer/anti-spam routing.
 +     */
 +    private void colgramDispatchPlugins(ArrayList<TLRPC.Message> messages) {
 +        try {
@@ -4152,38 +4194,59 @@ index 98e066ea..758e6e5b 100644
 +                return;
 +            }
 +            long colgramNowSec = System.currentTimeMillis() / 1000L;
++            long colgramSelfId = UserConfig.getInstance(currentAccount).getClientUserId();
++            TLRPC.User colgramSelfUser = UserConfig.getInstance(currentAccount).getCurrentUser();
++            boolean colgramIsBotAccount = colgramSelfUser != null && colgramSelfUser.bot;
 +            int colgramDispatched = 0;
 +            for (int i = messages.size() - 1; i >= 0 && colgramDispatched < 10; i--) {
 +                TLRPC.Message colgramMessage = messages.get(i);
-+                if (colgramMessage == null) {
++                if (colgramMessage == null || colgramMessage.id <= 0
++                        || colgramMessage instanceof TLRPC.TL_messageEmpty
++                        || colgramMessage.action != null
++                        || MessageObject.isWelcomeMessage(colgramMessage)
++                        || MessageObject.isQuickReply(colgramMessage)) {
 +                    continue;
 +                }
 +                if (colgramMessage.date < colgramNowSec - 120) {
 +                    continue;
 +                }
 +                long colgramDialogId = MessageObject.getDialogId(colgramMessage);
-+                if (colgramDialogId == 0) {
++                if (colgramDialogId == 0
++                        || DialogObject.isEncryptedDialog(colgramDialogId)
++                        || DialogObject.isFolderDialogId(colgramDialogId)) {
 +                    continue;
 +                }
 +                if (colgramMessage.out) {
 +                    if (colgramMessage.message != null && !colgramMessage.message.isEmpty()) {
 +                        org.colgram.core.ColgramHookHandler.hookOnMessageReceived(
-+                                currentAccount, colgramDialogId, colgramMessage.id, colgramMessage.message, 0L, true);
++                                currentAccount, colgramDialogId, colgramMessage.id, colgramMessage.message, colgramSelfId, true);
 +                    }
-+                    continue;
-+                }
-+                org.colgram.core.ColgramHookHandler.notifyColemailerIncoming(currentAccount, colgramMessage);
-+                if (colgramMessage.message == null || colgramMessage.message.isEmpty()) {
-+                    colgramDispatched++;
 +                    continue;
 +                }
 +                long colgramSender = colgramMessage.from_id != null
 +                        ? MessageObject.getPeerId(colgramMessage.from_id) : 0L;
-+                if (colgramSender != 0 && colgramSender
-+                        != UserConfig.getInstance(currentAccount).getClientUserId()) {
++                // Saved Messages & own-sender messages must NEVER enter Colemailer, SpamGuard, Auto-Reply, or inbound plugins.
++                if (colgramSelfId == 0 || colgramDialogId == colgramSelfId
++                        || (colgramSender != 0 && colgramSender == colgramSelfId)) {
++                    if (colgramMessage.message != null && !colgramMessage.message.isEmpty()) {
++                        org.colgram.core.ColgramHookHandler.hookOnMessageReceived(
++                                currentAccount, colgramDialogId, colgramMessage.id, colgramMessage.message, colgramSender, true);
++                    }
++                    continue;
++                }
++                if (org.colgram.core.ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(colgramDialogId)) {
++                    continue;
++                }
++                if (!colgramIsBotAccount) {
++                    org.colgram.core.ColgramHookHandler.notifyColemailerIncoming(currentAccount, colgramMessage);
++                }
++                if (colgramMessage.message == null || colgramMessage.message.isEmpty()) {
++                    colgramDispatched++;
++                    continue;
++                }
++                if (!colgramIsBotAccount && colgramDialogId < 0 && colgramSender != 0) {
 +                    int colgramVerdict = org.colgram.core.ColgramHookHandler.colgramSpamVerdict(
-+                            currentAccount, colgramDialogId, colgramSender, colgramMessage.message,
-+                            colgramDialogId < 0);
++                            currentAccount, colgramDialogId, colgramSender, colgramMessage.message, true);
 +                    if (colgramVerdict >= org.colgram.core.ColgramSpamGuard.VERDICT_MUTE) {
 +                        org.colgram.core.ColgramHookHandler.setNotificationsBlocked(colgramSender, true);
 +                    }
@@ -4197,11 +4260,13 @@ index 98e066ea..758e6e5b 100644
 +    }
 +
      public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {
-+        colgramDispatchPlugins(messages);
++        if (mode == ChatActivity.MODE_DEFAULT) {
++            colgramDispatchPlugins(messages);
++        }
          putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);
      }
  
-@@ -14308,10 +14398,10 @@ public class MessagesStorage extends BaseController {
+@@ -14308,10 +14420,10 @@ public class MessagesStorage extends BaseController {
          try {
              String midsStr = TextUtils.join(",", mids);
              database.executeFast(String.format(Locale.US, "UPDATE messages_v2 SET read_state = read_state | 2 WHERE mid IN (%s) AND uid = %d", midsStr, dialogId)).stepThis().dispose();
@@ -4215,7 +4280,7 @@ index 98e066ea..758e6e5b 100644
                      if (arrayList == null) {
                          arrayList = new ArrayList<>();
                      }
-@@ -14320,8 +14410,10 @@ public class MessagesStorage extends BaseController {
+@@ -14320,8 +14432,10 @@ public class MessagesStorage extends BaseController {
                  if (arrayList != null) {
                      emptyMessagesMedia(dialogId, arrayList);
                  }
@@ -4228,7 +4293,7 @@ index 98e066ea..758e6e5b 100644
              }
          } catch (Exception e) {
              checkSQLException(e);
-@@ -14886,11 +14978,12 @@ public class MessagesStorage extends BaseController {
+@@ -14886,11 +15000,12 @@ public class MessagesStorage extends BaseController {
                          cursor.dispose();
                          cursor = null;
                      }
@@ -4246,7 +4311,7 @@ index 98e066ea..758e6e5b 100644
                      if (unknownMessages.isEmpty()) {
                          cursor = database.queryFinalized(String.format(Locale.US, "SELECT uid, type FROM media_v4 WHERE mid IN(%s) AND uid = %d", ids, did));
                          SparseArray<LongSparseArray<Integer>> mediaCounts = null;
-@@ -15312,7 +15405,55 @@ public class MessagesStorage extends BaseController {
+@@ -15312,7 +15427,55 @@ public class MessagesStorage extends BaseController {
          executeInStorageQueue(() -> updateDialogsWithDeletedMessagesInternal(dialogId, channelId, messages, additionalDialogsToUpdate));
      }
  
@@ -4302,7 +4367,7 @@ index 98e066ea..758e6e5b 100644
          if (messages.isEmpty()) {
              return null;
          }
-@@ -15429,7 +15570,8 @@ public class MessagesStorage extends BaseController {
+@@ -15429,7 +15592,8 @@ public class MessagesStorage extends BaseController {
                  cursor = null;
              }
  
@@ -4312,7 +4377,7 @@ index 98e066ea..758e6e5b 100644
              database.executeFast(String.format(Locale.US, "DELETE FROM messages_topics WHERE uid = %d AND mid <= %d", -channelId, mid)).stepThis().dispose();
              database.executeFast(String.format(Locale.US, "DELETE FROM media_v4 WHERE uid = %d AND mid <= %d", -channelId, mid)).stepThis().dispose();
              database.executeFast(String.format(Locale.US, "UPDATE media_counts_v2 SET old = 1 WHERE uid = %d", -channelId)).stepThis().dispose();
-@@ -15449,7 +15591,82 @@ public class MessagesStorage extends BaseController {
+@@ -15449,7 +15613,87 @@ public class MessagesStorage extends BaseController {
          return null;
      }
  
@@ -4359,6 +4424,11 @@ index 98e066ea..758e6e5b 100644
 +                if (uid != null) {
 +                    resolvedDid = uid;
 +                }
++            }
++            // Never write an unscoped dialogId=0 tombstone into the shared vault DB:
++            // Telegram private chats and Saved Messages share the mid sequence across accounts.
++            if (resolvedDid == 0) {
++                continue;
 +            }
 +            if (org.colgram.core.ColgramHookHandler.hookShouldPreventDelete(resolvedDid, mid)) {
 +                toRemove.add(mid);
@@ -4571,7 +4641,7 @@ index a8a2558c..95fab60d 100644
                      return null;
                  } else if (serviceMessage.action instanceof TLRPC.TL_decryptedMessageActionReadMessages) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
-index 4a6661d1..e280ba13 100644
+index 4a6661d1..7bed60b6 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
 @@ -1773,10 +1773,98 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
@@ -4851,7 +4921,7 @@ index 4a6661d1..e280ba13 100644
              }
          });
      }
-@@ -4257,6 +4448,21 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+@@ -4257,6 +4448,25 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
      }
  
      public void sendMessage(SendMessageParams sendMessageParams) {
@@ -4865,15 +4935,19 @@ index 4a6661d1..e280ba13 100644
 +                    colgramReplySender = MessageObject.getPeerId(sendMessageParams.replyToMsg.messageOwner.from_id);
 +                }
 +            }
-+            ColgramNativeColemailerBridge.rememberPendingReply(sendMessageParams.peer, sendMessageParams.replyToMsg);
-+            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {
++            if (sendMessageParams.message.trim().startsWith(".")) {
++                ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, sendMessageParams.peer, sendMessageParams.replyToMsg);
++            } else {
++                ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, sendMessageParams.peer, null);
++            }
++            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(currentAccount, sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {
 +                return;
 +            }
 +        }
          final SendMessageChatArguments sendMessageChatArguments = sendMessageParams.sendMessageChatArguments != null ?
                  sendMessageParams.sendMessageChatArguments : SendMessageChatArguments.EMPTY;
          String message = sendMessageParams.message;
-@@ -5138,6 +5344,13 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+@@ -5138,6 +5348,13 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
              if (replyToTopMsg != null && replyToTopMsg == reply && replyToTopMsg.getId() == 1 || destroyReply) {
                  reply = null;
              }
@@ -4887,7 +4961,7 @@ index 4a6661d1..e280ba13 100644
              newMsgObj = new MessageObject(currentAccount, newMsg, reply, true, true);
              newMsgObj.sendAnimationData = sendAnimationData;
              newMsgObj.wasJustSent = true;
-@@ -5270,6 +5483,11 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+@@ -5270,6 +5487,11 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                          if (retryMessageObject == null) {
                              getMediaDataController().cleanDraft(peer, replyToTopMsg != null ? replyToTopMsg.getId() : 0, false);
                          }
@@ -4899,7 +4973,7 @@ index 4a6661d1..e280ba13 100644
                      } else {
                          final TLRPC.TL_messages_sendMessage reqSend = new TLRPC.TL_messages_sendMessage();
                          reqSend.ephemeralReceiverBotId = ephemeralReceiverBotId;
-@@ -8097,9 +8315,158 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+@@ -8097,9 +8319,158 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                          });
  
                      } else {
@@ -5061,7 +5135,7 @@ index 4a6661d1..e280ba13 100644
                      }
                  });
              } else {
-@@ -8353,6 +8720,81 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+@@ -8353,6 +8724,81 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                              }
                          }
                      } else {
@@ -6109,10 +6183,29 @@ index 9b9d066f..4729d2de 100644
          getPreviewColors(0, 0);
          getPreviewColors(0, 1);
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
-index 3638979f..e3d669d1 100644
+index 3638979f..1fde1639 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java
-@@ -1646,7 +1646,8 @@ public class Theme {
+@@ -157,6 +157,10 @@ public class Theme {
+     public static final int MSG_OUT_COLOR_WHITE = 0xffffffff;
+     public static final int default_shadow_color = ColorUtils.setAlphaComponent(Color.BLACK, 27);
+     public static boolean disallowChangeServiceMessageColor;
++    private static final ThreadLocal<Boolean> colgramInGuard = new ThreadLocal<>();
++    private static final java.util.concurrent.ConcurrentHashMap<String, Paint> colgramPaintCache =
++            new java.util.concurrent.ConcurrentHashMap<>();
++    private static volatile long colgramPaintCacheRevision = -1L;
+ 
+     public static void applyDefaultShadow(Paint paint) {
+         paint.setShadowLayer(dpf2(1), 0, dpf2(0.33f), default_shadow_color);
+@@ -897,6 +901,7 @@ public class Theme {
+             }
+             applyCalculatedTableColors(currentColorsNoAccent, currentColors, isDarkTheme);
+             applyCalculatedArticleCodeColors(currentColorsNoAccent, currentColors, isDarkTheme);
++            colgramEnforceSmartContrast(currentColors, isDarkTheme);
+ 
+             return !isMyMessagesGradientColorsNear;
+         }
+@@ -1646,7 +1651,8 @@ public class Theme {
              if (isDark != UNKNOWN) {
                  return isDark == DARK;
              }
@@ -6122,7 +6215,22 @@ index 3638979f..e3d669d1 100644
                  isDark = DARK;
              } else if ("Blue".equals(name) || "Arctic Blue".equals(name) || "Day".equals(name)) {
                  isDark = LIGHT;
-@@ -4010,6 +4011,19 @@ public class Theme {
+@@ -2124,6 +2130,14 @@ public class Theme {
+             return getColor(key);
+         }
+ 
++        default int getRawColorUnchecked(int key) {
++            return getCurrentColor(key);
++        }
++
++        default boolean hasRawColorKey(int key) {
++            return false;
++        }
++
+         default void setAnimatedColor(int key, int color) {}
+ 
+         default Drawable getDrawable(String drawableKey) {
+@@ -4010,6 +4024,19 @@ public class Theme {
          themes.add(themeInfo);
          themesDict.put("Night", themeInfo);
  
@@ -6142,7 +6250,7 @@ index 3638979f..e3d669d1 100644
          String themesString = themeConfig.getString("themes2", null);
  
          int remoteVersion = themeConfig.getInt("remote_version", 0);
-@@ -5630,6 +5644,17 @@ public class Theme {
+@@ -5630,6 +5657,17 @@ public class Theme {
          if (themeInfo == null) {
              return;
          }
@@ -6160,7 +6268,18 @@ index 3638979f..e3d669d1 100644
          ThemeEditorView editorView = ThemeEditorView.getInstance();
          if (editorView != null) {
              editorView.destroy();
-@@ -7077,10 +7102,125 @@ public class Theme {
+@@ -6075,6 +6113,10 @@ public class Theme {
+         }
+         applyCalculatedTableColors(currentColorsNoAccent, currentColors, currentTheme.isDark());
+         applyCalculatedArticleCodeColors(currentColorsNoAccent, currentColors, currentTheme.isDark());
++        colgramEnforceSmartContrast(currentColors, currentTheme.isDark());
++        if (colgramPaintCache != null) {
++            colgramPaintCache.clear();
++        }
+         if (!messages) {
+             boolean async = !(LaunchActivity.getLastFragment() instanceof ChatActivity);
+             reloadWallpaper(async);
+@@ -7077,10 +7119,125 @@ public class Theme {
                      PatternsLoader.createLoader(true);
                  }
                  MediaDataController.getInstance(currentAccount).generateEmojiPreviewThemes(emojiPreviewThemes, currentAccount);
@@ -6286,50 +6405,30 @@ index 3638979f..e3d669d1 100644
      public static String getBaseThemeKey(TLRPC.ThemeSettings settings) {
          if (settings == null)
              return null;
-@@ -8966,8 +9106,19 @@ public class Theme {
+@@ -8966,8 +9123,16 @@ public class Theme {
      }
  
      public static int getColor(int key, ResourcesProvider provider) {
 +        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
 +            // Delegate to the shared palette so this path and the
 +            // getColor(key, isDefault, ignoreAnimation) wrapper cannot disagree.
-+            // This overload returns provider.getColor(key) directly when a provider is
-+            // present, so without the delegation a provider-scoped screen received the
-+            // cyber background but NOT the cyber text colour - black on near-black.
 +            int colgramCyberColor = colgramCyberOverride(key);
 +            if (colgramCyberColor != 0) {
-+                return colgramCyberColor;
++                return colgramGuard(key, colgramCyberColor, provider);
 +            }
 +        }
          if (provider != null) {
 -            return provider.getColor(key);
-+            return colgramGuard(key, provider.getColor(key));
++            return colgramGuard(key, provider.getColor(key), provider);
          }
          return getColor(key);
      }
-@@ -8984,7 +9135,1115 @@ public class Theme {
+@@ -8984,7 +9149,1349 @@ public class Theme {
          return getColor(key, isDefault, false);
      }
  
 -    public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {
-+        // Bump this whenever the wrapper or the cyber palette changes shape, and change
-+    // the patch_file marker below to match. Without it the marker stays satisfied by
-+    // an OLDER wrapper, patch_file reports 'already patched', the injector never
-+    // re-runs, and edits to the palette silently never reach a build. That exact trap
-+    // swallowed two separate theme fixes in this file before it was pinned down.
-+
-+    // Bump this whenever the wrapper or the cyber palette changes shape, and change
-+    // the patch_file marker below to match. Without it the marker stays satisfied by
-+    // an OLDER wrapper, patch_file reports 'already patched', the injector never
-+    // re-runs, and edits to the palette silently never reach a build. That exact trap
-+    // swallowed two separate theme fixes in this file before it was pinned down.
-+
-+    // Bump this whenever the wrapper or the cyber palette changes shape, and change
-+    // the patch_file marker below to match. Without it the marker stays satisfied by
-+    // an OLDER wrapper, patch_file reports 'already patched', the injector never
-+    // re-runs, and edits to the palette silently never reach a build. That exact trap
-+    // swallowed two separate theme fixes in this file before it was pinned down.
-+    private static final int COLGRAM_THEME_PATCH = 21;
++    private static final int COLGRAM_THEME_PATCH = 22;
 +
 +public static int getColor(int key, boolean[] isDefault, boolean ignoreAnimation) {
 +        boolean[] colgramIsDefault = new boolean[1];
@@ -6344,7 +6443,7 @@ index 3638979f..e3d669d1 100644
 +        if (colgramCyber) {
 +            int colgramCyberColor = colgramCyberOverride(key);
 +            if (colgramCyberColor != 0) {
-+                return colgramCyberColor;
++                return colgramGuard(key, colgramCyberColor, null);
 +            }
 +        }
 +        final boolean colgramDarkSurface = colgramCyber || colgramHasDarkSurface();
@@ -6356,33 +6455,37 @@ index 3638979f..e3d669d1 100644
 +        }
 +        final boolean colgramHole = colgramIsDefault[0] || colgramResolved == 0;
 +        if (colgramHole && colgramDarkSurface && colgramNightHasKey(key)) {
-+            return colgramNightColor(key);
++            return colgramGuard(key, colgramNightColor(key), null);
 +        }
 +        if (colgramHole && colgramDarkSurface && colgramIsReadableKey(key)) {
 +            return 0xffffffff;
 +        }
 +        if (colgramHole && colgramDarkSurface && colgramLooksLikeBackground(key)) {
-+            // Surface holes under a dark theme used to fall through to the LIGHT
-+            // default: white text filled in above a strip that stayed white.
 +            return colgramCyber ? COLGRAM_CYBER_BG : colgramNightColor(key_windowBackgroundWhite);
 +        }
 +        if (colgramDarkSurface && (key == key_actionBarTabUnactiveText || key == key_profile_tabText)) {
-+            // Inactive tab labels are alpha-dimmed by the view itself; the palette grey
-+            // lands near-invisible on a black surface (profile posts tabs).
 +            return 0xffb8bdc7;
 +        }
-+        return colgramGuard(key, colgramResolved);
++        return colgramGuard(key, colgramResolved, null);
 +    }
 +
-+    /**
-+     * The single readability guard, shared by BOTH colour paths.
-+     *
-+     * getColor(key, ResourcesProvider) returns provider.getColor(key) directly and
-+     * never reaches the wrapper, so a provider-scoped screen (a themed chat, a sheet,
-+     * a settings section header) previously got no repair at all. Keeping one method
-+     * is what stops the two paths disagreeing about what readable means.
-+     */
-+    private static int colgramGuard(int key, int color) {
++    public static int colgramGuard(int key, int color) {
++        return colgramGuard(key, color, null);
++    }
++
++    public static int colgramGuard(int key, int color, ResourcesProvider provider) {
++        if (Boolean.TRUE.equals(colgramInGuard.get())) {
++            return color;
++        }
++        colgramInGuard.set(Boolean.TRUE);
++        try {
++            return colgramGuardImpl(key, color, provider);
++        } finally {
++            colgramInGuard.remove();
++        }
++    }
++
++    private static int colgramGuardImpl(int key, int color, ResourcesProvider provider) {
 +        if (org.colgram.core.ColgramDesignConfig.isHideDividers() && key == key_divider) {
 +            return 0x00000000;
 +        }
@@ -6448,32 +6551,26 @@ index 3638979f..e3d669d1 100644
 +        if (colgramDarkSurface && colgramReadableGrayTextKey(key)) {
 +            return colgramReadableGrayTextColor(colgramCyber);
 +        }
-+        if (colgramDarkSurface && colgramLooksLikeForeground(key)) {
-+            boolean isCyberAccent = colgramCyber && ((color & 0x00ffffff) == (COLGRAM_CYBER_ACCENT & 0x00ffffff));
-+            if (!isCyberAccent && colgramWorstContrast(key, color, colgramCyber) < COLGRAM_MIN_CONTRAST) {
-+                return colgramReadableForeground(colgramCyber);
-+            }
-+        }
 +        if (key == key_chats_onlineCircle) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),
++                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
 +                    0xff4ecc5e, 0xff28a745, 2.6);
 +        }
 +        if (key == key_chats_actionMessage) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),
++                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
 +                    0xff5ce079, 0xff1976d2, 3.6);
 +        }
 +        if (key == key_chat_status) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber),
++                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber, provider),
 +                    0xff5ce079, 0xff1976d2, 3.4);
 +        }
 +        if (key == key_graySectionText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurfaces(
 +                    color,
-+                    colgramEffectiveColor(key_graySection, colgramCyber),
-+                    colgramEffectiveColor(key_windowBackgroundGray, colgramCyber),
++                    colgramEffectiveColor(key_graySection, colgramCyber, provider),
++                    colgramEffectiveColor(key_windowBackgroundGray, colgramCyber, provider),
 +                    0xffd6dbe4, 0xff3b4350, 4.2);
 +        }
 +        if (key == key_windowBackgroundWhiteGrayText
@@ -6487,42 +6584,55 @@ index 3638979f..e3d669d1 100644
 +                || key == key_windowBackgroundWhiteGrayIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurfaces(
 +                    color,
-+                    colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),
-+                    colgramEffectiveColor(key_windowBackgroundGray, colgramCyber),
++                    colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
++                    colgramEffectiveColor(key_windowBackgroundGray, colgramCyber, provider),
 +                    0xffc5cbd6, 0xff495057, 3.6);
 +        }
 +        if (key == key_dialogTextGray || key == key_dialogTextGray2
 +                || key == key_dialogTextGray3 || key == key_dialogTextGray4
 +                || key == key_dialogTextHint) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber, provider),
 +                    0xffc5cbd6, 0xff495057, 3.6);
 +        }
 +        if (key == key_chats_actionIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chats_actionBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chats_actionBackground, colgramCyber, provider),
 +                    0xffffffff, 0xff101418, 2.8);
 +        }
 +        if (key == key_featuredStickers_buttonText
 +                || key == key_chat_msgIvButtonPrimaryInText
 +                || key == key_chat_msgIvButtonPrimaryOutText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_featuredStickers_addButton, colgramCyber),
++                    color, colgramEffectiveColor(key_featuredStickers_addButton, colgramCyber, provider),
 +                    0xffffffff, 0xff101418, 2.8);
 +        }
 +        if (key == key_dialogFloatingIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_dialogFloatingButton, colgramCyber),
++                    color, colgramEffectiveColor(key_dialogFloatingButton, colgramCyber, provider),
 +                    0xffffffff, 0xff101418, 2.8);
 +        }
++        boolean colgramSmartContrast = org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled() || colgramCyber;
++        if (key == key_chats_unreadCounterMuted) {
++            int winBg = colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider);
++            return colgramSmartContrast
++                    ? org.colgram.core.ColgramThemePolicy.resolveMutedBadgeBackground(color, winBg, colgramDarkSurface)
++                    : color;
++        }
 +        if (key == key_chats_unreadCounterText) {
-+            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chats_unreadCounter, colgramCyber),
-+                    0xffffffff, 0xff101418, 2.8);
++            int activeBadge = colgramEffectiveColor(key_chats_unreadCounter, colgramCyber, provider);
++            int mutedBadge = org.colgram.core.ColgramThemePolicy.resolveMutedBadgeBackground(
++                    colgramEffectiveColor(key_chats_unreadCounterMuted, colgramCyber, provider),
++                    colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
++                    colgramDarkSurface);
++            return colgramSmartContrast
++                    ? org.colgram.core.ColgramThemePolicy.resolveUnreadCounterText(color, activeBadge, mutedBadge, colgramDarkSurface)
++                    : org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                            color, activeBadge, 0xffffffff, 0xff101418, 2.8);
 +        }
 +        if (key == key_picker_badgeText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_picker_badge, colgramCyber),
++                    color, colgramEffectiveColor(key_picker_badge, colgramCyber, provider),
 +                    0xffffffff, 0xff101418, 2.8);
 +        }
 +        if (key == key_windowBackgroundWhiteBlackText
@@ -6533,8 +6643,8 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chats_nameMessage_threeLines
 +                || key == key_chats_nameMessageArchived_threeLines) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),
-+                    0xffeef0f4, 0xff14181e, 4.2);
++                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
++                    0xfff4f7fb, 0xff14181e, colgramSmartContrast ? 4.5 : 4.2);
 +        }
 +        if (key == key_chats_message || key == key_chats_messageArchived
 +                || key == key_chats_message_threeLines
@@ -6542,34 +6652,42 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chats_pinnedIcon || key == key_chats_muteIcon
 +                || key == key_chats_sentClock || key == key_chats_attachMessage) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber),
-+                    0xffc2c8d2, 0xff495057, 3.4);
++                    color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
++                    0xffb8cae0, 0xff495057, colgramSmartContrast ? 4.5 : 3.4);
++        }
++        if (key == key_chats_sentCheck || key == key_chats_sentReadCheck) {
++            if (colgramSmartContrast) {
++                return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                        color, colgramEffectiveColor(key_windowBackgroundWhite, colgramCyber, provider),
++                        0xff7ec8ff, 0xff1e78c8, 4.5);
++            }
++            return color;
 +        }
 +        if (key == key_chats_menuItemText || key == key_chats_menuItemIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chats_menuBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chats_menuBackground, colgramCyber, provider),
 +                    0xffeef0f4, 0xff14181e, 4.0);
 +        }
 +        if (key == key_dialogTextBlack || key == key_dialogIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber, provider),
 +                    0xffeef0f4, 0xff14181e, 4.2);
 +        }
 +        if (key == key_actionBarDefaultTitle || key == key_actionBarDefaultIcon
 +                || key == key_actionBarDefaultSearch || key == key_actionBarActionModeDefaultIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber),
++                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber, provider),
 +                    0xffffffff, 0xff14181e, 3.8);
 +        }
 +        if (key == key_actionBarDefaultSubtitle || key == key_actionBarDefaultSearchPlaceholder
 +                || key == key_actionBarTabUnactiveText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber),
++                    color, colgramEffectiveColor(key_actionBarDefault, colgramCyber, provider),
 +                    0xffc5cbd6, 0xff495057, 3.4);
 +        }
 +        if (key == key_actionBarDefaultSubmenuItem || key == key_actionBarDefaultSubmenuItemIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_actionBarDefaultSubmenuBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_actionBarDefaultSubmenuBackground, colgramCyber, provider),
 +                    0xffeef0f4, 0xff14181e, 4.0);
 +        }
 +        if (key == key_chat_messagePanelText || key == key_chat_messagePanelIcons
@@ -6579,12 +6697,12 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chat_recordTime || key == key_chat_messagePanelVoiceDuration
 +                || key == key_chat_fieldOverlayText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_messagePanelBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chat_messagePanelBackground, colgramCyber, provider),
 +                    0xffeef0f4, 0xff14181e, 3.8);
 +        }
 +        if (key == key_chat_messagePanelHint || key == key_chat_topPanelMessage) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_messagePanelBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chat_messagePanelBackground, colgramCyber, provider),
 +                    0xffaeb5c2, 0xff545e6a, 3.0);
 +        }
 +        if (key == key_chat_emojiPanelIcon || key == key_chat_emojiBottomPanelIcon
@@ -6593,7 +6711,7 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chat_emojiPanelStickerSetName || key == key_chat_emojiPanelStickerSetNameIcon
 +                || key == key_chat_emojiSearchIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_emojiPanelBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chat_emojiPanelBackground, colgramCyber, provider),
 +                    0xffd0d6e0, 0xff3b4350, 3.6);
 +        }
 +        if (key == key_chat_messageTextIn
@@ -6602,9 +6720,9 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chat_inFileNameText || key == key_chat_inForwardedNameText
 +                || key == key_chat_inViaBotNameText || key == key_chat_inSiteNameText
 +                || key == key_chat_inPreviewInstantText) {
++            int inBg = colgramEffectiveInBubble(colgramCyber, provider);
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_inBubble, colgramCyber),
-+                    0xffeef0f4, 0xff14181e, 4.2);
++                    color, inBg, 0xffffffff, 0xff14181e, colgramSmartContrast ? 4.5 : 4.2);
 +        }
 +        if (key == key_chat_inTimeText || key == key_chat_inTimeSelectedText
 +                || key == key_chat_inViews || key == key_chat_inViewsSelected
@@ -6620,9 +6738,15 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chat_inMediaIcon || key == key_chat_inMediaIconSelected
 +                || key == key_chat_inInstant || key == key_chat_inInstantSelected
 +                || key == key_chat_inLoader || key == key_chat_inLoaderSelected) {
++            int inBg = colgramEffectiveInBubble(colgramCyber, provider);
++            if (colgramSmartContrast && org.colgram.core.ColgramThemePolicy.relativeLuminance(inBg) < 0.55) {
++                if ((color >>> 24) >= 0x20 && org.colgram.core.ColgramThemePolicy.contrast(color, inBg) >= 4.5) {
++                    return color;
++                }
++                return 0xc8dce8f8;
++            }
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_inBubble, colgramCyber),
-+                    0xffbcc3d0, 0xff495057, 3.5);
++                    color, inBg, 0xc8dce8f8, 0xff495057, colgramSmartContrast ? 4.5 : 3.5);
 +        }
 +        if (key == key_chat_messageLinkIn
 +                || key == key_avatar_nameInMessageRed || key == key_avatar_nameInMessageOrange
@@ -6630,47 +6754,32 @@ index 3638979f..e3d669d1 100644
 +                || key == key_avatar_nameInMessageCyan || key == key_avatar_nameInMessageBlue
 +                || key == key_avatar_nameInMessagePink) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_inBubble, colgramCyber),
++                    color, colgramEffectiveInBubble(colgramCyber, provider),
 +                    0xff8dc8ff, 0xff1b5e99, 3.6);
 +        }
-+        if (key == key_chat_messageTextOut
-+                || key == key_chat_outReplyNameText || key == key_chat_outReplyMessageText
-+                || key == key_chat_outContactNameText || key == key_chat_outAudioTitleText
-+                || key == key_chat_outFileNameText || key == key_chat_outForwardedNameText
-+                || key == key_chat_outViaBotNameText || key == key_chat_outSiteNameText
-+                || key == key_chat_outPreviewInstantText) {
++        if (colgramIsOutPrimaryCrispKey(key)) {
++            int outBg = colgramEffectiveOutBubble(colgramCyber, provider);
++            if (colgramSmartContrast && org.colgram.core.ColgramThemePolicy.relativeLuminance(outBg) < 0.55) {
++                return 0xffffffff;
++            }
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_outBubble, colgramCyber),
-+                    0xfff4f6fa, 0xff14181e, 4.2);
++                    color, outBg, 0xffffffff, 0xff14181e, 4.5);
 +        }
-+        if (key == key_chat_outTimeText || key == key_chat_outTimeSelectedText
-+                || key == key_chat_outViews || key == key_chat_outViewsSelected
-+                || key == key_chat_outAdminText || key == key_chat_outAdminSelectedText
-+                || key == key_chat_outMenu || key == key_chat_outMenuSelected
-+                || key == key_chat_outSentCheck || key == key_chat_outSentCheckSelected
-+                || key == key_chat_outSentCheckRead || key == key_chat_outSentCheckReadSelected
-+                || key == key_chat_outSentClock || key == key_chat_outSentClockSelected
-+                || key == key_chat_outReplyMediaMessageText || key == key_chat_outReplyMediaMessageSelectedText
-+                || key == key_chat_outAudioPerformerText || key == key_chat_outAudioPerformerSelectedText
-+                || key == key_chat_outAudioDurationText || key == key_chat_outAudioDurationSelectedText
-+                || key == key_chat_outFileInfoText || key == key_chat_outFileInfoSelectedText
-+                || key == key_chat_outContactPhoneText || key == key_chat_outContactPhoneSelectedText
-+                || key == key_chat_outVenueInfoText || key == key_chat_outVenueInfoSelectedText
-+                || key == key_chat_outMediaIcon || key == key_chat_outMediaIconSelected
-+                || key == key_chat_outInstant || key == key_chat_outInstantSelected
-+                || key == key_chat_outLoader || key == key_chat_outLoaderSelected) {
++        if (colgramIsOutSecondaryWhiteKey(key)) {
++            int outBg = colgramEffectiveOutBubble(colgramCyber, provider);
++            if (colgramSmartContrast && org.colgram.core.ColgramThemePolicy.relativeLuminance(outBg) < 0.55) {
++                return 0xe6ffffff;
++            }
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_outBubble, colgramCyber),
-+                    0xffd0d5df, 0xff3b4350, 3.5);
++                    color, outBg, 0xe6ffffff, 0xff3b4350, 4.5);
 +        }
 +        if (key == key_chat_messageLinkOut) {
-+            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurfaces(
-+                    color, colgramEffectiveColor(key_chat_outBubble, colgramCyber),
-+                    colgramEffectiveColor(key_chat_outBubbleGradient1, colgramCyber),
-+                    0xff8fd3ff, 0xff15528a, 4.5);
++            int outBg = colgramEffectiveOutBubble(colgramCyber, provider);
++            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                    color, outBg, 0xffb3e5ff, 0xff15528a, 4.5);
 +        }
 +        if (key == key_chat_mediaTimeText) {
-+            int mediaBg = colgramEffectiveColor(key_chat_mediaTimeBackground, colgramCyber);
++            int mediaBg = colgramEffectiveColor(key_chat_mediaTimeBackground, colgramCyber, provider);
 +            if ((mediaBg >>> 24) < 0x40) {
 +                mediaBg = 0xa812141c;
 +            }
@@ -6679,40 +6788,291 @@ index 3638979f..e3d669d1 100644
 +        }
 +        if (key == key_chat_botKeyboardButtonText) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_botKeyboardButtonBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chat_botKeyboardButtonBackground, colgramCyber, provider),
 +                    0xfff8fafc, 0xff101418, 4.5);
 +        }
 +        if (key == key_chat_unreadMessagesStartText || key == key_chat_unreadMessagesStartArrowIcon) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_chat_unreadMessagesStartBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_chat_unreadMessagesStartBackground, colgramCyber, provider),
 +                    0xffeef0f4, 0xff14181e, 4.0);
 +        }
 +        if (key == key_dialogButton || key == key_dialogTextLink) {
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
-+                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber),
++                    color, colgramEffectiveColor(key_dialogBackground, colgramCyber, provider),
 +                    0xfff8fafc, 0xff14181e, 3.8);
 +        }
 +        if (key == key_chat_serviceText || key == key_chat_serviceLink || key == key_chat_serviceIcon) {
 +            if (colgramCyber) return 0xffffffff;
-+            int svcBg = colgramEffectiveColor(key_chat_serviceBackground, false);
++            int svcBg = colgramEffectiveColor(key_chat_serviceBackground, false, provider);
 +            if ((svcBg >>> 24) < 0x30) {
 +                svcBg = colgramDarkSurface ? 0xff161a22 : 0xff3b4656;
 +            }
 +            return org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
 +                    color, svcBg, 0xffffffff, 0xff101418, 4.2);
 +        }
++        if (colgramDarkSurface && colgramLooksLikeForeground(key)) {
++            boolean isCyberAccent = colgramCyber && ((color & 0x00ffffff) == (COLGRAM_CYBER_ACCENT & 0x00ffffff));
++            if (!isCyberAccent && colgramWorstContrast(key, color, colgramCyber) < COLGRAM_MIN_CONTRAST) {
++                return colgramReadableForeground(colgramCyber);
++            }
++        }
 +        return color;
 +    }
 +
-+    private static int colgramEffectiveColor(int key, boolean cyber) {
++    private static boolean colgramIsOutPrimaryCrispKey(int key) {
++        return key == key_chat_messageTextOut
++                || key == key_chat_outSentCheck || key == key_chat_outSentCheckSelected
++                || key == key_chat_outSentCheckRead || key == key_chat_outSentCheckReadSelected
++                || key == key_chat_outSentClock || key == key_chat_outSentClockSelected
++                || key == key_chat_outReplyNameText || key == key_chat_outForwardedNameText
++                || key == key_chat_outReplyLine || key == key_chat_outReplyLine2
++                || key == key_chat_outContactNameText || key == key_chat_outAudioTitleText
++                || key == key_chat_outFileNameText
++                || key == key_chat_outMenu || key == key_chat_outMenuSelected
++                || key == key_chat_outAudioSeekbarFill || key == key_chat_outVoiceSeekbarFill;
++    }
++
++    private static boolean colgramIsOutSecondaryWhiteKey(int key) {
++        return key == key_chat_outTimeText || key == key_chat_outTimeSelectedText
++                || key == key_chat_outViews || key == key_chat_outViewsSelected
++                || key == key_chat_outAudioDurationText || key == key_chat_outAudioDurationSelectedText
++                || key == key_chat_outMediaIcon || key == key_chat_outMediaIconSelected
++                || key == key_chat_outReplyMessageText
++                || key == key_chat_outReplyMediaMessageText || key == key_chat_outReplyMediaMessageSelectedText
++                || key == key_chat_outAudioPerformerText || key == key_chat_outAudioPerformerSelectedText
++                || key == key_chat_outFileInfoText || key == key_chat_outFileInfoSelectedText
++                || key == key_chat_outContactPhoneText || key == key_chat_outContactPhoneSelectedText
++                || key == key_chat_outVenueInfoText || key == key_chat_outVenueInfoSelectedText
++                || key == key_chat_outViaBotNameText || key == key_chat_outSiteNameText
++                || key == key_chat_outPreviewInstantText
++                || key == key_chat_outInstant || key == key_chat_outInstantSelected
++                || key == key_chat_outLoader || key == key_chat_outLoaderSelected
++                || key == key_chat_outAdminText || key == key_chat_outAdminSelectedText;
++    }
++
++    private static int colgramEffectiveColor(int key, boolean cyber, ResourcesProvider provider) {
 +        if (cyber) {
 +            int ov = colgramCyberOverride(key);
 +            if (ov != 0) return ov;
 +        }
++        int base = 0;
++        if (provider != null) {
++            base = provider.getRawColorUnchecked(key);
++        }
++        if (base == 0) {
++            base = colgramGetColorInternal(key, null, true);
++        }
++        int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
++        if (customAccent != 0) {
++            if (key == key_chats_unreadCounter || key == key_chats_actionBackground
++                    || key == key_featuredStickers_addButton || key == key_dialogFloatingButton) {
++                return customAccent;
++            }
++            if ((key == key_chat_outBubble || key == key_chat_outBubbleGradient1)
++                    && (cyber || colgramHasDarkSurface())) {
++                int r = (((customAccent >> 16) & 0xFF) * 35) / 100 + 18;
++                int g = (((customAccent >> 8) & 0xFF) * 35) / 100 + 18;
++                int b = ((customAccent & 0xFF) * 35) / 100 + 22;
++                return 0xFF000000 | (Math.min(255, r) << 16) | (Math.min(255, g) << 8) | Math.min(255, b);
++            }
++        }
++        int customSurface = org.colgram.core.ColgramDesignConfig.resolveCustomBaseSurfaceColor();
++        if (customSurface != 0 && org.colgram.core.ColgramThemePolicy.isDarkColor(customSurface)) {
++            int r = (customSurface >> 16) & 0xFF;
++            int g = (customSurface >> 8) & 0xFF;
++            int b = customSurface & 0xFF;
++            int elevated = 0xFF000000 | (Math.min(255, r + 10) << 16) | (Math.min(255, g + 10) << 8) | Math.min(255, b + 12);
++            if (key == key_windowBackgroundWhite || key == key_dialogBackground
++                    || key == key_actionBarDefault || key == key_chats_menuBackground) {
++                return customSurface;
++            }
++            if (key == key_windowBackgroundGray || key == key_chat_messagePanelBackground) {
++                return elevated;
++            }
++        }
++        return base;
++    }
++
++    private static int colgramEffectiveColor(int key, boolean cyber) {
++        return colgramEffectiveColor(key, cyber, null);
++    }
++
++    private static int colgramRawGradientStop(int key, boolean cyber, ResourcesProvider provider) {
++        if (cyber) {
++            int ov = colgramCyberOverride(key);
++            if (ov != 0) return ov;
++        }
++        if (provider != null) {
++            return provider.hasRawColorKey(key) ? provider.getRawColorUnchecked(key) : 0;
++        }
++        SparseIntArray active = currentColors;
++        if (active != null && active.indexOfKey(key) >= 0) {
++            return active.get(key);
++        }
++        return 0;
++    }
++
++    private static int colgramEffectiveOutBubble(boolean cyber, ResourcesProvider provider) {
++        int base = colgramEffectiveColor(key_chat_outBubble, cyber, provider);
++        int g1 = colgramRawGradientStop(key_chat_outBubbleGradient1, cyber, provider);
++        int g2 = colgramRawGradientStop(key_chat_outBubbleGradient2, cyber, provider);
++        int g3 = colgramRawGradientStop(key_chat_outBubbleGradient3, cyber, provider);
++        return org.colgram.core.ColgramThemePolicy.averageSurfaceColor(base, g1, g2, g3);
++    }
++
++    private static int colgramEffectiveInBubble(boolean cyber, ResourcesProvider provider) {
++        return colgramEffectiveColor(key_chat_inBubble, cyber, provider);
++    }
++
++    public static int colgramGetRawColorUnchecked(int key) {
 +        return colgramGetColorInternal(key, null, true);
 +    }
 +
++    private static int colgramMapColor(SparseIntArray colors, int key) {
++        if (colors != null) {
++            int idx = colors.indexOfKey(key);
++            if (idx >= 0) return colors.valueAt(idx);
++            int fb = fallbackKeys.get(key, -1);
++            if (fb >= 0) {
++                int fbIdx = colors.indexOfKey(fb);
++                if (fbIdx >= 0) return colors.valueAt(fbIdx);
++            }
++        }
++        return colgramGetColorInternal(key, null, true);
++    }
++
++    public static void colgramEnforceSmartContrast(SparseIntArray colors, boolean isDark) {
++        if (colors == null) return;
++        boolean cyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();
++        if (!org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled() && !cyber) {
++            return;
++        }
++        int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
++        int customSurface = org.colgram.core.ColgramDesignConfig.resolveCustomBaseSurfaceColor();
++        int winBg = customSurface != 0 ? customSurface : colgramMapColor(colors, key_windowBackgroundWhite);
++        boolean darkSurface = isDark || cyber || org.colgram.core.ColgramThemePolicy.isDarkColor(winBg);
++
++        // 1. Outgoing bubble contrast
++        int outBase = colgramMapColor(colors, key_chat_outBubble);
++        if (customAccent != 0 && darkSurface) {
++            int r = (((customAccent >> 16) & 0xFF) * 35) / 100 + 18;
++            int g = (((customAccent >> 8) & 0xFF) * 35) / 100 + 18;
++            int b = ((customAccent & 0xFF) * 35) / 100 + 22;
++            outBase = 0xFF000000 | (Math.min(255, r) << 16) | (Math.min(255, g) << 8) | Math.min(255, b);
++        }
++        int g1 = colors.indexOfKey(key_chat_outBubbleGradient1) >= 0 ? colors.get(key_chat_outBubbleGradient1) : 0;
++        int g2 = colors.indexOfKey(key_chat_outBubbleGradient2) >= 0 ? colors.get(key_chat_outBubbleGradient2) : 0;
++        int g3 = colors.indexOfKey(key_chat_outBubbleGradient3) >= 0 ? colors.get(key_chat_outBubbleGradient3) : 0;
++        int outBg = org.colgram.core.ColgramThemePolicy.averageSurfaceColor(outBase, g1, g2, g3);
++        boolean darkOutBubble = org.colgram.core.ColgramThemePolicy.relativeLuminance(outBg) < 0.55;
++
++        int[] outPrimaryKeys = new int[]{
++                key_chat_messageTextOut, key_chat_outSentCheck, key_chat_outSentCheckSelected,
++                key_chat_outSentCheckRead, key_chat_outSentCheckReadSelected, key_chat_outSentClock,
++                key_chat_outSentClockSelected, key_chat_outReplyNameText, key_chat_outForwardedNameText,
++                key_chat_outReplyLine, key_chat_outReplyLine2, key_chat_outContactNameText,
++                key_chat_outAudioTitleText, key_chat_outFileNameText, key_chat_outMenu,
++                key_chat_outMenuSelected, key_chat_outAudioSeekbarFill, key_chat_outVoiceSeekbarFill
++        };
++        for (int k : outPrimaryKeys) {
++            if (darkOutBubble) {
++                colors.put(k, 0xffffffff);
++            } else {
++                colors.put(k, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                        colgramMapColor(colors, k), outBg, 0xffffffff, 0xff14181e, 4.5));
++            }
++        }
++        int[] outSecondaryKeys = new int[]{
++                key_chat_outTimeText, key_chat_outTimeSelectedText, key_chat_outViews,
++                key_chat_outViewsSelected, key_chat_outAudioDurationText, key_chat_outAudioDurationSelectedText,
++                key_chat_outMediaIcon, key_chat_outMediaIconSelected, key_chat_outReplyMessageText,
++                key_chat_outReplyMediaMessageText, key_chat_outReplyMediaMessageSelectedText,
++                key_chat_outAudioPerformerText, key_chat_outAudioPerformerSelectedText,
++                key_chat_outFileInfoText, key_chat_outFileInfoSelectedText,
++                key_chat_outContactPhoneText, key_chat_outContactPhoneSelectedText,
++                key_chat_outVenueInfoText, key_chat_outVenueInfoSelectedText,
++                key_chat_outViaBotNameText, key_chat_outSiteNameText, key_chat_outPreviewInstantText,
++                key_chat_outInstant, key_chat_outInstantSelected, key_chat_outLoader, key_chat_outLoaderSelected
++        };
++        for (int k : outSecondaryKeys) {
++            if (darkOutBubble) {
++                colors.put(k, 0xe6ffffff);
++            } else {
++                colors.put(k, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                        colgramMapColor(colors, k), outBg, 0xe6ffffff, 0xff3b4350, 4.5));
++            }
++        }
++        colors.put(key_chat_messageLinkOut, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                colgramMapColor(colors, key_chat_messageLinkOut), outBg, 0xffb3e5ff, 0xff15528a, 4.5));
++
++        // 2. Incoming bubble contrast
++        int inBg = colgramMapColor(colors, key_chat_inBubble);
++        boolean darkInBubble = org.colgram.core.ColgramThemePolicy.relativeLuminance(inBg) < 0.55;
++        int[] inPrimaryKeys = new int[]{
++                key_chat_messageTextIn, key_chat_inReplyNameText, key_chat_inReplyMessageText,
++                key_chat_inForwardedNameText, key_chat_inContactNameText, key_chat_inAudioTitleText,
++                key_chat_inFileNameText, key_chat_inViaBotNameText, key_chat_inSiteNameText,
++                key_chat_inPreviewInstantText
++        };
++        for (int k : inPrimaryKeys) {
++            colors.put(k, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                    colgramMapColor(colors, k), inBg, 0xffffffff, 0xff14181e, 4.5));
++        }
++        int[] inSecondaryKeys = new int[]{
++                key_chat_inTimeText, key_chat_inTimeSelectedText, key_chat_inViews,
++                key_chat_inViewsSelected, key_chat_inAudioDurationText, key_chat_inAudioDurationSelectedText,
++                key_chat_inMediaIcon, key_chat_inMediaIconSelected,
++                key_chat_inReplyMediaMessageText, key_chat_inReplyMediaMessageSelectedText,
++                key_chat_inSentClock, key_chat_inSentClockSelected,
++                key_chat_inMenu, key_chat_inMenuSelected
++        };
++        for (int k : inSecondaryKeys) {
++            int cur = colgramMapColor(colors, k);
++            if (darkInBubble && ((cur >>> 24) < 0x20 || org.colgram.core.ColgramThemePolicy.contrast(cur, inBg) < 4.5)) {
++                colors.put(k, 0xc8dce8f8);
++            } else {
++                colors.put(k, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                        cur, inBg, 0xc8dce8f8, 0xff495057, 4.5));
++            }
++        }
++
++        // 3. Dialogs list & unread badges contrast
++        int mutedBg = org.colgram.core.ColgramThemePolicy.resolveMutedBadgeBackground(
++                colgramMapColor(colors, key_chats_unreadCounterMuted), winBg, darkSurface);
++        colors.put(key_chats_unreadCounterMuted, mutedBg);
++        int activeBg = customAccent != 0 ? customAccent : colgramMapColor(colors, key_chats_unreadCounter);
++        colors.put(key_chats_unreadCounterText, org.colgram.core.ColgramThemePolicy.resolveUnreadCounterText(
++                colgramMapColor(colors, key_chats_unreadCounterText), activeBg, mutedBg, darkSurface));
++
++        int[] dialogSecondaryKeys = new int[]{
++                key_chats_date, key_chats_date_bold, key_chats_muteIcon, key_chats_pinnedIcon,
++                key_chats_sentClock, key_chats_message, key_chats_messageArchived,
++                key_chats_message_threeLines, key_chats_attachMessage
++        };
++        for (int k : dialogSecondaryKeys) {
++            colors.put(k, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                    colgramMapColor(colors, k), winBg, 0xffb8cae0, 0xff495057, 4.5));
++        }
++        int[] dialogNameKeys = new int[]{
++                key_chats_name, key_chats_nameArchived, key_chats_nameMessage,
++                key_chats_nameMessageArchived, key_chats_nameMessage_threeLines,
++                key_chats_nameMessageArchived_threeLines
++        };
++        for (int k : dialogNameKeys) {
++            colors.put(k, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                    colgramMapColor(colors, k), winBg, 0xfff4f7fb, 0xff14181e, 4.5));
++        }
++        colors.put(key_chats_sentCheck, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                colgramMapColor(colors, key_chats_sentCheck), winBg, 0xff7ec8ff, 0xff1e78c8, 4.5));
++        colors.put(key_chats_sentReadCheck, org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                colgramMapColor(colors, key_chats_sentReadCheck), winBg, 0xff7ec8ff, 0xff1e78c8, 4.5));
++    }
++
 +    private static boolean colgramHasDarkSurface() {
++        int customSurface = org.colgram.core.ColgramDesignConfig.resolveCustomBaseSurfaceColor();
++        if (customSurface != 0 && org.colgram.core.ColgramThemePolicy.isDarkColor(customSurface)) {
++            return true;
++        }
 +        if (isCurrentThemeDark()) return true;
 +        return colgramLuma(colgramGetColorInternal(key_windowBackgroundWhite, null, true)) < 128;
 +    }
@@ -7149,11 +7509,10 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chats_menuItemText || key == key_chats_menuName
 +                || key == key_actionBarDefaultSearch || key == key_actionBarActionModeDefaultIcon
 +                || key == key_actionBarDefaultArchivedTitle || key == key_actionBarDefaultArchivedIcon
-+                || key == key_chat_messageTextIn || key == key_chat_messageTextOut
-+                || key == key_chat_inReplyMessageText || key == key_chat_outReplyMessageText
-+                || key == key_chat_inAudioTitleText || key == key_chat_outAudioTitleText
-+                || key == key_chat_inFileNameText || key == key_chat_outFileNameText
-+                || key == key_chat_inContactNameText || key == key_chat_outContactNameText
++                || key == key_chat_messageTextIn
++                || key == key_chat_inReplyMessageText
++                || key == key_chat_inAudioTitleText || key == key_chat_inFileNameText
++                || key == key_chat_inContactNameText
 +                || key == key_chat_messagePanelText || key == key_chat_topPanelTitle
 +                || key == key_chat_searchPanelText || key == key_chat_recordTime
 +                || key == key_chat_messagePanelVoiceDuration || key == key_chat_fieldOverlayText
@@ -7164,6 +7523,12 @@ index 3638979f..e3d669d1 100644
 +                || key == key_graySectionText) {
 +            return COLGRAM_CYBER_TEXT;
 +        }
++        if (colgramIsOutPrimaryCrispKey(key)) {
++            return 0xffffffff;
++        }
++        if (colgramIsOutSecondaryWhiteKey(key)) {
++            return 0xe6ffffff;
++        }
 +        if (key == key_chats_message || key == key_chats_messageArchived
 +                || key == key_chats_message_threeLines || key == key_chats_attachMessage
 +                || key == key_chats_date || key == key_chats_date_bold || key == key_chats_pinnedIcon
@@ -7173,33 +7538,18 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chat_replyPanelClose || key == key_chat_searchPanelIcons
 +                || key == key_chat_topPanelMessage || key == key_chat_topPanelClose
 +                || key == key_chat_inTimeText || key == key_chat_inTimeSelectedText
-+                || key == key_chat_outTimeText || key == key_chat_outTimeSelectedText
 +                || key == key_chat_inViews || key == key_chat_inViewsSelected
-+                || key == key_chat_outViews || key == key_chat_outViewsSelected
 +                || key == key_chat_inAdminText || key == key_chat_inAdminSelectedText
-+                || key == key_chat_outAdminText || key == key_chat_outAdminSelectedText
 +                || key == key_chat_inMenu || key == key_chat_inMenuSelected
-+                || key == key_chat_outMenu || key == key_chat_outMenuSelected
-+                || key == key_chat_outSentCheck || key == key_chat_outSentCheckSelected
-+                || key == key_chat_outSentCheckRead || key == key_chat_outSentCheckReadSelected
-+                || key == key_chat_outSentClock || key == key_chat_outSentClockSelected
 +                || key == key_chat_inSentClock || key == key_chat_inSentClockSelected
 +                || key == key_chat_inReplyMediaMessageText || key == key_chat_inReplyMediaMessageSelectedText
-+                || key == key_chat_outReplyMediaMessageText || key == key_chat_outReplyMediaMessageSelectedText
 +                || key == key_chat_inAudioPerformerText || key == key_chat_inAudioPerformerSelectedText
-+                || key == key_chat_outAudioPerformerText || key == key_chat_outAudioPerformerSelectedText
 +                || key == key_chat_inAudioDurationText || key == key_chat_inAudioDurationSelectedText
-+                || key == key_chat_outAudioDurationText || key == key_chat_outAudioDurationSelectedText
 +                || key == key_chat_inFileInfoText || key == key_chat_inFileInfoSelectedText
-+                || key == key_chat_outFileInfoText || key == key_chat_outFileInfoSelectedText
 +                || key == key_chat_inContactPhoneText || key == key_chat_inContactPhoneSelectedText
-+                || key == key_chat_outContactPhoneText || key == key_chat_outContactPhoneSelectedText
 +                || key == key_chat_inVenueInfoText || key == key_chat_inVenueInfoSelectedText
-+                || key == key_chat_outVenueInfoText || key == key_chat_outVenueInfoSelectedText
 +                || key == key_chat_inMediaIcon || key == key_chat_inMediaIconSelected
-+                || key == key_chat_outMediaIcon || key == key_chat_outMediaIconSelected
 +                || key == key_chat_inLoader || key == key_chat_inLoaderSelected
-+                || key == key_chat_outLoader || key == key_chat_outLoaderSelected
 +                || key == key_chat_inAudioSeekbar || key == key_chat_outAudioSeekbar
 +                || key == key_chat_inVoiceSeekbar || key == key_chat_outVoiceSeekbar
 +                || key == key_chat_emojiPanelIcon || key == key_chat_emojiBottomPanelIcon
@@ -7207,7 +7557,7 @@ index 3638979f..e3d669d1 100644
 +                || key == key_chat_emojiPanelTrendingDescription || key == key_chat_emojiPanelStickerSetNameIcon
 +                || key == key_chat_emojiSearchIcon
 +                || key == key_actionBarTabUnactiveText || key == key_actionBarDefaultSearchPlaceholder) {
-+            return COLGRAM_CYBER_TEXT_DIM;
++            return 0xffb8cae0;
 +        }
 +        if (key == key_chat_messagePanelHint) {
 +            return COLGRAM_CYBER_HINT;
@@ -7248,7 +7598,7 @@ index 3638979f..e3d669d1 100644
 +            return 0xff080507;
 +        }
 +        if (key == key_chats_unreadCounterMuted) {
-+            return COLGRAM_CYBER_FIELD;
++            return 0xff3e536e;
 +        }
 +        if (key == key_chats_verifiedCheck || key == key_profile_verifiedCheck
 +                || key == key_switchTrackBlueThumb || key == key_switchTrackBlueThumbChecked) {
@@ -7424,7 +7774,7 @@ index 3638979f..e3d669d1 100644
          if (!ignoreAnimation && animatingColors != null) {
              int index = animatingColors.indexOfKey(key);
              if (index >= 0) {
-@@ -9445,7 +10704,7 @@ public class Theme {
+@@ -9445,7 +10952,7 @@ public class Theme {
                              File f = FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(wallpaperDocument, true);
                              patternBitmap = SvgHelper.getBitmap(f, w, h, false, SvgHelper.ScaleMode.ByWidth);
                          } else {
@@ -7433,7 +7783,7 @@ index 3638979f..e3d669d1 100644
                          }
                          if (patternBitmap != null) {
                              FileOutputStream stream = null;
-@@ -9465,7 +10724,12 @@ public class Theme {
+@@ -9465,7 +10972,12 @@ public class Theme {
                      motionBackgroundDrawable.setPhase(previousPhase);
                      settings.wallpaper = motionBackgroundDrawable;
                  } else if (gradientToColor1 == 0 || gradientToColor1 == backgroundColor) {
@@ -7447,7 +7797,7 @@ index 3638979f..e3d669d1 100644
                  } else {
                      final int[] colors = {backgroundColor, gradientToColor1};
                      final BackgroundGradientDrawable.Orientation orientation = BackgroundGradientDrawable.getGradientOrientation(rotation);
-@@ -9614,13 +10878,49 @@ public class Theme {
+@@ -9614,13 +11126,49 @@ public class Theme {
      }
  
      public static Drawable createDefaultWallpaper(int w, int h) {
@@ -7500,15 +7850,18 @@ index 3638979f..e3d669d1 100644
          return motionBackgroundDrawable;
      }
  
-@@ -9970,7 +11270,25 @@ public class Theme {
-         return defaultChatPaints;
-     }
- 
-+    private static final java.util.concurrent.ConcurrentHashMap<String, Paint> colgramPaintCache =
-+            new java.util.concurrent.ConcurrentHashMap<>();
-+
-     public static Paint getThemePaint(String paintKey) {
-+        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {
+@@ -9974,6 +11522,31 @@ public class Theme {
+         if (Objects.equals(paintKey, Theme.key_paint_divider)) {
+             return dividerPaint;
+         }
++        if ((org.colgram.core.ColgramConfig.isCyberThemeEnabled()
++                || org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled())
++                && !Objects.equals(paintKey, Theme.key_paint_chatActionBackgroundDarken)) {
++            long rev = org.colgram.core.ColgramDesignConfig.getRevision();
++            if (colgramPaintCacheRevision != rev) {
++                colgramPaintCache.clear();
++                colgramPaintCacheRevision = rev;
++            }
 +            Paint colgramCached = colgramPaintCache.get(paintKey);
 +            if (colgramCached != null) {
 +                return colgramCached;
@@ -7518,14 +7871,17 @@ index 3638979f..e3d669d1 100644
 +                Paint colgramPaint = colgramBase instanceof TextPaint
 +                        ? new TextPaint(colgramBase)
 +                        : new Paint(colgramBase);
-+                colgramPaint.setColor(getColor(getThemePaintColorKey(paintKey)));
++                int colorKey = getThemePaintColorKey(paintKey);
++                if (colorKey >= 0) {
++                    colgramPaint.setColor(getColor(colorKey));
++                }
 +                colgramPaintCache.put(paintKey, colgramPaint);
 +                return colgramPaint;
 +            }
 +        }
-         if (Objects.equals(paintKey, Theme.key_paint_divider)) {
-             return dividerPaint;
-         }
+         return defaultChatPaints.get(paintKey);
+     }
+ 
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java
 index cd393c4d..d4a8fc88 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java
@@ -8162,7 +8518,7 @@ index 469d4a85..4a923b72 100644
                      if (inlineResult.type.startsWith("gif")) {
                          if (inlineResult.thumb instanceof TLRPC.TL_webDocument && "video/mp4".equals(inlineResult.thumb.mime_type)) {
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
-index 790e4493..6a5a35e3 100644
+index 790e4493..21b4a37c 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
 @@ -594,6 +594,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
@@ -8315,7 +8671,36 @@ index 790e4493..6a5a35e3 100644
                  final boolean drawCounterMuted = isCounterMuted();
                  drawCounter(canvas, drawCounterMuted, countTop, countLeft, countLeftOld, 1f, false);
                  if (drawMention) {
-@@ -5268,6 +5355,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+@@ -5252,6 +5339,28 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+                 paint = drawCounterMuted || currentDialogFolderId != 0 ? Theme.dialogs_countGrayPaint : Theme.dialogs_countPaint;
+             }
+ 
++            int savedCountTextColor = Theme.dialogs_countTextPaint2.getColor();
++            if (org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled() && !restoreCountTextPaint) {
++                if (drawCounterMuted || currentDialogFolderId != 0) {
++                    int mutedBg = Theme.dialogs_countGrayPaint.getColor();
++                    int resolvedText = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                            savedCountTextColor, mutedBg, 0xffffffff, 0xff101418, 5.5);
++                    if (resolvedText != savedCountTextColor) {
++                        Theme.dialogs_countTextPaint2.setColor(resolvedText);
++                        restoreCountTextPaint = true;
++                    }
++                } else if (!isTopic) {
++                    int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
++                    int activeBg = customAccent != 0 ? customAccent : Theme.dialogs_countPaint.getColor();
++                    int resolvedText = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
++                            savedCountTextColor, activeBg, 0xffffffff, 0xff101418, 5.5);
++                    if (resolvedText != savedCountTextColor) {
++                        Theme.dialogs_countTextPaint2.setColor(resolvedText);
++                        restoreCountTextPaint = true;
++                    }
++                }
++            }
++
+             if (countOldLayout == null || unreadCount == 0) {
+                 StaticLayout drawLayout = unreadCount == 0 ? countOldLayout : countLayout;
+                 paint.setAlpha((int) ((1.0f - reorderIconProgress) * fillPaintAlpha));
+@@ -5268,6 +5377,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                      canvas.scale(progressFinal, progressFinal, rect.centerX(), rect.centerY());
                  }
  
@@ -8326,7 +8711,7 @@ index 790e4493..6a5a35e3 100644
                  if (drawBubble) {
                      if (counterPath == null || counterPathRect == null || !counterPathRect.equals(rect)) {
                          if (counterPathRect == null) {
-@@ -5290,6 +5381,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+@@ -5290,6 +5403,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                          canvas.drawRoundRect(rect, dp(11.5f), dp(11.5f), counterPaintOutline);
                      }
                  }
@@ -8334,7 +8719,7 @@ index 790e4493..6a5a35e3 100644
                  if (drawLayout != null) {
                      canvas.save();
                      canvas.translate(countLeftLocal + dp(BADGE_TEXT_PADDING), countTop + dpf2(3));
-@@ -5320,6 +5412,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+@@ -5320,6 +5434,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
  
                  canvas.save();
                  canvas.scale(scale * globalScale, scale * globalScale, rect.centerX(), rect.centerY());
@@ -8345,7 +8730,7 @@ index 790e4493..6a5a35e3 100644
                  if (drawBubble) {
                      if (counterPath == null || counterPathRect == null || !counterPathRect.equals(rect)) {
                          if (counterPathRect == null) {
-@@ -5342,6 +5438,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+@@ -5342,6 +5460,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                          canvas.drawRoundRect(rect, dp(11.5f), dp(11.5f), counterPaintOutline);
                      }
                  }
@@ -8353,7 +8738,7 @@ index 790e4493..6a5a35e3 100644
                  if (countAnimationStableLayout != null) {
                      canvas.save();
                      canvas.translate(countLeft + dpf2(BADGE_TEXT_PADDING),  countTop + dpf2(3f));
-@@ -5428,6 +5525,29 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+@@ -5428,6 +5547,29 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
          }
      }
  
@@ -8757,7 +9142,7 @@ index 4b426706..35eec630 100644
          req.username = username;
  
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-index fcd1abc9..b9c1d2f8 100644
+index fcd1abc9..44ee9ea2 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 @@ -489,6 +489,10 @@ public class ChatActivity extends BaseFragment implements
@@ -9240,10 +9625,10 @@ index fcd1abc9..b9c1d2f8 100644
 +                if (chatListView != null) {
 +                    createEmptyView(false);
 +                    chatListView.setEmptyView(emptyViewContainer);
-+                }
+                 }
 +                if (chatAdapter != null) {
 +                    chatAdapter.notifyDataSetChanged(true);
-                 }
++                }
 +                resumeDelayedFragmentAnimation();
              }
          } else if (id == NotificationCenter.customStickerCreated) {
@@ -9462,8 +9847,8 @@ index fcd1abc9..b9c1d2f8 100644
              contentView.onResume();
          }
 +        if (colgramVideoWallpaperView != null) {
-+            colgramVideoWallpaperView.setHostPaused(false);
 +            updateBackground();
++            colgramVideoWallpaperView.setHostPaused(false);
 +        }
          checkChecksHint();
 +        if (ColgramGlobalOrbController.getInstance() != null) {
@@ -9937,7 +10322,77 @@ index fcd1abc9..b9c1d2f8 100644
                  cell.invalidate();
                  SecretMediaViewer.getInstance().setParentActivity(getParentActivity());
                  SecretMediaViewer.getInstance().openMedia(message, photoViewerProvider, openAction, closeAction);
-@@ -43546,6 +44014,9 @@ public class ChatActivity extends BaseFragment implements
+@@ -43442,7 +43910,7 @@ public class ChatActivity extends BaseFragment implements
+             if (animatingColors != null) {
+                 int index = animatingColors.indexOfKey(key);
+                 if (index >= 0) {
+-                    return animatingColors.valueAt(index);
++                    return Theme.colgramGuard(key, animatingColors.valueAt(index), this);
+                 }
+             }
+             if (chatTheme == null) {
+@@ -43450,14 +43918,14 @@ public class ChatActivity extends BaseFragment implements
+             }
+             int index = currentColors.indexOfKey(key);
+             if (index >= 0) {
+-                return currentColors.valueAt(index);
++                return Theme.colgramGuard(key, currentColors.valueAt(index), this);
+             }
+ 
+             int fallbackKey = Theme.getFallbackKey(key);
+             if (fallbackKey >= 0) {
+                 index = currentColors.indexOfKey(fallbackKey);
+                 if (index >= 0) {
+-                    return currentColors.valueAt(index);
++                    return Theme.colgramGuard(key, currentColors.valueAt(index), this);
+                 }
+             }
+             return Theme.getColor(key);
+@@ -43476,18 +43944,41 @@ public class ChatActivity extends BaseFragment implements
+             if (!ignoreAnimation && animatingColors != null) {
+                 int index = animatingColors.indexOfKey(key);
+                 if (index >= 0) {
+-                    return animatingColors.valueAt(index);
++                    return Theme.colgramGuard(key, animatingColors.valueAt(index), this);
+                 }
+             }
+             if (currentColors != null) {
+                 int index = currentColors.indexOfKey(key);
+                 if (index >= 0) {
+-                    return currentColors.valueAt(index);
++                    return Theme.colgramGuard(key, currentColors.valueAt(index), this);
+                 }
+             }
+             return Theme.getColor(key);
+         }
+ 
++        @Override
++        public int getRawColorUnchecked(int key) {
++            if (currentColors != null) {
++                int index = currentColors.indexOfKey(key);
++                if (index >= 0) {
++                    return currentColors.valueAt(index);
++                }
++                int fallbackKey = Theme.getFallbackKey(key);
++                if (fallbackKey >= 0) {
++                    index = currentColors.indexOfKey(fallbackKey);
++                    if (index >= 0) {
++                        return currentColors.valueAt(index);
++                    }
++                }
++            }
++            return Theme.colgramGetRawColorUnchecked(key);
++        }
++
++        @Override
++        public boolean hasRawColorKey(int key) {
++            return currentColors != null && currentColors.indexOfKey(key) >= 0;
++        }
++
+         @Override
+         public void setAnimatedColor(int key, int color) {
+             if (animatingColors != null) {
+@@ -43546,6 +44037,9 @@ public class ChatActivity extends BaseFragment implements
  
          @Override
          public Drawable getWallpaperDrawable() {
@@ -9947,7 +10402,7 @@ index fcd1abc9..b9c1d2f8 100644
              return backgroundDrawable != null ? backgroundDrawable : Theme.getCachedWallpaperNonBlocking();
          }
  
-@@ -43613,8 +44084,8 @@ public class ChatActivity extends BaseFragment implements
+@@ -43613,8 +44107,8 @@ public class ChatActivity extends BaseFragment implements
              animationSettings.afterStartDescriptionsAddedRunnable = () -> {
                  setupChatTheme(chatTheme, newWallpaper, animated, true);
                  initServiceMessageColors(backgroundDrawable);
@@ -9957,7 +10412,15 @@ index fcd1abc9..b9c1d2f8 100644
                      contentView.invalidateBackground();
                  }
              };
-@@ -44188,12 +44659,133 @@ public class ChatActivity extends BaseFragment implements
+@@ -43713,6 +44207,7 @@ public class ChatActivity extends BaseFragment implements
+                 } else {
+                     currentColors = chatTheme.createColors(currentAccount, isDark ? 1 : 0);
+                 }
++                Theme.colgramEnforceSmartContrast(currentColors, isDark);
+                 if (!TextUtils.isEmpty(ChatThemeController.getWallpaperEmoticon(wallpaper))) {
+                     backgroundDrawable = PreviewView.getBackgroundDrawable(backgroundDrawable, currentAccount, wallpaper, isDark);
+                 } else if (wallPaper != null) {
+@@ -44188,12 +44683,133 @@ public class ChatActivity extends BaseFragment implements
          if (contentView == null || parentThemeDelegate != null) {
              return;
          }
@@ -9999,8 +10462,8 @@ index fcd1abc9..b9c1d2f8 100644
 +                                LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
 +                    }
 +                }
-+                colgramVideoWallpaperView.setVideoPath(videoPath);
 +                colgramVideoWallpaperView.setHostPaused(paused);
++                colgramVideoWallpaperView.setVideoPath(videoPath);
 +            }
 +            contentView.invalidateBackground();
 +            return;
@@ -10094,7 +10557,7 @@ index fcd1abc9..b9c1d2f8 100644
          }
      }
  
-@@ -45425,6 +46017,25 @@ public class ChatActivity extends BaseFragment implements
+@@ -45425,6 +46041,25 @@ public class ChatActivity extends BaseFragment implements
                      forceBottom = true;
                  } else {
                      scrimPopupContainerLayout.setVisibility(View.GONE);
@@ -10120,7 +10583,7 @@ index fcd1abc9..b9c1d2f8 100644
                  }
              } else {
                  scrimPopupContainerLayout.setVisibility(View.GONE);
-@@ -45683,6 +46294,22 @@ public class ChatActivity extends BaseFragment implements
+@@ -45683,6 +46318,22 @@ public class ChatActivity extends BaseFragment implements
          ArrayList<CharSequence> items,
          ArrayList<Integer> options
      ) {
@@ -10143,7 +10606,7 @@ index fcd1abc9..b9c1d2f8 100644
          final MessageObject message = selectedObject;
          final MessageObject.GroupedMessages groupedMessages = selectedObjectGroup;
          final int type = getMessageType(message);
-@@ -45703,6 +46330,8 @@ public class ChatActivity extends BaseFragment implements
+@@ -45703,6 +46354,8 @@ public class ChatActivity extends BaseFragment implements
                  allowPin = false;
              } else if (userInfo != null) {
                  allowPin = userInfo.can_pin_message;
@@ -10152,7 +10615,7 @@ index fcd1abc9..b9c1d2f8 100644
              } else {
                  allowPin = false;
              }
-@@ -45713,8 +46342,9 @@ public class ChatActivity extends BaseFragment implements
+@@ -45713,8 +46366,9 @@ public class ChatActivity extends BaseFragment implements
              allowPin = false;
          }
          allowPin = allowPin && message.getId() > 0 && (message.messageOwner.action == null || message.messageOwner.action instanceof TLRPC.TL_messageActionEmpty) && !message.isExpiredStory() && message.type != MessageObject.TYPE_STORY_MENTION;
@@ -10164,7 +10627,7 @@ index fcd1abc9..b9c1d2f8 100644
          boolean allowUnpin = !isEphemeral && message.getDialogId() != mergeDialogId && allowPin && (pinnedMessageObjects.containsKey(message.getId()) || groupedMessages != null && !groupedMessages.messages.isEmpty() && pinnedMessageObjects.containsKey(groupedMessages.messages.get(0).getId())) && !message.isExpiredStory();
          boolean allowEdit = !isEphemeral && message.canEditMessage(currentChat) && !chatActivityEnterView.hasAudioToSend() && message.getDialogId() != mergeDialogId && message.type != MessageObject.TYPE_STORY && message.type != MessageObject.TYPE_POLL;
          if (allowEdit && groupedMessages != null) {
-@@ -45993,11 +46623,11 @@ public class ChatActivity extends BaseFragment implements
+@@ -45993,11 +46647,11 @@ public class ChatActivity extends BaseFragment implements
                                      icons.add(R.drawable.msg_addbot);
                                  }
                              }
@@ -10178,7 +10641,7 @@ index fcd1abc9..b9c1d2f8 100644
                              items.add(LocaleController.getString(R.string.SaveToDownloads));
                              options.add(OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC);
                              icons.add(R.drawable.msg_download);
-@@ -46012,7 +46642,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46012,7 +46666,7 @@ public class ChatActivity extends BaseFragment implements
                  } else if (type == 4) {
                      if (!noforwardsOrPaidMedia && !selectedObject.hasRevealedExtendedMedia()) {
                          if (selectedObject.isVideo()) {
@@ -10187,7 +10650,7 @@ index fcd1abc9..b9c1d2f8 100644
                                  items.add(LocaleController.getString(R.string.SaveToGallery));
                                  options.add(OPTION_SAVE_TO_GALLERY);
                                  icons.add(R.drawable.msg_gallery);
-@@ -46020,14 +46650,14 @@ public class ChatActivity extends BaseFragment implements
+@@ -46020,14 +46674,14 @@ public class ChatActivity extends BaseFragment implements
                                  options.add(OPTION_SHARE);
                                  icons.add(R.drawable.msg_shareout);
                              }
@@ -10204,7 +10667,7 @@ index fcd1abc9..b9c1d2f8 100644
                              if (MessageObject.isNewGifDocument(selectedObject.getDocument())) {
                                  items.add(LocaleController.getString(R.string.SaveToGIFs));
                                  options.add(OPTION_ADD_TO_GIFS);
-@@ -46040,7 +46670,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46040,7 +46694,7 @@ public class ChatActivity extends BaseFragment implements
                              options.add(OPTION_SHARE);
                              icons.add(R.drawable.msg_shareout);
                          } else {
@@ -10213,7 +10676,7 @@ index fcd1abc9..b9c1d2f8 100644
                                  items.add(LocaleController.getString(R.string.SaveToGallery));
                                  options.add(OPTION_SAVE_TO_GALLERY);
                                  icons.add(R.drawable.msg_gallery);
-@@ -46051,7 +46681,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46051,7 +46705,7 @@ public class ChatActivity extends BaseFragment implements
                      items.add(LocaleController.getString(R.string.ApplyLocalizationFile));
                      options.add(OPTION_APPLY_LOCALIZATION_OR_THEME);
                      icons.add(R.drawable.msg_language);
@@ -10222,7 +10685,7 @@ index fcd1abc9..b9c1d2f8 100644
                          items.add(LocaleController.getString(R.string.SaveToDownloads));
                          options.add(OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC);
                          icons.add(R.drawable.msg_download);
-@@ -46063,7 +46693,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46063,7 +46717,7 @@ public class ChatActivity extends BaseFragment implements
                      items.add(LocaleController.getString(R.string.ApplyThemeFile));
                      options.add(OPTION_APPLY_LOCALIZATION_OR_THEME);
                      icons.add(R.drawable.msg_theme);
@@ -10231,7 +10694,7 @@ index fcd1abc9..b9c1d2f8 100644
                          items.add(LocaleController.getString(R.string.SaveToDownloads));
                          options.add(OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC);
                          icons.add(R.drawable.msg_download);
-@@ -46072,7 +46702,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46072,7 +46726,7 @@ public class ChatActivity extends BaseFragment implements
                          icons.add(R.drawable.msg_shareout);
                      }
                  } else if (type == 6 && !noforwardsOrPaidMedia && !selectedObject.hasRevealedExtendedMedia()) {
@@ -10240,7 +10703,7 @@ index fcd1abc9..b9c1d2f8 100644
                          items.add(LocaleController.getString(R.string.SaveToGallery));
                          options.add(OPTION_SAVE_TO_GALLERY2);
                          icons.add(R.drawable.msg_gallery);
-@@ -46144,7 +46774,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46144,7 +46798,7 @@ public class ChatActivity extends BaseFragment implements
                  final boolean canForward = !selectedObject.isSponsored()
                      && !isQuickRepliesOrWelcomeMessagesMode()
                      && chatMode != MODE_SCHEDULED
@@ -10249,7 +10712,7 @@ index fcd1abc9..b9c1d2f8 100644
                      && !selectedObject.isLiveLocation()
                      && selectedObject.type != MessageObject.TYPE_PHONE_CALL
                      && !noforwards && selectedObject.type != MessageObject.TYPE_SHARING_OFFER
-@@ -46239,7 +46869,7 @@ public class ChatActivity extends BaseFragment implements
+@@ -46239,7 +46893,7 @@ public class ChatActivity extends BaseFragment implements
                      options.add(OPTION_VIEW_IN_TOPIC);
                      icons.add(R.drawable.msg_viewintopic);
                  }
@@ -10258,7 +10721,7 @@ index fcd1abc9..b9c1d2f8 100644
                      if (selectedObject.isVideo()) {
                          items.add(LocaleController.getString(R.string.SaveToGallery));
                          options.add(OPTION_SAVE_TO_GALLERY);
-@@ -46247,14 +46877,14 @@ public class ChatActivity extends BaseFragment implements
+@@ -46247,14 +46901,14 @@ public class ChatActivity extends BaseFragment implements
                          items.add(LocaleController.getString(R.string.ShareFile));
                          options.add(OPTION_SHARE);
                          icons.add(R.drawable.msg_shareout);
@@ -10275,7 +10738,7 @@ index fcd1abc9..b9c1d2f8 100644
                          items.add(LocaleController.getString(R.string.SaveToDownloads));
                          options.add(OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC);
                          icons.add(R.drawable.msg_download);
-@@ -46551,13 +47181,20 @@ public class ChatActivity extends BaseFragment implements
+@@ -46551,13 +47205,20 @@ public class ChatActivity extends BaseFragment implements
      }
  
      private void checkUi_backgroundViewVisible() {
@@ -12270,7 +12733,7 @@ index 0dd0f1a2..5cc1466f 100644
  
          @Override
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java
-index d9d6c04f..7c9ac32f 100644
+index d9d6c04f..9e13e5e5 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/SizeNotifierFrameLayout.java
 @@ -88,6 +88,7 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
@@ -12351,6 +12814,33 @@ index d9d6c04f..7c9ac32f 100644
          }
      }
  
+@@ -375,13 +431,13 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
+         if (attached && backgroundDrawable instanceof ChatBackgroundDrawable) {
+             ((ChatBackgroundDrawable) backgroundDrawable).onDetachedFromWindow(backgroundView);
+         }
++        if (attached && backgroundDrawable instanceof MotionBackgroundDrawable) {
++            ((MotionBackgroundDrawable) backgroundDrawable).onDetachedFromWindow();
++        }
+         backgroundDrawable = bitmap;
+         if (attached && backgroundDrawable instanceof ChatBackgroundDrawable) {
+             ((ChatBackgroundDrawable) backgroundDrawable).onAttachedToWindow(backgroundView);
+         }
+-        if (attached && backgroundDrawable instanceof MotionBackgroundDrawable) {
+-            ((MotionBackgroundDrawable) backgroundDrawable).onDetachedFromWindow();
+-        }
+         if (attached && backgroundDrawable instanceof MotionBackgroundDrawable) {
+             ((MotionBackgroundDrawable) backgroundDrawable).onAttachedToWindow();
+         }
+@@ -459,6 +515,9 @@ public class SizeNotifierFrameLayout extends FrameLayout implements Theme.Colora
+             parallaxEffect.setEnabled(true);
+         }
+         paused = false;
++        if (backgroundView != null) {
++            backgroundView.invalidate();
++        }
+     }
+ 
+     @Override
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/StickersAlert.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/StickersAlert.java
 index 542e330b..4165b334 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/Components/StickersAlert.java
@@ -14827,7 +15317,7 @@ index b3cd7c50..ca2ecad3 100644
      }
  }
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
-index dc29adcd..8155867c 100644
+index dc29adcd..06fca4b0 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
 @@ -380,6 +380,48 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
@@ -15188,7 +15678,17 @@ index dc29adcd..8155867c 100644
          if (requestCode == 105) {
              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                  if (ApplicationLoader.canDrawOverlays = Settings.canDrawOverlays(this)) {
-@@ -6852,6 +7134,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -6769,6 +7051,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+             VoIPFragment.onPause();
+         }
+         SpoilerEffect2.pause(true);
++        if (ColgramGlobalOrbController.getInstance() != null) {
++            ColgramGlobalOrbController.getInstance().setHostPaused(true);
++        }
+         //if (refreshRateController != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+         //    refreshRateController.stop();
+         //}
+@@ -6852,6 +7137,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
  
      @Override
      protected void onDestroy() {
@@ -15199,17 +15699,17 @@ index dc29adcd..8155867c 100644
          isActive = false;
          activeInstanceCount--;
          unregisterReceiver(batteryReceiver);
-@@ -7012,6 +7298,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7012,6 +7301,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                  overlay.onResume();
              }
          }
 +        if (ColgramGlobalOrbController.getInstance() != null) {
-+            ColgramGlobalOrbController.getInstance().scheduleRelayout();
++            ColgramGlobalOrbController.getInstance().setHostPaused(false);
 +        }
          ConnectionsManager.getInstance(currentAccount).setAppPaused(false, false);
          updateCurrentConnectionState(currentAccount);
          if (PhotoViewer.hasInstance() && PhotoViewer.getInstance().isVisible()) {
-@@ -7031,6 +7320,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7031,6 +7323,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              showUpdateActivity(UserConfig.selectedAccount, SharedConfig.pendingAppUpdate, true);
          }
          checkAppUpdate(false, null);
@@ -15217,7 +15717,7 @@ index dc29adcd..8155867c 100644
  
          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
              ApplicationLoader.canDrawOverlays = Settings.canDrawOverlays(this);
-@@ -7335,7 +7625,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7335,7 +7628,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
              fragment.showDialog(dialog);
              dialog.setCanceledOnTouchOutside(false);
          } else if (id == NotificationCenter.didSetNewTheme) {
@@ -15228,7 +15728,7 @@ index dc29adcd..8155867c 100644
              if (!nightTheme) {
                  try {
                      setTaskDescription(new ActivityManager.TaskDescription(null, null, Theme.getColor(Theme.key_actionBarDefault) | 0xff000000));
-@@ -7344,10 +7636,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
+@@ -7344,10 +7639,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                  }
              }
              boolean checkNavigationBarColor = true;

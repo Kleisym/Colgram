@@ -1,111 +1,107 @@
 import React from 'react';
-import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
+import { AbsoluteFill, Audio, interpolate, Sequence, staticFile, useCurrentFrame } from 'remotion';
 import { linearTiming, TransitionSeries } from '@remotion/transitions';
 import { fade } from '@remotion/transitions/fade';
 import { slide } from '@remotion/transitions/slide';
-import { wipe } from '@remotion/transitions/wipe';
 import {
   COLORS,
+  EASE_IN_OUT_CUBIC,
   SCENE_DURATIONS,
   TRANSITION_FRAMES,
   VIDEO_DURATION_FRAMES,
 } from './theme';
+import { ColaAtmosphere } from './components/ColaAtmosphere';
 import { Scene1Hero } from './scenes/Scene1Hero';
 import { Scene2Bypass } from './scenes/Scene2Bypass';
 import { Scene3Koliti } from './scenes/Scene3Koliti';
-import { Scene4Storage } from './scenes/Scene4Storage';
-import { Scene5Privacy } from './scenes/Scene5Privacy';
-import { Scene6Outro } from './scenes/Scene6Outro';
+import { Scene4Features } from './scenes/Scene4Features';
+import { Scene5ColaFinale } from './scenes/Scene5ColaFinale';
 
 export const ColgramRelease: React.FC = () => {
   const frame = useCurrentFrame();
 
-  const progressPct = interpolate(frame, [0, VIDEO_DURATION_FRAMES - 1], [0, 100], {
-    extrapolateLeft: 'clamp',
-    extrapolateRight: 'clamp',
+  // Gentle warm studio spotlight shift across the 30s film
+  const spotX = interpolate(
+    frame,
+    [0, 450, 900, 1350, VIDEO_DURATION_FRAMES],
+    [0.54, 0.34, 0.62, 0.50, 0.38],
+    { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' },
+  );
+
+  const smoothTiming = linearTiming({
+    durationInFrames: TRANSITION_FRAMES,
+    easing: EASE_IN_OUT_CUBIC,
   });
 
-  const transitionTiming = linearTiming({ durationInFrames: TRANSITION_FRAMES });
-
   return (
-    <AbsoluteFill style={{ backgroundColor: COLORS.bgDeep }}>
+    <AbsoluteFill style={{ backgroundColor: COLORS.bgObsidian }}>
+      {/* Studio 48kHz Stereo Soundtrack + Frame-Accurate UI & Cola Pour Foley SFX */}
+      <Audio src={staticFile('colgram-soundtrack.wav')} volume={1} />
+
+      {/* Continuous Iced Cola Espresso Studio Backdrop & Gentle Rising Micro-Bubbles */}
+      <ColaAtmosphere spotX={spotX} spotY={0.46} />
+
       <TransitionSeries>
-        {/* Scene 1: 0s - 5s */}
+        {/* Scene 1 (0.0s – 4.5s): Cold Open — "Colgram" */}
         <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.hero}>
           <Scene1Hero />
         </TransitionSeries.Sequence>
 
         <TransitionSeries.Transition
           presentation={slide({ direction: 'from-right' })}
-          timing={transitionTiming}
+          timing={smoothTiming}
         />
 
-        {/* Scene 2: 5s - 12s */}
+        {/* Scene 2 (4.5s – 9.5s): Встроенный обход блокировок */}
         <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.bypass}>
           <Scene2Bypass />
         </TransitionSeries.Sequence>
 
         <TransitionSeries.Transition
-          presentation={wipe({ direction: 'from-left' })}
-          timing={transitionTiming}
+          presentation={fade()}
+          timing={smoothTiming}
         />
 
-        {/* Scene 3: 12s - 19s */}
+        {/* Scene 3 (9.5s – 14.5s): Колити ИИ в чатах */}
         <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.koliti}>
           <Scene3Koliti />
         </TransitionSeries.Sequence>
 
         <TransitionSeries.Transition
-          presentation={slide({ direction: 'from-bottom' })}
-          timing={transitionTiming}
+          presentation={fade()}
+          timing={smoothTiming}
         />
 
-        {/* Scene 4: 19s - 26s */}
-        <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.storage}>
-          <Scene4Storage />
+        {/* Scene 4 (14.5s – 19.5s): Память, Призрак и Стиль */}
+        <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.features}>
+          <Scene4Features />
         </TransitionSeries.Sequence>
 
-        <TransitionSeries.Transition presentation={fade()} timing={transitionTiming} />
+        <TransitionSeries.Transition
+          presentation={fade()}
+          timing={smoothTiming}
+        />
 
-        {/* Scene 5: 26s - 31s */}
-        <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.privacy}>
-          <Scene5Privacy />
-        </TransitionSeries.Sequence>
-
-        <TransitionSeries.Transition presentation={fade()} timing={transitionTiming} />
-
-        {/* Scene 6: 31s - 36s */}
-        <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.outro}>
-          <Scene6Outro />
+        {/* Scene 5 (19.5s – 30.0s): Thematic Showstopper Finale — Pouring Cola Into Glass */}
+        <TransitionSeries.Sequence durationInFrames={SCENE_DURATIONS.finale}>
+          <Scene5ColaFinale />
         </TransitionSeries.Sequence>
       </TransitionSeries>
-
-      {/* Ultra-slim luminous cinema timeline progress bar at bottom edge */}
-      <div
-        style={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          bottom: 0,
-          height: 4,
-          backgroundColor: 'rgba(255, 255, 255, 0.08)',
-          zIndex: 100,
-          pointerEvents: 'none',
-        }}
-      >
-        <div
-          style={{
-            width: `${progressPct}%`,
-            height: '100%',
-            background: `linear-gradient(90deg, ${COLORS.emeraldBright}, ${COLORS.cyanBright}, ${COLORS.crimson})`,
-            boxShadow: `0 0 12px ${COLORS.cyanBright}`,
-          }}
-        />
-      </div>
     </AbsoluteFill>
   );
 };
 
+/**
+ * Crisp 1920x1080 Poster showcasing the Thematic Iced Cola Glass + Colgram Reveal
+ * rendered at the exact peak settled finale state.
+ */
 export const ColgramPoster: React.FC = () => {
-  return <Scene1Hero isPoster />;
+  return (
+    <AbsoluteFill style={{ backgroundColor: COLORS.bgObsidian }}>
+      <Sequence from={-552}>
+        <ColaAtmosphere spotX={0.36} spotY={0.48} />
+        <Scene5ColaFinale isPoster />
+      </Sequence>
+    </AbsoluteFill>
+  );
 };

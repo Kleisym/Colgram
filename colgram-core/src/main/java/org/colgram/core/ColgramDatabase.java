@@ -343,9 +343,10 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     /**
      * Records a message as deleted by the other party.
+     * Requires a concrete non-zero dialogId so tombstones never leak across private chats / Saved Messages.
      */
     public void markMessageDeleted(long dialogId, int messageId) {
-        if (messageId == 0) return;
+        if (dialogId == 0L || messageId == 0) return;
         deletedMessagesCache.add(deletedKey(dialogId, messageId));
         try {
             SQLiteDatabase db = getWritableDatabase();
@@ -361,35 +362,24 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     /** Removes a message from the deleted tombstone cache and DB (e.g. local self-delete or double-delete purge). */
     public void removeMessageDeleted(long dialogId, int messageId) {
-        if (messageId == 0) return;
+        if (dialogId == 0L || messageId == 0) return;
         deletedMessagesCache.remove(deletedKey(dialogId, messageId));
-        if (dialogId > 0) {
-            deletedMessagesCache.remove(deletedKey(0L, messageId));
-        }
         try {
-            if (dialogId > 0) {
-                getWritableDatabase().delete(TABLE_DELETED,
-                        "(" + COL_DEL_DIALOG_ID + "=? OR " + COL_DEL_DIALOG_ID + "=0) AND " + COL_DEL_MSG_ID + "=?",
-                        new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
-            } else {
-                getWritableDatabase().delete(TABLE_DELETED,
-                        COL_DEL_DIALOG_ID + "=? AND " + COL_DEL_MSG_ID + "=?",
-                        new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
-            }
+            getWritableDatabase().delete(TABLE_DELETED,
+                    COL_DEL_DIALOG_ID + "=? AND " + COL_DEL_MSG_ID + "=?",
+                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
         } catch (Exception ignored) {
         }
     }
 
     /**
      * Checks if a message was marked as deleted in O(1) memory without blocking the UI thread.
+     * Strictly scoped to the exact (dialogId, messageId) pair — never wildcard-matches dialogId=0.
      */
     public boolean isMessageDeleted(long dialogId, int messageId) {
-        if (messageId == 0) return false;
+        if (dialogId == 0L || messageId == 0) return false;
         prepareCacheForLookup();
-        if (deletedMessagesCache.contains(deletedKey(dialogId, messageId))) {
-            return true;
-        }
-        return dialogId > 0 && deletedMessagesCache.contains(deletedKey(0L, messageId));
+        return deletedMessagesCache.contains(deletedKey(dialogId, messageId));
     }
 
     /** Returns all preserved deleted message IDs for a dialog so SQLite sync/reload never wipes them. */
@@ -397,14 +387,11 @@ public class ColgramDatabase extends SQLiteOpenHelper {
         java.util.List<Integer> ids = new java.util.ArrayList<>();
         if (dialogId == 0) return ids;
         try {
-            String where = dialogId > 0
-                    ? "(" + COL_DEL_DIALOG_ID + "=? OR " + COL_DEL_DIALOG_ID + "=0)"
-                    : (COL_DEL_DIALOG_ID + "=?");
             android.database.Cursor c = getReadableDatabase().query(
                     true,
                     TABLE_DELETED,
                     new String[]{COL_DEL_MSG_ID},
-                    where,
+                    COL_DEL_DIALOG_ID + "=?",
                     new String[]{String.valueOf(dialogId)},
                     null, null, null, null);
             if (c != null) {

@@ -53,6 +53,40 @@ public final class ColgramAutoReplyPolicy {
         return false;
     }
 
+    /** Matches Telegram's DialogObject.isEncryptedDialog / isFolderDialogId (requires sign bit 0!). */
+    public static boolean isEncryptedOrFolderDialog(long dialogId) {
+        return dialogId > 0L && (dialogId & 0x6000000000000000L) != 0L;
+    }
+
+    /**
+     * Returns true for invalid dialog IDs, Secret Chats / Folder IDs (high bits set in Telegram's
+     * DialogObject encoding), and official Telegram service / anonymous-channel system IDs.
+     */
+    public static boolean isProtectedSystemOrSpecialDialog(long dialogId) {
+        if (dialogId == 0L) {
+            return true;
+        }
+        // Telegram encodes encrypted (Secret) chats (bit 62) and folders (bit 61) with sign bit == 0.
+        // Negative IDs are normal groups/channels (sign-extended) and MUST NOT be matched here.
+        if (isEncryptedOrFolderDialog(dialogId)) {
+            return true;
+        }
+        return dialogId == 777000L       // Telegram Service Notifications
+                || dialogId == 42777L    // Telegram Support / Login codes
+                || dialogId == 333000L   // Telegram Support
+                || dialogId == 4240004L  // Telegram Anti-Spam
+                || dialogId == 136817688L  // Channel_Bot (anonymous channel comment sender)
+                || dialogId == 1087968824L // GroupAnonymousBot
+                || dialogId == 2666000L;   // Anonymous Forwarded Saved Messages pseudo-peer
+    }
+
+    /** Pure-JVM send-target validation gate used by Python/plugin/auto-reply dispatchers. */
+    public static boolean isValidSendTarget(int account, long dialogId, String message) {
+        if (account < 0 || account >= 5) return false;
+        if (isProtectedSystemOrSpecialDialog(dialogId)) return false;
+        return message != null && !message.trim().isEmpty();
+    }
+
     /** Core loop-safe reply gate across human and bot accounts. */
     public static boolean shouldReply(
             boolean enabled,
@@ -69,7 +103,9 @@ public final class ColgramAutoReplyPolicy {
             long nowMs,
             long lastReplyMs,
             int cooldownSec) {
-        if (!enabled || isOut || dialogId == 0L || (selfUserId > 0L && dialogId == selfUserId)) {
+        // Fail closed if selfUserId could not be resolved so auto-reply can NEVER fire into Saved Messages.
+        if (!enabled || isOut || selfUserId <= 0L || dialogId == selfUserId
+                || isProtectedSystemOrSpecialDialog(dialogId)) {
             return false;
         }
         if (isChannel) {

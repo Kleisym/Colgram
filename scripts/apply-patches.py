@@ -686,8 +686,12 @@ def inject_hooks(repo_path):
                     colgramReplySender = MessageObject.getPeerId(sendMessageParams.replyToMsg.messageOwner.from_id);
                 }
             }
-            ColgramNativeColemailerBridge.rememberPendingReply(sendMessageParams.peer, sendMessageParams.replyToMsg);
-            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {
+            if (sendMessageParams.message.trim().startsWith(".")) {
+                ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, sendMessageParams.peer, sendMessageParams.replyToMsg);
+            } else {
+                ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, sendMessageParams.peer, null);
+            }
+            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(currentAccount, sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {
                 return;
             }
         }""",
@@ -1889,7 +1893,19 @@ def inject_hooks(repo_path):
                 try {
                     TLRPC.Message colgramEditMsg = (baseUpdate instanceof TL_update.TL_updateEditChannelMessage) ? ((TL_update.TL_updateEditChannelMessage) baseUpdate).message : ((TL_update.TL_updateEditMessage) baseUpdate).message;
                     if (colgramEditMsg != null && org.colgram.core.ColgramConfig.isEditHistoryEnabled()) {
-                        long did = colgramEditMsg.dialog_id != 0 ? colgramEditMsg.dialog_id : (colgramEditMsg.peer_id != null ? org.telegram.messenger.MessageObject.getPeerId(colgramEditMsg.peer_id) : 0);
+                        long did = colgramEditMsg.dialog_id;
+                        if (did == 0 && colgramEditMsg.peer_id != null) {
+                            if (colgramEditMsg.peer_id.chat_id != 0) {
+                                did = -colgramEditMsg.peer_id.chat_id;
+                            } else if (colgramEditMsg.peer_id.channel_id != 0) {
+                                did = -colgramEditMsg.peer_id.channel_id;
+                            } else if (colgramEditMsg.from_id == null || colgramEditMsg.out || colgramEditMsg.guestchat_via_from != null) {
+                                did = colgramEditMsg.peer_id.user_id;
+                            } else {
+                                did = colgramEditMsg.from_id.user_id;
+                            }
+                        }
+                        if (did != 0) {
 
                         // One storage read serves BOTH the text and the media capture.
                         TLRPC.Message colgramStored = null;
@@ -2027,6 +2043,7 @@ def inject_hooks(repo_path):
                                 }
                             }
                         } catch (Throwable ignoreMedia) {}
+                        }
                     }
                 } catch (Throwable ignore) {}"""
             return content.replace(target, target + inject, 1)
@@ -5428,16 +5445,15 @@ def inject_hooks(repo_path):
     # Bump with every edit to the body below: the marker is also what patch_file uses to
     # decide the work is done, so a stale marker silently freezes an old body in place.
 
-    COLGRAM_PLUGIN_INBOUND_PATCH = "2"
+    COLGRAM_PLUGIN_INBOUND_PATCH = "3"
     COLGRAM_PLUGIN_INBOUND_MARKER = "// COLGRAM_PLUGIN_INBOUND_PATCH = " + COLGRAM_PLUGIN_INBOUND_PATCH
-    COLGRAM_PLUGIN_INBOUND_HELPER = """    // COLGRAM_PLUGIN_INBOUND_PATCH = 2
+    COLGRAM_PLUGIN_INBOUND_HELPER = """    // COLGRAM_PLUGIN_INBOUND_PATCH = 3
     /**
-     * Hand genuinely-new incoming messages to the Colgram plugin system.
+     * Hand genuinely-new incoming messages (MODE_DEFAULT only) to the Colgram plugin & anti-spam hooks.
      *
-     * Only messages dated within the last two minutes are dispatched, because this method also
-     * serves history loads; only incoming ones, because a reply we send is itself a message and
-     * answering it would loop. The cap keeps a large fresh batch from starting one thread per
-     * message downstream.
+     * Strictly filters out history pages (>120s old), non-default modes (Saved Messages sub-dialogs,
+     * scheduled, quick replies, welcome messages), empty/service messages, Secret Chats, Folders,
+     * Saved Messages (selfId), and bot accounts from Colemailer/anti-spam routing.
      */
     private void colgramDispatchPlugins(ArrayList<TLRPC.Message> messages) {
         try {
@@ -5445,22 +5461,65 @@ def inject_hooks(repo_path):
                 return;
             }
             long colgramNowSec = System.currentTimeMillis() / 1000L;
+            long colgramSelfId = UserConfig.getInstance(currentAccount).getClientUserId();
+            TLRPC.User colgramSelfUser = UserConfig.getInstance(currentAccount).getCurrentUser();
+            boolean colgramIsBotAccount = colgramSelfUser != null && colgramSelfUser.bot;
             int colgramDispatched = 0;
             for (int i = messages.size() - 1; i >= 0 && colgramDispatched < 10; i--) {
                 TLRPC.Message colgramMessage = messages.get(i);
-                if (colgramMessage == null || colgramMessage.out
-                        || colgramMessage.message == null || colgramMessage.message.isEmpty()) {
+                if (colgramMessage == null || colgramMessage.id <= 0
+                        || colgramMessage instanceof TLRPC.TL_messageEmpty
+                        || colgramMessage.action != null
+                        || MessageObject.isWelcomeMessage(colgramMessage)
+                        || MessageObject.isQuickReply(colgramMessage)) {
                     continue;
                 }
                 if (colgramMessage.date < colgramNowSec - 120) {
                     continue;
                 }
                 long colgramDialogId = MessageObject.getDialogId(colgramMessage);
-                if (colgramDialogId == 0) {
+                if (colgramDialogId == 0
+                        || DialogObject.isEncryptedDialog(colgramDialogId)
+                        || DialogObject.isFolderDialogId(colgramDialogId)) {
                     continue;
                 }
+                if (colgramMessage.out) {
+                    if (colgramMessage.message != null && !colgramMessage.message.isEmpty()) {
+                        org.colgram.core.ColgramHookHandler.hookOnMessageReceived(
+                                currentAccount, colgramDialogId, colgramMessage.id, colgramMessage.message, colgramSelfId, true);
+                    }
+                    continue;
+                }
+                long colgramSender = colgramMessage.from_id != null
+                        ? MessageObject.getPeerId(colgramMessage.from_id) : 0L;
+                // Saved Messages & own-sender messages must NEVER enter Colemailer, SpamGuard, Auto-Reply, or inbound plugins.
+                if (colgramSelfId == 0 || colgramDialogId == colgramSelfId
+                        || (colgramSender != 0 && colgramSender == colgramSelfId)) {
+                    if (colgramMessage.message != null && !colgramMessage.message.isEmpty()) {
+                        org.colgram.core.ColgramHookHandler.hookOnMessageReceived(
+                                currentAccount, colgramDialogId, colgramMessage.id, colgramMessage.message, colgramSender, true);
+                    }
+                    continue;
+                }
+                if (org.colgram.core.ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(colgramDialogId)) {
+                    continue;
+                }
+                if (!colgramIsBotAccount) {
+                    org.colgram.core.ColgramHookHandler.notifyColemailerIncoming(currentAccount, colgramMessage);
+                }
+                if (colgramMessage.message == null || colgramMessage.message.isEmpty()) {
+                    colgramDispatched++;
+                    continue;
+                }
+                if (!colgramIsBotAccount && colgramDialogId < 0 && colgramSender != 0) {
+                    int colgramVerdict = org.colgram.core.ColgramHookHandler.colgramSpamVerdict(
+                            currentAccount, colgramDialogId, colgramSender, colgramMessage.message, true);
+                    if (colgramVerdict >= org.colgram.core.ColgramSpamGuard.VERDICT_MUTE) {
+                        org.colgram.core.ColgramHookHandler.setNotificationsBlocked(colgramSender, true);
+                    }
+                }
                 org.colgram.core.ColgramHookHandler.hookOnMessageReceived(
-                        colgramDialogId, colgramMessage.id, colgramMessage.message, false);
+                        currentAccount, colgramDialogId, colgramMessage.id, colgramMessage.message, colgramSender, false);
                 colgramDispatched++;
             }
         } catch (Throwable ignore) {
@@ -5480,16 +5539,13 @@ def inject_hooks(repo_path):
             return content
         if colgram_storage_sig not in content:
             return content
-        # Strip an older copy first: the first revision of this helper called
-        # TLRPC.Message.getDialogId(), which does not exist in this version, and it had
-        # already been written into the tree. An injector that only ever ADDS cannot repair
-        # a line it shipped wrong.
         content = colgram_inbound_re.sub("", content, count=1)
+        content = content.replace("\n        if (mode == ChatActivity.MODE_DEFAULT) {\n            colgramDispatchPlugins(messages);\n        }", "")
         content = content.replace("\n        colgramDispatchPlugins(messages);", "")
         return content.replace(
             colgram_storage_sig,
             COLGRAM_PLUGIN_INBOUND_HELPER + colgram_storage_sig
-            + "\n        colgramDispatchPlugins(messages);",
+            + "\n        if (mode == ChatActivity.MODE_DEFAULT) {\n            colgramDispatchPlugins(messages);\n        }",
             1)
 
     patch_file(messages_storage, storage_inbound_injector, COLGRAM_PLUGIN_INBOUND_MARKER,

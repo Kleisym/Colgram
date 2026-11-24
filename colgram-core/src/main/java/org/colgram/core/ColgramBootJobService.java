@@ -131,8 +131,20 @@ public class ColgramBootJobService extends JobService {
             return true;
         }
         if (params != null && params.getJobId() == PROXY_REFRESH_JOB_ID) {
-            Log.i(TAG, "persistent proxy refresh job running");
             final android.content.Context app = getApplicationContext();
+            ColgramConfig.init(app);
+            boolean canSkipInBackground = !ColgramUiBridge.isAppInForeground()
+                    && !ColgramForegroundService.hasConfiguredBotTokens()
+                    && !ColgramDpiBypass.isStrictL3WhitelistDetected()
+                    && (!ColgramConfig.isAlwaysBackgroundEnabled()
+                        || (ColgramDpiBypass.isBound()
+                            && (ColgramProxyManager.isTelegramConnected()
+                                || ColgramDpiBypass.bytesFromTarget() > 0)));
+            if (canSkipInBackground) {
+                jobFinished(params, false);
+                return false;
+            }
+            Log.i(TAG, "persistent proxy refresh job running");
             ColgramProxyManager.refreshProxySourcesInBackground(app, () -> {
                 try {
                     if (ColgramConfig.isAlwaysBackgroundEnabled()) {
@@ -142,7 +154,7 @@ public class ColgramBootJobService extends JobService {
                         }
                         ColgramBotSync.ensureAllAccountsSynced(app, "periodic-job");
                     }
-                    if (ColgramConfig.isDefenderEnabled()) {
+                    if (ColgramConfig.isDefenderEnabled() && ColgramUiBridge.isAppInForeground()) {
                         ColgramSecurityDefender.runFullAuditAndHeal(app, "periodic-job");
                     }
                     ColgramAiEngine.getInstance().unloadIfIdleInBackground();

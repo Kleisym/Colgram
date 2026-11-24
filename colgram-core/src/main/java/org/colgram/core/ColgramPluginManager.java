@@ -337,7 +337,7 @@ public class ColgramPluginManager {
     }
 
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text) {
-        return hookOnSendMessage(dialogId, replyToMsgId, text, 0L);
+        return hookOnSendMessage(ColgramPythonEngine.resolveSelectedAccount(), dialogId, replyToMsgId, text, 0L);
     }
 
     /**
@@ -347,8 +347,13 @@ public class ColgramPluginManager {
      * the person being muted is the author of the quoted message, not the chat itself.
      */
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text, long replySenderId) {
+        return hookOnSendMessage(ColgramPythonEngine.resolveSelectedAccount(), dialogId, replyToMsgId, text, replySenderId);
+    }
+
+    public static boolean hookOnSendMessage(int account, long dialogId, int replyToMsgId, String text, long replySenderId) {
         if (text != null && handleMuteCommand(dialogId, text, replySenderId)) return true;
-        if (text == null || !text.startsWith(".")) return false;
+        if (text == null || !text.startsWith(".") || dialogId == 0L) return false;
+        final int safeAcc = account >= 0 && account < 5 ? account : ColgramPythonEngine.resolveSelectedAccount();
 
         String[] parts = text.substring(1).split("\\s+", 2);
         String cmd = parts[0].toLowerCase();
@@ -358,20 +363,20 @@ public class ColgramPluginManager {
         if (activeCommands.containsKey(cmd)) {
             PluginInfo p = activeCommands.get(cmd);
             if (p != null && p.isEnabled) {
-                executePluginCommand(dialogId, p, cmd, args);
+                executePluginCommand(safeAcc, dialogId, p, cmd, args);
                 return true;
             }
         }
 
         // 2. Built-in command handlers
         if ("spam".equals(cmd)) {
-            handleSpamCommand(dialogId, args);
+            handleSpamCommand(safeAcc, dialogId, args);
             return true;
         } else if ("export".equals(cmd)) {
             handleExportCommand(dialogId);
             return true;
         } else if ("info".equals(cmd)) {
-            handleInfoCommand(dialogId);
+            handleInfoCommand(safeAcc, dialogId);
             return true;
         } else if ("calc".equals(cmd) || "py".equals(cmd) || "eval".equals(cmd)) {
             final long targetDialog = dialogId;
@@ -381,24 +386,24 @@ public class ColgramPluginManager {
                 if (res == null) {
                     res = ColgramPythonEngine.executeCode(codeArg);
                 }
-                ColgramPythonEngine.sendMessage(targetDialog, "🐍 Результат: " + res);
+                ColgramPythonEngine.sendMessage(safeAcc, targetDialog, "🐍 Результат: " + res);
             }, "colgram-py-cmd").start();
             return true;
         } else if ("ping".equals(cmd) || "id".equals(cmd) || "del".equals(cmd) || "help".equals(cmd) || "plugins".equals(cmd)) {
-            return ColgramPythonEngine.handleCommand(dialogId, 0, "." + cmd + (args == null || args.isEmpty() ? "" : (" " + args)));
+            return ColgramPythonEngine.handleCommand(safeAcc, dialogId, 0, "." + cmd + (args == null || args.isEmpty() ? "" : (" " + args)));
         } else if ("rev".equals(cmd)) {
-            ColgramPythonEngine.sendMessage(dialogId, new StringBuilder(args).reverse().toString());
+            ColgramPythonEngine.sendMessage(safeAcc, dialogId, new StringBuilder(args).reverse().toString());
             return true;
         } else if ("shrug".equals(cmd)) {
-            ColgramPythonEngine.sendMessage(dialogId, args + " ¯\\_(ツ)_/¯");
+            ColgramPythonEngine.sendMessage(safeAcc, dialogId, args + " ¯\\_(ツ)_/¯");
             return true;
         } else if ("flip".equals(cmd)) {
-            ColgramPythonEngine.sendMessage(dialogId, "(╯°□°)╯︵ ┻━┻");
+            ColgramPythonEngine.sendMessage(safeAcc, dialogId, "(╯°□°)╯︵ ┻━┻");
             return true;
         }
 
         if (ColgramPythonEngine.isPythonReady() && ColgramPythonEngine.isShimCommandRegistered(cmd)) {
-            new Thread(() -> dispatchExteraShimCommand(dialogId, cmd, args), "colgram-extera-cmd").start();
+            new Thread(() -> dispatchExteraShimCommand(safeAcc, dialogId, cmd, args), "colgram-extera-cmd").start();
             return true;
         }
 
@@ -406,37 +411,30 @@ public class ColgramPluginManager {
     }
 
     public static boolean dispatchCommand(long dialogId, String cmd, String args) {
+        return dispatchCommand(ColgramPythonEngine.resolveSelectedAccount(), dialogId, cmd, args);
+    }
+
+    public static boolean dispatchCommand(int account, long dialogId, String cmd, String args) {
+        if (dialogId == 0L) return false;
+        final int safeAcc = account >= 0 && account < 5 ? account : ColgramPythonEngine.resolveSelectedAccount();
         if (activeCommands.containsKey(cmd)) {
             PluginInfo p = activeCommands.get(cmd);
             if (p != null && p.isEnabled) {
-                executePluginCommand(dialogId, p, cmd, args);
+                executePluginCommand(safeAcc, dialogId, p, cmd, args);
                 return true;
             }
         }
-        // Fall through to any command registered through the exteraGram compat shim.
-        // exteraGram plugins register via `exteraPlugins.add_command(...)` rather than
-        // Colgram's header comment, so they never appear in activeCommands and would
-        // otherwise never fire.
-        return dispatchExteraShimCommand(dialogId, cmd, args);
+        return dispatchExteraShimCommand(safeAcc, dialogId, cmd, args);
     }
 
-    /**
-     * Run a command registered through the exteraPlugins compatibility shim.
-     *
-     * The shim lives inside the Python interpreter; we reach it through ColgramPythonEngine
-     * rather than importing Python here, since this module must stay free of Telegram and
-     * interpreter references at compile time.
-     *
-     * Returns true if the shim handled the command.
-     */
-    private static boolean dispatchExteraShimCommand(long dialogId, String cmd, String args) {
+    private static boolean dispatchExteraShimCommand(int account, long dialogId, String cmd, String args) {
         try {
-            if (!ColgramPythonEngine.isShimCommandRegistered(cmd)) {
+            if (dialogId == 0L || !ColgramPythonEngine.isShimCommandRegistered(cmd)) {
                 return false;
             }
-            String result = ColgramPythonEngine.runShimCommand(dialogId, cmd, args);
+            String result = ColgramPythonEngine.runShimCommand(account, dialogId, cmd, args);
             if (result != null && !result.isEmpty()) {
-                ColgramPythonEngine.sendMessage(dialogId, result);
+                ColgramPythonEngine.sendMessage(account, dialogId, result);
             }
             return true;
         } catch (Throwable t) {
@@ -501,7 +499,7 @@ public class ColgramPluginManager {
         }
     }
 
-    private static void handleSpamCommand(long dialogId, String args) {
+    private static void handleSpamCommand(int account, long dialogId, String args) {
         new Thread(() -> {
             try {
                 String[] parts = args.split("\\s+", 2);
@@ -509,11 +507,11 @@ public class ColgramPluginManager {
                 String msg = parts.length > 1 ? parts[1] : "Spam test";
                 count = Math.min(Math.max(1, count), 50); // limit 1..50 for safety
                 for (int i = 0; i < count; i++) {
-                    ColgramPythonEngine.sendMessage(dialogId, msg);
+                    ColgramPythonEngine.sendMessage(account, dialogId, msg);
                     Thread.sleep(300);
                 }
             } catch (Throwable t) {
-                ColgramPythonEngine.sendMessage(dialogId, "Использование: `.spam <кол-во> <текст>`");
+                ColgramPythonEngine.sendMessage(account, dialogId, "Использование: `.spam <кол-во> <текст>`");
             }
         }).start();
     }
@@ -533,7 +531,7 @@ public class ColgramPluginManager {
         }, "colgram-export").start();
     }
 
-    private static void handleInfoCommand(long dialogId) {
+    private static void handleInfoCommand(int account, long dialogId) {
         String appVer = "12.10.6";
         try {
             Object v = Class.forName("org.telegram.messenger.BuildVars")
@@ -548,7 +546,7 @@ public class ColgramPluginManager {
                 + "• Plugins Loaded: `" + loadedPlugins.size() + "`\n"
                 + "• Engine: `CPython 3.11 Embedded`\n"
                 + "• DPI Bypass: `" + (ColgramDpiBypass.isRunning() ? "Встроенный маршрут активен" : "Offline") + "`";
-        ColgramPythonEngine.sendMessage(dialogId, info);
+        ColgramPythonEngine.sendMessage(account, dialogId, info);
     }
 
     private static final java.util.concurrent.ExecutorService PLUGIN_EXECUTOR =
@@ -558,7 +556,8 @@ public class ColgramPluginManager {
                 return t;
             });
 
-    private static void executePluginCommand(long dialogId, PluginInfo plugin, String cmd, String args) {
+    private static void executePluginCommand(int account, long dialogId, PluginInfo plugin, String cmd, String args) {
+        if (dialogId == 0L) return;
         PLUGIN_EXECUTOR.execute(() -> {
             try {
                 String module = plugin.fileName.substring(0, plugin.fileName.length() - 3);
@@ -579,7 +578,7 @@ public class ColgramPluginManager {
                         + "    if _r: print(_r)\n";
                 String output = ColgramPythonEngine.executePluginCode(pySnippet);
                 if (output != null && !output.trim().isEmpty() && !output.startsWith("Executed")) {
-                    ColgramPythonEngine.sendMessage(dialogId, output.trim());
+                    ColgramPythonEngine.sendMessage(account, dialogId, output.trim());
                 }
             } catch (Throwable t) {
                 Log.e(TAG, "Plugin execution error", t);
@@ -588,7 +587,13 @@ public class ColgramPluginManager {
     }
 
     public static void hookOnMessageReceived(long dialogId, int messageId, String text, boolean isOut) {
-        if (isOut || text == null) return;
+        hookOnMessageReceived(ColgramPythonEngine.resolveSelectedAccount(), dialogId, messageId, text, isOut);
+    }
+
+    public static void hookOnMessageReceived(int account, long dialogId, int messageId, String text, boolean isOut) {
+        if (isOut || text == null || dialogId == 0L
+                || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)) return;
+        final int safeAcc = account >= 0 && account < 5 ? account : ColgramPythonEngine.resolveSelectedAccount();
         // Fast bail-out BEFORE scheduling any worker thread if zero enabled plugins exist!
         List<PluginInfo> enabledPlugins = null;
         synchronized (loadedPlugins) {
@@ -623,8 +628,8 @@ public class ColgramPluginManager {
                     if (out == null) continue;
                     String reply = out.trim();
                     if (reply.isEmpty() || reply.startsWith("Executed")) continue;
-                    ColgramPythonEngine.sendMessage(dialogId, reply);
-                    Log.i(TAG, "plugin " + p.fileName + " replied to message " + messageId);
+                    ColgramPythonEngine.sendMessage(safeAcc, dialogId, reply);
+                    Log.i(TAG, "plugin " + p.fileName + " replied to message " + messageId + " on acc=" + safeAcc);
                 } catch (Throwable t) {
                     Log.w(TAG, "plugin " + p.fileName + " on_message failed: " + t.getMessage());
                 }

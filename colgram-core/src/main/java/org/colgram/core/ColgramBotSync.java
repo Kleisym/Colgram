@@ -2182,6 +2182,10 @@ public class ColgramBotSync {
                     messageClass.getField("peer_id").set(message, peer);
                 }
 
+                try {
+                    messageClass.getField("dialog_id").setLong(message, resolvedDialogId);
+                } catch (Throwable ignored) {}
+
                 if (fromId != 0) {
                     Object peerFrom = peerUserClass.getConstructor().newInstance();
                     peerUserClass.getField("user_id").setLong(peerFrom, fromId);
@@ -2190,11 +2194,19 @@ public class ColgramBotSync {
 
                 messagesList.add(message);
 
-                // Only anything NOT sent by this bot is "incoming". Feeding our own replies back
-                // into the plugin hook is how an auto-responder ends up answering itself.
-                boolean colgramIsIncoming = botSelfId == 0 || fromId != botSelfId;
-                if (colgramIsIncoming && !text.isEmpty()) {
-                    pluginInbound.add(new Object[]{chatId, Integer.valueOf(msgId), text});
+                // Only fresh, non-edited inbound messages NOT sent by this bot (and not Saved Messages)
+                // enter the plugin/auto-reply hook, always keyed by resolvedDialogId (never raw -100 chatId).
+                boolean colgramIsIncoming = (botSelfId == 0 || fromId != botSelfId) && !isChannelPostUpdate;
+                long nowSec = System.currentTimeMillis() / 1000L;
+                if (colgramIsIncoming && !isEditedUpdate && !text.isEmpty()
+                        && resolvedDialogId != 0L && (botSelfId == 0L || resolvedDialogId != botSelfId)
+                        && date >= nowSec - 120L) {
+                    pluginInbound.add(new Object[]{
+                            Long.valueOf(resolvedDialogId),
+                            Integer.valueOf(msgId),
+                            text,
+                            Long.valueOf(fromId)
+                    });
                 }
             }
 
@@ -2646,13 +2658,15 @@ public class ColgramBotSync {
             });
 
             // Hand the batch's incoming messages to the plugin system now that they are stored
-            // and the UI has been told about them.
+            // and the UI has been told about them — strictly pinned to this bot's `account`!
             for (Object[] entry : pluginInbound) {
                 try {
                     ColgramHookHandler.hookOnMessageReceived(
+                            account,
                             ((Long) entry[0]).longValue(),
                             ((Integer) entry[1]).intValue(),
                             (String) entry[2],
+                            ((Long) entry[3]).longValue(),
                             false);
                 } catch (Throwable t) {
                     Log.w(TAG, "plugin inbound dispatch failed: " + t.getMessage());

@@ -121,6 +121,8 @@ public final class ColgramColemailerEngine {
         public final List<List<ButtonSpec>> buttons = new ArrayList<>();
         public boolean disablePreview;
         public boolean enabled = true;
+        /** Account slot that owns this campaign (-1 = legacy/unassigned, >=0 = pinned to that account). */
+        public int ownerAccount = -1;
 
         public BroadcastCampaign(String name, String text, int mode, long intervalSec,
                                  int counterThreshold, String folderName) {
@@ -475,13 +477,24 @@ public final class ColgramColemailerEngine {
     }
 
     public synchronized void syncFolderTargets(String folderName, Set<Long> liveDialogIds) {
+        syncFolderTargets(-1, folderName, liveDialogIds);
+    }
+
+    public synchronized void syncFolderTargets(int account, String folderName, Set<Long> liveDialogIds) {
         if (folderName == null || folderName.trim().isEmpty() || liveDialogIds == null) return;
+        LinkedHashSet<Long> safeIds = new LinkedHashSet<>();
+        for (Long id : liveDialogIds) {
+            if (id != null && !ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(id)) {
+                safeIds.add(id);
+            }
+        }
         boolean changed = false;
         for (BroadcastCampaign c : campaigns.values()) {
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
             if (folderName.equalsIgnoreCase(c.folderName)) {
-                if (!c.targetChats.equals(liveDialogIds)) {
+                if (!c.targetChats.equals(safeIds)) {
                     c.targetChats.clear();
-                    c.targetChats.addAll(liveDialogIds);
+                    c.targetChats.addAll(safeIds);
                     changed = true;
                 }
             }
@@ -490,9 +503,15 @@ public final class ColgramColemailerEngine {
     }
 
     public synchronized void onIncomingChatMessage(long chatId, long nowSec) {
+        onIncomingChatMessage(-1, chatId, nowSec);
+    }
+
+    public synchronized void onIncomingChatMessage(int account, long chatId, long nowSec) {
+        if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) return;
         boolean changed = false;
         for (BroadcastCampaign c : campaigns.values()) {
             if (!c.enabled || c.mode == MODE_INTERVAL) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
             if (!c.targetChats.contains(chatId)) continue;
             if (c.mode == MODE_HYBRID) {
                 long staleWindow = Math.max(c.intervalSec * 3L, HYBRID_STALE_MIN_SEC);
@@ -510,11 +529,16 @@ public final class ColgramColemailerEngine {
     }
 
     public synchronized List<BroadcastDueEvent> collectDueBroadcasts(long nowSec) {
+        return collectDueBroadcasts(-1, nowSec);
+    }
+
+    public synchronized List<BroadcastDueEvent> collectDueBroadcasts(int account, long nowSec) {
         List<BroadcastDueEvent> due = new ArrayList<>();
         for (BroadcastCampaign c : campaigns.values()) {
             if (!c.enabled || c.text.isEmpty() || c.targetChats.isEmpty()) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
             for (Long chatId : c.targetChats) {
-                if (chatId == null || chatId == 0) continue;
+                if (chatId == null || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) continue;
                 Long lastSentObj = c.chatLastSentAt.get(chatId);
                 long lastSent = lastSentObj == null ? 0L : lastSentObj;
                 if (lastSent == 0L) {
@@ -755,7 +779,8 @@ public final class ColgramColemailerEngine {
                     .append('\t').append(c.disablePreview ? '1' : '0')
                     .append('\t').append(c.enabled ? '1' : '0')
                     .append('\t').append(joinLongs(c.targetChats))
-                    .append('\t').append(esc(formatButtonsPreview(c.buttons))).append('\n');
+                    .append('\t').append(esc(formatButtonsPreview(c.buttons)))
+                    .append('\t').append(c.ownerAccount).append('\n');
         }
         for (RotationRule rot : rotations.values()) {
             sb.append("ROT\t").append(esc(rot.name)).append('\t')
@@ -808,6 +833,13 @@ public final class ColgramColemailerEngine {
                     String btnLayout = unesc(p[10]);
                     if (!btnLayout.isEmpty()) {
                         c.buttons.addAll(parseButtonLayout(btnLayout));
+                    }
+                    if (p.length >= 12 && !p[11].trim().isEmpty()) {
+                        try {
+                            c.ownerAccount = Integer.parseInt(p[11].trim());
+                        } catch (NumberFormatException ignored) {
+                            c.ownerAccount = -1;
+                        }
                     }
                     campaigns.put(c.name, c);
                 } else if ("ROT".equals(p[0]) && p.length >= 3) {

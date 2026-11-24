@@ -975,6 +975,71 @@ public final class ColgramCoreRegressionTest {
             throw new AssertionError("in-tunnel TLS fragmentation test failed", e);
         }
 
+        // 11g. Relay Tier-2 fallback ordering, dead-relay eviction, and ColgramDesignConfig performance defaults
+        check(ColgramDesignConfig.isSmartColorContrastEnabled(), "smart color contrast enabled by default");
+        check(ColgramDesignConfig.isDownloadSpeedBoostEnabled(), "download speed boost enabled by default");
+        ColgramProxyManager.clearPoolsForTest();
+        ColgramDpiBypass.setStrictL3WhitelistForTest(false);
+        try (java.net.ServerSocket mockRelay = new java.net.ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))) {
+            final int relayPort = mockRelay.getLocalPort();
+            Thread relayAccept = new Thread(() -> {
+                try (java.net.Socket s = mockRelay.accept()) {
+                    java.io.InputStream in = s.getInputStream();
+                    java.io.OutputStream out = s.getOutputStream();
+                    byte[] hdr = ColgramSocks5Codec.readFully(in, 3);
+                    if (hdr[0] == 5) {
+                        out.write(new byte[]{5, 0});
+                        out.flush();
+                        byte[] reqHead = ColgramSocks5Codec.readFully(in, 4);
+                        if ((reqHead[3] & 0xFF) == 3) {
+                            int domLen = ColgramSocks5Codec.readByte(in) & 0xFF;
+                            ColgramSocks5Codec.readFully(in, domLen + 2);
+                        }
+                        out.write(new byte[]{5, 0, 0, 1, 127, 0, 0, 1, 0, 80});
+                        out.flush();
+                        // Immediately close on TLS start to trigger L3 WSS failover penalty
+                    }
+                } catch (Throwable ignored) {}
+            }, "test-l3-wss-evict");
+            relayAccept.setDaemon(true);
+            relayAccept.start();
+
+            ColgramProxyManager.ProxyItem t1 = new ColgramProxyManager.ProxyItem("203.0.113.10", 1080, "", 0);
+            t1.socksConnectOk = true;
+            t1.tcpMs = 120;
+            ColgramProxyManager.addPoolItemForTest(t1);
+
+            ColgramProxyManager.ProxyItem t2 = new ColgramProxyManager.ProxyItem("203.0.113.20", 1080, "", 0);
+            t2.socksGreetedOk = true;
+            t2.pingMs = -2; // Failed raw MTProto probe must NOT disqualify a greeted Tier-2 relay
+            t2.tcpMs = 40; // Faster TCP RTT, but Tier-2 gets +600ms offset so Tier-1 stays ahead
+            ColgramProxyManager.addPoolItemForTest(t2);
+
+            java.util.List<ColgramProxyChain.Relay> tiered = ColgramProxyManager.getReachableRelays();
+            check(tiered.size() == 2 && "203.0.113.10".equals(tiered.get(0).host) && "203.0.113.20".equals(tiered.get(1).host),
+                    "Tier-1 socksConnectOk relays outrank Tier-2 socksGreetedOk relays, got=" + tiered);
+
+            ColgramProxyManager.markRelayDead("203.0.113.10", 1080);
+            java.util.List<ColgramProxyChain.Relay> afterEvict = ColgramProxyManager.getReachableRelays();
+            check(afterEvict.size() == 1 && "203.0.113.20".equals(afterEvict.get(0).host),
+                    "markRelayDead evicts dead relay from getReachableRelays, got=" + afterEvict);
+
+            ColgramProxyChain.Relay brokenWssRelay = new ColgramProxyChain.Relay("127.0.0.1", relayPort, true, "", "");
+            brokenWssRelay.rttMs = 15;
+            java.util.List<ColgramProxyChain.Relay> brokenList = java.util.Collections.singletonList(brokenWssRelay);
+            ColgramTelegramWsBridge.WsSession wsFail = ColgramDpiBypass.dialWssViaL3RelayCascade(
+                    "149.154.167.51", 443, null, brokenList);
+            check(wsFail == null, "dialWssViaL3RelayCascade returns null when TLS upgrade stalls/closes");
+            check(ColgramDpiBypass.isL3RelayPenalized("127.0.0.1", relayPort),
+                    "failed WSS-over-relay evicts relay into 90s penalty window");
+            relayAccept.join(1500);
+        } catch (Exception e) {
+            throw new AssertionError("relay eviction / tier2 test failed", e);
+        } finally {
+            ColgramDpiBypass.setStrictL3WhitelistForTest(false);
+            ColgramProxyManager.clearPoolsForTest();
+        }
+
         System.out.println("ColgramCoreRegressionTest: PASS");
     }
 

@@ -160,7 +160,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         rows.add(new RowItem(TYPE_CHECK, CHK_NOTIF_FILTER, "Автоочистка спам-уведомлений (Android)", null, ColgramConfig.isNotificationAdFilterEnabled(), null));
         rows.add(new RowItem(TYPE_SETTING, ACT_NOTIF_PERMISSION, "Доступ к уведомлениям Android",
                 notifGranted ? "Выдан" : "Выдать (нажать)", false, null));
-        rows.add(new RowItem(TYPE_CHECK, CHK_SAVE_LEADS, "Сохранять живые лиды в Избранное", null, ColgramConfig.isSaveLeadsEnabled(), null));
+        rows.add(new RowItem(TYPE_CHECK, CHK_SAVE_LEADS, "Пересылать лиды из групп в Избранное (опц.)", null, ColgramConfig.isSaveLeadsEnabled(), null));
         rows.add(new RowItem(TYPE_SETTING, ACT_DEFAULT_MUTE_MODE, "Режим реакции на спам",
                 formatMuteMode(ColgramConfig.getDefaultMuteMode()), false, null));
         rows.add(new RowItem(TYPE_SETTING, ACT_TEST_DETECTOR, "Проверить текст в детекторе (песочница)", "Скоринг", false, null));
@@ -575,6 +575,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
             ColgramColemailerEngine.ParsedPost parsed = ColgramColemailerEngine.extractButtonsFromPost(rawPayload);
             ColgramColemailerEngine.BroadcastCampaign camp = new ColgramColemailerEngine.BroadcastCampaign(
                     name, parsed.body, spec.mode, spec.intervalSec, spec.counterThreshold, folderEt.getText().toString().trim());
+            camp.ownerAccount = currentAccount;
             camp.disablePreview = noPreviewCb.isChecked();
             camp.buttons.addAll(parsed.buttons);
             if (existing != null) {
@@ -582,7 +583,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 camp.targetChats.addAll(existing.targetChats);
             }
             ColgramColemailerEngine.getInstance().addOrUpdateCampaign(camp);
-            ColgramNativeColemailerBridge.syncFoldersIntoEngine();
+            ColgramNativeColemailerBridge.syncFoldersIntoEngine(currentAccount);
             ColgramNativeColemailerBridge.startScheduler();
             refreshList(ctx);
         });

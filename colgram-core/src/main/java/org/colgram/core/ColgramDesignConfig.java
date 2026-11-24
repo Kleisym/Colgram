@@ -68,6 +68,8 @@ public final class ColgramDesignConfig {
     private static final String KEY_KOLITI_AVATAR_PATH = "koliti_avatar_path";
     private static final String KEY_KOLITI_CUSTOM_NAME = "koliti_custom_name";
     private static final String KEY_HIDE_DIVIDERS = "hide_dividers";
+    private static final String KEY_SMART_COLOR_CONTRAST = "smart_color_contrast";
+    private static final String KEY_DOWNLOAD_SPEED_BOOST = "download_speed_boost";
 
     private static volatile SharedPreferences prefs;
 
@@ -88,6 +90,8 @@ public final class ColgramDesignConfig {
     private static volatile String kolitiAvatarPath = "";
     private static volatile String kolitiCustomName = "";
     private static volatile boolean hideDividers = false;
+    private static volatile boolean smartColorContrastEnabled = true;
+    private static volatile boolean downloadSpeedBoostEnabled = true;
     private static volatile long revision = 1L;
 
     private ColgramDesignConfig() {}
@@ -114,6 +118,8 @@ public final class ColgramDesignConfig {
         if (kolitiAvatarPath == null) kolitiAvatarPath = "";
         kolitiCustomName = safeTrim(p.getString(KEY_KOLITI_CUSTOM_NAME, ""), 24);
         hideDividers = p.getBoolean(KEY_HIDE_DIVIDERS, false);
+        smartColorContrastEnabled = p.getBoolean(KEY_SMART_COLOR_CONTRAST, true);
+        downloadSpeedBoostEnabled = p.getBoolean(KEY_DOWNLOAD_SPEED_BOOST, true);
         revision++;
     }
 
@@ -244,6 +250,28 @@ public final class ColgramDesignConfig {
         revision++;
         SharedPreferences p = prefs;
         if (p != null) p.edit().putBoolean(KEY_HIDE_DIVIDERS, hideDividers).apply();
+    }
+
+    public static boolean isSmartColorContrastEnabled() {
+        return smartColorContrastEnabled;
+    }
+
+    public static void setSmartColorContrastEnabled(boolean enabled) {
+        smartColorContrastEnabled = enabled;
+        revision++;
+        SharedPreferences p = prefs;
+        if (p != null) p.edit().putBoolean(KEY_SMART_COLOR_CONTRAST, smartColorContrastEnabled).apply();
+    }
+
+    public static boolean isDownloadSpeedBoostEnabled() {
+        return downloadSpeedBoostEnabled;
+    }
+
+    public static void setDownloadSpeedBoostEnabled(boolean enabled) {
+        downloadSpeedBoostEnabled = enabled;
+        revision++;
+        SharedPreferences p = prefs;
+        if (p != null) p.edit().putBoolean(KEY_DOWNLOAD_SPEED_BOOST, downloadSpeedBoostEnabled).apply();
     }
 
     // ---- Layout & Placement ----
@@ -517,6 +545,8 @@ public final class ColgramDesignConfig {
         kolitiAvatarPath = "";
         kolitiCustomName = "";
         hideDividers = false;
+        smartColorContrastEnabled = true;
+        downloadSpeedBoostEnabled = true;
         ColgramConfig.setQuickBarEnabled(true);
         revision++;
         SharedPreferences p = prefs;

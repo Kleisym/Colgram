@@ -59,6 +59,7 @@ public class ColgramForegroundService extends Service {
     private Runnable heartbeat;
     private boolean foregroundStarted = false;
     private static volatile boolean serviceRunning = false;
+    private static volatile ColgramForegroundService activeInstance;
     private static volatile long lastDefenderSweepAtMs = 0L;
     private static volatile long screenOffSinceMs = 0L;
 
@@ -75,6 +76,7 @@ public class ColgramForegroundService extends Service {
         super.onCreate();
         handler = new Handler(Looper.getMainLooper());
         serviceRunning = true;
+        activeInstance = this;
         ensureForeground();
         // Register persistent self-healing JobScheduler watchdog so OEM killers / Android 15 6h quota
         // can never permanently stop Colgram's 24/7 background engine.
@@ -104,9 +106,14 @@ public class ColgramForegroundService extends Service {
         // START_STICKY: if the system kills us for memory, restart with a null intent rather than
         // leaving the app dead until the user opens it again.
         serviceRunning = true;
+        activeInstance = this;
         ensureForeground();
         ensurePollers();
-        startHeartbeat();
+        if (ColgramUiBridge.isAppInForeground() || hasAnyBotTokens()) {
+            startHeartbeat();
+        } else {
+            stopHeartbeat();
+        }
         return START_STICKY;
     }
 
@@ -116,6 +123,7 @@ public class ColgramForegroundService extends Service {
         stopHeartbeat();
         foregroundStarted = false;
         serviceRunning = false;
+        if (activeInstance == this) activeInstance = null;
         try {
             if (Build.VERSION.SDK_INT >= 24) {
                 stopForeground(Service.STOP_FOREGROUND_REMOVE);
@@ -133,6 +141,7 @@ public class ColgramForegroundService extends Service {
     public void onDestroy() {
         stopHeartbeat();
         serviceRunning = false;
+        if (activeInstance == this) activeInstance = null;
         // Do NOT tear the pollers down here. onDestroy can fire on a config change or a
         // system-initiated restart, and killing the pollers would then lose updates until the
         // user next opened the app - the exact failure this service exists to prevent.
@@ -295,21 +304,44 @@ public class ColgramForegroundService extends Service {
      * cleanly in the background so anti-delete / edit history / vaults capture every chat update
      * without exceeding RAM/battery budgets.
      */
+    private boolean hasAnyBotTokens() {
+        for (int account = 0; account < 5; account++) {
+            try {
+                String token = ColgramBotSync.getBotToken(this, account);
+                if (token != null && !token.isEmpty()) {
+                    return true;
+                }
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
     private void ensurePollers() {
         try {
+            boolean anyBotToken = false;
             for (int account = 0; account < 5; account++) {
                 try {
                     String token = ColgramBotSync.getBotToken(this, account);
                     if (token == null || token.isEmpty()) {
                         continue;
                     }
+                    anyBotToken = true;
                     ColgramBotSync.startBotUpdatesPoller(this, account);
                 } catch (Throwable t) {
                     // One bad account must not stop the others.
                     Log.w(TAG, "poller ensure failed for account " + account + ": " + t.getMessage());
                 }
             }
-            ensureHumanAccountBackgroundSync();
+            if (!ColgramUiBridge.isAppInForeground()) {
+                ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
+                try {
+                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+                } catch (Throwable ignored) {}
+                return;
+            }
+            if (anyBotToken || ColgramConfig.isAlwaysBackgroundEnabled()) {
+                ensureHumanAccountBackgroundSync();
+            }
             ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
             ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
             if (active != null && active.isLocalDpi() && !ColgramDpiBypass.isBound()) {
@@ -424,14 +456,21 @@ public class ColgramForegroundService extends Service {
     }
 
     private void startHeartbeat() {
-        if (heartbeat != null) {
+        if (heartbeat != null || handler == null) {
+            return;
+        }
+        if (!ColgramUiBridge.isAppInForeground() && !hasAnyBotTokens()) {
             return;
         }
         heartbeat = new Runnable() {
             @Override
             public void run() {
+                if (!ColgramUiBridge.isAppInForeground() && !hasAnyBotTokens()) {
+                    stopHeartbeat();
+                    return;
+                }
                 ensurePollers();
-                if (handler != null) {
+                if (handler != null && heartbeat == this) {
                     long delay = HEARTBEAT_MS * Math.max(1, ColgramPowerGuard.intervalFactor(ColgramForegroundService.this));
                     handler.postDelayed(this, delay);
                 }
@@ -445,6 +484,39 @@ public class ColgramForegroundService extends Service {
             handler.removeCallbacks(heartbeat);
         }
         heartbeat = null;
+    }
+
+    /** Stops periodic CPU wake timers immediately when backgrounded without active bots. */
+    static boolean hasConfiguredBotTokens() {
+        ColgramForegroundService inst = activeInstance;
+        return inst != null && inst.hasAnyBotTokens();
+    }
+
+    public static void onAppBackgrounded() {
+        ColgramForegroundService inst = activeInstance;
+        if (inst == null || inst.handler == null) return;
+        inst.handler.post(() -> {
+            if (!ColgramUiBridge.isAppInForeground() && !inst.hasAnyBotTokens()) {
+                inst.stopHeartbeat();
+                try {
+                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+                } catch (Throwable ignored) {}
+                try {
+                    ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(inst);
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    /** Resumes lightweight foreground heartbeat only once the UI returns to the foreground. */
+    public static void onAppForegrounded() {
+        ColgramForegroundService inst = activeInstance;
+        if (inst == null || inst.handler == null) return;
+        inst.handler.post(() -> {
+            if (ColgramUiBridge.isAppInForeground()) {
+                inst.startHeartbeat();
+            }
+        });
     }
 
     // ---------------------------------------------------------------------------------------

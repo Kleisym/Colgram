@@ -177,6 +177,75 @@ public final class ColgramThemePolicy {
         return (chosen & 0x00ffffff) | (alpha << 24);
     }
 
+    /** Relative WCAG luminance [0.0..1.0] of the RGB channels of a color. */
+    public static double relativeLuminance(int color) {
+        return luminance(color);
+    }
+
+    /** Computes the average opaque color across non-zero surface stops (e.g. bubble + gradients). */
+    public static int averageSurfaceColor(int base, int g1, int g2, int g3) {
+        int r = 0, g = 0, b = 0, count = 0;
+        int[] cols = new int[]{base, g1, g2, g3};
+        for (int c : cols) {
+            if (c == 0 || (c >>> 24) < 0x20) continue;
+            r += (c >>> 16) & 255;
+            g += (c >>> 8) & 255;
+            b += c & 255;
+            count++;
+        }
+        if (count == 0) return base;
+        return 0xff000000 | ((r / count) << 16) | ((g / count) << 8) | (b / count);
+    }
+
+    /**
+     * Resolves readable secondary text/icon ink for outgoing or incoming chat bubbles.
+     * Any bubble with relative luminance < 0.55 receives crisp white/translucent-white ink
+     * so saturated purple/blue/emerald bubbles never inherit muddy dark-grey timestamps/checks.
+     */
+    public static int resolveBubbleInk(int fgArgb, int bubbleBgArgb, int onDarkInk, int onLightInk, double minContrast) {
+        int solidBg = opaque(bubbleBgArgb, WHITE);
+        if (luminance(solidBg) < 0.55) {
+            if ((fgArgb >>> 24) >= 0x20 && contrast(fgArgb, solidBg) >= Math.max(minContrast, 7.0)) {
+                return fgArgb;
+            }
+            return onDarkInk;
+        }
+        return ensureReadableOnSurface(fgArgb, solidBg, onDarkInk, onLightInk, minContrast);
+    }
+
+    /**
+     * Ensures muted unread badge fill stands apart from the dialog background AND gives white
+     * badge text >= 5.5:1 WCAG contrast on both dark and light themes.
+     */
+    public static int resolveMutedBadgeBackground(int badgeBgArgb, int windowBgArgb, boolean darkSurface) {
+        int solidWin = opaque(windowBgArgb, darkSurface ? 0xff16181e : WHITE);
+        if (darkSurface) {
+            int solid = (badgeBgArgb != 0 && (badgeBgArgb >>> 24) >= 0xd0) ? opaque(badgeBgArgb, solidWin) : 0xff3e536e;
+            if (luminance(solid) >= 0.5 || contrast(WHITE, solid) < 5.5 || contrast(solid, solidWin) < 1.85) {
+                return 0xff3e536e;
+            }
+            return solid;
+        }
+        int solid = (badgeBgArgb != 0 && (badgeBgArgb >>> 24) >= 0xd0) ? opaque(badgeBgArgb, solidWin) : 0xff52647a;
+        if (contrast(WHITE, solid) < 5.5 || contrast(solid, solidWin) < 2.2) {
+            return 0xff52647a;
+        }
+        return solid;
+    }
+
+    /**
+     * Resolves unread counter text color with >= 5.5:1 contrast against both active and muted
+     * badge backgrounds (forcing pure white whenever the muted badge or dark theme requires it).
+     */
+    public static int resolveUnreadCounterText(int currentFgArgb, int activeBadgeBg, int mutedBadgeBg, boolean darkSurface) {
+        int solidMuted = opaque(mutedBadgeBg, 0xff3e536e);
+        int solidActive = opaque(activeBadgeBg, 0xffe11d48);
+        if (darkSurface || luminance(solidMuted) < 0.5) {
+            return WHITE;
+        }
+        return ensureReadableOnSurfaces(currentFgArgb, solidActive, solidMuted, WHITE, 0xff101418, 5.5);
+    }
+
     public static int perceivedLuma(int color) {
         int r = (color >>> 16) & 255;
         int g = (color >>> 8) & 255;

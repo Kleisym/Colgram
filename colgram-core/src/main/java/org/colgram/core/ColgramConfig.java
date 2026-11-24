@@ -79,6 +79,14 @@ public class ColgramConfig {
                         .putBoolean("colgram_defaults_v3_migrated", true)
                         .apply();
             }
+            // One-time safety migration: lead auto-forwarding to Saved Messages must be strictly opt-in
+            // so messages from other chats are NEVER silently forwarded into Saved Messages by default.
+            if (!prefs.getBoolean("colgram_save_leads_optin_v1", false)) {
+                prefs.edit()
+                        .putBoolean(KEY_COLEMAILER_SAVE_LEADS, false)
+                        .putBoolean("colgram_save_leads_optin_v1", true)
+                        .apply();
+            }
         }
         // The WARP row's gate asks whether the MASQUE client exists without loading it, and needs a
         // Context to answer from the package. ColgramConfig.init is the one initialiser every entry
@@ -892,8 +900,9 @@ public class ColgramConfig {
         if (prefs != null) prefs.edit().putBoolean(KEY_COLEMAILER_NOTIF_FILTER, enabled).apply();
     }
 
+    /** Strictly opt-in (OFF by default): never forward messages from other chats into Saved Messages unless enabled. */
     public static boolean isSaveLeadsEnabled() {
-        return prefs == null || prefs.getBoolean(KEY_COLEMAILER_SAVE_LEADS, true);
+        return prefs != null && prefs.getBoolean(KEY_COLEMAILER_SAVE_LEADS, false);
     }
 
     public static void setSaveLeadsEnabled(boolean enabled) {

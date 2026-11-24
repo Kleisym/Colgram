@@ -241,6 +241,20 @@ public final class ColgramGlobalOrbController {
         }
     }
 
+    public void setHostPaused(boolean paused) {
+        if (detached) return;
+        if (paused && springAnimator != null) {
+            springAnimator.cancel();
+            springAnimator = null;
+        }
+        if (orbView != null) {
+            orbView.setHostPaused(paused);
+        }
+        if (!paused) {
+            scheduleRelayout();
+        }
+    }
+
     public void scheduleRelayout() {
         if (detached || overlayHost == null) return;
         overlayHost.removeCallbacks(deferredRelayout);

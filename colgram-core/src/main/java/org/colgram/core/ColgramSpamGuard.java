@@ -641,7 +641,7 @@ public final class ColgramSpamGuard {
         score = Math.max(0, score - Math.min(damp, cap));
 
         boolean isLead = false;
-        if (meta.isEmpty() && !catalogueOffer) {
+        if (isLeadCheckAllowed && meta.isEmpty() && !catalogueOffer) {
             boolean strongCommercial = hasSellerAsk || hasTextRouting || hasEmojiRouting || hasLinks
                     || (!foreignHandles.isEmpty() && (topicPoints > 0 || hasSaleVerb || hasDmCta));
             if (!strongCommercial && isGenuineBuyerQuestion(text, ownUsernames)) {
@@ -675,7 +675,11 @@ public final class ColgramSpamGuard {
     public static synchronized int judge(long dialogId, long senderId, String text,
                                          boolean isContact, boolean isGroup) {
         if (!ColgramConfig.isSpamGuardEnabled()) return VERDICT_OK;
-        if (senderId == 0 || isContact) return VERDICT_OK;
+        if (dialogId == 0 || senderId == 0 || isContact) return VERDICT_OK;
+        if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)
+                || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(senderId)) {
+            return VERDICT_OK;
+        }
         if (ColgramColemailerEngine.getInstance().isWhitelisted(senderId)) return VERDICT_OK;
         if (text == null) text = "";
 
@@ -689,7 +693,7 @@ public final class ColgramSpamGuard {
         }
         state.messages++;
 
-        SpamReport report = diagnose(text, "", null, !isGroup, false, false, false, true, Collections.emptyList());
+        SpamReport report = diagnose(text, "", null, !isGroup, false, false, false, false, Collections.emptyList());
         int effectiveScore = report.score + (state.messages >= 3 && report.score >= 25 ? 20 : 0);
         state.score = Math.max(state.score, effectiveScore);
 

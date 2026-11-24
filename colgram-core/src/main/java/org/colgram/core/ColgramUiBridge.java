@@ -62,13 +62,19 @@ public final class ColgramUiBridge {
                 public void onActivityResumed(Activity activity) {
                     currentActivity = new WeakReference<>(activity);
                     isForeground = true;
+                    try { ColgramProxyManager.onAppForegrounded(); } catch (Throwable ignored) {}
+                    try { ColgramForegroundService.onAppForegrounded(); } catch (Throwable ignored) {}
                 }
 
                 @Override
                 public void onActivityPaused(Activity activity) {
-                    // Do not clear here: a paused activity is still the right anchor for a
-                    // pending edit/delete, and clearing would break edits triggered from a
-                    // dialog that was just dismissed.
+                    // Preserve currentActivity for overlay-dismissed edits, but mark backgrounded and
+                    // quiesce idle proxy scrapes / periodic timers immediately.
+                    if (isCurrent(activity)) {
+                        isForeground = false;
+                        try { ColgramProxyManager.onAppBackgrounded(); } catch (Throwable ignored) {}
+                        try { ColgramForegroundService.onAppBackgrounded(); } catch (Throwable ignored) {}
+                    }
                 }
 
                 @Override

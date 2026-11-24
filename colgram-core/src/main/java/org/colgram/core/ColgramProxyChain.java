@@ -45,7 +45,7 @@ public final class ColgramProxyChain {
     private static final String TAG = "ColgramProxyChain";
 
     private static final int CONNECT_TIMEOUT_MS = 6000;
-    private static final int BUFFER_SIZE = 16 * 1024;
+    private static final int BUFFER_SIZE = 64 * 1024;
     /** Bound per-candidate route discovery so one blocked node cannot stall the full sweep. */
     private static final int MAX_RELAY_ROUTE_ATTEMPTS = 8;
     /** Hard cap: one listening socket per (target, relay) pair, and pairs are cheap to lose. */
@@ -167,6 +167,13 @@ public final class ColgramProxyChain {
                 }
                 ColgramRelayMissCache.recordSuccess(relay.key(), targetHost, targetPort);
                 upstream.setTcpNoDelay(true);
+                try {
+                    client.setReceiveBufferSize(262144);
+                    client.setSendBufferSize(262144);
+                    upstream.setReceiveBufferSize(262144);
+                    upstream.setSendBufferSize(262144);
+                    upstream.setKeepAlive(true);
+                } catch (Throwable ignored) {}
                 final Socket up = upstream;
                 Thread toUpstream = new Thread(() -> pump(client, up), "ColgramChain-up-" + port());
                 toUpstream.setDaemon(true);
@@ -791,8 +798,11 @@ public final class ColgramProxyChain {
             int read;
             while ((read = in.read(buffer)) > 0) {
                 out.write(buffer, 0, read);
-                out.flush();
+                if (in.available() <= 0) {
+                    out.flush();
+                }
             }
+            out.flush();
         } catch (Throwable ignored) {
             // A closed peer is the normal way a tunnel ends; there is nothing to report.
         } finally {

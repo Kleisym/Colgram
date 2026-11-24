@@ -1,709 +1,535 @@
 import React from 'react';
-import {
-  AbsoluteFill,
-  Img,
-  interpolate,
-  spring,
-  staticFile,
-  useCurrentFrame,
-  useVideoConfig,
-} from 'remotion';
-import { COLORS, FONT_MONO, FONT_SANS, SPRING_BOUNCY, SPRING_SNAPPY } from '../theme';
-import { SceneBackdrop } from '../components/SceneBackdrop';
-import { GlassCard } from '../components/GlassCard';
-import { PhoneMockup3D } from '../components/PhoneMockup3D';
-import {
-  CheckCircleIcon,
-  CpuIcon,
-  EyeScanIcon,
-  MicWaveIcon,
-  SparklesIcon,
-  TerminalIcon,
-} from '../components/BrandIcons';
+import { AbsoluteFill, Img, interpolate, staticFile, useCurrentFrame } from 'remotion';
+import { COLORS, EASE_APPLE, EASE_OUT_CUBIC, FONT_SANS, revealMotion } from '../theme';
+import { StudioPhone } from '../components/StudioPhone';
+import { TelegramLottie } from '../components/TelegramLottie';
 
-const FULL_AI_REPLY =
-  'Готово! Распознал 4 позиции на сумму 2 840 ₽ (EXIF очищен). Сохранил итог в Избранное и включил режим Невидимки.';
+const WAVE_BAR_HEIGHTS = [
+  10, 18, 28, 16, 32, 24, 14, 30, 36, 22, 16, 28, 34, 20, 14, 26, 18, 12,
+];
 
 export const Scene3Koliti: React.FC = () => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
 
-  const headerEnter = spring({ frame: frame - 4, fps, config: SPRING_SNAPPY });
-
-  // Chat choreography inside phone
-  const userMsgEnter = spring({ frame: frame - 36, fps, config: SPRING_SNAPPY });
-  const thinkingVisible = frame >= 76 && frame < 118;
-  const aiMsgEnter = spring({ frame: frame - 118, fps, config: SPRING_SNAPPY });
-  const charsShown = Math.floor(
-    interpolate(frame, [124, 245], [0, FULL_AI_REPLY.length], {
-      extrapolateLeft: 'clamp',
-      extrapolateRight: 'clamp',
-    }),
-  );
-  const toolsEnter = spring({ frame: frame - 246, fps, config: SPRING_BOUNCY });
-  const voiceCardEnter = spring({ frame: frame - 285, fps, config: SPRING_SNAPPY });
-
-  const speedVal = interpolate(frame, [26, 90], [0, 14.8], {
+  const duckReveal = revealMotion(frame, 10, 38, 22);
+  const titleReveal = revealMotion(frame, 20, 42, 26);
+  const subReveal = revealMotion(frame, 34, 42, 20);
+  const lineProgress = interpolate(frame, [48, 86], [0, 1], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
+    easing: EASE_OUT_CUBIC,
   });
 
-  const capabilities = [
-    {
-      title: 'Живой русский диалог',
-      desc: 'Контекстное общение, краткие сводки переписок и черновики ответов прямо в чатах без интернета.',
-      badge: 'OFFLINE CHAT',
-      color: COLORS.amber,
-      icon: <SparklesIcon size={24} color={COLORS.amberBright} />,
-      delay: 42,
-    },
-    {
-      title: 'Exif-Safe Vision',
-      desc: 'Локальный анализ фото, чеков и документов с автоматическим удалением GPS и EXIF метаданных.',
-      badge: 'ZERO LEAK VISION',
-      color: COLORS.cyan,
-      icon: <EyeScanIcon size={24} color={COLORS.cyanBright} />,
-      delay: 56,
-    },
-    {
-      title: 'Sherpa-ONNX Voice',
-      desc: 'Мгновенная расшифровка голосовых сообщений и реалистичное клонирование тембра речи на устройстве.',
-      badge: 'ASR + VOICE CLONE',
-      color: COLORS.crimson,
-      icon: <MicWaveIcon size={24} color={COLORS.crimson} />,
-      delay: 70,
-    },
-    {
-      title: 'Прямое управление приложением',
-      desc: 'Выполнение инструментов Colgram голосом и текстом: Ghost Mode, темы Aero, поиск и отправка.',
-      badge: 'AGENT TOOLS',
-      color: COLORS.emerald,
-      icon: <TerminalIcon size={24} color={COLORS.emeraldBright} />,
-      delay: 84,
-    },
-  ];
+  // Chat choreography inside the phone
+  const userMsg = revealMotion(frame, 22, 30, 18);
 
-  const waveformBars = Array.from({ length: 26 }, (_, i) => {
-    const wave =
-      0.32 +
-      0.48 * Math.abs(Math.sin(frame * 0.16 + i * 0.45)) +
-      0.2 * Math.abs(Math.cos(frame * 0.11 + i * 0.8));
-    return Math.min(1, wave);
+  // Typing indicator appears softly between user message and Koliti reply
+  const typingIn = interpolate(frame, [58, 72], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+    easing: EASE_APPLE,
+  });
+  const typingOut = interpolate(frame, [108, 122], [1, 0], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+    easing: EASE_OUT_CUBIC,
+  });
+  const typingOpacity = typingIn * typingOut;
+
+  const replyMsg = revealMotion(frame, 114, 34, 22);
+  const confirmFade = interpolate(frame, [148, 174], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+    easing: EASE_OUT_CUBIC,
   });
 
   return (
-    <AbsoluteFill style={{ fontFamily: FONT_SANS }}>
-      <SceneBackdrop
-        accentPrimary={COLORS.amber}
-        accentSecondary={COLORS.crimson}
-        accentTertiary={COLORS.cyan}
-        seed={303}
-        chapterIndex="03 / 06"
-        chapterLabel="KOLITI AI · OFFLINE CORE"
-      />
-
-      <AbsoluteFill
+    <AbsoluteFill
+      style={{
+        fontFamily: FONT_SANS,
+        padding: '0 148px',
+        display: 'flex',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 90,
+      }}
+    >
+      {/* Left Column: Editorial Text + Listening/Reacting Utya Duck */}
+      <div
         style={{
-          padding: '84px 72px 54px 72px',
+          flex: 1,
           display: 'flex',
-          flexDirection: 'row',
-          alignItems: 'center',
-          gap: 54,
+          flexDirection: 'column',
+          alignItems: 'flex-start',
+          maxWidth: 880,
         }}
       >
-        {/* LEFT COLUMN — Animated 3D Phone Running Koliti AI Live Chat */}
         <div
           style={{
-            width: 446,
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
+            gap: 24,
+            marginBottom: 28,
+            opacity: duckReveal.opacity,
+            transform: `translateY(${duckReveal.translateY}px)`,
           }}
         >
-          <PhoneMockup3D
-            width={412}
-            height={834}
-            rotateY={11}
-            rotateX={3}
-            delay={10}
-            glowColor={COLORS.amber}
-            floatAmplitude={7}
-            showNotch
+          <TelegramLottie
+            name="utyan_streaming"
+            size={188}
+            playbackRate={0.9}
+          />
+        </div>
+
+        <h2
+          style={{
+            margin: 0,
+            fontSize: 98,
+            fontWeight: 800,
+            lineHeight: 1.05,
+            letterSpacing: '-0.038em',
+            color: COLORS.textPrimary,
+            opacity: titleReveal.opacity,
+            transform: `translateY(${titleReveal.translateY}px)`,
+          }}
+        >
+          Колити ИИ
+        </h2>
+
+        <p
+          style={{
+            margin: '26px 0 0 0',
+            fontSize: 33,
+            fontWeight: 400,
+            lineHeight: 1.42,
+            letterSpacing: '-0.012em',
+            color: COLORS.textSecondary,
+            maxWidth: 740,
+            opacity: subReveal.opacity,
+            transform: `translateY(${subReveal.translateY}px)`,
+          }}
+        >
+          Умный помощник в чатах —
+          <br />
+          работает даже офлайн
+        </p>
+
+        <div
+          style={{
+            marginTop: 40,
+            width: 72 * lineProgress,
+            height: 3.5,
+            borderRadius: 999,
+            background: `linear-gradient(90deg, ${COLORS.colaRed}, ${COLORS.caramelAmber})`,
+            opacity: lineProgress,
+          }}
+        />
+      </div>
+
+      {/* Right Column: Minimalist Clean Telegram Chat Mockup */}
+      <div
+        style={{
+          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          paddingRight: 16,
+        }}
+      >
+        <StudioPhone
+          width={436}
+          height={804}
+          delay={6}
+          enterDistanceY={42}
+          showDynamicIsland
+          ambientGlow="rgba(245, 158, 11, 0.17)"
+        >
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              background:
+                'linear-gradient(180deg, #171315 0%, #120F11 58%, #0E0B0C 100%)',
+            }}
           >
-            {/* Authentic Dark Colgram Koliti Sheet UI */}
+            {/* Clean Telegram Top Bar */}
             <div
               style={{
-                width: '100%',
-                height: '100%',
-                background: 'linear-gradient(180deg, #10141D 0%, #0A0D13 100%)',
+                padding: '48px 22px 16px 22px',
                 display: 'flex',
-                flexDirection: 'column',
-                padding: '44px 18px 20px 18px',
-                boxSizing: 'border-box',
+                alignItems: 'center',
                 gap: 14,
+                borderBottom: '1px solid rgba(255, 248, 244, 0.08)',
+                backgroundColor: 'rgba(24, 18, 18, 0.72)',
               }}
             >
-              {/* Chat Header */}
-              <div
+              <Img
+                src={staticFile('koliti-avatar.png')}
                 style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  paddingBottom: 12,
-                  borderBottom: '1px solid rgba(255,255,255,0.09)',
+                  width: 46,
+                  height: 46,
+                  borderRadius: '50%',
+                  objectFit: 'cover',
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.45)',
                 }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 11 }}>
-                  <div
-                    style={{
-                      width: 44,
-                      height: 44,
-                      borderRadius: 999,
-                      border: `2px solid ${COLORS.amberBright}`,
-                      overflow: 'hidden',
-                      boxShadow: '0 0 18px rgba(245, 158, 11, 0.45)',
-                    }}
-                  >
-                    <Img
-                      src={staticFile('koliti-avatar.png')}
-                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                    />
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    <span style={{ fontSize: 18, fontWeight: 800, color: COLORS.textPrimary }}>
-                      Koliti AI
-                    </span>
-                    <span
-                      style={{
-                        fontFamily: FONT_MONO,
-                        fontSize: 11,
-                        color: COLORS.amberBright,
-                        fontWeight: 600,
-                      }}
-                    >
-                      Qwen3.5-2B · Текст, фото, голос
-                    </span>
-                  </div>
-                </div>
-                <div
+              />
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <span
                   style={{
-                    padding: '4px 10px',
-                    borderRadius: 999,
-                    backgroundColor: 'rgba(16, 185, 129, 0.16)',
-                    border: '1px solid rgba(52, 211, 153, 0.4)',
-                    fontFamily: FONT_MONO,
-                    fontSize: 10.5,
-                    fontWeight: 700,
-                    color: COLORS.emeraldBright,
+                    fontSize: 19,
+                    fontWeight: 600,
+                    color: COLORS.textPrimary,
+                    letterSpacing: '-0.01em',
                   }}
                 >
-                  OFFLINE
-                </div>
+                  Колити
+                </span>
+                <span
+                  style={{
+                    fontSize: 13.5,
+                    fontWeight: 400,
+                    color: 'rgba(245, 158, 11, 0.85)',
+                    marginTop: 1,
+                  }}
+                >
+                  умный ассистент · офлайн
+                </span>
               </div>
+            </div>
 
-              {/* Welcome Pill */}
+            {/* Chat Canvas */}
+            <div
+              style={{
+                flex: 1,
+                padding: '26px 20px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 18,
+                position: 'relative',
+              }}
+            >
+              {/* Quiet Date Separator */}
               <div
                 style={{
-                  padding: '10px 13px',
-                  borderRadius: 14,
-                  backgroundColor: 'rgba(255,255,255,0.045)',
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  fontSize: 13.5,
-                  lineHeight: 1.38,
-                  color: COLORS.textSecondary,
+                  alignSelf: 'center',
+                  padding: '5px 14px',
+                  borderRadius: 999,
+                  backgroundColor: 'rgba(255, 248, 244, 0.06)',
+                  fontSize: 12.5,
+                  fontWeight: 500,
+                  color: COLORS.textMuted,
+                  marginBottom: 4,
                 }}
               >
-                Хей, привет! Я Koliti — твой локальный ИИ-помощник прямо в Colgram.
+                Сегодня
               </div>
 
-              {/* User Prompt Bubble with Photo Vision Attachment */}
+              {/* Incoming User Message (Voice + Request) */}
               <div
                 style={{
                   alignSelf: 'flex-end',
-                  maxWidth: '88%',
-                  opacity: interpolate(userMsgEnter, [0, 1], [0, 1], {
-                    extrapolateLeft: 'clamp',
-                    extrapolateRight: 'clamp',
-                  }),
-                  transform: `translateY(${interpolate(userMsgEnter, [0, 1], [18, 0], {
-                    extrapolateLeft: 'clamp',
-                    extrapolateRight: 'clamp',
-                  })}px)`,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 8,
-                  padding: '11px 14px',
-                  borderRadius: '18px 18px 6px 18px',
-                  background: 'linear-gradient(135deg, #E11D48 0%, #BE123C 100%)',
-                  boxShadow: '0 10px 24px rgba(225, 29, 72, 0.34)',
+                  maxWidth: '86%',
+                  padding: '15px 18px 12px 18px',
+                  borderRadius: '22px 22px 6px 22px',
+                  background: 'linear-gradient(145deg, #B92B37 0%, #8C1D27 100%)',
+                  boxShadow: '0 10px 24px rgba(0, 0, 0, 0.34)',
+                  opacity: userMsg.opacity,
+                  transform: `translateY(${userMsg.translateY}px)`,
                 }}
               >
-                {/* Mini Photo Card */}
+                {/* Mini voice strip inside user request */}
                 <div
                   style={{
                     display: 'flex',
                     alignItems: 'center',
-                    gap: 9,
-                    padding: '7px 10px',
-                    borderRadius: 11,
-                    backgroundColor: 'rgba(0, 0, 0, 0.28)',
-                  }}
-                >
-                  <EyeScanIcon size={18} color="#FDE68A" />
-                  <div style={{ display: 'flex', flexDirection: 'column' }}>
-                    <span style={{ fontFamily: FONT_MONO, fontSize: 11.5, fontWeight: 700, color: '#FFF' }}>
-                      check_2840.jpg
-                    </span>
-                    <span style={{ fontSize: 10.5, color: 'rgba(255,255,255,0.78)' }}>
-                      Exif-Safe Vision · GPS удалён
-                    </span>
-                  </div>
-                </div>
-                <span style={{ fontSize: 14, lineHeight: 1.36, color: '#FFFFFF', fontWeight: 500 }}>
-                  Разбери чек с фото, сохрани в Избранное и включи Невидимку
-                </span>
-              </div>
-
-              {/* Thinking Wave Indicator */}
-              {thinkingVisible && (
-                <div
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    padding: '9px 14px',
-                    borderRadius: 14,
-                    backgroundColor: 'rgba(245, 158, 11, 0.12)',
-                    border: '1px solid rgba(251, 191, 36, 0.34)',
-                    width: 'fit-content',
-                  }}
-                >
-                  {[0, 1, 2].map((dot) => {
-                    const dotScale = 0.7 + 0.45 * Math.abs(Math.sin(frame * 0.22 + dot * 1.1));
-                    return (
-                      <span
-                        key={dot}
-                        style={{
-                          width: 7,
-                          height: 7,
-                          borderRadius: 999,
-                          backgroundColor: COLORS.amberBright,
-                          transform: `scale(${dotScale})`,
-                        }}
-                      />
-                    );
-                  })}
-                  <span style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: COLORS.amberBright }}>
-                    KleidiAI · DotProd inference...
-                  </span>
-                </div>
-              )}
-
-              {/* Koliti AI Typewriter Reply Bubble */}
-              {frame >= 118 && (
-                <div
-                  style={{
-                    alignSelf: 'flex-start',
-                    width: '94%',
-                    opacity: interpolate(aiMsgEnter, [0, 1], [0, 1], {
-                      extrapolateLeft: 'clamp',
-                      extrapolateRight: 'clamp',
-                    }),
-                    transform: `translateY(${interpolate(aiMsgEnter, [0, 1], [16, 0], {
-                      extrapolateLeft: 'clamp',
-                      extrapolateRight: 'clamp',
-                    })}px)`,
-                    padding: '13px 14px',
-                    borderRadius: '18px 18px 18px 6px',
-                    backgroundColor: '#161C28',
-                    border: '1px solid rgba(251, 191, 36, 0.28)',
-                    display: 'flex',
-                    flexDirection: 'column',
                     gap: 10,
+                    marginBottom: 10,
+                    paddingBottom: 10,
+                    borderBottom: '1px solid rgba(255,255,255,0.16)',
                   }}
                 >
-                  <div style={{ fontSize: 14, lineHeight: 1.42, color: COLORS.textPrimary }}>
-                    {FULL_AI_REPLY.slice(0, charsShown)}
-                    {charsShown < FULL_AI_REPLY.length && (
-                      <span
-                        style={{
-                          display: 'inline-block',
-                          width: 7,
-                          height: 14,
-                          marginLeft: 2,
-                          backgroundColor: COLORS.amberBright,
-                          verticalAlign: 'middle',
-                        }}
-                      />
-                    )}
-                  </div>
-
-                  {/* Executed Tool Badges */}
-                  {frame >= 246 && (
-                    <div
-                      style={{
-                        display: 'flex',
-                        flexWrap: 'wrap',
-                        gap: 6,
-                        opacity: interpolate(toolsEnter, [0, 1], [0, 1], {
-                          extrapolateLeft: 'clamp',
-                          extrapolateRight: 'clamp',
-                        }),
-                        transform: `scale(${interpolate(toolsEnter, [0, 1], [0.9, 1], {
-                          extrapolateLeft: 'clamp',
-                          extrapolateRight: 'clamp',
-                        })})`,
-                      }}
-                    >
-                      {[
-                        { label: 'Vision OCR', color: COLORS.cyanBright },
-                        { label: 'Ghost Mode: ВКЛ', color: COLORS.emeraldBright },
-                        { label: 'Заметка сохранена', color: COLORS.amberBright },
-                      ].map((t) => (
-                        <span
-                          key={t.label}
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: 5,
-                            padding: '4px 9px',
-                            borderRadius: 999,
-                            backgroundColor: `${t.color}1C`,
-                            border: `1px solid ${t.color}55`,
-                            fontFamily: FONT_MONO,
-                            fontSize: 10.5,
-                            fontWeight: 700,
-                            color: t.color,
-                          }}
-                        >
-                          <CheckCircleIcon size={12} color={t.color} />
-                          {t.label}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-
-                  <span style={{ fontFamily: FONT_MONO, fontSize: 10, color: COLORS.textMuted, whiteSpace: 'nowrap' }}>
-                    Koliti Core · Q4_K_XL · 14.8 tok/s · 0 KB
-                  </span>
-                </div>
-              )}
-
-              {/* Live Sherpa-ONNX Voice Cloning & Transcription Bar */}
-              {frame >= 285 && (
-                <div
-                  style={{
-                    padding: '12px 14px',
-                    borderRadius: 16,
-                    background:
-                      'linear-gradient(135deg, rgba(244, 63, 94, 0.16) 0%, rgba(245, 158, 11, 0.14) 100%)',
-                    border: '1px solid rgba(244, 63, 94, 0.42)',
-                    opacity: interpolate(voiceCardEnter, [0, 1], [0, 1], {
-                      extrapolateLeft: 'clamp',
-                      extrapolateRight: 'clamp',
-                    }),
-                    transform: `translateY(${interpolate(voiceCardEnter, [0, 1], [16, 0], {
-                      extrapolateLeft: 'clamp',
-                      extrapolateRight: 'clamp',
-                    })}px)`,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 8,
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-                      <MicWaveIcon size={16} color={COLORS.crimson} />
-                      <span style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.textPrimary, whiteSpace: 'nowrap' }}>
-                        Sherpa-ONNX · Voice Clone
-                      </span>
-                    </div>
-                    <span style={{ fontFamily: FONT_MONO, fontSize: 11, color: COLORS.amberBright, whiteSpace: 'nowrap', flexShrink: 0 }}>
-                      RU · LIVE
-                    </span>
-                  </div>
                   <div
                     style={{
+                      width: 30,
+                      height: 30,
+                      borderRadius: '50%',
+                      backgroundColor: 'rgba(255,255,255,0.2)',
                       display: 'flex',
                       alignItems: 'center',
-                      justifyContent: 'space-between',
-                      height: 30,
-                      gap: 3,
+                      justifyContent: 'center',
+                      flexShrink: 0,
                     }}
                   >
-                    {waveformBars.map((h, idx) => (
+                    <svg width="11" height="12" viewBox="0 0 11 12" fill="none">
+                      <path d="M2 1.5L9.5 6L2 10.5V1.5Z" fill="#FAF7F5" />
+                    </svg>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 3, flex: 1 }}>
+                    {[8, 15, 11, 20, 14, 18, 10, 16, 12, 19, 13, 9].map((h, i) => (
                       <div
-                        key={idx}
+                        key={i}
                         style={{
-                          flex: 1,
-                          height: `${Math.round(h * 100)}%`,
-                          borderRadius: 99,
-                          background:
-                            idx % 2 === 0
-                              ? `linear-gradient(180deg, ${COLORS.amberBright}, ${COLORS.crimson})`
-                              : `linear-gradient(180deg, ${COLORS.cyanBright}, ${COLORS.emerald})`,
+                          width: 3,
+                          height: h,
+                          borderRadius: 999,
+                          backgroundColor: 'rgba(255,255,255,0.82)',
                         }}
                       />
                     ))}
                   </div>
+                  <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.78)' }}>
+                    02:14
+                  </span>
+                </div>
+
+                <div
+                  style={{
+                    fontSize: 16.5,
+                    lineHeight: 1.42,
+                    color: '#FAF7F5',
+                    fontWeight: 400,
+                  }}
+                >
+                  Перескажи коротко и включи тёплую тему
+                </div>
+                <div
+                  style={{
+                    marginTop: 6,
+                    fontSize: 11.5,
+                    color: 'rgba(255,255,255,0.68)',
+                    textAlign: 'right',
+                  }}
+                >
+                  18:34 ✓✓
+                </div>
+              </div>
+
+              {/* Sleek Typing Indicator Dots (transitions smoothly out as reply arrives) */}
+              {typingOpacity > 0.01 && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: 20,
+                    top: 238,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    padding: '14px 18px',
+                    borderRadius: '20px 20px 20px 6px',
+                    backgroundColor: 'rgba(255, 248, 244, 0.075)',
+                    border: '1px solid rgba(255, 248, 244, 0.1)',
+                    opacity: typingOpacity,
+                  }}
+                >
+                  {[0, 1, 2].map((dot) => {
+                    const lift = Math.sin(frame * 0.22 - dot * 0.9) * 3.5;
+                    const dotOp = 0.45 + (Math.sin(frame * 0.22 - dot * 0.9) + 1) * 0.27;
+                    return (
+                      <div
+                        key={dot}
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: '50%',
+                          backgroundColor: COLORS.champagne,
+                          opacity: dotOp,
+                          transform: `translateY(${lift}px)`,
+                        }}
+                      />
+                    );
+                  })}
                 </div>
               )}
 
-              {/* Bottom Input Bar */}
+              {/* Koliti AI Clean Russian Reply with Smooth Audio Wave Indicator */}
               <div
                 style={{
-                  marginTop: 'auto',
-                  padding: '10px 14px',
-                  borderRadius: 999,
-                  backgroundColor: 'rgba(255,255,255,0.06)',
-                  border: '1px solid rgba(255,255,255,0.12)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
+                  alignSelf: 'flex-start',
+                  maxWidth: '90%',
+                  padding: '16px 18px 14px 18px',
+                  borderRadius: '22px 22px 22px 6px',
+                  backgroundColor: 'rgba(255, 248, 244, 0.07)',
+                  border: '1px solid rgba(255, 248, 244, 0.11)',
+                  boxShadow: '0 14px 32px rgba(0, 0, 0, 0.34)',
+                  opacity: replyMsg.opacity,
+                  transform: `translateY(${replyMsg.translateY}px)`,
                 }}
               >
-                <span style={{ fontSize: 13.5, color: COLORS.textMuted }}>
-                  Спросите Koliti о чём угодно...
-                </span>
+                {/* Live Audio Wave Indicator */}
                 <div
                   style={{
-                    width: 30,
-                    height: 30,
-                    borderRadius: 999,
-                    background: 'linear-gradient(135deg, #F43F5E, #E11D48)',
                     display: 'flex',
                     alignItems: 'center',
-                    justifyContent: 'center',
+                    gap: 12,
+                    marginBottom: 14,
+                    padding: '10px 12px',
+                    borderRadius: 14,
+                    backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                    border: '1px solid rgba(245, 158, 11, 0.16)',
                   }}
                 >
-                  <SparklesIcon size={15} color="#FFFFFF" />
-                </div>
-              </div>
-            </div>
-          </PhoneMockup3D>
-        </div>
-
-        {/* RIGHT COLUMN — Silicon Engine Core & 2x2 Capability Grid */}
-        <div
-          style={{
-            flex: 1,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 22,
-          }}
-        >
-          {/* Title Block */}
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 8,
-              opacity: interpolate(headerEnter, [0, 1], [0, 1], {
-                extrapolateLeft: 'clamp',
-                extrapolateRight: 'clamp',
-              }),
-              transform: `translateY(${interpolate(headerEnter, [0, 1], [24, 0], {
-                extrapolateLeft: 'clamp',
-                extrapolateRight: 'clamp',
-              })}px)`,
-            }}
-          >
-            <h2
-              style={{
-                margin: 0,
-                fontSize: 54,
-                fontWeight: 900,
-                letterSpacing: '-0.03em',
-                lineHeight: 1.05,
-                color: COLORS.textPrimary,
-              }}
-            >
-              Koliti AI — умный{' '}
-              <span
-                style={{
-                  background: `linear-gradient(90deg, ${COLORS.amberBright}, ${COLORS.crimson})`,
-                  WebkitBackgroundClip: 'text',
-                  WebkitTextFillColor: 'transparent',
-                }}
-              >
-                офлайн-ассистент
-              </span>
-            </h2>
-            <span style={{ fontSize: 22, color: COLORS.textSecondary, fontWeight: 500 }}>
-              Встроен прямо в чаты Colgram · Полностью автономный интеллект без облаков и подписок
-            </span>
-          </div>
-
-          {/* Native Core Silicon Spec Banner */}
-          <GlassCard
-            delay={18}
-            accent={COLORS.amber}
-            glow
-            style={{
-              padding: '22px 26px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 16,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                <div
-                  style={{
-                    width: 54,
-                    height: 54,
-                    borderRadius: 16,
-                    background: 'linear-gradient(135deg, rgba(245,158,11,0.24), rgba(244,63,94,0.22))',
-                    border: '1px solid rgba(251, 191, 36, 0.5)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    flexShrink: 0,
-                  }}
-                >
-                  <CpuIcon size={28} color={COLORS.amberBright} />
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  <span
-                    style={{
-                      fontFamily: FONT_MONO,
-                      fontSize: 13,
-                      fontWeight: 700,
-                      letterSpacing: '0.1em',
-                      color: COLORS.amberBright,
-                    }}
-                  >
-                    UPGRADED IMATRIX NEURAL CORE
-                  </span>
-                  <span
-                    style={{
-                      fontFamily: FONT_MONO,
-                      fontSize: 28,
-                      fontWeight: 800,
-                      color: COLORS.textPrimary,
-                      letterSpacing: '-0.02em',
-                    }}
-                  >
-                    Qwen3.5-2B-UD-Q4_K_XL
-                  </span>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  padding: '10px 18px',
-                  borderRadius: 14,
-                  backgroundColor: 'rgba(16, 185, 129, 0.14)',
-                  border: '1px solid rgba(52, 211, 153, 0.45)',
-                  textAlign: 'right',
-                }}
-              >
-                <div
-                  style={{
-                    fontFamily: FONT_MONO,
-                    fontSize: 22,
-                    fontWeight: 800,
-                    color: COLORS.emeraldBright,
-                  }}
-                >
-                  {speedVal.toFixed(1)} tok/s
-                </div>
-                <div style={{ fontFamily: FONT_MONO, fontSize: 11.5, color: COLORS.textSecondary }}>
-                  0 БАЙТ В ОБЛАКО
-                </div>
-              </div>
-            </div>
-
-            {/* Hardware ISA Acceleration Pills */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-              {[
-                { label: 'ARMv8.2 DotProd', color: COLORS.cyanBright },
-                { label: 'Native FP16', color: COLORS.amberBright },
-                { label: 'ARM KleidiAI Kernels', color: COLORS.emeraldBright },
-                { label: 'imatrix Quantization', color: COLORS.crimson },
-              ].map((isa) => (
-                <span
-                  key={isa.label}
-                  style={{
-                    padding: '7px 14px',
-                    borderRadius: 10,
-                    backgroundColor: `${isa.color}18`,
-                    border: `1px solid ${isa.color}50`,
-                    fontFamily: FONT_MONO,
-                    fontSize: 14,
-                    fontWeight: 700,
-                    color: isa.color,
-                  }}
-                >
-                  {isa.label}
-                </span>
-              ))}
-            </div>
-          </GlassCard>
-
-          {/* 2x2 Capability Grid */}
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: '1fr 1fr',
-              gap: 18,
-            }}
-          >
-            {capabilities.map((cap) => (
-              <GlassCard
-                key={cap.title}
-                delay={cap.delay}
-                accent={cap.color}
-                style={{
-                  padding: '22px 24px',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 11,
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div
                     style={{
-                      width: 46,
-                      height: 46,
-                      borderRadius: 14,
-                      backgroundColor: `${cap.color}1F`,
-                      border: `1px solid ${cap.color}55`,
                       display: 'flex',
                       alignItems: 'center',
-                      justifyContent: 'center',
+                      gap: 3.5,
+                      height: 36,
                     }}
                   >
-                    {cap.icon}
+                    {WAVE_BAR_HEIGHTS.map((baseH, idx) => {
+                      const wave =
+                        0.45 +
+                        0.55 *
+                          Math.abs(Math.sin(frame * 0.13 + idx * 0.52));
+                      const h = Math.max(6, Math.round(baseH * wave));
+                      return (
+                        <div
+                          key={idx}
+                          style={{
+                            width: 3.5,
+                            height: h,
+                            borderRadius: 999,
+                            background: `linear-gradient(180deg, ${COLORS.caramelAmber}, ${COLORS.colaRed})`,
+                          }}
+                        />
+                      );
+                    })}
                   </div>
                   <span
                     style={{
-                      fontFamily: FONT_MONO,
-                      fontSize: 11.5,
-                      fontWeight: 700,
-                      letterSpacing: '0.08em',
-                      color: cap.color,
-                      padding: '4px 10px',
-                      borderRadius: 999,
-                      backgroundColor: `${cap.color}16`,
-                      border: `1px solid ${cap.color}40`,
+                      marginLeft: 'auto',
+                      fontSize: 12.5,
+                      fontWeight: 500,
+                      color: COLORS.champagne,
+                      whiteSpace: 'nowrap',
                     }}
                   >
-                    {cap.badge}
+                    Кратко
                   </span>
                 </div>
-                <div style={{ fontSize: 22, fontWeight: 800, color: COLORS.textPrimary }}>
-                  {cap.title}
+
+                {/* Summary text */}
+                <div
+                  style={{
+                    fontSize: 16.5,
+                    lineHeight: 1.46,
+                    color: COLORS.textPrimary,
+                    fontWeight: 400,
+                  }}
+                >
+                  Встречу перенесли на <strong style={{ fontWeight: 600 }}>19:00</strong>,
+                  макеты уже согласованы — можно выходить в релиз.
                 </div>
-                <div style={{ fontSize: 16, lineHeight: 1.4, color: COLORS.textSecondary }}>
-                  {cap.desc}
+
+                {/* Clean subtle action confirmation */}
+                <div
+                  style={{
+                    marginTop: 12,
+                    paddingTop: 10,
+                    borderTop: '1px solid rgba(255, 248, 244, 0.08)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    opacity: confirmFade,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span
+                      style={{
+                        color: COLORS.mintConnected,
+                        fontSize: 14,
+                        fontWeight: 700,
+                      }}
+                    >
+                      ✓
+                    </span>
+                    <span
+                      style={{
+                        fontSize: 14,
+                        fontWeight: 500,
+                        color: 'rgba(250, 247, 245, 0.82)',
+                      }}
+                    >
+                      Тёплая тема включена
+                    </span>
+                  </div>
+                  <span style={{ fontSize: 11.5, color: COLORS.textMuted }}>
+                    18:34
+                  </span>
                 </div>
-              </GlassCard>
-            ))}
+              </div>
+            </div>
+
+            {/* Minimal Bottom Chat Input Bar */}
+            <div
+              style={{
+                padding: '14px 18px 26px 18px',
+                borderTop: '1px solid rgba(255, 248, 244, 0.06)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                backgroundColor: 'rgba(18, 14, 15, 0.86)',
+              }}
+            >
+              <div
+                style={{
+                  flex: 1,
+                  height: 42,
+                  borderRadius: 999,
+                  backgroundColor: 'rgba(255, 248, 244, 0.055)',
+                  border: '1px solid rgba(255, 248, 244, 0.08)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  paddingLeft: 18,
+                  fontSize: 15,
+                  color: COLORS.textMuted,
+                }}
+              >
+                Сообщение...
+              </div>
+              <div
+                style={{
+                  width: 42,
+                  height: 42,
+                  borderRadius: '50%',
+                  background: `linear-gradient(145deg, ${COLORS.colaRed}, #A91E2A)`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                  <rect
+                    x="9"
+                    y="3"
+                    width="6"
+                    height="11"
+                    rx="3"
+                    stroke="#FAF7F5"
+                    strokeWidth="2"
+                  />
+                  <path
+                    d="M5 11C5 14.866 8.134 18 12 18C15.866 18 19 14.866 19 11"
+                    stroke="#FAF7F5"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                  />
+                  <path
+                    d="M12 18V21"
+                    stroke="#FAF7F5"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </div>
+            </div>
           </div>
-        </div>
-      </AbsoluteFill>
+        </StudioPhone>
+      </div>
     </AbsoluteFill>
   );
 };

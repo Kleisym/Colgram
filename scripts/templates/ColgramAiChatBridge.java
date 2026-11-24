@@ -511,7 +511,9 @@ public final class ColgramAiChatBridge {
             int limitDialogs = Math.min(dialogs.size(), 45);
             for (int i = 0; i < limitDialogs && result.size() < maxSnippets; i++) {
                 TLRPC.Dialog d = dialogs.get(i);
-                if (d == null || d.id == excludeDialogId) continue;
+                if (d == null || d.id == excludeDialogId
+                        || org.telegram.messenger.DialogObject.isEncryptedDialog(d.id)
+                        || org.telegram.messenger.DialogObject.isFolderDialogId(d.id)) continue;
                 String title = resolveDialogTitle(mc, d.id);
                 ArrayList<MessageObject> msgs = mc.dialogMessage != null ? mc.dialogMessage.get(d.id) : null;
                 if (msgs != null) {
@@ -552,7 +554,10 @@ public final class ColgramAiChatBridge {
         if (dialogs != null) {
             for (int i = 0; i < dialogs.size() && count < cap; i++) {
                 TLRPC.Dialog d = dialogs.get(i);
-                if (d == null || !seen.add(d.id)) continue;
+                if (d == null
+                        || org.telegram.messenger.DialogObject.isEncryptedDialog(d.id)
+                        || org.telegram.messenger.DialogObject.isFolderDialogId(d.id)
+                        || !seen.add(d.id)) continue;
                 String title = resolveDialogTitle(mc, d.id);
                 if (TextUtils.isEmpty(title)) continue;
                 String uname = "";
@@ -720,10 +725,11 @@ public final class ColgramAiChatBridge {
                 }
                 String target = payload.substring(0, sep).trim();
                 String rawText = payload.substring(sep + 1).trim();
-                long targetDid = resolveTargetDialogId(account, target);
+                long targetDid = resolveTargetDialogId(account, target, true);
                 if (targetDid == 0L) {
                     return new ColgramAiEngine.ToolResult(false, false, false, "SEND_TO_CHAT", "",
-                            "Чат «" + target + "» не найден. Доступные чаты: " + listShortDialogNames(account, 12));
+                            "Чат «" + target + "» не найден однозначно или защищён от отправки. Уточните имя или @username. Доступные чаты: "
+                                    + listShortDialogNames(account, 12));
                 }
                 String cleanText = ColgramAiAgentTools.cleanMessagePayload(
                         ColgramAiContextEngine.extractCleanDraftText(rawText));
@@ -949,10 +955,10 @@ public final class ColgramAiChatBridge {
 
     private static boolean openChatAndSend(BaseFragment presenter, Activity activity, int account, String targetQuery, String rawText) {
         if (TextUtils.isEmpty(targetQuery) || TextUtils.isEmpty(rawText)) return false;
-        long targetDid = resolveTargetDialogId(account, targetQuery);
+        long targetDid = resolveTargetDialogId(account, targetQuery, true);
         if (targetDid == 0) {
             if (activity != null) {
-                Toast.makeText(activity, "Чат «" + targetQuery + "» не найден", Toast.LENGTH_SHORT).show();
+                Toast.makeText(activity, "Чат «" + targetQuery + "» не найден однозначно", Toast.LENGTH_SHORT).show();
             }
             return false;
         }
@@ -1021,9 +1027,33 @@ public final class ColgramAiChatBridge {
         return true;
     }
 
+    private static boolean isSendableDialog(MessagesController mc, long dialogId) {
+        if (dialogId == 0L
+                || org.telegram.messenger.DialogObject.isEncryptedDialog(dialogId)
+                || org.telegram.messenger.DialogObject.isFolderDialogId(dialogId)
+                || org.colgram.core.ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)) {
+            return false;
+        }
+        if (dialogId < 0L && mc != null) {
+            TLRPC.Chat chat = mc.getChat(-dialogId);
+            if (chat != null && org.telegram.messenger.ChatObject.isChannelAndNotMegaGroup(chat)
+                    && !org.telegram.messenger.ChatObject.canPost(chat)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static long resolveTargetDialogId(int account, String query) {
+        return resolveTargetDialogId(account, query, false);
+    }
+
+    private static long resolveTargetDialogId(int account, String query, boolean strictForSend) {
         if (TextUtils.isEmpty(query)) return 0L;
-        String clean = query.startsWith("@") ? query.substring(1).trim() : query.trim();
+        String trimmed = query.trim();
+        boolean explicitAt = trimmed.startsWith("@");
+        String clean = explicitAt ? trimmed.substring(1).trim() : trimmed;
+        if (clean.isEmpty()) return 0L;
         String lower = clean.toLowerCase(java.util.Locale.ROOT);
         if (lower.contains("избран") || lower.contains("избра")
                 || lower.contains("сохранен") || lower.contains("сохранён")
@@ -1036,13 +1066,20 @@ public final class ColgramAiChatBridge {
 
         long bestDid = 0L;
         double bestScore = 0.0;
+        double secondBestScore = 0.0;
+        long secondBestDid = 0L;
+        java.util.HashSet<Long> scored = new java.util.HashSet<>();
 
         // 1. Score all active/recent dialogs (private, bots, groups, channels) with exact + translit + fuzzy matcher
         ArrayList<TLRPC.Dialog> dialogs = mc.getAllDialogs();
         if (dialogs != null) {
             for (int i = 0; i < dialogs.size(); i++) {
                 TLRPC.Dialog d = dialogs.get(i);
-                if (d == null) continue;
+                if (d == null || d.id == 0L) continue;
+                if (org.telegram.messenger.DialogObject.isEncryptedDialog(d.id)
+                        || org.telegram.messenger.DialogObject.isFolderDialogId(d.id)) continue;
+                if (strictForSend && !isSendableDialog(mc, d.id)) continue;
+                if (!scored.add(d.id)) continue;
                 String title = resolveDialogTitle(mc, d.id);
                 String uname = "";
                 if (d.id > 0) {
@@ -1054,9 +1091,15 @@ public final class ColgramAiChatBridge {
                 }
                 double s = ColgramAiAgentTools.scoreTargetMatch(clean, title, uname);
                 if (s > bestScore) {
+                    if (bestDid != 0L && bestDid != d.id) {
+                        secondBestScore = bestScore;
+                        secondBestDid = bestDid;
+                    }
                     bestScore = s;
                     bestDid = d.id;
-                    if (bestScore >= 0.99) return bestDid;
+                } else if (d.id != bestDid && s > secondBestScore) {
+                    secondBestScore = s;
+                    secondBestDid = d.id;
                 }
             }
         }
@@ -1069,39 +1112,67 @@ public final class ColgramAiChatBridge {
                     TLRPC.TL_contact c = contacts.get(i);
                     if (c == null) continue;
                     TLRPC.User u = mc.getUser(c.user_id);
-                    if (u == null) continue;
+                    if (u == null || !scored.add(u.id)) continue;
+                    if (strictForSend && !isSendableDialog(mc, u.id)) continue;
                     String title = UserObject.getUserName(u);
                     String uname = u.username != null ? u.username : "";
                     double s = ColgramAiAgentTools.scoreTargetMatch(clean, title, uname);
                     if (s > bestScore) {
+                        if (bestDid != 0L && bestDid != u.id) {
+                            secondBestScore = bestScore;
+                            secondBestDid = bestDid;
+                        }
                         bestScore = s;
                         bestDid = u.id;
-                        if (bestScore >= 0.99) return bestDid;
+                    } else if (u.id != bestDid && s > secondBestScore) {
+                        secondBestScore = s;
+                        secondBestDid = u.id;
                     }
                 }
             }
         } catch (Throwable ignored) {}
 
-        // 3. Fallback scan of cached users in memory (useful on bot accounts with synced contacts)
-        if (bestScore < 0.85) {
+        // 3. Fallback scan of cached users in memory:
+        //    - For irreversible SEND_TO_CHAT (`strictForSend`), ONLY allow exact @username match so
+        //      we NEVER accidentally message an unrelated cached group member!
+        if (bestScore < (strictForSend ? 0.99 : 0.85)) {
             try {
                 java.util.concurrent.ConcurrentHashMap<Long, TLRPC.User> users = mc.getUsers();
                 if (users != null) {
                     for (TLRPC.User u : users.values()) {
-                        if (u == null || u.self) continue;
-                        String title = UserObject.getUserName(u);
+                        if (u == null || u.self || !scored.add(u.id)) continue;
+                        if (strictForSend && !isSendableDialog(mc, u.id)) continue;
                         String uname = u.username != null ? u.username : "";
+                        if (strictForSend) {
+                            if (explicitAt && !uname.isEmpty() && uname.equalsIgnoreCase(clean)) {
+                                return u.id;
+                            }
+                            continue;
+                        }
+                        String title = UserObject.getUserName(u);
                         double s = ColgramAiAgentTools.scoreTargetMatch(clean, title, uname);
                         if (s > bestScore) {
+                            if (bestDid != 0L && bestDid != u.id) {
+                                secondBestScore = bestScore;
+                                secondBestDid = bestDid;
+                            }
                             bestScore = s;
                             bestDid = u.id;
-                            if (bestScore >= 0.99) return bestDid;
+                        } else if (u.id != bestDid && s > secondBestScore) {
+                            secondBestScore = s;
+                            secondBestDid = u.id;
                         }
                     }
                 }
             } catch (Throwable ignored) {}
         }
 
+        if (strictForSend) {
+            if (bestDid == 0L || bestScore < 0.88) return 0L;
+            // Refuse ambiguous ties between two different chats so messages never go to the wrong recipient.
+            if (secondBestDid != 0L && (bestScore - secondBestScore) < 0.06) return 0L;
+            return bestDid;
+        }
         return bestScore >= 0.72 ? bestDid : 0L;
     }
 

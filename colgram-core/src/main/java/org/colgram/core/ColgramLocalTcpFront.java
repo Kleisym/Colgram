@@ -55,6 +55,13 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
             if (closed) return;
             client.setTcpNoDelay(true);
             target.setTcpNoDelay(true);
+            try {
+                client.setReceiveBufferSize(262144);
+                client.setSendBufferSize(262144);
+                target.setReceiveBufferSize(262144);
+                target.setSendBufferSize(262144);
+                target.setKeepAlive(true);
+            } catch (Throwable ignored) {}
             target.connect(new InetSocketAddress(host, targetPort), 3500);
             if (closed) return;
             java.util.concurrent.CountDownLatch downstream = new java.util.concurrent.CountDownLatch(1);
@@ -76,22 +83,22 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
     }
 
     private static void copy(InputStream in, OutputStream out, boolean shape) throws IOException {
-        byte[] buffer = new byte[16 * 1024];
+        byte[] buffer = new byte[64 * 1024];
         int count, shaped = 0;
         while ((count = in.read(buffer)) != -1) {
-            // Shape SOCKS5 CONNECT requests (10-byte IPv4 / 22-byte IPv6 / domain) into 2-byte
-            // TCP segments (with TCP_NODELAY) so carrier TSPU DPI (e.g. MegaFon/Yota LTE) cannot
-            // match 05 01 00 01 <149.154.*|91.108.*> in a single segment!
+            // Shape SOCKS5 CONNECT requests (10-byte IPv4 / 22-byte IPv6 / domain) into
+            // TSPU-evading TCP segments: first 6 bytes keep the 4-byte SOCKS5 header intact
+            // for microsocks/3proxy/danted while splitting the target IP/hostname across packets.
             boolean socksConnect = count >= 8 && count <= 262
                     && buffer[0] == 5 && buffer[1] == 1 && buffer[2] == 0
                     && (buffer[3] == 1 || buffer[3] == 3 || buffer[3] == 4);
             if (shape && socksConnect && shaped < 4) {
                 for (int off = 0; off < count; ) {
-                    int step = Math.min(off < 12 ? 2 : 4, count - off);
+                    int step = Math.min(off == 0 ? 6 : 6, count - off);
                     out.write(buffer, off, step);
                     out.flush();
                     off += step;
-                    if (off < count) sleepQuiet(16);
+                    if (off < count) sleepQuiet(10);
                 }
                 shaped++;
                 continue;
@@ -119,8 +126,11 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
                 sleepQuiet(2);
                 out.write(buffer, cut, count - cut); shaped++;
             } else out.write(buffer, 0, count);
-            out.flush();
+            if (in.available() <= 0) {
+                out.flush();
+            }
         }
+        out.flush();
     }
 
     private static void sleepQuiet(long ms) throws IOException {

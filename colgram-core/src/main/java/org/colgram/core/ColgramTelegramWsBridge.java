@@ -180,7 +180,9 @@ public final class ColgramTelegramWsBridge {
     private static final long FAILURE_COOLDOWN_MS = 1800L;
     private static final long BURST_FAILURE_WINDOW_MS = 800L;
     private static final long DEPRIORITIZE_TTL_MS = 45_000L;
-    private static final int MAX_OUTBOUND_FRAME_BYTES = 32768;
+    private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
+    private static final int WS_IDLE_PING_TIMEOUT_MS = 25_000;
+    private static final int WS_PONG_WAIT_TIMEOUT_MS = 10_000;
 
     private static final ExecutorService RACE_POOL = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "colgram-ws-dial");
@@ -325,6 +327,10 @@ public final class ColgramTelegramWsBridge {
                     remaining -= chunk;
                 }
             }
+        }
+
+        public void sendPing() throws IOException {
+            writeFrame(0x89, new byte[0], 0, 0);
         }
 
         public void sendPong(byte[] payload, int len) throws IOException {
@@ -852,6 +858,8 @@ public final class ColgramTelegramWsBridge {
             if (!upgradeWebSocket(in, out, realHost)) {
                 throw new IOException("WebSocket upgrade rejected by " + ip + " (" + realHost + ")");
             }
+            tuneConnectedSocket(tcp.socket);
+            tuneConnectedSocket(ssl);
             ssl.setSoTimeout(0);
             int bucket = dcBucket(dcId);
             lastWorkingByDc.set(bucket, tcp.endpoint);
@@ -921,6 +929,8 @@ public final class ColgramTelegramWsBridge {
             if (!upgradeWebSocket(in, out, host)) {
                 throw new IOException("WebSocket upgrade rejected over relay " + label + " (" + host + ")");
             }
+            tuneConnectedSocket(relayTcpSocket);
+            tuneConnectedSocket(ssl);
             ssl.setSoTimeout(0);
             try {
                 Log.i(TAG, "WSS-over-L3-relay upgraded ok: relay=" + label + " host=" + host
@@ -1113,14 +1123,45 @@ public final class ColgramTelegramWsBridge {
         return Obfuscated2FrameSplitter.initAndPatch(data, length, dcId) != null;
     }
 
+    private static void tuneConnectedSocket(Socket s) {
+        if (s == null) return;
+        try { s.setTcpNoDelay(true); } catch (Throwable ignored) {}
+        try { s.setKeepAlive(true); } catch (Throwable ignored) {}
+        try { s.setReceiveBufferSize(262144); } catch (Throwable ignored) {}
+        try { s.setSendBufferSize(262144); } catch (Throwable ignored) {}
+    }
+
     public static long pumpUpstreamFrames(WsSession session, OutputStream clientOut,
                                           OnBytes onReply) throws IOException {
         long total = 0L;
-        byte[] buf = new byte[16384];
+        byte[] buf = new byte[65536];
         InputStream in = session.in;
+        boolean awaitingPong = false;
+        if (session.socket != null) {
+            try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
+        }
         while (true) {
-            int b0 = in.read();
+            int b0;
+            try {
+                b0 = in.read();
+            } catch (java.net.SocketTimeoutException idle) {
+                if (awaitingPong) {
+                    throw new IOException("WS keepalive pong timeout on " + session.edgeIp, idle);
+                }
+                awaitingPong = true;
+                session.sendPing();
+                if (session.socket != null) {
+                    try { session.socket.setSoTimeout(WS_PONG_WAIT_TIMEOUT_MS); } catch (Throwable ignored) {}
+                }
+                continue;
+            }
             if (b0 < 0) break;
+            if (awaitingPong) {
+                awaitingPong = false;
+                if (session.socket != null) {
+                    try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
+                }
+            }
             int b1 = in.read();
             if (b1 < 0) break;
             int opcode = b0 & 0x0f;
@@ -1182,8 +1223,11 @@ public final class ColgramTelegramWsBridge {
                 left -= n;
                 if (onReply != null) onReply.onBytes(n);
             }
-            clientOut.flush();
+            if (in.available() <= 0) {
+                clientOut.flush();
+            }
         }
+        clientOut.flush();
         return total;
     }
 

@@ -78,18 +78,21 @@ public class ColgramHookHandler {
      * @return true if the message was handled as a plugin command and should NOT be sent.
      */
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text) {
-        if (invokeBridgeChatCommand(dialogId, replyToMsgId, text, 0L)) {
-            return true;
-        }
-        return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text);
+        return hookOnSendMessage(resolveSelectedAccount(), dialogId, replyToMsgId, text, 0L);
     }
 
     /** Same hook with the replied-to message's author, so reply-targeted commands work. */
     public static boolean hookOnSendMessage(long dialogId, int replyToMsgId, String text, long replySenderId) {
-        if (invokeBridgeChatCommand(dialogId, replyToMsgId, text, replySenderId)) {
+        return hookOnSendMessage(resolveSelectedAccount(), dialogId, replyToMsgId, text, replySenderId);
+    }
+
+    /** Account-scoped outgoing hook so commands never cross accounts when selectedAccount changes. */
+    public static boolean hookOnSendMessage(int account, long dialogId, int replyToMsgId, String text, long replySenderId) {
+        int resolvedAcc = account >= 0 && account < 5 ? account : resolveSelectedAccount();
+        if (invokeBridgeChatCommand(resolvedAcc, dialogId, replyToMsgId, text, replySenderId)) {
             return true;
         }
-        return ColgramPluginManager.hookOnSendMessage(dialogId, replyToMsgId, text, replySenderId);
+        return ColgramPluginManager.hookOnSendMessage(resolvedAcc, dialogId, replyToMsgId, text, replySenderId);
     }
 
     /** Routes fresh incoming MTProto messages into native Colemailer counters, mute rules, leads, and Auto-Sub. */
@@ -109,7 +112,7 @@ public class ColgramHookHandler {
         } catch (Throwable ignored) {}
     }
 
-    private static boolean invokeBridgeChatCommand(long dialogId, int replyToMsgId, String text, long replySenderId) {
+    private static boolean invokeBridgeChatCommand(int account, long dialogId, int replyToMsgId, String text, long replySenderId) {
         if (text == null) return false;
         String trimmed = text.trim();
         String lower = trimmed.toLowerCase(java.util.Locale.ROOT);
@@ -131,9 +134,15 @@ public class ColgramHookHandler {
         if (!trimmed.startsWith(".")) return false;
         try {
             Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
-            Object res = bridge.getMethod("handleChatCommand", long.class, int.class, String.class, long.class)
-                    .invoke(null, dialogId, replyToMsgId, text, replySenderId);
-            return Boolean.TRUE.equals(res);
+            try {
+                Object res = bridge.getMethod("handleChatCommand", int.class, long.class, int.class, String.class, long.class)
+                        .invoke(null, account, dialogId, replyToMsgId, text, replySenderId);
+                return Boolean.TRUE.equals(res);
+            } catch (NoSuchMethodException fallbackOld) {
+                Object res = bridge.getMethod("handleChatCommand", long.class, int.class, String.class, long.class)
+                        .invoke(null, dialogId, replyToMsgId, text, replySenderId);
+                return Boolean.TRUE.equals(res);
+            }
         } catch (Throwable ignored) {
             return false;
         }
@@ -149,6 +158,14 @@ public class ColgramHookHandler {
 
     public static int colgramSpamVerdict(int account, long dialogId, long senderId, String text, boolean isGroup) {
         try {
+            // Never score 1-on-1 private chats, Saved Messages, self, or system dialogs.
+            if (!isGroup || dialogId >= 0L || senderId == 0L) {
+                return ColgramSpamGuard.VERDICT_OK;
+            }
+            long selfId = resolveSelfUserId(account);
+            if (selfId > 0L && (dialogId == selfId || senderId == selfId)) {
+                return ColgramSpamGuard.VERDICT_OK;
+            }
             if (ColgramColemailerEngine.getInstance().isWhitelisted(senderId)) {
                 return ColgramSpamGuard.VERDICT_OK;
             }
@@ -169,16 +186,30 @@ public class ColgramHookHandler {
     private static int resolveSelectedAccount() {
         try {
             Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            return ucClass.getField("selectedAccount").getInt(null);
+            int acc = ucClass.getField("selectedAccount").getInt(null);
+            return acc >= 0 && acc < 5 ? acc : 0;
         } catch (Throwable ignored) {
             return 0;
         }
     }
 
+    private static long resolveSelfUserId(int account) {
+        if (account < 0 || account >= 5) return 0L;
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
+            if (uc != null) {
+                Object id = ucClass.getMethod("getClientUserId").invoke(uc);
+                if (id instanceof Long) return ((Long) id).longValue();
+            }
+        } catch (Throwable ignored) {}
+        return 0L;
+    }
+
     /**
      * HOOK: Called from MessagesController / MessagesStorage when a new message is received or created.
      *
-     * Deduplicated on (dialog, message id) because more than one transport can report the same
+     * Deduplicated on (account, dialog, message id) because more than one transport can report the same
      * arrival: the bot synchroniser dispatches a batch it injected itself, and Telegram's own
      * update path stores the same dialog through MessagesStorage. Without this a plugin - and an
      * auto-reply is a plugin that answers - would fire twice for one message.
@@ -192,12 +223,22 @@ public class ColgramHookHandler {
     }
 
     public static void hookOnMessageReceived(int account, long dialogId, int messageId, String text, long senderId, boolean isOut) {
-        int resolvedAcc = account >= 0 ? account : resolveSelectedAccount();
-        colgramMessageLog(dialogId, messageId, text, isOut);
-        if (!isOut && !colgramRememberDispatch(dialogId, messageId)) return;
-        ColgramPluginManager.hookOnMessageReceived(dialogId, messageId, text, isOut);
-        if (!isOut) colgramAutoReply(resolvedAcc, dialogId);
-        colgramKeywordAlerts(resolvedAcc, dialogId, text, isOut);
+        if (dialogId == 0L || ColgramAutoReplyPolicy.isEncryptedOrFolderDialog(dialogId)) return;
+        int resolvedAcc = account >= 0 && account < 5 ? account : resolveSelectedAccount();
+        colgramMessageLog(resolvedAcc, dialogId, messageId, text, isOut);
+        if (isOut) return;
+        if (!colgramRememberDispatch(resolvedAcc, dialogId, messageId)) return;
+        // Strict Saved Messages / self-sender / system dialog isolation: never dispatch inbound
+        // plugins, auto-reply, or keyword alerts on Saved Messages, own messages, or Telegram system chats.
+        long selfUserId = resolveSelfUserId(resolvedAcc);
+        if (selfUserId <= 0L || dialogId == selfUserId
+                || (senderId != 0L && senderId == selfUserId)
+                || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)) {
+            return;
+        }
+        ColgramPluginManager.hookOnMessageReceived(resolvedAcc, dialogId, messageId, text, false);
+        colgramAutoReply(resolvedAcc, dialogId, senderId);
+        colgramKeywordAlerts(resolvedAcc, dialogId, text, false);
     }
 
     /** Per-(account, dialog) timestamp of the last automatic answer. */
@@ -284,8 +325,9 @@ public class ColgramHookHandler {
      * is append-only JSONL so it stays readable while the app is running and never needs a
      * schema migration.
      */
-    private static void colgramMessageLog(long dialogId, int messageId, String text, boolean isOut) {
+    private static void colgramMessageLog(int account, long dialogId, int messageId, String text, boolean isOut) {
         if (!ColgramConfig.isMessageLoggerEnabled() || appContext == null) return;
+        final int acct = account;
         final long dialog = dialogId;
         final int mid = messageId;
         final String safeText = jsonEscapeLog(text);
@@ -298,6 +340,7 @@ public class ColgramHookHandler {
                     java.io.File file = new java.io.File(dir, "messages_log.jsonl");
                     try (java.io.FileWriter w = new java.io.FileWriter(file, true)) {
                         w.write("{\"ts\":" + System.currentTimeMillis() / 1000L
+                                + ",\"account\":" + acct
                                 + ",\"dialog\":" + dialog
                                 + ",\"id\":" + mid
                                 + ",\"out\":" + out
@@ -315,7 +358,7 @@ public class ColgramHookHandler {
      * would, and the dedupe above guarantees one answer per arrival. The cooldown is what keeps
      * this from becoming a spam cannon in a busy chat: five minutes per dialog by default.
      */
-    private static void colgramAutoReply(int accountArg, long dialogId) {
+    private static void colgramAutoReply(int accountArg, long dialogId, long senderId) {
         if (!ColgramConfig.isAutoReplyEnabled()) return;
         long now = System.currentTimeMillis();
         long selfUserId = 0L;
@@ -324,13 +367,12 @@ public class ColgramHookHandler {
         boolean isContact = false;
         String peerName = "";
         String peerUsername = "";
-        int account = accountArg >= 0 ? accountArg : resolveSelectedAccount();
+        int account = accountArg >= 0 && accountArg < 5 ? accountArg : resolveSelectedAccount();
 
         try {
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
-            if (uc != null) {
-                selfUserId = (Long) ucClass.getMethod("getClientUserId").invoke(uc);
+            selfUserId = resolveSelfUserId(account);
+            if (selfUserId <= 0L || dialogId == selfUserId || (senderId != 0L && senderId == selfUserId)) {
+                return;
             }
             Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
             Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
@@ -422,14 +464,7 @@ public class ColgramHookHandler {
         }
         final int targetAccount = account;
         final String finalText = ColgramAutoReplyPolicy.renderTemplate(rawTemplate, peerName, peerUsername, hour, minute);
-        hookIoExecutor.execute(() -> {
-            try {
-                ColgramPythonEngine.class.getMethod("sendMessage", int.class, long.class, String.class)
-                        .invoke(null, targetAccount, dialogId, finalText);
-            } catch (Throwable fallback) {
-                ColgramPythonEngine.sendMessage(dialogId, finalText);
-            }
-        });
+        hookIoExecutor.execute(() -> ColgramPythonEngine.sendMessage(targetAccount, dialogId, finalText));
     }
 
     /** Bounded LRU of recently dispatched inbound messages; false means "already handled". */
@@ -443,8 +478,8 @@ public class ColgramHookHandler {
 
     private static final long COLGRAM_DISPATCH_DEDUPE_MS = 5 * 60 * 1000L;
 
-    private static boolean colgramRememberDispatch(long dialogId, int messageId) {
-        String key = dialogId + ":" + messageId;
+    private static boolean colgramRememberDispatch(int account, long dialogId, int messageId) {
+        String key = account + ":" + dialogId + ":" + messageId;
         long now = System.currentTimeMillis();
         synchronized (colgramDispatchedInbound) {
             Long seen = colgramDispatchedInbound.get(key);
@@ -473,6 +508,9 @@ public class ColgramHookHandler {
      * @return true if deletion should be BLOCKED (message preserved locally).
      */
     public static boolean hookShouldPreventDelete(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId == 0) {
+            return false;
+        }
         if (isForcePurged(dialogId, messageId)) {
             unmarkMessageDeleted(dialogId, messageId);
             return false;

@@ -87,6 +87,7 @@ public final class ColgramAiOrbView extends View {
     private boolean longPressed = false;
     private float baseTranslationY = 0f;
     private boolean windowVisible = true;
+    private boolean hostPaused = false;
 
     private final Runnable longPressTrigger = () -> {
         if (!dragging && onLongClickAction != null) {
@@ -189,7 +190,7 @@ public final class ColgramAiOrbView extends View {
 
     private void syncAnimatorState() {
         boolean powerSave = org.colgram.core.ColgramPowerGuard.isPowerSaveMode(getContext());
-        boolean shouldRun = isAttachedToWindow() && windowVisible && getVisibility() == VISIBLE && !powerSave;
+        boolean shouldRun = !hostPaused && isAttachedToWindow() && windowVisible && getVisibility() == VISIBLE && !powerSave;
         if (shouldRun && orbAnimator == null) {
             orbAnimator = ValueAnimator.ofFloat(0f, 1f);
             orbAnimator.setDuration(durationForState(state));
@@ -214,6 +215,12 @@ public final class ColgramAiOrbView extends View {
             orbAnimator.cancel();
             orbAnimator = null;
         }
+    }
+
+    public void setHostPaused(boolean paused) {
+        if (this.hostPaused == paused) return;
+        this.hostPaused = paused;
+        syncAnimatorState();
     }
 
     @Override

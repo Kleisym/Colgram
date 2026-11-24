@@ -68,6 +68,22 @@ public final class ColgramThemePolicyTest {
         ColgramThemePolicy.HintPalette original = ColgramThemePolicy.forStoryHint(
                 0xffffffff, 0xff272f38, 0xff85caff);
         require(original.background == 0xff272f38 && original.link == 0xff85caff, "honors usable hint colors");
+
+        // Outgoing saturated purple/blue bubbles (L < 0.55): muddy dark grey-blue timestamps/checks become crisp white
+        int purpleBubble = ColgramThemePolicy.averageSurfaceColor(0xff6b52c9, 0xff5a66d8, 0, 0);
+        require(ColgramThemePolicy.relativeLuminance(purpleBubble) < 0.55, "purple/blue bubble luminance < 0.55");
+        require(ColgramThemePolicy.resolveBubbleInk(0xff354656, purpleBubble, 0xffffffff, 0xff283644, 4.5) == 0xffffffff,
+                "outgoing checkmarks forced pure white on saturated bubble");
+        require(ColgramThemePolicy.resolveBubbleInk(0xff354656, purpleBubble, 0xe6ffffff, 0xff283644, 4.5) == 0xe6ffffff,
+                "outgoing time text forced crisp 0xE6FFFFFF on saturated bubble");
+
+        // Muted unread counter badges on dark themes must not render dark-on-dark
+        int resolvedMutedBg = ColgramThemePolicy.resolveMutedBadgeBackground(0xff1b2430, 0xff16181e, true);
+        int resolvedBadgeFg = ColgramThemePolicy.resolveUnreadCounterText(0xff354656, 0xffe11d48, resolvedMutedBg, true);
+        contrast(resolvedMutedBg, 0xff16181e, 1.85, "muted unread badge separated from dark window");
+        contrast(resolvedBadgeFg, resolvedMutedBg, 5.5, "unread count text crisp against muted badge");
+        require(resolvedBadgeFg == 0xffffffff, "dark muted badge forces white counter text");
+
         System.out.println("ColgramThemePolicyTest: " + checks + " checks PASS");
     }
 }

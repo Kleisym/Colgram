@@ -132,6 +132,8 @@ def send_message(text, dialog_id=None):
         raise UnsupportedFeature(
             "send_message needs the Colgram bridge; call set_context() first")
     dlg = dialog_id if dialog_id is not None else _context.get("dialog_id", 0)
+    if not dlg:
+        raise ValueError("send_message requires a non-zero dialog_id")
     return fn(dlg, str(text))
 
 
@@ -141,6 +143,8 @@ def edit_message(msg_id, text, dialog_id=None):
         raise UnsupportedFeature(
             "edit_message is not available in this Colgram build")
     dlg = dialog_id if dialog_id is not None else _context.get("dialog_id", 0)
+    if not dlg:
+        raise ValueError("edit_message requires a non-zero dialog_id")
     return fn(dlg, int(msg_id), str(text))
 
 
@@ -150,6 +154,8 @@ def delete_message(msg_id, dialog_id=None):
         raise UnsupportedFeature(
             "delete_message is not available in this Colgram build")
     dlg = dialog_id if dialog_id is not None else _context.get("dialog_id", 0)
+    if not dlg:
+        raise ValueError("delete_message requires a non-zero dialog_id")
     return fn(dlg, int(msg_id))
 
 
