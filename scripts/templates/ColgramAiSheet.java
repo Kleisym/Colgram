@@ -148,6 +148,7 @@ public final class ColgramAiSheet {
     private ValueAnimator dotPulseAnimator;
     private ValueAnimator thinkingPulseAnimator;
     private boolean busyGenerating = false;
+    private long activeRequestSeq = 0L;
     private boolean allowHandleSwipeDismiss = false;
     private boolean attachActiveChatContext;
     private final List<String> attachedPaths = new ArrayList<>();
@@ -621,6 +622,7 @@ public final class ColgramAiSheet {
         sendButton.setContentDescription("Отправить");
         sendButton.setOnClickListener(v -> {
             if (busyGenerating || ColgramAiEngine.getInstance().isBusy()) {
+                statusLine.setText("Останавливаю…");
                 ColgramAiEngine.getInstance().cancelCurrent();
                 setBusyUi(false);
                 setOrbState(ColgramAiOrbView.State.IDLE);
@@ -1026,24 +1028,73 @@ public final class ColgramAiSheet {
 
         setBusyUi(true);
         setOrbState(ColgramAiOrbView.State.THINKING);
+        final long myReqSeq = ++activeRequestSeq;
 
         final int account = chatActivity != null ? chatActivity.getCurrentAccount() : UserConfig.selectedAccount;
         long dialogId = chatActivity != null ? chatActivity.getDialogId() : 0L;
         boolean linkThisChat = chatActivity != null && attachActiveChatContext;
-        String title = linkThisChat ? ColgramAiChatBridge.resolveContextTitle(parentFragment, chatActivity) : "";
-        String activeMeta = linkThisChat ? ColgramAiChatBridge.collectActiveChatMetadata(chatActivity) : "";
-        List<ColgramAiContextEngine.ChatSnippet> activeSnippets = linkThisChat
-                ? ColgramAiChatBridge.collectActiveChatSnippets(chatActivity, 90)
+
+        // Lightweight pre-plan (<0.05ms in-memory) so normal chat prompts do ZERO UI-thread SQLite queries,
+        // ZERO 45-dialog scans, and ZERO disk stat calls before launching inference!
+        ColgramAiContextEngine.IntentPlan prePlan = ColgramAiContextEngine.planAutonomousIntent(
+                query,
+                ColgramAiContextEngine.AssistantMode.AUTO,
+                !mediaCopy.isEmpty(),
+                linkThisChat,
+                false
+        );
+        boolean needActiveChat = linkThisChat && (prePlan.shouldUseActiveChatContext
+                || prePlan.shouldDraftIntoInput
+                || prePlan.resolvedMode == ColgramAiContextEngine.AssistantMode.VISION);
+        boolean needCrossChat = prePlan.shouldIncludeCrossChat && ColgramAiConfig.isCrossChatRagEnabled(act);
+        boolean needDialogDir = ColgramAiAgentTools.queryNeedsDialogDirectory(query, "")
+                || queryContainsPronounRef(query);
+
+        String title = needActiveChat ? ColgramAiChatBridge.resolveContextTitle(parentFragment, chatActivity) : "";
+        String activeMeta = needActiveChat ? ColgramAiChatBridge.collectActiveChatMetadata(chatActivity) : "";
+        List<ColgramAiContextEngine.ChatSnippet> activeSnippets = needActiveChat
+                ? ColgramAiChatBridge.collectActiveChatSnippets(chatActivity, 60, false)
                 : new ArrayList<>();
-        List<ColgramAiContextEngine.ChatSnippet> crossSnippets = ColgramAiChatBridge.collectCrossChatSnippets(account, dialogId, 60);
-        List<String> recentMedia = linkThisChat ? ColgramAiChatBridge.collectRecentChatMediaPaths(chatActivity, 2) : new ArrayList<>();
-        String dialogDirectory = ColgramAiChatBridge.collectDialogDirectorySummary(account, dialogId, 22);
+        List<ColgramAiContextEngine.ChatSnippet> crossSnippets = needCrossChat
+                ? ColgramAiChatBridge.collectCrossChatSnippets(account, dialogId, 45)
+                : new ArrayList<>();
+        List<String> recentMedia = (linkThisChat && prePlan.shouldAutoGrabMedia)
+                ? ColgramAiChatBridge.collectRecentChatMediaPaths(chatActivity, 2)
+                : new ArrayList<>();
+        String dialogDirectory = needDialogDir
+                ? ColgramAiChatBridge.collectDialogDirectorySummary(account, dialogId, 22)
+                : "";
 
         final ColgramAiContextEngine.IntentPlan[] resolvedPlanHolder = new ColgramAiContextEngine.IntentPlan[1];
         final ColgramAiAgentTools.InstalledPluginResult[] installedPluginHolder = new ColgramAiAgentTools.InstalledPluginResult[1];
         final boolean[] directActionFired = {false};
         final boolean[] songChosenByLlm = {false};
         final String[] deliveredChatTarget = {""};
+        final String[] pendingStreamText = {null};
+        final boolean[] streamUiFlushScheduled = {false};
+        final boolean[] firstTokenRendered = {false};
+        final Runnable streamUiFlushRunnable = () -> {
+            streamUiFlushScheduled[0] = false;
+            if (cleanedUp.get() || !sheet.isShowing() || activeRequestSeq != myReqSeq) return;
+            String snap = pendingStreamText[0];
+            if (snap == null) return;
+            pendingStreamText[0] = null;
+            stopThinkingPulse();
+            if (typingWaveRef[0] != null && typingWaveRef[0].getVisibility() != View.GONE) {
+                typingWaveRef[0].setVisibility(View.GONE);
+            }
+            if (answerViewRef[0].getVisibility() != View.VISIBLE) {
+                answerViewRef[0].setVisibility(View.VISIBLE);
+                answerViewRef[0].setAlpha(1f);
+            }
+            // During active streaming, avoid expensive full-document regex re-spans unless markdown/math exists
+            if (hasMarkdownOrMathMarkers(snap)) {
+                answerViewRef[0].setText(formatMarkdownSpans(snap));
+            } else {
+                answerViewRef[0].setText(snap);
+            }
+            scrollToBottomIfNearBottom();
+        };
 
         ColgramAiEngine.ToolExecutor toolExecutor = normalizedAction -> {
             final ColgramAiEngine.ToolResult[] resHolder = new ColgramAiEngine.ToolResult[1];
@@ -1086,6 +1137,7 @@ public final class ColgramAiSheet {
         ColgramAiEngine.getInstance().runRequest(act, req, new ColgramAiEngine.ResponseListener() {
             @Override
             public void onPlanResolved(ColgramAiContextEngine.IntentPlan plan) {
+                if (cleanedUp.get() || activeRequestSeq != myReqSeq) return;
                 resolvedPlanHolder[0] = plan;
                 if (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.VISION) {
                     setOrbState(ColgramAiOrbView.State.VISION);
@@ -1098,7 +1150,7 @@ public final class ColgramAiSheet {
 
             @Override
             public void onToolResult(ColgramAiEngine.ToolResult result) {
-                if (result == null || cleanedUp.get() || !sheet.isShowing()) return;
+                if (result == null || cleanedUp.get() || !sheet.isShowing() || activeRequestSeq != myReqSeq) return;
                 if (result.ok) {
                     if ("SING_SONG".equals(result.toolName)) {
                         songChosenByLlm[0] = true;
@@ -1120,7 +1172,7 @@ public final class ColgramAiSheet {
 
             @Override
             public void onDirectUiAction(String uiAction) {
-                if (cleanedUp.get() || !sheet.isShowing()) return;
+                if (cleanedUp.get() || !sheet.isShowing() || activeRequestSeq != myReqSeq) return;
                 if ("SING_SONG".equals(uiAction)) {
                     songChosenByLlm[0] = true;
                     return;
@@ -1144,18 +1196,19 @@ public final class ColgramAiSheet {
 
             @Override
             public void onPluginInstalled(ColgramAiAgentTools.InstalledPluginResult plugin) {
+                if (activeRequestSeq != myReqSeq) return;
                 installedPluginHolder[0] = plugin;
             }
 
             @Override
             public void onStage(String stageLabel) {
-                if (cleanedUp.get() || !sheet.isShowing()) return;
+                if (cleanedUp.get() || !sheet.isShowing() || activeRequestSeq != myReqSeq) return;
                 statusLine.setText(stageLabel);
             }
 
             @Override
             public void onWebHits(List<ColgramAiWebSearch.SearchHit> hits) {
-                if (cleanedUp.get() || !sheet.isShowing()) return;
+                if (cleanedUp.get() || !sheet.isShowing() || activeRequestSeq != myReqSeq) return;
                 if (hits != null && !hits.isEmpty()) {
                     statusLine.setText("Анализирую " + hits.size() + " источников…");
                 }
@@ -1163,7 +1216,7 @@ public final class ColgramAiSheet {
 
             @Override
             public void onTokenDelta(String accumulatedVisibleText, boolean isThinking) {
-                if (cleanedUp.get() || !sheet.isShowing()) return;
+                if (cleanedUp.get() || !sheet.isShowing() || activeRequestSeq != myReqSeq) return;
                 if (isThinking && !ColgramAiConfig.isThinkingEnabled(act)) {
                     statusLine.setText("Думаю…");
                     return;
@@ -1172,16 +1225,23 @@ public final class ColgramAiSheet {
                     ttsWarmedForTurn[0] = true;
                     ColgramKolitiVoice.warmUpNeuralTtsAsync(act, detectedUserLang, R.raw.koliti_user_voice_ref);
                 }
-                stopThinkingPulse();
-                if (typingWaveRef[0] != null) typingWaveRef[0].setVisibility(View.GONE);
-                answerViewRef[0].setVisibility(View.VISIBLE);
-                answerViewRef[0].setAlpha(1f);
-                answerViewRef[0].setText(formatMarkdownSpans(accumulatedVisibleText));
-                scrollToBottomSmooth();
+                pendingStreamText[0] = accumulatedVisibleText;
+                if (!firstTokenRendered[0]) {
+                    firstTokenRendered[0] = true;
+                    messagesContainer.removeCallbacks(streamUiFlushRunnable);
+                    streamUiFlushRunnable.run();
+                } else if (!streamUiFlushScheduled[0]) {
+                    streamUiFlushScheduled[0] = true;
+                    messagesContainer.postDelayed(streamUiFlushRunnable, 55L);
+                }
             }
 
             @Override
             public void onFinished(String finalText, String footerInfo, boolean usedLocalModel) {
+                if (activeRequestSeq != myReqSeq) return;
+                messagesContainer.removeCallbacks(streamUiFlushRunnable);
+                streamUiFlushScheduled[0] = false;
+                pendingStreamText[0] = null;
                 stopThinkingPulse();
                 if (typingWaveRef[0] != null) typingWaveRef[0].setVisibility(View.GONE);
                 answerViewRef[0].setVisibility(View.VISIBLE);
@@ -1275,16 +1335,40 @@ public final class ColgramAiSheet {
 
             @Override
             public void onError(String message) {
+                if (activeRequestSeq != myReqSeq) return;
+                messagesContainer.removeCallbacks(streamUiFlushRunnable);
+                streamUiFlushScheduled[0] = false;
+                pendingStreamText[0] = null;
                 stopThinkingPulse();
                 if (typingWaveRef[0] != null) typingWaveRef[0].setVisibility(View.GONE);
                 answerViewRef[0].setVisibility(View.VISIBLE);
                 answerViewRef[0].setAlpha(1f);
                 setBusyUi(false);
                 setOrbState(ColgramAiOrbView.State.IDLE);
+                if (cleanedUp.get() || !sheet.isShowing()) return;
                 statusLine.setText(message);
                 answerViewRef[0].setText(message);
             }
         });
+    }
+
+    private static boolean hasMarkdownOrMathMarkers(String s) {
+        if (s == null || s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '*' || c == '`' || c == '$' || c == '#' || c == '~' || c == '\\') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean queryContainsPronounRef(String q) {
+        if (q == null || q.isEmpty()) return false;
+        String l = q.toLowerCase(Locale.ROOT);
+        return l.contains("ему") || l.contains("ей") || l.contains("него")
+                || l.contains("неё") || l.contains("нее") || l.contains("туда")
+                || l.contains("ещё раз") || l.contains("еще раз");
     }
 
     private boolean canWriteToActiveChat() {
@@ -1676,8 +1760,7 @@ public final class ColgramAiSheet {
             rmBg.setStroke(dp(1), 0x80FFFFFF);
             removeBtn.setBackground(rmBg);
             removeBtn.setOnClickListener(v -> {
-                if (idx >= 0 && idx < attachedPaths.size()) {
-                    attachedPaths.remove(idx);
+                if (attachedPaths.remove(path)) {
                     refreshAttachmentStrip();
                 }
             });
@@ -1723,7 +1806,11 @@ public final class ColgramAiSheet {
                 retriever.setDataSource(path);
                 Bitmap frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
                 if (frame != null) {
-                    return Bitmap.createScaledBitmap(frame, Math.max(1, reqW), Math.max(1, reqH), true);
+                    Bitmap scaled = Bitmap.createScaledBitmap(frame, Math.max(1, reqW), Math.max(1, reqH), true);
+                    if (scaled != frame) {
+                        frame.recycle();
+                    }
+                    return scaled;
                 }
             } catch (Throwable ignored) {
             } finally {
@@ -1779,9 +1866,14 @@ public final class ColgramAiSheet {
         final int decW = Math.max(128, widthPx);
         final int decH = Math.max(128, heightPx);
         MEDIA_THUMB_EXEC.execute(() -> {
+            if (cleanedUp.get()) return;
             Bitmap bmp = decodeMediaThumbnail(path, decW, decH);
             if (bmp != null) {
                 AndroidUtilities.runOnUIThread(() -> {
+                    if (cleanedUp.get()) {
+                        bmp.recycle();
+                        return;
+                    }
                     iv.setImageBitmap(bmp);
                     ph.setVisibility(View.GONE);
                     iv.animate().alpha(1f).setDuration(160L).start();
@@ -1884,6 +1976,18 @@ public final class ColgramAiSheet {
                 scrollView.smoothScrollTo(0, targetY);
             }
         });
+    }
+
+    private void scrollToBottomIfNearBottom() {
+        View last = messagesContainer.getChildAt(messagesContainer.getChildCount() - 1);
+        if (last == null) return;
+        int viewH = scrollView.getHeight();
+        if (viewH <= 0) return;
+        int targetY = Math.max(0, last.getBottom() - viewH + dp(16));
+        int currentY = scrollView.getScrollY();
+        if (targetY - currentY <= dp(140) || currentY == 0) {
+            scrollView.scrollTo(0, targetY);
+        }
     }
 
     private void addUserBubble(String text) {
@@ -2298,24 +2402,27 @@ public final class ColgramAiSheet {
         // Parse live telemetry numbers
         String tps = extractRegexGroup(rawTelemetry, "\\(([0-9.]+)\\s*tok/s\\)");
         String genTok = extractRegexGroup(rawTelemetry, "gen\\s+([0-9]+)\\s*tok");
+        String ttftMs = extractRegexGroup(rawTelemetry, "ttft\\s+([0-9.]+)ms");
         String prefillMs = extractRegexGroup(rawTelemetry, "prefill\\s+([0-9.]+)ms");
         String reuseTok = extractRegexGroup(rawTelemetry, "reuse\\s+([0-9]+)tok");
+        String latencySrc = !ttftMs.isEmpty() ? ttftMs : prefillMs;
         String prefillFmt = "";
-        if (!prefillMs.isEmpty()) {
+        if (!latencySrc.isEmpty()) {
             try {
-                double ms = Double.parseDouble(prefillMs);
+                double ms = Double.parseDouble(latencySrc);
                 prefillFmt = ms >= 1000.0 ? String.format(Locale.US, "%.1f с", ms / 1000.0) : (Math.round(ms) + " мс");
             } catch (Throwable ignored) {}
         }
 
         // 2x2 Flagship Metric Grid
+        boolean thinkModeOn = ColgramAiConfig.isThinkingEnabled(act);
         LinearLayout row1 = new LinearLayout(act);
         row1.setOrientation(LinearLayout.HORIZONTAL);
         row1.addView(makeInfoMetricTile(act, "⚡ Скорость", tps.isEmpty() ? "Локально" : (tps + " tok/s"),
                 genTok.isEmpty() ? "Офлайн ядро" : (genTok + " токенов"), ACCENT_AMBER),
                 LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, 0, 0, 8, 0));
-        row1.addView(makeInfoMetricTile(act, "🧠 Мышление", "Умный MAX",
-                "Быстрый чат + CoT · Q" + ColgramAiConfig.getKvQuantBits(act), ACCENT_CRIMSON),
+        row1.addView(makeInfoMetricTile(act, "🧠 Режим", thinkModeOn ? "Мышление" : "Турбо",
+                (thinkModeOn ? "CoT" : "Мгновенный") + " · Q" + ColgramAiConfig.getKvQuantBits(act), ACCENT_CRIMSON),
                 LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
         box.addView(row1, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
 
@@ -2325,7 +2432,7 @@ public final class ColgramAiSheet {
         row2.addView(makeInfoMetricTile(act, "🎙 Озвучка", voiceOn ? "Включена" : "Выключена",
                 ColgramKolitiVoice.getVoiceEngineSummary(act), ACCENT_EMERALD),
                 LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, 0, 0, 8, 0));
-        row2.addView(makeInfoMetricTile(act, "⏱ Prefill / KV", prefillFmt.isEmpty() ? "Готово" : prefillFmt,
+        row2.addView(makeInfoMetricTile(act, "⏱ TTFT / KV", prefillFmt.isEmpty() ? "Готово" : prefillFmt,
                 reuseTok.isEmpty() ? "FlashAttention" : ("Повтор кэша: " + reuseTok + " tok"), 0xFF3B82F6),
                 LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
         box.addView(row2, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));

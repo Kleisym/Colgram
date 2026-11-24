@@ -254,18 +254,20 @@ public class ColgramAiActivity extends BaseFragment {
             return;
         }
         if (position == ctxSizeRow) {
-            final int[] vals = {0, 4096, 8192, 16384, 32768};
+            final int[] vals = {0, 2048, 3072, 4096, 8192, 16384};
             final String[] labels = {
-                    "Авто (по свободной RAM)",
-                    "4K токенов (минимальная память)",
-                    "8K токенов (баланс)",
-                    "16K токенов (длинные чаты)",
-                    "32K токенов (максимум)"
+                    "Авто (Турбо: 2K текст / 3K Vision)",
+                    "2K токенов (максимальная скорость и минимум RAM)",
+                    "3K токенов (для Vision и средних чатов)",
+                    "4K токенов (баланс)",
+                    "8K токенов (длинные чаты)",
+                    "16K токенов (максимум)"
             };
             showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
                     .setTitle("Размер контекста Koliti")
                     .setItems(labels, (d, which) -> {
                         ColgramAiConfig.setContextSizeOverride(ctx, vals[which]);
+                        ColgramAiEngine.getInstance().unloadModelAsync();
                         refreshRow(ctxSizeRow);
                     }).create());
             return;
@@ -288,11 +290,11 @@ public class ColgramAiActivity extends BaseFragment {
         if (position == threadsRow) {
             final int[] vals = {0, 2, 3, 4, 6};
             final String[] labels = {
-                    "Авто (без перегрева)",
-                    "2 потока (экономичный)",
+                    "Авто (только быстрые big-ядра CPU)",
+                    "2 потока (лучший для 2×A76 big.LITTLE)",
                     "3 потока (тихий)",
-                    "4 потока (сбалансированный)",
-                    "6 потоков (максимальная скорость)"
+                    "4 потока (для 4× big-ядер)",
+                    "6 потоков (все ядра)"
             };
             showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
                     .setTitle("Потоки CPU для Koliti")
@@ -391,16 +393,29 @@ public class ColgramAiActivity extends BaseFragment {
     @Override
     public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
         super.onActivityResultFragment(requestCode, resultCode, data);
-        if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return;
+        if (resultCode != Activity.RESULT_OK || data == null) return;
         Activity act = getParentActivity();
-        if (act == null) return;
-        Uri uri = data.getData();
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
 
         if (requestCode == REQ_PICK_MEDIA_FROM_SHEET && pendingSheetForMedia != null) {
-            pendingSheetForMedia.attachExternalMediaUri(act, uri);
+            ColgramAiSheet targetSheet = pendingSheetForMedia;
             pendingSheetForMedia = null;
+            android.content.ClipData clip = data.getClipData();
+            if (clip != null && clip.getItemCount() > 0) {
+                int count = Math.min(4, clip.getItemCount());
+                for (int i = 0; i < count; i++) {
+                    Uri itemUri = clip.getItemAt(i) != null ? clip.getItemAt(i).getUri() : null;
+                    if (itemUri != null) {
+                        targetSheet.attachExternalMediaUri(act, itemUri);
+                    }
+                }
+            } else if (data.getData() != null) {
+                targetSheet.attachExternalMediaUri(act, data.getData());
+            }
             return;
         }
+        Uri uri = data.getData();
+        if (uri == null) return;
         if (requestCode == REQ_PICK_VOICE_REF) {
             Toast.makeText(act, "Сохраняю образец голоса…", Toast.LENGTH_SHORT).show();
             new Thread(() -> {
@@ -837,7 +852,8 @@ public class ColgramAiActivity extends BaseFragment {
             if (nativeTxt.length() > 54) nativeTxt = nativeTxt.substring(0, 54) + "…";
             long ramGb = Math.max(1L, getDeviceTotalRamMb(ctx) / 1024L);
 
-            addRow(ctx, "Мышление", "MAX · всегда активно", pal, true);
+            addRow(ctx, "Режим ответов",
+                    ColgramAiConfig.isThinkingEnabled(ctx) ? "Глубокое мышление (CoT)" : "Турбо (мгновенный ответ)", pal, true);
             addRow(ctx, "Голосовой движок", org.colgram.core.ColgramKolitiVoice.getVoiceEngineSummary(ctx), pal, true);
             addRow(ctx, "Память устройства", ramGb + " ГБ RAM · автосон " + ColgramAiConfig.getIdleUnloadSeconds(ctx) + " сек", pal, true);
             addRow(ctx, "CPU-движок", nativeTxt, pal, true);
@@ -988,7 +1004,7 @@ public class ColgramAiActivity extends BaseFragment {
                     c.setTextAndValueAndCheck("Контекст всех чатов (BM25)", "Поиск важных фактов по всей истории переписок", ColgramAiConfig.isCrossChatRagEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_TEAL, R.drawable.msg_folders);
                 } else if (position == thinkingRow) {
-                    c.setTextAndValueAndCheck("Показывать ход рассуждений", "Глубокое мышление MAX всегда активно; тумблер раскрывает мысли", ColgramAiConfig.isThinkingEnabled(mContext), true, true);
+                    c.setTextAndValueAndCheck("Глубокое мышление (CoT)", "Выкл = Турбо-режим (мгновенный ответ); вкл = пошаговые рассуждения", ColgramAiConfig.isThinkingEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_INDIGO, R.drawable.msg_info);
                 } else if (position == flashAttnRow) {
                     c.setTextAndValueAndCheck("FlashAttention + Zero-Copy mmap", "Ускоряет большой контекст и снижает нагрев", ColgramAiConfig.isFlashAttentionEnabled(mContext), true, true);
@@ -1020,14 +1036,14 @@ public class ColgramAiActivity extends BaseFragment {
                     ColgramMenuChrome.applyDetailIcon(d, "Проверить озвучку", "Произнести тестовую фразу с проверкой ударений", R.drawable.msg_voice_speaker, ColgramMenuChrome.COLOR_EMERALD, false);
                 } else if (position == ctxSizeRow) {
                     int ov = ColgramAiConfig.getContextSizeOverride(mContext);
-                    String val = ov == 0 ? "Авто (4K – 32K по свободной RAM)" : (ov / 1024) + "K токенов";
+                    String val = ov == 0 ? "Авто (Турбо: 2K текст / 3K Vision)" : (ov / 1024) + "K токенов";
                     ColgramMenuChrome.applyDetailIcon(d, "Окно контекста", val, R.drawable.msg_folders, ColgramMenuChrome.COLOR_BLUE, true);
                 } else if (position == kvQuantRow) {
                     int kv = ColgramAiConfig.getKvQuantBits(mContext);
                     ColgramMenuChrome.applyDetailIcon(d, "Квантование KV-кэша", kv == 16 ? "FP16" : ("Q" + kv + "_0 (экономия RAM)"), R.drawable.msg_speed, ColgramMenuChrome.COLOR_EMERALD, true);
                 } else if (position == threadsRow) {
                     int th = ColgramAiConfig.getThreadsOverride(mContext);
-                    ColgramMenuChrome.applyDetailIcon(d, "Потоки CPU", th == 0 ? "Авто (термо-контроль)" : th + " потока", R.drawable.msg_settings, ColgramMenuChrome.COLOR_AMBER, false);
+                    ColgramMenuChrome.applyDetailIcon(d, "Потоки CPU", th == 0 ? "Авто (быстрые big-ядра)" : th + " потока", R.drawable.msg_settings, ColgramMenuChrome.COLOR_AMBER, false);
                 } else if (position == importGgufRow) {
                     String custom = ColgramAiConfig.getCustomModelPath(mContext);
                     ColgramMenuChrome.applyDetailIcon(d, "Подключить свой .gguf", TextUtils.isEmpty(custom) ? "По умолчанию используется встроенная Koliti Core Ultra" : new File(custom).getName(), R.drawable.msg_download, ColgramMenuChrome.COLOR_SLATE, true);

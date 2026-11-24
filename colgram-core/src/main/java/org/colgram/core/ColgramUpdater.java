@@ -275,7 +275,7 @@ public class ColgramUpdater {
         boolean preferColgramTransport = ColgramDpiBypass.isBound()
                 || ColgramProxyManager.hasActiveRouteForUi()
                 || !ColgramConfig.getRelayUrl().isEmpty();
-        final DownloadManager manager = preferColgramTransport
+        final DownloadManager manager = (preferColgramTransport || dlDir == null)
                 ? null : (DownloadManager) appCtx.getSystemService(Context.DOWNLOAD_SERVICE);
         if (manager == null) {
             mainHandler.post(() -> Toast.makeText(
@@ -311,8 +311,9 @@ public class ColgramUpdater {
                     success = true;
                 }
 
-                final File file = new File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Colgram-Update.apk");
-                if (!success || !file.exists()) {
+                final File dlDir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                final File file = dlDir != null ? new File(dlDir, "Colgram-Update.apk") : null;
+                if (!success || file == null || !file.exists()) {
                     downloadViaColgramHttpFallback(ctx, apkUrl, expectedSha256);
                     return;
                 }

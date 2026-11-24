@@ -45,6 +45,8 @@ public final class ColgramGlobalOrbController {
     private final Rect tmpRect = new Rect();
     private final Rect enterRect = new Rect();
     private final Rect kbRect = new Rect();
+    private final int[] hostLoc = new int[2];
+    private boolean orbEntranceAnimating = false;
 
     private ValueAnimator springAnimator;
     private float curX = -1f;
@@ -87,6 +89,19 @@ public final class ColgramGlobalOrbController {
         }
     }
 
+    private final View.OnAttachStateChangeListener hostAttachListener = new View.OnAttachStateChangeListener() {
+        @Override
+        public void onViewAttachedToWindow(View v) {}
+
+        @Override
+        public void onViewDetachedFromWindow(View v) {
+            detachInternal();
+            if (instance == ColgramGlobalOrbController.this) {
+                instance = null;
+            }
+        }
+    };
+
     private ColgramGlobalOrbController(LaunchActivity activity, FrameLayout overlayHost) {
         this.activity = activity;
         this.overlayHost = overlayHost;
@@ -97,7 +112,9 @@ public final class ColgramGlobalOrbController {
             if (detached || activity == null || activity.isFinishing()) return;
             BaseFragment f = ColgramAiChatBridge.resolveTopFragment(activity);
             ChatActivity chat = ColgramAiChatBridge.resolveActiveChat(f);
-            ColgramAiSheet.showWithQuickPrompt(f, chat, orbView,
+            BaseFragment anchorFrag = f != null ? f : LaunchActivity.getSafeLastFragment();
+            if (anchorFrag == null) return;
+            ColgramAiSheet.showWithQuickPrompt(anchorFrag, chat, orbView,
                     chat != null ? "Сделай краткую и точную сводку последних событий в этом чате"
                             : "Что важного и непрочитанного есть во всех моих чатах?");
         });
@@ -158,6 +175,7 @@ public final class ColgramGlobalOrbController {
         overlayHost.addView(orbView, lp);
         orbView.setVisibility(View.GONE);
         overlayHost.addOnLayoutChangeListener(hostLayoutListener);
+        overlayHost.addOnAttachStateChangeListener(hostAttachListener);
         try {
             overlayHost.getViewTreeObserver().addOnGlobalLayoutListener(keyboardListener);
         } catch (Throwable ignored) {}
@@ -199,6 +217,7 @@ public final class ColgramGlobalOrbController {
         if (overlayHost != null) {
             overlayHost.removeCallbacks(deferredRelayout);
             overlayHost.removeOnLayoutChangeListener(hostLayoutListener);
+            overlayHost.removeOnAttachStateChangeListener(hostAttachListener);
             try {
                 ViewTreeObserver vto = overlayHost.getViewTreeObserver();
                 if (vto != null && vto.isAlive()) {
@@ -385,7 +404,6 @@ public final class ColgramGlobalOrbController {
                 && activeChat.fragmentView != null && activeChat.fragmentView.isShown()) {
             screenTag = "CHAT:" + activeChat.getDialogId();
             activeChat.fragmentView.getGlobalVisibleRect(tmpRect);
-            int[] hostLoc = new int[2];
             overlayHost.getLocationOnScreen(hostLoc);
 
             float chatLeft = Math.max(0, tmpRect.left - hostLoc[0]);
@@ -408,7 +426,6 @@ public final class ColgramGlobalOrbController {
             // Bottom-left above MainTabs dock, always clear of right Compose FAB
             screenTag = "DIALOGS";
             top.fragmentView.getGlobalVisibleRect(tmpRect);
-            int[] hostLoc = new int[2];
             overlayHost.getLocationOnScreen(hostLoc);
             float dLeft = Math.max(0, tmpRect.left - hostLoc[0]);
             float dRight = tmpRect.right > 0 ? Math.min(hostW, tmpRect.right - hostLoc[0]) : hostW;
@@ -419,7 +436,6 @@ public final class ColgramGlobalOrbController {
             // Settings / TempMail / Profile / Colgram pages
             screenTag = top.getClass().getSimpleName();
             top.fragmentView.getGlobalVisibleRect(tmpRect);
-            int[] hostLoc = new int[2];
             overlayHost.getLocationOnScreen(hostLoc);
             float fLeft = Math.max(0, tmpRect.left - hostLoc[0]);
             float fRight = tmpRect.right > 0 ? Math.min(hostW, tmpRect.right - hostLoc[0]) : hostW;
@@ -444,7 +460,7 @@ public final class ColgramGlobalOrbController {
         targetX = clampX(baseTargetX + manualDragOffsetX);
         targetY = clampY(baseTargetY + manualDragOffsetY);
 
-        if (!initializedPos || curX < 0f) {
+        if (!initializedPos || curX < 0f || orbView.getVisibility() != View.VISIBLE) {
             initializedPos = true;
             curX = targetX;
             curY = targetY;
@@ -519,11 +535,12 @@ public final class ColgramGlobalOrbController {
         final float targetAlpha = org.colgram.core.ColgramDesignConfig.getKolitiOrbAlpha();
         if (visible == orbIntendedVisible) {
             if (visible && orbView.getVisibility() != View.VISIBLE) {
+                orbEntranceAnimating = false;
                 orbView.setVisibility(View.VISIBLE);
                 orbView.setAlpha(targetAlpha);
                 orbView.setScaleX(1f);
                 orbView.setScaleY(1f);
-            } else if (visible) {
+            } else if (visible && !orbEntranceAnimating) {
                 orbView.setAlpha(targetAlpha);
             }
             return;
@@ -531,6 +548,7 @@ public final class ColgramGlobalOrbController {
         orbIntendedVisible = visible;
         orbView.animate().cancel();
         if (visible) {
+            orbEntranceAnimating = true;
             orbView.setVisibility(View.VISIBLE);
             orbView.setScaleX(0.65f);
             orbView.setScaleY(0.65f);
@@ -541,9 +559,10 @@ public final class ColgramGlobalOrbController {
                     .alpha(targetAlpha)
                     .setDuration(220L)
                     .setInterpolator(new OvershootInterpolator(1.35f))
-                    .withEndAction(null)
+                    .withEndAction(() -> orbEntranceAnimating = false)
                     .start();
         } else {
+            orbEntranceAnimating = false;
             if (springAnimator != null) {
                 springAnimator.cancel();
                 springAnimator = null;

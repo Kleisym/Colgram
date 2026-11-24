@@ -19,6 +19,9 @@ public final class ColgramNotificationFilter {
     private static final Pattern HANDLE = p("(?<![\\w@])@[a-z0-9_]{4,32}\\b|https?://[^\\s]+|t\\.me/[^\\s]+");
     private static final Pattern SPACED = p("(?<![\\p{L}0-9_])(?:[а-яa-z][.\\-_*•|·~/\\\\]{1,2}){3,}[а-яa-z](?![\\p{L}0-9_])");
     private static final Pattern SPACED_WS = p("(?<![\\p{L}0-9_])(?:[а-я] ){3,}[а-я](?![\\p{L}0-9_])");
+    private static final Pattern SPACED_STRIP = Pattern.compile("[\\s.\\-_*•|·~/\\\\]");
+    private static final Pattern CYR_DIGIT_MIX = Pattern.compile("[а-я][036]+[а-я]");
+    private static final Pattern AD_DISCLOSURE = p("(?:\\berid\\s*[:=]\\s*[a-z0-9_-]{3,}|(?<![\\p{L}0-9_])#(?:реклама|рекламный|промо|promo|ad|sponsored)(?![\\p{L}0-9_])|на\\s+правах\\s+рекламы)");
     private static final Pattern WORD = p("[0-9a-zа-я]+");
     private static final Pattern CYR = Pattern.compile("[а-я]");
     private static final Pattern LAT = Pattern.compile("[a-z]");
@@ -96,7 +99,7 @@ public final class ColgramNotificationFilter {
     }
 
     private static String normalizeProse(String input) {
-        String collapsed = SPACED.matcher(input).replaceAll(m -> m.group().replaceAll("[\\s.\\-_*•|·~/\\\\]", ""));
+        String collapsed = SPACED.matcher(input).replaceAll(m -> SPACED_STRIP.matcher(m.group()).replaceAll(""));
         collapsed = SPACED_WS.matcher(collapsed).replaceAll(m -> m.group().replace(" ", ""));
         boolean hasCyr = CYR.matcher(collapsed).find();
         Matcher wm = WORD.matcher(collapsed);
@@ -104,7 +107,7 @@ public final class ColgramNotificationFilter {
         while (wm.find()) {
             String w = wm.group();
             String rep = w;
-            if (CYR.matcher(w).find() && (LAT.matcher(w).find() || w.matches(".*[а-я][036]+[а-я].*"))) {
+            if (CYR.matcher(w).find() && (LAT.matcher(w).find() || CYR_DIGIT_MIX.matcher(w).find())) {
                 rep = foldHomoglyphs(w);
             } else if (hasCyr && w.length() >= 3 && HOMOGLYPH_ONLY.matcher(w).matches()) {
                 String cand = foldHomoglyphs(w);
@@ -127,6 +130,7 @@ public final class ColgramNotificationFilter {
         if (raw == null || raw.isEmpty() || raw.length() > MAX_TEXT) return false;
         String text = Normalizer.normalize(raw, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT).replace('ё', 'е');
         if (AUTH.matcher(text).find()) return false;
+        if (AD_DISCLOSURE.matcher(text).find()) return true;
         boolean contact = HANDLE.matcher(text).find();
         String prose = normalizeProse(HANDLE.matcher(text).replaceAll(" "));
         boolean sale = SALE.matcher(prose).find();

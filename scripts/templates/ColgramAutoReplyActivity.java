@@ -59,6 +59,11 @@ public class ColgramAutoReplyActivity extends BaseFragment {
     private int previewRow;
     private int scheduleSectionRow;
 
+    private boolean canOpenDialog() {
+        android.app.Activity act = getParentActivity();
+        return act != null && !act.isFinishing() && !act.isDestroyed() && getVisibleDialog() == null;
+    }
+
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
@@ -168,8 +173,8 @@ public class ColgramAutoReplyActivity extends BaseFragment {
     }
 
     private void showTextEditor(boolean awayMode) {
+        if (!canOpenDialog()) return;
         Context context = getParentActivity();
-        if (context == null) return;
         final EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
                 context, resourceProvider, "Переменные: {name}, {first_name}, {username}, {time}", true);
         input.setText(awayMode ? ColgramConfig.getAutoReplyAwayText() : ColgramConfig.getAutoReplyText());
@@ -199,8 +204,8 @@ public class ColgramAutoReplyActivity extends BaseFragment {
     }
 
     private void showAudiencePicker() {
+        if (!canOpenDialog()) return;
         Context context = getParentActivity();
-        if (context == null) return;
         String[] labels = {
                 "Все чаты",
                 "Только контакты",
@@ -221,8 +226,8 @@ public class ColgramAutoReplyActivity extends BaseFragment {
     }
 
     private void showCooldownPicker() {
+        if (!canOpenDialog()) return;
         Context context = getParentActivity();
-        if (context == null) return;
         final int[] options = {0, 60, 300, 900, 3600, 86400};
         final String[] labels = {
                 "Без паузы (на каждое сообщение)",
@@ -243,8 +248,8 @@ public class ColgramAutoReplyActivity extends BaseFragment {
     }
 
     private void showBlacklistEditor() {
+        if (!canOpenDialog()) return;
         Context context = getParentActivity();
-        if (context == null) return;
         final EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
                 context, resourceProvider, "ID чатов через запятую (напр. 123456, -100987654)", false);
         input.setText(ColgramConfig.getAutoReplyBlacklist());
@@ -266,13 +271,14 @@ public class ColgramAutoReplyActivity extends BaseFragment {
     }
 
     private void pickTime(boolean isStart) {
+        if (!canOpenDialog()) return;
         Context context = getParentActivity();
-        if (context == null) return;
         int cur = isStart ? ColgramConfig.getAutoReplyStartMin() : ColgramConfig.getAutoReplyEndMin();
         int themeRes = Theme.isCurrentThemeDark()
                 ? android.R.style.Theme_DeviceDefault_Dialog_Alert
                 : android.R.style.Theme_DeviceDefault_Light_Dialog_Alert;
-        new TimePickerDialog(context, themeRes, (view, hourOfDay, minute) -> {
+        showDialog(new TimePickerDialog(context, themeRes, (view, hourOfDay, minute) -> {
+            if (isFinishing()) return;
             int val = hourOfDay * 60 + minute;
             if (isStart) ColgramConfig.setAutoReplyStartMin(val);
             else ColgramConfig.setAutoReplyEndMin(val);
@@ -280,12 +286,12 @@ public class ColgramAutoReplyActivity extends BaseFragment {
                 listAdapter.notifyItemChanged(heroRow);
                 listAdapter.notifyItemChanged(isStart ? startTimeRow : endTimeRow);
             }
-        }, cur / 60, cur % 60, true).show();
+        }, cur / 60, cur % 60, true));
     }
 
     private void showTemplatePreview() {
+        if (!canOpenDialog()) return;
         Context context = getParentActivity();
-        if (context == null) return;
         java.util.Calendar cal = java.util.Calendar.getInstance();
         int h = cal.get(java.util.Calendar.HOUR_OF_DAY);
         int m = cal.get(java.util.Calendar.MINUTE);

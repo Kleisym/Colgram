@@ -37,15 +37,47 @@ public final class ColgramTelegramDcAddresses {
         if (lower.startsWith("149.154.174.")) return 3;
         if (lower.startsWith("149.154.167.9")) return 4;
         if (lower.startsWith("149.154.167.") || lower.startsWith("95.161.76.") || lower.startsWith("185.76.151.")) return 2;
-        if (lower.startsWith("194.221.250.") || lower.startsWith("149.154.164.")
-                || lower.startsWith("149.154.165.") || lower.startsWith("149.154.166.")) return 4;
+        if (lower.startsWith("194.221.250.") || lower.startsWith("149.154.162.") || lower.startsWith("149.154.163.")
+                || lower.startsWith("149.154.164.") || lower.startsWith("149.154.165.")
+                || lower.startsWith("149.154.166.")) return 4;
         if (lower.startsWith("149.154.170.") || lower.startsWith("149.154.171.")
                 || lower.startsWith("91.108.56.")) return 5;
+        int cidrDc = dcIdForIpv4Ranges(lower);
+        if (cidrDc > 0) return cidrDc;
         if (lower.startsWith("2001:b28:f23d:f001:")) return 1;
         if (lower.startsWith("2001:67c:4e8:f002:")) return 2;
         if (lower.startsWith("2001:b28:f23d:f003:")) return 3;
         if (lower.startsWith("2001:67c:4e8:f004:")) return 4;
         if (lower.startsWith("2001:b28:f23f:f005:")) return 5;
+        return 0;
+    }
+
+    private static int dcIdForIpv4Ranges(String host) {
+        if (host == null || host.indexOf(':') >= 0) return 0;
+        String[] parts = host.split("\\.", -1);
+        if (parts.length != 4) return 0;
+        int[] oct = new int[4];
+        for (int i = 0; i < 4; i++) {
+            if (parts[i].isEmpty() || parts[i].length() > 3) return 0;
+            int v = 0;
+            for (int j = 0; j < parts[i].length(); j++) {
+                char ch = parts[i].charAt(j);
+                if (ch < '0' || ch > '9') return 0;
+                v = v * 10 + (ch - '0');
+            }
+            if (v > 255) return 0;
+            oct[i] = v;
+        }
+        int a = oct[0], b = oct[1], c = oct[2];
+        // 95.161.64.0/20 -> DC2
+        if (a == 95 && b == 161 && c >= 64 && c <= 79) return 2;
+        // 91.108.4.0/22 + 91.108.8.0/22 -> DC4; 91.108.12.0/22 + 91.108.20.0/22 -> DC2;
+        // 91.108.16.0/22 + 91.108.56.0/22 -> DC5
+        if (a == 91 && b == 108) {
+            if (c >= 4 && c <= 11) return 4;
+            if ((c >= 12 && c <= 15) || (c >= 20 && c <= 23)) return 2;
+            if ((c >= 16 && c <= 19) || (c >= 56 && c <= 59)) return 5;
+        }
         return 0;
     }
 

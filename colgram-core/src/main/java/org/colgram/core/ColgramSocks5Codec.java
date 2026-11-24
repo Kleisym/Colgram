@@ -51,7 +51,8 @@ final class ColgramSocks5Codec {
         boolean realStream = !(output instanceof java.io.ByteArrayOutputStream);
         int chunk = Math.max(1, headChunkBytes);
         for (int off = 0; off < data.length; ) {
-            int step = Math.min(off < 12 ? chunk : Math.max(chunk, 4), data.length - off);
+            int stepSize = (chunk <= 2) ? chunk : (off < 12 ? chunk : Math.max(chunk, 4));
+            int step = Math.min(stepSize, data.length - off);
             output.write(data, off, step);
             output.flush();
             off += step;
@@ -146,7 +147,7 @@ final class ColgramSocks5Codec {
         System.arraycopy(target, 0, req, 4, target.length);
         req[4 + target.length] = (byte) (port >>> 8);
         req[5 + target.length] = (byte) port;
-        writeSegmented(output, req, 6, 10L);
+        writeSegmented(output, req, 2, 10L);
         if (input.next() != 5 || input.next() != 0 || input.next() != 0) return false;
         int type = input.next();
         int addressLength = type == 1 ? 4 : type == 4 ? 16 : type == 3 ? input.next() : -1;
@@ -210,7 +211,7 @@ final class ColgramSocks5Codec {
         System.arraycopy(hostBytes, 0, req, 5, hostBytes.length);
         req[5 + hostBytes.length] = (byte) (port >>> 8);
         req[6 + hostBytes.length] = (byte) port;
-        writeSegmented(output, req, 6, 10L);
+        writeSegmented(output, req, 2, 10L);
         if (readByte(input) != 5 || readByte(input) != 0 || readByte(input) != 0) return false;
         int type = readByte(input);
         int addressLength = type == 1 ? 4 : type == 4 ? 16 : type == 3 ? readByte(input) : -1;

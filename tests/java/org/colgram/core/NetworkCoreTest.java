@@ -275,6 +275,41 @@ public final class NetworkCoreTest {
         ColgramTelegramWsBridge.clearCooldowns();
         check(!ColgramTelegramWsBridge.isInCooldown(5), "clearCooldowns clears DC5 cooldown");
 
+        // 8. Accurate IP->DC mapping & negative/media DC ID preservation (-2, -4, 10002, -10004)
+        check(ColgramTelegramDcAddresses.dcIdFor("91.108.4.1") == 4, "91.108.4.1 maps to DC4");
+        check(ColgramTelegramDcAddresses.dcIdFor("91.108.8.12") == 4, "91.108.8.12 maps to DC4");
+        check(ColgramTelegramDcAddresses.dcIdFor("95.161.64.10") == 2, "95.161.64.10 maps to DC2");
+        check(ColgramTelegramDcAddresses.dcIdFor("95.161.79.254") == 2, "95.161.79.254 maps to DC2");
+        check("kws2-1.web.telegram.org".equals(ColgramTelegramWsBridge.primaryWssHostForDc(-2)), "DC -2 uses kws2-1");
+        check("kws4-1.web.telegram.org".equals(ColgramTelegramWsBridge.primaryWssHostForDc(-4)), "DC -4 uses kws4-1");
+        check("kws2-1.web.telegram.org".equals(ColgramTelegramWsBridge.primaryWssHostForDc(10002)), "DC 10002 uses kws2-1");
+        check("kws4-1.web.telegram.org".equals(ColgramTelegramWsBridge.primaryWssHostForDc(-10004)), "DC -10004 uses kws4-1");
+        check("kws2.web.telegram.org".equals(ColgramTelegramWsBridge.fallbackWssHostForDc(-2)), "DC -2 fallback is kws2");
+        check("kws4.web.telegram.org".equals(ColgramTelegramWsBridge.fallbackWssHostForDc(-10004)), "DC -10004 fallback is kws4");
+
+        int[] mediaDcs = {-2, -4, 10002, -10004};
+        for (int idx = 0; idx < mediaDcs.length; idx++) {
+            int rawDc = mediaDcs[idx];
+            byte[] mSeed = new byte[64];
+            new Random(300 + idx).nextBytes(mSeed);
+            mSeed[56] = (byte) 0xef; mSeed[57] = (byte) 0xef; mSeed[58] = (byte) 0xef; mSeed[59] = (byte) 0xef;
+            mSeed[60] = (byte) (rawDc & 0xff);
+            mSeed[61] = (byte) ((rawDc >> 8) & 0xff);
+            Cipher mEnc = Cipher.getInstance("AES/CTR/NoPadding");
+            mEnc.init(Cipher.ENCRYPT_MODE,
+                    new SecretKeySpec(Arrays.copyOfRange(mSeed, 8, 40), "AES"),
+                    new IvParameterSpec(Arrays.copyOfRange(mSeed, 40, 56)));
+            byte[] mCipher = mEnc.update(mSeed);
+            System.arraycopy(mCipher, 56, mSeed, 56, 8);
+            ColgramTelegramWsBridge.Obfuscated2FrameSplitter mSplit =
+                    ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
+                            mSeed, 64, ColgramTelegramWsBridge.Obfuscated2FrameSplitter.normalizeDcId(rawDc));
+            check(mSplit != null && mSplit.rawDcId() == rawDc && mSplit.isMediaSession(),
+                    "Splitter preserves media dc " + rawDc);
+            check(ColgramTelegramWsBridge.extractRawDcFromObfuscated2(mSeed, 64) == rawDc,
+                    "Header bytes [60..61] preserve raw dc " + rawDc + " verbatim");
+        }
+
         System.out.println("NetworkCoreTest: " + checks + " checks PASS");
     }
 }

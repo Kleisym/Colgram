@@ -33,6 +33,8 @@ public final class ColgramAiEngineTest {
         check(ColgramAiModels.findById("koliti-core-4b") == koliti, "Legacy koliti-core-4b migration failed");
         check(ColgramAiModels.recommendForDeviceRamMb(4096L) == koliti, "Expected unified Koliti recommendation");
 
+        check(ColgramAiModels.recommendContextForTotalRamMb(8192L) == 2048, "Default fast text context must be 2048");
+        check(ColgramAiModels.recommendContextForVision(8192L) == 3072, "Vision context must expand cleanly to 3072");
         check(ColgramAiModels.recommendContextForFreeRamMb(1100L) == 3072, "Free RAM <4GB -> 3072 ctx");
         check(ColgramAiModels.recommendContextForFreeRamMb(4200L) == 6144, "Free RAM ~4.2GB -> 6144 ctx");
         check(ColgramAiModels.recommendContextForFreeRamMb(6200L) == 8192, "Free RAM ~6.2GB -> 8192 ctx");
@@ -166,6 +168,9 @@ public final class ColgramAiEngineTest {
         String implicitKept = ColgramAiContextEngine.stripThinkingTags(implicitCompleted, true, true);
         check(implicitKept.startsWith("Мысли:\n") && implicitKept.contains("---") && implicitKept.endsWith("Корни: x = 2 и x = 3."),
                 "Implicit thinking keepThinking format failed: " + implicitKept);
+        String leakedStop = ColgramAiContextEngine.stripThinkingTags("Привет!<|im_end|><|endoftext|>", false, false);
+        check("Привет!".equals(leakedStop), "Special stop tokens must be stripped cleanly: " + leakedStop);
+        check(chatSys.length() <= 350, "Base system prompt must stay ultra-compact for fast mobile prefill: " + chatSys.length());
     }
 
     private static void testWebSearchParsers() {
@@ -382,15 +387,18 @@ public final class ColgramAiEngineTest {
         check(ColgramAiWebSearch.looksLikeFinanceQuery("курс btc"), "Real BTC query missed");
         check(ColgramAiWebSearch.looksLikeFinanceQuery("переведи $100 в рубли"), "Real $100 query missed");
 
-        // Adaptive thinking enabled on reasoning/coding/math, disabled on casual greetings
+        // Turbo fast-by-default: normal chat, questions, explanations & code stream immediately WITHOUT hidden <think> burn;
+        // deep thinking activates ONLY on explicit deep-reasoning / proof requests!
         check(!ColgramAiContextEngine.shouldUseAdaptiveThinking("ку", null, false), "Greeting should stay instant");
         check(!ColgramAiContextEngine.shouldUseAdaptiveThinking("че ?", null, false), "Short casual check should stay instant");
-        check(ColgramAiContextEngine.shouldUseAdaptiveThinking("объясни простыми словами как работает нейронная сеть", null, false),
-                "Deep explanation should enable adaptive thinking");
-        check(ColgramAiContextEngine.shouldUseAdaptiveThinking("напиши на python быструю сортировку", null, false),
-                "Coding task should enable adaptive thinking");
-        check(ColgramAiContextEngine.shouldUseAdaptiveThinking("реши квадратное уравнение x^2 - 5x + 6 = 0", null, false),
-                "Math equation should enable adaptive thinking");
+        check(!ColgramAiContextEngine.shouldUseAdaptiveThinking("объясни простыми словами как работает нейронная сеть", null, false),
+                "Normal explanation should stream immediately without hidden <think> stall");
+        check(!ColgramAiContextEngine.shouldUseAdaptiveThinking("напиши на python быструю сортировку", null, false),
+                "Standard coding prompt should stream immediately without hidden <think> stall");
+        check(ColgramAiContextEngine.shouldUseAdaptiveThinking("докажи теорему Пифагора", null, false),
+                "Explicit proof request should enable deep thinking");
+        check(ColgramAiContextEngine.shouldUseAdaptiveThinking("подумай и пошагово реши уравнение x^2 - 5x + 6 = 0", null, false),
+                "Explicit step-by-step deep reasoning request should enable thinking");
 
         // Poisoned currency history cleanup: repeating "82.08 RUB (на 20.11.2026)." must NEVER bleed into "ку" or normal questions!
         List<ColgramAiContextEngine.ConversationTurn> poisoned = new ArrayList<>();

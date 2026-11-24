@@ -9,6 +9,7 @@ import android.graphics.drawable.BitmapDrawable;
 import android.media.MediaMetadataRetriever;
 import android.media.MediaPlayer;
 import android.net.Uri;
+import android.util.LruCache;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
@@ -19,6 +20,7 @@ import androidx.annotation.NonNull;
 import org.colgram.core.ColgramConfig;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.DispatchQueue;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.Utilities;
 
@@ -27,13 +29,30 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Lightweight, looping, muted center-crop video wallpaper view and local wallpaper storage
  * helper for Colgram chats. Renders directly inside ChatActivity's background layer with
- * automatic lifecycle pause/resume and zero audio focus interruption.
+ * automatic lifecycle pause/resume, async MediaPlayer teardown, zero main-thread disk I/O,
+ * and zero audio focus interruption.
  */
 public final class ColgramVideoWallpaperView extends TextureView implements TextureView.SurfaceTextureListener {
+
+    public interface WallpaperResolveCallback {
+        void onResolved(boolean hasVideo, String videoPath, BitmapDrawable drawable, String loadedImagePath);
+    }
+
+    private static final int MAX_WALLPAPER_CACHE_KB = Math.min(32 * 1024, Math.max(8 * 1024, (int) (Runtime.getRuntime().maxMemory() / 1024 / 12)));
+    private static final LruCache<String, Bitmap> WALLPAPER_BITMAP_CACHE = new LruCache<String, Bitmap>(MAX_WALLPAPER_CACHE_KB) {
+        @Override
+        protected int sizeOf(String key, Bitmap value) {
+            return value == null ? 1 : Math.max(1, value.getByteCount() / 1024);
+        }
+    };
+    private static final ConcurrentHashMap<String, Boolean> FILE_EXISTS_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, String> VIDEO_POSTER_PATH_CACHE = new ConcurrentHashMap<>();
+    private static final DispatchQueue RELEASE_QUEUE = new DispatchQueue("ColgramVideoReleaseQueue");
 
     private String videoPath;
     private MediaPlayer mediaPlayer;
@@ -41,9 +60,17 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     private int videoWidth;
     private int videoHeight;
     private boolean pausedByHost;
+    private boolean windowVisible = true;
     private boolean surfaceReady;
-    private boolean playerPrepared = false;
-    private int playerGeneration = 0;
+    private boolean playerPrepared;
+    private boolean firstFrameRendered;
+    private int playerGeneration;
+    private int pendingFileCheckGen;
+    private int errorRetryCount;
+    private int stallRecoveryCount;
+    private Runnable fallbackCheckRunnable;
+    private Runnable watchdogCheckRunnable;
+    private Runnable retryRunnable;
 
     public ColgramVideoWallpaperView(@NonNull Context context) {
         super(context);
@@ -57,29 +84,74 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
 
     public void setVideoPath(String path) {
         String clean = path == null ? "" : path.trim();
-        if (clean.isEmpty() || !new File(clean).isFile()) {
+        pendingFileCheckGen++;
+        if (clean.isEmpty()) {
             this.videoPath = "";
             releasePlayer();
             setVisibility(View.GONE);
             return;
         }
+        Boolean cachedExists = FILE_EXISTS_CACHE.get(clean);
+        if (Boolean.FALSE.equals(cachedExists)) {
+            this.videoPath = "";
+            releasePlayer();
+            setVisibility(View.GONE);
+            return;
+        }
+        if (Boolean.TRUE.equals(cachedExists)) {
+            applyValidatedVideoPath(clean);
+            return;
+        }
+        // Unknown on cold process start: never stat disk synchronously on UI thread.
+        this.videoPath = clean;
+        final int checkGen = pendingFileCheckGen;
+        Utilities.globalQueue.postRunnable(() -> {
+            boolean exists = new File(clean).isFile();
+            FILE_EXISTS_CACHE.put(clean, exists);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (checkGen != pendingFileCheckGen || !clean.equals(videoPath)) {
+                    return;
+                }
+                if (!exists) {
+                    this.videoPath = "";
+                    releasePlayer();
+                    setVisibility(View.GONE);
+                } else {
+                    applyValidatedVideoPath(clean);
+                }
+            });
+        });
+    }
+
+    private void applyValidatedVideoPath(String clean) {
         if (clean.equals(this.videoPath) && mediaPlayer != null) {
             setVisibility(View.VISIBLE);
-            // CRITICAL: NEVER call start() while MediaPlayer is still in Preparing state!
-            // Calling start() before onPrepared() fires Android MEDIA_ERROR (-38, 0) and hides the video!
-            if (playerPrepared && !pausedByHost) {
-                try {
-                    if (!mediaPlayer.isPlaying()) {
-                        mediaPlayer.start();
+            if (shouldBePlaying()) {
+                if (renderSurface == null || !renderSurface.isValid()) {
+                    if (isAvailable() && getSurfaceTexture() != null) {
+                        surfaceReady = true;
+                        startPlayer(getSurfaceTexture());
                     }
-                    scheduleStartFallbackCheck(playerGeneration);
-                } catch (Throwable ignored) {}
+                } else if (playerPrepared) {
+                    // CRITICAL: NEVER call start() while MediaPlayer is still in Preparing state!
+                    try {
+                        if (!mediaPlayer.isPlaying()) {
+                            mediaPlayer.start();
+                        }
+                        if (firstFrameRendered && getAlpha() < 1f) {
+                            setAlpha(1f);
+                        }
+                        scheduleStartFallbackCheck(playerGeneration);
+                    } catch (Throwable ignored) {}
+                }
             }
             return;
         }
         this.videoPath = clean;
+        errorRetryCount = 0;
+        stallRecoveryCount = 0;
         setVisibility(View.VISIBLE);
-        if (isAvailable() && getSurfaceTexture() != null) {
+        if (shouldBePlaying() && isAvailable() && getSurfaceTexture() != null) {
             surfaceReady = true;
             startPlayer(getSurfaceTexture());
         }
@@ -88,23 +160,67 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     public void setHostPaused(boolean paused) {
         pausedByHost = paused;
         if (paused) {
-            if (mediaPlayer != null && playerPrepared) {
-                try {
-                    if (mediaPlayer.isPlaying()) {
-                        mediaPlayer.pause();
-                    }
-                } catch (Throwable ignored) {}
-            }
+            pausePlaybackOnly();
             return;
         }
+        errorRetryCount = 0;
+        stallRecoveryCount = 0;
         resumePlaybackIfReady();
     }
 
+    public void onHostConfigurationChanged() {
+        applyCenterCropTransform();
+        if (shouldBePlaying()) {
+            resumePlaybackIfReady();
+        }
+    }
+
+    private boolean shouldBePlaying() {
+        return !pausedByHost
+                && windowVisible
+                && isAttachedToWindow()
+                && getVisibility() == View.VISIBLE
+                && videoPath != null
+                && !videoPath.isEmpty();
+    }
+
+    private void cancelScheduledChecks() {
+        if (fallbackCheckRunnable != null) {
+            removeCallbacks(fallbackCheckRunnable);
+            fallbackCheckRunnable = null;
+        }
+        if (watchdogCheckRunnable != null) {
+            removeCallbacks(watchdogCheckRunnable);
+            watchdogCheckRunnable = null;
+        }
+        if (retryRunnable != null) {
+            removeCallbacks(retryRunnable);
+            retryRunnable = null;
+        }
+    }
+
+    private void pausePlaybackOnly() {
+        cancelScheduledChecks();
+        if (mediaPlayer != null && playerPrepared) {
+            try {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                }
+            } catch (Throwable ignored) {}
+        }
+    }
+
     public void resumePlaybackIfReady() {
-        if (pausedByHost || videoPath == null || videoPath.isEmpty() || getVisibility() != View.VISIBLE) {
+        if (!shouldBePlaying()) {
             return;
         }
-        if (mediaPlayer == null) {
+        if (Boolean.FALSE.equals(FILE_EXISTS_CACHE.get(videoPath))) {
+            this.videoPath = "";
+            releasePlayer();
+            setVisibility(View.GONE);
+            return;
+        }
+        if (mediaPlayer == null || renderSurface == null || !renderSurface.isValid()) {
             if (isAvailable() && getSurfaceTexture() != null) {
                 surfaceReady = true;
                 startPlayer(getSurfaceTexture());
@@ -114,18 +230,43 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                 if (!mediaPlayer.isPlaying()) {
                     mediaPlayer.start();
                 }
+                if (firstFrameRendered && getAlpha() < 1f) {
+                    setAlpha(1f);
+                }
                 scheduleStartFallbackCheck(playerGeneration);
             } catch (Throwable ignored) {}
         }
     }
 
     private void scheduleStartFallbackCheck(final int gen) {
-        final Runnable check = () -> {
-            if (gen != playerGeneration || mediaPlayer == null || !playerPrepared
-                    || pausedByHost || getVisibility() != View.VISIBLE || !isAttachedToWindow()) {
+        cancelScheduledChecks();
+        fallbackCheckRunnable = () -> {
+            fallbackCheckRunnable = null;
+            if (gen != playerGeneration || mediaPlayer == null || !playerPrepared || !shouldBePlaying()) {
                 return;
             }
             try {
+                if (!mediaPlayer.isPlaying()) {
+                    mediaPlayer.start();
+                }
+                if (firstFrameRendered && mediaPlayer.isPlaying() && getAlpha() < 1f) {
+                    setAlpha(1f);
+                }
+            } catch (Throwable ignored) {}
+        };
+        watchdogCheckRunnable = () -> {
+            watchdogCheckRunnable = null;
+            if (gen != playerGeneration || mediaPlayer == null || !playerPrepared || !shouldBePlaying()) {
+                return;
+            }
+            try {
+                if (!firstFrameRendered || renderSurface == null || !renderSurface.isValid()) {
+                    if (stallRecoveryCount < 1 && isAvailable() && getSurfaceTexture() != null) {
+                        stallRecoveryCount++;
+                        startPlayer(getSurfaceTexture());
+                    }
+                    return;
+                }
                 if (!mediaPlayer.isPlaying()) {
                     mediaPlayer.start();
                 }
@@ -134,14 +275,16 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                 }
             } catch (Throwable ignored) {}
         };
-        postDelayed(check, 120L);
-        postDelayed(check, 350L);
+        postDelayed(fallbackCheckRunnable, 160L);
+        postDelayed(watchdogCheckRunnable, 900L);
     }
 
     public void releasePlayer() {
         playerGeneration++;
         playerPrepared = false;
-        MediaPlayer mp = mediaPlayer;
+        firstFrameRendered = false;
+        cancelScheduledChecks();
+        final MediaPlayer mp = mediaPlayer;
         mediaPlayer = null;
         if (mp != null) {
             try {
@@ -153,14 +296,6 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
             try {
                 mp.setSurface(null);
             } catch (Throwable ignored) {}
-            try {
-                if (mp.isPlaying()) {
-                    mp.stop();
-                }
-            } catch (Throwable ignored) {}
-            try {
-                mp.release();
-            } catch (Throwable ignored) {}
         }
         Surface s = renderSurface;
         renderSurface = null;
@@ -169,17 +304,31 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                 s.release();
             } catch (Throwable ignored) {}
         }
+        if (mp != null) {
+            RELEASE_QUEUE.postRunnable(() -> {
+                try {
+                    mp.reset();
+                } catch (Throwable ignored) {}
+                try {
+                    mp.release();
+                } catch (Throwable ignored) {}
+            });
+        }
     }
 
     private void startPlayer(SurfaceTexture texture) {
         releasePlayer();
-        if (texture == null || videoPath == null || videoPath.isEmpty() || !new File(videoPath).isFile()) {
+        if (texture == null || !shouldBePlaying()) {
+            return;
+        }
+        if (Boolean.FALSE.equals(FILE_EXISTS_CACHE.get(videoPath))) {
             return;
         }
         final int gen = playerGeneration;
         try {
             // Keep underlying poster crisp during ~100ms codec warmup without triggering HWUI skip-draw (0.01f > 0).
             setAlpha(0.01f);
+            firstFrameRendered = false;
             renderSurface = new Surface(texture);
             final MediaPlayer mp = new MediaPlayer();
             mp.setSurface(renderSurface);
@@ -194,7 +343,8 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
             });
             mp.setOnInfoListener((player, what, extra) -> {
                 if (mediaPlayer == player && what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
-                    if (getAlpha() < 1f) {
+                    firstFrameRendered = true;
+                    if (shouldBePlaying() && getAlpha() < 1f) {
                         setAlpha(1f);
                     }
                     applyCenterCropTransform();
@@ -207,7 +357,7 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                 videoWidth = player.getVideoWidth();
                 videoHeight = player.getVideoHeight();
                 applyCenterCropTransform();
-                if (!pausedByHost && getVisibility() == View.VISIBLE) {
+                if (shouldBePlaying()) {
                     try {
                         player.start();
                         scheduleStartFallbackCheck(gen);
@@ -217,15 +367,28 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
             mp.setOnErrorListener((player, what, extra) -> {
                 if (mediaPlayer != player) return true;
                 releasePlayer();
-                setAlpha(1f);
-                setVisibility(View.GONE);
+                setAlpha(0.01f);
+                if (shouldBePlaying() && errorRetryCount < 2) {
+                    errorRetryCount++;
+                    final int retryGen = playerGeneration;
+                    retryRunnable = () -> {
+                        retryRunnable = null;
+                        if (retryGen == playerGeneration && shouldBePlaying()
+                                && isAvailable() && getSurfaceTexture() != null && mediaPlayer == null) {
+                            startPlayer(getSurfaceTexture());
+                        }
+                    };
+                    postDelayed(retryRunnable, 250L * errorRetryCount);
+                } else {
+                    setVisibility(View.GONE);
+                }
                 return true;
             });
             mediaPlayer = mp;
             mp.prepareAsync();
         } catch (Throwable ignored) {
             releasePlayer();
-            setAlpha(1f);
+            setAlpha(0.01f);
             setVisibility(View.GONE);
         }
     }
@@ -259,21 +422,35 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        windowVisible = getWindowVisibility() == View.VISIBLE;
         if (isAvailable() && getSurfaceTexture() != null) {
             surfaceReady = true;
-            if (videoPath != null && !videoPath.isEmpty() && getVisibility() == View.VISIBLE
-                    && (mediaPlayer == null || renderSurface == null || !renderSurface.isValid())) {
-                startPlayer(getSurfaceTexture());
-            } else {
+            if (shouldBePlaying()) {
                 resumePlaybackIfReady();
             }
         }
     }
 
     @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        windowVisible = visibility == View.VISIBLE;
+        if (!windowVisible) {
+            pausePlaybackOnly();
+        } else {
+            errorRetryCount = 0;
+            stallRecoveryCount = 0;
+            resumePlaybackIfReady();
+        }
+    }
+
+    @Override
     public void setVisibility(int visibility) {
+        int prev = getVisibility();
         super.setVisibility(visibility);
-        if (visibility == View.VISIBLE && !pausedByHost) {
+        if (visibility != View.VISIBLE) {
+            pausePlaybackOnly();
+        } else if (prev != View.VISIBLE || !pausedByHost) {
             resumePlaybackIfReady();
         }
     }
@@ -288,7 +465,7 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     @Override
     public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int width, int height) {
         surfaceReady = true;
-        if (videoPath != null && !videoPath.isEmpty() && getVisibility() == View.VISIBLE) {
+        if (shouldBePlaying()) {
             startPlayer(surface);
         }
     }
@@ -296,6 +473,9 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     @Override
     public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surface, int width, int height) {
         applyCenterCropTransform();
+        if (shouldBePlaying() && mediaPlayer == null) {
+            startPlayer(surface);
+        }
     }
 
     @Override
@@ -307,9 +487,90 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
 
     @Override
     public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surface) {
-        if (getAlpha() < 1f && mediaPlayer != null && playerPrepared && !pausedByHost) {
+        firstFrameRendered = true;
+        if (getAlpha() < 1f && mediaPlayer != null && playerPrepared && shouldBePlaying()) {
             setAlpha(1f);
         }
+    }
+
+    public static boolean hasCachedFile(String path) {
+        return path != null && !path.isEmpty() && Boolean.TRUE.equals(FILE_EXISTS_CACHE.get(path));
+    }
+
+    public static BitmapDrawable getCachedImageDrawable(Context ctx, String path) {
+        Context safeCtx = ctx != null ? ctx : ApplicationLoader.applicationContext;
+        if (safeCtx == null || path == null || path.isEmpty()) {
+            return null;
+        }
+        Bitmap bmp = WALLPAPER_BITMAP_CACHE.get(path);
+        if (bmp != null && !bmp.isRecycled()) {
+            return new BitmapDrawable(safeCtx.getResources(), bmp);
+        }
+        return null;
+    }
+
+    public static String getCachedVideoPosterPath(String videoPath) {
+        if (videoPath == null || videoPath.isEmpty()) {
+            return "";
+        }
+        String cached = VIDEO_POSTER_PATH_CACHE.get(videoPath);
+        return cached != null ? cached : "";
+    }
+
+    public static void resolveWallpaperAsync(Context ctx, String videoPath, String imagePath, WallpaperResolveCallback callback) {
+        if (callback == null) {
+            return;
+        }
+        final Context appCtx = ctx != null ? ctx.getApplicationContext() : ApplicationLoader.applicationContext;
+        final String cleanVid = videoPath == null ? "" : videoPath.trim();
+        final String cleanImg = imagePath == null ? "" : imagePath.trim();
+        Utilities.globalQueue.postRunnable(() -> {
+            boolean hasVid = false;
+            BitmapDrawable drawable = null;
+            String loadedPath = null;
+            if (!cleanVid.isEmpty()) {
+                hasVid = new File(cleanVid).isFile();
+                FILE_EXISTS_CACHE.put(cleanVid, hasVid);
+                if (hasVid) {
+                    String posterPath = getOrCreateVideoPosterPath(cleanVid);
+                    if (!posterPath.isEmpty()) {
+                        drawable = loadScaledImageDrawable(appCtx, posterPath);
+                        loadedPath = posterPath;
+                    }
+                }
+            }
+            if (!hasVid && !cleanImg.isEmpty()) {
+                boolean hasImg = new File(cleanImg).isFile();
+                FILE_EXISTS_CACHE.put(cleanImg, hasImg);
+                if (hasImg) {
+                    drawable = loadScaledImageDrawable(appCtx, cleanImg);
+                    if (drawable != null) {
+                        loadedPath = cleanImg;
+                    }
+                }
+            }
+            final boolean finalHasVid = hasVid;
+            final BitmapDrawable finalDrawable = drawable;
+            final String finalLoadedPath = loadedPath;
+            AndroidUtilities.runOnUIThread(() ->
+                    callback.onResolved(finalHasVid, finalHasVid ? cleanVid : "", finalDrawable, finalLoadedPath));
+        });
+    }
+
+    private static void invalidatePathCaches(String path) {
+        if (path == null || path.isEmpty()) {
+            return;
+        }
+        FILE_EXISTS_CACHE.remove(path);
+        WALLPAPER_BITMAP_CACHE.remove(path);
+        String poster = VIDEO_POSTER_PATH_CACHE.remove(path);
+        if (poster != null && !poster.isEmpty()) {
+            FILE_EXISTS_CACHE.remove(poster);
+            WALLPAPER_BITMAP_CACHE.remove(poster);
+        }
+        String fallbackPoster = path + ".poster.jpg";
+        FILE_EXISTS_CACHE.remove(fallbackPoster);
+        WALLPAPER_BITMAP_CACHE.remove(fallbackPoster);
     }
 
     public static File getWallpapersDir() {
@@ -344,24 +605,40 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
         }
         String prevImg = ColgramConfig.getExactChatImageWallpaper(dialogId);
         String prevVid = ColgramConfig.getExactChatVideoWallpaper(dialogId);
-        ColgramConfig.setChatImageWallpaper(dialogId, dst.getAbsolutePath());
+        String dstPath = dst.getAbsolutePath();
+        ColgramConfig.setChatImageWallpaper(dialogId, dstPath);
         ColgramConfig.setChatVideoWallpaper(dialogId, "");
-        cleanupPreviousWallpaper(prevImg, dst.getAbsolutePath());
-        cleanupPreviousWallpaper(prevVid, "");
-        return dst.getAbsolutePath();
+        FILE_EXISTS_CACHE.put(dstPath, Boolean.TRUE);
+        invalidatePathCaches(prevImg);
+        invalidatePathCaches(prevVid);
+        Utilities.globalQueue.postRunnable(() -> {
+            cleanupPreviousWallpaper(prevImg, dstPath);
+            cleanupPreviousWallpaper(prevVid, "");
+        });
+        return dstPath;
     }
 
     /** Clears saved custom video and/or image wallpaper for dialogId (0 = global) and deletes orphaned files. */
     public static void clearSavedWallpaper(long dialogId, boolean clearVideo, boolean clearImage) {
+        final String prevVid = clearVideo ? ColgramConfig.getExactChatVideoWallpaper(dialogId) : "";
+        final String prevImg = clearImage ? ColgramConfig.getExactChatImageWallpaper(dialogId) : "";
         if (clearVideo) {
-            String prevVid = ColgramConfig.getExactChatVideoWallpaper(dialogId);
             ColgramConfig.setChatVideoWallpaper(dialogId, "");
-            cleanupPreviousWallpaper(prevVid, "");
+            invalidatePathCaches(prevVid);
         }
         if (clearImage) {
-            String prevImg = ColgramConfig.getExactChatImageWallpaper(dialogId);
             ColgramConfig.setChatImageWallpaper(dialogId, "");
-            cleanupPreviousWallpaper(prevImg, "");
+            invalidatePathCaches(prevImg);
+        }
+        if ((prevVid != null && !prevVid.isEmpty()) || (prevImg != null && !prevImg.isEmpty())) {
+            Utilities.globalQueue.postRunnable(() -> {
+                if (prevVid != null && !prevVid.isEmpty()) {
+                    cleanupPreviousWallpaper(prevVid, "");
+                }
+                if (prevImg != null && !prevImg.isEmpty()) {
+                    cleanupPreviousWallpaper(prevImg, "");
+                }
+            });
         }
     }
 
@@ -427,11 +704,18 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
         }
         String prevVid = ColgramConfig.getExactChatVideoWallpaper(dialogId);
         String prevImg = ColgramConfig.getExactChatImageWallpaper(dialogId);
+        String dstPath = dst.getAbsolutePath();
         // Extract first-frame JPEG poster so re-entering the chat NEVER flashes solid gray while preparing
-        getOrCreateVideoPosterPath(dst.getAbsolutePath());
-        ColgramConfig.setChatVideoWallpaper(dialogId, dst.getAbsolutePath());
+        String posterPath = getOrCreateVideoPosterPath(dstPath);
+        if (!posterPath.isEmpty()) {
+            loadScaledImageDrawable(app, posterPath);
+        }
+        ColgramConfig.setChatVideoWallpaper(dialogId, dstPath);
         ColgramConfig.setChatImageWallpaper(dialogId, "");
-        cleanupPreviousWallpaper(prevVid, dst.getAbsolutePath());
+        FILE_EXISTS_CACHE.put(dstPath, Boolean.TRUE);
+        invalidatePathCaches(prevVid);
+        invalidatePathCaches(prevImg);
+        cleanupPreviousWallpaper(prevVid, dstPath);
         cleanupPreviousWallpaper(prevImg, "");
         AndroidUtilities.runOnUIThread(() -> {
             NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.didSetNewWallpapper);
@@ -445,11 +729,22 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     /** Returns (creating once if absent) a crisp JPEG first-frame poster next to a saved video wallpaper. */
     public static String getOrCreateVideoPosterPath(String videoPath) {
         if (videoPath == null || videoPath.isEmpty()) return "";
+        String cached = VIDEO_POSTER_PATH_CACHE.get(videoPath);
+        if (cached != null && !cached.isEmpty() && Boolean.TRUE.equals(FILE_EXISTS_CACHE.get(cached))) {
+            return cached;
+        }
         File vf = new File(videoPath);
-        if (!vf.isFile() || vf.length() <= 0) return "";
+        if (!vf.isFile() || vf.length() <= 0) {
+            FILE_EXISTS_CACHE.put(videoPath, Boolean.FALSE);
+            return "";
+        }
+        FILE_EXISTS_CACHE.put(videoPath, Boolean.TRUE);
         File poster = new File(videoPath + ".poster.jpg");
         if (poster.isFile() && poster.length() > 0) {
-            return poster.getAbsolutePath();
+            String abs = poster.getAbsolutePath();
+            FILE_EXISTS_CACHE.put(abs, Boolean.TRUE);
+            VIDEO_POSTER_PATH_CACHE.put(videoPath, abs);
+            return abs;
         }
         MediaMetadataRetriever mmr = new MediaMetadataRetriever();
         try {
@@ -465,7 +760,10 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                 }
                 frame.recycle();
                 if (poster.isFile() && poster.length() > 0) {
-                    return poster.getAbsolutePath();
+                    String abs = poster.getAbsolutePath();
+                    FILE_EXISTS_CACHE.put(abs, Boolean.TRUE);
+                    VIDEO_POSTER_PATH_CACHE.put(videoPath, abs);
+                    return abs;
                 }
             }
         } catch (Throwable ignored) {
@@ -497,8 +795,16 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     public static BitmapDrawable loadScaledImageDrawable(Context ctx, String path) {
         Context safeCtx = ctx != null ? ctx : ApplicationLoader.applicationContext;
         if (safeCtx == null || path == null || path.isEmpty()) return null;
+        Bitmap cached = WALLPAPER_BITMAP_CACHE.get(path);
+        if (cached != null && !cached.isRecycled()) {
+            return new BitmapDrawable(safeCtx.getResources(), cached);
+        }
         File f = new File(path);
-        if (!f.isFile() || f.length() <= 0) return null;
+        if (!f.isFile() || f.length() <= 0) {
+            FILE_EXISTS_CACHE.put(path, Boolean.FALSE);
+            return null;
+        }
+        FILE_EXISTS_CACHE.put(path, Boolean.TRUE);
         try {
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
@@ -534,6 +840,7 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                     }
                 }
             } catch (Throwable ignored) {}
+            WALLPAPER_BITMAP_CACHE.put(path, bmp);
             return new BitmapDrawable(safeCtx.getResources(), bmp);
         } catch (Throwable ignored) {
             return null;

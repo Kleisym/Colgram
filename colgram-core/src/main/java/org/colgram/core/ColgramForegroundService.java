@@ -52,8 +52,8 @@ public class ColgramForegroundService extends Service {
     private static final String CHANNEL_ID = "colgram_background";
     private static final int NOTIFICATION_ID = 771001;
 
-    /** How often to re-assert the pollers. Cheap: startBotUpdatesPoller is idempotent. */
-    private static final long HEARTBEAT_MS = 60_000L;
+    /** Lightweight passive 30-second bypass/poller check interval. */
+    private static final long HEARTBEAT_MS = 30_000L;
 
     private Handler handler;
     private Runnable heartbeat;
@@ -109,11 +109,7 @@ public class ColgramForegroundService extends Service {
         activeInstance = this;
         ensureForeground();
         ensurePollers();
-        if (ColgramUiBridge.isAppInForeground() || hasAnyBotTokens()) {
-            startHeartbeat();
-        } else {
-            stopHeartbeat();
-        }
+        startHeartbeat();
         return START_STICKY;
     }
 
@@ -332,20 +328,22 @@ public class ColgramForegroundService extends Service {
                     Log.w(TAG, "poller ensure failed for account " + account + ": " + t.getMessage());
                 }
             }
-            if (!ColgramUiBridge.isAppInForeground()) {
-                ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
-                try {
-                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
-                } catch (Throwable ignored) {}
-                return;
-            }
             if (anyBotToken || ColgramConfig.isAlwaysBackgroundEnabled()) {
                 ensureHumanAccountBackgroundSync();
             }
             ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
-            ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
-            if (active != null && active.isLocalDpi() && !ColgramDpiBypass.isBound()) {
-                ColgramOptimizer.scheduleAfterStartup(() -> ColgramDpiBypass.restartIfDeadAndWait(2000L));
+            if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                ColgramOptimizer.scheduleAfterStartup(() -> {
+                    if (ColgramDpiBypass.restartIfDeadAndWait(2000L)) {
+                        kickHumanConnectionsNow();
+                    }
+                });
+            }
+            if (!ColgramUiBridge.isAppInForeground()) {
+                try {
+                    ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+                } catch (Throwable ignored) {}
+                return;
             }
             long now = android.os.SystemClock.elapsedRealtime();
             if (ColgramConfig.isDefenderEnabled()
@@ -424,7 +422,7 @@ public class ColgramForegroundService extends Service {
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         super.onTaskRemoved(rootIntent);
-        if (!ColgramConfig.isAlwaysBackgroundEnabled()) return;
+        if (!ColgramConfig.isAlwaysBackgroundEnabled() && ColgramDpiBypass.wasExplicitlyStopped()) return;
         try {
             ColgramBootJobService.schedule(this);
             // Only schedule a PendingIntent.getForegroundService alarm when battery-optimization
@@ -459,17 +457,21 @@ public class ColgramForegroundService extends Service {
         if (heartbeat != null || handler == null) {
             return;
         }
-        if (!ColgramUiBridge.isAppInForeground() && !hasAnyBotTokens()) {
-            return;
-        }
         heartbeat = new Runnable() {
             @Override
             public void run() {
-                if (!ColgramUiBridge.isAppInForeground() && !hasAnyBotTokens()) {
-                    stopHeartbeat();
-                    return;
+                if (!ColgramUiBridge.isAppInForeground() && !hasAnyBotTokens()
+                        && !ColgramConfig.isAlwaysBackgroundEnabled()) {
+                    if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                        ColgramOptimizer.scheduleAfterStartup(() -> {
+                            if (ColgramDpiBypass.restartIfDeadAndWait(2000L)) {
+                                kickHumanConnectionsNow();
+                            }
+                        });
+                    }
+                } else {
+                    ensurePollers();
                 }
-                ensurePollers();
                 if (handler != null && heartbeat == this) {
                     long delay = HEARTBEAT_MS * Math.max(1, ColgramPowerGuard.intervalFactor(ColgramForegroundService.this));
                     handler.postDelayed(this, delay);
@@ -496,8 +498,10 @@ public class ColgramForegroundService extends Service {
         ColgramForegroundService inst = activeInstance;
         if (inst == null || inst.handler == null) return;
         inst.handler.post(() -> {
-            if (!ColgramUiBridge.isAppInForeground() && !inst.hasAnyBotTokens()) {
-                inst.stopHeartbeat();
+            // Keep START_STICKY service, passive 30s bypass watchdog, and 127.0.0.1:9876 ALWAYS alive
+            // in background so chats, notifications, media, and Anti-Delete Vault continue 24/7.
+            inst.startHeartbeat();
+            if (!ColgramUiBridge.isAppInForeground()) {
                 try {
                     ColgramAiEngine.getInstance().unloadIfIdleInBackground();
                 } catch (Throwable ignored) {}
@@ -508,15 +512,39 @@ public class ColgramForegroundService extends Service {
         });
     }
 
-    /** Resumes lightweight foreground heartbeat only once the UI returns to the foreground. */
+    /** Resumes lightweight foreground heartbeat and triggers instant <1s reconnect on UI return. */
     public static void onAppForegrounded() {
         ColgramForegroundService inst = activeInstance;
         if (inst == null || inst.handler == null) return;
         inst.handler.post(() -> {
             if (ColgramUiBridge.isAppInForeground()) {
+                inst.screenOffSinceMs = 0L;
+                inst.ensurePollers();
                 inst.startHeartbeat();
+                if (!ColgramProxyManager.isTelegramConnected()) {
+                    ColgramOptimizer.scheduleAfterStartup(inst::kickHumanConnectionsNow);
+                }
             }
         });
+    }
+
+    private void kickHumanConnectionsNow() {
+        try {
+            if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                ColgramDpiBypass.startImmediately();
+            }
+            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            for (int a = 0; a < 5; a++) {
+                Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, a);
+                boolean activated = (boolean) ucClass.getMethod("isClientActivated").invoke(uc);
+                if (!activated) continue;
+                Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
+                if (cm != null) {
+                    cmClass.getMethod("checkConnection").invoke(cm);
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     // ---------------------------------------------------------------------------------------

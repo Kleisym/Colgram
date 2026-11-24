@@ -417,6 +417,10 @@ public final class ColgramAiChatBridge {
                 }
             }
         }
+        // Never stall the Android UI thread waiting on SQLite for a pinned message preview
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return "";
+        }
         final String[] holder = new String[]{""};
         try {
             final MessagesStorage storage = MessagesStorage.getInstance(account);
@@ -739,7 +743,7 @@ public final class ColgramAiChatBridge {
                 String resolvedTitle = resolveDialogTitle(MessagesController.getInstance(account), targetDid);
                 SendMessagesHelper.getInstance(account).sendMessage(
                         SendMessagesHelper.SendMessageParams.of(cleanText, targetDid));
-                if (activity != null) {
+                if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
                     Toast.makeText(activity, "✓ Отправлено в «" + resolvedTitle + "»", Toast.LENGTH_SHORT).show();
                 }
                 return new ColgramAiEngine.ToolResult(
@@ -946,7 +950,7 @@ public final class ColgramAiChatBridge {
                     return false;
             }
         } catch (Throwable t) {
-            if (activity != null) {
+            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
                 Toast.makeText(activity, "Не удалось выполнить действие", Toast.LENGTH_SHORT).show();
             }
             return false;

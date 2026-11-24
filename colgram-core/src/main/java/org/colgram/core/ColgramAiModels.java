@@ -128,13 +128,15 @@ public final class ColgramAiModels {
     }
 
     /**
-     * Stable context budget derived from device total RAM so loading Koliti into memory NEVER
-     * lowers the tier on the next prompt and triggers a wasteful full core reload.
+     * Compact, fast mobile context budget for text chat (2048 tokens) so KV cache & scratch buffers
+     * stay tiny and never evict mmap'd GGUF weights from the OS page cache. Expands to 3072 only for Vision.
      */
     public static int recommendContextForTotalRamMb(long totalRamMb) {
-        if (totalRamMb >= 10000L) return 8192;
-        if (totalRamMb >= 6000L) return 6144;
-        if (totalRamMb >= 3800L) return 4096;
+        return 2048;
+    }
+
+    /** Expanded context budget used only when Vision image/video tokens are attached. */
+    public static int recommendContextForVision(long totalRamMb) {
         return 3072;
     }
 

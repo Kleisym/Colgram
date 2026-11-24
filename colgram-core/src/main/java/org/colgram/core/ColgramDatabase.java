@@ -106,10 +106,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     public void compactOwnDatabase() {
         try {
             SQLiteDatabase db = getWritableDatabase();
-            Cursor c1 = db.rawQuery("PRAGMA incremental_vacuum(200)", null);
-            if (c1 != null) c1.close();
-            Cursor c2 = db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null);
-            if (c2 != null) c2.close();
+            try (Cursor c1 = db.rawQuery("PRAGMA incremental_vacuum(200)", null)) {
+                if (c1 != null) c1.moveToFirst();
+            }
+            try (Cursor c2 = db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null)) {
+                if (c2 != null) c2.moveToFirst();
+            }
         } catch (Throwable ignored) {}
     }
 
@@ -311,15 +313,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     public boolean isNotificationsBlockedFrom(long userId) {
         if (userId == 0) return false;
-        try {
-            Cursor cursor = getReadableDatabase().query(TABLE_BLOCKED_USERS,
-                    new String[]{COL_BLOCK_USER_ID},
-                    COL_BLOCK_USER_ID + "=?",
-                    new String[]{String.valueOf(userId)},
-                    null, null, null);
-            boolean exists = cursor != null && cursor.getCount() > 0;
-            if (cursor != null) cursor.close();
-            return exists;
+        try (Cursor cursor = getReadableDatabase().query(TABLE_BLOCKED_USERS,
+                new String[]{COL_BLOCK_USER_ID},
+                COL_BLOCK_USER_ID + "=?",
+                new String[]{String.valueOf(userId)},
+                null, null, null)) {
+            return cursor != null && cursor.getCount() > 0;
         } catch (Exception e) {
             return false;
         }
@@ -327,13 +326,11 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     public List<Long> getBlockedNotifyUsers() {
         List<Long> out = new ArrayList<>();
-        try {
-            Cursor cursor = getReadableDatabase().query(TABLE_BLOCKED_USERS,
-                    new String[]{COL_BLOCK_USER_ID},
-                    null, null, null, null, COL_BLOCK_ADDED_AT + " ASC");
+        try (Cursor cursor = getReadableDatabase().query(TABLE_BLOCKED_USERS,
+                new String[]{COL_BLOCK_USER_ID},
+                null, null, null, null, COL_BLOCK_ADDED_AT + " ASC")) {
             if (cursor != null) {
                 while (cursor.moveToNext()) out.add(cursor.getLong(0));
-                cursor.close();
             }
         } catch (Exception e) {
             // Silently handle
@@ -449,7 +446,7 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     }
 
     public void saveMessageEdit(long dialogId, int messageId, String previousText, String previousEntitiesJson, long editTimestamp) {
-        if (previousText == null || previousText.trim().isEmpty()) return;
+        if (dialogId == 0L || messageId == 0 || previousText == null || previousText.trim().isEmpty()) return;
 
         try {
             SQLiteDatabase db = getWritableDatabase();
@@ -457,25 +454,22 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             String normEntities = previousEntitiesJson == null ? "" : previousEntitiesJson;
 
             // Deduplicate against the newest inserted row by _id DESC (not timestamp, which can tie within <1s).
-            Cursor last = db.query(TABLE_EDITS,
+            try (Cursor last = db.query(TABLE_EDITS,
                     new String[]{COL_EDIT_PREV_TEXT, COL_EDIT_TIMESTAMP, COL_EDIT_ENTITIES},
                     COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?",
                     new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_EDIT_ID + " DESC", "1");
-            if (last != null) {
-                if (last.moveToFirst()) {
+                    null, null, COL_EDIT_ID + " DESC", "1")) {
+                if (last != null && last.moveToFirst()) {
                     String existing = last.getString(0);
                     long lastTs = normalizeEpochMillis(last.getLong(1));
                     String existingEnt = last.isNull(2) ? "" : last.getString(2);
                     if (previousText.equals(existing) && normEntities.equals(existingEnt)) {
-                        last.close();
                         return;
                     }
                     if (tsMs <= lastTs) {
                         tsMs = lastTs + 1L;
                     }
                 }
-                last.close();
             }
 
             ContentValues values = new ContentValues();
@@ -557,30 +551,26 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             long tsMs = normalizeEpochMillis(capturedAt);
 
             // Dedupe against the newest inserted revision by _id DESC so rapid <1s media swaps preserve order.
-            Cursor last = db.query(TABLE_MEDIA,
+            try (Cursor last = db.query(TABLE_MEDIA,
                     new String[]{COL_MEDIA_REMOTE_ID, COL_MEDIA_FILE_NAME, COL_MEDIA_TIMESTAMP},
                     COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
                     new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_MEDIA_ID + " DESC", "1");
-            if (last != null) {
-                if (last.moveToFirst()) {
+                    null, null, COL_MEDIA_ID + " DESC", "1")) {
+                if (last != null && last.moveToFirst()) {
                     long existingRemote = last.getLong(0);
                     String existingName = last.isNull(1) ? null : last.getString(1);
                     long lastTs = normalizeEpochMillis(last.getLong(2));
                     // Same attachment id AND same name => nothing actually changed.
                     if (remoteId != 0 && existingRemote == remoteId) {
-                        last.close();
                         return;
                     }
                     if (remoteId == 0 && existingName != null && existingName.equals(fileName)) {
-                        last.close();
                         return;
                     }
                     if (tsMs <= lastTs) {
                         tsMs = lastTs + 1L;
                     }
                 }
-                last.close();
             }
 
             ContentValues values = new ContentValues();
@@ -602,15 +592,13 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     /** All stored media revisions for a message, oldest first. */
     public List<MediaRevision> getMediaRevisions(long dialogId, int messageId) {
         List<MediaRevision> out = new ArrayList<>();
-        try {
-            SQLiteDatabase db = getReadableDatabase();
-            Cursor cursor = db.query(TABLE_MEDIA,
-                    new String[]{COL_MEDIA_TIMESTAMP, COL_MEDIA_TYPE, COL_MEDIA_PATH,
-                            COL_MEDIA_FILE_NAME, COL_MEDIA_SIZE, COL_MEDIA_MIME},
-                    COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
-                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_MEDIA_TIMESTAMP + " ASC, " + COL_MEDIA_ID + " ASC");
-
+        if (dialogId == 0L || messageId == 0) return out;
+        try (Cursor cursor = getReadableDatabase().query(TABLE_MEDIA,
+                new String[]{COL_MEDIA_TIMESTAMP, COL_MEDIA_TYPE, COL_MEDIA_PATH,
+                        COL_MEDIA_FILE_NAME, COL_MEDIA_SIZE, COL_MEDIA_MIME},
+                COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
+                new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
+                null, null, COL_MEDIA_TIMESTAMP + " ASC, " + COL_MEDIA_ID + " ASC")) {
             if (cursor != null) {
                 while (cursor.moveToNext()) {
                     out.add(new MediaRevision(
@@ -621,7 +609,6 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                             cursor.getLong(4),
                             cursor.isNull(5) ? null : cursor.getString(5)));
                 }
-                cursor.close();
             }
         } catch (Exception e) {
             // Silently handle
@@ -631,16 +618,13 @@ public class ColgramDatabase extends SQLiteOpenHelper {
 
     /** True when at least one revision exists — cheap existence probe for menu gating. */
     public boolean hasMediaRevisions(long dialogId, int messageId) {
-        try {
-            SQLiteDatabase db = getReadableDatabase();
-            Cursor cursor = db.query(TABLE_MEDIA,
-                    new String[]{COL_MEDIA_ID},
-                    COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
-                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, null, "1");
-            boolean exists = cursor != null && cursor.getCount() > 0;
-            if (cursor != null) cursor.close();
-            return exists;
+        if (dialogId == 0L || messageId == 0) return false;
+        try (Cursor cursor = getReadableDatabase().query(TABLE_MEDIA,
+                new String[]{COL_MEDIA_ID},
+                COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?",
+                new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
+                null, null, null, "1")) {
+            return cursor != null && cursor.getCount() > 0;
         } catch (Exception e) {
             return false;
         }
@@ -668,14 +652,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
      */
     public List<MessageEditEntry> getEditHistory(long dialogId, int messageId) {
         List<MessageEditEntry> history = new ArrayList<>();
-        try {
-            SQLiteDatabase db = getReadableDatabase();
-            Cursor cursor = db.query(TABLE_EDITS,
-                    new String[]{COL_EDIT_TIMESTAMP, COL_EDIT_PREV_TEXT, COL_EDIT_ENTITIES},
-                    COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?",
-                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
-                    null, null, COL_EDIT_TIMESTAMP + " ASC, " + COL_EDIT_ID + " ASC");
-
+        if (dialogId == 0L || messageId == 0) return history;
+        try (Cursor cursor = getReadableDatabase().query(TABLE_EDITS,
+                new String[]{COL_EDIT_TIMESTAMP, COL_EDIT_PREV_TEXT, COL_EDIT_ENTITIES},
+                COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?",
+                new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
+                null, null, COL_EDIT_TIMESTAMP + " ASC, " + COL_EDIT_ID + " ASC")) {
             if (cursor != null) {
                 while (cursor.moveToNext()) {
                     long ts = normalizeEpochMillis(cursor.getLong(0));
@@ -683,7 +665,6 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                     String entJson = cursor.isNull(2) ? null : cursor.getString(2);
                     history.add(new MessageEditEntry(ts, text, entJson));
                 }
-                cursor.close();
             }
         } catch (Exception e) {
             // Silently handle

@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -72,6 +74,15 @@ public final class ColgramColemailerEngine {
     private static final Pattern TG_JOIN_RE = Pattern.compile(
             "tg://join\\?invite=([a-zA-Z0-9_+\\-]+)", Pattern.CASE_INSENSITIVE);
     private static final Pattern MENTION_LINK_RE = Pattern.compile("@([a-zA-Z0-9_]{4,32})");
+    private static final Pattern TRAILING_WS_RE = Pattern.compile("\\s+$");
+    private static final Pattern LINK_TRAILING_PUNCT_RE = Pattern.compile("[/.,;:!?)\\]}>]+$");
+    private static final Pattern SCHEDULE_TIME_RE = Pattern.compile(
+            "(\\d+)\\s*(?:сек\\w*|sec\\w*|s\\b|мин\\w*|min\\w*|m\\b|час\\w*|hour\\w*|h\\b|дн\\w*|сут\\w*|day\\w*|d\\b)");
+    private static final Pattern SCHEDULE_COUNTER_RE = Pattern.compile(
+            "(\\d+)\\s*(?:сообщ\\w*|смс|пост\\w*|msg\\w*|messages?)");
+    private static final Pattern SCHEDULE_BARE_NUM_RE = Pattern.compile("^\\d+$");
+    private static final Pattern FLOOD_WAIT_RE = Pattern.compile(
+            "(?:FLOOD_WAIT_|retry_after[\"']?\\s*[:=]\\s*)(\\d+)", Pattern.CASE_INSENSITIVE);
 
     public static final class ButtonSpec {
         public final String text;
@@ -209,7 +220,7 @@ public final class ColgramColemailerEngine {
         }
     }
 
-    private static ColgramColemailerEngine instance;
+    private static volatile ColgramColemailerEngine instance;
 
     private final Map<String, BroadcastCampaign> campaigns = new LinkedHashMap<>();
     private final Map<String, RotationRule> rotations = new LinkedHashMap<>();
@@ -218,27 +229,45 @@ public final class ColgramColemailerEngine {
     private final Map<Long, QuietSnapshot> quietSnapshots = new LinkedHashMap<>();
     private final List<PingRpcRecord> rpcHistory = new ArrayList<>();
 
+    // Lock-free hot-path caches (zero SharedPreferences I/O or lock contention per incoming message)
+    private final Set<Long> whitelistFast = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<String, MuteRule> muteRulesFast = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Boolean> dmAutoDeleteMuted = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Long> selfUserIds = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Set<Long>> folderTargetsCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> floodWaitUntilMs = new ConcurrentHashMap<>();
+    private final AtomicInteger activeCampaignCount = new AtomicInteger(0);
+
+    private final boolean persistent;
     private boolean loadedFromConfig = false;
 
-    private ColgramColemailerEngine() {}
+    private ColgramColemailerEngine(boolean persistent) {
+        this.persistent = persistent;
+    }
 
-    public static synchronized ColgramColemailerEngine getInstance() {
-        if (instance == null) {
-            instance = new ColgramColemailerEngine();
+    public static ColgramColemailerEngine getInstance() {
+        ColgramColemailerEngine local = instance;
+        if (local != null) {
+            return local;
         }
-        if (!instance.loadedFromConfig) {
-            String raw = ColgramConfig.getColemailerState();
-            instance.loadedFromConfig = true;
-            if (raw != null && !raw.isEmpty()) {
-                instance.deserializeIntoSelf(raw);
+        synchronized (ColgramColemailerEngine.class) {
+            local = instance;
+            if (local == null) {
+                local = new ColgramColemailerEngine(true);
+                String raw = ColgramConfig.getColemailerState();
+                local.loadedFromConfig = true;
+                if (raw != null && !raw.isEmpty()) {
+                    local.deserializeIntoSelf(raw);
+                }
+                instance = local;
             }
+            return local;
         }
-        return instance;
     }
 
     /** Creates an isolated instance for deterministic JVM unit tests without touching preferences. */
     public static ColgramColemailerEngine newStandaloneForTest() {
-        ColgramColemailerEngine eng = new ColgramColemailerEngine();
+        ColgramColemailerEngine eng = new ColgramColemailerEngine(false);
         eng.loadedFromConfig = true;
         return eng;
     }
@@ -352,7 +381,7 @@ public final class ColgramColemailerEngine {
             if (i > 0) body.append('\n');
             body.append(lines[i]);
         }
-        return new ParsedPost(body.toString().replaceAll("\\s+$", ""), trailing);
+        return new ParsedPost(TRAILING_WS_RE.matcher(body.toString()).replaceAll(""), trailing);
     }
 
     public static String formatButtonsPreview(List<List<ButtonSpec>> rows) {
@@ -409,9 +438,7 @@ public final class ColgramColemailerEngine {
         long intervalSec = 0L;
         int counterThreshold = 0;
 
-        Matcher timeM = Pattern.compile(
-                "(\\d+)\\s*(?:сек\\w*|sec\\w*|s\\b|мин\\w*|min\\w*|m\\b|час\\w*|hour\\w*|h\\b|дн\\w*|сут\\w*|day\\w*|d\\b)")
-                .matcher(clean);
+        Matcher timeM = SCHEDULE_TIME_RE.matcher(clean);
         while (timeM.find()) {
             long val = Long.parseLong(timeM.group(1));
             String unit = timeM.group(0).toLowerCase(Locale.ROOT);
@@ -421,7 +448,7 @@ public final class ColgramColemailerEngine {
             else if (unit.contains("дн") || unit.contains("сут") || unit.contains("day") || unit.endsWith("d")) intervalSec += val * 86400L;
         }
 
-        Matcher cntM = Pattern.compile("(\\d+)\\s*(?:сообщ\\w*|смс|пост\\w*|msg\\w*|messages?)").matcher(clean);
+        Matcher cntM = SCHEDULE_COUNTER_RE.matcher(clean);
         if (cntM.find()) {
             counterThreshold = Math.max(1, Integer.parseInt(cntM.group(1)));
         }
@@ -433,22 +460,59 @@ public final class ColgramColemailerEngine {
             return new ScheduleSpec(MODE_COUNTER, 0L, counterThreshold);
         }
         if (intervalSec <= 0) {
-            Matcher bare = Pattern.compile("^\\d+$").matcher(clean);
+            Matcher bare = SCHEDULE_BARE_NUM_RE.matcher(clean);
             intervalSec = bare.find() ? Long.parseLong(clean) * 60L : 600L;
         }
         return new ScheduleSpec(MODE_INTERVAL, Math.max(MIN_INTERVAL_SEC, intervalSec), 0);
     }
 
+    private void recomputeActiveCampaignCountLocked() {
+        int active = 0;
+        for (BroadcastCampaign c : campaigns.values()) {
+            if (c != null && c.enabled && !c.text.isEmpty()) {
+                active++;
+            }
+        }
+        activeCampaignCount.set(active);
+    }
+
+    public int getActiveCampaignCount() {
+        return activeCampaignCount.get();
+    }
+
+    public boolean hasActiveCampaigns() {
+        return activeCampaignCount.get() > 0;
+    }
+
+    public synchronized int getActiveCampaignCount(int account) {
+        if (activeCampaignCount.get() == 0) return 0;
+        int active = 0;
+        for (BroadcastCampaign c : campaigns.values()) {
+            if (c == null || !c.enabled || c.text.isEmpty()) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            active++;
+        }
+        return active;
+    }
+
+    public boolean hasActiveCampaigns(int account) {
+        return getActiveCampaignCount(account) > 0;
+    }
+
     public synchronized void addOrUpdateCampaign(BroadcastCampaign campaign) {
         if (campaign == null || campaign.name.trim().isEmpty()) return;
         campaigns.put(campaign.name.trim(), campaign);
+        recomputeActiveCampaignCountLocked();
         persistIfBound();
     }
 
     public synchronized boolean removeCampaign(String name) {
         if (name == null) return false;
         boolean removed = campaigns.remove(name.trim()) != null;
-        if (removed) persistIfBound();
+        if (removed) {
+            recomputeActiveCampaignCountLocked();
+            persistIfBound();
+        }
         return removed;
     }
 
@@ -464,6 +528,7 @@ public final class ColgramColemailerEngine {
         BroadcastCampaign c = getCampaign(name);
         if (c == null) return false;
         c.enabled = enabled;
+        recomputeActiveCampaignCountLocked();
         persistIfBound();
         return true;
     }
@@ -474,6 +539,16 @@ public final class ColgramColemailerEngine {
         c.buttons.clear();
         if (rows != null) c.buttons.addAll(rows);
         persistIfBound();
+    }
+
+    private static String folderCacheKey(int account, String folderName) {
+        return account + ":" + folderName.trim().toLowerCase(Locale.ROOT);
+    }
+
+    public Set<Long> getCachedFolderTargets(int account, String folderName) {
+        if (folderName == null || folderName.trim().isEmpty()) return Collections.emptySet();
+        Set<Long> cached = folderTargetsCache.get(folderCacheKey(account, folderName));
+        return cached != null ? cached : Collections.emptySet();
     }
 
     public synchronized void syncFolderTargets(String folderName, Set<Long> liveDialogIds) {
@@ -488,6 +563,7 @@ public final class ColgramColemailerEngine {
                 safeIds.add(id);
             }
         }
+        folderTargetsCache.put(folderCacheKey(account, folderName), Collections.unmodifiableSet(new LinkedHashSet<>(safeIds)));
         boolean changed = false;
         for (BroadcastCampaign c : campaigns.values()) {
             if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
@@ -502,30 +578,162 @@ public final class ColgramColemailerEngine {
         if (changed) persistIfBound();
     }
 
-    public synchronized void onIncomingChatMessage(long chatId, long nowSec) {
-        onIncomingChatMessage(-1, chatId, nowSec);
+    // --- Per-(account, dialogId) FLOOD_WAIT_X backoff (zero busy-spin retries) ---
+
+    private static String floodKey(int account, long dialogId) {
+        return Math.max(0, account) + ":" + dialogId;
     }
 
-    public synchronized void onIncomingChatMessage(int account, long chatId, long nowSec) {
-        if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) return;
-        boolean changed = false;
-        for (BroadcastCampaign c : campaigns.values()) {
-            if (!c.enabled || c.mode == MODE_INTERVAL) continue;
-            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
-            if (!c.targetChats.contains(chatId)) continue;
-            if (c.mode == MODE_HYBRID) {
-                long staleWindow = Math.max(c.intervalSec * 3L, HYBRID_STALE_MIN_SEC);
-                Long updatedAt = c.chatCounterUpdatedAt.get(chatId);
-                if (updatedAt != null && (nowSec - updatedAt) > staleWindow) {
-                    c.chatCounters.put(chatId, 0);
+    public static long parseFloodWaitSeconds(String errorText) {
+        if (errorText == null || errorText.isEmpty()) return 0L;
+        Matcher m = FLOOD_WAIT_RE.matcher(errorText);
+        if (m.find()) {
+            try {
+                long sec = Long.parseLong(m.group(1));
+                return Math.max(1L, Math.min(86_400L, sec));
+            } catch (NumberFormatException ignored) {}
+        }
+        String upper = errorText.toUpperCase(Locale.ROOT);
+        if (upper.contains("FLOOD_WAIT") || upper.contains("TOO MANY REQUESTS") || upper.contains("HTTP 429")) {
+            return 60L;
+        }
+        return 0L;
+    }
+
+    public void recordFloodWait(int account, long dialogId, long waitSeconds, long nowMs) {
+        if (dialogId == 0L || waitSeconds <= 0L) return;
+        long clampedSec = Math.max(1L, Math.min(86_400L, waitSeconds));
+        long until = nowMs + clampedSec * 1000L;
+        String key = floodKey(account, dialogId);
+        floodWaitUntilMs.merge(key, until, Math::max);
+        if (floodWaitUntilMs.size() > 256) {
+            floodWaitUntilMs.entrySet().removeIf(e -> e.getValue() <= nowMs);
+        }
+    }
+
+    public long getFloodBackoffRemainingMs(int account, long dialogId, long nowMs) {
+        if (floodWaitUntilMs.isEmpty() || dialogId == 0L) return 0L;
+        String key = floodKey(account, dialogId);
+        Long until = floodWaitUntilMs.get(key);
+        if (until == null) return 0L;
+        long rem = until - nowMs;
+        if (rem <= 0L) {
+            floodWaitUntilMs.remove(key, until);
+            return 0L;
+        }
+        return rem;
+    }
+
+    public boolean isFloodBackedOff(int account, long dialogId, long nowMs) {
+        return getFloodBackoffRemainingMs(account, dialogId, nowMs) > 0L;
+    }
+
+    public void clearFloodWait(int account, long dialogId) {
+        if (dialogId == 0L) return;
+        floodWaitUntilMs.remove(floodKey(account, dialogId));
+    }
+
+    public void onIncomingChatMessage(long chatId, long nowSec) {
+        onIncomingChatMessageAndCheckDue(-1, chatId, nowSec);
+    }
+
+    public void onIncomingChatMessage(int account, long chatId, long nowSec) {
+        onIncomingChatMessageAndCheckDue(account, chatId, nowSec);
+    }
+
+    /**
+     * Increments counter/hybrid campaign counters on an incoming message without disk I/O.
+     * Returns true if at least one counter/hybrid campaign reached its threshold and may now need scheduling.
+     */
+    public boolean onIncomingChatMessageAndCheckDue(int account, long chatId, long nowSec) {
+        if (activeCampaignCount.get() == 0) return false;
+        if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) return false;
+        boolean thresholdReached = false;
+        synchronized (this) {
+            for (BroadcastCampaign c : campaigns.values()) {
+                if (!c.enabled || c.mode == MODE_INTERVAL) continue;
+                if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+                if (!c.targetChats.contains(chatId)) continue;
+                if (c.mode == MODE_HYBRID) {
+                    long staleWindow = Math.max(c.intervalSec * 3L, HYBRID_STALE_MIN_SEC);
+                    Long updatedAt = c.chatCounterUpdatedAt.get(chatId);
+                    if (updatedAt != null && (nowSec - updatedAt) > staleWindow) {
+                        c.chatCounters.put(chatId, 0);
+                    }
+                }
+                int nextCount = c.chatCounters.getOrDefault(chatId, 0) + 1;
+                c.chatCounters.put(chatId, nextCount);
+                c.chatCounterUpdatedAt.put(chatId, nowSec);
+                if (c.counterThreshold > 0 && nextCount >= c.counterThreshold) {
+                    thresholdReached = true;
                 }
             }
-            int prev = c.chatCounters.getOrDefault(chatId, 0);
-            c.chatCounters.put(chatId, prev + 1);
-            c.chatCounterUpdatedAt.put(chatId, nowSec);
-            changed = true;
         }
-        if (changed) persistIfBound();
+        return thresholdReached;
+    }
+
+    /** Arms unarmed targets with current timestamp so newly enabled campaigns never fire an immediate catch-up burst. */
+    public synchronized void armMissingBaselines(int account, long nowSec) {
+        if (activeCampaignCount.get() == 0) return;
+        for (BroadcastCampaign c : campaigns.values()) {
+            if (!c.enabled || c.text.isEmpty() || c.targetChats.isEmpty()) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            for (Long chatId : c.targetChats) {
+                if (chatId == null || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) continue;
+                Long lastSentObj = c.chatLastSentAt.get(chatId);
+                if (lastSentObj == null || lastSentObj == 0L) {
+                    c.chatLastSentAt.put(chatId, nowSec);
+                }
+            }
+        }
+    }
+
+    /**
+     * Computes exact delay (in ms) until the earliest enabled campaign target becomes due.
+     * Returns -1L when idle (no active campaigns, or only counter/hybrid campaigns waiting for chat activity),
+     * guaranteeing 0.0% idle CPU and zero periodic polling wakeups.
+     */
+    public long getNextDueCampaignDelayMs(long nowMs) {
+        return getNextDueCampaignDelayMs(-1, nowMs);
+    }
+
+    public synchronized long getNextDueCampaignDelayMs(int account, long nowMs) {
+        if (activeCampaignCount.get() == 0) return -1L;
+        long minDelay = Long.MAX_VALUE;
+        long nowSec = nowMs / 1000L;
+        for (BroadcastCampaign c : campaigns.values()) {
+            if (!c.enabled || c.text.isEmpty() || c.targetChats.isEmpty()) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            long intervalMs = Math.max(MIN_INTERVAL_SEC, c.intervalSec) * 1000L;
+            int effAccount = account >= 0 ? account : (c.ownerAccount >= 0 ? c.ownerAccount : 0);
+            for (Long chatId : c.targetChats) {
+                if (chatId == null || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) continue;
+                long floodRemMs = getFloodBackoffRemainingMs(effAccount, chatId, nowMs);
+                Long lastSentObj = c.chatLastSentAt.get(chatId);
+                long lastSent = lastSentObj == null ? 0L : lastSentObj;
+                if (c.mode == MODE_INTERVAL) {
+                    long rem = lastSent == 0L ? intervalMs : Math.max(0L, lastSent * 1000L + intervalMs - nowMs);
+                    long dueIn = Math.max(rem, floodRemMs);
+                    if (dueIn < minDelay) minDelay = dueIn;
+                } else if (c.mode == MODE_COUNTER) {
+                    int count = c.chatCounters.getOrDefault(chatId, 0);
+                    if (c.counterThreshold > 0 && count >= c.counterThreshold) {
+                        if (floodRemMs < minDelay) minDelay = floodRemMs;
+                    }
+                } else {
+                    long staleWindow = Math.max(c.intervalSec * 3L, HYBRID_STALE_MIN_SEC);
+                    Long cntAt = c.chatCounterUpdatedAt.get(chatId);
+                    int count = (cntAt != null && (nowSec - cntAt) > staleWindow)
+                            ? 0 : c.chatCounters.getOrDefault(chatId, 0);
+                    if (c.counterThreshold > 0 && count >= c.counterThreshold) {
+                        long rem = lastSent == 0L ? intervalMs : Math.max(0L, lastSent * 1000L + intervalMs - nowMs);
+                        long dueIn = Math.max(rem, floodRemMs);
+                        if (dueIn < minDelay) minDelay = dueIn;
+                    }
+                }
+            }
+        }
+        return minDelay == Long.MAX_VALUE ? -1L : minDelay;
     }
 
     public synchronized List<BroadcastDueEvent> collectDueBroadcasts(long nowSec) {
@@ -533,12 +741,16 @@ public final class ColgramColemailerEngine {
     }
 
     public synchronized List<BroadcastDueEvent> collectDueBroadcasts(int account, long nowSec) {
+        if (activeCampaignCount.get() == 0) return Collections.emptyList();
         List<BroadcastDueEvent> due = new ArrayList<>();
+        long nowMs = nowSec * 1000L;
         for (BroadcastCampaign c : campaigns.values()) {
             if (!c.enabled || c.text.isEmpty() || c.targetChats.isEmpty()) continue;
             if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            int effAccount = account >= 0 ? account : (c.ownerAccount >= 0 ? c.ownerAccount : 0);
             for (Long chatId : c.targetChats) {
                 if (chatId == null || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) continue;
+                if (isFloodBackedOff(effAccount, chatId, nowMs)) continue;
                 Long lastSentObj = c.chatLastSentAt.get(chatId);
                 long lastSent = lastSentObj == null ? 0L : lastSentObj;
                 if (lastSent == 0L) {
@@ -575,7 +787,6 @@ public final class ColgramColemailerEngine {
         c.chatLastSentAt.put(chatId, nowSec);
         c.chatCounters.put(chatId, 0);
         c.chatCounterUpdatedAt.put(chatId, nowSec);
-        persistIfBound();
     }
 
     // --- Rotations ---
@@ -607,22 +818,24 @@ public final class ColgramColemailerEngine {
         return campaigns.get(chosen);
     }
 
-    // --- Whitelist & Mute rules ---
+    // --- Whitelist & Mute rules (lock-free O(1) hot-path reads) ---
 
     public synchronized void addWhitelist(long userId) {
         if (userId == 0) return;
         whitelist.add(userId);
+        whitelistFast.add(userId);
         persistIfBound();
     }
 
     public synchronized boolean removeWhitelist(long userId) {
         boolean ok = whitelist.remove(userId);
+        whitelistFast.remove(userId);
         if (ok) persistIfBound();
         return ok;
     }
 
-    public synchronized boolean isWhitelisted(long userId) {
-        return userId != 0 && whitelist.contains(userId);
+    public boolean isWhitelisted(long userId) {
+        return userId != 0 && !whitelistFast.isEmpty() && whitelistFast.contains(userId);
     }
 
     public synchronized List<Long> listWhitelist() {
@@ -632,25 +845,36 @@ public final class ColgramColemailerEngine {
     public synchronized void setMuteRule(long senderId, long scopeChatId, boolean wholeChat, String mode) {
         if (senderId == 0 && !wholeChat) return;
         String key = muteKey(senderId, scopeChatId, wholeChat);
-        muteRules.put(key, new MuteRule(senderId, scopeChatId, wholeChat, mode));
+        MuteRule rule = new MuteRule(senderId, scopeChatId, wholeChat, mode);
+        muteRules.put(key, rule);
+        muteRulesFast.put(key, rule);
         persistIfBound();
     }
 
     public synchronized boolean removeMuteRule(long senderId, long scopeChatId, boolean wholeChat) {
         String key = muteKey(senderId, scopeChatId, wholeChat);
         boolean removed = muteRules.remove(key) != null;
+        muteRulesFast.remove(key);
         if (removed) persistIfBound();
         return removed;
     }
 
-    public synchronized String getMuteActionFor(long senderId, long chatId) {
+    public String getMuteActionFor(long senderId, long chatId) {
+        if (muteRulesFast.isEmpty()) return null;
         if (senderId != 0 && isWhitelisted(senderId)) return null;
-        MuteRule scoped = muteRules.get(muteKey(senderId, chatId, false));
-        if (scoped != null) return scoped.mode;
-        MuteRule global = muteRules.get(muteKey(senderId, 0L, false));
-        if (global != null) return global.mode;
-        MuteRule chatRule = muteRules.get(muteKey(0L, chatId, true));
-        return chatRule != null ? chatRule.mode : null;
+        if (senderId != 0 && chatId != 0) {
+            MuteRule scoped = muteRulesFast.get(muteKey(senderId, chatId, false));
+            if (scoped != null) return scoped.mode;
+        }
+        if (senderId != 0) {
+            MuteRule global = muteRulesFast.get(muteKey(senderId, 0L, false));
+            if (global != null) return global.mode;
+        }
+        if (chatId != 0) {
+            MuteRule chatRule = muteRulesFast.get(muteKey(0L, chatId, true));
+            if (chatRule != null) return chatRule.mode;
+        }
+        return null;
     }
 
     public synchronized List<MuteRule> listMuteRules() {
@@ -660,6 +884,133 @@ public final class ColgramColemailerEngine {
     private static String muteKey(long senderId, long scopeChatId, boolean wholeChat) {
         return wholeChat ? ("chat:" + scopeChatId)
                 : (scopeChatId != 0 ? ("cu:" + scopeChatId + ":" + senderId) : ("u:" + senderId));
+    }
+
+    // --- 1-on-1 DM Instant Auto-Delete Mute Mode (per-account, O(1) lock-free reads) ---
+
+    private static String dmMuteKey(int account, long dialogId) {
+        return account + ":" + dialogId;
+    }
+
+    public void setSelfUserId(int account, long selfUserId) {
+        if (account < 0 || account >= 5 || selfUserId <= 0L) return;
+        selfUserIds.put(account, selfUserId);
+        // Defensive invariant: if selfUserId was somehow present, immediately evict it.
+        dmAutoDeleteMuted.remove(dmMuteKey(account, selfUserId));
+    }
+
+    private long resolveSelfUserId(int account) {
+        if (account < 0 || account >= 5) return 0L;
+        Long cached = selfUserIds.get(account);
+        if (cached != null && cached > 0L) return cached;
+        if (!persistent) return 0L;
+        try {
+            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
+            if (uc != null) {
+                Object id = ucClass.getMethod("getClientUserId").invoke(uc);
+                if (id instanceof Long) {
+                    long val = ((Long) id).longValue();
+                    if (val > 0L) {
+                        selfUserIds.put(account, val);
+                        return val;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return 0L;
+    }
+
+    /**
+     * Strictly allows ONLY real 1-on-1 private user chats:
+     * NEVER Saved Messages, NEVER groups/channels (<= 0), NEVER Secret Chats, NEVER Folders,
+     * NEVER official Telegram service IDs (777000, 42777, 333000, etc.).
+     */
+    public static boolean isEligibleDmAutoDeleteDialog(long dialogId, long selfUserId) {
+        if (dialogId <= 0L) return false;
+        if (selfUserId > 0L && dialogId == selfUserId) return false;
+        return !ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId);
+    }
+
+    public boolean hasAnyDmAutoDeleteMutes() {
+        return !dmAutoDeleteMuted.isEmpty();
+    }
+
+    public boolean isDmAutoDeleteMuted(int account, long dialogId) {
+        if (dmAutoDeleteMuted.isEmpty()) return false;
+        if (account < 0 || account >= 5 || dialogId <= 0L) return false;
+        if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)) return false;
+        Long selfId = selfUserIds.get(account);
+        if (selfId != null && selfId > 0L && dialogId == selfId) return false;
+        return Boolean.TRUE.equals(dmAutoDeleteMuted.get(dmMuteKey(account, dialogId)));
+    }
+
+    public boolean setDmAutoDeleteMuted(int account, long dialogId, boolean muted) {
+        return setDmAutoDeleteMuted(account, dialogId, resolveSelfUserId(account), muted);
+    }
+
+    public synchronized boolean setDmAutoDeleteMuted(int account, long dialogId, long selfUserId, boolean muted) {
+        if (account < 0 || account >= 5) return false;
+        if (selfUserId > 0L) {
+            selfUserIds.put(account, selfUserId);
+        }
+        long effectiveSelf = selfUserId > 0L ? selfUserId : resolveSelfUserId(account);
+        String key = dmMuteKey(account, dialogId);
+        if (muted) {
+            if (!isEligibleDmAutoDeleteDialog(dialogId, effectiveSelf)) {
+                return false;
+            }
+            Boolean prev = dmAutoDeleteMuted.put(key, Boolean.TRUE);
+            if (!Boolean.TRUE.equals(prev)) {
+                persistIfBound();
+            }
+            return true;
+        } else {
+            Boolean removed = dmAutoDeleteMuted.remove(key);
+            if (Boolean.TRUE.equals(removed)) {
+                persistIfBound();
+            }
+            return isEligibleDmAutoDeleteDialog(dialogId, effectiveSelf);
+        }
+    }
+
+    public boolean toggleDmAutoDeleteMuted(int account, long dialogId) {
+        return toggleDmAutoDeleteMuted(account, dialogId, resolveSelfUserId(account));
+    }
+
+    public synchronized boolean toggleDmAutoDeleteMuted(int account, long dialogId, long selfUserId) {
+        if (account < 0 || account >= 5) return false;
+        if (selfUserId > 0L) {
+            selfUserIds.put(account, selfUserId);
+        }
+        long effectiveSelf = selfUserId > 0L ? selfUserId : resolveSelfUserId(account);
+        if (!isEligibleDmAutoDeleteDialog(dialogId, effectiveSelf)) {
+            return false;
+        }
+        boolean next = !isDmAutoDeleteMuted(account, dialogId);
+        setDmAutoDeleteMuted(account, dialogId, effectiveSelf, next);
+        return next;
+    }
+
+    public Set<Long> getDmAutoDeleteMutedDialogs(int account) {
+        if (account < 0 || account >= 5 || dmAutoDeleteMuted.isEmpty()) {
+            return Collections.emptySet();
+        }
+        String prefix = account + ":";
+        Long selfId = selfUserIds.get(account);
+        Set<Long> out = new LinkedHashSet<>();
+        for (Map.Entry<String, Boolean> e : dmAutoDeleteMuted.entrySet()) {
+            if (!Boolean.TRUE.equals(e.getValue())) continue;
+            String k = e.getKey();
+            if (!k.startsWith(prefix)) continue;
+            try {
+                long did = Long.parseLong(k.substring(prefix.length()));
+                if (isEligibleDmAutoDeleteDialog(did, selfId == null ? 0L : selfId)) {
+                    out.add(did);
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        return Collections.unmodifiableSet(out);
     }
 
     // --- Native Telegram quiet snapshots (.тишина / .тишина выкл) ---
@@ -714,12 +1065,12 @@ public final class ColgramColemailerEngine {
         Set<String> targets = new LinkedHashSet<>();
         Matcher tm = T_ME_LINK_RE.matcher(text);
         while (tm.find()) {
-            String target = (tm.group(1) + tm.group(2)).replaceAll("[/.,;:!?)\\]}>]+$", "");
+            String target = LINK_TRAILING_PUNCT_RE.matcher(tm.group(1) + tm.group(2)).replaceAll("");
             if (!target.isEmpty()) targets.add(target);
         }
         Matcher jg = TG_JOIN_RE.matcher(text);
         while (jg.find()) {
-            String invite = jg.group(1).replaceAll("[/.,;:!?)\\]}>]+$", "");
+            String invite = LINK_TRAILING_PUNCT_RE.matcher(jg.group(1)).replaceAll("");
             if (!invite.isEmpty()) targets.add("+" + invite);
         }
         Matcher mm = MENTION_LINK_RE.matcher(text);
@@ -764,6 +1115,11 @@ public final class ColgramColemailerEngine {
                     .append('\t').append(mr.wholeChat ? '1' : '0')
                     .append('\t').append(esc(mr.mode)).append('\n');
         }
+        for (int acc = 0; acc < 5; acc++) {
+            for (Long dmDid : getDmAutoDeleteMutedDialogs(acc)) {
+                sb.append("DMMUTE\t").append(acc).append('\t').append(dmDid).append('\n');
+            }
+        }
         for (QuietSnapshot qs : quietSnapshots.values()) {
             sb.append("QUIET\t").append(qs.dialogId).append('\t').append(qs.prevNotifyType)
                     .append('\t').append(qs.prevMuteUntil).append('\t').append(qs.prevSilent ? '1' : '0')
@@ -793,8 +1149,14 @@ public final class ColgramColemailerEngine {
         campaigns.clear();
         rotations.clear();
         whitelist.clear();
+        whitelistFast.clear();
         muteRules.clear();
+        muteRulesFast.clear();
+        dmAutoDeleteMuted.clear();
+        folderTargetsCache.clear();
+        floodWaitUntilMs.clear();
         quietSnapshots.clear();
+        activeCampaignCount.set(0);
         loadedFromConfig = true;
         deserializeIntoSelf(raw);
     }
@@ -806,13 +1168,24 @@ public final class ColgramColemailerEngine {
             String[] p = line.split("\t", -1);
             try {
                 if ("WL".equals(p[0]) && p.length >= 2) {
-                    whitelist.add(Long.parseLong(p[1]));
+                    long uid = Long.parseLong(p[1]);
+                    whitelist.add(uid);
+                    whitelistFast.add(uid);
                 } else if ("MUTE".equals(p[0]) && p.length >= 5) {
                     long sid = Long.parseLong(p[1]);
                     long cid = Long.parseLong(p[2]);
                     boolean wc = "1".equals(p[3]);
                     String mode = unesc(p[4]);
-                    muteRules.put(muteKey(sid, cid, wc), new MuteRule(sid, cid, wc, mode));
+                    String k = muteKey(sid, cid, wc);
+                    MuteRule mr = new MuteRule(sid, cid, wc, mode);
+                    muteRules.put(k, mr);
+                    muteRulesFast.put(k, mr);
+                } else if ("DMMUTE".equals(p[0]) && p.length >= 3) {
+                    int acc = Integer.parseInt(p[1]);
+                    long did = Long.parseLong(p[2]);
+                    if (acc >= 0 && acc < 5 && isEligibleDmAutoDeleteDialog(did, resolveSelfUserId(acc))) {
+                        dmAutoDeleteMuted.put(dmMuteKey(acc, did), Boolean.TRUE);
+                    }
                 } else if ("QUIET".equals(p[0]) && p.length >= 9) {
                     long did = Long.parseLong(p[1]);
                     quietSnapshots.put(did, new QuietSnapshot(
@@ -853,9 +1226,11 @@ public final class ColgramColemailerEngine {
                 }
             } catch (Throwable ignored) {}
         }
+        recomputeActiveCampaignCountLocked();
     }
 
     private void persistIfBound() {
+        if (!persistent) return;
         ColgramConfig.setColemailerState(serializeState());
     }
 

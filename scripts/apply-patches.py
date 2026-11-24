@@ -8084,6 +8084,7 @@ def sync_colgram_extra_templates_and_assets(repo_path, root_dir):
         "ColgramQuickBarView.java",
         "ColgramMessageSeenSheet.java",
         "ColgramSubscriptionControls.java",
+        "ColgramBottomBarConfig.java",
     ):
         src = os.path.join(template_dir, name)
         if os.path.isfile(src):

@@ -62,7 +62,7 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
                 target.setSendBufferSize(262144);
                 target.setKeepAlive(true);
             } catch (Throwable ignored) {}
-            target.connect(new InetSocketAddress(host, targetPort), 3500);
+            target.connect(new InetSocketAddress(host, targetPort), 4500);
             if (closed) return;
             java.util.concurrent.CountDownLatch downstream = new java.util.concurrent.CountDownLatch(1);
             IO.execute(() -> {
@@ -87,18 +87,18 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
         int count, shaped = 0;
         while ((count = in.read(buffer)) != -1) {
             // Shape SOCKS5 CONNECT requests (10-byte IPv4 / 22-byte IPv6 / domain) into
-            // TSPU-evading TCP segments: first 6 bytes keep the 4-byte SOCKS5 header intact
-            // for microsocks/3proxy/danted while splitting the target IP/hostname across packets.
+            // 2-byte TSPU-evading TCP segments so carrier DPI never sees `05 01 00 01 149.154.*`
+            // or `kws*.web.telegram.org` in a single TCP segment.
             boolean socksConnect = count >= 8 && count <= 262
                     && buffer[0] == 5 && buffer[1] == 1 && buffer[2] == 0
                     && (buffer[3] == 1 || buffer[3] == 3 || buffer[3] == 4);
             if (shape && socksConnect && shaped < 4) {
                 for (int off = 0; off < count; ) {
-                    int step = Math.min(off == 0 ? 6 : 6, count - off);
+                    int step = Math.min(2, count - off);
                     out.write(buffer, off, step);
                     out.flush();
                     off += step;
-                    if (off < count) sleepQuiet(10);
+                    if (off < count) sleepQuiet(6);
                 }
                 shaped++;
                 continue;

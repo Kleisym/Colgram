@@ -106,6 +106,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
 
     private RecyclerListView listView;
     private ListAdapter adapter;
+    private long lastDialogTapMs;
 
     private int rowCount;
     private int previewRow;
@@ -118,6 +119,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
     private int hideDividersRow;
     private int sectionLayoutRow;
     private int quickBarPlacementRow;
+    private int bottomBarButtonsRow;
     private int showHeaderShieldRow;
     private int customHeaderTitleRow;
     private int sectionKolitiRow;
@@ -153,6 +155,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
         hideDividersRow = rowCount++;
         sectionLayoutRow = rowCount++;
         quickBarPlacementRow = rowCount++;
+        bottomBarButtonsRow = rowCount++;
         showHeaderShieldRow = rowCount++;
         customHeaderTitleRow = rowCount++;
         sectionKolitiRow = rowCount++;
@@ -200,6 +203,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
     }
 
     private void applyLiveDesignEverywhere(boolean refreshTheme) {
+        if (isFinishing()) return;
         if (ColgramGlobalOrbController.getInstance() != null) {
             ColgramGlobalOrbController.getInstance().applyDesignConfig();
         }
@@ -239,8 +243,17 @@ public class ColgramDesignStudioActivity extends BaseFragment {
     }
 
     private void handleClick(View view, int position) {
-        Context ctx = getParentActivity();
-        if (ctx == null) return;
+        Activity act = getParentActivity();
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed()) return;
+        final Context ctx = act;
+        final Context appCtx = act.getApplicationContext();
+
+        if (position != hideDividersRow && position != showHeaderShieldRow && position != exportJsonRow && position != kolitiAvatarResetRow) {
+            if (getVisibleDialog() != null) return;
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - lastDialogTapMs < 320L) return;
+            lastDialogTapMs = now;
+        }
 
         if (position == cardStyleRow) {
             final String[] items = {
@@ -285,6 +298,8 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         ColgramDesignConfig.setQuickBarPlacement(which);
                         applyLiveDesignEverywhere(false);
                     }).create());
+        } else if (position == bottomBarButtonsRow) {
+            ColgramBottomBarConfig.showEditorSheet(this, () -> applyLiveDesignEverywhere(false));
         } else if (position == showHeaderShieldRow) {
             boolean next = !ColgramDesignConfig.isShowHeaderShield();
             ColgramDesignConfig.setShowHeaderShield(next);
@@ -317,17 +332,19 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
                 startActivityForResult(Intent.createChooser(intent, "Выберите аватар для Koliti"), REQ_PICK_KOLITI_AVATAR);
             } catch (Throwable t) {
-                Toast.makeText(ctx, "Не удалось открыть галерею", Toast.LENGTH_SHORT).show();
+                Toast.makeText(appCtx, "Не удалось открыть галерею", Toast.LENGTH_SHORT).show();
             }
         } else if (position == kolitiAvatarResetRow) {
-            String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
+            final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
             if (!TextUtils.isEmpty(old)) {
-                try { new File(old).delete(); } catch (Throwable ignored) {}
+                org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                    try { new File(old).delete(); } catch (Throwable ignored) {}
+                });
             }
             ColgramDesignConfig.setKolitiCustomAvatarPath("");
             ColgramAeroStyler.invalidateKolitiAvatarCache();
             applyLiveDesignEverywhere(false);
-            Toast.makeText(ctx, "Возвращён стандартный аватар Koliti", Toast.LENGTH_SHORT).show();
+            Toast.makeText(appCtx, "Возвращён стандартный аватар Koliti", Toast.LENGTH_SHORT).show();
         } else if (position == kolitiNameRow) {
             showTextInputDialog(ctx, "Имя ассистента",
                     "Например: Koliti, Jarvis, Nova",
@@ -338,10 +355,10 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     });
         } else if (position == exportJsonRow) {
             String json = ColgramDesignConfig.exportJson();
-            ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+            ClipboardManager cm = (ClipboardManager) appCtx.getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
                 cm.setPrimaryClip(ClipData.newPlainText("Colgram Design", json));
-                Toast.makeText(ctx, "Конфиг дизайна (JSON) скопирован в буфер", Toast.LENGTH_SHORT).show();
+                Toast.makeText(appCtx, "Конфиг дизайна (JSON) скопирован в буфер", Toast.LENGTH_SHORT).show();
             }
         } else if (position == importJsonRow) {
             showTextInputDialog(ctx, "Импорт дизайна (JSON)",
@@ -350,9 +367,9 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     val -> {
                         if (ColgramDesignConfig.importJson(val)) {
                             applyLiveDesignEverywhere(true);
-                            Toast.makeText(ctx, "Дизайн успешно применён!", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(appCtx, "Дизайн успешно применён!", Toast.LENGTH_SHORT).show();
                         } else {
-                            Toast.makeText(ctx, "Некорректный JSON-конфиг", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(appCtx, "Некорректный JSON-конфиг", Toast.LENGTH_SHORT).show();
                         }
                     });
         } else if (position == resetAllRow) {
@@ -360,14 +377,16 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     .setTitle("Сбросить дизайн?")
                     .setMessage("Все цвета, геометрия карточек, раскладка шапки, размер и аватар Koliti вернутся к заводским.")
                     .setPositiveButton("Сбросить", (d, w) -> {
-                        String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
+                        final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
                         if (!TextUtils.isEmpty(old)) {
-                            try { new File(old).delete(); } catch (Throwable ignored) {}
+                            org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                                try { new File(old).delete(); } catch (Throwable ignored) {}
+                            });
                         }
                         ColgramDesignConfig.resetAll();
                         ColgramAeroStyler.invalidateKolitiAvatarCache();
                         applyLiveDesignEverywhere(true);
-                        Toast.makeText(ctx, "Дизайн сброшен к стандарту Colgram", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(appCtx, "Дизайн сброшен к стандарту Colgram", Toast.LENGTH_SHORT).show();
                     })
                     .setNegativeButton("Отмена", null)
                     .create());
@@ -484,7 +503,9 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     AndroidUtilities.runOnUIThread(() -> {
                         ColgramDesignConfig.setKolitiCustomAvatarPath(out.getAbsolutePath());
                         ColgramAeroStyler.invalidateKolitiAvatarCache();
-                        applyLiveDesignEverywhere(false);
+                        if (!isFinishing() && fragmentView != null) {
+                            applyLiveDesignEverywhere(false);
+                        }
                         Toast.makeText(appCtx, "Новый аватар Koliti установлен везде!", Toast.LENGTH_SHORT).show();
                     });
                 } catch (Throwable t) {
@@ -686,7 +707,12 @@ public class ColgramDesignStudioActivity extends BaseFragment {
 
     private final class SwatchRowCell extends LinearLayout {
         private final TextView labelTv;
+        private final HorizontalScrollView scrollView;
         private final LinearLayout strip;
+        private int boundKind = -1;
+        private final ArrayList<GradientDrawable> chipDotBgs = new ArrayList<>();
+        private final ArrayList<TextView> chipLabels = new ArrayList<>();
+        private final ArrayList<View> chipContainers = new ArrayList<>();
 
         SwatchRowCell(Context ctx) {
             super(ctx);
@@ -699,58 +725,30 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             labelTv.setTypeface(AndroidUtilities.bold());
             addView(labelTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
 
-            HorizontalScrollView hsv = new HorizontalScrollView(ctx);
-            hsv.setHorizontalScrollBarEnabled(false);
+            scrollView = new HorizontalScrollView(ctx);
+            scrollView.setHorizontalScrollBarEnabled(false);
             strip = new LinearLayout(ctx);
             strip.setOrientation(HORIZONTAL);
-            hsv.addView(strip);
-            addView(hsv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            scrollView.addView(strip);
+            addView(scrollView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         }
 
-        void bindAccent(Context ctx) {
-            setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
-            int cur = ColgramDesignConfig.getAccentColor();
-            labelTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
-            labelTv.setText("Акцентный цвет" + (cur == 0 ? " (Авто)" : " (" + ColgramDesignConfig.formatHexColor(cur) + ")"));
-            strip.removeAllViews();
-            for (int i = 0; i < ACCENT_SWATCHES.length; i++) {
-                final int col = ACCENT_SWATCHES[i];
-                boolean sel = cur == col;
-                strip.addView(makeSwatchChip(ctx, col == 0 ? 0xFFE11D48 : col, ACCENT_NAMES[i], sel, () -> {
-                    ColgramDesignConfig.setAccentColor(col);
-                    applyLiveDesignEverywhere(true);
-                }));
+        private void ensureChips(Context ctx, int kind, String[] names) {
+            if (boundKind == kind && chipContainers.size() == names.length + 1) {
+                return;
             }
-            strip.addView(makeSwatchChip(ctx, cur == 0 ? 0xFF334155 : cur, "+ HEX", false, () ->
-                    showHexColorDialog(ctx, "Свой акцентный цвет (HEX)", cur, picked -> {
-                        ColgramDesignConfig.setAccentColor(picked);
-                        applyLiveDesignEverywhere(true);
-                    })));
-        }
-
-        void bindSurface(Context ctx) {
-            setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
-            int preset = ColgramDesignConfig.getSurfacePreset();
-            labelTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
-            labelTv.setText("Фон и поверхность интерфейса");
+            boundKind = kind;
             strip.removeAllViews();
-            for (int i = 0; i < SURFACE_PRESET_IDS.length; i++) {
-                final int pid = SURFACE_PRESET_IDS[i];
-                boolean sel = preset == pid;
-                strip.addView(makeSwatchChip(ctx, SURFACE_SWATCH_COLORS[i], SURFACE_NAMES[i], sel, () -> {
-                    ColgramDesignConfig.setSurfacePreset(pid);
-                    applyLiveDesignEverywhere(true);
-                }));
+            chipDotBgs.clear();
+            chipLabels.clear();
+            chipContainers.clear();
+            for (int i = 0; i <= names.length; i++) {
+                String label = i < names.length ? names[i] : "+ HEX";
+                strip.addView(createChipSlot(ctx, label));
             }
-            strip.addView(makeSwatchChip(ctx, ColgramDesignConfig.getCustomSurfaceColor(), "+ HEX",
-                    preset == ColgramDesignConfig.SURFACE_CUSTOM_HEX, () ->
-                            showHexColorDialog(ctx, "Свой цвет фона (HEX)", ColgramDesignConfig.getCustomSurfaceColor(), picked -> {
-                                ColgramDesignConfig.setCustomSurfaceColor(picked);
-                                applyLiveDesignEverywhere(true);
-                            })));
         }
 
-        private View makeSwatchChip(Context ctx, int fillCol, String name, boolean selected, Runnable onClick) {
+        private View createChipSlot(Context ctx, String name) {
             LinearLayout col = new LinearLayout(ctx);
             col.setOrientation(VERTICAL);
             col.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -759,25 +757,78 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             View dot = new View(ctx);
             GradientDrawable gd = new GradientDrawable();
             gd.setShape(GradientDrawable.OVAL);
-            gd.setColor(fillCol);
-            gd.setStroke(dp(selected ? 2.6f : 1f), selected
-                    ? Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
-                    : 0x4494A3B8);
             dot.setBackground(gd);
             col.addView(dot, LayoutHelper.createLinear(34, 34));
 
             TextView tv = new TextView(ctx);
             tv.setText(name);
             tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f);
+            col.addView(tv, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 4, 0, 0));
+
+            ColgramMenuChrome.attachSpringPress(col);
+            chipDotBgs.add(gd);
+            chipLabels.add(tv);
+            chipContainers.add(col);
+            return col;
+        }
+
+        private void styleChipSlot(int index, int fillCol, boolean selected, Runnable onClick) {
+            GradientDrawable gd = chipDotBgs.get(index);
+            gd.setColor(fillCol);
+            gd.setStroke(dp(selected ? 2.6f : 1f), selected
+                    ? Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+                    : 0x4494A3B8);
+            TextView tv = chipLabels.get(index);
             tv.setTypeface(selected ? AndroidUtilities.bold() : null);
             tv.setTextColor(selected
                     ? Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
                     : Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
-            col.addView(tv, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 4, 0, 0));
+            chipContainers.get(index).setOnClickListener(v -> onClick.run());
+        }
 
-            ColgramMenuChrome.attachSpringPress(col);
-            col.setOnClickListener(v -> onClick.run());
-            return col;
+        void bindAccent(Context ctx) {
+            setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+            int cur = ColgramDesignConfig.getAccentColor();
+            labelTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+            labelTv.setText("Акцентный цвет" + (cur == 0 ? " (Авто)" : " (" + ColgramDesignConfig.formatHexColor(cur) + ")"));
+            ensureChips(ctx, 0, ACCENT_NAMES);
+            boolean matchesPreset = false;
+            for (int i = 0; i < ACCENT_SWATCHES.length; i++) {
+                final int col = ACCENT_SWATCHES[i];
+                boolean sel = cur == col;
+                if (sel) matchesPreset = true;
+                styleChipSlot(i, col == 0 ? 0xFFE11D48 : col, sel, () -> {
+                    ColgramDesignConfig.setAccentColor(col);
+                    applyLiveDesignEverywhere(true);
+                });
+            }
+            styleChipSlot(ACCENT_SWATCHES.length, cur == 0 ? 0xFF334155 : cur, cur != 0 && !matchesPreset, () ->
+                    showHexColorDialog(ctx, "Свой акцентный цвет (HEX)", cur, picked -> {
+                        ColgramDesignConfig.setAccentColor(picked);
+                        applyLiveDesignEverywhere(true);
+                    }));
+        }
+
+        void bindSurface(Context ctx) {
+            setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+            int preset = ColgramDesignConfig.getSurfacePreset();
+            labelTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+            labelTv.setText("Фон и поверхность интерфейса");
+            ensureChips(ctx, 1, SURFACE_NAMES);
+            for (int i = 0; i < SURFACE_PRESET_IDS.length; i++) {
+                final int pid = SURFACE_PRESET_IDS[i];
+                boolean sel = preset == pid;
+                styleChipSlot(i, SURFACE_SWATCH_COLORS[i], sel, () -> {
+                    ColgramDesignConfig.setSurfacePreset(pid);
+                    applyLiveDesignEverywhere(true);
+                });
+            }
+            styleChipSlot(SURFACE_PRESET_IDS.length, ColgramDesignConfig.getCustomSurfaceColor(),
+                    preset == ColgramDesignConfig.SURFACE_CUSTOM_HEX, () ->
+                            showHexColorDialog(ctx, "Свой цвет фона (HEX)", ColgramDesignConfig.getCustomSurfaceColor(), picked -> {
+                                ColgramDesignConfig.setCustomSurfaceColor(picked);
+                                applyLiveDesignEverywhere(true);
+                            }));
         }
     }
 
@@ -959,6 +1010,10 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                 } else if (position == quickBarPlacementRow) {
                     String[] qb = {"Под поиском (сворачивается при скролле)", "Свёрнута в кнопку ⚡ в шапке", "Скрыта"};
                     ColgramMenuChrome.applyDetailIcon(d, "Панель быстрого доступа", qb[ColgramDesignConfig.getQuickBarPlacement()], R.drawable.msg_folders, ColgramMenuChrome.COLOR_BLUE, true);
+                } else if (position == bottomBarButtonsRow) {
+                    ColgramMenuChrome.applyDetailIcon(d, "Кнопки нижней панели",
+                            ColgramBottomBarConfig.getSummaryText() + " · доп. страницы при свайпе",
+                            R.drawable.msg_list, ColgramMenuChrome.COLOR_INDIGO, true);
                 } else if (position == customHeaderTitleRow) {
                     ColgramMenuChrome.applyDetailIcon(d, "Заголовок в шапке чатов", ColgramDesignConfig.getEffectiveHeaderTitle() + " (нажмите, чтобы переименовать)", R.drawable.msg_edit, ColgramMenuChrome.COLOR_TEAL, false);
                 } else if (position == kolitiOrbDockRow) {

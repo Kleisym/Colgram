@@ -29,6 +29,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -62,28 +64,35 @@ public final class ColgramTelegramWsBridge {
     private static final String DEFAULT_EDGE_IP = "149.154.167.220";
     private static final String[] SHARED_EDGE_HOSTS_DC2 = {
             "kws2.web.telegram.org",
+            "kws2-1.web.telegram.org",
             "zws2.web.telegram.org",
             "venus.web.telegram.org"
     };
     private static final String[] SHARED_EDGE_HOSTS_DC4 = {
             "vesta.web.telegram.org",
             "kws4.web.telegram.org",
+            "kws4-1.web.telegram.org",
             "zws4.web.telegram.org"
     };
     private static final String[] ALL_EDGE_HOSTS = {
             "kws2.web.telegram.org",
+            "kws2-1.web.telegram.org",
             "zws2.web.telegram.org",
             "venus.web.telegram.org",
             "vesta.web.telegram.org",
             "kws4.web.telegram.org",
+            "kws4-1.web.telegram.org",
             "zws4.web.telegram.org",
             "kws1.web.telegram.org",
+            "kws1-1.web.telegram.org",
             "zws1.web.telegram.org",
             "pluto.web.telegram.org",
             "kws3.web.telegram.org",
+            "kws3-1.web.telegram.org",
             "zws3.web.telegram.org",
             "aurora.web.telegram.org",
             "kws5.web.telegram.org",
+            "kws5-1.web.telegram.org",
             "zws5.web.telegram.org",
             "flora.web.telegram.org"
     };
@@ -127,10 +136,10 @@ public final class ColgramTelegramWsBridge {
     private static final int CONNECT_RACE_BUDGET_MS = 1400;
     private static final int HANDSHAKE_READ_TIMEOUT_MS = 2200;
     private static final long MAX_DIAL_WALL_MS = 4600L;
-    private static final int CELLULAR_CONNECT_ATTEMPT_TIMEOUT_MS = 2000;
-    private static final int CELLULAR_CONNECT_RACE_BUDGET_MS = 2300;
-    private static final int CELLULAR_HANDSHAKE_READ_TIMEOUT_MS = 3200;
-    private static final long CELLULAR_MAX_DIAL_WALL_MS = 5400L;
+    private static final int CELLULAR_CONNECT_ATTEMPT_TIMEOUT_MS = 1500;
+    private static final int CELLULAR_CONNECT_RACE_BUDGET_MS = 1800;
+    private static final int CELLULAR_HANDSHAKE_READ_TIMEOUT_MS = 2600;
+    private static final long CELLULAR_MAX_DIAL_WALL_MS = 3800L;
     private static volatile boolean cellularNetwork = false;
 
     public static void setCellularNetwork(boolean cellular) {
@@ -182,13 +191,19 @@ public final class ColgramTelegramWsBridge {
     private static final long DEPRIORITIZE_TTL_MS = 45_000L;
     private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
     private static final int WS_IDLE_PING_TIMEOUT_MS = 25_000;
-    private static final int WS_PONG_WAIT_TIMEOUT_MS = 10_000;
+    private static final int WS_PONG_WAIT_TIMEOUT_MS = 9_000;
 
     private static final ExecutorService RACE_POOL = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "colgram-ws-dial");
         t.setDaemon(true);
         return t;
     });
+    private static final ScheduledExecutorService KEEPALIVE_WATCHDOG =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "colgram-ws-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
 
     static final class EdgeEndpoint {
         final String ip;
@@ -285,13 +300,15 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static int dcBucket(int dcId) {
-        return (dcId >= 1 && dcId <= 5) ? dcId : 0;
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        return (norm >= 1 && norm <= 5) ? norm : 0;
     }
 
     private ColgramTelegramWsBridge() {}
 
     public static final class WsSession implements Closeable {
         public final int dcId;
+        public final int rawDcId;
         public final String edgeIp;
         public final String sniHost;
         public final Socket socket;
@@ -303,7 +320,13 @@ public final class ColgramTelegramWsBridge {
 
         WsSession(int dcId, String edgeIp, String sniHost, Socket socket,
                   InputStream in, OutputStream out) {
+            this(dcId, dcId, edgeIp, sniHost, socket, in, out);
+        }
+
+        WsSession(int dcId, int rawDcId, String edgeIp, String sniHost, Socket socket,
+                  InputStream in, OutputStream out) {
             this.dcId = dcId;
+            this.rawDcId = rawDcId;
             this.edgeIp = edgeIp;
             this.sniHost = sniHost;
             this.socket = socket;
@@ -321,7 +344,7 @@ public final class ColgramTelegramWsBridge {
                     int chunk = Math.min(remaining, MAX_OUTBOUND_FRAME_BYTES);
                     boolean last = (chunk == remaining);
                     int headerByte = (last ? 0x80 : 0x00) | (first ? 0x02 : 0x00);
-                    writeFrame(headerByte, buf, pos, chunk);
+                    writeFrameLocked(headerByte, buf, pos, chunk);
                     first = false;
                     pos += chunk;
                     remaining -= chunk;
@@ -334,7 +357,9 @@ public final class ColgramTelegramWsBridge {
         }
 
         public void sendPong(byte[] payload, int len) throws IOException {
-            writeFrame(0x8A, payload, 0, Math.min(len, 125));
+            byte[] safe = payload == null ? new byte[0] : payload;
+            int clamped = Math.max(0, Math.min(len, Math.min(safe.length, 125)));
+            writeFrame(0x8A, safe, 0, clamped);
         }
 
         public void sendClose() {
@@ -345,6 +370,12 @@ public final class ColgramTelegramWsBridge {
         }
 
         private void writeFrame(int firstByte, byte[] data, int off, int len) throws IOException {
+            synchronized (writeLock) {
+                writeFrameLocked(firstByte, data, off, len);
+            }
+        }
+
+        private void writeFrameLocked(int firstByte, byte[] data, int off, int len) throws IOException {
             if (closed.get()) throw new IOException("WebSocket closed");
             byte[] mask = new byte[4];
             rng.nextBytes(mask);
@@ -377,10 +408,8 @@ public final class ColgramTelegramWsBridge {
             for (int i = 0; i < len; i++) {
                 frame[p + i] = (byte) (data[off + i] ^ mask[i & 3]);
             }
-            synchronized (writeLock) {
-                out.write(frame);
-                out.flush();
-            }
+            out.write(frame);
+            out.flush();
         }
 
         @Override
@@ -461,6 +490,13 @@ public final class ColgramTelegramWsBridge {
     public static WsSession dialProtected(String destHost, int destPort,
                                           ColgramDohResolver.SocketProtector protector,
                                           ColgramNativeDesync.FdProtector fdProtector) {
+        return dialProtected(destHost, destPort, protector, fdProtector, false);
+    }
+
+    public static WsSession dialProtected(String destHost, int destPort,
+                                          ColgramDohResolver.SocketProtector protector,
+                                          ColgramNativeDesync.FdProtector fdProtector,
+                                          boolean preferMediaEdge) {
         if (destPort != 443 && destPort != 80 && destPort != 5222) return null;
         int dcId = ColgramTelegramDcAddresses.dcIdFor(destHost);
         if (dcId <= 0) return null;
@@ -494,7 +530,7 @@ public final class ColgramTelegramWsBridge {
             // real-SNI Java TLS-record-split and native MODE_MULTI_SPLIT_SNI (zero MSG_OOB,
             // zero TTL=1, zero tiny MSS).
             if (!workedOnNetwork) {
-                List<EdgeEndpoint> coldCandidates = candidateEndpointsFor(dcId);
+                List<EdgeEndpoint> coldCandidates = candidateEndpointsFor(dcId, preferMediaEdge);
                 if (!coldCandidates.isEmpty()) {
                     int[] coldModes = canNative
                             ? new int[]{
@@ -509,8 +545,8 @@ public final class ColgramTelegramWsBridge {
                                     FRAG_TLS_RECORD_SNI
                             };
                     long coldBudget = Math.min(
-                            cellularNetwork ? 3600L : 2800L,
-                            Math.max(1400L, deadlineMs - System.currentTimeMillis()));
+                            cellularNetwork ? 2500L : 2000L,
+                            Math.max(1200L, deadlineMs - System.currentTimeMillis()));
                     WsSession coldWinner = raceHandshakeModes(
                             coldCandidates, dcId, coldModes, protector, fdProtector, coldBudget);
                     if (coldWinner != null) {
@@ -523,7 +559,7 @@ public final class ColgramTelegramWsBridge {
             int maxAltPerEndpoint = 2;
             for (int attempt = 0; attempt < 3; attempt++) {
                 if (System.currentTimeMillis() >= deadlineMs) break;
-                List<EdgeEndpoint> candidates = filterUnvisitedIps(candidateEndpointsFor(dcId), triedIps);
+                List<EdgeEndpoint> candidates = filterUnvisitedIps(candidateEndpointsFor(dcId, preferMediaEdge), triedIps);
                 if (candidates.isEmpty()) break;
 
                 int primaryMode = preferredFragMode;
@@ -885,10 +921,22 @@ public final class ColgramTelegramWsBridge {
         }
     }
 
-    /** Primary official Telegram WebSocket hostname for DC 1..5 (used for ATYP=0x03 L3 relay tunnels). */
+    /** Primary official Telegram WebSocket hostname for DC 1..5 or media DC ids (-2, -4, 10002, -10004). */
     public static String primaryWssHostForDc(int dcId) {
-        String[] hosts = dcHosts(dcId);
+        return primaryWssHostForDc(dcId, Obfuscated2FrameSplitter.isMediaDcId(dcId));
+    }
+
+    /** Primary official Telegram WebSocket hostname for a normalized DC and explicit media flag. */
+    public static String primaryWssHostForDc(int dcId, boolean media) {
+        String[] hosts = dcHosts(dcId, media);
         return (hosts != null && hosts.length > 0) ? hosts[0] : "kws2.web.telegram.org";
+    }
+
+    /** Fallback non-media WebSocket hostname for a DC when media edge `kws{dc}-1` fails or stalls. */
+    public static String fallbackWssHostForDc(int dcId) {
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (norm < 1 || norm > 5) return "kws2.web.telegram.org";
+        return "kws" + norm + ".web.telegram.org";
     }
 
     /**
@@ -902,8 +950,10 @@ public final class ColgramTelegramWsBridge {
      */
     public static WsSession dialViaRelaySocket(Socket relayTcpSocket, int dcId,
                                                String realHost, String relayLabel) {
-        if (relayTcpSocket == null || dcId < 1 || dcId > 5) return null;
-        String host = (realHost != null && !realHost.isEmpty()) ? realHost : primaryWssHostForDc(dcId);
+        int normDc = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (relayTcpSocket == null || normDc < 1 || normDc > 5) return null;
+        boolean media = Obfuscated2FrameSplitter.isMediaDcId(dcId);
+        String host = (realHost != null && !realHost.isEmpty()) ? realHost : primaryWssHostForDc(normDc, media);
         String label = (relayLabel != null && !relayLabel.isEmpty()) ? relayLabel : host;
         String tlsSni = pickSpoofSni(FRAG_SPOOF_SNI_TLSREC);
         try {
@@ -936,7 +986,7 @@ public final class ColgramTelegramWsBridge {
                 Log.i(TAG, "WSS-over-L3-relay upgraded ok: relay=" + label + " host=" + host
                         + " tlsSni=" + tlsSni + " dc=" + dcId);
             } catch (Throwable ignored) {}
-            return new WsSession(dcId, label, host, ssl, in, out);
+            return new WsSession(normDc, dcId, label, host, ssl, in, out);
         } catch (Throwable t) {
             spoofSniCursor.incrementAndGet();
             try {
@@ -970,15 +1020,35 @@ public final class ColgramTelegramWsBridge {
 
         private final int proto;
         private final Cipher shadowCtr;
+        private final int rawDcId;
         private final byte[] hdrPlain = new byte[4];
         private int hdrFilled = 0;
         private int payloadRemaining = -1;
         private boolean fallbackPassthrough = false;
         private ByteArrayOutputStream packetBuf = new ByteArrayOutputStream(2048);
 
-        private Obfuscated2FrameSplitter(int proto, Cipher shadowCtr) {
+        private Obfuscated2FrameSplitter(int proto, Cipher shadowCtr, int rawDcId) {
             this.proto = proto;
             this.shadowCtr = shadowCtr;
+            this.rawDcId = rawDcId;
+        }
+
+        public static int normalizeDcId(int rawDc) {
+            int absDc = Math.abs(rawDc);
+            if (absDc >= 10000) absDc -= 10000;
+            return (absDc >= 1 && absDc <= 5) ? absDc : 0;
+        }
+
+        public static boolean isMediaDcId(int rawDc) {
+            return rawDc < 0 || Math.abs(rawDc) >= 10000;
+        }
+
+        public int rawDcId() {
+            return rawDcId;
+        }
+
+        public boolean isMediaSession() {
+            return isMediaDcId(rawDcId);
         }
 
         public static Obfuscated2FrameSplitter create(byte[] initBuf, int initLen, int dcId) {
@@ -986,7 +1056,7 @@ public final class ColgramTelegramWsBridge {
         }
 
         private static Obfuscated2FrameSplitter initAndPatch(byte[] data, int length, int dcId) {
-            if (data == null || length < 64 || dcId <= 0) return null;
+            if (data == null || length < 64 || normalizeDcId(dcId) <= 0) return null;
             try {
                 byte[] key = new byte[32];
                 byte[] iv = new byte[16];
@@ -1002,9 +1072,15 @@ public final class ColgramTelegramWsBridge {
                 int p3 = (data[59] ^ ks[59]) & 0xff;
                 if (p0 != p1 || p1 != p2 || p2 != p3) return null;
                 if (p0 != 0xef && p0 != 0xdd && p0 != 0xee) return null;
-                data[60] = (byte) ((dcId & 0xff) ^ (ks[60] & 0xff));
-                data[61] = (byte) (((dcId >> 8) & 0xff) ^ (ks[61] & 0xff));
-                return new Obfuscated2FrameSplitter(p0, ctr);
+                int existingRawDc = (short) (((data[60] ^ ks[60]) & 0xff)
+                        | (((data[61] ^ ks[61]) & 0xff) << 8));
+                int effectiveRawDc = existingRawDc;
+                if (normalizeDcId(existingRawDc) <= 0) {
+                    data[60] = (byte) ((dcId & 0xff) ^ (ks[60] & 0xff));
+                    data[61] = (byte) (((dcId >> 8) & 0xff) ^ (ks[61] & 0xff));
+                    effectiveRawDc = (short) dcId;
+                }
+                return new Obfuscated2FrameSplitter(p0, ctr, effectiveRawDc);
             } catch (Throwable t) {
                 return null;
             }
@@ -1115,9 +1191,39 @@ public final class ColgramTelegramWsBridge {
         }
     }
 
+    /** True when raw DC id represents a media / CDN session (`-2`, `-4`, `10002`, `-10004`). */
+    public static boolean isMediaDcId(int rawDc) {
+        return Obfuscated2FrameSplitter.isMediaDcId(rawDc);
+    }
+
+    /** Extracts signed obfuscated2 raw DC id (`-2`, `-4`, `10002`, `-10004`, `1..5`) without mutating. */
+    public static int extractRawDcFromObfuscated2(byte[] data, int length) {
+        if (data == null || length < 64) return 0;
+        try {
+            byte[] key = new byte[32];
+            byte[] iv = new byte[16];
+            System.arraycopy(data, 8, key, 0, 32);
+            System.arraycopy(data, 40, iv, 0, 16);
+            Cipher ctr = Cipher.getInstance("AES/CTR/NoPadding");
+            ctr.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
+            byte[] ks = ctr.update(new byte[64]);
+            if (ks == null || ks.length < 64) return 0;
+            int p0 = (data[56] ^ ks[56]) & 0xff;
+            int p1 = (data[57] ^ ks[57]) & 0xff;
+            int p2 = (data[58] ^ ks[58]) & 0xff;
+            int p3 = (data[59] ^ ks[59]) & 0xff;
+            if (p0 != p1 || p1 != p2 || p2 != p3) return 0;
+            if (p0 != 0xef && p0 != 0xdd && p0 != 0xee) return 0;
+            return (short) (((data[60] ^ ks[60]) & 0xff) | (((data[61] ^ ks[61]) & 0xff) << 8));
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
     /**
      * Validate un-secreted obfuscated2 from `tgnet` (`useSecret == 0`) and inject `dc_id` into
      * bytes `[60..61]` without disturbing the AES-CTR keystream from byte `64` onward.
+     * Existing valid positive or media DC ids (`-2`, `-4`, `10002`, `-10004`) are preserved verbatim.
      */
     public static boolean patchObfuscated2Header(byte[] data, int length, int dcId) {
         return Obfuscated2FrameSplitter.initAndPatch(data, length, dcId) != null;
@@ -1131,104 +1237,135 @@ public final class ColgramTelegramWsBridge {
         try { s.setSendBufferSize(262144); } catch (Throwable ignored) {}
     }
 
+    private static void cancelWatchdog(ScheduledFuture<?> f) {
+        if (f != null) {
+            try { f.cancel(false); } catch (Throwable ignored) {}
+        }
+    }
+
     public static long pumpUpstreamFrames(WsSession session, OutputStream clientOut,
                                           OnBytes onReply) throws IOException {
         long total = 0L;
         byte[] buf = new byte[65536];
         InputStream in = session.in;
         boolean awaitingPong = false;
+        boolean inFragmentedData = false;
+        ScheduledFuture<?> pongWatchdog = null;
         if (session.socket != null) {
             try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
         }
-        while (true) {
-            int b0;
-            try {
-                b0 = in.read();
-            } catch (java.net.SocketTimeoutException idle) {
-                if (awaitingPong) {
-                    throw new IOException("WS keepalive pong timeout on " + session.edgeIp, idle);
+        try {
+            while (true) {
+                int b0;
+                try {
+                    b0 = in.read();
+                } catch (java.net.SocketTimeoutException idle) {
+                    if (awaitingPong) {
+                        throw new IOException("WS keepalive pong timeout on " + session.edgeIp, idle);
+                    }
+                    awaitingPong = true;
+                    cancelWatchdog(pongWatchdog);
+                    pongWatchdog = KEEPALIVE_WATCHDOG.schedule(
+                            session::close, WS_PONG_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    if (session.socket != null) {
+                        try { session.socket.setSoTimeout(WS_PONG_WAIT_TIMEOUT_MS); } catch (Throwable ignored) {}
+                    }
+                    session.sendPing();
+                    continue;
                 }
-                awaitingPong = true;
-                session.sendPing();
-                if (session.socket != null) {
-                    try { session.socket.setSoTimeout(WS_PONG_WAIT_TIMEOUT_MS); } catch (Throwable ignored) {}
+                if (b0 < 0) break;
+                if (awaitingPong || pongWatchdog != null) {
+                    cancelWatchdog(pongWatchdog);
+                    pongWatchdog = null;
+                    awaitingPong = false;
+                    if (session.socket != null) {
+                        try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
+                    }
                 }
-                continue;
-            }
-            if (b0 < 0) break;
-            if (awaitingPong) {
-                awaitingPong = false;
-                if (session.socket != null) {
-                    try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
+                int b1 = in.read();
+                if (b1 < 0) break;
+                boolean fin = (b0 & 0x80) != 0;
+                int opcode = b0 & 0x0f;
+                boolean masked = (b1 & 0x80) != 0;
+                long payloadLen = b1 & 0x7f;
+                if (payloadLen == 126) {
+                    int hi = readUnsignedByte(in);
+                    int lo = readUnsignedByte(in);
+                    payloadLen = (hi << 8) | lo;
+                } else if (payloadLen == 127) {
+                    payloadLen = 0L;
+                    for (int i = 0; i < 8; i++) {
+                        payloadLen = (payloadLen << 8) | readUnsignedByte(in);
+                    }
+                    if (payloadLen < 0L) throw new IOException("Invalid WS frame length");
                 }
-            }
-            int b1 = in.read();
-            if (b1 < 0) break;
-            int opcode = b0 & 0x0f;
-            boolean masked = (b1 & 0x80) != 0;
-            long payloadLen = b1 & 0x7f;
-            if (payloadLen == 126) {
-                int hi = readUnsignedByte(in);
-                int lo = readUnsignedByte(in);
-                payloadLen = (hi << 8) | lo;
-            } else if (payloadLen == 127) {
-                payloadLen = 0L;
-                for (int i = 0; i < 8; i++) {
-                    payloadLen = (payloadLen << 8) | readUnsignedByte(in);
+                byte[] mask = null;
+                if (masked) {
+                    mask = new byte[4];
+                    readFully(in, mask, 4);
                 }
-                if (payloadLen < 0L) throw new IOException("Invalid WS frame length");
-            }
-            byte[] mask = null;
-            if (masked) {
-                mask = new byte[4];
-                readFully(in, mask, 4);
-            }
 
-            if (opcode == 0x8) {
-                Log.d(TAG, "WS close frame from " + session.edgeIp + " payloadLen=" + payloadLen);
-                drainPayload(in, payloadLen);
-                session.sendClose();
-                break;
-            }
-            if (opcode == 0x9) {
-                int ctrlLen = (int) Math.min(payloadLen, 125L);
-                byte[] ctrl = new byte[ctrlLen];
-                readFully(in, ctrl, ctrlLen);
-                if (mask != null) unmask(ctrl, 0, ctrlLen, mask, 0);
-                if (payloadLen > ctrlLen) drainPayload(in, payloadLen - ctrlLen);
-                session.sendPong(ctrl, ctrlLen);
-                continue;
-            }
-            if (opcode == 0xA) {
-                drainPayload(in, payloadLen);
-                continue;
-            }
-            if (opcode != 0x0 && opcode != 0x1 && opcode != 0x2) {
-                drainPayload(in, payloadLen);
-                continue;
-            }
-
-            long left = payloadLen;
-            int maskOffset = 0;
-            while (left > 0L) {
-                int toRead = (int) Math.min(left, buf.length);
-                int n = in.read(buf, 0, toRead);
-                if (n < 0) throw new EOFException("WS frame truncated");
-                if (mask != null) {
-                    unmask(buf, 0, n, mask, maskOffset);
-                    maskOffset = (maskOffset + n) & 3;
+                if (opcode >= 0x8 && (!fin || payloadLen > 125L)) {
+                    drainPayload(in, payloadLen);
+                    session.sendClose();
+                    break;
                 }
-                clientOut.write(buf, 0, n);
-                total += n;
-                left -= n;
-                if (onReply != null) onReply.onBytes(n);
+                if (opcode == 0x8) {
+                    Log.d(TAG, "WS close frame from " + session.edgeIp + " payloadLen=" + payloadLen);
+                    drainPayload(in, payloadLen);
+                    session.sendClose();
+                    break;
+                }
+                if (opcode == 0x9) {
+                    int ctrlLen = (int) Math.min(payloadLen, 125L);
+                    byte[] ctrl = new byte[ctrlLen];
+                    if (ctrlLen > 0) readFully(in, ctrl, ctrlLen);
+                    if (mask != null && ctrlLen > 0) unmask(ctrl, 0, ctrlLen, mask, 0);
+                    if (payloadLen > ctrlLen) drainPayload(in, payloadLen - ctrlLen);
+                    session.sendPong(ctrl, ctrlLen);
+                    continue;
+                }
+                if (opcode == 0xA) {
+                    drainPayload(in, payloadLen);
+                    continue;
+                }
+                if (opcode == 0x0) {
+                    if (!inFragmentedData) {
+                        drainPayload(in, payloadLen);
+                        continue;
+                    }
+                    if (fin) inFragmentedData = false;
+                } else if (opcode == 0x1 || opcode == 0x2) {
+                    inFragmentedData = !fin;
+                } else {
+                    drainPayload(in, payloadLen);
+                    continue;
+                }
+
+                long left = payloadLen;
+                int maskOffset = 0;
+                while (left > 0L) {
+                    int toRead = (int) Math.min(left, buf.length);
+                    int n = in.read(buf, 0, toRead);
+                    if (n < 0) throw new EOFException("WS frame truncated");
+                    if (mask != null) {
+                        unmask(buf, 0, n, mask, maskOffset);
+                        maskOffset = (maskOffset + n) & 3;
+                    }
+                    clientOut.write(buf, 0, n);
+                    total += n;
+                    left -= n;
+                    if (onReply != null) onReply.onBytes(n);
+                }
+                if ((fin && !inFragmentedData) || in.available() <= 0) {
+                    clientOut.flush();
+                }
             }
-            if (in.available() <= 0) {
-                clientOut.flush();
-            }
+            clientOut.flush();
+            return total;
+        } finally {
+            cancelWatchdog(pongWatchdog);
         }
-        clientOut.flush();
-        return total;
     }
 
     public interface OnBytes {
@@ -1236,19 +1373,56 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static String[] dcHosts(int dcId) {
-        switch (dcId) {
-            case 1: return new String[]{"kws1.web.telegram.org", "zws1.web.telegram.org", "pluto.web.telegram.org"};
-            case 2: return new String[]{"kws2.web.telegram.org", "zws2.web.telegram.org", "venus.web.telegram.org"};
-            case 3: return new String[]{"kws3.web.telegram.org", "zws3.web.telegram.org", "aurora.web.telegram.org"};
-            case 4: return new String[]{"vesta.web.telegram.org", "kws4.web.telegram.org", "zws4.web.telegram.org"};
-            case 5: return new String[]{"kws5.web.telegram.org", "zws5.web.telegram.org", "flora.web.telegram.org"};
-            default: return new String[]{"kws2.web.telegram.org", "vesta.web.telegram.org"};
+        return dcHosts(dcId, Obfuscated2FrameSplitter.isMediaDcId(dcId));
+    }
+
+    private static String[] dcHosts(int dcId, boolean media) {
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (norm == 0) norm = dcId;
+        switch (norm) {
+            case 1:
+                return media
+                        ? new String[]{"kws1-1.web.telegram.org", "kws1.web.telegram.org", "zws1.web.telegram.org", "pluto.web.telegram.org"}
+                        : new String[]{"kws1.web.telegram.org", "kws1-1.web.telegram.org", "zws1.web.telegram.org", "pluto.web.telegram.org"};
+            case 2:
+                return media
+                        ? new String[]{"kws2-1.web.telegram.org", "kws2.web.telegram.org", "zws2.web.telegram.org", "venus.web.telegram.org"}
+                        : new String[]{"kws2.web.telegram.org", "kws2-1.web.telegram.org", "zws2.web.telegram.org", "venus.web.telegram.org"};
+            case 3:
+                return media
+                        ? new String[]{"kws3-1.web.telegram.org", "kws3.web.telegram.org", "zws3.web.telegram.org", "aurora.web.telegram.org"}
+                        : new String[]{"kws3.web.telegram.org", "kws3-1.web.telegram.org", "zws3.web.telegram.org", "aurora.web.telegram.org"};
+            case 4:
+                return media
+                        ? new String[]{"kws4-1.web.telegram.org", "kws4.web.telegram.org", "vesta.web.telegram.org", "zws4.web.telegram.org"}
+                        : new String[]{"vesta.web.telegram.org", "kws4.web.telegram.org", "kws4-1.web.telegram.org", "zws4.web.telegram.org"};
+            case 5:
+                return media
+                        ? new String[]{"kws5-1.web.telegram.org", "kws5.web.telegram.org", "zws5.web.telegram.org", "flora.web.telegram.org"}
+                        : new String[]{"kws5.web.telegram.org", "kws5-1.web.telegram.org", "zws5.web.telegram.org", "flora.web.telegram.org"};
+            default:
+                return media
+                        ? new String[]{"kws2-1.web.telegram.org", "kws2.web.telegram.org", "vesta.web.telegram.org"}
+                        : new String[]{"kws2.web.telegram.org", "kws2-1.web.telegram.org", "vesta.web.telegram.org"};
         }
     }
 
     private static String[] sharedEdgeHostsForDc(int dcId) {
-        if (dcId == 2) return SHARED_EDGE_HOSTS_DC2;
-        if (dcId == 4) return SHARED_EDGE_HOSTS_DC4;
+        return sharedEdgeHostsForDc(dcId, Obfuscated2FrameSplitter.isMediaDcId(dcId));
+    }
+
+    private static String[] sharedEdgeHostsForDc(int dcId, boolean media) {
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (norm == 2) {
+            return media
+                    ? new String[]{"kws2-1.web.telegram.org", "kws2.web.telegram.org", "zws2.web.telegram.org", "venus.web.telegram.org"}
+                    : SHARED_EDGE_HOSTS_DC2;
+        }
+        if (norm == 4) {
+            return media
+                    ? new String[]{"kws4-1.web.telegram.org", "kws4.web.telegram.org", "vesta.web.telegram.org", "zws4.web.telegram.org"}
+                    : SHARED_EDGE_HOSTS_DC4;
+        }
         return new String[0];
     }
 
@@ -1436,12 +1610,16 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static List<EdgeEndpoint> candidateEndpointsFor(int dcId) {
+        return candidateEndpointsFor(dcId, Obfuscated2FrameSplitter.isMediaDcId(dcId));
+    }
+
+    private static List<EdgeEndpoint> candidateEndpointsFor(int dcId, boolean media) {
         long now = System.currentTimeMillis();
         if (now - resolvedAt > DNS_CACHE_TTL_MS && refreshInFlight.compareAndSet(false, true)) {
             RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
         }
         int bucket = dcBucket(dcId);
-        return buildCandidateEndpoints(dcId, lastWorkingByDc.get(bucket), perHostIps, activeDeprioritizedKeys(now));
+        return buildCandidateEndpoints(dcId, lastWorkingByDc.get(bucket), perHostIps, activeDeprioritizedKeys(now), media);
     }
 
     /**
@@ -1458,10 +1636,20 @@ public final class ColgramTelegramWsBridge {
             EdgeEndpoint lastWorking,
             Map<String, List<String>> hostIps,
             Set<String> deprioritizedKeys) {
+        return buildCandidateEndpoints(dcId, lastWorking, hostIps, deprioritizedKeys,
+                Obfuscated2FrameSplitter.isMediaDcId(dcId));
+    }
+
+    static List<EdgeEndpoint> buildCandidateEndpoints(
+            int dcId,
+            EdgeEndpoint lastWorking,
+            Map<String, List<String>> hostIps,
+            Set<String> deprioritizedKeys,
+            boolean media) {
         LinkedHashMap<String, EdgeEndpoint> ordered = new LinkedHashMap<>();
         Set<String> skipped = deprioritizedKeys == null ? Collections.emptySet() : deprioritizedKeys;
 
-        if (lastWorking != null
+        if (!media && lastWorking != null
                 && !skipped.contains(lastWorking.key())
                 && isDcHostMatch(lastWorking.sniHost, dcId)
                 && !(DEFAULT_EDGE_IP.equals(lastWorking.ip) && !isSharedEdgeSniForDc(lastWorking.sniHost, dcId))) {
@@ -1469,14 +1657,15 @@ public final class ColgramTelegramWsBridge {
         }
 
         // For DC2/DC4, ALWAYS rank proven 149.154.167.220 ahead of DoH-resolved IPs (e.g. .99).
-        for (String host : sharedEdgeHostsForDc(dcId)) {
+        for (String host : sharedEdgeHostsForDc(dcId, media)) {
             EdgeEndpoint primaryShared = new EdgeEndpoint(DEFAULT_EDGE_IP, host);
             if (!skipped.contains(primaryShared.key())) ordered.putIfAbsent(primaryShared.key(), primaryShared);
         }
 
         // Next include fresh DoH-resolved DC-specific IPs (never pairing .220 with non-DC2/4 hosts).
+        String[] dcSnis = dcHosts(dcId, media);
         if (hostIps != null) {
-            for (String host : dcHosts(dcId)) {
+            for (String host : dcSnis) {
                 List<String> ips = hostIps.get(host);
                 if (ips == null) continue;
                 for (String ip : ips) {
@@ -1490,8 +1679,7 @@ public final class ColgramTelegramWsBridge {
 
         // Live-verified official Telegram WebSocket edge IPv4 + IPv6 addresses per DC
         // (never raw non-TLS MTProto DC IPs).
-        String[] dcSnis = dcHosts(dcId);
-        for (String secIp : secondaryEdgeIpsForDc(dcId)) {
+        for (String secIp : secondaryEdgeIpsForDc(dcBucket(dcId))) {
             if (secIp == null) continue;
             for (String host : dcSnis) {
                 if (DEFAULT_EDGE_IP.equals(secIp) && !isSharedEdgeSniForDc(host, dcId)) continue;
@@ -1503,7 +1691,7 @@ public final class ColgramTelegramWsBridge {
         if (ordered.isEmpty()) {
             // Every candidate was temporarily deprioritized; re-seed strictly within dcId's own
             // verified WSS edges so DC1/DC3/DC5 never cross-wire onto DC2's kws2 endpoint.
-            for (String secIp : secondaryEdgeIpsForDc(dcId)) {
+            for (String secIp : secondaryEdgeIpsForDc(dcBucket(dcId))) {
                 if (secIp == null) continue;
                 for (String host : dcSnis) {
                     if (DEFAULT_EDGE_IP.equals(secIp) && !isSharedEdgeSniForDc(host, dcId)) continue;
@@ -1675,9 +1863,9 @@ public final class ColgramTelegramWsBridge {
         EdgeEndpoint[] plan = {ep0, ep1, ep2, ep3};
         long[] delaysMs = {
                 0L,
-                ep0.ip.equals(ep1.ip) ? 110L : 40L,
-                140L,
-                220L
+                100L,
+                200L,
+                300L
         };
 
         final boolean useNative = isNativeFragMode(fragMode) && ColgramNativeDesync.isAvailable()

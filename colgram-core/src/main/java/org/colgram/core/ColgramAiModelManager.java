@@ -57,6 +57,8 @@ public final class ColgramAiModelManager {
     private static volatile boolean downloading = false;
     private static volatile boolean extracting = false;
     private static volatile Boolean cachedHasEmbeddedAssets = null;
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> VALID_GGUF_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     private ColgramAiModelManager() {}
 
@@ -313,13 +315,28 @@ public final class ColgramAiModelManager {
     }
 
     public static boolean isValidGgufFile(File f) {
-        if (f == null || !f.isFile() || f.length() < 65536L) {
+        if (f == null || !f.isFile()) {
             return false;
+        }
+        long len = f.length();
+        if (len < 65536L) {
+            return false;
+        }
+        String path = f.getAbsolutePath();
+        String sig = len + ":" + f.lastModified();
+        if (sig.equals(VALID_GGUF_CACHE.get(path))) {
+            return true;
         }
         byte[] hdr = new byte[4];
         try (FileInputStream fis = new FileInputStream(f)) {
             int n = fis.read(hdr);
-            return n == 4 && hdr[0] == 'G' && hdr[1] == 'G' && hdr[2] == 'U' && hdr[3] == 'F';
+            boolean ok = n == 4 && hdr[0] == 'G' && hdr[1] == 'G' && hdr[2] == 'U' && hdr[3] == 'F';
+            if (ok) {
+                VALID_GGUF_CACHE.put(path, sig);
+            } else {
+                VALID_GGUF_CACHE.remove(path);
+            }
+            return ok;
         } catch (Throwable ignored) {
             return false;
         }

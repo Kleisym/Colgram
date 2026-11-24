@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -165,21 +166,23 @@ public class ColgramTempMailActivity extends BaseFragment {
             try {
                 final ArrayList<String> fastDomains = fetchFastDomains();
                 mainHandler.post(() -> {
+                    if (isDestroyed) return;
                     discoveryRunning = false;
                     bootstrapDone = true;
                     if (!fastDomains.isEmpty()) {
                         mergeAvailableDomains(fastDomains);
                     }
                     if (listAdapter != null) listAdapter.notifyDataSetChanged();
-                    if (!hasActiveSession() && !mailboxGenerating && !isDestroyed) {
+                    if (!hasActiveSession() && !mailboxGenerating) {
                         generateNewMailbox();
-                    } else if (hasActiveSession() && !isDestroyed) {
+                    } else if (hasActiveSession()) {
                         fetchMessages(false);
                     }
                 });
             } catch (Throwable t) {
                 Log.w(TAG, "fast bootstrap failed: " + t.getMessage());
                 mainHandler.post(() -> {
+                    if (isDestroyed) return;
                     discoveryRunning = false;
                     bootstrapDone = true;
                     if (listAdapter != null) listAdapter.notifyDataSetChanged();
@@ -199,6 +202,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                 }
                 final ArrayList<String> extraDomains = fetchSlowFallbackDomains();
                 mainHandler.post(() -> {
+                    if (isDestroyed) return;
                     if (!extraDomains.isEmpty()) {
                         mergeAvailableDomains(extraDomains);
                     }
@@ -243,6 +247,7 @@ public class ColgramTempMailActivity extends BaseFragment {
         super.onFragmentDestroy();
         isDestroyed = true;
         stopAutoRefresh();
+        mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
     }
 
@@ -462,7 +467,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             if (got.isEmpty()) got = fetchSlowFallbackDomains();
             final ArrayList<String> resolved = got;
             mainHandler.post(() -> {
-                if (getParentActivity() == null) return;
+                if (isDestroyed || getParentActivity() == null) return;
                 mergeAvailableDomains(resolved);
                 if (listAdapter != null) listAdapter.notifyDataSetChanged();
                 presentDomainDialog();
@@ -471,8 +476,8 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void presentDomainDialog() {
-        final Context ctx = getParentActivity();
-        if (ctx == null) return;
+        final Activity ctx = getParentActivity();
+        if (isDestroyed || isFinishing() || ctx == null || ctx.isFinishing() || ctx.isDestroyed() || getVisibleDialog() != null) return;
 
         final ArrayList<String> labels = new ArrayList<>();
         final ArrayList<Runnable> actions = new ArrayList<>();
@@ -523,7 +528,7 @@ public class ColgramTempMailActivity extends BaseFragment {
         String title = availableDomains.isEmpty()
                 ? "Выбор сервиса и домена"
                 : "Домены (" + Math.max(2, availableDomains.size()) + " доступно)";
-        new AlertDialog.Builder(ctx)
+        showDialog(new AlertDialog.Builder(ctx, resourceProvider)
                 .setTitle(title)
                 .setItems(labels.toArray(new String[0]), (d, which) -> {
                     if (which >= 0 && which < actions.size()) {
@@ -531,7 +536,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                     }
                 })
                 .setNegativeButton("Отмена", null)
-                .show();
+                .create());
     }
 
     /** Creates a native @gmail.com or @googlemail.com mailbox directly inside Colgram (zero browser/WebView). */
@@ -588,6 +593,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             final DiscoveryResult finalRes = res;
             final Throwable finalErr = error;
             mainHandler.post(() -> {
+                if (isDestroyed) return;
                 discoveryRunning = false;
                 if (finalRes != null) {
                     synchronized (discoveredProviders) {
@@ -597,8 +603,8 @@ public class ColgramTempMailActivity extends BaseFragment {
                     saveDiscoveryState();
                 }
                 if (listAdapter != null) listAdapter.notifyDataSetChanged();
-                Context activity = getParentActivity();
-                if (activity == null) return;
+                Activity activity = getParentActivity();
+                if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
                 if (finalErr != null) {
                     showToast("Ошибка автопоиска: " + humanizeError(finalErr));
                     return;
@@ -609,17 +615,17 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void presentDiscoveryReport(DiscoveryResult res) {
-        final Context ctx = getParentActivity();
-        if (ctx == null || res == null) return;
+        final Activity ctx = getParentActivity();
+        if (isDestroyed || isFinishing() || ctx == null || ctx.isFinishing() || ctx.isDestroyed() || res == null) return;
         if (res.workingProviders.isEmpty()) {
-            new AlertDialog.Builder(ctx)
+            showDialog(new AlertDialog.Builder(ctx, resourceProvider)
                     .setTitle("Автопоиск источников")
                     .setMessage("Проверено кандидатов: " + res.probedCandidates
                             + "\nРабочие бесплатные API не ответили с текущей сети.\n\n"
                             + res.reportSummary)
                     .setPositiveButton("Добавить свой URL", (d, w) -> showAddCustomProviderDialog())
                     .setNegativeButton("Закрыть", null)
-                    .show();
+                    .create());
             return;
         }
 
@@ -628,20 +634,24 @@ public class ColgramTempMailActivity extends BaseFragment {
             ProviderSpec p = res.workingProviders.get(i);
             items[i] = p.name + " [" + p.protocol + "] — " + p.latencyMs + " мс";
         }
-        new AlertDialog.Builder(ctx)
+        showDialog(new AlertDialog.Builder(ctx, resourceProvider)
                 .setTitle("Найдено рабочих API: " + res.workingProviders.size())
                 .setItems(items, (d, which) -> {
                     pendingProvider = res.workingProviders.get(which);
                     pendingDomain = null;
                     generateNewMailbox();
                 })
-                .setNeutralButton("Подробный отчёт", (d, w) -> new AlertDialog.Builder(ctx)
-                        .setTitle("Отчёт проверки (" + res.probedCandidates + " проверено)")
-                        .setMessage(res.reportSummary)
-                        .setPositiveButton("OK", null)
-                        .show())
+                .setNeutralButton("Подробный отчёт", (d, w) -> {
+                    Activity curAct = getParentActivity();
+                    if (isDestroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
+                    showDialog(new AlertDialog.Builder(curAct, resourceProvider)
+                            .setTitle("Отчёт проверки (" + res.probedCandidates + " проверено)")
+                            .setMessage(res.reportSummary)
+                            .setPositiveButton("OK", null)
+                            .create());
+                })
                 .setNegativeButton("Закрыть", null)
-                .show();
+                .create());
     }
 
     private void showAddCustomProviderDialog() {
@@ -1015,6 +1025,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             mailboxGenerating = false;
             final String errText = lastError != null ? humanizeError(lastError) : "ни один сервис не ответил";
             mainHandler.post(() -> {
+                if (isDestroyed) return;
                 showToast("Не удалось создать ящик: " + errText);
                 if (listAdapter != null) listAdapter.notifyDataSetChanged();
             });
@@ -1305,6 +1316,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                                      String login, String domain, String password,
                                      String token, String gToken, String providerLabel) {
         mainHandler.post(() -> {
+            if (isDestroyed) return;
             SharedPreferences prefs = getPrefs();
             if (prefs != null) {
                 SharedPreferences.Editor ed = prefs.edit()
@@ -1372,6 +1384,7 @@ public class ColgramTempMailActivity extends BaseFragment {
                 }
                 final List<TempMessage> finalList = list;
                 mainHandler.post(() -> {
+                    if (isDestroyed) return;
                     boolean changed = !sameInbox(messages, finalList);
                     if (changed) {
                         synchronized (messages) {
@@ -1388,7 +1401,9 @@ public class ColgramTempMailActivity extends BaseFragment {
                 final String msg = humanizeError(t);
                 Log.w(TAG, "fetchMessages failed: " + msg);
                 if (notifyUser) {
-                    mainHandler.post(() -> showToast("Ошибка почты: " + msg));
+                    mainHandler.post(() -> {
+                        if (!isDestroyed) showToast("Ошибка почты: " + msg);
+                    });
                 }
             }
         });
@@ -1797,17 +1812,21 @@ public class ColgramTempMailActivity extends BaseFragment {
                 final String fSubject = subject;
                 final String fBody = textBody.isEmpty() ? "(Пустое тело письма)" : textBody;
                 final String fOtp = otp;
-                mainHandler.post(() -> showMessageDialog(fFrom, fSubject, fBody, fOtp));
+                mainHandler.post(() -> {
+                    if (!isDestroyed) showMessageDialog(fFrom, fSubject, fBody, fOtp);
+                });
             } catch (Throwable t) {
-                mainHandler.post(() -> showToast("Ошибка чтения: " + humanizeError(t)));
+                mainHandler.post(() -> {
+                    if (!isDestroyed) showToast("Ошибка чтения: " + humanizeError(t));
+                });
             }
         });
     }
 
     private void showMessageDialog(String from, String subject, String body, String otp) {
-        Context ctx = getParentActivity();
-        if (ctx == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(ctx);
+        Activity ctx = getParentActivity();
+        if (isDestroyed || isFinishing() || ctx == null || ctx.isFinishing() || ctx.isDestroyed()) return;
+        AlertDialog.Builder builder = new AlertDialog.Builder(ctx, resourceProvider);
         builder.setTitle(subject.isEmpty() ? "Письмо" : subject);
 
         String message = "От: " + from + "\n\n" + body;
@@ -2012,9 +2031,10 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void showToast(String text) {
+        if (isDestroyed) return;
         Context ctx = getParentActivity();
         if (ctx != null) {
-            Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show();
+            Toast.makeText(ctx.getApplicationContext(), text, Toast.LENGTH_SHORT).show();
         }
     }
 

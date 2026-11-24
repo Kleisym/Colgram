@@ -62,6 +62,8 @@ public final class ColgramNativeLlama {
             boolean flashAttn
     );
 
+    public static native int nativeWarmUpPrompt(String systemPrompt);
+
     public static native String nativeGetModelInfo();
 
     public static native int nativeGenerate(

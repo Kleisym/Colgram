@@ -77,6 +77,7 @@ public class ColgramQuickBarView extends FrameLayout {
     private final LinearLayout chipsRow;
     private Runnable onVisibilityChangeRequested;
     private Runnable onCollapseToButtonRequested;
+    private long lastNavActionMs;
 
     public ColgramQuickBarView(Context context, BaseFragment hostFragment) {
         super(context);
@@ -302,8 +303,21 @@ public class ColgramQuickBarView extends FrameLayout {
         }
     }
 
+    private boolean canLaunchNavAction() {
+        if (hostFragment == null || hostFragment.isFinishing() || hostFragment.getParentLayout() == null) {
+            return false;
+        }
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - lastNavActionMs < 380L) {
+            return false;
+        }
+        lastNavActionMs = now;
+        return true;
+    }
+
     private void executeAction(Context ctx, String id) {
-        if (hostFragment == null) return;
+        if (hostFragment == null || hostFragment.isFinishing() || ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
         int currentAccount = hostFragment.getCurrentAccount();
         switch (id) {
             case "ghost": {
@@ -313,22 +327,25 @@ public class ColgramQuickBarView extends FrameLayout {
                     triggerGhostOfflineAllAccounts();
                 }
                 rebuild();
-                Toast.makeText(ctx,
+                Toast.makeText(appCtx,
                         next ? "Невидимка ВКЛ: оффлайн, чтение и набор скрыты"
                                 : "Невидимка ВЫКЛ: обычный онлайн статус",
                         Toast.LENGTH_SHORT).show();
                 break;
             }
             case "proxy": {
+                if (!canLaunchNavAction()) return;
                 ColgramProxyManager.populateSharedConfigProxies();
                 hostFragment.presentFragment(new ProxyListActivity());
                 break;
             }
             case "koliti": {
+                if (!canLaunchNavAction()) return;
                 ColgramAiSheet.show(hostFragment, null, null);
                 break;
             }
             case "saved": {
+                if (!canLaunchNavAction()) return;
                 long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
                 if (selfId != 0) {
                     Bundle args = new Bundle();
@@ -338,22 +355,23 @@ public class ColgramQuickBarView extends FrameLayout {
                 break;
             }
             case "theme": {
-                toggleQuickTheme(ctx);
+                toggleQuickTheme(appCtx);
                 rebuild();
                 break;
             }
             case "design": {
+                if (!canLaunchNavAction()) return;
                 hostFragment.presentFragment(new ColgramDesignStudioActivity());
                 break;
             }
             case "voice": {
-                boolean next = !ColgramAiConfig.isVoiceOverEnabled(ctx);
-                ColgramAiConfig.setVoiceOverEnabled(ctx, next);
+                boolean next = !ColgramAiConfig.isVoiceOverEnabled(appCtx);
+                ColgramAiConfig.setVoiceOverEnabled(appCtx, next);
                 if (!next) {
                     ColgramKolitiVoice.stopSpeaking();
                 }
                 rebuild();
-                Toast.makeText(ctx,
+                Toast.makeText(appCtx,
                         next ? "Озвучка ответов Koliti включена" : "Озвучка ответов Koliti отключена",
                         Toast.LENGTH_SHORT).show();
                 break;
@@ -362,24 +380,28 @@ public class ColgramQuickBarView extends FrameLayout {
                 boolean next = !ColgramConfig.isAntiDeleteEnabled();
                 ColgramConfig.setAntiDeleteEnabled(next);
                 rebuild();
-                Toast.makeText(ctx,
+                Toast.makeText(appCtx,
                         next ? "Анти-удаление включено" : "Анти-удаление отключено",
                         Toast.LENGTH_SHORT).show();
                 break;
             }
             case "antispam": {
+                if (!canLaunchNavAction()) return;
                 hostFragment.presentFragment(new ColgramAntiSpamActivity());
                 break;
             }
             case "tempmail": {
+                if (!canLaunchNavAction()) return;
                 hostFragment.presentFragment(new ColgramTempMailActivity());
                 break;
             }
             case "plugins": {
+                if (!canLaunchNavAction()) return;
                 hostFragment.presentFragment(new ColgramPluginsActivity());
                 break;
             }
             case "settings": {
+                if (!canLaunchNavAction()) return;
                 hostFragment.presentFragment(new ColgramSettingsActivity());
                 break;
             }
@@ -411,7 +433,7 @@ public class ColgramQuickBarView extends FrameLayout {
                 Theme.applyTheme(target, !currentlyDark);
                 LaunchActivity.colgramSyncAllPanesAfterTheme(target, !currentlyDark);
             }
-            Toast.makeText(ctx,
+            Toast.makeText(ctx.getApplicationContext(),
                     currentlyDark ? "Светлая тема включена" : "Тёмная тема включена",
                     Toast.LENGTH_SHORT).show();
         } catch (Throwable ignored) {}
@@ -420,7 +442,12 @@ public class ColgramQuickBarView extends FrameLayout {
     public void showCustomizeDialog(Context ctx) {
         if (ctx == null) return;
         android.app.Activity act = AndroidUtilities.findActivity(ctx);
-        if (act == null || act.isFinishing()) return;
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
+        if (hostFragment != null && (hostFragment.isFinishing() || hostFragment.getVisibleDialog() != null)) return;
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - lastNavActionMs < 350L) return;
+        lastNavActionMs = now;
+        final Context appCtx = act.getApplicationContext();
         List<String> current = ColgramConfig.getQuickBarItems();
         final boolean[] checked = new boolean[ALL_ACTIONS.length];
         for (int i = 0; i < ALL_ACTIONS.length; i++) {
@@ -460,13 +487,24 @@ public class ColgramQuickBarView extends FrameLayout {
         subTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
         root.addView(subTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
 
-        android.widget.ScrollView scroll = new android.widget.ScrollView(act);
+        android.widget.ScrollView scroll = new android.widget.ScrollView(act) {
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                int maxH = Math.round(AndroidUtilities.displaySize.y * 0.56f);
+                int hMode = View.MeasureSpec.getMode(heightMeasureSpec);
+                int hSize = View.MeasureSpec.getSize(heightMeasureSpec);
+                int cappedSpec = (hMode == View.MeasureSpec.UNSPECIFIED)
+                        ? View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST)
+                        : View.MeasureSpec.makeMeasureSpec(Math.min(hSize, maxH), hMode);
+                super.onMeasure(widthMeasureSpec, cappedSpec);
+            }
+        };
         scroll.setVerticalScrollBarEnabled(false);
         LinearLayout listCol = new LinearLayout(act);
         listCol.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(listCol, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0, 1f, 0, 0, 0, 12));
+        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
 
         for (int i = 0; i < ALL_ACTIONS.length; i++) {
             final int idx = i;
@@ -499,7 +537,7 @@ public class ColgramQuickBarView extends FrameLayout {
             lbl.setTextColor(cTextPrimary);
             lbl.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
             lbl.setTypeface(AndroidUtilities.bold());
-            lbl.setMaxLines(1);
+            lbl.setMaxLines(2);
             lbl.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(lbl, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, 0, 0, 8, 0));
 
@@ -552,7 +590,7 @@ public class ColgramQuickBarView extends FrameLayout {
             ColgramConfig.setQuickBarEnabled(false);
             if (onVisibilityChangeRequested != null) onVisibilityChangeRequested.run();
             sheet.dismiss();
-            Toast.makeText(ctx, "Панель скрыта (вернуть: Настройки Colgram)", Toast.LENGTH_SHORT).show();
+            Toast.makeText(appCtx, "Панель скрыта (вернуть: Настройки Colgram)", Toast.LENGTH_SHORT).show();
         });
         footerBtns.addView(hideBtn, LayoutHelper.createLinear(0, 44, 0.9f, 0, 0, 8, 0));
 
@@ -575,7 +613,7 @@ public class ColgramQuickBarView extends FrameLayout {
             ColgramConfig.setQuickBarItems(selected);
             rebuild();
             sheet.dismiss();
-            Toast.makeText(ctx, "Панель обновлена (" + selected.size() + " кнопок)", Toast.LENGTH_SHORT).show();
+            Toast.makeText(appCtx, "Панель обновлена (" + selected.size() + " кнопок)", Toast.LENGTH_SHORT).show();
         });
         footerBtns.addView(saveBtn, LayoutHelper.createLinear(0, 44, 1.5f));
         root.addView(footerBtns, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
@@ -584,7 +622,13 @@ public class ColgramQuickBarView extends FrameLayout {
         if (hostFragment != null) {
             hostFragment.showDialog(sheet);
         } else {
-            sheet.show();
+            ColgramGlobalOrbController.pushModalSuppression();
+            sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
+            try {
+                sheet.show();
+            } catch (Throwable ignored) {
+                ColgramGlobalOrbController.popModalSuppression();
+            }
         }
     }
 

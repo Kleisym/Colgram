@@ -4,12 +4,12 @@ import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -46,12 +46,22 @@ public final class ColgramSpamGuard {
             "[\\u200b\\u200e\\u200f\\u2060-\\u2064\\u2066-\\u206f\\ufeff\\u180e\\u3164\\u115f\\u1160\\u2800]");
 
     private static final Pattern AUTH_SAFE_RE = p("(?:my\\.telegram\\.org|login\\s*code|confirmation\\s*code|код\\s+(?:входа|подтверждения))");
+    private static final Pattern AD_DISCLOSURE_RE = p("(?:\\berid\\s*[:=]\\s*[a-z0-9_-]{3,}|(?<![\\p{L}0-9_])#(?:реклама|рекламный|промо|promo|ad|sponsored)(?![\\p{L}0-9_])|реклама\\s*[.,;]\\s*(?:ооо|ип|ао|пао|инн|erid)|инн\\s*\\d{10,12}\\b[^\\n]{0,40}\\berid\\b|маркировк\\w*\\s+реклам\\w*)");
+    private static final Pattern AD_PROMO_PHRASE_RE = p("(?:на\\s+правах\\s+рекламы|партнерск\\w*\\s+(?:материал\\w*|интеграц\\w*|ссылк\\w*)|\\bреклам\\w*\\s+(?:пост\\w*|интеграц\\w*|услуг\\w*))");
     private static final Pattern CYR_RE = Pattern.compile("[а-я]");
     private static final Pattern LAT_RE = Pattern.compile("[a-z]");
     private static final Pattern WORD_RE = Pattern.compile("[0-9a-zа-я]+");
     private static final Pattern MASK_RE = p("(?:https?://\\S+|t\\.me/\\S+|telegram\\.me/\\S+|@[a-z0-9_]{3,32})");
     private static final Pattern SPACED_RE = p("(?<![\\p{L}0-9_])(?:[а-яa-z][.\\-_*•|·~/\\\\]{1,2}){3,}[а-яa-z](?![\\p{L}0-9_])");
     private static final Pattern SPACED_WS_RE = p("(?<![\\p{L}0-9_])(?:[а-я] ){3,}[а-я](?![\\p{L}0-9_])");
+    private static final Pattern SPACED_STRIP_RE = Pattern.compile("[\\s.\\-_*•|·~/\\\\]");
+    private static final Pattern CYR_DIGIT_MIX_RE = Pattern.compile("[а-я][036]+[а-я]");
+    private static final Pattern TG_USER_URL_RE = Pattern.compile("tg://user\\?id=(\\d+)");
+    private static final Pattern HAS_LETTER_RE = Pattern.compile("\\p{L}");
+    private static final Pattern HAS_DIGIT_RE = Pattern.compile("\\d");
+    private static final Pattern HANDLE_STRIP_RE = Pattern.compile("@[A-Za-z0-9_]{3,32}");
+    private static final Pattern NON_WORD_STRIP_RE = Pattern.compile("[\\W_]+");
+    private static final Pattern NON_ALNUM_CYR_RE = Pattern.compile("[^0-9a-zа-яё]");
     private static final Pattern HOMOGLYPH_LAT_ONLY_RE = Pattern.compile("^[aeopcxkymthbun]+$");
     private static final Pattern HOMOGLYPH_DECEPTIVE_CYR_RE = p(
             "^(?:ворк\\w*|курс\\w*|прайс\\w*|скуп\\w*|продам|продаю|продаем|куплю|мтс|"
@@ -86,15 +96,15 @@ public final class ColgramSpamGuard {
             new LexiconRule("\\bголд\\w*|\\bgold\\b|\\bробукс\\w*|\\bгемы\\b|\\bдонат\\w*", 15, "game_currency", false),
             new LexiconRule("аккаунт\\w*|\\bакк(?:и|а|ов)?\\b|\\bсессии\\b|\\btdata\\b|виртуальн\\w*\\s+номер\\w*|\\bпремиум\\w*|\\bpremium\\b|\\bпремк\\w*|\\bбуст(?:ы|ов)?\\b|\\busernames?\\b", 20, "tg_goods", false),
             new LexiconRule("\\bфиз(?:\\s*номер\\w*|\\s*сим\\w*|\\s*акк\\w*|ы|ов)?\\b|\\bе?-?сим(?:ки|ок|ка)?\\b|\\besim\\b|\\bсимк\\w*|\\bсим[-\\s]*карт\\w*|\\bнерег\\w*|\\bпод\\s+рег\\w*|\\bпри[её]м\\s+смс\\b|\\bотлеж\\w*\\b", 25, "sim_numbers", false),
-            new LexiconRule("заработ\\w*|зарабат\\w*|\\bворк\\w*|\\bдоход\\w*|пассивн\\w*|без\\s+вложени\\w*|подработк\\w*|удаленн\\w*\\s+работ\\w*|\\bваканси(?:я|и)\\b|\\bтребу(?:ю|е)тся\\b|набор\\s+в\\s+команду|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:от|до|сразу|момент\\w*|кажд\\w*)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|репутац\\w*\\s+в\\s+тим\\w*|(?<!\\w)\\+rep\\b|\\bпрофит\\w*|инвест\\w*|\\bearn\\w*|\\bprofit\\w*|\\binvest\\w*|\\bсхем[ауы]\\b|\\bарбитраж\\w*", 35, "earnings", true),
-            new LexiconRule("казино|\\bcasino\\b|\\bkazino\\b|\\bказик\\w*|гемблинг|\\bazart\\b|\\b1win\\b|\\bstake\\b|ставк[иа]\\b|фриспин\\w*|промокод\\w*|\\bслоты\\b|\\bbet\\b|\\bбеттинг\\w*", 35, "gambling", true),
+            new LexiconRule("заработ\\w*(?:\\s+(?:в\\s+день|от\\s+\\d+|онлайн|на\\s+крипт\\w*))?|зарабат\\w*|криптосигнал\\w*|сигнал\\w*\\s+(?:на\\s+)?(?:фьючерс\\w*|трейд\\w*|крипт\\w*|бинар\\w*)|памп\\w*\\s+канал\\w*|вип\\s*сигнал\\w*|\\bворк\\w*|\\bдоход\\w*(?:\\s+от\\s+\\d+)?|пассивн\\w*|без\\s+вложени\\w*|подработк\\w*|удаленн\\w*\\s+работ\\w*|\\bваканси(?:я|и)\\b|\\bтребу(?:ю|е)тся\\b|набор\\s+в\\s+команду|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:от|до|сразу|момент\\w*|кажд\\w*)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|репутац\\w*\\s+в\\s+тим\\w*|(?<!\\w)\\+rep\\b|\\bпрофит\\w*|инвест\\w*|\\bearn\\w*|\\bprofit\\w*|\\binvest\\w*|\\bсхем[ауы]\\b|\\bарбитраж\\w*", 35, "earnings", true),
+            new LexiconRule("казино|\\bcasino\\b|\\bkazino\\b|\\bказик\\w*|гемблинг|\\bazart\\b|\\b1win\\b|\\bstake\\b|ставк[иа]\\b(?:\\s+на\\s+спорт)?|букмекер\\w*|фриспин\\w*|промокод\\w*|джекпот\\w*|рулетк\\w*|прогноз\\w*\\s+на\\s+(?:спорт|матч)|\\bслоты\\b|\\bbet\\b|\\bбеттинг\\w*", 35, "gambling", true),
             new LexiconRule("\\bинтим\\w*|\\b18\\s*\\+|\\bэро\\b|\\bслив\\w*|\\bприват\\w*\\s+канал|\\bonlyfans\\b|\\bнюдс\\w*|\\bnudes?\\b", 35, "adult", true),
             new LexiconRule("\\bклик(?:и|ов)\\b|\\bпросмотр(?:ы|ов)\\b\\s+(?:на|для)|\\bнакрутк\\w*|\\bподписчик(?:и|ов)\\b\\s+(?:на|в|для)", 20, "smm", false),
             new LexiconRule("\\bвербовк\\w*|\\bдроп\\w*\\b|\\bобнал\\w*|\\bкарты?\\s+(?:физ|юр)", 30, "fraud", true),
-            new LexiconRule("выиграл\\w*|\\bприз\\w*|розыгрыш\\w*|халяв\\w*|\\bраздач\\w*|\\bраздаю\\b|бесплатн\\w*|\\bgiveaway\\w*|\\bбонус\\w*", 25, "prize", false),
+            new LexiconRule("выиграл\\w*|выигрыш\\w*|\\bприз\\w*|розыгрыш\\w*|халяв\\w*|\\bраздач\\w*|\\bраздаю\\b|бесплатн\\w*|\\bgiveaway\\w*|\\bбонус\\w*|получи(?:ть|те)?\\s+(?:приз|бонус|подарок|деньги)", 25, "prize", false),
             new LexiconRule("пиар\\w*\\s+в\\s+\\d+|\\b\\d+\\s+чат(?:ах|ов|а)\\b|прода(?:м|ю)\\s+рекламу\\s+в\\s+(?:чат|канал|\\d)|взаимн\\w*\\s+пиар\\w*|\\bвп\\b|рассылк\\w*\\s+по\\s+(?:чатам|лс|базе)|\\bинвайт\\w*|\\bрепост(?:ы|ов)?\\s*:|\\bкуплю\\s+чат\\w*", 25, "ad_services", false),
             new LexiconRule("делаю\\s+(?:ботов|бота|сайт\\w*|дизайн\\w*|аватар\\w*|монтаж\\w*|рекламу)|на\\s+заказ\\b|\\bуслуг\\w*|разработ\\w*\\s+(?:бот|сайт)\\w*", 20, "services", false),
-            new LexiconRule("\\b(?:мой|мою|наш|нашу)\\s+(?:канал\\w*|чат\\w*|бот\\w*|магазин\\w*|проект\\w*|групп\\w*)|\\bподпис(?:ывайся|ывайтесь|ись|итесь)\\b|\\bзаход(?:и|ите)\\b|\\bвступ(?:ай|айте)\\b|\\bзалета(?:й|йте)\\b|\\bjoin\\s+(?:my|our|us)\\b|\\bsubscribe\\b", 25, "self_promo", false)
+            new LexiconRule("\\b(?:мой|мою|наш|нашу)\\s+(?:канал\\w*|чат\\w*|бот\\w*|магазин\\w*|проект\\w*|групп\\w*)|\\bподпис(?:ывайся|ывайтесь|ись|итесь)\\b|\\bжми\\s+(?:сюда|ниже|на\\s+кнопку|по\\s+кнопке)\\b|\\bпереходи\\s+(?:сюда|по\\s+ссылке|в\\s+канал|в\\s+бот)\\b|\\bуспей\\s+(?:забрать|подписаться|войти)\\b|\\bзаход(?:и|ите)\\b|\\bвступ(?:ай|айте)\\b|\\bзалета(?:й|йте)\\b|\\bjoin\\s+(?:my|our|us)\\b|\\bsubscribe\\b", 25, "self_promo", false)
     };
 
     private static final Set<String> BUYER_BLOCKING_TOPICS = Set.of(
@@ -103,12 +113,12 @@ public final class ColgramSpamGuard {
     );
 
     private static final Pattern CARRIER_RE = p("\\b(?:билайн\\w*|мтс|мегафон\\w*|теле2|tele2|йота|yota|сб[-\\s]*моб\\w*|сбермоб\\w*|т[-\\s]*мобайл\\w*|тинькофф\\s*моб\\w*|ростелеком\\w*)\\b");
-    private static final Pattern PROMO_RE = p("\\b(?:бонус\\w*|промокод\\w*|акци[яи]|скидк\\w*|бесплатн\\w*|халяв\\w*|розыгрыш\\w*|раздач\\w*|выигр\\w*|вывод\\w*|оптом|опт\\b)");
+    private static final Pattern PROMO_RE = p("\\b(?:бонус\\w*|промокод\\w*|купон\\w*|к[еэ]шб[еэ]к\\w*|акци[яи]|скидк\\w*|бесплатн\\w*|халяв\\w*|розыгрыш\\w*|раздач\\w*|выигр\\w*|вывод\\w*|оптом|опт\\b)");
     private static final Pattern SALE_VERB_RE = p("\\b(?:продам|продаю|продается|продаем|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|отдаю|дарю|раздаю|раздача|делаю|помогу|ищу\\s+менеджер\\w*|ищ(?:у|ем)\\s+(?:партнер\\w*|админ\\w*|людей|сотрудник\\w*|работник\\w*)|требу(?:ю|е)тся|нужны\\s+люди|принима(?:ю|ем)|при[её]м\\s+(?:смс|номер\\w*|физ\\w*|акк\\w*)|возьму\\s+(?:под|на\\s+ворк|на\\s+рег\\w*|физ\\w*|сим\\w*|акк\\w*)|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:момент\\w*|сразу|от\\b)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|обращайтесь|дешевле|дешево|выгодно|недорого|по\\s+курсу|ниже\\s+рынка|купить\\s+можно|в\\s+наличии|цена\\s+за|прайс\\s*:|sell\\w*|buy\\w*|cheap\\w*)\\b");
     private static final Pattern SELLER_ASK_RE = p("\\b(?:купишь|купите|покупайте|покупай|закажи|заказывай|нужн[ыао]\\s+(?:звезд|акк|подписчик|просмотр|клик|реклам|бусты|премиум)|хочешь\\s+(?:заработать|зарабатывать|звезд|бесплатн|подарок|подарки|премиум)|хотите\\s+(?:заработать|зарабатывать))");
     private static final Pattern ROUTING_RE = p("(?:пиш(?:и|ите)|писать|связь|обращаться|отпиш(?:и|ите)|стучи(?:те)?|жду|заказ|менеджер\\w*|contact|для\\s+заказа|купить)\\s*(?:в\\s+лс|в\\s+личку|в\\s+пм|сюда|тут|мне)?\\s*[:\\-—–]?\\s*@\\w+");
     private static final Pattern EMOJI_ROUTING_RE = p("(?:📩|👉|📲|💬|✍️|✍|✉️|☎️|📞|➡️|⬇️)\\s*(?:в\\s+лс|пишите|связь|обращаться)?\\s*@\\w+");
-    private static final Pattern DM_CTA_RE = p("(?:\\bв\\s+лс\\b|\\bв\\s+личк\\w*|\\bв\\s+пм\\b|\\bлс\\s+открыт\\w*|\\bпиш(?:и|ите)\\b|\\bнапиш(?:и|ите)\\b|\\bотпиш(?:и|ите)\\w*|\\bстуч(?:и|ите)\\b|подробн\\w*|ссылка\\s+в\\s+(?:профиле|био|описании)|\\bв\\s+био\\b|\\bпо\\s+ссылке\\b|жми\\b|переходи\\w*|\\bтык\\b|\\bdm\\b|\\bpm\\b|\\bwrite\\s+me\\b|\\bcontact\\b)");
+    private static final Pattern DM_CTA_RE = p("(?:\\bв\\s+лс\\b|\\bв\\s+личк\\w*|\\bв\\s+пм\\b|\\bлс\\s+открыт\\w*|\\bпиш(?:и|ите)\\b|\\bнапиш(?:и|ите)\\b|\\bотпиш(?:и|ите)\\w*|\\bстуч(?:и|ите)\\b|подробн\\w*|ссылка\\s+в\\s+(?:профиле|био|описании)|\\bв\\s+био\\b|\\bпо\\s+ссылке\\b|жми(?:\\s+сюда)?\\b|кликай\\w*|переходи\\w*|\\bтык(?:ай)?\\b|\\bуспей\\b|\\bdm\\b|\\bpm\\b|\\bwrite\\s+me\\b|\\bcontact\\b)");
     private static final Pattern PRICE_RE = p("\\d+(?:[.,]\\d+)?\\s*(?:₽|руб\\w*|\\$|usd\\w*|€|грн|тг|⭐|🌟|звезд\\w*|ton\\b|тон\\b)|\\$\\s*\\d+");
     private static final Pattern LINK_RE = p("t\\.me/(?:\\+|joinchat/|[a-z0-9_]{5,})|telegram\\.me/|https?://\\S+");
     private static final Pattern PRIVATE_LINK_RE = p("t\\.me/(?:\\+|joinchat/)|t\\.me/[a-z0-9_]*bot\\b|\\?start=");
@@ -168,6 +178,7 @@ public final class ColgramSpamGuard {
         public final boolean isSpam;
         public final boolean shouldAutoRead;
         public final boolean isHardSpam;
+        public final boolean isExplicitAd;
         public final boolean isLead;
         public final String primaryTrigger;
         public final List<String> factors;
@@ -177,10 +188,18 @@ public final class ColgramSpamGuard {
         public SpamReport(int score, boolean isSpam, boolean shouldAutoRead, boolean isHardSpam,
                           boolean isLead, String primaryTrigger, List<String> factors,
                           Set<String> obfuscationFlags, String normalizedText) {
+            this(score, isSpam, shouldAutoRead, isHardSpam, false, isLead,
+                    primaryTrigger, factors, obfuscationFlags, normalizedText);
+        }
+
+        public SpamReport(int score, boolean isSpam, boolean shouldAutoRead, boolean isHardSpam,
+                          boolean isExplicitAd, boolean isLead, String primaryTrigger, List<String> factors,
+                          Set<String> obfuscationFlags, String normalizedText) {
             this.score = score;
             this.isSpam = isSpam;
             this.shouldAutoRead = shouldAutoRead;
             this.isHardSpam = isHardSpam;
+            this.isExplicitAd = isExplicitAd;
             this.isLead = isLead;
             this.primaryTrigger = primaryTrigger;
             this.factors = Collections.unmodifiableList(factors);
@@ -219,7 +238,7 @@ public final class ColgramSpamGuard {
         int messages;
     }
 
-    private static final HashMap<Long, SenderState> senders = new HashMap<>();
+    private static final ConcurrentHashMap<Long, SenderState> senders = new ConcurrentHashMap<>();
 
     private ColgramSpamGuard() {}
 
@@ -253,7 +272,7 @@ public final class ColgramSpamGuard {
         while (spacedM.find()) {
             flags.add("spaced_letters");
             spacedM.appendReplacement(sb1, Matcher.quoteReplacement(
-                    spacedM.group(0).replaceAll("[\\s.\\-_*•|·~/\\\\]", "")));
+                    SPACED_STRIP_RE.matcher(spacedM.group(0)).replaceAll("")));
         }
         spacedM.appendTail(sb1);
         t = sb1.toString();
@@ -288,7 +307,7 @@ public final class ColgramSpamGuard {
             String w = wm.group();
             String rep = w;
             boolean hasCyr = CYR_RE.matcher(w).find();
-            if (hasCyr && (LAT_RE.matcher(w).find() || w.matches(".*[а-я][036]+[а-я].*"))) {
+            if (hasCyr && (LAT_RE.matcher(w).find() || CYR_DIGIT_MIX_RE.matcher(w).find())) {
                 flags.add("mixed_script");
                 rep = ColgramNotificationFilter.foldHomoglyphs(w);
             } else if (hasCyrContext && w.length() >= 3 && HOMOGLYPH_LAT_ONLY_RE.matcher(w).matches()) {
@@ -329,7 +348,7 @@ public final class ColgramSpamGuard {
         for (MentionTarget ent : entities) {
             long target = ent.targetUserId;
             if (target == 0 && !ent.targetUrl.isEmpty()) {
-                Matcher um = Pattern.compile("tg://user\\?id=(\\d+)").matcher(ent.targetUrl.toLowerCase(Locale.ROOT));
+                Matcher um = TG_USER_URL_RE.matcher(ent.targetUrl.toLowerCase(Locale.ROOT));
                 if (um.find()) {
                     try { target = Long.parseLong(um.group(1)); } catch (NumberFormatException ignored) {}
                 }
@@ -364,7 +383,7 @@ public final class ColgramSpamGuard {
                 userMentions++;
                 totalMentions++;
                 String slice = utf16Slice(text, ent.offset, ent.length);
-                if (!slice.matches(".*\\p{L}.*") && !slice.matches(".*\\d.*")) {
+                if (!HAS_LETTER_RE.matcher(slice).find() && !HAS_DIGIT_RE.matcher(slice).find()) {
                     return true;
                 }
             } else {
@@ -432,49 +451,57 @@ public final class ColgramSpamGuard {
     }
 
     public static SpamReport diagnose(String rawText) {
-        return diagnose(rawText, "", null, false, false, false, false, false, Collections.emptyList());
+        return diagnose(rawText, "", null, false, false, false, false, false, Collections.emptyList(), false, false);
     }
 
     public static SpamReport diagnose(String rawText, String metadata, String pingKind, boolean isPing,
                                       boolean viaBot, boolean visualMedia, boolean hiddenOrMassEntity,
                                       boolean isLeadCheckAllowed, Collection<String> ownUsernames) {
+        return diagnose(rawText, metadata, pingKind, isPing, viaBot, visualMedia, hiddenOrMassEntity,
+                isLeadCheckAllowed, ownUsernames, false, false);
+    }
+
+    public static SpamReport diagnose(String rawText, String metadata, String pingKind, boolean isPing,
+                                      boolean viaBot, boolean visualMedia, boolean hiddenOrMassEntity,
+                                      boolean isLeadCheckAllowed, Collection<String> ownUsernames,
+                                      boolean hasInlineUrlButtons, boolean isForwardedFromChannel) {
         String text = rawText == null ? "" : rawText;
         String meta = metadata == null ? "" : metadata;
         NormalizedResult combined = normalizeText(meta.isEmpty() ? text : (text + "\n" + meta));
         List<String> factors = new ArrayList<>();
 
         if (AUTH_SAFE_RE.matcher(combined.normalized).find()) {
-            return new SpamReport(0, false, false, false, false, "auth_safe",
+            return new SpamReport(0, false, false, false, false, false, "auth_safe",
                     Collections.singletonList("telegram_auth_code"), combined.flags, combined.normalized);
         }
 
         if (PING_STEALTH.equals(pingKind)) {
-            return new SpamReport(100, true, true, true, false, "stealth_ping",
+            return new SpamReport(100, true, true, true, false, false, "stealth_ping",
                     Collections.singletonList("hidden_mention_without_username_or_reply"),
                     combined.flags, combined.normalized);
         }
         if (viaBot) {
-            return new SpamReport(100, true, true, true, false, "sent_via_inline_bot",
+            return new SpamReport(100, true, true, true, false, false, "sent_via_inline_bot",
                     Collections.singletonList("inline_bot"), combined.flags, combined.normalized);
         }
         if (hasInvisibleGhostChars(text)) {
-            return new SpamReport(100, true, true, true, false, "invisible_ghost_ping",
+            return new SpamReport(100, true, true, true, false, false, "invisible_ghost_ping",
                     Collections.singletonList("zero_width_ghost_chars"), combined.flags, combined.normalized);
         }
         if (hiddenOrMassEntity) {
-            return new SpamReport(100, true, true, true, false, "hidden_or_mass_entity",
+            return new SpamReport(100, true, true, true, false, false, "hidden_or_mass_entity",
                     Collections.singletonList("entity_ghost_or_mass_mention"), combined.flags, combined.normalized);
         }
         String lowText = text.toLowerCase(Locale.ROOT);
         for (Pattern sig : SPAM_SIGNATURES) {
             if (sig.matcher(lowText).find()) {
-                return new SpamReport(100, true, true, true, false, "signature_match",
+                return new SpamReport(100, true, true, true, false, false, "signature_match",
                         Collections.singletonList("autoposter_signature"), combined.flags, combined.normalized);
             }
         }
 
-        if (text.isEmpty() && meta.isEmpty()) {
-            return new SpamReport(0, false, false, false, false, "",
+        if (text.isEmpty() && meta.isEmpty() && !hasInlineUrlButtons) {
+            return new SpamReport(0, false, false, false, false, false, "",
                     Collections.emptyList(), combined.flags, "");
         }
 
@@ -487,6 +514,16 @@ public final class ColgramSpamGuard {
         }
 
         int score = 0;
+        boolean explicitAd = AD_DISCLOSURE_RE.matcher(combined.normalized).find();
+        if (explicitAd) {
+            score += 65;
+            factors.add("ad_disclosure(+65)");
+        }
+        boolean adPromoPhrase = AD_PROMO_PHRASE_RE.matcher(prose).find();
+        if (adPromoPhrase) {
+            score += 35;
+            factors.add("ad_promo_phrase(+35)");
+        }
         if (combined.flags.contains("mixed_script")) { score += 30; factors.add("lookalike_letters(+30)"); }
         if (combined.flags.contains("fancy_font")) { score += 25; factors.add("fancy_unicode_font(+25)"); }
         if (combined.flags.contains("spaced_letters")) { score += 25; factors.add("spaced_out_letters(+25)"); }
@@ -526,6 +563,7 @@ public final class ColgramSpamGuard {
         boolean hasTextRouting = ROUTING_RE.matcher(combined.normalized).find() && !foreignHandles.isEmpty();
         boolean hasDmCta = DM_CTA_RE.matcher(prose).find();
         boolean hasLinks = LINK_RE.matcher(combined.normalized).find();
+        boolean hasPrivateLink = hasLinks && PRIVATE_LINK_RE.matcher(combined.normalized).find();
         int priceCount = countMatches(PRICE_RE, prose);
         boolean sellerHeader = SELLER_HEADER_RE.matcher(prose).find();
         boolean contactSection = CONTACT_SECTION_RE.matcher(prose).find() && (hasLinks || !foreignHandles.isEmpty());
@@ -553,15 +591,27 @@ public final class ColgramSpamGuard {
         if (hasSaleVerb) { score += 25; factors.add("sale_verb(+25)"); }
         if (hasSellerAsk) { score += 55; factors.add("seller_ask(+55)"); }
 
-        boolean commercialCore = topicPoints > 0 || hasSaleVerb || hasSellerAsk;
+        boolean commercialCore = topicPoints > 0 || hasSaleVerb || hasSellerAsk || adPromoPhrase || explicitAd;
         if (hasEmojiRouting) { score += 30; factors.add("emoji_contact_routing(+30)"); }
         else if (hasTextRouting) { score += 25; factors.add("text_seller_routing(+25)"); }
         if (hasDmCta && commercialCore) { score += 20; factors.add("dm_call_to_action(+20)"); }
 
         if (hasLinks) {
-            int lp = PRIVATE_LINK_RE.matcher(combined.normalized).find() ? 25 : 10;
+            int lp = hasPrivateLink ? 25 : 10;
             score += lp;
             factors.add("promo_links(+" + lp + ")");
+        }
+
+        boolean hasPromo = PROMO_RE.matcher(prose).find();
+        if (hasInlineUrlButtons) {
+            boolean suspiciousButtons = commercialCore || hasLinks || hasPromo || hasDmCta || isForwardedFromChannel || score >= 15;
+            int bp = suspiciousButtons ? 35 : 20;
+            score += bp;
+            factors.add("inline_url_buttons(+" + bp + ")");
+        }
+        if (isForwardedFromChannel && (commercialCore || hasLinks || hasInlineUrlButtons || hasPromo || hasDmCta)) {
+            score += 25;
+            factors.add("ad_channel_forward(+25)");
         }
 
         if (hasRepeatedDestinationAndJoin(combined.normalized, prose)) {
@@ -610,10 +660,11 @@ public final class ColgramSpamGuard {
         }
 
         boolean commercial = commercialCore || hasEmojiRouting || hasTextRouting;
-        boolean hasPromo = PROMO_RE.matcher(prose).find();
-        boolean combo = topicPoints > 0 && (hasSaleVerb || hasSellerAsk || hasEmojiRouting || hasTextRouting
+        boolean combo = (topicPoints > 0 && (hasSaleVerb || hasSellerAsk || hasEmojiRouting || hasTextRouting
                 || hasDmCta || hasLinks || priceCount > 0 || hasPromo || !foreignHandles.isEmpty()
-                || !combined.flags.isEmpty() || (strongTopic && multiHitTopic) || topics.size() >= 2);
+                || !combined.flags.isEmpty() || (strongTopic && multiHitTopic) || topics.size() >= 2
+                || hasInlineUrlButtons || isForwardedFromChannel))
+                || (hasInlineUrlButtons && (hasLinks || hasPromo || hasDmCta || isForwardedFromChannel));
         if (combo) {
             score += 20;
             factors.add("commercial_combo(+20)");
@@ -636,12 +687,12 @@ public final class ColgramSpamGuard {
             damp += 15;
             factors.add("conversational_markers(-15)");
         }
-        int cap = (hasSellerAsk || combo || !combined.flags.isEmpty() || catalogueOffer) ? 0
+        int cap = (explicitAd || hasSellerAsk || combo || !combined.flags.isEmpty() || catalogueOffer) ? 0
                 : (strongTopic ? 10 : (commercial && score >= 70 ? 20 : 40));
         score = Math.max(0, score - Math.min(damp, cap));
 
         boolean isLead = false;
-        if (isLeadCheckAllowed && meta.isEmpty() && !catalogueOffer) {
+        if (isLeadCheckAllowed && meta.isEmpty() && !catalogueOffer && !explicitAd && !hasInlineUrlButtons) {
             boolean strongCommercial = hasSellerAsk || hasTextRouting || hasEmojiRouting || hasLinks
                     || (!foreignHandles.isEmpty() && (topicPoints > 0 || hasSaleVerb || hasDmCta));
             if (!strongCommercial && isGenuineBuyerQuestion(text, ownUsernames)) {
@@ -652,28 +703,31 @@ public final class ColgramSpamGuard {
         }
 
         boolean autoRead = score >= SPAM_THRESHOLD;
-        if (!isLead && !isPing) {
-            boolean strongContact = hasEmojiRouting || hasTextRouting || hasDmCta || contactSection || !foreignHandles.isEmpty() || hasLinks;
-            boolean saleOrCombo = hasSaleVerb || hasSellerAsk || combo;
+        if (explicitAd) {
+            autoRead = true;
+        } else if (!isLead && !isPing) {
+            boolean strongContact = hasEmojiRouting || hasTextRouting || hasDmCta || contactSection
+                    || !foreignHandles.isEmpty() || hasLinks || hasInlineUrlButtons;
+            boolean saleOrCombo = hasSaleVerb || hasSellerAsk || combo || adPromoPhrase;
             autoRead = hasRepeatedDestinationAndJoin(combined.normalized, prose)
                     || (score >= 80 && (catalogueOffer || (strongContact && saleOrCombo)));
         } else if (!isLead && PING_NAME.equals(pingKind) && score >= SPAM_THRESHOLD - 15) {
             autoRead = true;
         } else if (!isLead && isPing && visualMedia) {
-            String rest = text.replaceAll("@[A-Za-z0-9_]{3,32}", " ").replaceAll("[\\W_]+", "");
+            String rest = NON_WORD_STRIP_RE.matcher(HANDLE_STRIP_RE.matcher(text).replaceAll(" ")).replaceAll("");
             autoRead = rest.length() < 12 || score >= SPAM_THRESHOLD - 15;
         } else if (!isLead && isPing && score >= SPAM_THRESHOLD - 15) {
             autoRead = true;
         }
 
         String trigger = factors.isEmpty() ? "low_score" : factors.get(0);
-        return new SpamReport(score, score >= SPAM_THRESHOLD, autoRead, false, isLead,
+        return new SpamReport(score, score >= SPAM_THRESHOLD, autoRead, false, explicitAd, isLead,
                 trigger, factors, combined.flags, combined.normalized);
     }
 
     /** Score one inbound message and return VERDICT_OK / VERDICT_MUTE / VERDICT_DELETE. */
-    public static synchronized int judge(long dialogId, long senderId, String text,
-                                         boolean isContact, boolean isGroup) {
+    public static int judge(long dialogId, long senderId, String text,
+                            boolean isContact, boolean isGroup) {
         if (!ColgramConfig.isSpamGuardEnabled()) return VERDICT_OK;
         if (dialogId == 0 || senderId == 0 || isContact) return VERDICT_OK;
         if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)
@@ -684,25 +738,31 @@ public final class ColgramSpamGuard {
         if (text == null) text = "";
 
         long now = System.currentTimeMillis();
-        SenderState state = senders.get(senderId);
-        if (state == null || now - state.windowStart > WINDOW_MS) {
-            state = new SenderState();
-            state.windowStart = now;
-            senders.put(senderId, state);
+        if (senders.size() > 512) {
+            senders.entrySet().removeIf(e -> now - e.getValue().windowStart > WINDOW_MS);
             if (senders.size() > 512) senders.clear();
         }
-        state.messages++;
+        SenderState state = senders.compute(senderId, (k, existing) -> {
+            if (existing == null || now - existing.windowStart > WINDOW_MS) {
+                SenderState fresh = new SenderState();
+                fresh.windowStart = now;
+                fresh.messages = 1;
+                return fresh;
+            }
+            existing.messages++;
+            return existing;
+        });
 
         SpamReport report = diagnose(text, "", null, !isGroup, false, false, false, false, Collections.emptyList());
         int effectiveScore = report.score + (state.messages >= 3 && report.score >= 25 ? 20 : 0);
         state.score = Math.max(state.score, effectiveScore);
 
-        if (isGroup && (report.isHardSpam || state.score >= 85)) return VERDICT_DELETE;
+        if (isGroup && (report.isHardSpam || report.isExplicitAd || state.score >= 85)) return VERDICT_DELETE;
         if (state.score >= SPAM_THRESHOLD) return VERDICT_MUTE;
         return VERDICT_OK;
     }
 
-    public static synchronized void reset(long senderId) {
+    public static void reset(long senderId) {
         senders.remove(senderId);
     }
 
@@ -742,8 +802,8 @@ public final class ColgramSpamGuard {
 
     private static String lettersOnly(String raw) {
         if (raw == null) return "";
-        return Normalizer.normalize(raw, Normalizer.Form.NFKC)
-                .toLowerCase(Locale.ROOT)
-                .replaceAll("[^0-9a-zа-яё]", "");
+        return NON_ALNUM_CYR_RE.matcher(
+                Normalizer.normalize(raw, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT)
+        ).replaceAll("");
     }
 }

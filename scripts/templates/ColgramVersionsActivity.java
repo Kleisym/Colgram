@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
@@ -680,8 +681,9 @@ public class ColgramVersionsActivity extends BaseFragment {
     // ---------------------------------------------------------------- actions
 
     private void confirmInstall(Row row) {
-        if (getParentActivity() == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
+        Activity act = getParentActivity();
+        if (destroyed || isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
+        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
         builder.setTitle("Установить сборку");
         builder.setMessage(row.title + "\n\n" + row.subtitle
                 + "\n\nAPK будет скачан и установлен поверх текущего Colgram. "
@@ -790,9 +792,13 @@ public class ColgramVersionsActivity extends BaseFragment {
                                     lastPct = pct;
                                     final long doneMb = done / (1024L * 1024L);
                                     final long totalMb = total / (1024L * 1024L);
-                                    mainHandler.post(() -> progress.setMessage(
-                                            "Загрузка сборки... " + pct + "%\n"
-                                                    + doneMb + " / " + totalMb + " МБ\n" + row.title));
+                                    mainHandler.post(() -> {
+                                        if (!destroyed && !cancelled.get() && progress.isShowing()) {
+                                            progress.setMessage(
+                                                    "Загрузка сборки... " + pct + "%\n"
+                                                            + doneMb + " / " + totalMb + " МБ\n" + row.title);
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -817,22 +823,25 @@ public class ColgramVersionsActivity extends BaseFragment {
                 }
 
                 final File apk = target;
+                final Context appCtx = ctx.getApplicationContext();
                 mainHandler.post(() -> {
                     try {
                         progress.dismiss();
                     } catch (Throwable ignore) {}
-                    launchInstaller(ctx, apk);
+                    if (destroyed || cancelled.get()) return;
+                    Activity curAct = getParentActivity();
+                    launchInstaller(curAct != null ? curAct : appCtx, apk);
                 });
             } catch (Throwable t) {
                 final String msg = t.getMessage() == null ? t.toString() : t.getMessage();
                 Log.w(TAG, "download failed: " + msg);
+                final Context appCtx = ctx.getApplicationContext();
                 mainHandler.post(() -> {
                     try {
                         progress.dismiss();
                     } catch (Throwable ignore) {}
-                    if (getParentActivity() != null) {
-                        Toast.makeText(getParentActivity(), "Не удалось скачать: " + msg, Toast.LENGTH_LONG).show();
-                    }
+                    if (destroyed) return;
+                    Toast.makeText(appCtx, "Не удалось скачать: " + msg, Toast.LENGTH_LONG).show();
                 });
             }
         });
@@ -864,24 +873,26 @@ public class ColgramVersionsActivity extends BaseFragment {
     }
 
     private void launchInstaller(Context ctx, File apk) {
+        if (ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
         try {
-            if (Build.VERSION.SDK_INT >= 26 && !ctx.getPackageManager().canRequestPackageInstalls()) {
-                Toast.makeText(ctx, "Разрешите установку обновлений Colgram из неизвестных источников", Toast.LENGTH_LONG).show();
+            if (Build.VERSION.SDK_INT >= 26 && !appCtx.getPackageManager().canRequestPackageInstalls()) {
+                Toast.makeText(appCtx, "Разрешите установку обновлений Colgram из неизвестных источников", Toast.LENGTH_LONG).show();
                 Intent perm = new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                        Uri.parse("package:" + ctx.getPackageName()));
+                        Uri.parse("package:" + appCtx.getPackageName()));
                 perm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                ctx.startActivity(perm);
+                appCtx.startActivity(perm);
                 return;
             }
-            Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".provider", apk);
+            Uri uri = FileProvider.getUriForFile(appCtx, appCtx.getPackageName() + ".provider", apk);
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setDataAndType(uri, "application/vnd.android.package-archive");
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            ctx.startActivity(intent);
+            appCtx.startActivity(intent);
         } catch (Throwable t) {
             Log.w(TAG, "installer launch failed: " + t.getMessage());
-            Toast.makeText(ctx, "Не удалось запустить установщик: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            Toast.makeText(appCtx, "Не удалось запустить установщик: " + t.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
@@ -890,8 +901,10 @@ public class ColgramVersionsActivity extends BaseFragment {
      * build tag and open the workflow that rebuilds Colgram on it.
      */
     private void confirmTagBuild(Row row) {
-        if (getParentActivity() == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
+        Activity act = getParentActivity();
+        if (destroyed || isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
+        final Context appCtx = act.getApplicationContext();
+        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
         builder.setTitle(row.title);
         builder.setMessage("Upstream-тег " + row.tag + " будет использован как база для сборки Colgram.\n\n"
                 + "Установить эту версию сразу нельзя: это исходный код Telegram без патчей Colgram. "
@@ -900,13 +913,16 @@ public class ColgramVersionsActivity extends BaseFragment {
         builder.setPositiveButton("Сохранить тег и открыть CI", (d, w) -> {
             try {
                 org.colgram.core.ColgramConfig.setPendingUpstreamTag(row.tag);
-                Toast.makeText(getParentActivity(),
+                Toast.makeText(appCtx,
                         "Тег " + row.tag + " сохранён", Toast.LENGTH_LONG).show();
             } catch (Throwable ignore) {
                 // best-effort; the browser fallback still works
             }
-            Browser.openUrl(getParentActivity(),
-                    "https://github.com/" + getColgramRepo() + "/actions/workflows/build-colgram.yml");
+            Activity curAct = getParentActivity();
+            if (curAct != null) {
+                Browser.openUrl(curAct,
+                        "https://github.com/" + getColgramRepo() + "/actions/workflows/build-colgram.yml");
+            }
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());

@@ -82,6 +82,8 @@ public final class ColgramAiVisionProcessor {
     }
 
     private static PreparedMedia normalizeImage(File cacheDir, File src) {
+        Bitmap bmp = null;
+        Bitmap scaled = null;
         try {
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
@@ -91,12 +93,12 @@ public final class ColgramAiVisionProcessor {
             }
             int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
             int sample = 1;
-            while (maxDim / sample > 1400) {
+            while (maxDim / sample > 1120) {
                 sample *= 2;
             }
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inSampleSize = sample;
-            Bitmap bmp = BitmapFactory.decodeFile(src.getAbsolutePath(), opts);
+            bmp = BitmapFactory.decodeFile(src.getAbsolutePath(), opts);
             if (bmp == null) return null;
 
             int rotDeg = readExifRotationDegrees(src);
@@ -112,19 +114,27 @@ public final class ColgramAiVisionProcessor {
                 } catch (Throwable ignored) {}
             }
 
-            Bitmap scaled = scaleDownTo(bmp, 768);
+            // 560px max edge cuts ViT patch tokens ~2x on mobile CPU while staying crisp for OCR & scene details.
+            scaled = scaleDownTo(bmp, 560);
             if (scaled != bmp) {
                 bmp.recycle();
+                bmp = null;
             }
             File out = new File(cacheDir, "img_" + System.currentTimeMillis() + "_" + IMG_SEQ.getAndIncrement() + ".jpg");
             try (FileOutputStream fos = new FileOutputStream(out)) {
-                scaled.compress(Bitmap.CompressFormat.JPEG, 88, fos);
+                scaled.compress(Bitmap.CompressFormat.JPEG, 86, fos);
             }
             String desc = "Фото " + scaled.getWidth() + "x" + scaled.getHeight();
-            scaled.recycle();
             return new PreparedMedia(out, false, desc);
         } catch (Throwable ignored) {
             return null;
+        } finally {
+            if (scaled != null && !scaled.isRecycled()) {
+                try { scaled.recycle(); } catch (Throwable ignored) {}
+            }
+            if (bmp != null && !bmp.isRecycled()) {
+                try { bmp.recycle(); } catch (Throwable ignored) {}
+            }
         }
     }
 
@@ -137,8 +147,8 @@ public final class ColgramAiVisionProcessor {
             if (durStr != null && !durStr.isEmpty()) {
                 durMs = Math.max(1000L, Long.parseLong(durStr));
             }
-            final int cellW = 384;
-            final int cellH = 288;
+            final int cellW = 288;
+            final int cellH = 216;
             Bitmap grid = Bitmap.createBitmap(cellW * 2, cellH * 2, Bitmap.Config.ARGB_8888);
             Canvas canvas = new Canvas(grid);
             canvas.drawColor(Color.BLACK);

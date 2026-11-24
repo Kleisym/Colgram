@@ -149,6 +149,25 @@ public final class ColgramAeroStyler {
                 borderAccent = (customAccent & 0x00FFFFFF) | ((dark ? 0x68 : 0x52) << 24);
             }
 
+            // Guarantee WCAG AA contrast across custom / mid-grey / Aero surfaces so text & semantic
+            // accents can never drop into grey-on-grey on any card, sheet, or input fill.
+            textPrimary = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurfaces(
+                    textPrimary, cardSurface, sheetBgBottom, 0xFFF8FAFC, 0xFF0F172A, 7.0);
+            textSecondary = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurfaces(
+                    textSecondary, cardSurface, sheetBgBottom, 0xFFDCE4F0, 0xFF2C3542, 4.5);
+            accentPrimary = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    accentPrimary, cardSurface, 0xFF7EC8FF, 0xFF1565C0, 4.5);
+            accentSecondary = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    accentSecondary, cardSurface, 0xFF9CD6FF, 0xFF1565C0, 4.5);
+            semanticEmerald = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    semanticEmerald, cardSurface, 0xFF5CE0A8, 0xFF047857, 4.5);
+            semanticAmber = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    semanticAmber, cardSurface, 0xFFFCD34D, 0xFFB45309, 4.5);
+            semanticCyan = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    semanticCyan, cardSurface, 0xFF7DD3FC, 0xFF0369A1, 4.5);
+            semanticCrimson = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    semanticCrimson, cardSurface, 0xFFFF8290, 0xFFBE123C, 4.5);
+
             return new Palette(
                     dark, cyber,
                     sheetBgTop, sheetBgBottom, cardSurface, cardElevated,

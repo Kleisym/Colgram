@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.Context;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -29,6 +30,7 @@ import org.telegram.messenger.ColgramNotificationListenerService;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
+import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
@@ -45,6 +47,7 @@ import org.telegram.ui.Components.RecyclerListView;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Unified UI screen for Colgram Anti-Spam Guard (ping cleaner, notification filter, lead capture)
@@ -71,6 +74,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     private static final int ACT_SYNC_FOLDERS = 10;
     private static final int ACT_CHEATSHEET = 11;
     private static final int ACT_LEGACY_USERBOT = 12;
+    private static final int ACT_DM_AUTO_DELETE_MUTES = 13;
 
     private static final int CHK_SPAM_GUARD = 101;
     private static final int CHK_NOTIF_FILTER = 102;
@@ -97,8 +101,19 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     }
 
     private final List<RowItem> rows = new ArrayList<>();
+    private final java.util.concurrent.ExecutorService workerExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private boolean destroyed;
+    private boolean resumedOnce;
     private RecyclerListView listView;
     private ListAdapter listAdapter;
+
+    @Override
+    public void onFragmentDestroy() {
+        destroyed = true;
+        workerExecutor.shutdownNow();
+        super.onFragmentDestroy();
+    }
 
     @Override
     public View createView(Context context) {
@@ -138,6 +153,10 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     @Override
     public void onResume() {
         super.onResume();
+        if (!resumedOnce) {
+            resumedOnce = true;
+            return;
+        }
         if (getParentActivity() != null) {
             rebuildRows(getParentActivity());
             if (listAdapter != null) listAdapter.notifyDataSetChanged();
@@ -169,6 +188,8 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 null, false, null));
 
         rows.add(new RowItem(TYPE_HEADER, 0, "Муты, белый список и .тишина", null, false, null));
+        rows.add(new RowItem(TYPE_SETTING, ACT_DM_AUTO_DELETE_MUTES, "Мут ЛС (мгновенное автоудаление)",
+                String.valueOf(engine.getDmAutoDeleteMutedDialogs(currentAccount).size()), false, null));
         rows.add(new RowItem(TYPE_SETTING, ACT_MUTE_RULES, "Правила .мутить (пользователи / чаты)",
                 String.valueOf(engine.listMuteRules().size()), false, null));
         rows.add(new RowItem(TYPE_SETTING, ACT_WHITELIST, "Белый список (неприкосновенные ID)",
@@ -260,6 +281,9 @@ public class ColgramAntiSpamActivity extends BaseFragment {
             case ACT_TEST_DETECTOR:
                 showDetectorSandboxDialog(ctx);
                 break;
+            case ACT_DM_AUTO_DELETE_MUTES:
+                showDmAutoDeleteMutesDialog(ctx);
+                break;
             case ACT_MUTE_RULES:
                 showMuteRulesDialog(ctx);
                 break;
@@ -273,8 +297,10 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 boolean next = !ColgramConfig.isBroadcasterEnabled();
                 ColgramConfig.setBroadcasterEnabled(next);
                 if (next) {
-                    ColgramNativeColemailerBridge.startScheduler();
-                    ColgramNativeColemailerBridge.syncFoldersIntoEngine();
+                    ColgramNativeColemailerBridge.syncFoldersIntoEngine(currentAccount);
+                    ColgramNativeColemailerBridge.rescheduleScheduler();
+                } else {
+                    ColgramNativeColemailerBridge.stopScheduler();
                 }
                 updateCheckRow(ctx, view, position, next, false);
                 break;
@@ -374,6 +400,62 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         showDialog(b.create());
     }
 
+    private void showDmAutoDeleteMutesDialog(Context ctx) {
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        Set<Long> mutedSet = engine.getDmAutoDeleteMutedDialogs(currentAccount);
+        List<Long> mutedIds = new ArrayList<>(mutedSet);
+        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
+        b.setTitle("Мут ЛС с автоудалением (" + mutedIds.size() + ")");
+        if (mutedIds.isEmpty()) {
+            b.setMessage("Список пуст.\nОткройте любой личный чат 1-на-1 -> меню ⋮ -> «Мут ЛС (автоудаление)», или отправьте `.dmmute` / `.mute` в чате.");
+        } else {
+            MessagesController mc = MessagesController.getInstance(currentAccount);
+            String[] items = new String[mutedIds.size()];
+            for (int i = 0; i < mutedIds.size(); i++) {
+                long uid = mutedIds.get(i);
+                String label = "ID " + uid;
+                TLRPC.User u = mc != null ? mc.getUser(uid) : null;
+                if (u != null) {
+                    String name = (u.first_name != null ? u.first_name : "")
+                            + (u.last_name != null && !u.last_name.isEmpty() ? (" " + u.last_name) : "");
+                    name = name.trim();
+                    if (!name.isEmpty()) {
+                        label = name + " (" + uid + ")";
+                    }
+                }
+                items[i] = label + " — выключить мут ЛС";
+            }
+            b.setItems(items, (d, which) -> {
+                long uid = mutedIds.get(which);
+                long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
+                engine.setDmAutoDeleteMuted(currentAccount, uid, selfId, false);
+                Toast.makeText(ctx, "Мут ЛС выключен для " + uid, Toast.LENGTH_SHORT).show();
+                refreshList(ctx);
+            });
+        }
+        b.setPositiveButton("+ По User ID", (d, w) -> {
+            LinearLayout box = makeDialogContainer(ctx);
+            EditText ed = makeStyledEdit(ctx, "Telegram User ID (личный чат)", false);
+            ed.setInputType(InputType.TYPE_CLASS_NUMBER);
+            box.addView(ed);
+            showDialog(new AlertDialog.Builder(ctx).setTitle("Включить мут ЛС по ID").setView(box)
+                    .setPositiveButton("Включить", (d2, w2) -> {
+                        try {
+                            long uid = Long.parseLong(ed.getText().toString().trim());
+                            long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
+                            boolean ok = engine.setDmAutoDeleteMuted(currentAccount, uid, selfId, true);
+                            Toast.makeText(ctx, ok ? ("Мут ЛС включён для " + uid)
+                                    : "Недопустимый ID (нельзя мутить Избранное или сервисные чаты)", Toast.LENGTH_SHORT).show();
+                            refreshList(ctx);
+                        } catch (NumberFormatException ignored) {
+                            Toast.makeText(ctx, "Введите корректный числовой User ID", Toast.LENGTH_SHORT).show();
+                        }
+                    }).setNegativeButton("Отмена", null).create());
+        });
+        b.setNegativeButton("Закрыть", null);
+        showDialog(b.create());
+    }
+
     private void showMuteRulesDialog(Context ctx) {
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         List<ColgramColemailerEngine.MuteRule> rules = engine.listMuteRules();
@@ -458,7 +540,9 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                             long uid = Long.parseLong(ed.getText().toString().trim());
                             engine.addWhitelist(uid);
                             refreshList(ctx);
-                        } catch (NumberFormatException ignored) {}
+                        } catch (NumberFormatException ignored) {
+                            Toast.makeText(ctx.getApplicationContext(), "Введите числовой Telegram User ID", Toast.LENGTH_SHORT).show();
+                        }
                     }).setNegativeButton("Отмена", null).create());
         });
         b.setNegativeButton("Закрыть", null);
@@ -516,10 +600,16 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 : "Доступные папки (нажмите для подстановки): " + TextUtils.join(", ", folderNames));
         folderHint.setPadding(0, AndroidUtilities.dp(4), 0, AndroidUtilities.dp(8));
         if (!folderNames.isEmpty()) {
-            folderHint.setOnClickListener(v -> showDialog(new AlertDialog.Builder(ctx)
-                    .setTitle("Выберите папку Telegram")
-                    .setItems(folderNames.toArray(new String[0]), (d, which) -> folderEt.setText(folderNames.get(which)))
-                    .create()));
+            folderHint.setOnClickListener(v -> {
+                Activity curAct = getParentActivity();
+                if (destroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
+                try {
+                    new AlertDialog.Builder(curAct, resourceProvider)
+                            .setTitle("Выберите папку Telegram")
+                            .setItems(folderNames.toArray(new String[0]), (d, which) -> folderEt.setText(folderNames.get(which)))
+                            .show();
+                } catch (Throwable ignored) {}
+            });
         }
 
         EditText schedEt = makeStyledEdit(ctx, "Расписание: 15м | 20 сообщений | 1ч 15 сообщений", false);
@@ -582,9 +672,11 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 camp.enabled = existing.enabled;
                 camp.targetChats.addAll(existing.targetChats);
             }
-            ColgramColemailerEngine.getInstance().addOrUpdateCampaign(camp);
+            ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+            engine.addOrUpdateCampaign(camp);
             ColgramNativeColemailerBridge.syncFoldersIntoEngine(currentAccount);
-            ColgramNativeColemailerBridge.startScheduler();
+            engine.armMissingBaselines(currentAccount, System.currentTimeMillis() / 1000L);
+            ColgramNativeColemailerBridge.rescheduleScheduler();
             refreshList(ctx);
         });
         b.setNegativeButton("Отмена", null);
@@ -606,6 +698,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         b.setItems(actions, (d, which) -> {
             if (which == 0) {
                 engine.setCampaignEnabled(c.name, !c.enabled);
+                ColgramNativeColemailerBridge.rescheduleScheduler();
                 refreshList(ctx);
             } else if (which == 1) {
                 ColgramNativeColemailerBridge.triggerCampaignNow(c.name);
@@ -613,6 +706,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 showCampaignEditorDialog(ctx, c);
             } else if (which == 3) {
                 engine.removeCampaign(c.name);
+                ColgramNativeColemailerBridge.rescheduleScheduler();
                 refreshList(ctx);
             }
         });
@@ -681,13 +775,14 @@ public class ColgramAntiSpamActivity extends BaseFragment {
 
     private void showCheatsheetDialog() {
         String text =
-                "• .очиститьпинги (.clearpings)\nСнимает спам-упоминания в открытом чате, не трогая личные вопросы и лиды.\n\n"
+                "• .dmmute / .dmunmute (.мутлс / .размутлс)\nВключает/выключает мгновенное автоудаление всех входящих сообщений в личном чате 1-на-1 (также в меню ⋮ чата).\n\n"
+                        + "• .очиститьпинги (.clearpings)\nСнимает спам-упоминания в открытом чате, не трогая личные вопросы и лиды.\n\n"
                         + "• .пингдиаг [текст]\nЛокальная диагностика скоринга и факторов на отвеченном сообщении (без чтения истории и утечки в чат).\n\n"
                         + "• .тишина / .тишина выкл\nЗапоминает точные настройки звука чата и восстанавливает их при выключении.\n\n"
-                        + "• .мутить [тихо|удалить|варн|бан] [чат]\nВключает правило автореакции ответом на сообщение (или в личке).\n\n"
+                        + "• .мутить [тихо|удалить|варн|бан] [чат]\nВключает правило автореакции ответом на сообщение (или мут ЛС в личном чате).\n\n"
                         + "• .размутить / .мутлист / .вайтлист\nУправление мутом и неприкосновенным белым списком.\n\n"
                         + "• .кнопки [Текст](https://...) || [Клик](cb:data)\nСохраняет черновик inline-кнопок (`.кнопки тест` / `.кнопки очистить`).\n\n"
-                        + "• .рассыл Имя 15м | Текст\nСоздаёт/обновляет рассылку в текущий чат (поддержка `20 сообщений`, `1ч 15 сообщений`).\n\n"
+                        + "• .рассыл Имя 15м | Текст\nСоздаёт/обновляет событийную рассылку (0% нагрузки в простое; поддержка `20 сообщений`, `1ч 15 сообщений`).\n\n"
                         + "• .стоп [Имя] / .продолжить [Имя] / .синк\nПауза, запуск и синхронизация папок Telegram.";
         ColgramNativeColemailerBridge.showAlert("Шпаргалка команд Colemailer", text);
     }
@@ -713,39 +808,45 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         box.addView(password);
         box.addView(codeEt);
         b.setView(ColgramMenuChrome.wrapDialogScroll(ctx, box));
+        final Context appCtx = ctx.getApplicationContext();
         b.setPositiveButton("Сохранить / Код", (d, w) -> {
             String enteredCode = codeEt.getText().toString().trim();
             String pass = password.getText().toString();
-            ColgramAntiSpam.saveCredentials(ctx, acct,
+            ColgramAntiSpam.saveCredentials(appCtx, acct,
                     apiId.getText().toString().trim(),
                     apiHash.getText().toString().trim(),
                     phone.getText().toString().trim(),
                     pass);
             if (!enteredCode.isEmpty()) {
-                new Thread(() -> {
+                workerExecutor.execute(() -> {
                     boolean ok = ColgramAntiSpam.submitCredentials(enteredCode, pass);
-                    AndroidUtilities.runOnUIThread(() -> Toast.makeText(ctx,
-                            ok ? "Код отправлен userbot" : "Не удалось отправить код userbot", Toast.LENGTH_SHORT).show());
-                }, "colgram-userbot-code").start();
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (destroyed) return;
+                        Toast.makeText(appCtx,
+                                ok ? "Код отправлен userbot" : "Не удалось отправить код userbot", Toast.LENGTH_SHORT).show();
+                    });
+                });
             }
             refreshList(ctx);
         });
         boolean running = ColgramAntiSpam.isEnabled(ctx, acct);
         b.setNeutralButton(running ? "Остановить" : "Запустить", (d, w) -> {
-            ColgramAntiSpam.saveCredentials(ctx, acct,
+            ColgramAntiSpam.saveCredentials(appCtx, acct,
                     apiId.getText().toString().trim(),
                     apiHash.getText().toString().trim(),
                     phone.getText().toString().trim(),
                     password.getText().toString());
-            Toast.makeText(ctx, running ? "Останавливаю userbot..." : "Запускаю userbot...", Toast.LENGTH_SHORT).show();
-            new Thread(() -> {
-                String err = running ? ColgramAntiSpam.stop(ctx, acct) : ColgramAntiSpam.start(ctx, acct);
+            Toast.makeText(appCtx, running ? "Останавливаю userbot..." : "Запускаю userbot...", Toast.LENGTH_SHORT).show();
+            workerExecutor.execute(() -> {
+                String err = running ? ColgramAntiSpam.stop(appCtx, acct) : ColgramAntiSpam.start(appCtx, acct);
                 AndroidUtilities.runOnUIThread(() -> {
-                    Toast.makeText(ctx, err != null ? err : (running ? "Userbot остановлен" : "Запуск запрошен"),
+                    Toast.makeText(appCtx, err != null ? err : (running ? "Userbot остановлен" : "Запуск запрошен"),
                             Toast.LENGTH_SHORT).show();
-                    refreshList(ctx);
+                    if (!destroyed && getParentActivity() != null) {
+                        refreshList(getParentActivity());
+                    }
                 });
-            }, "colgram-userbot-toggle").start();
+            });
         });
         b.setNegativeButton("Отмена", null);
         showDialog(b.create());
@@ -919,6 +1020,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 case ACT_NOTIF_PERMISSION: return R.drawable.msg_info;
                 case ACT_DEFAULT_MUTE_MODE: return R.drawable.msg_policy;
                 case ACT_TEST_DETECTOR: return R.drawable.msg_search;
+                case ACT_DM_AUTO_DELETE_MUTES: return R.drawable.msg_autodelete;
                 case ACT_MUTE_RULES: return R.drawable.msg_block;
                 case ACT_WHITELIST: return R.drawable.outline_shield_check;
                 case ACT_QUIET_CHATS: return R.drawable.msg_folders;
@@ -943,6 +1045,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 case ACT_NOTIF_PERMISSION: return ColgramMenuChrome.COLOR_BLUE;
                 case ACT_DEFAULT_MUTE_MODE: return ColgramMenuChrome.COLOR_INDIGO;
                 case ACT_TEST_DETECTOR: return ColgramMenuChrome.COLOR_VIOLET;
+                case ACT_DM_AUTO_DELETE_MUTES: return ColgramMenuChrome.COLOR_ROSE;
                 case ACT_MUTE_RULES: return ColgramMenuChrome.COLOR_CRIMSON;
                 case ACT_WHITELIST: return ColgramMenuChrome.COLOR_EMERALD;
                 case ACT_QUIET_CHATS: return ColgramMenuChrome.COLOR_SLATE;

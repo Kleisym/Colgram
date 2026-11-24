@@ -36,18 +36,20 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Native Java bridge connecting ColgramColemailerEngine & ColgramSpamGuard to
- * Telegram 12.10.6 MTProto / Bot API, chat commands, folder sync, and notification state.
+ * Telegram 12.10.6 MTProto / Bot API, chat commands, folder sync, notification suppression,
+ * and 1-on-1 DM instant auto-delete mute.
  */
 public final class ColgramNativeColemailerBridge {
 
     private static final String TAG = "ColgramColemailer";
-    private static final long SCHEDULER_POLL_MS = 15_000L;
-    private static final AtomicBoolean schedulerStarted = new AtomicBoolean(false);
-    private static volatile long floodCooldownUntilMs = 0L;
+    private static final long FOLDER_SYNC_MIN_INTERVAL_MS = 60_000L;
+    private static volatile long lastFolderSyncMs = 0L;
+
+    private static final Runnable scheduledTickRunnable = ColgramNativeColemailerBridge::runDueBroadcastsOnUi;
 
     private static final Map<String, Long> recentIncomingDedupe = new LinkedHashMap<String, Long>(256, 0.75f, true) {
         @Override
@@ -56,9 +58,16 @@ public final class ColgramNativeColemailerBridge {
         }
     };
 
-    private static final Map<String, MessageObject> pendingReplyByDialog = Collections.synchronizedMap(new HashMap<>());
-    private static final Set<String> activeGatekeeperDialogs = Collections.synchronizedSet(new HashSet<>());
-    private static List<List<ColgramColemailerEngine.ButtonSpec>> draftButtons = Collections.emptyList();
+    private static final Map<String, Boolean> recentSuppressVerdicts = new LinkedHashMap<String, Boolean>(256, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+            return size() > 256;
+        }
+    };
+
+    private static final Map<String, MessageObject> pendingReplyByDialog = new ConcurrentHashMap<>();
+    private static final Set<String> activeGatekeeperDialogs = ConcurrentHashMap.newKeySet();
+    private static volatile List<List<ColgramColemailerEngine.ButtonSpec>> draftButtons = Collections.emptyList();
 
     private ColgramNativeColemailerBridge() {}
 
@@ -77,27 +86,43 @@ public final class ColgramNativeColemailerBridge {
         return selfId == 0L || dialogId == selfId;
     }
 
+    /**
+     * Event-driven scheduler entry point (backwards-compatible name):
+     * Schedules ONE exact delayed UI runnable for the next due campaign.
+     * Cancels all callbacks when disabled or activeCampaignCount == 0 -> 0.0% idle CPU & 0 wakeups.
+     */
     public static void startScheduler() {
-        if (!schedulerStarted.compareAndSet(false, true)) return;
-        Thread t = new Thread(() -> {
-            while (true) {
-                try {
-                    Thread.sleep(SCHEDULER_POLL_MS);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                try {
-                    if (!ColgramConfig.isBroadcasterEnabled()) continue;
-                    long nowMs = System.currentTimeMillis();
-                    if (nowMs < floodCooldownUntilMs) continue;
-                    AndroidUtilities.runOnUIThread(ColgramNativeColemailerBridge::runDueBroadcastsOnUi);
-                } catch (Throwable tr) {
-                    FileLog.e(tr);
-                }
-            }
-        }, "colgram-colemailer-scheduler");
-        t.setDaemon(true);
-        t.start();
+        rescheduleScheduler();
+    }
+
+    public static void stopScheduler() {
+        AndroidUtilities.cancelRunOnUIThread(scheduledTickRunnable);
+    }
+
+    public static void rescheduleScheduler() {
+        AndroidUtilities.cancelRunOnUIThread(scheduledTickRunnable);
+        if (!ColgramConfig.isBroadcasterEnabled()) {
+            return;
+        }
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        if (!engine.hasActiveCampaigns()) {
+            return;
+        }
+        long nowMs = System.currentTimeMillis();
+        long delayMs = engine.getNextDueCampaignDelayMs(-1, nowMs);
+        if (delayMs < 0L) {
+            return;
+        }
+        AndroidUtilities.runOnUIThread(scheduledTickRunnable, Math.max(0L, delayMs));
+    }
+
+    public static void onFloodWait(int account, long dialogId, String errorText) {
+        long waitSec = ColgramColemailerEngine.parseFloodWaitSeconds(errorText);
+        if (waitSec <= 0L) waitSec = 60L;
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        engine.recordFloodWait(account, dialogId, waitSec, System.currentTimeMillis());
+        engine.recordPingRpc(dialogId, "flood_wait", false, "wait=" + waitSec + "s");
+        rescheduleScheduler();
     }
 
     public static void rememberPendingReply(long dialogId, MessageObject replyToMsg) {
@@ -137,28 +162,61 @@ public final class ColgramNativeColemailerBridge {
             }
             engine.syncFolderTargets(account, f.name, ids);
         }
+        lastFolderSyncMs = System.currentTimeMillis();
+        rescheduleScheduler();
+    }
+
+    private static boolean anyActiveCampaignNeedsFolderSync(ColgramColemailerEngine engine) {
+        for (ColgramColemailerEngine.BroadcastCampaign c : engine.listCampaigns()) {
+            if (c != null && c.enabled && !TextUtils.isEmpty(c.folderName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void runDueBroadcastsOnUi() {
         try {
-            int account = UserConfig.selectedAccount;
-            syncFoldersIntoEngine(account);
+            if (!ColgramConfig.isBroadcasterEnabled()) {
+                return;
+            }
             ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
-            long nowSec = System.currentTimeMillis() / 1000L;
-            List<ColgramColemailerEngine.BroadcastDueEvent> due = engine.collectDueBroadcasts(account, nowSec);
-            if (due.isEmpty()) return;
-            for (int i = 0; i < due.size(); i++) {
-                final ColgramColemailerEngine.BroadcastDueEvent ev = due.get(i);
-                if (isBlockedTargetDialog(account, ev.chatId)) continue;
-                long delayMs = i * 900L;
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (System.currentTimeMillis() < floodCooldownUntilMs) return;
-                    ColgramColemailerEngine.BroadcastCampaign toSend = ev.campaign;
-                    dispatchCampaignToChat(account, toSend, ev.chatId);
-                }, delayMs);
+            if (!engine.hasActiveCampaigns()) {
+                return;
+            }
+            long nowMs = System.currentTimeMillis();
+            long nowSec = nowMs / 1000L;
+            int selectedAcc = UserConfig.selectedAccount;
+            boolean needFolderSync = (nowMs - lastFolderSyncMs >= FOLDER_SYNC_MIN_INTERVAL_MS)
+                    && anyActiveCampaignNeedsFolderSync(engine);
+            int dispatchSlot = 0;
+            for (int acc = 0; acc < UserConfig.MAX_ACCOUNT_COUNT; acc++) {
+                if (!UserConfig.getInstance(acc).isClientActivated()) continue;
+                if (acc != selectedAcc && !engine.hasActiveCampaigns(acc)) continue;
+                if (needFolderSync) {
+                    syncFoldersIntoEngine(acc);
+                }
+                List<ColgramColemailerEngine.BroadcastDueEvent> due = engine.collectDueBroadcasts(acc, nowSec);
+                if (due.isEmpty()) continue;
+                final int targetAccount = acc;
+                for (int i = 0; i < due.size(); i++) {
+                    final ColgramColemailerEngine.BroadcastDueEvent ev = due.get(i);
+                    if (isBlockedTargetDialog(targetAccount, ev.chatId)) continue;
+                    if (engine.isFloodBackedOff(targetAccount, ev.chatId, nowMs)) continue;
+                    // Advance baseline immediately so overlapping ticks never double-send the same slot.
+                    engine.markBroadcastSent(ev.campaign, ev.chatId, nowSec);
+                    long delayMs = dispatchSlot++ * 900L;
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (!ColgramConfig.isBroadcasterEnabled()) return;
+                        if (engine.isFloodBackedOff(targetAccount, ev.chatId, System.currentTimeMillis())) return;
+                        dispatchCampaignToChat(targetAccount, ev.campaign, ev.chatId);
+                    }, delayMs);
+                }
             }
         } catch (Throwable tr) {
             FileLog.e(tr);
+        } finally {
+            rescheduleScheduler();
         }
     }
 
@@ -173,19 +231,23 @@ public final class ColgramNativeColemailerBridge {
         AndroidUtilities.runOnUIThread(() -> {
             int account = (c.ownerAccount >= 0 && c.ownerAccount < UserConfig.MAX_ACCOUNT_COUNT)
                     ? c.ownerAccount : UserConfig.selectedAccount;
-            syncFoldersIntoEngine(account);
+            if (!TextUtils.isEmpty(c.folderName)) {
+                syncFoldersIntoEngine(account);
+            }
             if (c.targetChats.isEmpty()) {
                 showToast("Нет целевых чатов", "Укажите папку или откройте нужный чат и используйте .рассыл");
                 return;
             }
             int idx = 0;
             int sentCount = 0;
+            long nowMs = System.currentTimeMillis();
             for (Long chatId : new ArrayList<>(c.targetChats)) {
                 if (chatId == null || isBlockedTargetDialog(account, chatId)) continue;
+                if (engine.isFloodBackedOff(account, chatId, nowMs)) continue;
                 final long target = chatId;
                 sentCount++;
                 AndroidUtilities.runOnUIThread(() -> {
-                    if (System.currentTimeMillis() < floodCooldownUntilMs) return;
+                    if (engine.isFloodBackedOff(account, target, System.currentTimeMillis())) return;
                     dispatchCampaignToChat(account, c, target);
                 }, idx++ * 900L);
             }
@@ -196,6 +258,8 @@ public final class ColgramNativeColemailerBridge {
     private static void dispatchCampaignToChat(int account, ColgramColemailerEngine.BroadcastCampaign campaign, long dialogId) {
         if (campaign == null || TextUtils.isEmpty(campaign.text) || isBlockedTargetDialog(account, dialogId)) return;
         if (campaign.ownerAccount >= 0 && campaign.ownerAccount != account) return;
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        if (engine.isFloodBackedOff(account, dialogId, System.currentTimeMillis())) return;
         String botToken = ColgramConfig.getHelperBotToken();
         if (!campaign.buttons.isEmpty() && !TextUtils.isEmpty(botToken)) {
             final String markupJson = ColgramColemailerEngine.toBotApiReplyMarkupJson(campaign.buttons);
@@ -209,19 +273,22 @@ public final class ColgramNativeColemailerBridge {
                             + ",\"reply_markup\":" + markupJson + "}";
                     ColgramHttp.Response resp = ColgramHttp.post(apiUrl, json, null);
                     if (resp != null && resp.code >= 200 && resp.code < 300) {
-                        ColgramColemailerEngine.getInstance().markBroadcastSent(campaign, dialogId, System.currentTimeMillis() / 1000L);
-                        ColgramColemailerEngine.getInstance().recordPingRpc(dialogId, "broadcast_bot_api", true, campaign.name);
+                        engine.markBroadcastSent(campaign, dialogId, System.currentTimeMillis() / 1000L);
+                        engine.recordPingRpc(dialogId, "broadcast_bot_api", true, campaign.name);
                         return;
                     }
                     if (resp != null && resp.code == 429) {
-                        floodCooldownUntilMs = System.currentTimeMillis() + 60_000L;
-                        ColgramColemailerEngine.getInstance().recordPingRpc(dialogId, "broadcast_bot_api_429", false, "HTTP 429");
+                        long waitSec = ColgramColemailerEngine.parseFloodWaitSeconds(resp.body);
+                        if (waitSec <= 0L) waitSec = 60L;
+                        engine.recordFloodWait(account, dialogId, waitSec, System.currentTimeMillis());
+                        engine.recordPingRpc(dialogId, "broadcast_bot_api_429", false, "HTTP 429 wait=" + waitSec + "s");
+                        AndroidUtilities.runOnUIThread(ColgramNativeColemailerBridge::rescheduleScheduler);
                         return;
                     }
-                    ColgramColemailerEngine.getInstance().recordPingRpc(
+                    engine.recordPingRpc(
                             dialogId, "broadcast_bot_api_fallback", false, "HTTP " + (resp == null ? -1 : resp.code));
                 } catch (Throwable t) {
-                    ColgramColemailerEngine.getInstance().recordPingRpc(dialogId, "broadcast_bot_api_err", false, t.getMessage());
+                    engine.recordPingRpc(dialogId, "broadcast_bot_api_err", false, t.getMessage());
                 }
                 AndroidUtilities.runOnUIThread(() -> sendClientPost(account, campaign, dialogId));
             }, "colgram-bot-broadcast").start();
@@ -319,15 +386,73 @@ public final class ColgramNativeColemailerBridge {
                 return true;
             }
 
+            case ".dmmute":
+            case ".мутлс": {
+                long selfId = UserConfig.getInstance(account).getClientUserId();
+                if (DialogObject.isEncryptedDialog(dialogId)
+                        || !ColgramColemailerEngine.isEligibleDmAutoDeleteDialog(dialogId, selfId)) {
+                    showToast("Мут ЛС недоступен здесь", "Доступно только в обычном личном чате 1-на-1");
+                    return true;
+                }
+                boolean nextState;
+                if (parts.length > 1 && ("выкл".equalsIgnoreCase(parts[1]) || "off".equalsIgnoreCase(parts[1]) || "0".equals(parts[1]))) {
+                    engine.setDmAutoDeleteMuted(account, dialogId, selfId, false);
+                    nextState = false;
+                } else if (parts.length > 1 && ("вкл".equalsIgnoreCase(parts[1]) || "on".equalsIgnoreCase(parts[1]) || "1".equals(parts[1]))) {
+                    engine.setDmAutoDeleteMuted(account, dialogId, selfId, true);
+                    nextState = true;
+                } else {
+                    nextState = engine.toggleDmAutoDeleteMuted(account, dialogId, selfId);
+                }
+                if (nextState) {
+                    NotificationsController nc = NotificationsController.getInstance(account);
+                    if (nc != null) nc.removeNotificationsForDialog(dialogId);
+                    showToast("Мут ЛС включён", "Все входящие сообщения этого собеседника удаляются мгновенно");
+                } else {
+                    showToast("Мут ЛС выключен", "Входящие сообщения снова приходят обычно");
+                }
+                return true;
+            }
+
+            case ".dmunmute":
+            case ".размутлс": {
+                long selfId = UserConfig.getInstance(account).getClientUserId();
+                engine.setDmAutoDeleteMuted(account, dialogId, selfId, false);
+                showToast("Мут ЛС выключен", "Автоудаление входящих отключено");
+                return true;
+            }
+
             case ".мутить":
             case ".мут":
             case ".mute": {
                 boolean wholeChat = false;
+                boolean explicitMode = false;
                 String mode = ColgramConfig.getDefaultMuteMode();
                 for (int i = 1; i < parts.length; i++) {
                     String tok = parts[i].toLowerCase(Locale.ROOT);
                     if (tok.equals("чат") || tok.equals("chat")) wholeChat = true;
-                    else mode = ColgramColemailerEngine.normalizeMuteMode(tok);
+                    else {
+                        mode = ColgramColemailerEngine.normalizeMuteMode(tok);
+                        explicitMode = true;
+                    }
+                }
+                long selfId = UserConfig.getInstance(account).getClientUserId();
+                // Inside a 1-on-1 DM, `.mute` (or `.mute delete`) toggles/enables instant DM Auto-Delete Mute cleanly.
+                if (dialogId > 0L && replySenderId == 0L && !wholeChat
+                        && !DialogObject.isEncryptedDialog(dialogId)
+                        && ColgramColemailerEngine.isEligibleDmAutoDeleteDialog(dialogId, selfId)
+                        && (!explicitMode || ColgramColemailerEngine.MUTE_DELETE.equals(mode))) {
+                    boolean nextState = explicitMode
+                            ? engine.setDmAutoDeleteMuted(account, dialogId, selfId, true)
+                            : engine.toggleDmAutoDeleteMuted(account, dialogId, selfId);
+                    if (nextState) {
+                        NotificationsController nc = NotificationsController.getInstance(account);
+                        if (nc != null) nc.removeNotificationsForDialog(dialogId);
+                        showToast("Мут ЛС включён", "Все входящие сообщения удаляются мгновенно");
+                    } else {
+                        showToast("Мут ЛС выключен", "Автоудаление входящих отключено");
+                    }
+                    return true;
                 }
                 long target = replySenderId != 0 ? replySenderId : (dialogId > 0 ? dialogId : 0L);
                 if (wholeChat && target == 0) {
@@ -351,6 +476,11 @@ public final class ColgramNativeColemailerBridge {
             case ".размутить":
             case ".размут":
             case ".unmute": {
+                long selfId = UserConfig.getInstance(account).getClientUserId();
+                boolean wasDmMuted = dialogId > 0L && engine.isDmAutoDeleteMuted(account, dialogId);
+                if (wasDmMuted) {
+                    engine.setDmAutoDeleteMuted(account, dialogId, selfId, false);
+                }
                 long target = replySenderId != 0 ? replySenderId : (dialogId > 0 ? dialogId : 0L);
                 boolean wholeChat = parts.length > 1 && ("чат".equalsIgnoreCase(parts[1]) || "chat".equalsIgnoreCase(parts[1]));
                 if (wholeChat) {
@@ -365,16 +495,22 @@ public final class ColgramNativeColemailerBridge {
                 engine.removeMuteRule(target, dialogId, false);
                 engine.removeMuteRule(target, 0L, false);
                 ColgramHookHandler.setNotificationsBlocked(target, false);
-                showToast("Пользователь размучен", "ID " + target + " снова активен");
+                showToast(wasDmMuted ? "Мут ЛС выключен" : "Пользователь размучен",
+                        wasDmMuted ? "Входящие сообщения снова отображаются" : ("ID " + target + " снова активен"));
                 return true;
             }
 
             case ".мутлист":
             case ".mutelist": {
                 List<ColgramColemailerEngine.MuteRule> rules = engine.listMuteRules();
+                Set<Long> dmMuted = engine.getDmAutoDeleteMutedDialogs(account);
                 List<Long> wl = engine.listWhitelist();
                 StringBuilder sb = new StringBuilder();
-                sb.append("Правила мута: ").append(rules.size()).append("\n");
+                sb.append("Мут ЛС (автоудаление): ").append(dmMuted.size()).append("\n");
+                for (Long did : dmMuted) {
+                    sb.append("• ЛС ID ").append(did).append("\n");
+                }
+                sb.append("\nПравила мута: ").append(rules.size()).append("\n");
                 for (ColgramColemailerEngine.MuteRule r : rules) {
                     sb.append("• ");
                     if (r.wholeChat) sb.append("Чат ").append(r.scopeChatId);
@@ -484,7 +620,9 @@ public final class ColgramNativeColemailerBridge {
                 }
                 c.buttons.addAll(!parsed.buttons.isEmpty() ? parsed.buttons : draftButtons);
                 engine.addOrUpdateCampaign(c);
+                engine.armMissingBaselines(account, System.currentTimeMillis() / 1000L);
                 ColgramConfig.setBroadcasterEnabled(true);
+                rescheduleScheduler();
                 showToast("Кампания сохранена: " + campName,
                         "Режим " + modeTitle(spec.mode) + ", чатов: " + c.targetChats.size());
                 return true;
@@ -494,9 +632,11 @@ public final class ColgramNativeColemailerBridge {
             case ".stop": {
                 if (parts.length > 1) {
                     boolean ok = engine.setCampaignEnabled(parts[1], false);
+                    rescheduleScheduler();
                     showToast(ok ? "Кампания приостановлена" : "Кампания не найдена", parts[1]);
                 } else {
                     ColgramConfig.setBroadcasterEnabled(false);
+                    stopScheduler();
                     showToast("Авторассылка остановлена", "Включить: `.продолжить` или в настройках Colgram");
                 }
                 return true;
@@ -506,17 +646,21 @@ public final class ColgramNativeColemailerBridge {
             case ".resume": {
                 if (parts.length > 1) {
                     boolean ok = engine.setCampaignEnabled(parts[1], true);
+                    engine.armMissingBaselines(account, System.currentTimeMillis() / 1000L);
+                    rescheduleScheduler();
                     showToast(ok ? "Кампания возобновлена" : "Кампания не найдена", parts[1]);
                 } else {
                     ColgramConfig.setBroadcasterEnabled(true);
-                    showToast("Авторассылка активна", "Планировщик проверяет очереди каждые 15с");
+                    engine.armMissingBaselines(account, System.currentTimeMillis() / 1000L);
+                    rescheduleScheduler();
+                    showToast("Авторассылка активна", "Событийный планировщик (0% нагрузки в простое)");
                 }
                 return true;
             }
 
             case ".синк":
             case ".sync": {
-                syncFoldersIntoEngine();
+                syncFoldersIntoEngine(account);
                 showToast("Папки синхронизированы", "Списки чатов в кампаниях обновлены из Telegram");
                 return true;
             }
@@ -526,12 +670,156 @@ public final class ColgramNativeColemailerBridge {
         }
     }
 
+    /**
+     * Zero-latency notification suppression gate called from NotificationsController BEFORE sound/vibration/banner.
+     * Returns true to silently suppress notifications for:
+     *   1. 1-on-1 DM Instant Auto-Delete Mute dialogs
+     *   2. Explicitly muted users / chats (respecting whitelist)
+     *   3. Ads, promos (`erid:`, `#реклама`, promo links, suspicious URL buttons / ad channel forwards) and spam pings
+     *      from non-contacts — with 0% false positives on contacts, Saved Messages, Secret Chats, and normal conversations.
+     */
+    public static boolean shouldSuppressNotification(int account, MessageObject messageObject) {
+        if (messageObject == null || messageObject.messageOwner == null) return false;
+        return shouldSuppressNotification(account, messageObject.messageOwner);
+    }
+
+    public static boolean shouldSuppressNotification(int account, TLRPC.Message msg) {
+        if (msg == null || msg.out || msg instanceof TLRPC.TL_messageEmpty) return false;
+        try {
+            long selfId = UserConfig.getInstance(account).getClientUserId();
+            ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+            if (selfId > 0L) {
+                engine.setSelfUserId(account, selfId);
+            }
+            long dialogId = MessageObject.getDialogId(msg);
+            if (dialogId == 0L || (selfId > 0L && dialogId == selfId)
+                    || DialogObject.isEncryptedDialog(dialogId)
+                    || DialogObject.isFolderDialogId(dialogId)
+                    || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)) {
+                return false;
+            }
+            long senderId = msg.from_id != null ? MessageObject.getPeerId(msg.from_id)
+                    : (dialogId > 0L ? dialogId : 0L);
+            if (selfId > 0L && senderId == selfId) {
+                return false;
+            }
+
+            // 1. 1-on-1 DM Instant Auto-Delete Mute (O(1) lock-free, supersedes contact check because explicitly toggled).
+            if (dialogId > 0L && engine.isDmAutoDeleteMuted(account, dialogId)) {
+                return true;
+            }
+
+            // 2. Explicit mute rules (O(1) lock-free, respects whitelist).
+            if (senderId != 0L && engine.getMuteActionFor(senderId, dialogId) != null) {
+                return true;
+            }
+            if (dialogId < 0L && engine.getMuteActionFor(0L, dialogId) != null) {
+                return true;
+            }
+
+            // 3. Anti-spam / ad suppression (zero false positives on contacts & whitelisted users).
+            if (!ColgramConfig.isSpamGuardEnabled()) return false;
+            if (senderId != 0L && (isUserContact(account, senderId) || engine.isWhitelisted(senderId))) {
+                return false;
+            }
+
+            String cacheKey = msg.id > 0 ? (account + ":" + dialogId + ":" + msg.id) : null;
+            if (cacheKey != null) {
+                synchronized (recentSuppressVerdicts) {
+                    Boolean cached = recentSuppressVerdicts.get(cacheKey);
+                    if (cached != null) return cached;
+                }
+            }
+
+            boolean isGroup = dialogId < 0L;
+            boolean isBroadcastChannel = false;
+            if (isGroup) {
+                MessagesController mc = MessagesController.getInstance(account);
+                TLRPC.Chat chat = mc != null ? mc.getChat(-dialogId) : null;
+                isBroadcastChannel = chat != null && ChatObject.isChannelAndNotMegaGroup(chat);
+            }
+
+            String text = msg.message == null ? "" : msg.message;
+            boolean inlineUrlBtns = hasInlineUrlButtons(msg);
+            boolean fwdFromChannel = isForwardedFromChannel(msg);
+            if (text.isEmpty() && !inlineUrlBtns && !msg.mentioned) {
+                return false;
+            }
+
+            List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(msg);
+            String ownUname = ownUsername(account);
+            List<String> own = ownLabels(account);
+            String pingKind = classifyMessagePing(msg, selfId, ownUname, own, targets);
+            boolean isPing = msg.mentioned || pingKind != null;
+            boolean hiddenEntity = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
+            boolean visualMedia = isVisualMedia(msg);
+            boolean viaBot = msg.via_bot_id != 0;
+
+            ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
+                    text, "", pingKind, isPing, viaBot, visualMedia, hiddenEntity,
+                    isPing && !isBroadcastChannel, own, inlineUrlBtns, fwdFromChannel);
+
+            boolean suppress;
+            if (report.isLead) {
+                suppress = false;
+            } else if (isBroadcastChannel) {
+                suppress = report.isExplicitAd
+                        || (report.isSpam && report.score >= 85 && (inlineUrlBtns || report.isHardSpam || report.shouldAutoRead));
+            } else if (isGroup) {
+                suppress = report.isSpam || report.shouldAutoRead;
+            } else {
+                // Non-contact 1-on-1 DM: silence obvious cold spam/ad disclosures without touching ordinary first DMs.
+                suppress = report.isExplicitAd || report.isHardSpam || report.score >= 70;
+            }
+
+            if (cacheKey != null) {
+                synchronized (recentSuppressVerdicts) {
+                    recentSuppressVerdicts.put(cacheKey, suppress);
+                }
+            }
+            return suppress;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void executeDmInstantAutoDelete(int account, long dialogId, int msgId, int msgDate) {
+        if (dialogId <= 0L || msgId <= 0) return;
+        // Mark force-purged immediately so Anti-Delete has zero race window.
+        ColgramHookHandler.markForcePurged(dialogId, msgId);
+        AndroidUtilities.runOnUIThread(() -> {
+            try {
+                ColgramHookHandler.markForcePurged(dialogId, msgId);
+                MessagesController mc = MessagesController.getInstance(account);
+                if (mc != null) {
+                    ArrayList<Integer> ids = new ArrayList<>(1);
+                    ids.add(msgId);
+                    // revoke=true deletes for BOTH sides on Telegram servers instantaneously.
+                    mc.deleteMessages(ids, null, null, dialogId, 0, true, 0);
+                    if (!ColgramHookHandler.shouldPreventReadReceipt(dialogId)) {
+                        mc.markDialogAsRead(dialogId, msgId, msgId, msgDate, false, 0, 0, true, 0);
+                    }
+                }
+                NotificationsController nc = NotificationsController.getInstance(account);
+                if (nc != null) {
+                    nc.removeNotificationsForDialog(dialogId);
+                }
+                ColgramColemailerEngine.getInstance().recordPingRpc(dialogId, "dm_auto_delete", true, "msgId=" + msgId);
+            } catch (Throwable tr) {
+                FileLog.e(tr);
+            }
+        });
+    }
+
     public static void onIncomingMessage(int account, TLRPC.Message msg) {
         if (msg == null || msg.id <= 0 || msg instanceof TLRPC.TL_messageEmpty || msg.action != null) return;
         TLRPC.User selfUser = UserConfig.getInstance(account).getCurrentUser();
         if (selfUser != null && selfUser.bot) return;
         long selfId = UserConfig.getInstance(account).getClientUserId();
         if (selfId == 0L) return;
+
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        engine.setSelfUserId(account, selfId);
 
         long dialogId = MessageObject.getDialogId(msg);
         if (dialogId == 0L || dialogId == selfId
@@ -547,15 +835,24 @@ public final class ColgramNativeColemailerBridge {
             recentIncomingDedupe.put(dedupeKey, nowMs);
         }
 
-        long senderId = msg.from_id != null ? MessageObject.getPeerId(msg.from_id) : 0L;
+        long senderId = msg.from_id != null ? MessageObject.getPeerId(msg.from_id)
+                : (dialogId > 0L ? dialogId : 0L);
         if (msg.out || (senderId != 0 && senderId == selfId)) {
             return;
         }
 
+        // 0. 1-on-1 DM Instant Auto-Delete Mute (handles ALL message types including media/stickers/voice, even if from_id is null).
+        if (dialogId > 0L && engine.isDmAutoDeleteMuted(account, dialogId)) {
+            executeDmInstantAutoDelete(account, dialogId, msg.id, msg.date);
+            return;
+        }
+
         long nowSec = nowMs / 1000L;
-        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
-        if (msg.date >= nowSec - 180L) {
-            engine.onIncomingChatMessage(account, dialogId, nowSec);
+        if (msg.date >= nowSec - 180L && engine.hasActiveCampaigns()) {
+            boolean thresholdReached = engine.onIncomingChatMessageAndCheckDue(account, dialogId, nowSec);
+            if (thresholdReached && ColgramConfig.isBroadcasterEnabled()) {
+                rescheduleScheduler();
+            }
         }
 
         // Safe Gatekeeper Auto-Sub when active in a group/bot dialog
@@ -579,7 +876,7 @@ public final class ColgramNativeColemailerBridge {
         if (isUserContact(account, senderId) || engine.isWhitelisted(senderId)) return;
 
         // 1-on-1 private DMs and pure broadcast channels are NEVER touched by automatic
-        // spam-ping silencing, auto-read, or Saved Messages lead forwarding.
+        // group spam deletion, auto-read, or Saved Messages lead forwarding.
         boolean isGroup = dialogId < 0;
         if (!isGroup) return;
         MessagesController mc = MessagesController.getInstance(account);
@@ -597,11 +894,13 @@ public final class ColgramNativeColemailerBridge {
         boolean hiddenEntity = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
         boolean visualMedia = isVisualMedia(msg);
         boolean viaBot = msg.via_bot_id != 0;
+        boolean inlineUrlBtns = hasInlineUrlButtons(msg);
+        boolean fwdFromChannel = isForwardedFromChannel(msg);
 
         boolean allowLeadCheck = isPing && ColgramConfig.isSaveLeadsEnabled();
         ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
                 text, "", pingKind, isPing, viaBot, visualMedia, hiddenEntity,
-                allowLeadCheck, own);
+                allowLeadCheck, own, inlineUrlBtns, fwdFromChannel);
 
         if (report.isLead && allowLeadCheck) {
             saveLeadCopyToSavedMessages(account, dialogId, msg, report);
@@ -609,6 +908,9 @@ public final class ColgramNativeColemailerBridge {
         }
 
         if (report.isSpam || report.shouldAutoRead) {
+            synchronized (recentSuppressVerdicts) {
+                recentSuppressVerdicts.put(dedupeKey, Boolean.TRUE);
+            }
             engine.recordPingRpc(dialogId, "incoming_spam", true,
                     "score=" + report.score + " trigger=" + report.primaryTrigger);
             if (isPing) {
@@ -642,6 +944,9 @@ public final class ColgramNativeColemailerBridge {
         req.limit = 100;
         ConnectionsManager.getInstance(account).sendRequest(req, (response, error) -> {
             if (error != null || !(response instanceof TLRPC.messages_Messages)) {
+                if (error != null && error.text != null && error.text.toUpperCase(Locale.ROOT).contains("FLOOD_WAIT")) {
+                    onFloodWait(account, dialogId, error.text);
+                }
                 ColgramColemailerEngine.getInstance().recordPingRpc(
                         dialogId, "unread_mentions", false, error != null ? error.text : "empty");
                 AndroidUtilities.runOnUIThread(() ->
@@ -682,7 +987,7 @@ public final class ColgramNativeColemailerBridge {
                 ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
                         txt, "", pingKind, true, m.via_bot_id != 0, isVisualMedia(m),
                         ColgramSpamGuard.hasHiddenOrMassMentionEntity(txt, targets),
-                        allowLeads, own);
+                        allowLeads, own, hasInlineUrlButtons(m), isForwardedFromChannel(m));
                 if (report.isLead && allowLeads) {
                     saveLeadCopyToSavedMessages(account, dialogId, m, report);
                     leadsInPage++;
@@ -727,6 +1032,8 @@ public final class ColgramNativeColemailerBridge {
         boolean viaBot = false;
         boolean visual = false;
         boolean hidden = false;
+        boolean inlineUrlBtns = false;
+        boolean fwdFromChannel = false;
         long senderId = 0L;
         if ((text == null || text.isEmpty()) && replyObj != null && replyObj.messageOwner != null) {
             TLRPC.Message m = replyObj.messageOwner;
@@ -737,9 +1044,11 @@ public final class ColgramNativeColemailerBridge {
             viaBot = m.via_bot_id != 0;
             visual = isVisualMedia(m);
             hidden = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
+            inlineUrlBtns = hasInlineUrlButtons(m);
+            fwdFromChannel = isForwardedFromChannel(m);
             senderId = replyObj.getSenderId();
         }
-        if (TextUtils.isEmpty(text)) {
+        if (TextUtils.isEmpty(text) && !inlineUrlBtns) {
             showAlert("Диагностика (.пингдиаг)",
                     "Ответьте на сообщение командой `.пингдиаг` или передайте текст после команды.\n\n"
                             + "Последние RPC события для чата:\n"
@@ -748,7 +1057,7 @@ public final class ColgramNativeColemailerBridge {
         }
         ColgramSpamGuard.SpamReport rep = ColgramSpamGuard.diagnose(
                 text, "", pingKind, pingKind != null || replyObj == null, viaBot, visual, hidden,
-                true, ownLabels(account));
+                true, ownLabels(account), inlineUrlBtns, fwdFromChannel);
         StringBuilder sb = new StringBuilder();
         sb.append("Скор: ").append(rep.score).append(" / ").append(ColgramSpamGuard.SPAM_THRESHOLD);
         sb.append(rep.isSpam ? " [СПАМ]" : (rep.isLead ? " [ЖИВОЙ ЛИД]" : " [ЧИСТО]")).append("\n");
@@ -770,18 +1079,25 @@ public final class ColgramNativeColemailerBridge {
         MessagesController mc = MessagesController.getInstance(account);
         if (mc == null) return;
         if (ColgramColemailerEngine.MUTE_SILENT.equals(normalized)) {
-            ColgramHookHandler.setNotificationsBlocked(senderId, true);
+            if (senderId > 0L) {
+                ColgramHookHandler.setNotificationsBlocked(senderId, true);
+            }
             return;
         }
         if (ColgramColemailerEngine.MUTE_DELETE.equals(normalized)
                 || ColgramColemailerEngine.MUTE_WARN.equals(normalized)
                 || ColgramColemailerEngine.MUTE_BAN.equals(normalized)) {
-            boolean isChannelOrMega = dialogId < 0 && ChatObject.isChannel(mc.getChat(-dialogId));
-            ArrayList<Integer> ids = new ArrayList<>();
+            // Mark force-purged immediately before posting to UI thread so Anti-Delete never resurrects it.
+            ColgramHookHandler.markForcePurged(dialogId, msgId);
+            ArrayList<Integer> ids = new ArrayList<>(1);
             ids.add(msgId);
             AndroidUtilities.runOnUIThread(() -> {
                 ColgramHookHandler.markForcePurged(dialogId, msgId);
-                mc.deleteMessages(ids, null, null, dialogId, 0, isChannelOrMega, 0);
+                mc.deleteMessages(ids, null, null, dialogId, 0, true, 0);
+                NotificationsController nc = NotificationsController.getInstance(account);
+                if (nc != null) {
+                    nc.removeNotificationsForDialog(dialogId);
+                }
                 if (ColgramColemailerEngine.MUTE_WARN.equals(normalized)) {
                     showToast("Спам-сообщение удалено", "Отправитель ID " + senderId);
                 }
@@ -1087,6 +1403,28 @@ public final class ColgramNativeColemailerBridge {
 
     private static boolean isVisualMedia(TLRPC.Message msg) {
         return msg.media instanceof TLRPC.TL_messageMediaPhoto || msg.media instanceof TLRPC.TL_messageMediaDocument;
+    }
+
+    private static boolean hasInlineUrlButtons(TLRPC.Message msg) {
+        if (msg == null || !(msg.reply_markup instanceof TLRPC.TL_replyInlineMarkup)) return false;
+        TLRPC.TL_replyInlineMarkup markup = (TLRPC.TL_replyInlineMarkup) msg.reply_markup;
+        if (markup.rows == null || markup.rows.isEmpty()) return false;
+        for (TL_keyboard.KeyboardInlineButtonRow row : markup.rows) {
+            if (row == null || row.buttons == null) continue;
+            for (TL_keyboard.KeyboardInlineButton btn : row.buttons) {
+                if (btn != null && btn.type instanceof TL_keyboard.TL_inlineButtonTypeUrl) {
+                    String u = ((TL_keyboard.TL_inlineButtonTypeUrl) btn.type).url;
+                    if (!TextUtils.isEmpty(u)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isForwardedFromChannel(TLRPC.Message msg) {
+        if (msg == null || msg.fwd_from == null) return false;
+        if (msg.fwd_from.channel_post != 0) return true;
+        return msg.fwd_from.from_id != null && msg.fwd_from.from_id.channel_id != 0;
     }
 
     private static String toBotApiChatId(int account, long dialogId) {

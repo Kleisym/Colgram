@@ -72,6 +72,7 @@ public final class ColgramKolitiVoice {
     private static final ExecutorService IO_EXEC = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "koliti-voice-io");
         t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
         return t;
     });
 
@@ -542,6 +543,22 @@ public final class ColgramKolitiVoice {
                 handler().post(() -> cb.onStateChanged(key, false, 0, duration));
             }
         });
+        mp.setOnErrorListener((failed, what, extra) -> {
+            PlaybackListener cb;
+            synchronized (PLAYER_LOCK) {
+                if (activePlayer != failed) return true;
+                stopTickerLocked();
+                cb = activeListener;
+                activePlayer = null;
+                activeKey = "";
+                activeListener = null;
+            }
+            try { failed.release(); } catch (Throwable ignored) {}
+            if (cb != null) {
+                handler().post(() -> cb.onStateChanged(key, false, 0, 0));
+            }
+            return true;
+        });
         synchronized (PLAYER_LOCK) {
             activePlayer = mp;
             activeKey = key;
@@ -953,7 +970,7 @@ public final class ColgramKolitiVoice {
             }
             releaseSherpaLocked();
             long t0 = System.currentTimeMillis();
-            int threads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+            int threads = 2; // Cap at 2 threads to avoid big.LITTLE stalls & LLM CPU contention
             Class<?> vitsCls = Class.forName("com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig");
             Object vits = vitsCls.getDeclaredConstructor().newInstance();
             vitsCls.getMethod("setModel", String.class).invoke(vits, onnxFile.getAbsolutePath());
@@ -1262,12 +1279,17 @@ public final class ColgramKolitiVoice {
                         synchronized (TTS_LOCK) {
                             if (status == TextToSpeech.SUCCESS) {
                                 ttsReady = true;
+                                if (ttsEngine != null) {
+                                    AndroidTtsProgressBridge.attach(ttsEngine);
+                                }
                                 if (pendingTtsText != null) {
                                     String t = pendingTtsText;
                                     String l = pendingTtsLang;
                                     Context c = pendingTtsCtx;
                                     pendingTtsText = null;
-                                    dispatchAndroidTtsLocked(c, t, l);
+                                    if (!dispatchAndroidTtsLocked(c, t, l)) {
+                                        notifySpeakingState(false, "");
+                                    }
                                 }
                             } else {
                                 ttsReady = false;
@@ -1285,9 +1307,24 @@ public final class ColgramKolitiVoice {
                 pendingTtsText = text;
                 pendingTtsLang = langCode;
                 pendingTtsCtx = app;
-                return false;
+                return true;
             }
             return dispatchAndroidTtsLocked(app, text, langCode);
+        }
+    }
+
+    private static final class AndroidTtsProgressBridge {
+        static void attach(TextToSpeech engine) {
+            if (engine == null) return;
+            engine.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
+                @Override public void onStart(String utteranceId) {}
+                @Override public void onDone(String utteranceId) {
+                    notifySpeakingState(false, "");
+                }
+                @Override public void onError(String utteranceId) {
+                    notifySpeakingState(false, "");
+                }
+            });
         }
     }
 
@@ -1589,7 +1626,7 @@ public final class ColgramKolitiVoice {
                 synchronized (ASR_LOCK) {
                     if (sherpaAsrInstance != null) return;
                     long t0 = System.currentTimeMillis();
-                    int threads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+                    int threads = 2; // Keep offline ASR light on mobile big.LITTLE cores
                     Class<?> transCls = Class.forName("com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig");
                     Object trans = transCls.getDeclaredConstructor().newInstance();
                     transCls.getMethod("setEncoder", String.class).invoke(trans, new File(asrDir, "encoder.int8.onnx").getAbsolutePath());
@@ -1638,7 +1675,7 @@ public final class ColgramKolitiVoice {
                         synchronized (ASR_LOCK) {
                             if (sherpaAsrInstance == null) {
                                 long t0 = System.currentTimeMillis();
-                                int threads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+                                int threads = 2; // Keep offline ASR light on mobile big.LITTLE cores
                                 Class<?> transCls = Class.forName("com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig");
                                 Object trans = transCls.getDeclaredConstructor().newInstance();
                                 transCls.getMethod("setEncoder", String.class).invoke(trans, new File(asrDir, "encoder.int8.onnx").getAbsolutePath());

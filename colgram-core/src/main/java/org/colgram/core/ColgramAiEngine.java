@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Autonomous orchestrator for Koliti:
@@ -181,10 +183,12 @@ public final class ColgramAiEngine {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean busy = new AtomicBoolean(false);
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    private final AtomicLong requestSeq = new AtomicLong(0L);
     private final List<ColgramAiContextEngine.ConversationTurn> conversationMemory = new ArrayList<>();
     private volatile String lastReferencedChatTarget = "";
 
     private volatile String loadedModelKey = "";
+    private volatile int loadedCtxBudget = 0;
     private volatile boolean loadedWithVision = false;
     private volatile boolean modelLoaded = false;
     private final AtomicBoolean warmUpQueued = new AtomicBoolean(false);
@@ -273,6 +277,7 @@ public final class ColgramAiEngine {
                 modelLoaded = false;
                 loadedWithVision = false;
                 loadedModelKey = "";
+                loadedCtxBudget = 0;
             }
         });
     }
@@ -288,16 +293,17 @@ public final class ColgramAiEngine {
     }
 
     /**
-     * Silently warms the text core in background when the user opens the Koliti sheet so typing
-     * time overlaps with mmap initialization and the very first question responds immediately.
+     * Silently warms the text core AND prefills the static system prompt KV+SSM snapshot in background
+     * when the user opens the Koliti sheet so typing time overlaps with initialization and the very
+     * first question starts streaming immediately!
      */
     public void warmUpAsync(final Context appCtx) {
-        if (appCtx == null || !ColgramNativeLlama.isLoaded() || modelLoaded || busy.get()) return;
+        if (appCtx == null || !ColgramNativeLlama.isLoaded() || busy.get()) return;
         if (!warmUpQueued.compareAndSet(false, true)) return;
         final Context ctx = appCtx.getApplicationContext();
         worker.execute(() -> {
             try {
-                if (modelLoaded || busy.get()) return;
+                if (busy.get()) return;
                 ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);
                 if ((!paths.isReady() || ColgramAiModelManager.needsEmbeddedUpgrade(ctx))
                         && ColgramAiModelManager.hasEmbeddedAssets(ctx)) {
@@ -306,21 +312,31 @@ public final class ColgramAiEngine {
                         modelLoaded = false;
                         loadedWithVision = false;
                         loadedModelKey = "";
+                        loadedCtxBudget = 0;
                     }
                     paths = ColgramAiModelManager.ensureEmbeddedReadySync(ctx, null);
                 }
                 if (!paths.isReady()) return;
-                int ctxBudget = resolveEffectiveContext(ctx, queryTotalRamMb(ctx));
+                int ctxBudget = resolveEffectiveContext(ctx, queryTotalRamMb(ctx), false);
                 int kvBits = ColgramAiConfig.getKvQuantBits(ctx);
                 boolean flash = ColgramAiConfig.isFlashAttentionEnabled(ctx);
-                String baseKey = paths.modelPath + "|" + ctxBudget + "|" + kvBits + "|" + (flash ? 1 : 0);
-                if (modelLoaded && baseKey.equals(loadedModelKey)) return;
-                String mmprojArg = paths.hasVision() ? paths.mmprojPath : "";
-                int rc = ColgramNativeLlama.nativeInit(paths.modelPath, mmprojArg, ctxBudget, resolveThreads(ctx), kvBits, flash);
-                if (rc == 0) {
+                int threads = resolveThreads(ctx);
+                String baseKey = paths.modelPath + "|" + kvBits + "|" + (flash ? 1 : 0) + "|" + threads;
+                if (!modelLoaded || !baseKey.equals(loadedModelKey) || loadedCtxBudget < ctxBudget) {
+                    String mmprojArg = paths.hasVision() ? paths.mmprojPath : "";
+                    int rc = ColgramNativeLlama.nativeInit(paths.modelPath, mmprojArg, ctxBudget, threads, kvBits, flash);
+                    if (rc != 0) return;
                     modelLoaded = true;
                     loadedWithVision = paths.hasVision();
                     loadedModelKey = baseKey;
+                    loadedCtxBudget = ctxBudget;
+                }
+                if (!busy.get() && modelLoaded) {
+                    String baseSys = ColgramAiContextEngine.buildSystemPrompt(
+                            ColgramAiContextEngine.AssistantMode.CHAT, false, false, false);
+                    try {
+                        ColgramNativeLlama.nativeWarmUpPrompt(baseSys);
+                    } catch (Throwable ignored) {}
                     scheduleIdleUnload(ctx);
                 }
             } catch (Throwable ignored) {
@@ -333,10 +349,11 @@ public final class ColgramAiEngine {
     public String buildStatusSummary(Context ctx) {
         ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);
         long totalMb = queryTotalRamMb(ctx);
-        int ctxBudget = resolveEffectiveContext(ctx, totalMb);
+        int ctxBudget = resolveEffectiveContext(ctx, totalMb, false);
         int kv = ColgramAiConfig.getKvQuantBits(ctx);
         if (paths.isReady()) {
-            return "Koliti Core · Мышление MAX · " + (ctxBudget / 1024) + "K (Q" + kv + ")";
+            String modeLbl = ColgramAiConfig.isThinkingEnabled(ctx) ? "Мышление" : "Турбо";
+            return "Koliti Core · " + modeLbl + " · " + (ctxBudget / 1024) + "K (Q" + kv + ")";
         }
         if (ColgramAiModelManager.hasEmbeddedAssets(ctx)) {
             return "Koliti Core · Локально";
@@ -347,25 +364,31 @@ public final class ColgramAiEngine {
 
     public void runRequest(final Context appCtx, final Request req, final ResponseListener listener) {
         if (appCtx == null || req == null || listener == null) return;
+        final long myReqId = requestSeq.incrementAndGet();
         cancelCurrent();
         mainHandler.removeCallbacks(idleUnloadTask);
 
         worker.execute(() -> {
+            if (requestSeq.get() != myReqId) return;
             busy.set(true);
             cancelled.set(false);
             try {
-                executeInternal(appCtx.getApplicationContext(), req, listener);
+                executeInternal(appCtx.getApplicationContext(), req, listener, myReqId);
             } catch (Throwable t) {
-                String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
-                post(() -> listener.onError("Ошибка AI: " + msg));
+                if (requestSeq.get() == myReqId) {
+                    String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+                    postFor(myReqId, () -> listener.onError("Ошибка AI: " + msg));
+                }
             } finally {
-                busy.set(false);
-                scheduleIdleUnload(appCtx.getApplicationContext());
+                if (requestSeq.get() == myReqId) {
+                    busy.set(false);
+                    scheduleIdleUnload(appCtx.getApplicationContext());
+                }
             }
         });
     }
 
-    private void executeInternal(Context ctx, Request req, ResponseListener listener) {
+    private void executeInternal(Context ctx, Request req, ResponseListener listener, final long reqId) {
         // Resolve local Koliti Core Ultra availability FIRST:
         // When the real neural network is available, EVERY message goes to the LLM (ZERO canned replies!).
         // Deterministic command shortcuts only serve as offline fallback when no native model exists.
@@ -377,13 +400,14 @@ public final class ColgramAiEngine {
                 modelLoaded = false;
                 loadedWithVision = false;
                 loadedModelKey = "";
+                loadedCtxBudget = 0;
             }
-            post(() -> listener.onStage(upgradeEmbedded ? "Обновление ядра Koliti (UD-Q4_K_XL)…" : "Подготовка ядра Koliti…"));
+            postFor(reqId, () -> listener.onStage(upgradeEmbedded ? "Обновление ядра Koliti…" : "Подготовка ядра Koliti…"));
             paths = ColgramAiModelManager.ensureEmbeddedReadySync(ctx, new ColgramAiModelManager.DownloadListener() {
                 @Override
                 public void onProgress(String phase, long downloadedBytes, long totalBytes, double speedMbPerSec) {
                     int pct = totalBytes > 0 ? (int) Math.min(100L, (downloadedBytes * 100L) / totalBytes) : 0;
-                    post(() -> listener.onStage(phase + " • " + pct + "%"));
+                    postFor(reqId, () -> listener.onStage(phase + " • " + pct + "%"));
                 }
                 @Override
                 public void onComplete(boolean success, String message) {}
@@ -397,9 +421,9 @@ public final class ColgramAiEngine {
             if (direct.handled) {
                 recordTurn(req.userQuery, direct.replyMessage);
                 if (!direct.uiAction.isEmpty()) {
-                    post(() -> listener.onDirectUiAction(direct.uiAction));
+                    postFor(reqId, () -> listener.onDirectUiAction(direct.uiAction));
                 }
-                post(() -> listener.onFinished(direct.replyMessage, "Koliti • Управление Colgram", false));
+                postFor(reqId, () -> listener.onFinished(direct.replyMessage, "Koliti • Управление Colgram", false));
                 return;
             }
         }
@@ -412,29 +436,29 @@ public final class ColgramAiEngine {
                 req.hasActiveChat,
                 ColgramAiConfig.isWebSearchEnabled(ctx) || req.forceWebSearch
         );
-        post(() -> listener.onPlanResolved(plan));
-        post(() -> listener.onStage(nativeAvailable ? "Koliti думает…" : plan.intentSummary));
+        postFor(reqId, () -> listener.onPlanResolved(plan));
+        postFor(reqId, () -> listener.onStage(nativeAvailable ? "Koliti отвечает…" : plan.intentSummary));
 
         // Only short-circuit bare ACTION labels if native neural model is absent.
         if (!nativeAvailable && plan.resolvedMode == ColgramAiContextEngine.AssistantMode.ACTION && !plan.inAppAction.isEmpty()) {
             String msg = plan.intentSummary;
             recordTurn(req.userQuery, msg);
-            post(() -> listener.onFinished(msg, "Koliti • Действие", false));
+            postFor(reqId, () -> listener.onFinished(msg, "Koliti • Действие", false));
             return;
         }
 
         // 1. Live Web Search & Readable Excerpt Fetch (filtered & passed straight to Koliti)
         List<ColgramAiWebSearch.SearchHit> webHits = new ArrayList<>();
         if ((plan.shouldSearchWeb || req.forceWebSearch) && !cancelled.get()) {
-            post(() -> listener.onStage("Ищу и проверяю данные в сети для Koliti…"));
+            postFor(reqId, () -> listener.onStage("Ищу и проверяю данные в сети…"));
             webHits = ColgramAiWebSearch.search(req.userQuery, 4, true);
             final List<ColgramAiWebSearch.SearchHit> hitsFinal = webHits;
             if (!hitsFinal.isEmpty()) {
-                post(() -> listener.onWebHits(hitsFinal));
+                postFor(reqId, () -> listener.onWebHits(hitsFinal));
             }
         }
-        if (cancelled.get()) {
-            post(() -> listener.onError("Отменено"));
+        if (cancelled.get() || requestSeq.get() != reqId) {
+            postFor(reqId, () -> listener.onError("Отменено"));
             return;
         }
 
@@ -448,9 +472,9 @@ public final class ColgramAiEngine {
         List<String> processedImagePaths = new ArrayList<>();
         boolean hasVideoGrid = false;
         if (!rawMedia.isEmpty()) {
-            post(() -> listener.onStage("Подготавливаю кадры для Vision…"));
+            postFor(reqId, () -> listener.onStage("Подготавливаю кадры для Vision…"));
             for (String rawPath : rawMedia) {
-                if (cancelled.get()) return;
+                if (cancelled.get() || requestSeq.get() != reqId) return;
                 ColgramAiVisionProcessor.PreparedMedia pm = ColgramAiVisionProcessor.prepareMediaFile(ctx, rawPath);
                 if (pm != null && pm.file.isFile()) {
                     processedImagePaths.add(pm.file.getAbsolutePath());
@@ -458,24 +482,25 @@ public final class ColgramAiEngine {
                 }
             }
         }
-        if (cancelled.get()) {
-            post(() -> listener.onError("Отменено"));
+        if (cancelled.get() || requestSeq.get() != reqId) {
+            postFor(reqId, () -> listener.onError("Отменено"));
             return;
         }
 
         // 3. Focused BM25 + Recency compression — ONLY inject Telegram chat/channel context when asked or explicitly attached!
         long totalRamMb = queryTotalRamMb(ctx);
-        int ctxBudget = resolveEffectiveContext(ctx, totalRamMb);
-        int maxChatChars = Math.min(2400, Math.max(1200, (ctxBudget * 2) / 3));
+        boolean needsVision = !processedImagePaths.isEmpty() && paths.hasVision();
+        int ctxBudget = resolveEffectiveContext(ctx, totalRamMb, needsVision);
+        int maxChatChars = Math.min(1800, Math.max(900, (ctxBudget * 2) / 3));
 
         boolean includeActiveChat = (plan.shouldUseActiveChatContext || req.forceAttachChatContext)
                 && plan.resolvedMode != ColgramAiContextEngine.AssistantMode.PLUGIN;
         List<ColgramAiContextEngine.ChatSnippet> activePicked = includeActiveChat
-                ? ColgramAiContextEngine.selectRelevantContext(req.activeChatMessages, req.userQuery, 22, maxChatChars)
+                ? ColgramAiContextEngine.selectRelevantContext(req.activeChatMessages, req.userQuery, 18, maxChatChars)
                 : new ArrayList<>();
         boolean wantCross = plan.shouldIncludeCrossChat && ColgramAiConfig.isCrossChatRagEnabled(ctx);
         List<ColgramAiContextEngine.ChatSnippet> crossPicked = wantCross
-                ? ColgramAiContextEngine.selectRelevantContext(req.crossChatMessages, req.userQuery, 10, 1000)
+                ? ColgramAiContextEngine.selectRelevantContext(req.crossChatMessages, req.userQuery, 8, 900)
                 : new ArrayList<>();
 
         StringBuilder activeSb = new StringBuilder();
@@ -506,377 +531,10 @@ public final class ColgramAiEngine {
 
         // 4. Run built-in local Koliti Core Ultra GGUF + Vision generation via libcolgram_llama.so
         if (nativeAvailable) {
-            int kvBits = ColgramAiConfig.getKvQuantBits(ctx);
-            boolean flash = ColgramAiConfig.isFlashAttentionEnabled(ctx);
-            boolean needsVision = !processedImagePaths.isEmpty() && paths.hasVision();
-            String targetBaseKey = paths.modelPath + "|" + ctxBudget + "|" + kvBits + "|" + (flash ? 1 : 0);
-            boolean alreadySatisfied = modelLoaded
-                    && targetBaseKey.equals(loadedModelKey)
-                    && (!needsVision || loadedWithVision);
-            if (!alreadySatisfied) {
-                post(() -> listener.onStage(needsVision ? "Подключаю модуль Vision…" : "Запуск Koliti Core…"));
-                int threads = resolveThreads(ctx);
-                String mmprojArg = paths.hasVision() ? paths.mmprojPath : "";
-                int rc = ColgramNativeLlama.nativeInit(paths.modelPath, mmprojArg, ctxBudget, threads, kvBits, flash);
-                if (rc != 0) {
-                    modelLoaded = false;
-                    loadedWithVision = false;
-                    loadedModelKey = "";
-                    String err = ColgramNativeLlama.nativeGetLastError();
-                    post(() -> listener.onError("Не удалось загрузить Koliti Core: " + err));
-                    return;
-                }
-                modelLoaded = true;
-                loadedWithVision = paths.hasVision();
-                loadedModelKey = targetBaseKey;
-            }
-
-            post(() -> listener.onStage("Koliti отвечает…"));
-            boolean hasChatCtx = !activeBlock.isEmpty() || !crossBlock.isEmpty();
-            boolean hasWebCtx = !webBlock.isEmpty();
-
-            // Resolve natural person/chat messaging intent + coreference ("напиши kleisym и спроси...", "напиши ему")
-            ColgramAiAgentTools.NaturalSendIntent naturalSend =
-                    ColgramAiAgentTools.parseNaturalMessagingIntent(req.userQuery, lastReferencedChatTarget, req.dialogDirectory);
-            if (naturalSend.matched && !naturalSend.target.isEmpty()) {
-                lastReferencedChatTarget = naturalSend.target;
-            } else {
-                ColgramAiAgentTools.DirectCommandResult namedCmd = ColgramAiAgentTools.parseCrossChatDraftCommand(req.userQuery);
-                if (namedCmd.handled && namedCmd.uiAction.contains(":") && namedCmd.uiAction.contains("|")) {
-                    String t = namedCmd.uiAction.substring(namedCmd.uiAction.indexOf(':') + 1, namedCmd.uiAction.indexOf('|')).trim();
-                    if (!t.isEmpty()) {
-                        String resolved = ColgramAiAgentTools.resolveBestTargetFromDirectory(t, req.dialogDirectory);
-                        lastReferencedChatTarget = resolved.isEmpty() ? t : resolved;
-                    }
-                }
-            }
-
-            boolean remoteTargetOverride = naturalSend.matched && !naturalSend.target.isEmpty();
-            boolean effectiveLocalDraft = plan.shouldDraftIntoInput && !remoteTargetOverride;
-
-            boolean includeDirectory = !req.dialogDirectory.isEmpty()
-                    && (remoteTargetOverride
-                    || ColgramAiAgentTools.queryNeedsDialogDirectory(req.userQuery, lastReferencedChatTarget));
-            String dirForPrompt = includeDirectory ? req.dialogDirectory : "";
-
-            final boolean isSongAsk = !remoteTargetOverride && !effectiveLocalDraft
-                    && ColgramKolitiVoice.isSingSongRequest(req.userQuery);
-            final boolean allowTools = isSongAsk || ColgramAiAgentTools.queryAllowsToolCalls(
-                    req.userQuery, remoteTargetOverride, includeDirectory);
-            String sysPrompt = ColgramAiContextEngine.buildSystemPrompt(plan.resolvedMode, hasChatCtx, hasWebCtx, allowTools);
-            String effectiveQuery = req.userQuery;
-            if (remoteTargetOverride) {
-                String toolVerb = naturalSend.sendNow ? "SEND_TO_CHAT" : "DRAFT_TO_CHAT";
-                String hint = "\n(Задача: реально " + (naturalSend.sendNow ? "отправить сообщение" : "подготовить черновик")
-                        + " в чат «" + naturalSend.target + "». В Telegram сообщения доставляются даже офлайн — не отказывайся."
-                        + " Напиши живой естественный текст для собеседника и ОБЯЗАТЕЛЬНО добавь в конце тег [[TOOL:"
-                        + toolVerb + "|" + naturalSend.target + "|текст_сообщения]].)";
-                effectiveQuery = req.userQuery + hint;
-            } else if (effectiveLocalDraft) {
-                effectiveQuery = req.userQuery + "\n(Выведи ТОЛЬКО готовый текст для отправки в чат, без пояснений.)";
-            } else if (isSongAsk) {
-                effectiveQuery = req.userQuery
-                        + "\n(Пользователь просит спеть. Реши сам по настроению и контексту: "
-                        + "либо спой свою фирменную аудио-песню — напиши короткую живую реплику и добавь в самом конце [[TOOL:SING_SONG]]; "
-                        + "либо просто сочини короткий весёлый куплет текстом без тега; "
-                        + "либо шутливо откажись / спроси в каком стиле спеть. Без шаблонов!)";
-            }
-
-            String userPrompt = ColgramAiContextEngine.buildUserPrompt(
-                    effectiveQuery, req.activeChatTitle, activeBlock, crossBlock, webBlock,
-                    dirForPrompt, processedImagePaths.size(), hasVideoGrid, null);
-
-            String[] baseHistoryPairs = plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN
-                    ? null
-                    : ColgramAiContextEngine.buildCleanHistoryPairs(history, req.userQuery);
-            if (baseHistoryPairs == null && !history.isEmpty()) {
-                try {
-                    ColgramNativeLlama.nativeClearMemory();
-                } catch (Throwable ignored) {}
-            }
-
-            final boolean showThinking = ColgramAiConfig.isThinkingEnabled(ctx);
-            // Smart Adaptive Thinking: casual chat, greetings, voice notes, and song asks stream
-            // token #1 IMMEDIATELY (~5x faster on mobile CPU) with ZERO wasted hidden <think> pass;
-            // complex math/code/proofs (or explicit Thinking toggle) engage compact deep CoT!
-            final boolean adaptiveThink = !isSongAsk
-                    && ColgramAiContextEngine.shouldUseAdaptiveThinking(
-                            req.userQuery, plan, !processedImagePaths.isEmpty());
-            final boolean baseNativeThinking = !effectiveLocalDraft
-                    && !remoteTargetOverride
-                    && processedImagePaths.isEmpty()
-                    && (showThinking || adaptiveThink);
-            String[] imgArr = processedImagePaths.isEmpty() ? null : processedImagePaths.toArray(new String[0]);
-
-            int reasoningTier = ColgramAiContextEngine.classifyReasoningTier(req.userQuery);
-            int thinkingBudget = reasoningTier <= 1 ? 480 : 760;
-            int fastBudget = isSongAsk ? 220 : (reasoningTier == 0 ? 256 : 448);
-            int baseMaxTokens = effectiveLocalDraft ? 220
-                    : (remoteTargetOverride ? 280
-                    : (baseNativeThinking ? thinkingBudget
-                    : (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN ? 960 : fastBudget)));
-            float baseTemp = ColgramAiConfig.getTemperature(ctx);
-            boolean strictGrounded = hasChatCtx || hasWebCtx || includeDirectory || remoteTargetOverride
-                    || plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN
-                    || effectiveLocalDraft || verifiedMath != null;
-
-            List<String> agentLoopHistory = new ArrayList<>();
-            if (baseHistoryPairs != null) {
-                for (String hp : baseHistoryPairs) {
-                    agentLoopHistory.add(hp);
-                }
-            }
-
-            String currentStepPrompt = userPrompt;
-            String finalText = "";
-            List<String> verifiedConfirmations = new ArrayList<>();
-            boolean anyActionExecuted = false;
-
-            // Multi-Step Autonomous ReAct Agent Loop (Fast/Adaptive-Think -> Optional Verified Tool -> Finalize)
-            for (int step = 0; step < MAX_AGENT_STEPS && !cancelled.get(); step++) {
-                boolean useThinkingThisStep = (step == 0) && baseNativeThinking;
-                String[] stepHistory = agentLoopHistory.isEmpty() ? null : agentLoopHistory.toArray(new String[0]);
-                String[] stepImgs = (step == 0) ? imgArr : null;
-                int stepMaxTokens = (step == 0) ? baseMaxTokens : 640;
-
-                float temp;
-                float topP;
-                int repPen100;
-                if (useThinkingThisStep) {
-                    // Official Qwen3.5 Thinking sampling: repeat_penalty=1.0 (zero Cyrillic subword distortion!)
-                    temp = strictGrounded ? 0.45f : 0.60f;
-                    topP = 0.95f;
-                    repPen100 = 100;
-                } else if (strictGrounded || step > 0) {
-                    temp = 0.35f;
-                    topP = 0.85f;
-                    repPen100 = 100;
-                } else {
-                    // Official Qwen3.5 Non-Thinking chat: natural fluent Russian without weird token shifts
-                    temp = Math.max(0.55f, Math.min(0.70f, baseTemp));
-                    topP = 0.85f;
-                    repPen100 = 100;
-                }
-
-                final boolean[] streamedVisibleThisStep = {false};
-                String stepRaw = runNativeGenerationStep(
-                        sysPrompt, stepHistory, currentStepPrompt, stepImgs,
-                        stepMaxTokens, temp, topP, repPen100, useThinkingThisStep, showThinking,
-                        listener, streamedVisibleThisStep);
-                if (cancelled.get()) {
-                    post(() -> listener.onError("Генерация остановлена"));
-                    return;
-                }
-                if (stepRaw == null) {
-                    String err = ColgramNativeLlama.nativeGetLastError();
-                    post(() -> listener.onError("Ошибка генерации: " + err));
-                    return;
-                }
-
-                String stepText = ColgramAiContextEngine.stripThinkingTags(stepRaw, showThinking, useThinkingThisStep);
-
-                // Recovery ONLY if deep thinking exhausted token budget before closing </think> (nothing was shown yet)
-                if (step == 0 && stepText.isEmpty() && useThinkingThisStep && !cancelled.get()) {
-                    String retryRaw = runNativeGenerationStep(
-                            sysPrompt, stepHistory, currentStepPrompt, stepImgs,
-                            640, strictGrounded ? 0.35f : 0.62f, 0.85f, 100, false, showThinking,
-                            listener, streamedVisibleThisStep);
-                    if (!cancelled.get() && retryRaw != null) {
-                        stepText = ColgramAiContextEngine.stripThinkingTags(retryRaw, showThinking, false);
-                    }
-                }
-
-                // Hard anti-parrot guard ONLY if exact verbatim repeat of a previous answer (and never wipe on fresh text)
-                if (step == 0 && !cancelled.get() && ColgramAiContextEngine.isParrotRepeatOfHistory(stepText, req.userQuery, history)) {
-                    try {
-                        ColgramNativeLlama.nativeClearMemory();
-                    } catch (Throwable ignored) {}
-                    String retryRaw = runNativeGenerationStep(
-                            sysPrompt, null, currentStepPrompt, stepImgs,
-                            640, 0.68f, 0.88f, 100, false, showThinking,
-                            listener, streamedVisibleThisStep);
-                    if (!cancelled.get() && retryRaw != null) {
-                        String retried = ColgramAiContextEngine.stripThinkingTags(retryRaw, showThinking, false);
-                        if (!retried.isEmpty()) stepText = retried;
-                    }
-                }
-
-                if (stepText.isEmpty()) {
-                    if (step == 0) {
-                        post(() -> listener.onError("Модель вернула пустой ответ — попробуй переформулировать запрос."));
-                        return;
-                    }
-                    break;
-                }
-
-                // Strict tool-call gate: on normal chat, greetings, follow-ups ("че?"), coding, or math,
-                // IGNORE any hallucinated [[TOOL:...]] tags so Koliti NEVER wipes a finished reply and restarts!
-                List<String> toolActions = allowTools
-                        ? ColgramAiAgentTools.extractToolActions(stepText)
-                        : java.util.Collections.emptyList();
-                String visibleProse = ColgramAiAgentTools.stripToolTags(stepText);
-
-                // Anti-refusal auto-recovery ONLY for genuine user messaging requests
-                if (toolActions.isEmpty() && remoteTargetOverride
-                        && ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(visibleProse)
-                        && step < MAX_AGENT_STEPS - 1) {
-                    post(() -> listener.onStage("Уточняю отправку в «" + naturalSend.target + "»…"));
-                    agentLoopHistory.add(currentStepPrompt);
-                    agentLoopHistory.add(stepText);
-                    currentStepPrompt = "В Telegram сообщения доставляются собеседнику даже если он не в сети. "
-                            + "Не отказывайся и не объясняй статус онлайн. Напиши короткое естественное сообщение для «"
-                            + naturalSend.target + "» по просьбе пользователя («" + req.userQuery + "») и ОБЯЗАТЕЛЬНО "
-                            + "добавь в конце тег [[TOOL:" + (naturalSend.sendNow ? "SEND_TO_CHAT" : "DRAFT_TO_CHAT")
-                            + "|" + naturalSend.target + "|текст]].";
-                    continue;
-                }
-
-                if (!toolActions.isEmpty()) {
-                    StringBuilder observationsForNextTurn = new StringBuilder();
-                    boolean needsNextLlmTurn = false;
-                    for (String ta : toolActions) {
-                        if (cancelled.get()) break;
-                        if (ColgramAiAgentTools.isQueryToolAction(ta)) {
-                            // Never restart an already-completed long visible answer for an unsolicited query tool
-                            if (step == 0 && streamedVisibleThisStep[0] && visibleProse.length() >= 48 && !includeDirectory && !plan.shouldSearchWeb) {
-                                continue;
-                            }
-                            ToolResult qRes = executeQueryOrActionTool(ctx, req, ta, listener);
-                            if (qRes != null && !qRes.observation.isEmpty()) {
-                                if (observationsForNextTurn.length() > 0) observationsForNextTurn.append('\n');
-                                observationsForNextTurn.append("[").append(ta).append("]\n").append(qRes.observation);
-                                if (!qRes.resolvedTarget.isEmpty()) {
-                                    lastReferencedChatTarget = qRes.resolvedTarget;
-                                }
-                                needsNextLlmTurn = true;
-                            }
-                        } else {
-                            ToolResult aRes = executeQueryOrActionTool(ctx, req, ta, listener);
-                            if (aRes != null) {
-                                if (aRes.ok) {
-                                    anyActionExecuted = true;
-                                    if (!aRes.resolvedTarget.isEmpty()) {
-                                        lastReferencedChatTarget = aRes.resolvedTarget;
-                                    }
-                                    if (!aRes.observation.isEmpty()) {
-                                        verifiedConfirmations.add(aRes.observation);
-                                    }
-                                    final ToolResult delivered = aRes;
-                                    post(() -> listener.onToolResult(delivered));
-                                } else if (step < MAX_AGENT_STEPS - 1 && !aRes.observation.isEmpty()) {
-                                    if (observationsForNextTurn.length() > 0) observationsForNextTurn.append('\n');
-                                    observationsForNextTurn.append("[Ошибка ").append(ta).append("]: ").append(aRes.observation);
-                                    needsNextLlmTurn = true;
-                                } else if (!aRes.observation.isEmpty()) {
-                                    verifiedConfirmations.add("⚠ " + aRes.observation);
-                                }
-                            }
-                        }
-                    }
-
-                    if (needsNextLlmTurn && step < MAX_AGENT_STEPS - 1) {
-                        agentLoopHistory.add(currentStepPrompt);
-                        agentLoopHistory.add(stepText);
-                        currentStepPrompt = "Результат инструментов:\n" + observationsForNextTurn
-                                + "\n\nИспользуй эти реальные данные, чтобы дать точный финальный ответ пользователю"
-                                + " (или выполни действие через [[TOOL:...]], если задача ещё не завершена).";
-                        post(() -> listener.onStage("Koliti анализирует данные…"));
-                        continue;
-                    }
-
-                    finalText = visibleProse;
-                    break;
-                }
-
-                finalText = visibleProse;
-                break;
-            }
-
-            // Safety net ONLY if LLM still omitted [[TOOL:...]] on an explicit messaging/action request
-            if (!anyActionExecuted && !cancelled.get()) {
-                String fallbackAction = "";
-                if (remoteTargetOverride) {
-                    String msgBody = !naturalSend.literalPayload.isEmpty()
-                            ? naturalSend.literalPayload
-                            : ColgramAiAgentTools.extractNaturalMessageFromReply(finalText);
-                    if (msgBody.isEmpty() || ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(msgBody)) {
-                        // Look back at previous assistant turn if user said "напиши ему" after a draft
-                        if (naturalSend.pronounFollowUp && !history.isEmpty()) {
-                            for (int i = history.size() - 1; i >= 0; i--) {
-                                String prev = ColgramAiAgentTools.extractNaturalMessageFromReply(history.get(i).assistantReply);
-                                if (!prev.isEmpty() && !ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(prev) && prev.length() <= 300) {
-                                    msgBody = prev;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (!msgBody.isEmpty() && !ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(msgBody)) {
-                        fallbackAction = (naturalSend.sendNow ? "SEND_TO_CHAT:" : "DRAFT_TO_CHAT:")
-                                + naturalSend.target + "|" + msgBody;
-                    }
-                }
-                if (fallbackAction.isEmpty()) {
-                    fallbackAction = ColgramAiAgentTools.resolveGenerativeCrossChatAction(req.userQuery, finalText);
-                }
-                if (fallbackAction.isEmpty()) {
-                    ColgramAiAgentTools.DirectCommandResult implicit =
-                            ColgramAiAgentTools.tryExecuteDirectCommand(ctx, req.userQuery, history);
-                    if (implicit.handled && !implicit.uiAction.isEmpty()) {
-                        fallbackAction = implicit.uiAction;
-                    } else if (!plan.inAppAction.isEmpty()) {
-                        fallbackAction = plan.inAppAction;
-                    }
-                }
-                if (!fallbackAction.isEmpty()) {
-                    ToolResult fRes = executeQueryOrActionTool(ctx, req, fallbackAction, listener);
-                    if (fRes != null) {
-                        if (fRes.ok) {
-                            anyActionExecuted = true;
-                            if (!fRes.resolvedTarget.isEmpty()) {
-                                lastReferencedChatTarget = fRes.resolvedTarget;
-                            }
-                            if (!fRes.observation.isEmpty()) {
-                                verifiedConfirmations.add(fRes.observation);
-                            }
-                            final ToolResult delivered = fRes;
-                            post(() -> listener.onToolResult(delivered));
-                        } else if (!fRes.observation.isEmpty()) {
-                            verifiedConfirmations.add("⚠ " + fRes.observation);
-                        }
-                    }
-                }
-            }
-
-            // Merge verified tool execution badge cleanly so the user always sees truth about real delivery
-            if (!verifiedConfirmations.isEmpty()) {
-                StringBuilder confSb = new StringBuilder();
-                for (String c : verifiedConfirmations) {
-                    if (confSb.length() > 0) confSb.append('\n');
-                    confSb.append(c.startsWith("⚠") ? c : ("✓ " + c));
-                }
-                String confBlock = confSb.toString();
-                if (finalText.isEmpty() || remoteTargetOverride) {
-                    finalText = confBlock;
-                } else if (!finalText.contains(verifiedConfirmations.get(0))) {
-                    finalText = finalText + "\n\n" + confBlock;
-                }
-            } else if (finalText.isEmpty()) {
-                finalText = "Готово.";
-            }
-
-            if (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN) {
-                ColgramAiAgentTools.InstalledPluginResult installed =
-                        ColgramAiAgentTools.extractAndInstallPlugin(finalText, true);
-                if (installed.installed) {
-                    post(() -> listener.onPluginInstalled(installed));
-                }
-            }
-            recordTurn(req.userQuery, finalText);
-            String timings = ColgramNativeLlama.nativeGetLastTimings();
-            String footer = paths.displayName + (timings.isEmpty() ? "" : " • " + timings);
-            final String outFinal = finalText;
-            post(() -> listener.onFinished(outFinal, footer, true));
+            executeNativePipeline(
+                    ctx, req, listener, reqId, paths, plan,
+                    processedImagePaths, hasVideoGrid, needsVision, ctxBudget,
+                    activeBlock, crossBlock, webBlock, verifiedMath, history);
             return;
         }
 
@@ -887,15 +545,484 @@ public final class ColgramAiEngine {
             String reason = !ColgramNativeLlama.isLoaded()
                     ? (" (" + ColgramNativeLlama.getLoadError() + ")")
                     : (!paths.isReady() ? " (модель не распакована — проверьте память устройства)" : "");
-            post(() -> listener.onError("Локальное ядро Koliti не загружено" + reason + "."));
+            postFor(reqId, () -> listener.onError("Локальное ядро Koliti не загружено" + reason + "."));
             return;
         }
         recordTurn(req.userQuery, answer);
         String footer = plan.intentSummary + (webHits.isEmpty() ? "" : " • Источников: " + webHits.size());
-        post(() -> listener.onFinished(answer, footer, false));
+        postFor(reqId, () -> listener.onFinished(answer, footer, false));
+    }
+
+    private static final class NativeRunState {
+        String sysPrompt;
+        String currentStepPrompt;
+        String[] imgArr;
+        int baseMaxTokens;
+        float baseTemp;
+        boolean strictGrounded;
+        boolean baseNativeThinking;
+        boolean showThinking;
+        boolean allowTools;
+        boolean includeDirectory;
+        boolean remoteTargetOverride;
+        ColgramAiAgentTools.NaturalSendIntent naturalSend;
+        final List<String> agentLoopHistory = new ArrayList<>();
+        final List<String> verifiedConfirmations = new ArrayList<>();
+        String finalText = "";
+        boolean anyActionExecuted = false;
+        boolean aborted = false;
+    }
+
+    private boolean ensureNativeModelInitialized(
+            Context ctx,
+            ColgramAiModelManager.ResolvedModelPaths paths,
+            int ctxBudget,
+            boolean needsVision,
+            ResponseListener listener,
+            final long reqId
+    ) {
+        int kvBits = ColgramAiConfig.getKvQuantBits(ctx);
+        boolean flash = ColgramAiConfig.isFlashAttentionEnabled(ctx);
+        int threads = resolveThreads(ctx);
+        String targetBaseKey = paths.modelPath + "|" + kvBits + "|" + (flash ? 1 : 0) + "|" + threads;
+        boolean alreadySatisfied = modelLoaded
+                && targetBaseKey.equals(loadedModelKey)
+                && loadedCtxBudget >= ctxBudget
+                && (!needsVision || loadedWithVision);
+        if (alreadySatisfied) return true;
+
+        postFor(reqId, () -> listener.onStage(needsVision ? "Подключаю модуль Vision…" : "Запуск Koliti Core…"));
+        String mmprojArg = paths.hasVision() ? paths.mmprojPath : "";
+        int rc = ColgramNativeLlama.nativeInit(paths.modelPath, mmprojArg, ctxBudget, threads, kvBits, flash);
+        if (rc != 0) {
+            modelLoaded = false;
+            loadedWithVision = false;
+            loadedModelKey = "";
+            loadedCtxBudget = 0;
+            String err = ColgramNativeLlama.nativeGetLastError();
+            postFor(reqId, () -> listener.onError("Не удалось загрузить Koliti Core: " + err));
+            return false;
+        }
+        modelLoaded = true;
+        loadedWithVision = paths.hasVision();
+        loadedModelKey = targetBaseKey;
+        loadedCtxBudget = ctxBudget;
+        return true;
+    }
+
+    private NativeRunState buildNativeRunState(
+            Context ctx,
+            Request req,
+            ColgramAiContextEngine.IntentPlan plan,
+            List<String> processedImagePaths,
+            boolean hasVideoGrid,
+            String activeBlock,
+            String crossBlock,
+            String webBlock,
+            String verifiedMath,
+            List<ColgramAiContextEngine.ConversationTurn> history
+    ) {
+        NativeRunState st = new NativeRunState();
+        boolean hasChatCtx = !activeBlock.isEmpty() || !crossBlock.isEmpty();
+        boolean hasWebCtx = !webBlock.isEmpty();
+
+        st.naturalSend = ColgramAiAgentTools.parseNaturalMessagingIntent(
+                req.userQuery, lastReferencedChatTarget, req.dialogDirectory);
+        if (st.naturalSend.matched && !st.naturalSend.target.isEmpty()) {
+            lastReferencedChatTarget = st.naturalSend.target;
+        } else {
+            ColgramAiAgentTools.DirectCommandResult namedCmd = ColgramAiAgentTools.parseCrossChatDraftCommand(req.userQuery);
+            if (namedCmd.handled && namedCmd.uiAction.contains(":") && namedCmd.uiAction.contains("|")) {
+                String t = namedCmd.uiAction.substring(namedCmd.uiAction.indexOf(':') + 1, namedCmd.uiAction.indexOf('|')).trim();
+                if (!t.isEmpty()) {
+                    String resolved = ColgramAiAgentTools.resolveBestTargetFromDirectory(t, req.dialogDirectory);
+                    lastReferencedChatTarget = resolved.isEmpty() ? t : resolved;
+                }
+            }
+        }
+
+        st.remoteTargetOverride = st.naturalSend.matched && !st.naturalSend.target.isEmpty();
+        boolean effectiveLocalDraft = plan.shouldDraftIntoInput && !st.remoteTargetOverride;
+
+        st.includeDirectory = !req.dialogDirectory.isEmpty()
+                && (st.remoteTargetOverride
+                || ColgramAiAgentTools.queryNeedsDialogDirectory(req.userQuery, lastReferencedChatTarget));
+        String dirForPrompt = st.includeDirectory ? req.dialogDirectory : "";
+
+        boolean isSongAsk = !st.remoteTargetOverride && !effectiveLocalDraft
+                && ColgramKolitiVoice.isSingSongRequest(req.userQuery);
+        st.allowTools = isSongAsk || ColgramAiAgentTools.queryAllowsToolCalls(
+                req.userQuery, st.remoteTargetOverride, st.includeDirectory);
+        st.sysPrompt = ColgramAiContextEngine.buildSystemPrompt(plan.resolvedMode, hasChatCtx, hasWebCtx, st.allowTools);
+        String effectiveQuery = req.userQuery;
+        if (st.remoteTargetOverride) {
+            String toolVerb = st.naturalSend.sendNow ? "SEND_TO_CHAT" : "DRAFT_TO_CHAT";
+            String hint = "\n(Задача: реально " + (st.naturalSend.sendNow ? "отправить сообщение" : "подготовить черновик")
+                    + " в чат «" + st.naturalSend.target + "». В Telegram сообщения доставляются даже офлайн — не отказывайся."
+                    + " Напиши живой естественный текст для собеседника и ОБЯЗАТЕЛЬНО добавь в конце тег [[TOOL:"
+                    + toolVerb + "|" + st.naturalSend.target + "|текст_сообщения]].)";
+            effectiveQuery = req.userQuery + hint;
+        } else if (effectiveLocalDraft) {
+            effectiveQuery = req.userQuery + "\n(Выведи ТОЛЬКО готовый текст для отправки в чат, без пояснений.)";
+        } else if (isSongAsk) {
+            effectiveQuery = req.userQuery
+                    + "\n(Пользователь просит спеть. Реши сам по настроению и контексту: "
+                    + "либо спой свою фирменную аудио-песню — напиши короткую живую реплику и добавь в самом конце [[TOOL:SING_SONG]]; "
+                    + "либо просто сочини короткий весёлый куплет текстом без тега; "
+                    + "либо шутливо откажись / спроси в каком стиле спеть. Без шаблонов!)";
+        }
+
+        st.currentStepPrompt = ColgramAiContextEngine.buildUserPrompt(
+                effectiveQuery, req.activeChatTitle, activeBlock, crossBlock, webBlock,
+                dirForPrompt, processedImagePaths.size(), hasVideoGrid, null);
+
+        String[] baseHistoryPairs = plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN
+                ? null
+                : ColgramAiContextEngine.buildCleanHistoryPairs(history, req.userQuery);
+        if (baseHistoryPairs == null && !history.isEmpty()) {
+            try {
+                ColgramNativeLlama.nativeClearMemory();
+            } catch (Throwable ignored) {}
+        }
+        if (baseHistoryPairs != null) {
+            for (String hp : baseHistoryPairs) {
+                st.agentLoopHistory.add(hp);
+            }
+        }
+
+        st.showThinking = ColgramAiConfig.isThinkingEnabled(ctx);
+        boolean adaptiveThink = !isSongAsk
+                && ColgramAiContextEngine.shouldUseAdaptiveThinking(
+                        req.userQuery, plan, !processedImagePaths.isEmpty());
+        st.baseNativeThinking = !effectiveLocalDraft
+                && !st.remoteTargetOverride
+                && processedImagePaths.isEmpty()
+                && (st.showThinking || adaptiveThink);
+        st.imgArr = processedImagePaths.isEmpty() ? null : processedImagePaths.toArray(new String[0]);
+
+        int reasoningTier = ColgramAiContextEngine.classifyReasoningTier(req.userQuery);
+        int thinkingBudget = reasoningTier <= 1 ? 448 : 640;
+        int fastBudget = isSongAsk ? 200 : (reasoningTier == 0 ? 220 : 448);
+        st.baseMaxTokens = effectiveLocalDraft ? 200
+                : (st.remoteTargetOverride ? 260
+                : (st.baseNativeThinking ? thinkingBudget
+                : (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN ? 768 : fastBudget)));
+        st.baseTemp = ColgramAiConfig.getTemperature(ctx);
+        st.strictGrounded = hasChatCtx || hasWebCtx || st.includeDirectory || st.remoteTargetOverride
+                || plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN
+                || effectiveLocalDraft || verifiedMath != null;
+        return st;
+    }
+
+    private boolean executeSingleAgentStep(
+            Context ctx,
+            Request req,
+            ResponseListener listener,
+            final long reqId,
+            ColgramAiContextEngine.IntentPlan plan,
+            List<ColgramAiContextEngine.ConversationTurn> history,
+            NativeRunState st,
+            int step
+    ) {
+        boolean useThinkingThisStep = (step == 0) && st.baseNativeThinking;
+        String[] stepHistory = st.agentLoopHistory.isEmpty() ? null : st.agentLoopHistory.toArray(new String[0]);
+        String[] stepImgs = (step == 0) ? st.imgArr : null;
+        int stepMaxTokens = (step == 0) ? st.baseMaxTokens : 640;
+
+        float temp;
+        float topP;
+        if (useThinkingThisStep) {
+            temp = st.strictGrounded ? 0.45f : 0.60f;
+            topP = 0.95f;
+        } else if (st.strictGrounded || step > 0) {
+            temp = 0.35f;
+            topP = 0.85f;
+        } else {
+            temp = Math.max(0.55f, Math.min(0.70f, st.baseTemp));
+            topP = 0.85f;
+        }
+
+        final boolean[] streamedVisibleThisStep = {false};
+        String stepRaw = runNativeGenerationStep(
+                reqId, st.sysPrompt, stepHistory, st.currentStepPrompt, stepImgs,
+                stepMaxTokens, temp, topP, 100, useThinkingThisStep, st.showThinking,
+                listener, streamedVisibleThisStep);
+        if (cancelled.get() || requestSeq.get() != reqId) {
+            if (requestSeq.get() == reqId) {
+                String partialClean = stepRaw == null ? ""
+                        : ColgramAiAgentTools.stripToolTags(
+                                ColgramAiContextEngine.stripThinkingTags(stepRaw, st.showThinking, useThinkingThisStep));
+                if (!partialClean.isEmpty()) {
+                    recordTurn(req.userQuery, partialClean);
+                    postFor(reqId, () -> listener.onFinished(partialClean, "Koliti • Остановлено", true));
+                } else {
+                    postFor(reqId, () -> listener.onError("Генерация остановлена"));
+                }
+            }
+            st.aborted = true;
+            return false;
+        }
+        if (stepRaw == null) {
+            String err = ColgramNativeLlama.nativeGetLastError();
+            postFor(reqId, () -> listener.onError("Ошибка генерации: " + err));
+            st.aborted = true;
+            return false;
+        }
+
+        String stepText = ColgramAiContextEngine.stripThinkingTags(stepRaw, st.showThinking, useThinkingThisStep);
+        if (step == 0 && stepText.isEmpty() && useThinkingThisStep && !cancelled.get()) {
+            String retryRaw = runNativeGenerationStep(
+                    reqId, st.sysPrompt, stepHistory, st.currentStepPrompt, stepImgs,
+                    480, st.strictGrounded ? 0.35f : 0.62f, 0.85f, 100, false, st.showThinking,
+                    listener, streamedVisibleThisStep);
+            if (!cancelled.get() && retryRaw != null) {
+                stepText = ColgramAiContextEngine.stripThinkingTags(retryRaw, st.showThinking, false);
+            }
+        }
+        if (step == 0 && !cancelled.get() && ColgramAiContextEngine.isParrotRepeatOfHistory(stepText, req.userQuery, history)) {
+            try {
+                ColgramNativeLlama.nativeClearMemory();
+            } catch (Throwable ignored) {}
+            String retryRaw = runNativeGenerationStep(
+                    reqId, st.sysPrompt, null, st.currentStepPrompt, stepImgs,
+                    480, 0.68f, 0.88f, 100, false, st.showThinking,
+                    listener, streamedVisibleThisStep);
+            if (!cancelled.get() && retryRaw != null) {
+                String retried = ColgramAiContextEngine.stripThinkingTags(retryRaw, st.showThinking, false);
+                if (!retried.isEmpty()) stepText = retried;
+            }
+        }
+
+        if (stepText.isEmpty()) {
+            if (step == 0) {
+                postFor(reqId, () -> listener.onError("Модель вернула пустой ответ — попробуй переформулировать запрос."));
+                st.aborted = true;
+            }
+            return false;
+        }
+
+        List<String> toolActions = st.allowTools
+                ? ColgramAiAgentTools.extractToolActions(stepText)
+                : java.util.Collections.emptyList();
+        String visibleProse = ColgramAiAgentTools.stripToolTags(stepText);
+
+        if (toolActions.isEmpty() && st.remoteTargetOverride
+                && ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(visibleProse)
+                && step < MAX_AGENT_STEPS - 1) {
+            postFor(reqId, () -> listener.onStage("Уточняю отправку в «" + st.naturalSend.target + "»…"));
+            st.agentLoopHistory.add(st.currentStepPrompt);
+            st.agentLoopHistory.add(stepText);
+            st.currentStepPrompt = "В Telegram сообщения доставляются собеседнику даже если он не в сети. "
+                    + "Не отказывайся и не объясняй статус онлайн. Напиши короткое естественное сообщение для «"
+                    + st.naturalSend.target + "» по просьбе пользователя («" + req.userQuery + "») и ОБЯЗАТЕЛЬНО "
+                    + "добавь в конце тег [[TOOL:" + (st.naturalSend.sendNow ? "SEND_TO_CHAT" : "DRAFT_TO_CHAT")
+                    + "|" + st.naturalSend.target + "|текст]].";
+            return true;
+        }
+
+        if (!toolActions.isEmpty()) {
+            StringBuilder observationsForNextTurn = new StringBuilder();
+            boolean needsNextLlmTurn = false;
+            for (String ta : toolActions) {
+                if (cancelled.get()) break;
+                if (ColgramAiAgentTools.isQueryToolAction(ta)) {
+                    if (step == 0 && streamedVisibleThisStep[0] && visibleProse.length() >= 48 && !st.includeDirectory && !plan.shouldSearchWeb) {
+                        continue;
+                    }
+                    ToolResult qRes = executeQueryOrActionTool(ctx, req, ta, listener, reqId);
+                    if (qRes != null && !qRes.observation.isEmpty()) {
+                        if (observationsForNextTurn.length() > 0) observationsForNextTurn.append('\n');
+                        observationsForNextTurn.append("[").append(ta).append("]\n").append(qRes.observation);
+                        if (!qRes.resolvedTarget.isEmpty()) {
+                            lastReferencedChatTarget = qRes.resolvedTarget;
+                        }
+                        needsNextLlmTurn = true;
+                    }
+                } else {
+                    ToolResult aRes = executeQueryOrActionTool(ctx, req, ta, listener, reqId);
+                    if (aRes != null) {
+                        if (aRes.ok) {
+                            st.anyActionExecuted = true;
+                            if (!aRes.resolvedTarget.isEmpty()) {
+                                lastReferencedChatTarget = aRes.resolvedTarget;
+                            }
+                            if (!aRes.observation.isEmpty()) {
+                                st.verifiedConfirmations.add(aRes.observation);
+                            }
+                            final ToolResult delivered = aRes;
+                            postFor(reqId, () -> listener.onToolResult(delivered));
+                        } else if (step < MAX_AGENT_STEPS - 1 && !aRes.observation.isEmpty()) {
+                            if (observationsForNextTurn.length() > 0) observationsForNextTurn.append('\n');
+                            observationsForNextTurn.append("[Ошибка ").append(ta).append("]: ").append(aRes.observation);
+                            needsNextLlmTurn = true;
+                        } else if (!aRes.observation.isEmpty()) {
+                            st.verifiedConfirmations.add("⚠ " + aRes.observation);
+                        }
+                    }
+                }
+            }
+
+            if (needsNextLlmTurn && step < MAX_AGENT_STEPS - 1) {
+                st.agentLoopHistory.add(st.currentStepPrompt);
+                st.agentLoopHistory.add(stepText);
+                st.currentStepPrompt = "Результат инструментов:\n" + observationsForNextTurn
+                        + "\n\nИспользуй эти реальные данные, чтобы дать точный финальный ответ пользователю"
+                        + " (или выполни действие через [[TOOL:...]], если задача ещё не завершена).";
+                postFor(reqId, () -> listener.onStage("Koliti анализирует данные…"));
+                return true;
+            }
+        }
+
+        st.finalText = visibleProse;
+        return false;
+    }
+
+    private void executeNativePipeline(
+            Context ctx,
+            Request req,
+            ResponseListener listener,
+            final long reqId,
+            ColgramAiModelManager.ResolvedModelPaths paths,
+            ColgramAiContextEngine.IntentPlan plan,
+            List<String> processedImagePaths,
+            boolean hasVideoGrid,
+            boolean needsVision,
+            int ctxBudget,
+            String activeBlock,
+            String crossBlock,
+            String webBlock,
+            String verifiedMath,
+            List<ColgramAiContextEngine.ConversationTurn> history
+    ) {
+        if (!ensureNativeModelInitialized(ctx, paths, ctxBudget, needsVision, listener, reqId)) {
+            return;
+        }
+        postFor(reqId, () -> listener.onStage("Koliti отвечает…"));
+        NativeRunState st = buildNativeRunState(
+                ctx, req, plan, processedImagePaths, hasVideoGrid,
+                activeBlock, crossBlock, webBlock, verifiedMath, history);
+
+        for (int step = 0; step < MAX_AGENT_STEPS && !cancelled.get(); step++) {
+            boolean keepGoing = executeSingleAgentStep(ctx, req, listener, reqId, plan, history, st, step);
+            if (st.aborted) return;
+            if (!keepGoing) break;
+        }
+
+        if (!st.anyActionExecuted && !cancelled.get()) {
+            st.anyActionExecuted = runFallbackActionSafetyNet(
+                    ctx, req, listener, reqId, plan, st.naturalSend, st.remoteTargetOverride,
+                    st.finalText, history, st.verifiedConfirmations);
+        }
+
+        String finalText = st.finalText;
+        if (!st.verifiedConfirmations.isEmpty()) {
+            StringBuilder confSb = new StringBuilder();
+            for (String c : st.verifiedConfirmations) {
+                if (confSb.length() > 0) confSb.append('\n');
+                confSb.append(c.startsWith("⚠") ? c : ("✓ " + c));
+            }
+            String confBlock = confSb.toString();
+            if (finalText.isEmpty() || st.remoteTargetOverride) {
+                finalText = confBlock;
+            } else if (!finalText.contains(st.verifiedConfirmations.get(0))) {
+                finalText = finalText + "\n\n" + confBlock;
+            }
+        } else if (finalText.isEmpty()) {
+            finalText = "Готово.";
+        }
+
+        if (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN) {
+            ColgramAiAgentTools.InstalledPluginResult installed =
+                    ColgramAiAgentTools.extractAndInstallPlugin(finalText, true);
+            if (installed.installed) {
+                postFor(reqId, () -> listener.onPluginInstalled(installed));
+            }
+        }
+        recordTurn(req.userQuery, finalText);
+        String timings = ColgramNativeLlama.nativeGetLastTimings();
+        String footer = paths.displayName + (timings.isEmpty() ? "" : " • " + timings);
+        final String outFinal = finalText;
+        postFor(reqId, () -> listener.onFinished(outFinal, footer, true));
+    }
+
+    private boolean runFallbackActionSafetyNet(
+            Context ctx,
+            Request req,
+            ResponseListener listener,
+            final long reqId,
+            ColgramAiContextEngine.IntentPlan plan,
+            ColgramAiAgentTools.NaturalSendIntent naturalSend,
+            boolean remoteTargetOverride,
+            String finalText,
+            List<ColgramAiContextEngine.ConversationTurn> history,
+            List<String> verifiedConfirmations
+    ) {
+        String fallbackAction = "";
+        if (remoteTargetOverride) {
+            String msgBody = !naturalSend.literalPayload.isEmpty()
+                    ? naturalSend.literalPayload
+                    : ColgramAiAgentTools.extractNaturalMessageFromReply(finalText);
+            if (msgBody.isEmpty() || ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(msgBody)) {
+                if (naturalSend.pronounFollowUp && !history.isEmpty()) {
+                    for (int i = history.size() - 1; i >= 0; i--) {
+                        String prev = ColgramAiAgentTools.extractNaturalMessageFromReply(history.get(i).assistantReply);
+                        if (!prev.isEmpty() && !ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(prev) && prev.length() <= 300) {
+                            msgBody = prev;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!msgBody.isEmpty() && !ColgramAiAgentTools.looksLikeOfflineOrCannotSendRefusal(msgBody)) {
+                fallbackAction = (naturalSend.sendNow ? "SEND_TO_CHAT:" : "DRAFT_TO_CHAT:")
+                        + naturalSend.target + "|" + msgBody;
+            }
+        }
+        if (fallbackAction.isEmpty()) {
+            fallbackAction = ColgramAiAgentTools.resolveGenerativeCrossChatAction(req.userQuery, finalText);
+        }
+        if (fallbackAction.isEmpty()) {
+            ColgramAiAgentTools.DirectCommandResult implicit =
+                    ColgramAiAgentTools.tryExecuteDirectCommand(ctx, req.userQuery, history);
+            if (implicit.handled && !implicit.uiAction.isEmpty()) {
+                fallbackAction = implicit.uiAction;
+            } else if (!plan.inAppAction.isEmpty()) {
+                fallbackAction = plan.inAppAction;
+            }
+        }
+        if (!fallbackAction.isEmpty()) {
+            ToolResult fRes = executeQueryOrActionTool(ctx, req, fallbackAction, listener, reqId);
+            if (fRes != null) {
+                if (fRes.ok) {
+                    if (!fRes.resolvedTarget.isEmpty()) {
+                        lastReferencedChatTarget = fRes.resolvedTarget;
+                    }
+                    if (!fRes.observation.isEmpty()) {
+                        verifiedConfirmations.add(fRes.observation);
+                    }
+                    final ToolResult delivered = fRes;
+                    postFor(reqId, () -> listener.onToolResult(delivered));
+                    return true;
+                } else if (!fRes.observation.isEmpty()) {
+                    verifiedConfirmations.add("⚠ " + fRes.observation);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static final class StreamDelta {
+        final String text;
+        final boolean thinking;
+
+        StreamDelta(String text, boolean thinking) {
+            this.text = text;
+            this.thinking = thinking;
+        }
     }
 
     private String runNativeGenerationStep(
+            final long reqId,
             String sysPrompt,
             String[] historyPairs,
             String userPrompt,
@@ -913,6 +1040,17 @@ public final class ColgramAiEngine {
         final long[] lastEmit = {0L};
         final boolean[] announcedThinking = {false};
         final boolean[] announcedAnswering = {false};
+        final AtomicReference<StreamDelta> pendingDelta = new AtomicReference<>();
+        final AtomicBoolean drainScheduled = new AtomicBoolean(false);
+        final Runnable drainUiTask = () -> {
+            drainScheduled.set(false);
+            if (cancelled.get() || requestSeq.get() != reqId) return;
+            StreamDelta snap = pendingDelta.getAndSet(null);
+            if (snap != null) {
+                listener.onTokenDelta(snap.text, snap.thinking);
+            }
+        };
+
         int genRc = ColgramNativeLlama.nativeGenerateWithHistory(
                 sysPrompt,
                 historyPairs,
@@ -924,23 +1062,25 @@ public final class ColgramAiEngine {
                 repPen100,
                 useNativeThinking,
                 piece -> {
-                    if (cancelled.get()) return false;
+                    if (cancelled.get() || requestSeq.get() != reqId) return false;
                     rawAccum.append(piece);
                     long now = System.currentTimeMillis();
-                    if (now - lastEmit[0] >= 45L) {
+                    // Emit token #1 immediately (0ms wait) and coalesce subsequent UI ticks at ~50ms
+                    // so mainHandler never backs up and native decode never stalls!
+                    if (lastEmit[0] == 0L || now - lastEmit[0] >= 50L) {
                         lastEmit[0] = now;
                         boolean thinkingNow = (useNativeThinking || rawAccum.indexOf("<think>") >= 0)
                                 && rawAccum.indexOf("</think>") < 0;
                         if (thinkingNow && !showThinking) {
                             if (!announcedThinking[0]) {
                                 announcedThinking[0] = true;
-                                post(() -> listener.onStage("Глубоко размышляю (MAX)…"));
+                                postFor(reqId, () -> listener.onStage("Размышляю…"));
                             }
                             return true;
                         }
                         if (!thinkingNow && announcedThinking[0] && !announcedAnswering[0]) {
                             announcedAnswering[0] = true;
-                            post(() -> listener.onStage("Koliti отвечает…"));
+                            postFor(reqId, () -> listener.onStage("Koliti отвечает…"));
                         }
                         String visible = ColgramAiAgentTools.stripStreamingToolTail(
                                 ColgramAiContextEngine.stripThinkingTags(
@@ -953,9 +1093,10 @@ public final class ColgramAiEngine {
                             if (streamedVisibleFlag != null && !thinkingNow) {
                                 streamedVisibleFlag[0] = true;
                             }
-                            final String emitText = visible;
-                            final boolean isThink = thinkingNow;
-                            post(() -> listener.onTokenDelta(emitText, isThink));
+                            pendingDelta.set(new StreamDelta(visible, thinkingNow));
+                            if (drainScheduled.compareAndSet(false, true)) {
+                                mainHandler.post(drainUiTask);
+                            }
                         }
                     }
                     return true;
@@ -985,15 +1126,15 @@ public final class ColgramAiEngine {
         return false;
     }
 
-    private ToolResult executeQueryOrActionTool(Context ctx, Request req, String ta, ResponseListener listener) {
+    private ToolResult executeQueryOrActionTool(Context ctx, Request req, String ta, ResponseListener listener, long reqId) {
         if (ta == null || ta.isEmpty()) return null;
         if (ta.startsWith("WEB_SEARCH:")) {
             String query = ta.substring("WEB_SEARCH:".length()).trim();
             if (query.isEmpty()) return null;
-            post(() -> listener.onStage("Ищу в сети: " + query + "…"));
+            postFor(reqId, () -> listener.onStage("Ищу в сети: " + query + "…"));
             List<ColgramAiWebSearch.SearchHit> hits = ColgramAiWebSearch.search(query, 4, true);
             if (!hits.isEmpty()) {
-                post(() -> listener.onWebHits(hits));
+                postFor(reqId, () -> listener.onWebHits(hits));
             }
             String formatted = ColgramAiWebSearch.formatHitsForPrompt(hits);
             return new ToolResult(!formatted.isEmpty(), true, false, "WEB_SEARCH", "",
@@ -1013,7 +1154,7 @@ public final class ColgramAiEngine {
                 if (req.toolExecutor != null) {
                     req.toolExecutor.executeTool("REFRESH_THEME");
                 } else {
-                    post(() -> listener.onDirectUiAction("REFRESH_THEME"));
+                    postFor(reqId, () -> listener.onDirectUiAction("REFRESH_THEME"));
                 }
             }
             return new ToolResult(applied, false, false, "SET_SETTING", "",
@@ -1022,36 +1163,39 @@ public final class ColgramAiEngine {
         if (ta.startsWith("READ_CHAT:")) {
             String p = ta.substring("READ_CHAT:".length());
             String tName = p.contains("|") ? p.substring(0, p.indexOf('|')).trim() : p.trim();
-            post(() -> listener.onStage("Читаю чат «" + tName + "»…"));
+            postFor(reqId, () -> listener.onStage("Читаю чат «" + tName + "»…"));
         } else if ("LIST_CHATS".equals(ta)) {
-            post(() -> listener.onStage("Проверяю список чатов…"));
+            postFor(reqId, () -> listener.onStage("Проверяю список чатов…"));
         } else if (ta.startsWith("SEND_TO_CHAT:")) {
             String p = ta.substring("SEND_TO_CHAT:".length());
             String tName = p.contains("|") ? p.substring(0, p.indexOf('|')).trim() : p.trim();
-            post(() -> listener.onStage("Отправляю сообщение в «" + tName + "»…"));
+            postFor(reqId, () -> listener.onStage("Отправляю сообщение в «" + tName + "»…"));
         } else if (ta.startsWith("DRAFT_TO_CHAT:")) {
             String p = ta.substring("DRAFT_TO_CHAT:".length());
             String tName = p.contains("|") ? p.substring(0, p.indexOf('|')).trim() : p.trim();
-            post(() -> listener.onStage("Подготавливаю черновик для «" + tName + "»…"));
+            postFor(reqId, () -> listener.onStage("Подготавливаю черновик для «" + tName + "»…"));
         }
         if (req.toolExecutor != null) {
             return req.toolExecutor.executeTool(ta);
         }
         final String actionToRun = ta;
-        post(() -> listener.onDirectUiAction(actionToRun));
+        postFor(reqId, () -> listener.onDirectUiAction(actionToRun));
         return new ToolResult(true, false, false, ta, "", "");
     }
 
-    private int resolveEffectiveContext(Context ctx, long totalRamMb) {
+    private int resolveEffectiveContext(Context ctx, long totalRamMb, boolean needsVision) {
         int override = ColgramAiConfig.getContextSizeOverride(ctx);
-        if (override >= 2048) return override;
-        return ColgramAiModels.recommendContextForTotalRamMb(totalRamMb);
+        if (override >= 1024) {
+            return needsVision ? Math.max(override, 3072) : override;
+        }
+        return needsVision
+                ? ColgramAiModels.recommendContextForVision(totalRamMb)
+                : ColgramAiModels.recommendContextForTotalRamMb(totalRamMb);
     }
 
     private int resolveThreads(Context ctx) {
-        int override = ColgramAiConfig.getThreadsOverride(ctx);
-        if (override > 0) return override;
-        return ColgramAiModels.recommendThreadsForCores(Runtime.getRuntime().availableProcessors());
+        // 0 = auto big.LITTLE performance-core detection & affinity pinning in native C++!
+        return Math.max(0, ColgramAiConfig.getThreadsOverride(ctx));
     }
 
     private long queryTotalRamMb(Context ctx) {
@@ -1078,5 +1222,13 @@ public final class ColgramAiEngine {
 
     private void post(Runnable r) {
         mainHandler.post(r);
+    }
+
+    private void postFor(final long reqId, final Runnable r) {
+        mainHandler.post(() -> {
+            if (requestSeq.get() == reqId) {
+                r.run();
+            }
+        });
     }
 }

@@ -4,6 +4,7 @@ package org.colgram.core;
 public final class ColgramThemePolicy {
     private static final int BLACK = 0xff000000;
     private static final int WHITE = 0xffffffff;
+    private static final int DEEP_DARK_INK = 0xff0a0d12;
     private static final double TEXT = 4.5;
     private static final double CONTROL = 3.0;
 
@@ -91,8 +92,36 @@ public final class ColgramThemePolicy {
         }
     }
 
+    /** Composites a potentially translucent foreground over a solid background. */
+    public static int compositeOver(int fgArgb, int bgArgb) {
+        int solidBg = solidSurface(bgArgb);
+        return opaque(fgArgb, solidBg);
+    }
+
+    /**
+     * Resolves a surface color to opaque ARGB without bleaching dark translucent surfaces to white.
+     * Dark-RGB translucent surfaces composite over charcoal (#16181e); light-RGB surfaces over white.
+     */
+    public static int solidSurface(int bgArgb) {
+        int alpha = bgArgb >>> 24;
+        if (alpha >= 0xff) {
+            return bgArgb | 0xff000000;
+        }
+        int fallback = perceivedLuma(bgArgb) < 128 ? 0xff16181e : WHITE;
+        return opaque(bgArgb, fallback);
+    }
+
+    /** Resolves a translucent surface composited over an explicit underlying backdrop. */
+    public static int solidSurfaceOver(int bgArgb, int underlyingBackdropArgb) {
+        int solidBackdrop = solidSurface(underlyingBackdropArgb);
+        if ((bgArgb >>> 24) >= 0xff) {
+            return bgArgb | 0xff000000;
+        }
+        return opaque(bgArgb, solidBackdrop);
+    }
+
     public static double contrast(int foreground, int background) {
-        int solid = opaque(background, WHITE);
+        int solid = solidSurface(background);
         double a = luminance(opaque(foreground, solid));
         double b = luminance(solid);
         return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
@@ -100,10 +129,10 @@ public final class ColgramThemePolicy {
 
     /** Picks crisp white or dark charcoal ink depending on actual fill contrast (never same-on-same). */
     public static int contrastInkOn(int bgArgb) {
-        int solid = opaque(bgArgb, 0xff202b36);
+        int solid = solidSurfaceOver(bgArgb, 0xff202b36);
         double whiteContrast = contrast(WHITE, solid);
         double darkContrast = contrast(0xff101418, solid);
-        return (whiteContrast >= 2.45 || whiteContrast >= darkContrast) ? WHITE : 0xff101418;
+        return (whiteContrast >= 3.0 || whiteContrast >= darkContrast) ? WHITE : 0xff101418;
     }
 
     /** Repairs dark foregrounds on dark surfaces without corrupting saturated accent/button/badge fills. */
@@ -139,42 +168,94 @@ public final class ColgramThemePolicy {
         return perceivedLuma(lightDefaultColor) >= 196 && chroma(lightDefaultColor) < 24;
     }
 
-    /** Guards text/icon paints against BOTH black-on-black and white-on-white on any surface. */
+    /**
+     * Guards text/icon paints against BOTH dark-on-dark, white-on-white, AND grey-on-grey on any surface.
+     * Boosts low alpha when the original translucency drops contrast below {@code minContrast}, and
+     * escalates to crisp white/black on mid-grey surfaces where muted inks cannot meet WCAG AA.
+     */
     public static int ensureReadableOnSurface(int fgArgb, int bgArgb, int lightInk, int darkInk, double minContrast) {
         int alpha = fgArgb >>> 24;
         if (alpha < 0x20) {
             return fgArgb;
         }
-        int solidBg = opaque(bgArgb, WHITE);
+        int solidBg = solidSurface(bgArgb);
         if (contrast(fgArgb, solidBg) >= minContrast) {
             return fgArgb;
         }
-        int chosen = contrast(lightInk, solidBg) >= contrast(darkInk, solidBg) ? lightInk : darkInk;
-        if (alpha >= 0xff) {
-            return chosen | 0xff000000;
-        }
-        return (chosen & 0x00ffffff) | (alpha << 24);
+        int chosen = pickCandidateOnSurfaces(solidBg, solidBg, lightInk, darkInk, minContrast);
+        return applySafeAlpha(chosen, alpha, solidBg, solidBg, minContrast);
     }
 
-    /** Guards a foreground that may appear on EITHER of two surfaces (e.g. windowWhite or windowGray). */
+    /**
+     * Guards a foreground that may appear on EITHER of two surfaces (e.g. windowWhite or windowGray,
+     * dialogBackground or dialogBackgroundGray, messagePanel or glassTopPanel).
+     */
     public static int ensureReadableOnSurfaces(int fgArgb, int bgA, int bgB, int lightInk, int darkInk, double minContrast) {
         int alpha = fgArgb >>> 24;
         if (alpha < 0x20) {
             return fgArgb;
         }
-        int solidA = opaque(bgA, WHITE);
-        int solidB = opaque(bgB, WHITE);
+        int solidA = solidSurface(bgA);
+        int solidB = solidSurface(bgB);
         double curWorst = Math.min(contrast(fgArgb, solidA), contrast(fgArgb, solidB));
         if (curWorst >= minContrast) {
             return fgArgb;
         }
-        double lightWorst = Math.min(contrast(lightInk, solidA), contrast(lightInk, solidB));
-        double darkWorst = Math.min(contrast(darkInk, solidA), contrast(darkInk, solidB));
-        int chosen = lightWorst >= darkWorst ? lightInk : darkInk;
-        if (alpha >= 0xff) {
-            return chosen | 0xff000000;
+        int chosen = pickCandidateOnSurfaces(solidA, solidB, lightInk, darkInk, minContrast);
+        return applySafeAlpha(chosen, alpha, solidA, solidB, minContrast);
+    }
+
+    /**
+     * Keeps chromatic accent colors (sender names, reply titles, section headers, links, checkmarks)
+     * faithful to their hue while smoothly lightening/darkening toward white/black until WCAG contrast
+     * reaches {@code minContrast}. Neutral greys fall back to crisp readable inks.
+     */
+    public static int ensureAccentReadable(int fgArgb, int bgArgb, int fallbackLight, int fallbackDark, double minContrast) {
+        int alpha = fgArgb >>> 24;
+        if (alpha < 0x20) {
+            return fgArgb;
         }
-        return (chosen & 0x00ffffff) | (alpha << 24);
+        int solidBg = solidSurface(bgArgb);
+        if (contrast(fgArgb, solidBg) >= minContrast) {
+            return fgArgb;
+        }
+        int baseOpaque = fgArgb | 0xff000000;
+        if (chroma(baseOpaque) >= 18) {
+            int targetEnd = contrast(WHITE, solidBg) >= contrast(BLACK, solidBg) ? WHITE : BLACK;
+            for (int step = 1; step <= 24; step++) {
+                int candidate = mix(baseOpaque, targetEnd, step / 24.0);
+                if (contrast(candidate, solidBg) >= minContrast) {
+                    return candidate;
+                }
+            }
+            return targetEnd;
+        }
+        return ensureReadableOnSurface(fgArgb, solidBg, fallbackLight, fallbackDark, minContrast);
+    }
+
+    /**
+     * Resolves readable checkmark / status icon ink (sent, read, clock, mute, pin) on dialog rows
+     * or chat surfaces, guaranteeing {@code >= 4.5:1} contrast on dark, light, and mid-grey surfaces.
+     */
+    public static int resolveCheckmarkInk(int fgArgb, int bgArgb, int lightAccent, int darkAccent) {
+        int solidBg = solidSurface(bgArgb);
+        if ((fgArgb >>> 24) >= 0x20 && contrast(fgArgb, solidBg) >= TEXT) {
+            return fgArgb;
+        }
+        return ensureAccentReadable(fgArgb, solidBg, lightAccent, darkAccent, TEXT);
+    }
+
+    /**
+     * Resolves reply panel / glass overlay text and icon ink against the panel background.
+     * Guarantees {@code >= 7.0:1} (or max {@code >= 4.58:1} on mid-grey) for primary text and
+     * {@code >= 4.5:1} for secondary text / icons even when the panel is translucent or mid-grey.
+     */
+    public static int resolveReplyPanelInk(int fgArgb, int panelBgArgb, boolean primary) {
+        int solidBg = solidSurface(panelBgArgb);
+        double minC = primary ? 7.0 : TEXT;
+        int lightInk = primary ? 0xfff4f7fb : 0xffdce6f4;
+        int darkInk = primary ? 0xff14181e : 0xff222a35;
+        return ensureReadableOnSurface(fgArgb, solidBg, lightInk, darkInk, minC);
     }
 
     /** Relative WCAG luminance [0.0..1.0] of the RGB channels of a color. */
@@ -188,29 +269,41 @@ public final class ColgramThemePolicy {
         int[] cols = new int[]{base, g1, g2, g3};
         for (int c : cols) {
             if (c == 0 || (c >>> 24) < 0x20) continue;
-            r += (c >>> 16) & 255;
-            g += (c >>> 8) & 255;
-            b += c & 255;
+            int solid = solidSurface(c);
+            r += (solid >>> 16) & 255;
+            g += (solid >>> 8) & 255;
+            b += solid & 255;
             count++;
         }
-        if (count == 0) return base;
+        if (count == 0) return solidSurface(base);
         return 0xff000000 | ((r / count) << 16) | ((g / count) << 8) | (b / count);
     }
 
     /**
-     * Resolves readable secondary text/icon ink for outgoing or incoming chat bubbles.
-     * Any bubble with relative luminance < 0.55 receives crisp white/translucent-white ink
-     * so saturated purple/blue/emerald bubbles never inherit muddy dark-grey timestamps/checks.
+     * Resolves readable primary or secondary text/icon ink for outgoing or incoming chat bubbles.
+     * - Dark or saturated bubbles where {@code onDarkInk} meets {@code minContrast} receive crisp
+     *   light/white ink so purple/blue/emerald/dark bubbles never inherit muddy dark-grey checks.
+     * - Mid-grey and light bubbles use WCAG contrast selection (never forcing white onto mid-grey!).
      */
     public static int resolveBubbleInk(int fgArgb, int bubbleBgArgb, int onDarkInk, int onLightInk, double minContrast) {
-        int solidBg = opaque(bubbleBgArgb, WHITE);
-        if (luminance(solidBg) < 0.55) {
-            if ((fgArgb >>> 24) >= 0x20 && contrast(fgArgb, solidBg) >= Math.max(minContrast, 7.0)) {
-                return fgArgb;
+        int solidBg = solidSurface(bubbleBgArgb);
+        double bgLum = luminance(solidBg);
+        double darkInkContrast = contrast(onDarkInk, solidBg);
+        boolean preferWhiteSide = (bgLum < 0.22 || contrast(WHITE, solidBg) >= contrast(BLACK, solidBg))
+                && (darkInkContrast >= minContrast || contrast(WHITE, solidBg) >= minContrast);
+        if (preferWhiteSide) {
+            if ((fgArgb >>> 24) >= 0x20) {
+                int effFg = opaque(fgArgb, solidBg);
+                if (luminance(effFg) > bgLum && contrast(fgArgb, solidBg) >= Math.max(minContrast, 6.5)) {
+                    return fgArgb;
+                }
             }
-            return onDarkInk;
+            if (darkInkContrast >= minContrast) {
+                return onDarkInk;
+            }
+            return WHITE;
         }
-        return ensureReadableOnSurface(fgArgb, solidBg, onDarkInk, onLightInk, minContrast);
+        return ensureReadableOnSurface(fgArgb, solidBg, WHITE, onLightInk, minContrast);
     }
 
     /**
@@ -218,7 +311,7 @@ public final class ColgramThemePolicy {
      * badge text >= 5.5:1 WCAG contrast on both dark and light themes.
      */
     public static int resolveMutedBadgeBackground(int badgeBgArgb, int windowBgArgb, boolean darkSurface) {
-        int solidWin = opaque(windowBgArgb, darkSurface ? 0xff16181e : WHITE);
+        int solidWin = solidSurfaceOver(windowBgArgb, darkSurface ? 0xff16181e : WHITE);
         if (darkSurface) {
             int solid = (badgeBgArgb != 0 && (badgeBgArgb >>> 24) >= 0xd0) ? opaque(badgeBgArgb, solidWin) : 0xff3e536e;
             if (luminance(solid) >= 0.5 || contrast(WHITE, solid) < 5.5 || contrast(solid, solidWin) < 1.85) {
@@ -238,10 +331,12 @@ public final class ColgramThemePolicy {
      * badge backgrounds (forcing pure white whenever the muted badge or dark theme requires it).
      */
     public static int resolveUnreadCounterText(int currentFgArgb, int activeBadgeBg, int mutedBadgeBg, boolean darkSurface) {
-        int solidMuted = opaque(mutedBadgeBg, 0xff3e536e);
-        int solidActive = opaque(activeBadgeBg, 0xffe11d48);
+        int solidMuted = solidSurfaceOver(mutedBadgeBg, 0xff3e536e);
+        int solidActive = solidSurfaceOver(activeBadgeBg, 0xffe11d48);
         if (darkSurface || luminance(solidMuted) < 0.5) {
-            return WHITE;
+            if (contrast(WHITE, solidMuted) >= 5.5 && contrast(WHITE, solidActive) >= 2.5) {
+                return WHITE;
+            }
         }
         return ensureReadableOnSurfaces(currentFgArgb, solidActive, solidMuted, WHITE, 0xff101418, 5.5);
     }
@@ -251,6 +346,77 @@ public final class ColgramThemePolicy {
         int g = (color >>> 8) & 255;
         int b = color & 255;
         return (r * 299 + g * 587 + b * 114) / 1000;
+    }
+
+    private static double worstContrast(int fg, int solidA, int solidB) {
+        double cA = contrast(fg, solidA);
+        if (solidA == solidB) {
+            return cA;
+        }
+        return Math.min(cA, contrast(fg, solidB));
+    }
+
+    private static int pickCandidateOnSurfaces(int solidA, int solidB, int lightInk, int darkInk, double minContrast) {
+        double lightC = worstContrast(lightInk, solidA, solidB);
+        double darkC = worstContrast(darkInk, solidA, solidB);
+        int best = lightC >= darkC ? lightInk : darkInk;
+        double bestC = Math.max(lightC, darkC);
+        if (bestC >= minContrast) {
+            return best;
+        }
+        // Try opaque versions of the preferred light/dark inks before escalating to pure white/black.
+        int lightOp = lightInk | 0xff000000;
+        int darkOp = darkInk | 0xff000000;
+        double lightOpC = worstContrast(lightOp, solidA, solidB);
+        double darkOpC = worstContrast(darkOp, solidA, solidB);
+        if (lightOpC > bestC) {
+            best = lightOp;
+            bestC = lightOpC;
+        }
+        if (darkOpC > bestC) {
+            best = darkOp;
+            bestC = darkOpC;
+        }
+        if (bestC >= minContrast) {
+            return best;
+        }
+        // Escalate on mid-grey surfaces to crisp white / deep obsidian / pure black.
+        double deepC = worstContrast(DEEP_DARK_INK, solidA, solidB);
+        if (deepC > bestC) {
+            best = DEEP_DARK_INK;
+            bestC = deepC;
+        }
+        if (bestC >= minContrast) {
+            return best;
+        }
+        double whiteC = worstContrast(WHITE, solidA, solidB);
+        double blackC = worstContrast(BLACK, solidA, solidB);
+        if (whiteC > bestC) {
+            best = WHITE;
+            bestC = whiteC;
+        }
+        if (blackC > bestC) {
+            best = BLACK;
+        }
+        return best;
+    }
+
+    private static int applySafeAlpha(int chosenInk, int origAlpha, int solidA, int solidB, double minContrast) {
+        int inkAlpha = chosenInk >>> 24;
+        if (inkAlpha == 0) {
+            inkAlpha = 0xff;
+            chosenInk |= 0xff000000;
+        }
+        if (origAlpha < 0xff && origAlpha < inkAlpha) {
+            int withOrigAlpha = (chosenInk & 0x00ffffff) | (origAlpha << 24);
+            if (worstContrast(withOrigAlpha, solidA, solidB) >= minContrast) {
+                return withOrigAlpha;
+            }
+        }
+        if (worstContrast(chosenInk, solidA, solidB) >= minContrast) {
+            return chosenInk;
+        }
+        return chosenInk | 0xff000000;
     }
 
     private static int fitFill(int fill, int end, int surface) {
@@ -282,7 +448,7 @@ public final class ColgramThemePolicy {
     }
 
     public static boolean isDarkColor(int color) {
-        return luminance(color) < 0.25;
+        return luminance(solidSurface(color)) < 0.25;
     }
 
     private static double luminance(int color) {

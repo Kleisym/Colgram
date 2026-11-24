@@ -76,6 +76,13 @@ public final class ColgramAiChatStore {
     public static final int MAX_SESSIONS = 500;
     public static final int MAX_MESSAGES_PER_SESSION = 2000;
     private static final Object LOCK = new Object();
+    private static final java.util.concurrent.ExecutorService SAVE_EXEC =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "koliti-chat-store-io");
+                t.setDaemon(true);
+                t.setPriority(Thread.NORM_PRIORITY - 1);
+                return t;
+            });
 
     private static File storeFile;
     private static File legacyStoreFile;
@@ -84,6 +91,12 @@ public final class ColgramAiChatStore {
     private static boolean loaded = false;
 
     private ColgramAiChatStore() {}
+
+    private static void flushPendingSaves() {
+        try {
+            SAVE_EXEC.submit(() -> {}).get(3000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {}
+    }
 
     public static void init(File baseFilesDir) {
         if (baseFilesDir == null) return;
@@ -290,6 +303,7 @@ public final class ColgramAiChatStore {
 
     @SuppressWarnings("unchecked")
     private static void loadLocked() {
+        flushPendingSaves();
         sessions.clear();
         activeSessionId = "";
         loaded = true;
@@ -349,12 +363,16 @@ public final class ColgramAiChatStore {
             }
             sortSessionsLocked();
             if (migratedFromLegacy) {
-                saveLocked();
+                saveLocked(false);
             }
         } catch (Throwable ignored) {}
     }
 
     private static void saveLocked() {
+        saveLocked(true);
+    }
+
+    private static void saveLocked(boolean async) {
         if (storeFile == null) return;
         try {
             File parent = storeFile.getParentFile();
@@ -399,12 +417,24 @@ public final class ColgramAiChatStore {
                 sb.append("]}");
             }
             sb.append("]}");
-            byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
-            if (ColgramStorageOptimizer.writeGzipBytesAtomic(storeFile, bytes)) {
-                if (legacyStoreFile != null && legacyStoreFile.isFile()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    legacyStoreFile.delete();
-                }
+            final byte[] bytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+            final File targetStore = storeFile;
+            final File targetLegacy = legacyStoreFile;
+            Runnable writeTask = () -> {
+                try {
+                    if (ColgramStorageOptimizer.writeGzipBytesAtomic(targetStore, bytes)) {
+                        if (targetLegacy != null && targetLegacy.isFile()) {
+                            //noinspection ResultOfMethodCallIgnored
+                            targetLegacy.delete();
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            };
+            if (async) {
+                SAVE_EXEC.execute(writeTask);
+            } else {
+                flushPendingSaves();
+                writeTask.run();
             }
         } catch (Throwable ignored) {}
     }
@@ -560,6 +590,7 @@ public final class ColgramAiChatStore {
 
     /** For unit tests only. */
     public static void resetForTest() {
+        flushPendingSaves();
         synchronized (LOCK) {
             sessions.clear();
             activeSessionId = "";

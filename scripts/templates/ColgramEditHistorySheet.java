@@ -101,20 +101,14 @@ public class ColgramEditHistorySheet {
                             final String currentText, final ArrayList<TLRPC.MessageEntity> currentEntities,
                             final String currentMediaPath, final boolean currentIsVideo) {
         if (context == null) return;
+        final android.app.Activity act = AndroidUtilities.findActivity(context);
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
 
         final boolean isRu = LocaleController.getInstance().getCurrentLocaleInfo() != null
                 && "ru".equalsIgnoreCase(LocaleController.getInstance().getCurrentLocaleInfo().shortName);
         final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
         final boolean dark = pal.dark;
 
-        final List<org.colgram.core.ColgramDatabase.MessageEditEntry> history =
-                org.colgram.core.ColgramHookHandler.getEditHistory(dialogId, messageId);
-        final List<org.colgram.core.ColgramDatabase.MediaRevision> mediaRevisions =
-                org.colgram.core.ColgramHookHandler.getMediaRevisions(dialogId, messageId);
-
-        final boolean hasText = history != null && !history.isEmpty();
-        final boolean hasMedia = mediaRevisions != null && !mediaRevisions.isEmpty();
-        final boolean hasCurrentMedia = !TextUtils.isEmpty(currentMediaPath) && new File(currentMediaPath).isFile();
         final boolean hasCurrentText = !TextUtils.isEmpty(currentText);
 
         final int cardBg = pal.cardSurface;
@@ -129,20 +123,20 @@ public class ColgramEditHistorySheet {
         final int accentColor = pal.cyber ? pal.accentPrimary : accent;
 
         final boolean[] allowHandleDismiss = {false};
-        final BottomSheet sheet = new BottomSheet(context, false) {
+        final BottomSheet sheet = new BottomSheet(act, false) {
             @Override
             protected boolean canDismissWithSwipe() {
                 return allowHandleDismiss[0];
             }
         };
 
-        final LinearLayout root = new LinearLayout(context);
+        final LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(16), dp(8), dp(16), dp(18) + AndroidUtilities.navigationBarHeight);
         ColgramAeroStyler.applyFlagshipSheetChrome(sheet, root, pal);
 
         // Top handle zone (exclusive swipe-to-dismiss trigger)
-        FrameLayout handleZone = new FrameLayout(context);
+        FrameLayout handleZone = new FrameLayout(act);
         handleZone.setPadding(0, dp(4), 0, dp(10));
         handleZone.setOnTouchListener((v, ev) -> {
             int a = ev.getActionMasked();
@@ -150,7 +144,7 @@ public class ColgramEditHistorySheet {
             else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) allowHandleDismiss[0] = false;
             return false;
         });
-        View pill = new View(context);
+        View pill = new View(act);
         GradientDrawable pillBg = new GradientDrawable();
         pillBg.setColor(dark ? 0x44FFFFFF : 0x300F172A);
         pillBg.setCornerRadius(dp(99));
@@ -159,44 +153,29 @@ public class ColgramEditHistorySheet {
         root.addView(handleZone, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
         // Header row
-        LinearLayout headerRow = new LinearLayout(context);
+        LinearLayout headerRow = new LinearLayout(act);
         headerRow.setOrientation(LinearLayout.HORIZONTAL);
         headerRow.setGravity(Gravity.CENTER_VERTICAL);
         root.addView(headerRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
 
-        LinearLayout titleCol = new LinearLayout(context);
+        LinearLayout titleCol = new LinearLayout(act);
         titleCol.setOrientation(LinearLayout.VERTICAL);
         headerRow.addView(titleCol, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
 
-        TextView titleView = new TextView(context);
+        TextView titleView = new TextView(act);
         titleView.setText(isRu ? "История изменений" : "Edit History");
         titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 19.5f);
         titleView.setTypeface(AndroidUtilities.bold());
         titleView.setTextColor(textPrimary);
         titleCol.addView(titleView, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
 
-        int totalSaved = (hasText ? history.size() : 0) + (hasMedia ? mediaRevisions.size() : 0);
-        TextView subtitleView = new TextView(context);
-        if (totalSaved == 0) {
-            subtitleView.setText(isRu ? "Предыдущих правок и замен медиа пока нет" : "No prior edits or replaced media saved");
-        } else {
-            StringBuilder sb = new StringBuilder();
-            if (isRu) {
-                sb.append("Сохранено версий: ").append(totalSaved);
-                if (hasText) sb.append(" · текст: ").append(history.size());
-                if (hasMedia) sb.append(" · медиа: ").append(mediaRevisions.size());
-            } else {
-                sb.append("Saved revisions: ").append(totalSaved);
-                if (hasText) sb.append(" · text: ").append(history.size());
-                if (hasMedia) sb.append(" · media: ").append(mediaRevisions.size());
-            }
-            subtitleView.setText(sb.toString());
-        }
+        final TextView subtitleView = new TextView(act);
+        subtitleView.setText(isRu ? "Загрузка истории…" : "Loading history…");
         subtitleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
         subtitleView.setTextColor(textSecondary);
         titleCol.addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
 
-        TextView closeBtn = new TextView(context);
+        TextView closeBtn = new TextView(act);
         closeBtn.setText("✕");
         closeBtn.setGravity(Gravity.CENTER);
         closeBtn.setTextColor(textSecondary);
@@ -206,7 +185,7 @@ public class ColgramEditHistorySheet {
         headerRow.addView(closeBtn, LayoutHelper.createLinear(34, 34));
 
         final int maxScrollH = Math.max(dp(220), Math.min(dp(540), (int) (AndroidUtilities.displaySize.y * 0.66f)));
-        final ScrollView scroll = new ScrollView(context) {
+        final ScrollView scroll = new ScrollView(act) {
             @Override
             protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
                 int hSize = MeasureSpec.getSize(heightMeasureSpec);
@@ -231,79 +210,14 @@ public class ColgramEditHistorySheet {
         scroll.setVerticalScrollBarEnabled(true);
         scroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
 
-        final LinearLayout list = new LinearLayout(context);
+        final LinearLayout list = new LinearLayout(act);
         list.setOrientation(LinearLayout.VERTICAL);
         list.setPadding(0, dp(2), 0, dp(8));
         scroll.addView(list, LayoutHelper.createScroll(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP));
 
-        int animIdx = 0;
-
-        // 1. Current active version card
-        if (hasCurrentMedia || hasCurrentText) {
-            View curCard = buildCurrentVersionCard(
-                    context, isRu, pal, currentText, currentEntities, currentMediaPath, currentIsVideo,
-                    currentCardBg, accentColor, textPrimary, textSecondary);
-            animateCard(curCard, animIdx++);
-            list.addView(curCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
-        }
-
-        if (!hasText && !hasMedia) {
-            TextView emptyCard = new TextView(context);
-            emptyCard.setText(isRu
-                    ? "Как только текст, подпись или фото/видео этого сообщения будут изменены (даже несколько раз за секунду), все предыдущие версии появятся в этой ленте."
-                    : "Whenever text, caption, photo, or video is edited (even multiple times per second), all prior versions will be preserved in this timeline.");
-            emptyCard.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
-            emptyCard.setTextColor(textSecondary);
-            emptyCard.setGravity(Gravity.CENTER);
-            emptyCard.setPadding(dp(18), dp(20), dp(18), dp(20));
-            GradientDrawable emptyBg = new GradientDrawable();
-            emptyBg.setColor(cardBg);
-            emptyBg.setCornerRadius(dp(18));
-            emptyBg.setStroke(dp(1), cardStroke);
-            emptyCard.setBackground(emptyBg);
-            list.addView(emptyCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 6));
-        } else {
-            // 2. Unified chronological timeline (newest saved revision first)
-            List<TimelineItem> timeline = new ArrayList<>();
-            if (hasText) {
-                for (int i = 0; i < history.size(); i++) {
-                    org.colgram.core.ColgramDatabase.MessageEditEntry e = history.get(i);
-                    timeline.add(new TimelineItem(e.timestamp, e, i + 1));
-                }
-            }
-            if (hasMedia) {
-                for (int i = 0; i < mediaRevisions.size(); i++) {
-                    org.colgram.core.ColgramDatabase.MediaRevision m = mediaRevisions.get(i);
-                    timeline.add(new TimelineItem(m.timestamp, m, i + 1));
-                }
-            }
-            Collections.sort(timeline, (a, b) -> {
-                int cmp = Long.compare(b.timestamp, a.timestamp);
-                if (cmp != 0) return cmp;
-                return Integer.compare(b.seqNumber, a.seqNumber);
-            });
-
-            String newerTextCompare = hasCurrentText ? currentText.trim() : null;
-            for (int i = 0; i < timeline.size(); i++) {
-                TimelineItem item = timeline.get(i);
-                View card;
-                if (item.isMedia) {
-                    card = buildMediaCard(context, isRu, pal, item.mediaEntry, item.seqNumber,
-                            cardBg, cardStroke, textPrimary, textSecondary, accentColor);
-                } else {
-                    String label = item.seqNumber == 1
-                            ? (isRu ? "Оригинал #1" : "Original #1")
-                            : ((isRu ? "Версия #" : "Edit #") + item.seqNumber);
-                    card = buildTextCard(context, isRu, pal, item.textEntry, label, newerTextCompare,
-                            cardBg, cardStroke, textPrimary, textSecondary, accentColor);
-                    newerTextCompare = item.textEntry.text == null ? null : item.textEntry.text.trim();
-                }
-                View rowWithRail = wrapWithTimelineRail(context, card, i == timeline.size() - 1,
-                        item.isMedia ? pal.semanticCyan : accentColor, dark);
-                animateCard(rowWithRail, animIdx++);
-                list.addView(rowWithRail, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
-            }
-        }
+        android.widget.ProgressBar loadingPb = new android.widget.ProgressBar(act);
+        loadingPb.setIndeterminate(true);
+        list.addView(loadingPb, LayoutHelper.createLinear(28, 28, Gravity.CENTER_HORIZONTAL, 0, 28, 0, 28));
 
         root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
@@ -329,7 +243,108 @@ public class ColgramEditHistorySheet {
             sheet.show();
         } catch (Throwable showErr) {
             popOnce.run();
+            return;
         }
+
+        THUMB_EXEC.execute(() -> {
+            final List<org.colgram.core.ColgramDatabase.MessageEditEntry> history =
+                    org.colgram.core.ColgramHookHandler.getEditHistory(dialogId, messageId);
+            final List<org.colgram.core.ColgramDatabase.MediaRevision> mediaRevisions =
+                    org.colgram.core.ColgramHookHandler.getMediaRevisions(dialogId, messageId);
+            final boolean hasCurrentMedia = !TextUtils.isEmpty(currentMediaPath) && new File(currentMediaPath).isFile();
+
+            AndroidUtilities.runOnUIThread(() -> {
+                if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) {
+                    return;
+                }
+                final boolean hasText = history != null && !history.isEmpty();
+                final boolean hasMedia = mediaRevisions != null && !mediaRevisions.isEmpty();
+                int totalSaved = (hasText ? history.size() : 0) + (hasMedia ? mediaRevisions.size() : 0);
+                if (totalSaved == 0) {
+                    subtitleView.setText(isRu ? "Предыдущих правок и замен медиа пока нет" : "No prior edits or replaced media saved");
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    if (isRu) {
+                        sb.append("Сохранено версий: ").append(totalSaved);
+                        if (hasText) sb.append(" · текст: ").append(history.size());
+                        if (hasMedia) sb.append(" · медиа: ").append(mediaRevisions.size());
+                    } else {
+                        sb.append("Saved revisions: ").append(totalSaved);
+                        if (hasText) sb.append(" · text: ").append(history.size());
+                        if (hasMedia) sb.append(" · media: ").append(mediaRevisions.size());
+                    }
+                    subtitleView.setText(sb.toString());
+                }
+
+                list.removeAllViews();
+                int animIdx = 0;
+
+                if (hasCurrentMedia || hasCurrentText) {
+                    View curCard = buildCurrentVersionCard(
+                            act, isRu, pal, currentText, currentEntities, currentMediaPath, currentIsVideo,
+                            currentCardBg, accentColor, textPrimary, textSecondary);
+                    animateCard(curCard, animIdx++);
+                    list.addView(curCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
+                }
+
+                if (!hasText && !hasMedia) {
+                    TextView emptyCard = new TextView(act);
+                    emptyCard.setText(isRu
+                            ? "Как только текст, подпись или фото/видео этого сообщения будут изменены (даже несколько раз за секунду), все предыдущие версии появятся в этой ленте."
+                            : "Whenever text, caption, photo, or video is edited (even multiple times per second), all prior versions will be preserved in this timeline.");
+                    emptyCard.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
+                    emptyCard.setTextColor(textSecondary);
+                    emptyCard.setGravity(Gravity.CENTER);
+                    emptyCard.setPadding(dp(18), dp(20), dp(18), dp(20));
+                    GradientDrawable emptyBg = new GradientDrawable();
+                    emptyBg.setColor(cardBg);
+                    emptyBg.setCornerRadius(dp(18));
+                    emptyBg.setStroke(dp(1), cardStroke);
+                    emptyCard.setBackground(emptyBg);
+                    list.addView(emptyCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 6));
+                } else {
+                    List<TimelineItem> timeline = new ArrayList<>();
+                    if (hasText) {
+                        for (int i = 0; i < history.size(); i++) {
+                            org.colgram.core.ColgramDatabase.MessageEditEntry e = history.get(i);
+                            timeline.add(new TimelineItem(e.timestamp, e, i + 1));
+                        }
+                    }
+                    if (hasMedia) {
+                        for (int i = 0; i < mediaRevisions.size(); i++) {
+                            org.colgram.core.ColgramDatabase.MediaRevision m = mediaRevisions.get(i);
+                            timeline.add(new TimelineItem(m.timestamp, m, i + 1));
+                        }
+                    }
+                    Collections.sort(timeline, (a, b) -> {
+                        int cmp = Long.compare(b.timestamp, a.timestamp);
+                        if (cmp != 0) return cmp;
+                        return Integer.compare(b.seqNumber, a.seqNumber);
+                    });
+
+                    String newerTextCompare = hasCurrentText ? currentText.trim() : null;
+                    for (int i = 0; i < timeline.size(); i++) {
+                        TimelineItem item = timeline.get(i);
+                        View card;
+                        if (item.isMedia) {
+                            card = buildMediaCard(act, isRu, pal, item.mediaEntry, item.seqNumber,
+                                    cardBg, cardStroke, textPrimary, textSecondary, accentColor);
+                        } else {
+                            String label = item.seqNumber == 1
+                                    ? (isRu ? "Оригинал #1" : "Original #1")
+                                    : ((isRu ? "Версия #" : "Edit #") + item.seqNumber);
+                            card = buildTextCard(act, isRu, pal, item.textEntry, label, newerTextCompare,
+                                    cardBg, cardStroke, textPrimary, textSecondary, accentColor);
+                            newerTextCompare = item.textEntry.text == null ? null : item.textEntry.text.trim();
+                        }
+                        View rowWithRail = wrapWithTimelineRail(act, card, i == timeline.size() - 1,
+                                item.isMedia ? pal.semanticCyan : accentColor, dark);
+                        animateCard(rowWithRail, animIdx++);
+                        list.addView(rowWithRail, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+                    }
+                }
+            });
+        });
     }
 
     private static View wrapWithTimelineRail(Context ctx, View card, boolean isLast, int dotColor, boolean dark) {
@@ -467,6 +482,10 @@ public class ColgramEditHistorySheet {
             Bitmap bmp = isVideo ? decodeVideoThumb(path) : decodeSafePreview(path, 800);
             if (bmp != null) {
                 AndroidUtilities.runOnUIThread(() -> {
+                    if (!box.isAttachedToWindow() || !iv.isAttachedToWindow()) {
+                        if (!bmp.isRecycled()) bmp.recycle();
+                        return;
+                    }
                     iv.setImageBitmap(bmp);
                     iv.animate().alpha(1f).setDuration(180L).start();
                 });
@@ -778,28 +797,39 @@ public class ColgramEditHistorySheet {
             context.startActivity(view);
         } catch (Throwable t) {
             FileLog.e(t);
-            Toast.makeText(context, isRu ? "Нет приложения для этого файла" : "No viewer found", Toast.LENGTH_SHORT).show();
+            Toast.makeText(context.getApplicationContext(), isRu ? "Нет приложения для этого файла" : "No viewer found", Toast.LENGTH_SHORT).show();
         }
     }
 
     private static void showFullScreenImageDialog(Context ctx, String path, String title) {
+        final android.app.Activity act = AndroidUtilities.findActivity(ctx);
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
+        final Context appCtx = act.getApplicationContext();
         THUMB_EXEC.execute(() -> {
             Bitmap bmp = decodeSafePreview(path, 1800);
             AndroidUtilities.runOnUIThread(() -> {
                 if (bmp == null) {
-                    Toast.makeText(ctx, "Не удалось загрузить изображение", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(appCtx, "Не удалось загрузить изображение", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                ImageView iv = new ImageView(ctx);
+                if (act.isFinishing() || act.isDestroyed()) {
+                    if (!bmp.isRecycled()) bmp.recycle();
+                    return;
+                }
+                ImageView iv = new ImageView(act);
                 iv.setImageBitmap(bmp);
                 iv.setAdjustViewBounds(true);
                 iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
                 iv.setPadding(dp(8), dp(8), dp(8), dp(8));
-                new AlertDialog.Builder(ctx)
-                        .setTitle(TextUtils.isEmpty(title) ? "Сохранённое фото" : title)
-                        .setView(iv)
-                        .setPositiveButton("Закрыть", null)
-                        .show();
+                try {
+                    new AlertDialog.Builder(act)
+                            .setTitle(TextUtils.isEmpty(title) ? "Сохранённое фото" : title)
+                            .setView(iv)
+                            .setPositiveButton("Закрыть", null)
+                            .show();
+                } catch (Throwable ignored) {
+                    if (!bmp.isRecycled()) bmp.recycle();
+                }
             });
         });
     }

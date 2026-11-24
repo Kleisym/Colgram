@@ -258,8 +258,9 @@ public final class ColgramAccountSwitcherHelper {
 
     /** Interactive bottom sheet listing ALL active and vaulted accounts with unlimited pins and 1-tap swap. */
     public static void showAccountVaultSheet(BaseFragment fragment, int currentAccount) {
-        if (fragment == null || fragment.getParentActivity() == null) return;
+        if (fragment == null || fragment.isFinishing()) return;
         final Activity activity = fragment.getParentActivity();
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
         final Context ctx = activity.getApplicationContext();
 
         ArrayList<Integer> activeSlots = new ArrayList<>();
@@ -358,17 +359,23 @@ public final class ColgramAccountSwitcherHelper {
                 vaultAvatarUser.bot = entry.isBot;
                 AvatarDrawable vaultAvatarDrawable = new AvatarDrawable();
                 vaultAvatarDrawable.setInfo(currentAccount, vaultAvatarUser);
-                BackupImageView vaultAvatarView = new BackupImageView(activity);
+                final BackupImageView vaultAvatarView = new BackupImageView(activity);
                 vaultAvatarView.setRoundRadius(dp(16));
-                java.io.File cachedVaultAvatar = entry.userId > 0
-                        ? org.colgram.core.ColgramBotSync.getCachedBotAvatarFile(currentAccount, entry.userId)
-                        : null;
-                if (cachedVaultAvatar != null && cachedVaultAvatar.exists() && cachedVaultAvatar.length() > 64) {
-                    vaultAvatarView.setImage(
-                            org.telegram.messenger.ImageLocation.getForPath(cachedVaultAvatar.getAbsolutePath()),
-                            "50_50", vaultAvatarDrawable, vaultAvatarUser);
-                } else {
-                    vaultAvatarView.setImageDrawable(vaultAvatarDrawable);
+                vaultAvatarView.setImageDrawable(vaultAvatarDrawable);
+                if (entry.userId > 0) {
+                    org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                        java.io.File cachedVaultAvatar = org.colgram.core.ColgramBotSync.getCachedBotAvatarFile(currentAccount, entry.userId);
+                        if (cachedVaultAvatar != null && cachedVaultAvatar.exists() && cachedVaultAvatar.length() > 64) {
+                            final String path = cachedVaultAvatar.getAbsolutePath();
+                            AndroidUtilities.runOnUIThread(() -> {
+                                if (vaultAvatarView.isAttachedToWindow()) {
+                                    vaultAvatarView.setImage(
+                                            org.telegram.messenger.ImageLocation.getForPath(path),
+                                            "50_50", vaultAvatarDrawable, vaultAvatarUser);
+                                }
+                            });
+                        }
+                    });
                 }
                 row.addView(vaultAvatarView, LayoutHelper.createLinear(32, 32, Gravity.CENTER_VERTICAL, 0, 0, 10, 0));
 
@@ -406,7 +413,8 @@ public final class ColgramAccountSwitcherHelper {
                     pinBtn.animate().scaleX(1.22f).scaleY(1.22f).setDuration(90)
                             .withEndAction(() -> pinBtn.animate().scaleX(1f).scaleY(1f).setDuration(90)
                                     .withEndAction(() -> {
-                                        if (holder[0] == null || !holder[0].isShowing() || fragment.getParentActivity() == null) return;
+                                        if (holder[0] == null || !holder[0].isShowing()
+                                                || fragment.isFinishing() || activity.isFinishing() || activity.isDestroyed()) return;
                                         holder[0].dismiss();
                                         showAccountVaultSheet(fragment, currentAccount);
                                     }).start())
@@ -458,7 +466,7 @@ public final class ColgramAccountSwitcherHelper {
                     Toast.makeText(ctx, "Зашифровано аккаунтов: " + savedCount, Toast.LENGTH_SHORT).show();
                     if (holder[0] != null && holder[0].isShowing()) {
                         holder[0].dismiss();
-                        if (fragment.getParentActivity() != null) {
+                        if (!fragment.isFinishing() && !activity.isFinishing() && !activity.isDestroyed()) {
                             showAccountVaultSheet(fragment, currentAccount);
                         }
                     }
@@ -483,7 +491,19 @@ public final class ColgramAccountSwitcherHelper {
         actions.addView(addBtn, LayoutHelper.createLinear(0, 44, 1.35f, Gravity.CENTER_VERTICAL, 6, 0, 0, 0));
         root.addView(actions, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        ScrollView scroll = new ScrollView(activity);
+        final int maxH = Math.round(AndroidUtilities.displaySize.y * 0.72f);
+        ScrollView scroll = new ScrollView(activity) {
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                int hMode = View.MeasureSpec.getMode(heightMeasureSpec);
+                int hSize = View.MeasureSpec.getSize(heightMeasureSpec);
+                int capped = (hMode == View.MeasureSpec.UNSPECIFIED)
+                        ? View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST)
+                        : View.MeasureSpec.makeMeasureSpec(Math.min(hSize, maxH), hMode);
+                super.onMeasure(widthMeasureSpec, capped);
+            }
+        };
+        scroll.setVerticalScrollBarEnabled(false);
         scroll.addView(root);
 
         org.telegram.ui.ActionBar.BottomSheet.Builder builder =

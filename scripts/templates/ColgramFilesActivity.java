@@ -22,6 +22,7 @@ import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramStorageSandbox;
 import org.colgram.core.ColgramUnlimitedMemory;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
@@ -80,6 +81,7 @@ public class ColgramFilesActivity extends BaseFragment {
 
     private boolean pickMode;
     private boolean destroyed;
+    private long lastTapMs;
 
     private RecyclerListView listView;
     private ListAdapter listAdapter;
@@ -315,6 +317,10 @@ public class ColgramFilesActivity extends BaseFragment {
         listView.setAdapter(listAdapter);
 
         listView.setOnItemClickListener((view, position) -> {
+            if (destroyed) return;
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - lastTapMs < 280L) return;
+            lastTapMs = now;
             if (position == heroRow || position == controlsHeaderRow
                     || position == controlsShadowRow || position == bottomShadowRow) {
                 return;
@@ -396,15 +402,23 @@ public class ColgramFilesActivity extends BaseFragment {
         builder.setTitle("Новая папка");
         builder.setView(container);
         builder.setPositiveButton("Создать", (d, w) -> {
-            String name = input.getText() == null ? "" : input.getText().toString().trim();
-            name = name.replaceAll("[\\\\/:*?\"<>|]", "_");
-            if (name.isEmpty()) return;
-            File sub = new File(currentDir, name);
-            if (sub.exists() || sub.mkdirs()) {
-                reload();
-            } else {
-                Toast.makeText(act, "Не удалось создать папку", Toast.LENGTH_SHORT).show();
-            }
+            String raw = input.getText() == null ? "" : input.getText().toString().trim();
+            final String name = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
+            final File dir = currentDir;
+            if (name.isEmpty() || dir == null) return;
+            final Context appCtx = act.getApplicationContext();
+            bgExecutor.execute(() -> {
+                File sub = new File(dir, name);
+                final boolean ok = sub.exists() || sub.mkdirs();
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (destroyed) return;
+                    if (ok) {
+                        reload();
+                    } else {
+                        Toast.makeText(appCtx, "Не удалось создать папку", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            });
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
@@ -528,51 +542,62 @@ public class ColgramFilesActivity extends BaseFragment {
         builder.setTitle("Переименовать");
         builder.setView(container);
         builder.setPositiveButton("Сохранить", (d, w) -> {
-            String next = input.getText() == null ? "" : input.getText().toString().trim();
-            next = next.replaceAll("[\\\\/:*?\"<>|]", "_");
+            String raw = input.getText() == null ? "" : input.getText().toString().trim();
+            final String next = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
             if (next.isEmpty()) return;
-            File dest = new File(file.getParentFile(), next);
-            if (!dest.exists() && file.renameTo(dest)) {
-                reload();
-            } else {
-                Toast.makeText(act, "Не удалось переименовать", Toast.LENGTH_SHORT).show();
-            }
+            final Context appCtx = act.getApplicationContext();
+            bgExecutor.execute(() -> {
+                File dest = new File(file.getParentFile(), next);
+                final boolean ok = !dest.exists() && file.renameTo(dest);
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (destroyed) return;
+                    if (ok) {
+                        reload();
+                    } else {
+                        Toast.makeText(appCtx, "Не удалось переименовать", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            });
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
     }
 
     private void deleteFile(File file, int entryIndex, int adapterPos) {
-        try {
-            if (file.delete()) {
-                allEntries.remove(file);
-                if (entryIndex >= 0 && entryIndex < visibleEntries.size()
-                        && visibleEntries.get(entryIndex).equals(file)) {
-                    visibleEntries.remove(entryIndex);
-                    recalculateRows();
-                    if (listAdapter != null) {
-                        listAdapter.notifyItemRemoved(adapterPos);
-                    }
-                    final File dirForStats = currentDir;
-                    if (dirForStats != null) {
-                        bgExecutor.execute(() -> {
-                            long[] st = ColgramStorageSandbox.computeDirStats(dirForStats);
-                            final String formatted = objects((int) st[0]) + " · " + AndroidUtilities.formatFileSize(st[1]);
-                            AndroidUtilities.runOnUIThread(() -> {
-                                if (!destroyed && listAdapter != null && headerRow >= 0) {
-                                    dirStatsSummary = formatted;
-                                    listAdapter.notifyItemChanged(headerRow);
-                                }
-                            });
-                        });
-                    }
-                } else {
-                    reload();
-                }
-            } else if (getParentActivity() != null) {
-                Toast.makeText(getParentActivity(), "Не удалось удалить файл", Toast.LENGTH_SHORT).show();
+        if (file == null || destroyed) return;
+        Activity act = getParentActivity();
+        final Context appCtx = act != null ? act.getApplicationContext() : ApplicationLoader.applicationContext;
+        final File dirForStats = currentDir;
+        bgExecutor.execute(() -> {
+            boolean deleted = false;
+            try {
+                deleted = file.delete();
+            } catch (Throwable ignored) {}
+            final boolean ok = deleted;
+            final String formattedStats;
+            if (ok && dirForStats != null) {
+                long[] st = ColgramStorageSandbox.computeDirStats(dirForStats);
+                formattedStats = objects((int) st[0]) + " · " + AndroidUtilities.formatFileSize(st[1]);
+            } else {
+                formattedStats = null;
             }
-        } catch (Throwable ignored) {}
+            AndroidUtilities.runOnUIThread(() -> {
+                if (destroyed) return;
+                if (ok) {
+                    allEntries.remove(file);
+                    visibleEntries.remove(file);
+                    recalculateRows();
+                    if (formattedStats != null) {
+                        dirStatsSummary = formattedStats;
+                    }
+                    if (listAdapter != null) {
+                        listAdapter.notifyDataSetChanged();
+                    }
+                } else if (appCtx != null) {
+                    Toast.makeText(appCtx, "Не удалось удалить файл", Toast.LENGTH_SHORT).show();
+                }
+            });
+        });
     }
 
     private static String mimeFor(String name) {

@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
@@ -584,9 +585,11 @@ public class ColgramPluginsActivity extends BaseFragment {
             final boolean success = ok;
             final String failure = err;
             mainHandler.post(() -> {
+                if (destroyed) return;
                 rebuildRows();
-                if (getParentActivity() == null) return;
-                Toast.makeText(getParentActivity(),
+                Activity act = getParentActivity();
+                if (act == null || act.isFinishing() || act.isDestroyed()) return;
+                Toast.makeText(act.getApplicationContext(),
                         success ? "Плагин установлен из файла" : "Ошибка: " + failure,
                         success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
             });
@@ -636,20 +639,33 @@ public class ColgramPluginsActivity extends BaseFragment {
     }
 
     private void showInstalledPluginActions(ColgramPluginManager.PluginInfo p) {
-        if (getParentActivity() == null) return;
+        Activity act = getParentActivity();
+        if (destroyed || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
+        final Context appCtx = act.getApplicationContext();
         String[] options = {"Настройки плагина", "Редактировать код", "Удалить плагин", "Отмена"};
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
         builder.setTitle(p.name);
         builder.setItems(options, (d, w) -> {
             if (w == 0) {
                 openExteraPluginSettings(p);
             } else if (w == 1) {
-                String code = ColgramPluginManager.getPluginCode(p.fileName);
-                showPluginEditorDialog(p.fileName, code);
+                executor.execute(() -> {
+                    final String code = ColgramPluginManager.getPluginCode(p.fileName);
+                    mainHandler.post(() -> {
+                        if (!destroyed && getParentActivity() != null && !getParentActivity().isFinishing()) {
+                            showPluginEditorDialog(p.fileName, code);
+                        }
+                    });
+                });
             } else if (w == 2) {
-                ColgramPluginManager.deletePlugin(p.fileName);
-                rebuildRows();
-                Toast.makeText(getParentActivity(), "Плагин удалён", Toast.LENGTH_SHORT).show();
+                executor.execute(() -> {
+                    ColgramPluginManager.deletePlugin(p.fileName);
+                    mainHandler.post(() -> {
+                        if (destroyed) return;
+                        rebuildRows();
+                        Toast.makeText(appCtx, "Плагин удалён", Toast.LENGTH_SHORT).show();
+                    });
+                });
             }
         });
         showDialog(builder.create());
@@ -721,13 +737,15 @@ public class ColgramPluginsActivity extends BaseFragment {
                                 selCell.setTextAndValue(text, labels.get(initIdx), false);
                                 selCell.setTag("selector:" + key);
                                 selCell.setOnClickListener(v -> {
-                                    AlertDialog.Builder pick = new AlertDialog.Builder(ctx, resourceProvider);
+                                    Activity curAct = getParentActivity();
+                                    if (destroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
+                                    AlertDialog.Builder pick = new AlertDialog.Builder(curAct, resourceProvider);
                                     pick.setTitle(text);
                                     pick.setItems(labels.toArray(new String[0]), (d2, whichIdx) -> {
                                         selectorValues.put(key, whichIdx);
                                         selCell.setTextAndValue(text, labels.get(whichIdx), false);
                                     });
-                                    pick.show();
+                                    try { pick.show(); } catch (Throwable ignored) {}
                                 });
                                 layout.addView(selCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
                             }

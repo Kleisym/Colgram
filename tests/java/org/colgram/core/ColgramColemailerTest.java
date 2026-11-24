@@ -219,12 +219,179 @@ public final class ColgramColemailerTest {
         check(links.size() == 2, "expected 2 extracted channel links, got " + links);
     }
 
+    private static void testEventDrivenSchedulerZeroIdleAndFloodWait() {
+        ColgramColemailerEngine engine = ColgramColemailerEngine.newStandaloneForTest();
+
+        // Zero campaigns -> activeCampaignCount == 0 and getNextDueCampaignDelayMs returns -1 (zero wakeups!)
+        check(engine.getActiveCampaignCount() == 0 && !engine.hasActiveCampaigns(), "idle engine must have 0 active campaigns");
+        check(engine.getNextDueCampaignDelayMs(1_000_000L) == -1L,
+                "idle engine must return -1L delay (zero wakeups)");
+
+        // Paused campaign -> still -1L
+        ColgramColemailerEngine.BroadcastCampaign intervalCamp = new ColgramColemailerEngine.BroadcastCampaign(
+                "zero_drain", "Пост", ColgramColemailerEngine.MODE_INTERVAL, 120L, 0, "");
+        intervalCamp.ownerAccount = 0;
+        intervalCamp.enabled = false;
+        intervalCamp.targetChats.add(-10010L);
+        intervalCamp.targetChats.add(-10020L);
+        engine.addOrUpdateCampaign(intervalCamp);
+        check(engine.getActiveCampaignCount() == 0, "disabled campaign must not count as active");
+        check(engine.getNextDueCampaignDelayMs(0, 1_000_000L) == -1L,
+                "disabled campaign must return -1L delay");
+
+        // Enable campaign & arm baselines at t=1000s
+        engine.setCampaignEnabled("zero_drain", true);
+        check(engine.getActiveCampaignCount() == 1, "enabled campaign must count as active");
+        engine.armMissingBaselines(0, 1000L);
+        check(engine.getNextDueCampaignDelayMs(0, 1_000_000L) == 120_000L,
+                "exact remaining delay at t=1000s must be 120_000ms, got " + engine.getNextDueCampaignDelayMs(0, 1_000_000L));
+        check(engine.getNextDueCampaignDelayMs(0, 1_050_000L) == 70_000L,
+                "exact remaining delay at t=1050s must be 70_000ms");
+        check(engine.getNextDueCampaignDelayMs(0, 1_125_000L) == 0L,
+                "overdue campaign must return 0L");
+
+        // Per-(account, dialogId) FLOOD_WAIT_X backoff isolates only the rate-limited chat
+        check(ColgramColemailerEngine.parseFloodWaitSeconds("FLOOD_WAIT_45") == 45L, "parse FLOOD_WAIT_45");
+        check(ColgramColemailerEngine.parseFloodWaitSeconds("{\"ok\":false,\"parameters\":{\"retry_after\":33}}") == 33L,
+                "parse retry_after JSON");
+        engine.recordFloodWait(0, -10010L, 45L, 1_125_000L);
+        check(engine.isFloodBackedOff(0, -10010L, 1_125_000L), "-10010 must be in flood backoff");
+        check(!engine.isFloodBackedOff(0, -10020L, 1_125_000L), "-10020 must NOT be blocked by -10010's flood wait");
+
+        List<ColgramColemailerEngine.BroadcastDueEvent> due = engine.collectDueBroadcasts(0, 1125L);
+        check(due.size() == 1 && due.get(0).chatId == -10020L,
+                "collectDueBroadcasts must skip flood-backed-off -10010 and still emit -10020");
+        engine.markBroadcastSent(intervalCamp, -10020L, 1125L);
+        // Next wakeup is now exact flood backoff expiry of -10010 (45_000ms), NOT 15s polling!
+        check(engine.getNextDueCampaignDelayMs(0, 1_125_000L) == 45_000L,
+                "next wakeup must equal exact flood backoff expiry 45_000ms, got " + engine.getNextDueCampaignDelayMs(0, 1_125_000L));
+
+        // Pure counter campaign: -1L while below threshold, 0L once incoming messages hit threshold
+        ColgramColemailerEngine cntEngine = ColgramColemailerEngine.newStandaloneForTest();
+        ColgramColemailerEngine.BroadcastCampaign cntCamp = new ColgramColemailerEngine.BroadcastCampaign(
+                "cnt_only", "Счётчик", ColgramColemailerEngine.MODE_COUNTER, 0L, 2, "");
+        cntCamp.ownerAccount = 0;
+        cntCamp.targetChats.add(-10099L);
+        cntEngine.addOrUpdateCampaign(cntCamp);
+        cntEngine.armMissingBaselines(0, 2000L);
+        check(cntEngine.getNextDueCampaignDelayMs(0, 2_000_000L) == -1L,
+                "untriggered counter campaign needs zero timer wakeups (-1L)");
+        check(!cntEngine.onIncomingChatMessageAndCheckDue(0, -10099L, 2001L), "1/2 messages should not trigger yet");
+        check(cntEngine.getNextDueCampaignDelayMs(0, 2_001_000L) == -1L, "still below threshold -> -1L");
+        check(cntEngine.onIncomingChatMessageAndCheckDue(0, -10099L, 2002L), "2/2 messages must trigger");
+        check(cntEngine.getNextDueCampaignDelayMs(0, 2_002_000L) == 0L, "triggered counter campaign -> 0L");
+    }
+
+    private static void testUpgradedAdSpamHeuristicsAndZeroFalsePositives() {
+        String[] ads = {
+                "erid: 2Vtzqwp1234 Скидка 30% на доставку сегодня",
+                "#реклама Новый сервис доставки по всему городу",
+                "Криптосигналы VIP! Заработок в день от 500$ без опыта",
+                "Казино 1win, промокод VIP2026 — забирай выигрыш сразу!",
+                "Розыгрыш призов! Подписывайся и жми сюда https://t.me/+SecretPromo99",
+                "Ставки на спорт с гарантией, промокод WIN100, переходи https://t.me/+BetChannel"
+        };
+        for (String ad : ads) {
+            ColgramSpamGuard.SpamReport r = ColgramSpamGuard.diagnose(ad);
+            check(r.isSpam, "ad must be detected as spam: [" + ad + "] score=" + r.score + " factors=" + r.factors);
+        }
+
+        // Explicit ad disclosures set isExplicitAd & shouldAutoRead even without pings
+        ColgramSpamGuard.SpamReport eridRep = ColgramSpamGuard.diagnose("erid: 2Vtzqwp9999 Акция недели");
+        check(eridRep.isExplicitAd && eridRep.shouldAutoRead, "erid disclosure must set isExplicitAd and shouldAutoRead");
+        check(ColgramNotificationFilter.isAd("erid: 2Vtzqwp9999 Акция недели"), "notification filter must catch erid");
+        check(ColgramNotificationFilter.isAd("#реклама Лучший VPN сервис"), "notification filter must catch #реклама");
+
+        // Suspicious inline URL buttons + forwarded channel ad from non-contact
+        ColgramSpamGuard.SpamReport btnFwd = ColgramSpamGuard.diagnose(
+                "Скидка только сегодня! Жми по кнопке ниже", "", null, false, false, false, false,
+                false, Collections.emptyList(), true, true);
+        check(btnFwd.isSpam, "inline URL buttons + channel forward promo must be flagged as spam, score=" + btnFwd.score);
+
+        // Zero false positives on normal friend conversations & auth codes
+        String[] normalMessages = {
+                "Привет, как дела? Пойдём вечером в кино?",
+                "Скинь пожалуйста конспект по физике за вчера",
+                "Я буду через 15 минут возле метро",
+                "Ты уже посмотрел новую серию?",
+                "Надоела эта реклама на ютубе уже",
+                "У нас на работе сегодня дали премию!",
+                "Код подтверждения: 482910. Не сообщайте его никому."
+        };
+        for (String okMsg : normalMessages) {
+            ColgramSpamGuard.SpamReport r = ColgramSpamGuard.diagnose(okMsg);
+            check(!r.isSpam && !r.shouldAutoRead,
+                    "normal chat message must NEVER false-positive: [" + okMsg + "] score=" + r.score + " factors=" + r.factors);
+        }
+    }
+
+    private static void testDmAutoDeleteMuteSafetyAndIsolation() {
+        ColgramColemailerEngine engine = ColgramColemailerEngine.newStandaloneForTest();
+        long selfAcc0 = 55555L;
+        long selfAcc1 = 66666L;
+        engine.setSelfUserId(0, selfAcc0);
+        engine.setSelfUserId(1, selfAcc1);
+
+        // Strict refusal of Saved Messages, Secret Chats, Folders, groups/channels, 0, and service IDs (777000, 42777, etc.)
+        long[] forbidden = {
+                0L,
+                selfAcc0,                  // Saved Messages on account 0
+                777000L,                   // Telegram Service Notifications
+                42777L,                    // Telegram Support / Login codes
+                333000L,                   // Telegram Support
+                4240004L,                  // Telegram Anti-Spam
+                136817688L,                // Channel_Bot
+                1087968824L,               // GroupAnonymousBot
+                2666000L,                  // Anonymous Saved Messages pseudo-peer
+                0x4000000000001234L,       // Secret Chat
+                0x2000000000000001L,       // Folder dialog
+                -100123456789L             // Supergroup / Channel
+        };
+        for (long badId : forbidden) {
+            check(!engine.setDmAutoDeleteMuted(0, badId, true),
+                    "setDmAutoDeleteMuted MUST refuse disallowed dialogId=" + badId);
+            check(!engine.toggleDmAutoDeleteMuted(0, badId),
+                    "toggleDmAutoDeleteMuted MUST refuse disallowed dialogId=" + badId);
+            check(!engine.isDmAutoDeleteMuted(0, badId),
+                    "isDmAutoDeleteMuted MUST remain false for disallowed dialogId=" + badId);
+        }
+
+        // Real 1-on-1 DM toggle & per-account isolation
+        long peerA = 123456L;
+        long peerB = 789012L;
+        check(!engine.isDmAutoDeleteMuted(0, peerA), "initially unmuted");
+        check(engine.toggleDmAutoDeleteMuted(0, peerA), "first toggle enables DM mute");
+        check(engine.isDmAutoDeleteMuted(0, peerA), "account 0 peerA must be muted");
+        check(!engine.isDmAutoDeleteMuted(1, peerA), "account 1 peerA must stay isolated (unmuted)");
+
+        check(engine.setDmAutoDeleteMuted(1, peerB, true), "account 1 peerB mute enabled");
+        Set<Long> acc0Set = engine.getDmAutoDeleteMutedDialogs(0);
+        Set<Long> acc1Set = engine.getDmAutoDeleteMutedDialogs(1);
+        check(acc0Set.size() == 1 && acc0Set.contains(peerA), "account 0 set mismatch: " + acc0Set);
+        check(acc1Set.size() == 1 && acc1Set.contains(peerB), "account 1 set mismatch: " + acc1Set);
+
+        // Serialization round-trip preserves per-account DM auto-delete mutes
+        String ser = engine.serializeState();
+        ColgramColemailerEngine restored = ColgramColemailerEngine.newStandaloneForTest();
+        restored.setSelfUserId(0, selfAcc0);
+        restored.setSelfUserId(1, selfAcc1);
+        restored.loadFromSerializedState(ser);
+        check(restored.isDmAutoDeleteMuted(0, peerA), "restored acc 0 peerA must stay muted");
+        check(!restored.isDmAutoDeleteMuted(1, peerA), "restored acc 1 peerA must stay unmuted");
+        check(restored.isDmAutoDeleteMuted(1, peerB), "restored acc 1 peerB must stay muted");
+        check(!restored.toggleDmAutoDeleteMuted(0, peerA), "second toggle disables DM mute");
+        check(!restored.isDmAutoDeleteMuted(0, peerA), "peerA must now be unmuted");
+    }
+
     public static void main(String[] args) {
         testSpamGuardNormalizationAndPingDetection();
         testSpamGuardDiagnosisAndLeadVeto();
         testNotificationFilter();
         testColemailerEngineButtonsScheduleAndRotation();
         testWhitelistMuteQuietSafetyAndSerialization();
+        testEventDrivenSchedulerZeroIdleAndFloodWait();
+        testUpgradedAdSpamHeuristicsAndZeroFalsePositives();
+        testDmAutoDeleteMuteSafetyAndIsolation();
         System.out.println("ColgramColemailerTest: PASS");
     }
 }

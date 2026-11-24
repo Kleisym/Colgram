@@ -1040,6 +1040,70 @@ public final class ColgramCoreRegressionTest {
             ColgramProxyManager.clearPoolsForTest();
         }
 
+        // 11h. 2-byte SOCKS5 CONNECT segmentation + RFC 6455 Ping/Pong, 64-bit (len==127),
+        //      and fragmented (FIN=0 / opcode=0x0) frame verification
+        try {
+            java.io.ByteArrayOutputStream sockCapture = new java.io.ByteArrayOutputStream();
+            final java.util.List<Integer> writeChunks = new java.util.ArrayList<>();
+            java.io.OutputStream chunkMeasuringOut = new java.io.OutputStream() {
+                @Override public void write(int b) throws java.io.IOException { writeChunks.add(1); sockCapture.write(b); }
+                @Override public void write(byte[] b, int off, int len) throws java.io.IOException {
+                    writeChunks.add(len);
+                    sockCapture.write(b, off, len);
+                }
+            };
+            byte[] okReply = new byte[]{5, 0, 0, 1, 127, 0, 0, 1, 0, 80};
+            final int[] replyIdx = {0};
+            boolean segOk = ColgramSocks5Codec.requestConnect(chunkMeasuringOut,
+                    () -> replyIdx[0] < okReply.length ? (okReply[replyIdx[0]++] & 0xff) : -1,
+                    new byte[]{(byte) 149, (byte) 154, (byte) 167, (byte) 220}, 443);
+            check(segOk && !writeChunks.isEmpty() && writeChunks.get(0) <= 2 && sockCapture.size() == 10,
+                    "requestConnect writes 2-byte segments, first=" + (writeChunks.isEmpty() ? -1 : writeChunks.get(0)));
+
+            // Build inbound WebSocket stream:
+            //   1) Server Ping (0x89, "ping")
+            //   2) Fragmented Binary 1/2 (FIN=0, 0x02, "hel")
+            //   3) Interleaved Server Ping (0x89, "hi")
+            //   4) Fragmented Binary 2/2 (FIN=1, 0x00, "lo")
+            //   5) 64-bit length frame (FIN=1, 0x82, len==127 -> 70000 bytes)
+            java.io.ByteArrayOutputStream wireIn = new java.io.ByteArrayOutputStream();
+            wireIn.write(new byte[]{(byte) 0x89, 0x04, 'p', 'i', 'n', 'g'});
+            wireIn.write(new byte[]{0x02, 0x03, 'h', 'e', 'l'});
+            wireIn.write(new byte[]{(byte) 0x89, 0x02, 'h', 'i'});
+            wireIn.write(new byte[]{(byte) 0x80, 0x02, 'l', 'o'});
+            int bigLen = 70000;
+            wireIn.write(0x82);
+            wireIn.write(127);
+            for (int shift = 56; shift >= 0; shift -= 8) wireIn.write((int) (((long) bigLen >>> shift) & 0xff));
+            byte[] bigPayload = new byte[bigLen];
+            for (int i = 0; i < bigLen; i++) bigPayload[i] = (byte) (i & 0xff);
+            wireIn.write(bigPayload);
+
+            java.io.ByteArrayInputStream wsIn = new java.io.ByteArrayInputStream(wireIn.toByteArray());
+            java.io.ByteArrayOutputStream wsOut = new java.io.ByteArrayOutputStream();
+            java.io.ByteArrayOutputStream mtprotoDownstream = new java.io.ByteArrayOutputStream();
+            ColgramTelegramWsBridge.WsSession mockSess =
+                    new ColgramTelegramWsBridge.WsSession(2, "149.154.167.220", "kws2.web.telegram.org", null, wsIn, wsOut);
+            long downBytes = ColgramTelegramWsBridge.pumpUpstreamFrames(mockSess, mtprotoDownstream, null);
+            byte[] assembled = mtprotoDownstream.toByteArray();
+            check(downBytes == 5L + bigLen && assembled.length == 5 + bigLen
+                            && assembled[0] == 'h' && assembled[4] == 'o'
+                            && java.util.Arrays.equals(java.util.Arrays.copyOfRange(assembled, 5, assembled.length), bigPayload),
+                    "pumpUpstreamFrames handles fragmented FIN=0/0x0 + 64-bit len=127 frames verbatim");
+            byte[] pongs = wsOut.toByteArray();
+            // Verify both replies are masked RFC 6455 Pong (0x8A, MASK=1) with non-zero masked payload decoding to "ping" and "hi"
+            check(pongs.length == (6 + 4) + (6 + 2)
+                            && (pongs[0] & 0xff) == 0x8A && (pongs[1] & 0xff) == (0x80 | 4)
+                            && (pongs[10] & 0xff) == 0x8A && (pongs[11] & 0xff) == (0x80 | 2),
+                    "Ping opcode 0x9 sends RFC 6455 randomly masked Pong opcode 0xA");
+            byte[] unmaskedPong1 = new byte[4];
+            for (int i = 0; i < 4; i++) unmaskedPong1[i] = (byte) (pongs[6 + i] ^ pongs[2 + (i & 3)]);
+            check("ping".equals(new String(unmaskedPong1, java.nio.charset.StandardCharsets.US_ASCII)),
+                    "Masked Pong 1 payload decodes back to 'ping'");
+        } catch (Exception e) {
+            throw new AssertionError("SOCKS5/WS frame test failed", e);
+        }
+
         System.out.println("ColgramCoreRegressionTest: PASS");
     }
 

@@ -104,7 +104,7 @@ public final class ColgramMenuChrome {
             int pad = AndroidUtilities.dp(5);
             icon.setPadding(pad, pad, pad, pad);
             icon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-            icon.setColorFilter(Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN);
+            icon.setColorFilter(org.colgram.core.ColgramThemePolicy.contrastInkOn(iconColor), android.graphics.PorterDuff.Mode.SRC_IN);
             icon.setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(9), iconColor));
         }
         attachSpringPress(cell);
@@ -113,11 +113,10 @@ public final class ColgramMenuChrome {
     public static void styleHeader(HeaderCell cell, int lightAccent, int darkAccent) {
         if (cell == null) return;
         boolean dark = Theme.isCurrentThemeDark();
-        if (dark && ColgramConfig.isCyberThemeEnabled()) {
-            cell.setTextColor(0xFFFF5566);
-        } else {
-            cell.setTextColor(dark ? darkAccent : lightAccent);
-        }
+        int raw = (dark && ColgramConfig.isCyberThemeEnabled()) ? 0xFFFF5566 : (dark ? darkAccent : lightAccent);
+        int bg = Theme.getColor(Theme.key_windowBackgroundWhite);
+        cell.setTextColor(org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                raw, bg, 0xFF7EC8FF, 0xFF1565C0, 4.5));
     }
 
     /** Applies Colgram's unified Obsidian / Porcelain / Cyber ActionBar styling cleanly. */
@@ -713,6 +712,16 @@ public final class ColgramMenuChrome {
                 metaCol = 0xFF64748B;
             }
 
+            titleCol = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
+                    titleCol, surfaceCol, 0xFFF8FAFC, 0xFF0F172A, 7.0);
+            subCol = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
+                    subCol, surfaceCol, 0xFFDCE4F0, 0xFF2C3542, 4.5);
+            metaCol = org.colgram.core.ColgramThemePolicy.ensureReadableOnSurface(
+                    metaCol, surfaceCol, 0xFFD0DAE8, 0xFF334155, 4.5);
+            int pillEffectiveBg = org.colgram.core.ColgramThemePolicy.compositeOver(pillBgCol, surfaceCol);
+            pillTextCol = org.colgram.core.ColgramThemePolicy.ensureAccentReadable(
+                    pillTextCol, pillEffectiveBg, 0xFFF8FAFC, 0xFF14181E, 4.5);
+
             GradientDrawable bg = new GradientDrawable();
             bg.setColor(surfaceCol);
             bg.setCornerRadius(dp(16));
@@ -732,7 +741,7 @@ public final class ColgramMenuChrome {
                 badgeIcon.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 badgeIcon.setPadding(dp(1.5f), dp(1.5f), dp(1.5f), dp(1.5f));
             } else {
-                badgeIcon.setColorFilter(Color.WHITE);
+                badgeIcon.setColorFilter(org.colgram.core.ColgramThemePolicy.contrastInkOn(effectiveAccent));
                 badgeIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
                 badgeIcon.setPadding(dp(9), dp(9), dp(9), dp(9));
             }

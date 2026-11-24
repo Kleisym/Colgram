@@ -103,6 +103,12 @@ public class ColgramSettingsActivity extends BaseFragment {
     private long waitingWarpConsent = -1L;
     private long warpRouteEpoch = -1L;
     private boolean screenVisible;
+    private long lastNavTapMs;
+    private final Runnable proxyCheckRefreshRunnable = () -> {
+        if (!isFinishing() && listAdapter != null) {
+            listAdapter.notifyDataSetChanged();
+        }
+    };
     private String lastVisibleNetworkState = "";
     private final Runnable refreshVisibleNetworkState = new Runnable() {
         @Override
@@ -323,6 +329,16 @@ public class ColgramSettingsActivity extends BaseFragment {
         listView.setAdapter(listAdapter);
 
         listView.setOnItemClickListener((view, position) -> {
+            if (isFinishing()) return;
+            if (position == defenderRow || position == antiSpamRow || position == autoReplyRow
+                    || position == tempMailRow || position == versionsRow
+                    || position == dataSettingsRow || position == cacheSettingsRow
+                    || position == ownProxyRow || position == sandboxFilesRow
+                    || position == pluginsRow || position == accountVaultRow) {
+                long now = android.os.SystemClock.uptimeMillis();
+                if (now - lastNavTapMs < 360L) return;
+                lastNavTapMs = now;
+            }
             if (position == defenderRow) {
                 presentFragment(new ColgramDefenderActivity());
                 return;
@@ -586,15 +602,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                 editRelayUrl();
             } else if (position == proxyStatusRow) {
                 ColgramProxyManager.checkPoolNow(true);
-                Toast.makeText(getParentActivity(),
-                        "Проверяю прокси через нативный чекер Telegram…", Toast.LENGTH_SHORT).show();
+                if (getParentActivity() != null) {
+                    Toast.makeText(getParentActivity().getApplicationContext(),
+                            "Проверяю прокси через нативный чекер Telegram…", Toast.LENGTH_SHORT).show();
+                }
                 // A sweep is up to 8 handshakes, and an unreachable host only reports after the
                 // checker's own timeout, so refreshing at 4 s used to show the old numbers.
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (listAdapter != null) {
-                        listAdapter.notifyDataSetChanged();
-                    }
-                }, 15000L);
+                uiHandler.removeCallbacks(proxyCheckRefreshRunnable);
+                uiHandler.postDelayed(proxyCheckRefreshRunnable, 15000L);
             } else if (position == sandboxStorageRow) {
                 boolean val = !ColgramConfig.isSandboxStorageEnabled();
                 ColgramConfig.setSandboxStorageEnabled(val);
@@ -654,16 +669,20 @@ public class ColgramSettingsActivity extends BaseFragment {
                 // only says that. This runs the same calls the profile screen runs - read the name
                 // and description, write them straight back unchanged - and reports each one with
                 // the server's own reason and how long it took.
-                Toast.makeText(getParentActivity(), "Проверяю Bot API…", Toast.LENGTH_SHORT).show();
+                if (getParentActivity() != null) {
+                    Toast.makeText(getParentActivity().getApplicationContext(), "Проверяю Bot API…", Toast.LENGTH_SHORT).show();
+                }
                 ColgramBotSync.selfTestBotApi(getContext(), currentAccount, text -> {
+                    if (isFinishing()) return;
                     lastBotTestReport = text;
-                    if (listAdapter != null) listAdapter.notifyDataSetChanged();
-                    if (getParentActivity() == null) return;
-                    new AlertDialog.Builder(getParentActivity())
+                    if (listAdapter != null && botTestRow >= 0) listAdapter.notifyItemChanged(botTestRow);
+                    android.app.Activity act = getParentActivity();
+                    if (act == null || act.isFinishing() || act.isDestroyed()) return;
+                    showDialog(new AlertDialog.Builder(act, resourceProvider)
                             .setTitle("Bot API")
                             .setMessage(text)
                             .setPositiveButton("Ок", null)
-                            .show();
+                            .create());
                 });
             }
         });
@@ -695,6 +714,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     public void onFragmentDestroy() {
         screenVisible = false;
         uiHandler.removeCallbacks(refreshVisibleNetworkState);
+        uiHandler.removeCallbacks(proxyCheckRefreshRunnable);
         subscription.abandonConsent();
         if (waitingWarpConsent >= 0 && warpOperationsGate.isCurrent(waitingWarpConsent)
                 && warpOperationsGate.isPending()) {
@@ -709,10 +729,11 @@ public class ColgramSettingsActivity extends BaseFragment {
     }
 
     private void showSettingsBackupDialog() {
-        if (getParentActivity() == null) return;
-        Context ctx = getParentActivity();
-        java.io.File backupFile = new java.io.File(ColgramStorageSandbox.getRootPath(ctx), "colgram_settings_backup.json");
-        new AlertDialog.Builder(ctx, resourceProvider)
+        android.app.Activity act = getParentActivity();
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
+        final Context appCtx = act.getApplicationContext();
+        final java.io.File backupFile = new java.io.File(ColgramStorageSandbox.getRootPath(appCtx), "colgram_settings_backup.json");
+        showDialog(new AlertDialog.Builder(act, resourceProvider)
                 .setTitle("Бэкап настроек (JSON / AES-256)")
                 .setItems(new CharSequence[]{
                         "Экспорт в файл: " + backupFile.getName(),
@@ -724,93 +745,117 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }, (dialog, which) -> {
                     try {
                         if (which == 0) {
-                            java.io.File written = ColgramSettingsBackup.exportToFile(ctx, backupFile);
-                            Toast.makeText(ctx, "Сохранено: " + written.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                            warpOperations.execute(() -> {
+                                try {
+                                    java.io.File written = ColgramSettingsBackup.exportToFile(appCtx, backupFile);
+                                    uiHandler.post(() -> Toast.makeText(appCtx, "Сохранено: " + written.getAbsolutePath(), Toast.LENGTH_LONG).show());
+                                } catch (Throwable error) {
+                                    uiHandler.post(() -> Toast.makeText(appCtx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show());
+                                }
+                            });
                         } else if (which == 1) {
-                            if (!backupFile.exists()) {
-                                Toast.makeText(ctx, "Файл не найден: " + backupFile.getAbsolutePath(), Toast.LENGTH_SHORT).show();
-                                return;
-                            }
-                            int restored = ColgramSettingsBackup.importFromFile(ctx, backupFile);
-                            refreshSettings();
-                            Toast.makeText(ctx, "Восстановлено настроек: " + restored, Toast.LENGTH_SHORT).show();
+                            warpOperations.execute(() -> {
+                                try {
+                                    if (!backupFile.exists()) {
+                                        uiHandler.post(() -> Toast.makeText(appCtx, "Файл не найден: " + backupFile.getAbsolutePath(), Toast.LENGTH_SHORT).show());
+                                        return;
+                                    }
+                                    int restored = ColgramSettingsBackup.importFromFile(appCtx, backupFile);
+                                    uiHandler.post(() -> {
+                                        if (!isFinishing()) refreshSettings();
+                                        Toast.makeText(appCtx, "Восстановлено настроек: " + restored, Toast.LENGTH_SHORT).show();
+                                    });
+                                } catch (Throwable error) {
+                                    uiHandler.post(() -> Toast.makeText(appCtx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show());
+                                }
+                            });
                         } else if (which == 2) {
-                            String json = ColgramSettingsBackup.exportToJson(ctx);
+                            String json = ColgramSettingsBackup.exportToJson(appCtx);
                             AndroidUtilities.addToClipboard(json);
-                            Toast.makeText(ctx, "JSON бэкап скопирован", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(appCtx, "JSON бэкап скопирован", Toast.LENGTH_SHORT).show();
                         } else if (which == 3) {
-                            ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+                            ClipboardManager cm = (ClipboardManager) appCtx.getSystemService(Context.CLIPBOARD_SERVICE);
                             ClipData clip = cm != null ? cm.getPrimaryClip() : null;
-                            CharSequence raw = (clip != null && clip.getItemCount() > 0) ? clip.getItemAt(0).coerceToText(ctx) : null;
+                            CharSequence raw = (clip != null && clip.getItemCount() > 0) ? clip.getItemAt(0).coerceToText(appCtx) : null;
                             if (raw == null || raw.length() == 0) {
-                                Toast.makeText(ctx, "Буфер обмена пуст", Toast.LENGTH_SHORT).show();
+                                Toast.makeText(appCtx, "Буфер обмена пуст", Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            int restored = ColgramSettingsBackup.importFromJson(ctx, raw.toString());
+                            int restored = ColgramSettingsBackup.importFromJson(appCtx, raw.toString());
                             refreshSettings();
-                            Toast.makeText(ctx, "Импортировано настроек: " + restored, Toast.LENGTH_SHORT).show();
+                            Toast.makeText(appCtx, "Импортировано настроек: " + restored, Toast.LENGTH_SHORT).show();
                         } else if (which == 4) {
-                            promptBackupPassphrase(ctx, true, null);
+                            promptBackupPassphrase(act, true, null);
                         } else if (which == 5) {
-                            ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+                            ClipboardManager cm = (ClipboardManager) appCtx.getSystemService(Context.CLIPBOARD_SERVICE);
                             ClipData clip = cm != null ? cm.getPrimaryClip() : null;
-                            CharSequence raw = (clip != null && clip.getItemCount() > 0) ? clip.getItemAt(0).coerceToText(ctx) : null;
+                            CharSequence raw = (clip != null && clip.getItemCount() > 0) ? clip.getItemAt(0).coerceToText(appCtx) : null;
                             if (raw == null || raw.length() == 0) {
-                                Toast.makeText(ctx, "Буфер обмена пуст", Toast.LENGTH_SHORT).show();
+                                Toast.makeText(appCtx, "Буфер обмена пуст", Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            promptBackupPassphrase(ctx, false, raw.toString());
+                            promptBackupPassphrase(act, false, raw.toString());
                         }
                     } catch (Throwable error) {
-                        Toast.makeText(ctx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show();
+                        Toast.makeText(appCtx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show();
                     }
                 })
                 .setNegativeButton("Закрыть", null)
-                .show();
+                .create());
     }
 
     private void promptBackupPassphrase(Context ctx, boolean exportMode, String clipboardPayload) {
-        final EditTextBoldCursor input = new EditTextBoldCursor(ctx);
+        android.app.Activity act = getParentActivity();
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed()) return;
+        final Context appCtx = act.getApplicationContext();
+        final EditTextBoldCursor input = new EditTextBoldCursor(act);
         input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         input.setHint("Пароль для шифрования AES-256-GCM");
         input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
         input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
         input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
-        android.widget.FrameLayout container = new android.widget.FrameLayout(ctx);
+        android.widget.FrameLayout container = new android.widget.FrameLayout(act);
         int pad = AndroidUtilities.dp(16);
         container.setPadding(pad, pad / 2, pad, 0);
         container.addView(input);
 
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx, resourceProvider)
+        AlertDialog.Builder b = new AlertDialog.Builder(act, resourceProvider)
                 .setTitle(exportMode ? "Зашифровать настройки (AES-256)" : "Расшифровать бэкап (AES-256)")
                 .setView(container)
                 .setPositiveButton("OK", (d, w) -> {
                     String pass = input.getText().toString();
                     if (pass.isEmpty()) {
-                        Toast.makeText(ctx, "Введите пароль", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(appCtx, "Введите пароль", Toast.LENGTH_SHORT).show();
                         return;
                     }
-                    try {
-                        if (exportMode) {
-                            String enc = ColgramSettingsBackup.exportEncrypted(ctx, pass.toCharArray());
-                            AndroidUtilities.addToClipboard(enc);
-                            Toast.makeText(ctx, "Зашифрованный AES-256 бэкап скопирован", Toast.LENGTH_LONG).show();
-                        } else {
-                            int n = ColgramSettingsBackup.importAuto(ctx, clipboardPayload, pass.toCharArray());
-                            refreshSettings();
-                            Toast.makeText(ctx, "Расшифровано и применено: " + n, Toast.LENGTH_LONG).show();
+                    final char[] chars = pass.toCharArray();
+                    warpOperations.execute(() -> {
+                        try {
+                            if (exportMode) {
+                                String enc = ColgramSettingsBackup.exportEncrypted(appCtx, chars);
+                                uiHandler.post(() -> {
+                                    AndroidUtilities.addToClipboard(enc);
+                                    Toast.makeText(appCtx, "Зашифрованный AES-256 бэкап скопирован", Toast.LENGTH_LONG).show();
+                                });
+                            } else {
+                                int n = ColgramSettingsBackup.importAuto(appCtx, clipboardPayload, chars);
+                                uiHandler.post(() -> {
+                                    if (!isFinishing()) refreshSettings();
+                                    Toast.makeText(appCtx, "Расшифровано и применено: " + n, Toast.LENGTH_LONG).show();
+                                });
+                            }
+                        } catch (Throwable error) {
+                            uiHandler.post(() -> Toast.makeText(appCtx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show());
                         }
-                    } catch (Throwable error) {
-                        Toast.makeText(ctx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show();
-                    }
+                    });
                 })
                 .setNegativeButton("Отмена", null);
         showDialog(b.create());
     }
 
     private void showLiveWallpaperPicker() {
-        Context ctx = getParentActivity();
-        if (ctx == null) return;
+        android.app.Activity act = getParentActivity();
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
         String[] names = {
                 org.colgram.core.ColgramLiveWallpaper.styleLabel(org.colgram.core.ColgramLiveWallpaper.STYLE_OFF),
                 org.colgram.core.ColgramLiveWallpaper.styleLabel(org.colgram.core.ColgramLiveWallpaper.STYLE_AURORA),
@@ -818,14 +863,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                 org.colgram.core.ColgramLiveWallpaper.styleLabel(org.colgram.core.ColgramLiveWallpaper.STYLE_CONSTELLATION),
                 org.colgram.core.ColgramLiveWallpaper.styleLabel(org.colgram.core.ColgramLiveWallpaper.STYLE_COLA_FIZZ)
         };
-        new AlertDialog.Builder(ctx, resourceProvider)
+        showDialog(new AlertDialog.Builder(act, resourceProvider)
                 .setTitle("Живые обои чатов")
                 .setItems(names, (d, which) -> {
                     ColgramConfig.setLiveWallpaperStyle(which);
                     refreshSettings();
                     org.telegram.messenger.NotificationCenter.getGlobalInstance().postNotificationName(org.telegram.messenger.NotificationCenter.didSetNewWallpapper);
                 })
-                .show();
+                .create());
     }
 
     private void openBatteryAndAutostartSettings() {
@@ -860,17 +905,18 @@ public class ColgramSettingsActivity extends BaseFragment {
     }
 
     private void showPublicProxyNodes() {
-        if (getParentActivity() == null) return;
+        android.app.Activity act = getParentActivity();
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
         java.util.List<ColgramProxyManager.ProxyItem> nodes = ColgramProxyManager.getSelectableProxies();
         if (nodes.isEmpty()) {
-            new AlertDialog.Builder(getParentActivity()).setTitle("Публичные прокси")
+            showDialog(new AlertDialog.Builder(act, resourceProvider).setTitle("Публичные прокси")
                     .setMessage("В каталоге пока нет узлов с подтверждённым протоколом. Адрес сервера не подтверждает страну.")
                     .setPositiveButton("Проверить каталог", (d, w) -> {
                         Context context = getContext();
                         if (context != null) { cancelWarp(context); stopSubscriptionTunnel(context); }
                         ColgramProxyManager.selectPublicProxy(getContext());
                         refreshSettings();
-                    }).setNegativeButton("Отмена", null).show();
+                    }).setNegativeButton("Отмена", null).create());
             return;
         }
         String[] labels = new String[nodes.size()];
@@ -879,7 +925,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             String protocol = node.type == 0 ? "SOCKS5" : node.type == 1 ? "MTProto" : "WebSocket";
             labels[i] = protocol + " · " + node.address + ":" + node.port + " · " + node.pingMs + " мс";
         }
-        new AlertDialog.Builder(getParentActivity()).setTitle("Выбрать публичный узел")
+        showDialog(new AlertDialog.Builder(act, resourceProvider).setTitle("Выбрать публичный узел")
                 .setItems(labels, (d, which) -> {
                     Context context = getContext();
                     if (context == null) return;
@@ -889,7 +935,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                     ColgramProxyManager.selectUserProxy(context, node.address, node.port, node.secret,
                             node.type, node.user, node.password);
                     refreshSettings();
-                }).setNegativeButton("Отмена", null).show();
+                }).setNegativeButton("Отмена", null).create());
     }
 
     private void selectDirectConnection() {

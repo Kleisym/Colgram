@@ -320,14 +320,14 @@ public final class ColgramAiContextEngine {
             clean.add(t);
         }
         if (clean.isEmpty() || curIsGreeting) return null;
-        int from = Math.max(0, clean.size() - 6);
+        int from = Math.max(0, clean.size() - 4);
         int count = clean.size() - from;
         String[] pairs = new String[count * 2];
         for (int i = 0; i < count; i++) {
             ConversationTurn t = clean.get(from + i);
             pairs[i * 2] = t.userQuery;
             String a = t.assistantReply;
-            pairs[i * 2 + 1] = a.length() > 480 ? a.substring(0, 477) + "…" : a;
+            pairs[i * 2 + 1] = a.length() > 320 ? a.substring(0, 317) + "…" : a;
         }
         return pairs;
     }
@@ -355,8 +355,11 @@ public final class ColgramAiContextEngine {
     }
 
     /**
-     * Decides when Qwen3.5 should engage genuine internal chain-of-thought reasoning (<think>...</think>)
-     * for maximum intelligence on real questions while keeping greetings, reactions, drafts and song asks instant.
+     * Decides when Qwen3.5 should engage explicit chain-of-thought reasoning (<think>...</think>).
+     * Normal chat, everyday questions, coding, summaries, drafts, and greetings stay in instant
+     * Turbo mode (prefilled empty think block -> visible Russian tokens stream immediately!).
+     * Deep thinking activates ONLY when the user explicitly requests deep reasoning or formal proofs
+     * (or toggles Deep Thinking ON in Koliti Studio).
      */
     public static boolean shouldUseAdaptiveThinking(String query, IntentPlan plan, boolean hasMedia) {
         if (query == null || query.trim().isEmpty()) return false;
@@ -364,36 +367,18 @@ public final class ColgramAiContextEngine {
         if (plan != null && (plan.resolvedMode == AssistantMode.DRAFT || plan.resolvedMode == AssistantMode.ACTION)) {
             return false;
         }
-        if (plan != null && plan.resolvedMode == AssistantMode.PLUGIN) {
-            return true;
-        }
         String trimmed = query.trim();
         if (isCasualGreetingOrTopicReset(trimmed) || SHORT_REACTION_PATTERN.matcher(trimmed).matches()) {
             return false;
         }
         String l = trimmed.toLowerCase(Locale.ROOT);
-        if (ColgramAiWebSearch.looksLikeFinanceQuery(trimmed) && l.length() < 64) {
-            return false;
-        }
         if (containsAny(l, "анекдот", "шутк", "спой", "песн", "песенк")) {
             return false;
         }
-        if (containsAny(l,
-                "напиши код", "код на", "скрипт", "алгоритм", "функци", "класс ", "ошибк", "баг", "исправь",
-                "python", "java", "c++", "rust", "javascript", "typescript", "sql", "regex", "html", "css",
-                "реши", "докажи", "уравнен", "интеграл", "производн", "вероятност", "посчитай", "вычисли",
-                "задач", "логик", "сравни", "плюсы и минусы", "разниц", "почему", "зачем", "как работает",
-                "как устроен", "как сделать", "как настроить", "как починить", "как выбрать", "что лучше",
-                "что такое", "кто такой", "объясни", "разбери", "проанализ", "спланируй", "архитектур",
-                "пошагов", "помоги", "подскажи", "посоветуй", "стоит ли", "можно ли", "придумай", "составь",
-                "explain", "prove", "solve", "compare", "debug", "implement", "algorithm", "why ", "how ", "what is")) {
-            return true;
-        }
-        // Any genuine substantive question or multi-word prompt benefits hugely from crisp micro-CoT on Qwen3.5.
-        if (trimmed.contains("?") && l.length() >= 14) {
-            return true;
-        }
-        return l.length() >= 36;
+        return containsAny(l,
+                "подумай", "глубоко проанализ", "глубокий анализ", "глубоко разбер",
+                "докажи", "доказательств", "пошагово реши", "распиши по шагам",
+                "step by step", "think deeply", "deep reasoning", "chain of thought", "prove that");
     }
 
     private static boolean looksLikeOpenKnowledgeQuestion(String l, boolean hasActiveChat) {
@@ -562,13 +547,12 @@ public final class ColgramAiContextEngine {
         if (mode == AssistantMode.PLUGIN) {
             return "Ты — Koliti, опытный Python-архитектор плагинов Colgram.\n" + ColgramAiAgentTools.pluginAuthoringGuide();
         }
-        // Sharp, crystal-clear Russian/English high-IQ persona (static across modes for KV prefix reuse):
-        String base = "Ты — Koliti, очень умный, сообразительный и живой ИИ-друг в Colgram. "
-                + "Говори чисто, грамотно, по-человечески и строго на языке пользователя — без воды, канцелярита, обрывков фраз и чужих слов. "
-                + "Сначала давай чёткий и точный ответ по сути, затем — короткое понятное объяснение или шаги, если нужно. "
-                + "В задачах, логике, коде и расчётах тщательно проверяй каждый шаг; если данных из сети нет и факт неточный — честно скажи, не выдумывай. "
-                + "Математические формулы пиши в LaTeX ($...$). "
-                + "Если просят черновик сообщения — верни ТОЛЬКО готовый текст для отправки.";
+        // Crisp, ultra-compact persona (~85 tokens, static across modes for instant KV+SSM prefix reuse):
+        String base = "Ты — Koliti, умный и живой ИИ-ассистент в Colgram. "
+                + "Отвечай грамотно, кратко и по сути на языке пользователя, без воды. "
+                + "В коде и расчётах будь точен; не выдумывай неизвестные факты. "
+                + "Формулы пиши в LaTeX ($...$). "
+                + "Для черновика сообщения верни ТОЛЬКО готовый текст.";
         if (!includeToolGuide) {
             return base;
         }
@@ -929,7 +913,12 @@ public final class ColgramAiContextEngine {
      */
     public static String stripThinkingTags(String raw, boolean keepThinking, boolean promptOpenedThink) {
         if (raw == null || raw.isEmpty()) return "";
-        String lower = raw.toLowerCase(Locale.ROOT);
+        String sanitized = raw
+                .replace("<|im_end|>", "")
+                .replace("<|im_start|>", "")
+                .replace("<|endoftext|>", "")
+                .replace("<|eot_id|>", "");
+        String lower = sanitized.toLowerCase(Locale.ROOT);
         int openIdx = lower.indexOf("<think>");
         int lastCloseIdx = lower.lastIndexOf("</think>");
         boolean implicitThink = promptOpenedThink || (lastCloseIdx >= 0 && (openIdx < 0 || lastCloseIdx < openIdx));
@@ -939,16 +928,17 @@ public final class ColgramAiContextEngine {
                 if (!keepThinking) {
                     return "";
                 }
-                String body = raw.replaceFirst("(?is)^\\s*<think>\\s*", "").trim();
+                String body = sanitized.replaceFirst("(?is)^\\s*<think>\\s*", "").trim();
                 return body.isEmpty() ? "" : ("Мысли:\n" + body);
             }
-            String thinkPart = raw.substring(0, lastCloseIdx)
+            String thinkPart = sanitized.substring(0, lastCloseIdx)
                     .replaceFirst("(?is)^\\s*<think>\\s*", "")
                     .replaceAll("(?is)</?think>", "")
                     .trim();
-            String answerPart = raw.substring(lastCloseIdx + "</think>".length());
+            String answerPart = sanitized.substring(lastCloseIdx + "</think>".length());
             answerPart = THINK_BLOCK.matcher(answerPart).replaceAll("");
-            answerPart = THINK_UNCLOSED.matcher(answerPart).replaceAll("").trim();
+            answerPart = THINK_UNCLOSED.matcher(answerPart).replaceAll("")
+                    .replaceAll("(?is)</?think>", "").trim();
             if (!keepThinking) {
                 return answerPart;
             }
@@ -958,10 +948,11 @@ public final class ColgramAiContextEngine {
         }
 
         if (keepThinking) {
-            return raw.replace("<think>", "Мысли:\n").replace("</think>", "\n\n---\n").trim();
+            return sanitized.replace("<think>", "Мысли:\n").replace("</think>", "\n\n---\n").trim();
         }
-        String cleaned = THINK_BLOCK.matcher(raw).replaceAll("");
+        String cleaned = THINK_BLOCK.matcher(sanitized).replaceAll("");
         cleaned = THINK_UNCLOSED.matcher(cleaned).replaceAll("");
+        cleaned = cleaned.replaceAll("(?is)</?think>", "");
         return cleaned.trim();
     }
 

@@ -228,15 +228,15 @@ public class ColgramProxyManager {
 
     // Background-priority bounded pools so proxy scanning NEVER preempts Android's UI/RenderThread.
     private static final ExecutorService executor = newBgPool(8, "colgram-proxy");
-    /** Feed downloads are independent; serialize only parsing into the shared proxy pool. */
-    private static final ExecutorService sourceFetchers = newBgPool(10, "colgram-feed");
+    /** Feed downloads are independent; keep enough concurrency so 46+ feeds don't queue behind slow hosts. */
+    private static final ExecutorService sourceFetchers = newBgPool(24, "colgram-feed");
     // Separate from the background pool: a large relay sweep must not starve a user selection.
     private static final int SELECTION_TCP_PARALLEL = 24;
     private static final ExecutorService selectionTcpWorkers = newBgPool(SELECTION_TCP_PARALLEL, "colgram-tcp");
     private static final java.util.concurrent.Semaphore selectionTcpSlots =
             new java.util.concurrent.Semaphore(SELECTION_TCP_PARALLEL);
-    private static final long SOURCE_BATCH_TIMEOUT_MS = 22_000L;
-    private static final int SOURCE_IO_TIMEOUT_MS = 6_500;
+    private static final long SOURCE_BATCH_TIMEOUT_MS = 10_000L;
+    private static final int SOURCE_IO_TIMEOUT_MS = 4_500;
     private static final int SOURCE_MAX_BYTES = 1024 * 1024;
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(() -> {
@@ -329,8 +329,14 @@ public class ColgramProxyManager {
         "https://gcore.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
         "https://gcore.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
         "https://gcore.jsdelivr.net/gh/hookzof/socks5_list@master/proxy.txt",
+        "https://gcore.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/socks5.txt",
+        "https://gcore.jsdelivr.net/gh/Zaeem20/FREE_PROXIES_LIST@master/socks5.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
+        "https://www.proxy-list.download/api/v1/get?type=socks5",
         "https://fastly.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
         "https://fastly.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
+        "https://fastly.jsdelivr.net/gh/hookzof/socks5_list@master/proxy.txt",
         "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt",
         "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
         "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.txt",
@@ -339,7 +345,6 @@ public class ColgramProxyManager {
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
         "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt",
         "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
         "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
@@ -387,7 +392,7 @@ public class ColgramProxyManager {
      * takes to reach a feed whose entries answer.
      */
     private static final int MAX_STARTUP_SOCKS_FEEDS = 6;
-    private static final int MAX_STARTUP_RELAY_FEEDS = 2;
+    private static final int MAX_STARTUP_RELAY_FEEDS = 4;
 
     /** Separate budgets stop generic SOCKS lists from evicting every MTProto candidate. */
     // Bounded per-feed sampling keeps a much wider source set without turning one giant list
@@ -416,6 +421,14 @@ public class ColgramProxyManager {
     private static volatile boolean stockRotationPausedByColgram = false;
     /** Entries verified alive and kept across restarts. */
     private static final int MAX_REMEMBERED_ALIVE = 64;
+    /** Maximum freshly-verified working SOCKS5/HTTP relays persisted for strict-L3 LTE fallback. */
+    private static final int MAX_REMEMBERED_RELAYS = 40;
+    private static final Object periodicTasksLock = new Object();
+    private static java.util.concurrent.ScheduledFuture<?> localRouteWatchTask;
+    private static java.util.concurrent.ScheduledFuture<?> poolSweepTask;
+    private static java.util.concurrent.ScheduledFuture<?> healthCheckTask;
+    private static java.util.concurrent.ScheduledFuture<?> watchdogTask;
+    private static java.util.concurrent.ScheduledFuture<?> feedRefreshTask;
 
     /**
      * Main entry point — called from ColgramHookHandler.init() on app startup.
@@ -437,13 +450,7 @@ public class ColgramProxyManager {
             ColgramDpiBypass.startImmediately();
             mainHandler.post(() -> ensureLocalBaseRoute(appContext));
         });
-        scheduler.scheduleWithFixedDelay(() -> {
-            if (!ColgramUiBridge.isAppInForeground()) return;
-            if (!ColgramDpiBypass.wasExplicitlyStopped() && (!ColgramDpiBypass.isBound() || currentActiveProxy == null)) {
-                ColgramDpiBypass.startImmediately();
-                mainHandler.post(() -> ensureLocalBaseRoute(appContext));
-            }
-        }, 12, 12, TimeUnit.SECONDS);
+        ensureLocalWatchSchedulerRunning();
 
         // Everything below touches sockets: binding the local DPI listener,
         // probing proxies over TCP, and flipping Telegram's proxy settings (which
@@ -672,98 +679,104 @@ public class ColgramProxyManager {
                 Log.e(TAG, "Initial proxy fetch error", t);
             }
         });
+        ensurePeriodicSchedulersRunning();
+    }
 
-        // Reachability on a filtered network changes on the scale of minutes, and a stale "alive"
-        // is exactly why a chosen proxy silently stops working. Re-sweep every 5 minutes; the
-        // sweep is 24 parallel 1.2 s connects, so the whole pool costs a couple of seconds.
-        scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                // Skip background proxy pool sweeps while app is not in foreground or battery is low
-                // so radio & CPU stay asleep in pocket while Telegram push/sync remains alive.
-                if (!ColgramUiBridge.isAppInForeground()
-                        || ColgramPowerGuard.shouldThrottle(appContext)
-                        || !backgroundRelayOrProxyWorkNeeded(false)) {
-                    return;
-                }
-                if (ColgramConfig.isBuiltinProxyEnabled()) sweepFast(null);
-            } catch (Throwable t) {
-                Log.w(TAG, "periodic sweep failed", t);
-            }
-        }, 60000, 300000, java.util.concurrent.TimeUnit.MILLISECONDS);
-
-        // 5. Periodic health check every 30 seconds (was 5 minutes)
-        //
-        // The local DPI bypass used to be EXCLUDED here, on the assumption that it is
-        // in-process and therefore always alive. It is not: the listener binds on a deferred
-        // thread and can fail to bind at all, and once that happens nothing retries it —
-        // Telegram sits on a dead 127.0.0.1:9876 with the toggle showing "Недоступен" and
-        // the user has no way back except toggling the proxy off and on.
-        //
-        // 5 minutes was also far too slow to notice. 30s keeps the cost trivial (a single
-        // loopback connect) while making recovery actually feel automatic.
-        scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                if (!ColgramConfig.isBuiltinProxyEnabled()) return;
-                if (!ColgramUiBridge.isAppInForeground()) return;
-                ProxyItem active = currentActiveProxy;
-
-                if (active != null && active.isLocalDpi()) {
-                    if (isTelegramConnected() && ColgramDpiBypass.isBound()) return;
-                    // Probe the loopback listener for real. isBound() alone is not enough:
-                    // it is a flag set at bind time and never cleared if the socket later
-                    // dies (e.g. the accept loop throws and exits), so a stale `true` would
-                    // hide exactly the failure this check exists to catch.
-                    int ping = testProxy(active.address, active.port, 3000);
-                    if (ping < 0 || !ColgramDpiBypass.isBound()) {
-                        Log.w(TAG, "local DPI listener unhealthy (ping=" + ping
-                                + ", bound=" + ColgramDpiBypass.isBound() + "); attempting recovery");
-                        if (ColgramDpiBypass.restartIfDeadAndWait(5000)) {
-                            localRouteUnavailableUntil = 0L;
-                            mainHandler.post(() -> ensureLocalBaseRoute(appContext));
-                        } else {
-                            Log.e(TAG, "local DPI listener still not bound after recovery");
-                        }
+    private static void ensureLocalWatchSchedulerRunning() {
+        synchronized (periodicTasksLock) {
+            if (localRouteWatchTask == null || localRouteWatchTask.isCancelled() || localRouteWatchTask.isDone()) {
+                localRouteWatchTask = scheduler.scheduleWithFixedDelay(() -> {
+                    // Event-driven 127.0.0.1:9876 bypass stays alive 24/7 (even in background);
+                    // when already bound this 30s passive check returns immediately at 0% CPU.
+                    if (!ColgramDpiBypass.wasExplicitlyStopped()
+                            && (!ColgramDpiBypass.isBound()
+                                || (ColgramUiBridge.isAppInForeground() && currentActiveProxy == null))) {
+                        ColgramDpiBypass.startImmediately();
+                        mainHandler.post(() -> ensureLocalBaseRoute(appContext));
                     }
-                    return;
-                }
-
-                // A REMOTE proxy is not checked here any more. The prober already re-verifies
-                // every entry - including the applied one - inside a two-minute window and
-                // rotates on its verdict, and running a second handshake against the same node
-                // from two timers is what made live proxies answer "dead".
-            } catch (Throwable ignored) {}
-        }, 30, 30, TimeUnit.SECONDS);
-
-        // 5b. The connection watchdog: an applied proxy that stopped carrying traffic.
-        //
-        // Fresh verdicts fix rotation for a node that is measurably dead. They do not fix the two
-        // cases that actually keep the header reading "Соединение...": the node still answers TCP
-        // but no longer tunnels, and tgnet sitting on a socket it already gave up on. So look at
-        // what Telegram's own connection state says, and act on it.
-        scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                connectionWatchdogTick();
-            } catch (Throwable t) {
-                Log.w(TAG, "connection watchdog: " + t);
+                }, 30, 30, TimeUnit.SECONDS);
             }
-        }, 15, 10, TimeUnit.SECONDS);
+        }
+    }
 
-        // 6. Refresh public proxy feeds and their native reachability verdicts.
-        // This can fan out to several remote hosts, so do not wake the radio for feed traffic
-        // while the phone is both unplugged and below the low-battery threshold. The 20-minute
-        // scheduler still checks the battery state and resumes after charging / recovery.
-        scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                if (!ColgramUiBridge.isAppInForeground()
-                        || ColgramPowerGuard.shouldThrottle(appContext)
-                        || !backgroundRelayOrProxyWorkNeeded(false)) {
-                    return;
-                }
-                fetchAndVerifyAllSources();
-            } catch (Throwable t) {
-                Log.w(TAG, "periodic proxy feed refresh failed", t);
+    private static void ensurePeriodicSchedulersRunning() {
+        if (!ColgramUiBridge.isAppInForeground()) return;
+        synchronized (periodicTasksLock) {
+            if (poolSweepTask == null || poolSweepTask.isCancelled() || poolSweepTask.isDone()) {
+                poolSweepTask = scheduler.scheduleWithFixedDelay(() -> {
+                    try {
+                        if (!ColgramUiBridge.isAppInForeground()
+                                || ColgramPowerGuard.shouldThrottle(appContext)
+                                || !backgroundRelayOrProxyWorkNeeded(false)) {
+                            return;
+                        }
+                        if (ColgramConfig.isBuiltinProxyEnabled()) sweepFast(null);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "periodic sweep failed", t);
+                    }
+                }, 60000, 300000, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
-        }, 20, 20, TimeUnit.MINUTES);
+            if (healthCheckTask == null || healthCheckTask.isCancelled() || healthCheckTask.isDone()) {
+                healthCheckTask = scheduler.scheduleWithFixedDelay(() -> {
+                    try {
+                        if (!ColgramConfig.isBuiltinProxyEnabled()) return;
+                        if (!ColgramUiBridge.isAppInForeground()) return;
+                        ProxyItem active = currentActiveProxy;
+                        if (active != null && active.isLocalDpi()) {
+                            if (isTelegramConnected() && ColgramDpiBypass.isBound()) return;
+                            int ping = testProxy(active.address, active.port, 3000);
+                            if (ping < 0 || !ColgramDpiBypass.isBound()) {
+                                Log.w(TAG, "local DPI listener unhealthy (ping=" + ping
+                                        + ", bound=" + ColgramDpiBypass.isBound() + "); attempting recovery");
+                                if (ColgramDpiBypass.restartIfDeadAndWait(5000)) {
+                                    localRouteUnavailableUntil = 0L;
+                                    mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+                                } else {
+                                    Log.e(TAG, "local DPI listener still not bound after recovery");
+                                }
+                            }
+                            return;
+                        }
+                    } catch (Throwable ignored) {}
+                }, 30, 30, TimeUnit.SECONDS);
+            }
+            if (watchdogTask == null || watchdogTask.isCancelled() || watchdogTask.isDone()) {
+                watchdogTask = scheduler.scheduleWithFixedDelay(() -> {
+                    try {
+                        connectionWatchdogTick();
+                    } catch (Throwable t) {
+                        Log.w(TAG, "connection watchdog: " + t);
+                    }
+                }, 15, 10, TimeUnit.SECONDS);
+            }
+            if (feedRefreshTask == null || feedRefreshTask.isCancelled() || feedRefreshTask.isDone()) {
+                feedRefreshTask = scheduler.scheduleWithFixedDelay(() -> {
+                    try {
+                        if (!ColgramUiBridge.isAppInForeground()
+                                || ColgramPowerGuard.shouldThrottle(appContext)
+                                || !backgroundRelayOrProxyWorkNeeded(false)) {
+                            return;
+                        }
+                        fetchAndVerifyAllSources();
+                    } catch (Throwable t) {
+                        Log.w(TAG, "periodic proxy feed refresh failed", t);
+                    }
+                }, 20, 20, TimeUnit.MINUTES);
+            }
+        }
+    }
+
+    private static void stopBackgroundFeedScraping() {
+        synchronized (periodicTasksLock) {
+            java.util.concurrent.ScheduledFuture<?>[] tasks = {
+                poolSweepTask, feedRefreshTask
+            };
+            for (java.util.concurrent.ScheduledFuture<?> t : tasks) {
+                if (t != null) t.cancel(false);
+            }
+            poolSweepTask = null;
+            feedRefreshTask = null;
+        }
     }
 
     /** tgnet's ConnectionStateConnected, from org.telegram.tgnet.ConnectionsManager. */
@@ -1229,6 +1242,11 @@ public class ColgramProxyManager {
         if (appContext == null || !ColgramConfig.isBuiltinProxyEnabled() || isProxySelectionPending()) return;
         if (getSelectableProxies().size() >= 12) return;
         lastHealthyCatalogCheckAtMs = 0L;
+        manualCatalogScanRequested = true;
+        if (verifiedPool.isEmpty() || lastSourceFetchAt == 0L) {
+            executor.execute(() -> fetchAndVerifyAllSources(true));
+        }
+        startProber();
         if (backgroundProxySelection == null) {
             scheduleBackgroundProxyCheck(0L);
         }
@@ -1406,7 +1424,7 @@ public class ColgramProxyManager {
      * <p>Widened rather than replaced -- the checker is still serial underneath, so raising this
      * queues more requests at once instead of leaving the machine idle on one timeout.
      */
-    private static final int FAST_NATIVE_PARALLEL = 5;
+    private static final int FAST_NATIVE_PARALLEL = 16;
     private static final AtomicBoolean fastNativeRunning = new AtomicBoolean(false);
     private static int fastNativeInFlight;
 
@@ -2147,7 +2165,78 @@ public class ColgramProxyManager {
         });
     }
 
-    /** Persist reachable SOCKS5/HTTP relays so Wi-Fi -> strict-L3 LTE transitions keep warm relays. */
+    private static final AtomicBoolean prewarmingWifiRelays = new AtomicBoolean(false);
+
+    private static int countRememberedRelays() {
+        int n = 0;
+        synchronized (relayPool) {
+            for (ColgramProxyChain.Relay r : relayPool) {
+                if (r != null && !r.dead && r.rttMs >= 0) n++;
+            }
+        }
+        synchronized (verifiedPool) {
+            for (ProxyItem p : verifiedPool) {
+                if (p != null && p.type == 0 && p.port > 0 && !p.isLocalDpi()
+                        && !isInternalLoopbackEndpoint(p) && p.chainRelay == null
+                        && (p.socksConnectOk || p.socksGreetedOk || (p.isAvailable && p.pingMs > 0))) {
+                    n++;
+                }
+            }
+        }
+        return n;
+    }
+
+    /** Proactively probes & persists up to MAX_REMEMBERED_RELAYS (40) working SOCKS5 relays while on Wi-Fi. */
+    private static void prewarmWifiSocksRelaysAsync() {
+        if (ColgramDpiBypass.isStrictL3WhitelistDetected() || !ColgramUiBridge.isAppInForeground()) return;
+        if (countRememberedRelays() >= MAX_REMEMBERED_RELAYS) return;
+        if (!prewarmingWifiRelays.compareAndSet(false, true)) return;
+        executor.execute(() -> {
+            try {
+                final List<ProxyItem> candidates = new ArrayList<>();
+                synchronized (verifiedPool) {
+                    for (ProxyItem p : verifiedPool) {
+                        if (p == null || p.type != 0 || p.port <= 0 || p.isLocalDpi()
+                                || isInternalLoopbackEndpoint(p) || p.chainRelay != null) continue;
+                        if (p.socksConnectOk || p.socksGreetedOk || p.pingMs == -2 || p.tcpMs == -2) continue;
+                        if (isRelayDead(p.address, p.port)) continue;
+                        candidates.add(p);
+                        if (candidates.size() >= 48) break;
+                    }
+                }
+                if (candidates.isEmpty()) return;
+                final java.util.concurrent.atomic.AtomicInteger remaining =
+                        new java.util.concurrent.atomic.AtomicInteger(candidates.size());
+                final CountDownLatch done = new CountDownLatch(1);
+                for (final ProxyItem item : candidates) {
+                    selectionTcpWorkers.execute(() -> {
+                        try {
+                            if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+                                SelectionTcpResult res = probePublicCandidateTcp(item);
+                                if (res != null && (res.greeted || res.ready)) {
+                                    item.catalogPinnedAddress = res.address;
+                                    item.tcpMs = res.rtt;
+                                    item.tcpCheckedAt = SystemClock.elapsedRealtime();
+                                    item.socksGreetedOk = res.greeted;
+                                    item.socksConnectOk = res.ready;
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        } finally {
+                            if (remaining.decrementAndGet() == 0) done.countDown();
+                        }
+                    });
+                }
+                done.await(9_000L, TimeUnit.MILLISECONDS);
+                rememberRelays();
+            } catch (Throwable ignored) {
+            } finally {
+                prewarmingWifiRelays.set(false);
+            }
+        });
+    }
+
+    /** Persist up to 40 reachable SOCKS5/HTTP relays so Wi-Fi -> strict-L3 LTE transitions keep warm relays. */
     private static void rememberRelays() {
         final Context ctx = appContext;
         if (ctx == null) return;
@@ -2156,28 +2245,35 @@ public class ColgramProxyManager {
             rememberRelaysQueued.set(false);
             try {
                 java.util.LinkedHashMap<String, String> lines = new java.util.LinkedHashMap<>();
+                final List<ColgramProxyChain.Relay> relaySnap;
                 synchronized (relayPool) {
-                    for (ColgramProxyChain.Relay r : relayPool) {
-                        if (r == null || r.dead || r.rttMs < 0 || r.host == null || r.host.isEmpty() || r.port <= 0) {
-                            continue;
-                        }
-                        if (isRelayDead(r.host, r.port)) continue;
-                        String k = (r.socks ? "S|" : "H|") + r.host + "|" + r.port;
-                        lines.putIfAbsent(k, k + "|" + r.rttMs);
-                        if (lines.size() >= MAX_REMEMBERED_ALIVE) break;
-                    }
+                    relaySnap = new ArrayList<>(relayPool);
                 }
-                if (lines.size() < MAX_REMEMBERED_ALIVE) {
+                relaySnap.sort((a, b) -> Integer.compare(
+                        a != null && a.rttMs >= 0 ? a.rttMs : Integer.MAX_VALUE,
+                        b != null && b.rttMs >= 0 ? b.rttMs : Integer.MAX_VALUE));
+                for (ColgramProxyChain.Relay r : relaySnap) {
+                    if (r == null || r.dead || r.rttMs < 0 || r.host == null || r.host.isEmpty() || r.port <= 0) {
+                        continue;
+                    }
+                    if (isRelayDead(r.host, r.port)) continue;
+                    String k = (r.socks ? "S|" : "H|") + r.host + "|" + r.port;
+                    lines.putIfAbsent(k, k + "|" + r.rttMs + "|1|1");
+                    if (lines.size() >= MAX_REMEMBERED_RELAYS) break;
+                }
+                if (lines.size() < MAX_REMEMBERED_RELAYS) {
                     List<ProxyItem> snap;
                     synchronized (verifiedPool) {
                         snap = new ArrayList<>(verifiedPool);
                     }
                     snap.sort((a, b) -> {
-                        int ra = (a.socksConnectOk ? 0 : a.socksGreetedOk ? 1 : a.isAvailable ? 2 : 3);
-                        int rb = (b.socksConnectOk ? 0 : b.socksGreetedOk ? 1 : b.isAvailable ? 2 : 3);
+                        int ra = ((a.isAvailable && a.pingMs > 0) || a.socksConnectOk) ? 0
+                                : (a.socksGreetedOk ? 1 : (a.isAvailable ? 2 : 3));
+                        int rb = ((b.isAvailable && b.pingMs > 0) || b.socksConnectOk) ? 0
+                                : (b.socksGreetedOk ? 1 : (b.isAvailable ? 2 : 3));
                         if (ra != rb) return Integer.compare(ra, rb);
-                        int ta = a.tcpMs >= 0 ? a.tcpMs : Integer.MAX_VALUE;
-                        int tb = b.tcpMs >= 0 ? b.tcpMs : Integer.MAX_VALUE;
+                        int ta = a.tcpMs >= 0 ? a.tcpMs : (a.pingMs > 0 ? a.pingMs : Integer.MAX_VALUE);
+                        int tb = b.tcpMs >= 0 ? b.tcpMs : (b.pingMs > 0 ? b.pingMs : Integer.MAX_VALUE);
                         return Integer.compare(ta, tb);
                     });
                     for (ProxyItem p : snap) {
@@ -2188,9 +2284,11 @@ public class ColgramProxyManager {
                                 ? p.catalogPinnedAddress : p.address;
                         if (host == null || host.isEmpty() || isRelayDead(host, p.port)) continue;
                         int rtt = p.tcpMs >= 0 ? p.tcpMs : (p.pingMs > 0 ? p.pingMs : 500);
+                        String connectFlag = (p.socksConnectOk || (p.isAvailable && p.pingMs > 0)) ? "1" : "0";
+                        String greetFlag = (p.socksGreetedOk || p.socksConnectOk || p.isAvailable) ? "1" : "0";
                         String k = "S|" + host + "|" + p.port;
-                        lines.putIfAbsent(k, k + "|" + rtt);
-                        if (lines.size() >= MAX_REMEMBERED_ALIVE) break;
+                        lines.putIfAbsent(k, k + "|" + rtt + "|" + connectFlag + "|" + greetFlag);
+                        if (lines.size() >= MAX_REMEMBERED_RELAYS) break;
                     }
                 }
                 if (!lines.isEmpty()) {
@@ -2214,24 +2312,46 @@ public class ColgramProxyManager {
             String relayBlob = prefs.getString(KEY_REMEMBERED_RELAYS, "");
             if (relayBlob != null && !relayBlob.isEmpty()) {
                 long staleBefore = SystemClock.elapsedRealtime() - REMEMBERED_VALID_MS;
+                int loadedRelays = 0;
                 for (String line : relayBlob.split("\n")) {
-                    String[] parts = line.split("\\|", 4);
+                    if (loadedRelays >= MAX_REMEMBERED_RELAYS) break;
+                    String[] parts = line.split("\\|", 6);
                     if (parts.length < 3) continue;
                     try {
                         boolean socks = "S".equals(parts[0]);
                         String host = parts[1];
                         int port = Integer.parseInt(parts[2]);
-                        int rtt = parts.length == 4 ? Integer.parseInt(parts[3]) : -1;
+                        int rtt = parts.length >= 4 ? Integer.parseInt(parts[3]) : -1;
+                        boolean connectOk = parts.length >= 5
+                                ? "1".equals(parts[4])
+                                : (rtt >= 0);
+                        boolean greetedOk = parts.length >= 6
+                                ? "1".equals(parts[5])
+                                : (connectOk || rtt >= 0);
                         if (host == null || host.isEmpty() || port <= 0) continue;
+                        loadedRelays++;
                         if (socks) {
                             ProxyItem p = new ProxyItem(host, port, "", 0);
                             p.tcpMs = rtt;
+                            p.catalogPinnedAddress = host;
+                            p.socksConnectOk = connectOk;
+                            p.socksGreetedOk = greetedOk;
                             p.isAvailable = false;
                             p.lastCheckAt = staleBefore;
                             addCandidate(p);
+                            if (rtt >= 0) {
+                                ColgramProxyChain.Relay relay = new ColgramProxyChain.Relay(host, port, true, "", "");
+                                relay.rttMs = connectOk ? rtt : (rtt + TIER2_RELAY_RTT_OFFSET_MS);
+                                relay.dead = false;
+                                synchronized (relayPool) {
+                                    if (relayPool.size() < MAX_RELAYS && !relayPool.contains(relay)) {
+                                        relayPool.add(relay);
+                                    }
+                                }
+                            }
                         } else {
                             ColgramProxyChain.Relay relay = new ColgramProxyChain.Relay(host, port, false, "", "");
-                            relay.rttMs = -1;
+                            relay.rttMs = rtt;
                             relay.dead = false;
                             synchronized (relayPool) {
                                 if (relayPool.size() < MAX_RELAYS && !relayPool.contains(relay)) {
@@ -2948,6 +3068,25 @@ public static void reportProxyFailure() {
 
     private interface SourceParser { int parse(String sourceUrl, String body, int limit); }
 
+    private static final AtomicBoolean feedReadyNotifyQueued = new AtomicBoolean(false);
+
+    private static void runFeedReadyNotify() {
+        feedReadyNotifyQueued.set(false);
+        publishPoolToStock();
+        ProxySelection sel = proxySelection;
+        if (sel != null) proxySelectionTick(sel);
+        ProxySelection bg = backgroundProxySelection;
+        if (bg != null) backgroundProxyTick(bg);
+        if (ColgramConfig.isBuiltinProxyEnabled()) startProber();
+    }
+
+    private static void notifyFeedCandidatesReady() {
+        if (mainHandler == null) return;
+        if (feedReadyNotifyQueued.compareAndSet(false, true)) {
+            mainHandler.postDelayed(ColgramProxyManager::runFeedReadyNotify, 120L);
+        }
+    }
+
     private static Runnable feedTask(SourceBatch batch, String url, int limit, SourceParser parser) {
         return () -> {
             try {
@@ -2955,7 +3094,10 @@ public static void reportProxyFailure() {
                 if (Thread.currentThread().isInterrupted()) return;
                 batch.available.incrementAndGet();
                 int count = parser.parse(url, body, limit);
-                if (count > 0) batch.parsed.incrementAndGet();
+                if (count > 0) {
+                    batch.parsed.incrementAndGet();
+                    notifyFeedCandidatesReady();
+                }
                 batch.outcomes.put(url, count > 0 ? "OK · кандидатов " + count : "EMPTY_OR_UNSUPPORTED_FORMAT");
                 Log.i(TAG, "PROXY_SOURCE " + url + " parsed=" + count);
             } catch (IOException failure) {
@@ -3410,22 +3552,9 @@ public static void reportProxyFailure() {
         if (!"https".equals(url.getProtocol()) || url.getUserInfo() != null) {
             throw new IOException("expected an HTTPS source");
         }
-        try {
-            return httpGetOnce(url, java.net.Proxy.NO_PROXY, true, 8_500);
-        } catch (IOException firstFailure) {
-            try {
-                return httpGetOnce(url, java.net.Proxy.NO_PROXY, false, 7_000);
-            } catch (IOException ignoredPlain) {
-            }
-            if (ColgramDpiBypass.isBound()) {
-                try {
-                    java.net.Proxy localDpi = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
-                            new InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort()));
-                    return httpGetOnce(url, localDpi, false, 15_000);
-                } catch (IOException ignored) {
-                    // Fall through to relay fallback or report original failure.
-                }
-            }
+        boolean strictL3 = ColgramDpiBypass.isStrictL3WhitelistDetected();
+        IOException firstFailure = null;
+        if (strictL3) {
             List<ColgramProxyChain.Relay> relays = getReachableRelays();
             int triedRelays = 0;
             for (ColgramProxyChain.Relay relay : relays) {
@@ -3435,13 +3564,220 @@ public static void reportProxyFailure() {
                     java.net.Proxy relayProxy = new java.net.Proxy(
                             relay.socks ? java.net.Proxy.Type.SOCKS : java.net.Proxy.Type.HTTP,
                             new InetSocketAddress(relay.host, relay.port));
-                    return httpGetOnce(url, relayProxy, false, 10_000);
+                    return httpGetOnce(url, relayProxy, false, 5_500);
                 } catch (IOException ignoredRelay) {
+                    if (firstFailure == null) firstFailure = ignoredRelay;
                 }
-                if (++triedRelays >= 2) break;
+                if (++triedRelays >= 3) break;
+            }
+        }
+        try {
+            String desyncBody = httpGetViaNativeMultiSplit(url, 5_000);
+            if (desyncBody != null) return desyncBody;
+        } catch (IOException desyncErr) {
+            if (firstFailure == null) firstFailure = desyncErr;
+        }
+        try {
+            return httpGetOnce(url, java.net.Proxy.NO_PROXY, true, strictL3 ? 5_000 : 6_000);
+        } catch (IOException directErr) {
+            if (firstFailure == null) firstFailure = directErr;
+            if (!strictL3 && ColgramDpiBypass.isBound()) {
+                try {
+                    java.net.Proxy localDpi = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                            new InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort()));
+                    return httpGetOnce(url, localDpi, false, 6_500);
+                } catch (IOException ignored) {
+                }
+            }
+            if (!strictL3) {
+                List<ColgramProxyChain.Relay> relays = getReachableRelays();
+                int triedRelays = 0;
+                for (ColgramProxyChain.Relay relay : relays) {
+                    if (relay == null || relay.dead || relay.port <= 0) continue;
+                    if (relay.username != null && !relay.username.isEmpty()) continue;
+                    try {
+                        java.net.Proxy relayProxy = new java.net.Proxy(
+                                relay.socks ? java.net.Proxy.Type.SOCKS : java.net.Proxy.Type.HTTP,
+                                new InetSocketAddress(relay.host, relay.port));
+                        return httpGetOnce(url, relayProxy, false, 6_000);
+                    } catch (IOException ignoredRelay) {
+                    }
+                    if (++triedRelays >= 2) break;
+                }
             }
             throw firstFailure;
         }
+    }
+
+    /**
+     * Native {@code MODE_MULTI_SPLIT_SNI} + DoH IP fetch so packet-level SNI split bypasses
+     * OkHttp's plain-socket limitation ({@code createSocket(Socket, ...)} never opens {@code NativeSocket}).
+     */
+    private static String httpGetViaNativeMultiSplit(java.net.URL url, int budgetMs) throws IOException {
+        final String host = url.getHost();
+        if (host == null || host.isEmpty()) return null;
+        final int port = url.getPort() > 0 ? url.getPort() : 443;
+        final String file = (url.getFile() == null || url.getFile().isEmpty()) ? "/" : url.getFile();
+        java.net.InetAddress[] addrs = ColgramConfig.isDohEnabled()
+                ? ColgramDohResolver.resolveWithIpv6(host)
+                : ColgramDohResolver.resolveOrSystem(host);
+        if ((addrs == null || addrs.length == 0) && ColgramConfig.isDohEnabled()) {
+            addrs = ColgramDohResolver.resolveOrSystem(host);
+        }
+        if (addrs == null || addrs.length == 0) return null;
+
+        final boolean allowV6 = ColgramDohResolver.hasGlobalRoutableIpv6() || ColgramConfig.isIpv6BypassEnabled();
+        final boolean nativeAvailable = ColgramNativeDesync.isAvailable();
+        android.net.VpnService sysVpn = ColgramDpiBypass.activeSystemDpiVpn();
+        ColgramNativeDesync.FdProtector fdProt = sysVpn != null ? sysVpn::protect : null;
+        ColgramDohResolver.SocketProtector sockProt = sysVpn != null ? sysVpn::protect : null;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(4_000, budgetMs));
+        IOException lastErr = null;
+        int triedIps = 0;
+        for (java.net.InetAddress addr : addrs) {
+            if (addr == null) continue;
+            if (addr instanceof java.net.Inet6Address && !allowV6) continue;
+            if (triedIps++ >= 3) break;
+            String ip = addr.getHostAddress();
+            int remainingMs = (int) Math.max(1_500L, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+            if (remainingMs <= 1_500 && triedIps > 1) break;
+            String[] sniTrials = (triedIps == 1) ? new String[]{host, "vk.com"} : new String[]{host};
+            for (String sni : sniTrials) {
+                int stepRemMs = (int) Math.max(1_400L, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+                javax.net.ssl.SSLSocket ssl = null;
+                Socket base = null;
+                try {
+                    if (nativeAvailable) {
+                        ColgramNativeDesync.NativeSocket ns = ColgramNativeDesync.connect(
+                                ip, port, Math.min(stepRemMs, 3_000), 0, 0, fdProt);
+                        base = ColgramNativeDesync.wrapForFirstTlsHello(
+                                ns, ColgramNativeDesync.MODE_MULTI_SPLIT_SNI, 0,
+                                true, true, ColgramDpiBypass.isCellularNetwork(), 0);
+                        javax.net.ssl.SSLSocketFactory sf = ColgramNativeDesync.createEngineSslSocketFactory();
+                        ssl = (javax.net.ssl.SSLSocket) sf.createSocket(base, sni, port, true);
+                    } else {
+                        javax.net.ssl.SSLSocketFactory sf =
+                                ColgramDohResolver.createSniFragmentingFactory(ip, sni, sockProt);
+                        ssl = (javax.net.ssl.SSLSocket) sf.createSocket(ip, port);
+                    }
+                    try {
+                        javax.net.ssl.SSLParameters params = ssl.getSSLParameters();
+                        params.setServerNames(Collections.<javax.net.ssl.SNIServerName>singletonList(
+                                new javax.net.ssl.SNIHostName(sni)));
+                        ssl.setSSLParameters(params);
+                    } catch (Throwable ignored) {}
+                    ssl.setTcpNoDelay(true);
+                    ssl.setSoTimeout(Math.max(2_000, Math.min(stepRemMs, 3_500)));
+                    ssl.startHandshake();
+                    if (!javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier().verify(host, ssl.getSession())) {
+                        throw new IOException("TLS hostname mismatch for " + host);
+                    }
+                    java.io.OutputStream out = ssl.getOutputStream();
+                    String req = "GET " + file + " HTTP/1.1\r\n"
+                            + "Host: " + host + "\r\n"
+                            + "User-Agent: Colgram/1.0\r\n"
+                            + "Accept-Encoding: identity\r\n"
+                            + "Connection: close\r\n\r\n";
+                    out.write(req.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                    out.flush();
+                    java.io.InputStream in = ssl.getInputStream();
+                    return readHttpResponseBodyBounded(in, SOURCE_MAX_BYTES, deadline);
+                } catch (IOException io) {
+                    lastErr = io;
+                } catch (Throwable t) {
+                    lastErr = new IOException(t.getMessage(), t);
+                } finally {
+                    if (ssl != null) try { ssl.close(); } catch (Throwable ignored) {}
+                    if (base != null) try { base.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        if (lastErr != null) throw lastErr;
+        return null;
+    }
+
+    private static String readHttpResponseBodyBounded(java.io.InputStream in, int maxBytes, long deadlineNanos)
+            throws IOException {
+        java.io.ByteArrayOutputStream hdr = new java.io.ByteArrayOutputStream(512);
+        int window = 0;
+        while (hdr.size() < 16384) {
+            if (System.nanoTime() > deadlineNanos) throw new IOException("feed HTTP header timeout");
+            int b = in.read();
+            if (b < 0) throw new IOException("unexpected EOF in HTTP headers");
+            hdr.write(b);
+            window = (window << 8) | (b & 0xff);
+            if (window == 0x0d0a0d0a) break;
+        }
+        String headerText = hdr.toString(java.nio.charset.StandardCharsets.ISO_8859_1.name());
+        String[] lines = headerText.split("\r\n");
+        if (lines.length == 0) throw new IOException("empty HTTP status");
+        String[] statusParts = lines[0].split(" ");
+        int status = -1;
+        if (statusParts.length >= 2) {
+            try { status = Integer.parseInt(statusParts[1]); } catch (NumberFormatException ignored) {}
+        }
+        if (status < 200 || status >= 300) throw new IOException("HTTP " + status);
+        boolean chunked = false;
+        long contentLength = -1L;
+        for (int i = 1; i < lines.length; i++) {
+            int colon = lines[i].indexOf(':');
+            if (colon <= 0) continue;
+            String name = lines[i].substring(0, colon).trim().toLowerCase(java.util.Locale.US);
+            String val = lines[i].substring(colon + 1).trim();
+            if ("transfer-encoding".equals(name) && val.toLowerCase(java.util.Locale.US).contains("chunked")) {
+                chunked = true;
+            } else if ("content-length".equals(name)) {
+                try { contentLength = Long.parseLong(val); } catch (NumberFormatException ignored) {}
+            }
+        }
+        if (contentLength > maxBytes) throw new IOException("feed exceeds byte budget");
+        if (!chunked) {
+            return ColgramProxyPolicy.readBounded(in, maxBytes, deadlineNanos);
+        }
+        java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream(4096);
+        byte[] buf = new byte[4096];
+        while (true) {
+            String sizeLine = readAsciiLine(in, deadlineNanos);
+            if (sizeLine == null) break;
+            int semi = sizeLine.indexOf(';');
+            if (semi >= 0) sizeLine = sizeLine.substring(0, semi);
+            sizeLine = sizeLine.trim();
+            if (sizeLine.isEmpty()) continue;
+            int chunkLen;
+            try {
+                chunkLen = Integer.parseInt(sizeLine, 16);
+            } catch (NumberFormatException nfe) {
+                throw new IOException("invalid chunk header");
+            }
+            if (chunkLen == 0) break;
+            if (body.size() + chunkLen > maxBytes) throw new IOException("feed exceeds byte budget");
+            int rem = chunkLen;
+            while (rem > 0) {
+                if (System.nanoTime() > deadlineNanos) throw new IOException("feed body timeout");
+                int n = in.read(buf, 0, Math.min(rem, buf.length));
+                if (n < 0) throw new IOException("truncated HTTP chunk");
+                body.write(buf, 0, n);
+                rem -= n;
+            }
+            readAsciiLine(in, deadlineNanos);
+        }
+        return body.toString(java.nio.charset.StandardCharsets.UTF_8.name());
+    }
+
+    private static String readAsciiLine(java.io.InputStream in, long deadlineNanos) throws IOException {
+        java.io.ByteArrayOutputStream line = new java.io.ByteArrayOutputStream(64);
+        while (line.size() < 4096) {
+            if (System.nanoTime() > deadlineNanos) throw new IOException("feed timeout");
+            int b = in.read();
+            if (b < 0) return line.size() == 0 ? null : line.toString("US-ASCII");
+            if (b == '\n') {
+                byte[] raw = line.toByteArray();
+                int len = (raw.length > 0 && raw[raw.length - 1] == '\r') ? raw.length - 1 : raw.length;
+                return new String(raw, 0, len, java.nio.charset.StandardCharsets.US_ASCII);
+            }
+            line.write(b);
+        }
+        throw new IOException("HTTP line too long");
     }
 
     private static String httpGetOnce(java.net.URL url, java.net.Proxy proxy,
@@ -3454,11 +3790,24 @@ public static void reportProxyFailure() {
         // never redirects proxy feed fetches into ISP blockpage IPs!
         if (ColgramConfig.isDohEnabled() && !ColgramDohResolver.isIpLiteral(host)) {
             java.net.InetAddress resolved = ColgramDohResolver.resolveOrNull(host);
+            if (!(resolved instanceof java.net.Inet4Address)) {
+                java.net.InetAddress[] all = ColgramDohResolver.resolve(host);
+                if (all != null) {
+                    for (java.net.InetAddress a : all) {
+                        if (a instanceof java.net.Inet4Address) {
+                            resolved = a;
+                            break;
+                        }
+                    }
+                }
+            }
             if (resolved instanceof java.net.Inet4Address) {
                 pinnedIp = resolved.getHostAddress();
                 String file = url.getFile();
                 if (file == null || file.isEmpty()) file = "/";
                 targetUrl = new java.net.URL("https", pinnedIp, url.getPort() > 0 ? url.getPort() : 443, file);
+            } else if (proxy == java.net.Proxy.NO_PROXY && ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+                throw new IOException("DoH unresolved on strict-L3 network for " + host);
             }
         }
         javax.net.ssl.HttpsURLConnection connection =
@@ -3844,8 +4193,8 @@ public static void reportProxyFailure() {
     private static final long PROXY_SELECTION_TIMEOUT_MS = 25_000L;
     private static final int MAX_SELECTION_TCP_CHECKS = 240;
     private static final int MAX_SELECTION_GUEST_CHECKS = 60;
-    private static final int SELECTION_TCP_TIMEOUT_MS = 1_800;
-    private static final int CELLULAR_SELECTION_TCP_TIMEOUT_MS = 3_500;
+    private static final int SELECTION_TCP_TIMEOUT_MS = 2_000;
+    private static final int CELLULAR_SELECTION_TCP_TIMEOUT_MS = 2_000;
     private static final int MAX_BACKGROUND_TCP_CHECKS = 900;
     private static final int MAX_BACKGROUND_GUEST_CHECKS = 120;
     private static final int BACKGROUND_PROXY_TARGET_COUNT = 20;
@@ -3881,6 +4230,7 @@ public static void reportProxyFailure() {
     private static boolean backgroundRelayOrProxyWorkNeeded(boolean manual) {
         if (manual || scheduledCatalogCheck != null || manualCatalogScanRequested) return true;
         if (!ColgramUiBridge.isAppInForeground()) return false;
+        if (getSelectableProxies().size() < 10) return true;
         boolean l3Blocked = ColgramDpiBypass.isStrictL3WhitelistDetected();
         if (l3Blocked && getReachableRelays().size() < 2) return true;
         if (isTelegramConnected() && (!l3Blocked || getReachableRelays().size() >= 2)) return false;
@@ -3928,11 +4278,14 @@ public static void reportProxyFailure() {
         mainHandler.post(() -> finishScheduledCatalogCheck(false));
     }
 
-    /** Stops background proxy list scraping and probing cleanly when the app goes to background. */
+    /** Pauses heavy background feed scraping while keeping 127.0.0.1:9876 bypass & passive watchdog alive 24/7. */
     public static void onAppBackgrounded() {
+        stopBackgroundFeedScraping();
         if (mainHandler == null) return;
         mainHandler.post(() -> {
             if (ColgramUiBridge.isAppInForeground()) return;
+            stopBackgroundFeedScraping();
+            ensureLocalWatchSchedulerRunning();
             backgroundProxyScheduledAt = Long.MAX_VALUE;
             mainHandler.removeCallbacks(backgroundProxyRunner);
             ProxySelection bg = backgroundProxySelection;
@@ -3941,18 +4294,31 @@ public static void reportProxyFailure() {
                 backgroundProxySelection = null;
             }
             finishScheduledCatalogCheck(false);
-            proberRunning.set(false);
         });
     }
 
-    /** Resumes discovery only when Telegram is disconnected or L3 whitelist recovery is needed. */
+    /** Resumes foreground discovery and kicks an immediate <1s reconnect when returning to foreground. */
     public static void onAppForegrounded() {
         if (mainHandler == null || appContext == null) return;
         mainHandler.post(() -> {
             if (!ColgramUiBridge.isAppInForeground()) return;
+            ensureLocalWatchSchedulerRunning();
+            ensurePeriodicSchedulersRunning();
+            localRouteUnavailableUntil = 0L;
+            executor.execute(() -> {
+                ColgramDpiBypass.clearTransientCooldowns();
+                ColgramTelegramWsBridge.clearCooldowns();
+                if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                    ColgramDpiBypass.startImmediately();
+                    mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+                }
+                if (!isTelegramConnected()) {
+                    tgnetCheckConnection();
+                }
+            });
             if (backgroundRelayOrProxyWorkNeeded(false)) {
                 startProber();
-                scheduleBackgroundProxyCheck(3_000L);
+                scheduleBackgroundProxyCheck(1_500L);
             }
         });
     }
@@ -4379,6 +4745,7 @@ public static void reportProxyFailure() {
             lastHealthyCatalogCheckAtMs = SystemClock.elapsedRealtime();
         }
         rememberRelays();
+        prewarmWifiSocksRelaysAsync();
         backgroundProxyStatus = "Фоновая проверка · " + selectionProgress(selection);
         Log.i(TAG, "PROXY_BACKGROUND " + selectionDiagnostic(selection)
                 + " fresh=" + freshCount + " route_changed=false"
@@ -4504,6 +4871,8 @@ public static void reportProxyFailure() {
                 if (!ColgramProxyPolicy.isPublicAddress(address)) continue;
                 try (Socket socket = new Socket(java.net.Proxy.NO_PROXY)) {
                     socket.setTcpNoDelay(true);
+                    android.net.VpnService sysVpn = ColgramDpiBypass.activeSystemDpiVpn();
+                    if (sysVpn != null && !sysVpn.protect(socket)) continue;
                     socket.connect(new InetSocketAddress(address, candidate.port), Math.min(2_200, remaining));
                     String numeric = address.getHostAddress();
                     int rtt = (int) (SystemClock.elapsedRealtime() - started);
@@ -4523,11 +4892,51 @@ public static void reportProxyFailure() {
                                 ColgramTelegramDcAddresses.bootstrapIpv4(), 443)) {
                             return new SelectionTcpResult(numeric, rtt, true, true);
                         }
+                        if (remainingSelectionTcp(started) >= 1400 && probeRelayViaWssOverSocks(address, candidate.port, remainingSelectionTcp(started))) {
+                            return new SelectionTcpResult(numeric, rtt, true, true);
+                        }
                     }
                 } catch (IOException ignored) { }
             }
         } catch (IOException | SecurityException ignored) { }
         return reachable;
+    }
+
+    private static boolean probeRelayViaWssOverSocks(java.net.InetAddress relayAddr, int relayPort, int budgetMs) {
+        if (relayAddr == null || relayPort <= 0 || budgetMs < 1000) return false;
+        String[] targets = {"kws2.web.telegram.org", "149.154.167.220"};
+        android.net.VpnService sysVpn = ColgramDpiBypass.activeSystemDpiVpn();
+        long started = SystemClock.elapsedRealtime();
+        for (String target : targets) {
+            int rem = remainingDeadline(started, budgetMs);
+            if (rem < 900) break;
+            Socket sock = null;
+            ColgramTelegramWsBridge.WsSession sess = null;
+            try {
+                sock = new Socket(java.net.Proxy.NO_PROXY);
+                sock.setTcpNoDelay(true);
+                if (sysVpn != null && !sysVpn.protect(sock)) continue;
+                sock.connect(new InetSocketAddress(relayAddr, relayPort), Math.min(1_800, rem));
+                sock.setSoTimeout(Math.min(2_200, remainingDeadline(started, budgetMs)));
+                if (!ColgramSocks5Codec.requestConnectHost(
+                        sock.getOutputStream(), sock.getInputStream(), target, 443, null, null)) {
+                    continue;
+                }
+                sess = ColgramTelegramWsBridge.dialViaRelaySocket(
+                        sock, 2, "kws2.web.telegram.org", relayAddr.getHostAddress() + ":" + relayPort);
+                if (sess != null) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (sess != null) {
+                    sess.close();
+                } else if (sock != null) {
+                    try { sock.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        return false;
     }
 
     private static int readSelectionSocksByteWithDeadline(Socket socket, long startedAt, int budgetMs) throws IOException {
@@ -4620,13 +5029,16 @@ public static void reportProxyFailure() {
                         if (selection.catalogOnly) {
                             enterCatalogNetwork(candidate, selection.network);
                             candidate.catalogTcpAt = finishedAt;
-                            candidate.catalogPinnedAddress = measured != null && measured.ready ? measured.address : null;
-                            if (measured != null && measured.ready) {
+                            if (measured != null && (measured.ready || measured.greeted)) {
+                                candidate.catalogPinnedAddress = measured.address;
                                 candidate.tcpMs = measured.rtt;
                                 candidate.tcpCheckedAt = finishedAt;
-                            } else if (!isFreshProtocolVerified(candidate)) {
-                                candidate.tcpMs = -2;
-                                candidate.tcpCheckedAt = finishedAt;
+                            } else {
+                                candidate.catalogPinnedAddress = null;
+                                if (!isFreshProtocolVerified(candidate)) {
+                                    candidate.tcpMs = -2;
+                                    candidate.tcpCheckedAt = finishedAt;
+                                }
                             }
                             mainHandler.removeCallbacks(selection.tick);
                             mainHandler.postDelayed(selection.tick, measured != null && measured.ready ? 150L : 400L);

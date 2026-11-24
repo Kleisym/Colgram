@@ -126,7 +126,7 @@ public final class ColgramMessageSeenSheet {
             TLRPC.User user,
             Theme.ResourcesProvider resourcesProvider
     ) {
-        if (act == null || message == null || !canCheckSeen(currentAccount, message, chat, user)) {
+        if (act == null || act.isFinishing() || act.isDestroyed() || message == null || !canCheckSeen(currentAccount, message, chat, user)) {
             return;
         }
         final boolean isDark = Theme.isCurrentThemeDark();
@@ -145,7 +145,7 @@ public final class ColgramMessageSeenSheet {
 
         LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(12), dp(18), dp(22));
+        root.setPadding(dp(18), dp(12), dp(18), dp(22) + AndroidUtilities.navigationBarHeight);
         GradientDrawable sheetBg = new GradientDrawable();
         sheetBg.setColor(isDark ? 0xFF0D1018 : 0xFFF8FAFC);
         sheetBg.setCornerRadii(new float[]{dp(22), dp(22), dp(22), dp(22), 0, 0, 0, 0});
@@ -223,7 +223,13 @@ public final class ColgramMessageSeenSheet {
             card.addView(privateSeen, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));
             root.addView(card, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
             sheet.setCustomView(root);
-            sheet.show();
+            ColgramGlobalOrbController.pushModalSuppression();
+            sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
+            try {
+                sheet.show();
+            } catch (Throwable ignored) {
+                ColgramGlobalOrbController.popModalSuppression();
+            }
             return;
         }
 
@@ -251,22 +257,45 @@ public final class ColgramMessageSeenSheet {
         loadingRow.addView(loadTv);
         listContainer.addView(loadingRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        ScrollView scroll = new ScrollView(act);
+        final int maxH = Math.min(dp(380), (int) (AndroidUtilities.displaySize.y * 0.52f));
+        ScrollView scroll = new ScrollView(act) {
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                int hMode = View.MeasureSpec.getMode(heightMeasureSpec);
+                int hSize = View.MeasureSpec.getSize(heightMeasureSpec);
+                int cappedSpec = (hMode == View.MeasureSpec.UNSPECIFIED)
+                        ? View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST)
+                        : View.MeasureSpec.makeMeasureSpec(Math.min(hSize, maxH), hMode);
+                super.onMeasure(widthMeasureSpec, cappedSpec);
+            }
+        };
         scroll.setVerticalScrollBarEnabled(false);
         scroll.addView(listContainer, new FrameLayout.LayoutParams(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-        int maxH = Math.min(dp(380), (int) (AndroidUtilities.displaySize.y * 0.52f));
         root.addView(scroll, new LinearLayout.LayoutParams(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT) {{
             bottomMargin = dp(4);
         }});
-        scroll.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob) -> {
-            if (b - t > maxH) {
-                v.getLayoutParams().height = maxH;
-                v.requestLayout();
+
+        final int[] reqIds = new int[]{0, 0};
+        sheet.setCustomView(root);
+        ColgramGlobalOrbController.pushModalSuppression();
+        sheet.setOnDismissListener(d -> {
+            ColgramGlobalOrbController.popModalSuppression();
+            ConnectionsManager cm = ConnectionsManager.getInstance(currentAccount);
+            if (reqIds[0] != 0) {
+                cm.cancelRequest(reqIds[0], true);
+                reqIds[0] = 0;
+            }
+            if (reqIds[1] != 0) {
+                cm.cancelRequest(reqIds[1], true);
+                reqIds[1] = 0;
             }
         });
-
-        sheet.setCustomView(root);
-        sheet.show();
+        try {
+            sheet.show();
+        } catch (Throwable ignored) {
+            ColgramGlobalOrbController.popModalSuppression();
+            return;
+        }
 
         final MessagesController mc = MessagesController.getInstance(currentAccount);
         TLRPC.TL_messages_getMessageReadParticipants req = new TLRPC.TL_messages_getMessageReadParticipants();
@@ -274,8 +303,9 @@ public final class ColgramMessageSeenSheet {
         req.peer = mc.getInputPeer(message.getDialogId());
         final long fromId = message.messageOwner.from_id != null ? message.messageOwner.from_id.user_id : 0L;
 
-        ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
-            if (sheet.isDismissed()) return;
+        reqIds[0] = ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+            reqIds[0] = 0;
+            if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
             if (error != null || !(response instanceof Vector)) {
                 String msgText;
                 if (error != null && error.text != null && error.text.contains("MESSAGE_ID_INVALID")) {
@@ -344,7 +374,9 @@ public final class ColgramMessageSeenSheet {
                 uReq.offset = 0;
                 uReq.filter = new TLRPC.TL_channelParticipantsRecent();
                 uReq.channel = mc.getInputChannel(chat.id);
-                ConnectionsManager.getInstance(currentAccount).sendRequest(uReq, (r1, e1) -> AndroidUtilities.runOnUIThread(() -> {
+                reqIds[1] = ConnectionsManager.getInstance(currentAccount).sendRequest(uReq, (r1, e1) -> AndroidUtilities.runOnUIThread(() -> {
+                    reqIds[1] = 0;
+                    if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
                     if (r1 instanceof TLRPC.TL_channels_channelParticipants) {
                         TLRPC.TL_channels_channelParticipants cp = (TLRPC.TL_channels_channelParticipants) r1;
                         for (int i = 0; i < cp.users.size(); i++) {
@@ -358,7 +390,9 @@ public final class ColgramMessageSeenSheet {
             } else {
                 TLRPC.TL_messages_getFullChat uReq = new TLRPC.TL_messages_getFullChat();
                 uReq.chat_id = chat.id;
-                ConnectionsManager.getInstance(currentAccount).sendRequest(uReq, (r1, e1) -> AndroidUtilities.runOnUIThread(() -> {
+                reqIds[1] = ConnectionsManager.getInstance(currentAccount).sendRequest(uReq, (r1, e1) -> AndroidUtilities.runOnUIThread(() -> {
+                    reqIds[1] = 0;
+                    if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
                     if (r1 instanceof TLRPC.TL_messages_chatFull) {
                         TLRPC.TL_messages_chatFull cf = (TLRPC.TL_messages_chatFull) r1;
                         for (int i = 0; i < cf.users.size(); i++) {
@@ -438,7 +472,7 @@ public final class ColgramMessageSeenSheet {
         row.addView(info, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
 
         row.setOnClickListener(v -> {
-            if (parentFragment == null) return;
+            if (parentFragment == null || parentFragment.isFinishing() || parentFragment.getParentLayout() == null) return;
             sheet.dismiss();
             Bundle args = new Bundle();
             if (obj instanceof TLRPC.User) {

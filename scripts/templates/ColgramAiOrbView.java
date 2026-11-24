@@ -20,7 +20,9 @@ import android.view.animation.LinearInterpolator;
 import android.view.animation.OvershootInterpolator;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.R;
+import org.telegram.messenger.Utilities;
 
 /**
  * Animated Signature Orb for Koliti:
@@ -67,6 +69,9 @@ public final class ColgramAiOrbView extends View {
     private State cachedShaderState;
     private int cachedW = -1;
     private int cachedH = -1;
+    private int cachedCustomAccent = -1;
+    private int cachedPaletteSecondary = 0xFFF59E0B;
+    private int avatarLoadGen = 0;
 
     private ValueAnimator orbAnimator;
     private float phase = 0f;
@@ -117,16 +122,38 @@ public final class ColgramAiOrbView extends View {
     }
 
     public void reloadCustomAvatar() {
+        avatarLoadGen++;
         try {
-            avatarBitmap = ColgramAeroStyler.loadKolitiAvatarBitmap(getContext());
-            if (avatarBitmap != null) {
-                avatarShader = new BitmapShader(avatarBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
-                avatarPaint.setShader(avatarShader);
-            } else {
-                avatarShader = null;
-                avatarPaint.setShader(null);
+            String customPath = org.colgram.core.ColgramDesignConfig.getKolitiCustomAvatarPath();
+            if (customPath != null && !customPath.isEmpty()) {
+                final int gen = avatarLoadGen;
+                final Context appCtx = getContext() != null ? getContext().getApplicationContext() : ApplicationLoader.applicationContext;
+                Utilities.globalQueue.postRunnable(() -> {
+                    Bitmap loaded = null;
+                    try {
+                        loaded = ColgramAeroStyler.loadKolitiAvatarBitmap(appCtx);
+                    } catch (Throwable ignored) {}
+                    final Bitmap finalLoaded = loaded;
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (gen != avatarLoadGen) return;
+                        applyLoadedAvatarBitmap(finalLoaded);
+                    });
+                });
+                return;
             }
+            applyLoadedAvatarBitmap(ColgramAeroStyler.loadKolitiAvatarBitmap(getContext()));
         } catch (Throwable ignored) {}
+    }
+
+    private void applyLoadedAvatarBitmap(Bitmap bmp) {
+        avatarBitmap = bmp;
+        if (avatarBitmap != null && !avatarBitmap.isRecycled()) {
+            avatarShader = new BitmapShader(avatarBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+            avatarPaint.setShader(avatarShader);
+        } else {
+            avatarShader = null;
+            avatarPaint.setShader(null);
+        }
         invalidate();
     }
 
@@ -134,6 +161,10 @@ public final class ColgramAiOrbView extends View {
         setContentDescription(org.colgram.core.ColgramDesignConfig.getKolitiDisplayName() + " AI Ассистент");
         cachedShaderState = null;
         cachedW = -1;
+        cachedCustomAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
+        cachedPaletteSecondary = cachedCustomAccent != 0
+                ? ColgramAeroStyler.Palette.resolve().accentSecondary
+                : 0xFFF59E0B;
         reloadCustomAvatar();
         invalidate();
     }
@@ -198,8 +229,8 @@ public final class ColgramAiOrbView extends View {
             orbAnimator.setInterpolator(new LinearInterpolator());
             orbAnimator.addUpdateListener(a -> {
                 long nowMs = android.os.SystemClock.uptimeMillis();
-                long minStep = (state == State.IDLE) ? 55L : 16L;
-                if (nowMs - lastFrameInvalidateMs < minStep) {
+                long minStep = (state == State.IDLE) ? 33L : 0L;
+                if (minStep > 0L && nowMs - lastFrameInvalidateMs < minStep) {
                     return;
                 }
                 lastFrameInvalidateMs = nowMs;
@@ -234,6 +265,7 @@ public final class ColgramAiOrbView extends View {
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         removeCallbacks(longPressTrigger);
+        animate().cancel();
         if (orbAnimator != null) {
             orbAnimator.cancel();
             orbAnimator = null;
@@ -357,7 +389,7 @@ public final class ColgramAiOrbView extends View {
 
         int accentMain;
         int accentSoft;
-        int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
+        int customAccent = cachedCustomAccent >= 0 ? cachedCustomAccent : org.colgram.core.ColgramDesignConfig.getAccentColor();
         switch (state) {
             case SEARCHING:
                 accentMain = 0xFF38BDF8;
@@ -377,7 +409,7 @@ public final class ColgramAiOrbView extends View {
                 break;
             default:
                 accentMain = customAccent != 0 ? customAccent : 0xFFE11D48;
-                accentSoft = customAccent != 0 ? ColgramAeroStyler.Palette.resolve().accentSecondary : 0xFFF59E0B;
+                accentSoft = customAccent != 0 ? cachedPaletteSecondary : 0xFFF59E0B;
                 break;
         }
 
