@@ -1,0 +1,64 @@
+// Resilient Maven Central and Gradle Plugin Portal mirrors for CI runners where
+// repo.maven.apache.org returns HTTP 429 Too Many Requests.
+def ensureResilientRepos = { repos ->
+    def markerNames = [
+        "CiGoogleMaven",
+        "CiGoogleMavenCentralUS",
+        "CiGoogleMavenCentralEU",
+        "CiJetBrainsMavenCentral",
+        "CiJetBrainsPluginPortal"
+    ]
+    if (repos.any { it.name in markerNames }) {
+        return
+    }
+    def injected = []
+    injected << repos.maven {
+        name = "CiGoogleMaven"
+        url = uri("https://dl.google.com/dl/android/maven2/")
+    }
+    injected << repos.maven {
+        name = "CiGoogleMavenCentralUS"
+        url = uri("https://maven-central.storage-download.googleapis.com/maven2/")
+    }
+    injected << repos.maven {
+        name = "CiGoogleMavenCentralEU"
+        url = uri("https://maven-central-eu.storage-download.googleapis.com/maven2/")
+    }
+    injected << repos.maven {
+        name = "CiJetBrainsMavenCentral"
+        url = uri("https://cache-redirector.jetbrains.com/maven-central/")
+    }
+    injected << repos.maven {
+        name = "CiJetBrainsPluginPortal"
+        url = uri("https://cache-redirector.jetbrains.com/plugins.gradle.org/m2/")
+    }
+    injected.reverseEach { repo ->
+        if (repos.remove(repo)) {
+            repos.add(0, repo)
+        }
+    }
+}
+
+gradle.beforeSettings { settings ->
+    def hadPluginRepos = !settings.pluginManagement.repositories.isEmpty()
+    ensureResilientRepos(settings.pluginManagement.repositories)
+    if (!hadPluginRepos) {
+        settings.pluginManagement.repositories.gradlePluginPortal()
+    }
+}
+
+gradle.settingsEvaluated { settings ->
+    ensureResilientRepos(settings.pluginManagement.repositories)
+    if (!settings.dependencyResolutionManagement.repositories.isEmpty()) {
+        ensureResilientRepos(settings.dependencyResolutionManagement.repositories)
+    }
+}
+
+gradle.allprojects { project ->
+    ensureResilientRepos(project.buildscript.repositories)
+    ensureResilientRepos(project.repositories)
+    project.afterEvaluate {
+        ensureResilientRepos(project.buildscript.repositories)
+        ensureResilientRepos(project.repositories)
+    }
+}

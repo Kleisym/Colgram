@@ -86,6 +86,12 @@ jobs:
             if [ ! -f "$ANDROID_HOME/platforms/android-36/android.jar" ]; then
               "$SDK_MGR" "platforms;android-36" "build-tools;36.0.0"
             fi
+            if [ ! -d "$ANDROID_HOME/ndk/27.2.12479018" ]; then
+              "$SDK_MGR" "ndk;27.2.12479018"
+            fi
+            if [ ! -d "$ANDROID_HOME/cmake/3.22.1" ]; then
+              "$SDK_MGR" "cmake;3.22.1"
+            fi
           fi
 
       - name: Apply Colgram Core & Surgical Patches
@@ -106,7 +112,21 @@ jobs:
         run: |
           cd Telegram-Src
           chmod +x gradlew
-          ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease --build-cache --parallel -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled"
+          INIT_SCRIPT="$GITHUB_WORKSPACE/.github/gradle/ci-maven-mirror.init.gradle"
+          for attempt in 1 2; do
+            echo "Gradle build attempt $attempt/2..."
+            if ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease \
+              --init-script "$INIT_SCRIPT" \
+              --build-cache --parallel --max-workers=4 \
+              -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled" \
+              -Dorg.gradle.internal.http.connectionTimeout=120000 \
+              -Dorg.gradle.internal.http.socketTimeout=120000; then
+              exit 0
+            fi
+            echo "Gradle attempt $attempt failed; waiting 15s before retry..."
+            sleep 15
+          done
+          exit 1
 
       - name: Verify Core Compilation & Host Security/Update JVM Tests
         run: |
