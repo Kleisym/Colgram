@@ -162,13 +162,7 @@ public final class ColgramAiSheet {
     private final java.util.concurrent.atomic.AtomicBoolean cleanedUp = new java.util.concurrent.atomic.AtomicBoolean(false);
     private Runnable pendingWelcomeRunnable;
     private boolean embeddedUnpackRequested = false;
-    private final ColgramAiModelManager.DownloadObserver downloadObserver = state -> AndroidUtilities.runOnUIThread(() -> {
-        if (cleanedUp.get()) return;
-        Activity act = resolveValidActivity(parentFragment);
-        if (act != null) {
-            syncCoreInstallBanner(act);
-        }
-    });
+    private final ColgramAiModelManager.DownloadObserver downloadObserver;
 
     private static Activity resolveValidActivity(BaseFragment parentFragment) {
         Activity act = (parentFragment != null && parentFragment.getParentActivity() != null)
@@ -204,6 +198,13 @@ public final class ColgramAiSheet {
         this.parentFragment = parentFragment;
         this.chatActivity = chatActivity != null ? chatActivity : ColgramAiChatBridge.resolveActiveChat(parentFragment);
         this.orbView = orbView;
+        this.downloadObserver = state -> AndroidUtilities.runOnUIThread(() -> {
+            if (cleanedUp.get()) return;
+            Activity obsAct = resolveValidActivity(parentFragment);
+            if (obsAct != null) {
+                syncCoreInstallBanner(obsAct);
+            }
+        });
 
         Activity act = resolveValidActivity(parentFragment);
         if (act == null) {
