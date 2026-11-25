@@ -8274,6 +8274,17 @@ def inject_zero_perm_pip_patches(repo_path):
         else:
             print(" [=] Already patched: BotWebViewSheet MiniApp pin v4")
 
+    proxy_rotation = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ProxyRotationController.java"
+    )
+    if os.path.exists(proxy_rotation):
+        patch_file(
+            proxy_rotation,
+            "if (!SharedConfig.isProxyEnabled() && !SharedConfig.proxyRotationEnabled || SharedConfig.proxyList.size() <= 1) {",
+            "if (!SharedConfig.isProxyEnabled() || !SharedConfig.proxyRotationEnabled || SharedConfig.proxyList.size() <= 1) {",
+            "ProxyRotationController disabled-proxy precedence fix",
+        )
+
 
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

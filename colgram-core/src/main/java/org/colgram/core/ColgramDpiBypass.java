@@ -1188,6 +1188,8 @@ public class ColgramDpiBypass {
             boolean skipRawForWs = (call == null) && wsCapableDest && (
                     dcWsPreferred.get(dcBucket) != 0
                             || inheritedGenericWs
+                            || (!overlayActive && ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
+                                    && dcRawReplied.get(dcBucket) == 0)
                             || (dcRawReplied.get(dcBucket) == 0
                             && dcRawFailed.get(dcBucket) > 0
                             && (overlayActive
@@ -1246,7 +1248,15 @@ public class ColgramDpiBypass {
                     dcWsPreferred.set(dcBucket, 1);
                     dcBackoffUntil.set(dcBucket, 0L);
                 }
-            } else if (call != null && call.systemWide && targetSocket == null && wsCapableDest && call.vpn != null) {
+            }
+            if (call == null && skipRawForWs && wsSession == null && targetSocket == null
+                    && !strictL3WhitelistDetected && isCurrentListener(generation)) {
+                long waitMs = dcBackoffUntil.get(dcBucket) - System.currentTimeMillis();
+                if (waitMs > 0) sleep(Math.min(waitMs, MAX_BACKOFF_SLEEP_MS));
+                if (!isCurrentListener(generation)) return;
+                targetSocket = connectWithBackoff(destHost, destPort, generation);
+            }
+            if (call != null && call.systemWide && targetSocket == null && wsCapableDest && call.vpn != null) {
                 // Carrier dropped raw TCP SYN to a Telegram DC IP while whole-device DPI is ON.
                 // Reply SOCKS5 OK, peek firstPayload: only upgrade to protected WSS if it's real
                 // non-TLS MTProto Obfuscated2 (>= 64B), never TLS/HTTPS!
@@ -3534,10 +3544,14 @@ public class ColgramDpiBypass {
         final int strategy = pickStrategy();
         final java.util.concurrent.atomic.AtomicLong fromTarget =
                 new java.util.concurrent.atomic.AtomicLong(0);
+        final java.util.concurrent.atomic.AtomicBoolean clientSentInit =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        final java.util.concurrent.atomic.AtomicBoolean clientClosedFirst =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
 
         if (!executeWorker(() -> {
             try {
-                client.setSoTimeout(5000);
+                client.setSoTimeout(30_000);
                 InputStream cin = client.getInputStream();
                 byte[] initBuf = new byte[4096];
                 int initLen = 0;
@@ -3547,15 +3561,20 @@ public class ColgramDpiBypass {
                     initLen += n;
                 }
                 client.setSoTimeout(0);
+                if (initLen < 64) {
+                    clientClosedFirst.set(true);
+                }
                 ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter =
                         ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
                                 initBuf, initLen, session.rawDcId != 0 ? session.rawDcId : session.dcId);
                 if (splitter == null) {
+                    clientClosedFirst.set(true);
                     Log.w(TAG, "WS_C2S_BAD_HDR dc=" + session.dcId + " initLen=" + initLen);
                     return;
                 }
                 Log.d(TAG, "WS_C2S_INIT dc=" + session.dcId + " initLen=" + initLen);
                 splitter.feedInitAndTail(initBuf, initLen, session::sendBinary);
+                clientSentInit.set(true);
                 if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(initLen);
 
                 byte[] buffer = new byte[STREAM_COPY_BUFFER_BYTES];
@@ -3565,6 +3584,7 @@ public class ColgramDpiBypass {
                     splitter.feed(buffer, 0, len, session::sendBinary);
                     if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(len);
                 }
+                clientClosedFirst.set(true);
                 Log.d(TAG, "WS_C2S_EOF dc=" + session.dcId);
             } catch (Throwable err) {
                 Log.d(TAG, "WS_C2S_END dc=" + session.dcId + " err=" + err.getClass().getSimpleName() + ": " + err.getMessage());
@@ -3605,7 +3625,7 @@ public class ColgramDpiBypass {
                     }
                     if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(count);
                 });
-                if (!viaL3Relay && totalS2C == 0L) {
+                if (!viaL3Relay && totalS2C == 0L && clientSentInit.get() && !clientClosedFirst.get()) {
                     ColgramTelegramWsBridge.deprioritizeEndpoint(session);
                 }
                 Log.d(TAG, "WS_S2C_EOF dc=" + session.dcId + " total=" + totalS2C);
@@ -3617,8 +3637,8 @@ public class ColgramDpiBypass {
                 if (call != null) call.done(client, null);
                 if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
                 int bucket = dcBucketForSignedDc(session.rawDcId != 0 ? session.rawDcId : session.dcId);
-                if (!viaL3Relay && call == null && isCurrentListener(generation)) {
-                    reportStrategyResult(strategy, fromTarget.get() > 0, bucket);
+                if (!viaL3Relay && call == null && isCurrentListener(generation) && fromTarget.get() > 0) {
+                    reportStrategyResult(strategy, true, bucket);
                 }
             }
         })) {

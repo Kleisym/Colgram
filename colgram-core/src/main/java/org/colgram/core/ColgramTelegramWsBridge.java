@@ -190,8 +190,6 @@ public final class ColgramTelegramWsBridge {
     private static final long BURST_FAILURE_WINDOW_MS = 800L;
     private static final long DEPRIORITIZE_TTL_MS = 45_000L;
     private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
-    private static final int WS_IDLE_PING_TIMEOUT_MS = 25_000;
-    private static final int WS_PONG_WAIT_TIMEOUT_MS = 9_000;
 
     private static final ExecutorService RACE_POOL = new java.util.concurrent.ThreadPoolExecutor(
             0, 48, 30L, TimeUnit.SECONDS,
@@ -200,12 +198,6 @@ public final class ColgramTelegramWsBridge {
                 Thread t = new Thread(r, "colgram-ws-dial");
                 t.setDaemon(true);
                 t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws dial err: " + ex));
-                return t;
-            });
-    private static final ScheduledExecutorService KEEPALIVE_WATCHDOG =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "colgram-ws-watchdog");
-                t.setDaemon(true);
                 return t;
             });
 
@@ -1294,51 +1286,18 @@ public final class ColgramTelegramWsBridge {
         try { s.setSendBufferSize(262144); } catch (Throwable ignored) {}
     }
 
-    private static void cancelWatchdog(ScheduledFuture<?> f) {
-        if (f != null) {
-            try { f.cancel(false); } catch (Throwable ignored) {}
-        }
-    }
-
     public static long pumpUpstreamFrames(WsSession session, OutputStream clientOut,
                                           OnBytes onReply) throws IOException {
         long total = 0L;
         byte[] buf = new byte[65536];
         InputStream in = session.in;
-        boolean awaitingPong = false;
         boolean inFragmentedData = false;
-        ScheduledFuture<?> pongWatchdog = null;
         if (session.socket != null) {
-            try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
+            try { session.socket.setSoTimeout(0); } catch (Throwable ignored) {}
         }
-        try {
-            while (true) {
-                int b0;
-                try {
-                    b0 = in.read();
-                } catch (java.net.SocketTimeoutException idle) {
-                    if (awaitingPong) {
-                        throw new IOException("WS keepalive pong timeout on " + session.edgeIp, idle);
-                    }
-                    awaitingPong = true;
-                    cancelWatchdog(pongWatchdog);
-                    pongWatchdog = KEEPALIVE_WATCHDOG.schedule(
-                            session::close, WS_PONG_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                    if (session.socket != null) {
-                        try { session.socket.setSoTimeout(WS_PONG_WAIT_TIMEOUT_MS); } catch (Throwable ignored) {}
-                    }
-                    session.sendPing();
-                    continue;
-                }
-                if (b0 < 0) break;
-                if (awaitingPong || pongWatchdog != null) {
-                    cancelWatchdog(pongWatchdog);
-                    pongWatchdog = null;
-                    awaitingPong = false;
-                    if (session.socket != null) {
-                        try { session.socket.setSoTimeout(WS_IDLE_PING_TIMEOUT_MS); } catch (Throwable ignored) {}
-                    }
-                }
+        while (true) {
+            int b0 = in.read();
+            if (b0 < 0) break;
                 int b1 = in.read();
                 if (b1 < 0) break;
                 boolean fin = (b0 & 0x80) != 0;
@@ -1420,9 +1379,6 @@ public final class ColgramTelegramWsBridge {
             }
             clientOut.flush();
             return total;
-        } finally {
-            cancelWatchdog(pongWatchdog);
-        }
     }
 
     public interface OnBytes {

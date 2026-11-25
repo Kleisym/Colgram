@@ -129,6 +129,39 @@ class StabilityAndOverlayContractsTest(unittest.TestCase):
             twice = bot_sheet.read_text(encoding="utf-8")
             self.assertEqual(once, twice)
 
+    def test_ws_bridge_pump_disables_idle_client_ping(self):
+        src = read_text("colgram-core/src/main/java/org/colgram/core/ColgramTelegramWsBridge.java")
+        pump_body = extract_method(src, "public static long pumpUpstreamFrames(")
+        self.assertIn("session.socket.setSoTimeout(0)", pump_body)
+        self.assertNotIn("sendPing()", pump_body)
+        self.assertNotIn("WS_IDLE_PING_TIMEOUT_MS", src)
+
+    def test_proxy_manager_network_callback_dedup_and_connected_failure_reset(self):
+        src = read_text("colgram-core/src/main/java/org/colgram/core/ColgramProxyManager.java")
+        self.assertIn("lastActiveNetworkHandle", src)
+        inv_body = extract_method(src, "private static void invalidateNetworkProbeState(")
+        self.assertIn("ColgramDpiBypass.clearTransientCooldowns()", inv_body)
+        self.assertIn("ColgramDpiBypass.clearConnectionFailureBackoff()", inv_body)
+        wd_body = extract_method(src, "private static void connectionWatchdogTick()")
+        self.assertIn("applied.nativeFailures = 0;", wd_body)
+
+    def test_dpi_bypass_pipe_ws_guards_deprioritize_on_clean_client_close(self):
+        src = read_text("colgram-core/src/main/java/org/colgram/core/ColgramDpiBypass.java")
+        pipe_ws = extract_method(
+            src,
+            "private static void pipeOverWebSocket(final Socket client, final ColgramTelegramWsBridge.WsSession session,\n"
+            "                                          final CallListener call, final long generation,\n"
+            "                                          final boolean viaL3Relay)",
+        )
+        self.assertIn("clientSentInit", pipe_ws)
+        self.assertIn("clientClosedFirst", pipe_ws)
+        self.assertIn("clientSentInit.get() && !clientClosedFirst.get()", pipe_ws)
+
+    def test_apply_patches_fixes_proxy_rotation_precedence(self):
+        src = read_text("scripts/apply-patches.py")
+        self.assertIn("ProxyRotationController.java", src)
+        self.assertIn("!SharedConfig.isProxyEnabled() || !SharedConfig.proxyRotationEnabled", src)
+
 
 if __name__ == "__main__":
     unittest.main()
