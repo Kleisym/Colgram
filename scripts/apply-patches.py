@@ -5075,26 +5075,14 @@ def inject_hooks(repo_path):
         # controller takes over. Sources are keyed by tagPrefix, so each mini-app gets
         # its own window and they do not replace one another.
         impl_target = "    public void setFullscreen(boolean fullscreen, boolean animated) {"
-        impl_inject = """    // COLGRAM_MINIFLOAT_PATCH = 3
+        impl_inject = """    // COLGRAM_MINIFLOAT_PATCH = 4
     /**
      * Colgram: pin this mini-app into a floating window.
      *
-     * Two-tier strategy, because the platform allows different things depending on
-     * permissions:
-     *
-     *   1. ColgramFloatWindowManager — a real draggable overlay window. This IS the
-     *      "several at once, like a desktop" path the feature is asked for. It needs the
-     *      draw-over-other-apps permission; each window is an independent
-     *      WindowManager.addView using TYPE_APPLICATION_OVERLAY, which Android does not
-     *      cap at one.
-     *
-     *   2. Telegram's PipSource / PipActivityController — used when the overlay permission
-     *      is missing. No permission needed, but the controller keeps a single
-     *      maxPrioritySource and calls onLoseMaxPriority() on every other source, and
-     *      Android itself allows only one system PiP window per task. One window only.
-     *
-     * The user is told which one they got, rather than the button silently doing less
-     * than it says.
+     * Uses ColgramFloatWindowManager seamlessly:
+     *   - If SYSTEM_ALERT_WINDOW is already granted, creates a system-wide overlay window.
+     *   - Otherwise opens a zero-permission in-app floating multi-window without forcing Settings.
+     *   - Falls back to system PiP only if opening the floating window fails.
      */
     private void colgramPinMiniAppToFloatingWindow() {
         if (!org.colgram.core.ColgramConfig.isMiniAppPipEnabled()) {
@@ -5107,27 +5095,7 @@ def inject_hooks(repo_path):
             return;
         }
 
-        final boolean hasOverlayPermission = android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M
-                || android.provider.Settings.canDrawOverlays(activity);
-        if (!hasOverlayPermission) {
-            new org.telegram.ui.ActionBar.AlertDialog.Builder(activity, resourcesProvider)
-                    .setTitle("Плавающее мини-приложение")
-                    .setMessage("Разреши Colgram показывать окно поверх других приложений. Если не хочешь выдавать это разрешение, открой одно системное окно PiP.")
-                    .setPositiveButton("Открыть настройки", (dialog, which) -> {
-                        boolean opened = org.telegram.ui.ColgramFloatWindowManager.requestOverlayPermission(activity);
-                        if (!opened) {
-                            android.widget.Toast.makeText(activity,
-                                    "Не получилось открыть настройки разрешения",
-                                    android.widget.Toast.LENGTH_LONG).show();
-                        }
-                    })
-                    .setNeutralButton("Одно окно PiP", (dialog, which) -> colgramOpenMiniAppInPip(activity))
-                    .setNegativeButton("Отмена", null)
-                    .show();
-            return;
-        }
-
-        // --- Tier 1: real multi-window overlay ---
+        // --- Tier 1: real multi-window floating overlay (system-wide or zero-permission in-app) ---
         if (org.telegram.ui.ColgramFloatWindowManager.isSupported(activity)) {
             if (colgramPipOriginalParent == null && webViewContainer.getParent() instanceof android.view.ViewGroup) {
                 colgramPipOriginalParent = (android.view.ViewGroup) webViewContainer.getParent();
@@ -5312,13 +5280,16 @@ def inject_hooks(repo_path):
 
 """
         def minifloat_replacer(content):
-            marker = "COLGRAM_MINIFLOAT_PATCH = 3"
-            previous_marker = "COLGRAM_MINIFLOAT_PATCH = 2"
+            marker = "COLGRAM_MINIFLOAT_PATCH = 4"
+            previous_markers = ("COLGRAM_MINIFLOAT_PATCH = 3", "COLGRAM_MINIFLOAT_PATCH = 2")
             method = "private void colgramPinMiniAppToFloatingWindow()"
             method_at = content.find(method)
             marker_at = content.find(marker)
             if marker_at < 0:
-                marker_at = content.find(previous_marker)
+                for prev in previous_markers:
+                    marker_at = content.find(prev)
+                    if marker_at >= 0:
+                        break
             if marker_at >= 0 and method_at >= 0:
                 # A previous generated source could contain the marker followed by
                 # two copies of the setFullscreen overload (the injection boundary
@@ -7740,14 +7711,18 @@ def configure_package_and_branding(repo_path):
             bg_block = (
                 '\n'
                 '        <!-- Colgram: keeps the process alive so bot chats keep syncing without push.\n'
-                '             dataSync is the declared type; API 34+ requires it and the matching\n'
-                '             FOREGROUND_SERVICE_DATA_SYNC permission is added above. -->\n'
+                '             specialUse avoids Android 15/16 dataSync 6h rolling timeout crash loops;\n'
+                '             PROPERTY_SPECIAL_USE_FGS_SUBJECT satisfies API 34+ specialUse manifest check. -->\n'
                 '        <service\n'
                 '            android:name="org.colgram.core.ColgramForegroundService"\n'
                 '            android:enabled="true"\n'
                 '            android:exported="false"\n'
-                '            android:foregroundServiceType="dataSync"\n'
-                '            android:stopWithTask="false" />\n'
+                '            android:foregroundServiceType="specialUse"\n'
+                '            android:stopWithTask="false">\n'
+                '            <property\n'
+                '                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"\n'
+                '                android:value="Continuous private bot chat sync and privacy proxy bypass" />\n'
+                '        </service>\n'
                 '\n'
                 '        <!-- Colgram: bring the sync back after a reboot or an in-place update. -->\n'
                 '        <receiver\n'
@@ -7777,26 +7752,56 @@ def configure_package_and_branding(repo_path):
                 print(" [+] Injected Colgram foreground service + boot receiver into AndroidManifest.xml")
             else:
                 print(" [!] FATAL: </application> not found - background sync NOT registered")
-        elif "org.colgram.core.ColgramBootJobService" not in m_content:
-            # The guard above keys on ColgramForegroundService, which an already-patched tree
-            # contains — so a later addition to bg_block would never reach that tree, and the
-            # boot bridge below would be missing from every build except a fresh clone. This
-            # pass brings an existing tree up to the same manifest.
-            job_block = (
-                '\n'
-                '        <!-- Colgram: the boot broadcast cannot start a foreground service on\n'
-                '             Android 12+, but a running job can. This is the bridge. -->\n'
-                '        <service\n'
-                '            android:name="org.colgram.core.ColgramBootJobService"\n'
+        else:
+            # Upgrade legacy dataSync ColgramForegroundService declaration to specialUse + property.
+            legacy_fgs = re.compile(
+                r'<service\s+android:name="org\.colgram\.core\.ColgramForegroundService"[^>]*'
+                r'android:foregroundServiceType="dataSync"[^>]*(?:/\s*>|>[\s\S]*?</service>)',
+            )
+            modern_fgs = (
+                '<service\n'
+                '            android:name="org.colgram.core.ColgramForegroundService"\n'
                 '            android:enabled="true"\n'
                 '            android:exported="false"\n'
-                '            android:permission="android.permission.BIND_JOB_SERVICE" />\n'
+                '            android:foregroundServiceType="specialUse"\n'
+                '            android:stopWithTask="false">\n'
+                '            <property\n'
+                '                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"\n'
+                '                android:value="Continuous private bot chat sync and privacy proxy bypass" />\n'
+                '        </service>'
             )
-            if '    </application>' in m_content:
-                m_content = m_content.replace('    </application>', job_block + '    </application>', 1)
-                print(" [+] Added Colgram boot bridge JobService to AndroidManifest.xml")
-            else:
-                print(" [!] FATAL: </application> not found - boot bridge NOT registered")
+            m_content, fgs_upgraded = legacy_fgs.subn(modern_fgs, m_content, count=1)
+            if fgs_upgraded:
+                print(" [+] Upgraded ColgramForegroundService to specialUse in AndroidManifest.xml")
+
+            if "org.colgram.core.ColgramBootJobService" not in m_content:
+                # The guard above keys on ColgramForegroundService, which an already-patched tree
+                # contains — so a later addition to bg_block would never reach that tree, and the
+                # boot bridge below would be missing from every build except a fresh clone. This
+                # pass brings an existing tree up to the same manifest.
+                job_block = (
+                    '\n'
+                    '        <!-- Colgram: the boot broadcast cannot start a foreground service on\n'
+                    '             Android 12+, but a running job can. This is the bridge. -->\n'
+                    '        <service\n'
+                    '            android:name="org.colgram.core.ColgramBootJobService"\n'
+                    '            android:enabled="true"\n'
+                    '            android:exported="false"\n'
+                    '            android:permission="android.permission.BIND_JOB_SERVICE" />\n'
+                )
+                if '    </application>' in m_content:
+                    m_content = m_content.replace('    </application>', job_block + '    </application>', 1)
+                    print(" [+] Added Colgram boot bridge JobService to AndroidManifest.xml")
+                else:
+                    print(" [!] FATAL: </application> not found - boot bridge NOT registered")
+
+        # Location permissions are stripped for privacy, so LocationSharingService must not declare location FGS type.
+        loc_fgs = re.compile(
+            r'(<service\b[^>]*android:name="\.LocationSharingService"[^>]*\bandroid:foregroundServiceType=")location\|dataSync(")'
+        )
+        m_content, loc_fixed = loc_fgs.subn(r'\1dataSync\2', m_content)
+        if loc_fixed:
+            print(" [+] Stripped location FGS type from LocationSharingService in AndroidManifest.xml")
 
         # Firebase Installations is still in the build. Analytics and Crashlytics were removed,
         # but FirebaseInitProvider is contributed by the com.google.gms.google-services plugin
@@ -8199,6 +8204,77 @@ def apply_pinned_consolidated_patch(repo_path, root_dir):
     return False
 
 
+def inject_zero_perm_pip_patches(repo_path):
+    """Allow PiP and Mini App floating windows to open in-app when overlay permission is missing."""
+    comp_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Components")
+
+    pip_overlay = os.path.join(comp_dir, "PipVideoOverlay.java")
+    pip_target = (
+        "        windowManager = (WindowManager) (inAppOnly ? activity : ApplicationLoader.applicationContext).getSystemService(Context.WINDOW_SERVICE);\n\n"
+        "        windowLayoutParams = PipUtils.createWindowLayoutParams(context, inAppOnly);"
+    )
+    pip_inject = (
+        "        boolean useActivityWindow = inAppOnly || (activity != null && !AndroidUtilities.checkInlinePermissions(context));\n"
+        "        windowManager = (WindowManager) (useActivityWindow && activity != null ? activity : ApplicationLoader.applicationContext).getSystemService(Context.WINDOW_SERVICE);\n\n"
+        "        windowLayoutParams = PipUtils.createWindowLayoutParams(context, useActivityWindow);"
+    )
+    if os.path.exists(pip_overlay):
+        patch_file(pip_overlay, pip_target, pip_inject, "PipVideoOverlay zero-permission in-app fallback")
+
+    embed_sheet = os.path.join(comp_dir, "EmbedBottomSheet.java")
+    embed_target = (
+        '            boolean inAppOnly = isYouTube && "inapp".equals(MessagesController.getInstance(currentAccount).youtubePipType);\n'
+        '            if (!inAppOnly && !checkInlinePermissions()) {'
+    )
+    embed_inject = (
+        '            boolean inAppOnly = (parentActivity != null && !AndroidUtilities.checkInlinePermissions(parentActivity))\n'
+        '                    || (isYouTube && "inapp".equals(MessagesController.getInstance(currentAccount).youtubePipType));\n'
+        '            if (!inAppOnly && !checkInlinePermissions()) {'
+    )
+    if os.path.exists(embed_sheet):
+        patch_file(embed_sheet, embed_target, embed_inject, "EmbedBottomSheet zero-permission in-app PiP")
+
+    photo_web = os.path.join(comp_dir, "PhotoViewerWebView.java")
+    photo_target = "        boolean inAppOnly = isInAppOnly();"
+    photo_inject = "        boolean inAppOnly = isInAppOnly() || !AndroidUtilities.checkInlinePermissions(getContext());"
+    if os.path.exists(photo_web):
+        patch_file(photo_web, photo_target, photo_inject, "PhotoViewerWebView zero-permission in-app PiP")
+
+    bot_sheet = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "bots", "BotWebViewSheet.java"
+    )
+    if os.path.exists(bot_sheet):
+        with open(bot_sheet, "r", encoding="utf-8", errors="ignore", newline="") as f:
+            bs_content = f.read()
+        if "COLGRAM_MINIFLOAT_PATCH = 4" not in bs_content and "COLGRAM_MINIFLOAT_PATCH = 3" in bs_content:
+            eol = "\r\n" if "\r\n" in bs_content else "\n"
+            bs_norm = bs_content.replace("\r\n", "\n")
+            bs_norm = bs_norm.replace("// COLGRAM_MINIFLOAT_PATCH = 3", "// COLGRAM_MINIFLOAT_PATCH = 4", 1)
+            bs_norm = re.sub(
+                r"\n\s*final boolean hasOverlayPermission = android\.os\.Build\.VERSION\.SDK_INT < android\.os\.Build\.VERSION_CODES\.M\n"
+                r"[\s\S]*?\.show\(\);\n"
+                r"\s*return;\n"
+                r"\s*\}\n",
+                "\n",
+                bs_norm,
+                count=1,
+            )
+            bs_norm = bs_norm.replace(
+                "// --- Tier 1: real multi-window overlay ---",
+                "// --- Tier 1: real multi-window floating overlay (system-wide or zero-permission in-app) ---",
+                1,
+            )
+            bs_out = bs_norm if eol == "\n" else bs_norm.replace("\n", eol)
+            if bs_out != bs_content:
+                with open(bot_sheet, "w", encoding="utf-8", newline="") as f:
+                    f.write(bs_out)
+                print(" [+] Upgraded BotWebViewSheet MiniApp pin to v4 (zero-permission in-app)")
+            else:
+                print(" [=] Already patched: BotWebViewSheet MiniApp pin v4")
+        else:
+            print(" [=] Already patched: BotWebViewSheet MiniApp pin v4")
+
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
@@ -8234,6 +8310,7 @@ def main():
     inject_masque_process_isolation(target_repo)
     from guest_proxy_patches import apply as inject_guest_proxy_probe
     inject_guest_proxy_probe(target_repo)
+    inject_zero_perm_pip_patches(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

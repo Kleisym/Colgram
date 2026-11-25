@@ -67,11 +67,39 @@ public class ColgramForegroundService extends Service {
     private static volatile ColgramForegroundService activeInstance;
     private static volatile long lastDefenderSweepAtMs = 0L;
     private static volatile long screenOffSinceMs = 0L;
+    private static volatile long fgsCooldownUntilMs = 0L;
+    private static volatile long startInFlightUntilMs = 0L;
+    private static final long FGS_TIMEOUT_COOLDOWN_MS = 30L * 60L * 1000L;
+    private static final long START_DEBOUNCE_MS = 4_000L;
     private static final java.util.concurrent.atomic.AtomicBoolean dozePulseInFlight =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
     public static boolean isServiceRunning() {
         return serviceRunning;
+    }
+
+    private static long safeElapsedRealtime() {
+        try {
+            return android.os.SystemClock.elapsedRealtime();
+        } catch (Throwable ignored) {
+            return System.currentTimeMillis();
+        }
+    }
+
+    static boolean isInFgsCooldown(long nowMs) {
+        long until = fgsCooldownUntilMs;
+        return until > 0L && nowMs < until;
+    }
+
+    static long getFgsCooldownUntilMs() {
+        return fgsCooldownUntilMs;
+    }
+
+    static void resetStateForTest() {
+        fgsCooldownUntilMs = 0L;
+        startInFlightUntilMs = 0L;
+        serviceRunning = false;
+        activeInstance = null;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -81,11 +109,17 @@ public class ColgramForegroundService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        startInFlightUntilMs = 0L;
         handler = new Handler(Looper.getMainLooper());
-        serviceRunning = true;
         activeInstance = this;
         ensureForeground();
-        // Register persistent self-healing JobScheduler watchdog + Doze-proof 3m keepalive pulse
+        if (!foregroundStarted) {
+            serviceRunning = false;
+            if (activeInstance == this) activeInstance = null;
+            return;
+        }
+        serviceRunning = true;
+        // Register persistent self-healing JobScheduler watchdog + Doze-proof 5m keepalive pulse
         // so OEM killers / screen-off Doze can never silently stall incoming messages or Anti-Delete.
         if (ColgramConfig.isAlwaysBackgroundEnabled()) {
             try {
@@ -117,9 +151,15 @@ public class ColgramForegroundService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         // START_STICKY: if the system kills us for memory, restart with a null intent rather than
         // leaving the app dead until the user opens it again.
-        serviceRunning = true;
+        startInFlightUntilMs = 0L;
         activeInstance = this;
         ensureForeground();
+        if (!foregroundStarted) {
+            serviceRunning = false;
+            if (activeInstance == this) activeInstance = null;
+            return START_NOT_STICKY;
+        }
+        serviceRunning = true;
         ensurePollers();
         startHeartbeat();
         if (ColgramConfig.isAlwaysBackgroundEnabled()) {
@@ -128,9 +168,15 @@ public class ColgramForegroundService extends Service {
         return START_STICKY;
     }
 
-    /** Android 15 (API 35+) enforces a 6-hour rolling window on dataSync FGS; stop cleanly and reschedule. */
+    /** Android 14+ (API 34/35+) FGS timeout callback: back off safely instead of tight restart loop. */
+    public void onTimeout(int startId) {
+        onTimeout(startId, 0);
+    }
+
+    /** Android 15 (API 35+) timed FGS callback: set cooldown, stop cleanly, and reschedule periodic job only. */
     public void onTimeout(int startId, int fgsType) {
-        Log.i(TAG, "dataSync foreground quota reached (type=" + fgsType + "), stopping safely and rescheduling job");
+        Log.i(TAG, "foreground quota timeout reached (type=" + fgsType + "), entering cooldown and stopping safely");
+        fgsCooldownUntilMs = safeElapsedRealtime() + FGS_TIMEOUT_COOLDOWN_MS;
         stopHeartbeat();
         foregroundStarted = false;
         serviceRunning = false;
@@ -143,9 +189,11 @@ public class ColgramForegroundService extends Service {
             }
         } catch (Throwable ignored) {}
         try {
-            ColgramBootJobService.schedule(getApplicationContext());
+            scheduleProxyRefreshIfNotPending(getApplicationContext());
         } catch (Throwable ignored) {}
-        stopSelf(startId);
+        try {
+            stopSelf(startId);
+        } catch (Throwable ignored) {}
     }
 
     @Override
@@ -244,10 +292,10 @@ public class ColgramForegroundService extends Service {
             if (Build.VERSION.SDK_INT >= 34) {
                 try {
                     startForeground(NOTIFICATION_ID, n,
-                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
                     wentForeground = true;
                 } catch (Throwable typed) {
-                    Log.w(TAG, "typed startForeground refused (" + typed.getMessage()
+                    Log.w(TAG, "typed specialUse startForeground refused (" + typed.getMessage()
                             + "), retrying untyped");
                 }
             }
@@ -259,13 +307,12 @@ public class ColgramForegroundService extends Service {
             Log.i(TAG, "foreground started");
         } catch (Throwable t) {
             // Most likely cause on a modern device: a missing FOREGROUND_SERVICE_* permission or
-            // an FGS-start restriction. The pollers still run for as long as the process lives,
-            // so this degrades rather than fails.
+            // an FGS-start restriction. Enter cooldown and stop cleanly rather than looping.
+            foregroundStarted = false;
+            serviceRunning = false;
+            if (activeInstance == this) activeInstance = null;
+            fgsCooldownUntilMs = safeElapsedRealtime() + FGS_TIMEOUT_COOLDOWN_MS;
             Log.w(TAG, "could not go foreground: " + t);
-            // 🔴 CRITICAL: if we were started via startForegroundService() and never managed to
-            // call startForeground(), the platform kills the process. Stopping ourselves first
-            // avoids that - the pollers keep running because they are daemon threads owned by
-            // the process, not by this service.
             try {
                 stopSelf();
                 Log.i(TAG, "stopped self to avoid ForegroundServiceDidNotStartInTime");
@@ -658,12 +705,14 @@ public class ColgramForegroundService extends Service {
 
     /** Start (or re-assert) the service. Safe to call from any thread and any component. */
     public static void start(Context context) {
-        if (context == null) {
+        if (context == null || serviceRunning) {
             return;
         }
-        if (serviceRunning) {
+        long now = safeElapsedRealtime();
+        if (isInFgsCooldown(now) || now < startInFlightUntilMs) {
             return;
         }
+        startInFlightUntilMs = now + START_DEBOUNCE_MS;
         Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         try {
             Intent i = new Intent(app, ColgramForegroundService.class);
@@ -672,13 +721,9 @@ public class ColgramForegroundService extends Service {
                     && !ColgramPowerGuard.isBatteryExemptionGranted(app)) {
                 // On Android 12+ (targetSdk 36), calling startForegroundService() from the background
                 // without battery-optimization exemption throws ForegroundServiceStartNotAllowedException.
-                // Start in-process via startService() or defer via JobScheduler until foreground/exempt.
-                try {
-                    app.startService(i);
-                    Log.i(TAG, "background start used startService (not foreground/exempt)");
-                } catch (Throwable bgErr) {
-                    scheduleProxyRefreshIfNotPending(app);
-                }
+                // Defer cleanly via JobScheduler rather than scheduling an un-exempt FGS crash.
+                startInFlightUntilMs = 0L;
+                scheduleProxyRefreshIfNotPending(app);
                 return;
             }
             if (Build.VERSION.SDK_INT >= 26) {
@@ -688,16 +733,10 @@ public class ColgramForegroundService extends Service {
             }
             Log.i(TAG, "start requested");
         } catch (Throwable t) {
-            // Android 12+ blocks a foreground-service start from the background in some states.
-            // Falling back to startService at least keeps the pollers alive while the process is
-            // up; a later foreground entry (or the boot receiver) will promote it properly.
-            try {
-                app.startService(new Intent(app, ColgramForegroundService.class));
-                Log.i(TAG, "start fell back to startService");
-            } catch (Throwable t2) {
-                Log.w(TAG, "could not start service directly; deferring via JobScheduler: " + t2);
-                scheduleProxyRefreshIfNotPending(app);
-            }
+            startInFlightUntilMs = 0L;
+            fgsCooldownUntilMs = now + 60_000L;
+            Log.w(TAG, "could not start foreground service directly; deferring via JobScheduler: " + t);
+            scheduleProxyRefreshIfNotPending(app);
         }
     }
 

@@ -658,6 +658,8 @@ public final class ColgramUnlimitedMemory {
     }
 
     private static volatile long lastTrimAtMs = 0L;
+    private static final java.util.concurrent.atomic.AtomicBoolean trimPosted =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * Keeps transient image/bitmap RAM inside a <=100 MB ceiling without ever deleting cached
@@ -670,15 +672,31 @@ public final class ColgramUnlimitedMemory {
             Runtime rt = Runtime.getRuntime();
             long usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
             long maxMb = Math.max(128L, rt.maxMemory() / (1024L * 1024L));
-            // Only trim transient RAM cache under genuine memory pressure (>= 80% of Java heap ceiling)
+            // Only trim transient RAM cache under genuine memory pressure (>= 80% of Java heap ceiling).
+            // ImageLoader.clearMemory() touches UI-thread-only LruCache/mapFilters/bitmaps, so ALWAYS
+            // dispatch it on the main Looper rather than a background worker thread.
             if (usedMb >= (maxMb * 80L) / 100L) {
                 lastTrimAtMs = now;
-                Class<?> ilClass = Class.forName("org.telegram.messenger.ImageLoader");
-                Object il = ilClass.getMethod("getInstance").invoke(null);
-                if (il != null) {
-                    ilClass.getMethod("clearMemory").invoke(il);
+                Runnable clearTask = () -> {
+                    try {
+                        Class<?> ilClass = Class.forName("org.telegram.messenger.ImageLoader");
+                        Object il = ilClass.getMethod("getInstance").invoke(null);
+                        if (il != null) {
+                            ilClass.getMethod("clearMemory").invoke(il);
+                        }
+                        Log.i(TAG, "trimmed transient image memory (heap=" + usedMb + "/" + maxMb + " MB)");
+                    } catch (Throwable ignored) {
+                    } finally {
+                        trimPosted.set(false);
+                    }
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    clearTask.run();
+                } else if (trimPosted.compareAndSet(false, true)) {
+                    if (!new Handler(Looper.getMainLooper()).post(clearTask)) {
+                        trimPosted.set(false);
+                    }
                 }
-                Log.i(TAG, "trimmed transient image memory (heap=" + usedMb + "/" + maxMb + " MB)");
             }
         } catch (Throwable ignored) {}
     }

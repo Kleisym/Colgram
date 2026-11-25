@@ -325,6 +325,18 @@ public class ColgramBotSync {
      */
     private static volatile int colgramIpv4ProxyPort = -1;
     private static volatile boolean colgramIpv4ProxyStarted = false;
+    private static final java.util.concurrent.Semaphore IPV4_PROXY_SLOTS =
+            new java.util.concurrent.Semaphore(48);
+    private static final java.util.concurrent.ExecutorService IPV4_PROXY_POOL =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    0, 96, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.SynchronousQueue<>(),
+                    r -> {
+                        Thread t = new Thread(r, "colgram-ipv4-proxy-conn");
+                        t.setDaemon(true);
+                        t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ipv4 proxy err: " + ex));
+                        return t;
+                    });
 
     /** Port of the loopback IPv4-forcing proxy, starting it on first use. -1 if unavailable. */
     static int colgramIpv4ProxyPort() {
@@ -360,20 +372,28 @@ public class ColgramBotSync {
      * guessed at - a silent wrong answer here would be worse than a visible failure.
      */
     private static void colgramIpv4ProxyLoop(java.net.ServerSocket server) {
-        while (true) {
+        while (!server.isClosed()) {
             try {
                 final java.net.Socket client = server.accept();
-                // 🔴 ONE THREAD PER CLIENT. Handling the client inline meant the blocking
-                // header read (up to COLGRAM_CONNECT_TIMEOUT_MS) held the accept loop, so a
-                // single slow or silent connection stalled every other request. Measured as
-                // the proxy itself timing out:
-                //   SocketTimeoutException: failed to connect to /127.0.0.1 (port 36719)
-                //   from /127.0.0.1 (port 41600) after 8000ms
-                Thread t = new Thread(() -> colgramHandleProxyClient(client),
-                        "colgram-ipv4-proxy-conn");
-                t.setDaemon(true);
-                t.start();
+                if (!IPV4_PROXY_SLOTS.tryAcquire()) {
+                    try { client.close(); } catch (Throwable ignored) {}
+                    continue;
+                }
+                try {
+                    IPV4_PROXY_POOL.execute(() -> {
+                        try {
+                            colgramHandleProxyClient(client);
+                        } catch (Throwable ignored) {
+                        } finally {
+                            IPV4_PROXY_SLOTS.release();
+                        }
+                    });
+                } catch (Throwable rejected) {
+                    IPV4_PROXY_SLOTS.release();
+                    try { client.close(); } catch (Throwable ignored) {}
+                }
             } catch (Throwable t) {
+                if (server.isClosed()) break;
                 // Never let one accept failure kill the listener.
                 Log.w(TAG, "proxy accept: " + t.getClass().getSimpleName() + " " + t.getMessage());
             }
@@ -382,6 +402,7 @@ public class ColgramBotSync {
 
     /** Serve one client: read its request, dial IPv4 upstream, relay. */
     private static void colgramHandleProxyClient(java.net.Socket client) {
+        java.net.Socket upstream = null;
         try {
             client.setSoTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
             java.io.InputStream cin = client.getInputStream();
@@ -455,7 +476,7 @@ public class ColgramBotSync {
             }
 
             // The upstream leg: IPv4 literal only. This is the whole point of the proxy.
-            java.net.Socket upstream = new ColgramIpv4Socket(v4, upstreamPort);
+            upstream = new ColgramIpv4Socket(v4, upstreamPort);
             upstream.connect(new java.net.InetSocketAddress(v4, upstreamPort),
                     COLGRAM_CONNECT_TIMEOUT_MS);
 
@@ -483,10 +504,13 @@ public class ColgramBotSync {
             Log.i(TAG, "proxy: " + (isConnect ? "CONNECT " : "GET ") + host
                     + " -> " + v4.getHostAddress() + ":" + upstreamPort);
 
-            colgramPump(client, upstream);
+            java.net.Socket handedUpstream = upstream;
+            upstream = null;
+            colgramPump(client, handedUpstream);
         } catch (Throwable t) {
             // One bad client must never take the listener down.
             Log.w(TAG, "proxy: " + t.getClass().getSimpleName() + " " + t.getMessage());
+            try { if (upstream != null) upstream.close(); } catch (Throwable ignored) {}
             try { client.close(); } catch (Throwable ignored) {}
         }
     }
@@ -494,10 +518,14 @@ public class ColgramBotSync {
     /** Relay both directions until either side closes. */
     private static void colgramPump(final java.net.Socket client, final java.net.Socket upstream) {
         final java.net.Socket[] both = new java.net.Socket[] { client, upstream };
-        Thread t1 = new Thread(() -> colgramCopy(client, upstream, both));
-        Thread t2 = new Thread(() -> colgramCopy(upstream, client, both));
-        t1.setDaemon(true); t2.setDaemon(true);
-        t1.start(); t2.start();
+        try {
+            IPV4_PROXY_POOL.execute(() -> colgramCopy(upstream, client, both));
+            colgramCopy(client, upstream, both);
+        } catch (Throwable t) {
+            for (java.net.Socket s : both) {
+                try { s.close(); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     private static void colgramCopy(java.net.Socket from, java.net.Socket to,

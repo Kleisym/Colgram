@@ -75,7 +75,10 @@ public final class ColgramMasqueVpnService extends VpnService {
         // Android may still hold the VpnService binding. stopService alone defers
         // onDestroy until that binding disappears, leaving the TUN routing packets.
         // The explicit command closes the TUN immediately, before stopSelf/unbind.
-        context.startService(new Intent(context, ColgramMasqueVpnService.class).setAction(ACTION_STOP));
+        Intent stopIntent = new Intent(context, ColgramMasqueVpnService.class).setAction(ACTION_STOP);
+        try {
+            context.startService(stopIntent);
+        } catch (Throwable ignored) {}
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -84,19 +87,25 @@ public final class ColgramMasqueVpnService extends VpnService {
         }
         if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
         statusReceiver = intent.getParcelableExtra("status_receiver");
-        if (cleanupScheduled.get()) { report(ColgramWarpState.FAILED, "Предыдущий WARP ещё завершает работу; повторите подключение"); stopSelf(startId); return START_NOT_STICKY; }
+        try {
+            foreground("WARP: подключение и проверка защищённого канала");
+        } catch (RuntimeException error) {
+            fail("Запуск сервиса WARP: " + error.getMessage());
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        if (cleanupScheduled.get()) {
+            report(ColgramWarpState.FAILED, "Предыдущий WARP ещё завершает работу; повторите подключение");
+            stopForeground(true);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         if (running && tun != null) { report(ColgramWarpState.UP, null); return START_NOT_STICKY; }
         if (worker != null && worker.isAlive()) return START_NOT_STICKY;
         final long attempt = ++generation;
         final String bind = intent.getStringExtra("bind");
         final String edge = intent.getStringExtra("edge");
         final String socks = intent.getStringExtra("socks");
-        try {
-            foreground("WARP: подключение и проверка защищённого канала");
-        } catch (RuntimeException error) {
-            fail("Запуск сервиса WARP: " + error.getMessage());
-            return START_NOT_STICKY;
-        }
         report(ColgramWarpState.STARTING, null, "enrolling");
         worker = new Thread(() -> bootstrap(attempt, bind, edge, socks), "colgram-masque-start");
         worker.setDaemon(true); worker.start();

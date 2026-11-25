@@ -59,15 +59,42 @@ public class ColgramDpiBypass {
     private static Thread deferredStart;
     /** Keep the proxy listener out of the fragile application-startup window. */
     private static final long START_DELAY_MS = 8000L;
-    private static final ExecutorService workerPool = Executors.newCachedThreadPool(new java.util.concurrent.ThreadFactory() {
-        private final java.util.concurrent.atomic.AtomicInteger seq = new java.util.concurrent.atomic.AtomicInteger(1);
-        @Override
-        public Thread newThread(Runnable r) {
-            Thread t = new Thread(r, "colgram-dpi-worker-" + seq.getAndIncrement());
-            t.setDaemon(true);
-            return t;
+    private static final int MAX_WORKER_POOL_THREADS = 256;
+    private static final ExecutorService workerPool = new java.util.concurrent.ThreadPoolExecutor(
+            0, MAX_WORKER_POOL_THREADS, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            new java.util.concurrent.ThreadFactory() {
+                private final java.util.concurrent.atomic.AtomicInteger seq = new java.util.concurrent.atomic.AtomicInteger(1);
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "colgram-dpi-worker-" + seq.getAndIncrement());
+                    t.setDaemon(true);
+                    t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "dpi worker error: " + ex));
+                    return t;
+                }
+            });
+
+    static boolean executeWorker(Runnable task) {
+        if (task == null) return false;
+        try {
+            workerPool.execute(task);
+            return true;
+        } catch (Throwable rejectedOrOom) {
+            Log.w(TAG, "worker submission rejected: " + rejectedOrOom.getClass().getSimpleName());
+            return false;
         }
-    });
+    }
+
+    static int maxWorkerPoolThreadsForTest() {
+        return MAX_WORKER_POOL_THREADS;
+    }
+
+    static int systemWideClientCapForTest() {
+        return SYSTEM_WIDE_CLIENT_CAP;
+    }
+
+    private static final int SYSTEM_WIDE_CLIENT_CAP = 192;
+    private static final int MAX_TRACKED_MAP_ENTRIES = 512;
     // Admission backpressure prevents failed native SOCKS retries from spinning the CPU.
     private static final java.util.concurrent.Semaphore HANDSHAKE_SLOTS = new java.util.concurrent.Semaphore(32);
     private static final long REJECT_RETRY_DELAY_MS = 400L;
@@ -221,7 +248,12 @@ public class ColgramDpiBypass {
     static void markRelayFailed(String host, int port) {
         String key = normalizeRelayKey(host, port);
         if (key.isEmpty()) return;
-        l3RelayPenaltyUntil.put(key, safeElapsedRealtime() + L3_RELAY_PENALTY_MS);
+        long now = safeElapsedRealtime();
+        if (l3RelayPenaltyUntil.size() >= MAX_TRACKED_MAP_ENTRIES) {
+            l3RelayPenaltyUntil.entrySet().removeIf(e -> now >= e.getValue());
+            if (l3RelayPenaltyUntil.size() >= MAX_TRACKED_MAP_ENTRIES) l3RelayPenaltyUntil.clear();
+        }
+        l3RelayPenaltyUntil.put(key, now + L3_RELAY_PENALTY_MS);
         if (key.equalsIgnoreCase(activeL3RelayLabel)) {
             lastL3RelaySuccessAt = 0L;
             activeL3RelayLabel = "";
@@ -332,14 +364,16 @@ public class ColgramDpiBypass {
         long cacheWindow = strictL3WhitelistDetected ? L3_WHITELIST_DETECTED_CACHE_MS : L3_WHITELIST_CACHE_MS;
         if (l3WhitelistCheckedAt > 0L && now - l3WhitelistCheckedAt < cacheWindow) return;
         if (!l3ProbeInFlight.compareAndSet(false, true)) return;
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             try {
                 probeStrictL3WhitelistStatus();
             } catch (Throwable ignored) {
             } finally {
                 l3ProbeInFlight.set(false);
             }
-        });
+        })) {
+            l3ProbeInFlight.set(false);
+        }
     }
 
     private static boolean probeAnyTcpSyn(final java.util.List<String> hosts, final int port, final int timeoutMs) {
@@ -349,7 +383,7 @@ public class ColgramDpiBypass {
         final java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(hosts.size());
         final android.net.VpnService sysVpn = activeSystemDpiVpn;
         for (final String host : hosts) {
-            workerPool.execute(() -> {
+            if (!executeWorker(() -> {
                 Socket sock = null;
                 try {
                     if (anyOk.get()) return;
@@ -374,7 +408,11 @@ public class ColgramDpiBypass {
                         latch.countDown();
                     }
                 }
-            });
+            })) {
+                if (remaining.decrementAndGet() == 0) {
+                    latch.countDown();
+                }
+            }
         }
         try {
             latch.await(timeoutMs + 250L, java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -528,11 +566,10 @@ public class ColgramDpiBypass {
                     synchronized (ColgramDpiBypass.class) {
                         if (!ownsListener(listener, generation)) break;
                         final Socket accepted = client;
-                        workerPool.execute(() -> {
+                        submitted = executeWorker(() -> {
                             try { handleClient(accepted, null, generation); }
                             finally { HANDSHAKE_SLOTS.release(); }
                         });
-                        submitted = true;
                     }
                 } finally {
                     if (!submitted) { closeQuietly(client); HANDSHAKE_SLOTS.release(); }
@@ -728,7 +765,7 @@ public class ColgramDpiBypass {
         CallListener(boolean systemWide) throws java.io.IOException {
             this.systemWide = systemWide;
             this.dualStack = systemWide && ColgramDohResolver.hasGlobalRoutableIpv6();
-            this.clients = new java.util.concurrent.Semaphore(systemWide ? 512 : 64);
+            this.clients = new java.util.concurrent.Semaphore(systemWide ? SYSTEM_WIDE_CLIENT_CAP : 64);
             java.security.SecureRandom random = new java.security.SecureRandom();
             byte[] secret = new byte[24];
             random.nextBytes(secret);
@@ -747,7 +784,10 @@ public class ColgramDpiBypass {
             this.localDns = dns;
             Log.i(TAG, "CallListener ready systemWide=" + systemWide + " dualStackIpv6=" + dualStack
                     + " localDnsPort=" + (dns != null ? dns.port() : 0));
-            workerPool.execute(this::accept);
+            if (!executeWorker(this::accept)) {
+                close();
+                throw new java.io.IOException("Worker pool rejected CallListener accept loop");
+            }
         }
 
         String config() {
@@ -782,7 +822,12 @@ public class ColgramDpiBypass {
                         clients.release();
                         continue;
                     }
-                    workerPool.execute(() -> handleClient(client, this, -1L));
+                    final Socket accepted = client;
+                    if (!executeWorker(() -> handleClient(accepted, this, -1L))) {
+                        sockets.remove(accepted);
+                        closeQuietly(accepted);
+                        clients.release();
+                    }
                 }
             } catch (java.io.IOException ignored) {
                 close();
@@ -905,7 +950,7 @@ public class ColgramDpiBypass {
             for (int i = 0; i < 2; i++) {
                 final String ip = ips[i];
                 final long delay = delays[i];
-                workerPool.execute(() -> {
+                if (!executeWorker(() -> {
                     Socket s = null;
                     try {
                         if (delay > 0L) Thread.sleep(delay);
@@ -927,7 +972,12 @@ public class ColgramDpiBypass {
                             latch.countDown();
                         }
                     }
-                });
+                })) {
+                    if (left.decrementAndGet() == 0) {
+                        done.set(true);
+                        latch.countDown();
+                    }
+                }
             }
             try {
                 latch.await(budgetMs, java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -1344,7 +1394,7 @@ public class ColgramDpiBypass {
             }
             handedOff = true;
 
-        } catch (Exception e) {
+        } catch (Throwable e) {
             // A liveness probe sends a greeting and closes without a request, so the EOF
                 // that follows is that probe and not a failed connection. Naming it a handshake failure
                 // put a permanent red herring in the log for a check that is expected to behave this
@@ -1776,7 +1826,7 @@ public class ColgramDpiBypass {
         for (int i = 0; i < top.size(); i++) {
             final ColgramProxyChain.Relay relay = top.get(i);
             final long delay = i < delaysMs.length ? delaysMs[i] : 240L;
-            workerPool.execute(() -> {
+            if (!executeWorker(() -> {
                 Socket sock = null;
                 boolean selected = false;
                 try {
@@ -1808,7 +1858,12 @@ public class ColgramDpiBypass {
                         latch.countDown();
                     }
                 }
-            });
+            })) {
+                if (remaining.decrementAndGet() == 0) {
+                    synchronized (winnerLock) { finished[0] = true; }
+                    latch.countDown();
+                }
+            }
         }
 
         long raceBudgetMs = Math.max(perRelayTimeout + 400L,
@@ -2038,7 +2093,7 @@ public class ColgramDpiBypass {
         for (int i = 0; i < top.size(); i++) {
             final ColgramProxyChain.Relay relay = top.get(i);
             final long delay = i < delaysMs.length ? delaysMs[i] : 450L;
-            workerPool.execute(() -> {
+            if (!executeWorker(() -> {
                 ColgramTelegramWsBridge.WsSession sess = null;
                 boolean selected = false;
                 try {
@@ -2070,7 +2125,12 @@ public class ColgramDpiBypass {
                         latch.countDown();
                     }
                 }
-            });
+            })) {
+                if (remaining.decrementAndGet() == 0) {
+                    synchronized (winnerLock) { finished[0] = true; }
+                    latch.countDown();
+                }
+            }
         }
 
         try {
@@ -2205,7 +2265,7 @@ public class ColgramDpiBypass {
         final java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(laneCount);
 
         // Lane A: fast 900ms direct SYN recovery probe
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             Socket directSock = null;
             boolean handedToWinner = false;
             try {
@@ -2276,11 +2336,16 @@ public class ColgramDpiBypass {
                     latch.countDown();
                 }
             }
-        });
+        })) {
+            if (remaining.decrementAndGet() == 0) {
+                synchronized (gate) { finished[0] = true; }
+                latch.countDown();
+            }
+        }
 
         // Lane B: immediate Layer-2 L3-relay cascade (segmented SOCKS5/HTTP CONNECT + WSS-over-SOCKS5 failover)
         if (!relaySnapshot.isEmpty()) {
-            workerPool.execute(() -> {
+            if (!executeWorker(() -> {
                 Socket relaySock = null;
                 ColgramTelegramWsBridge.WsSession relayWs = null;
                 boolean handedToWinner = false;
@@ -2317,7 +2382,12 @@ public class ColgramDpiBypass {
                         latch.countDown();
                     }
                 }
-            });
+            })) {
+                if (remaining.decrementAndGet() == 0) {
+                    synchronized (gate) { finished[0] = true; }
+                    latch.countDown();
+                }
+            }
         }
 
         try {
@@ -2349,7 +2419,7 @@ public class ColgramDpiBypass {
         final java.util.concurrent.atomic.AtomicBoolean firstReplySeen =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
 
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             try {
                 OutputStream dout = relayDest.getOutputStream();
                 if (initialPayload != null && initialLen > 0) {
@@ -2374,9 +2444,14 @@ public class ColgramDpiBypass {
             } finally {
                 try { relayDest.shutdownOutput(); } catch (Throwable ignored) {}
             }
-        });
+        })) {
+            closeQuietly(relayDest);
+            closeQuietly(client);
+            if (call != null) call.done(client, relayDest);
+            return;
+        }
 
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             try {
                 InputStream din = relayDest.getInputStream();
                 OutputStream cout = client.getOutputStream();
@@ -2415,7 +2490,11 @@ public class ColgramDpiBypass {
                 if (call != null) call.done(client, relayDest);
                 if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
             }
-        });
+        })) {
+            closeQuietly(relayDest);
+            closeQuietly(client);
+            if (call != null) call.done(client, relayDest);
+        }
     }
 
     // ==================================================================================
@@ -3395,7 +3474,7 @@ public class ColgramDpiBypass {
         tuneSocketBuffers(client);
         final java.util.concurrent.atomic.AtomicLong fromTarget =
                 new java.util.concurrent.atomic.AtomicLong(0);
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             try {
                 InputStream cin = client.getInputStream();
                 byte[] buffer = new byte[STREAM_COPY_BUFFER_BYTES];
@@ -3409,8 +3488,13 @@ public class ColgramDpiBypass {
                 closeQuietly(client);
                 closeQuietly(session);
             }
-        });
-        workerPool.execute(() -> {
+        })) {
+            closeQuietly(client);
+            closeQuietly(session);
+            if (call != null) call.done(client, null);
+            return;
+        }
+        if (!executeWorker(() -> {
             try {
                 OutputStream cout = client.getOutputStream();
                 ColgramTelegramWsBridge.pumpUpstreamFrames(session, cout, count -> {
@@ -3431,7 +3515,11 @@ public class ColgramDpiBypass {
                 closeQuietly(session);
                 if (call != null) call.done(client, null);
             }
-        });
+        })) {
+            closeQuietly(client);
+            closeQuietly(session);
+            if (call != null) call.done(client, null);
+        }
     }
 
     private static void pipeOverWebSocket(final Socket client, final ColgramTelegramWsBridge.WsSession session,
@@ -3447,7 +3535,7 @@ public class ColgramDpiBypass {
         final java.util.concurrent.atomic.AtomicLong fromTarget =
                 new java.util.concurrent.atomic.AtomicLong(0);
 
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             try {
                 client.setSoTimeout(5000);
                 InputStream cin = client.getInputStream();
@@ -3484,9 +3572,14 @@ public class ColgramDpiBypass {
                 closeQuietly(client);
                 closeQuietly(session);
             }
-        });
+        })) {
+            closeQuietly(client);
+            closeQuietly(session);
+            if (call != null) call.done(client, null);
+            return;
+        }
 
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             try {
                 OutputStream cout = client.getOutputStream();
                 long totalS2C = ColgramTelegramWsBridge.pumpUpstreamFrames(session, cout, count -> {
@@ -3528,7 +3621,11 @@ public class ColgramDpiBypass {
                     reportStrategyResult(strategy, fromTarget.get() > 0, bucket);
                 }
             }
-        });
+        })) {
+            closeQuietly(client);
+            closeQuietly(session);
+            if (call != null) call.done(client, null);
+        }
     }
 
     interface ReplayDialer {
@@ -3667,7 +3764,7 @@ public class ColgramDpiBypass {
                 final int strat = plan[waveStart + lane];
                 final long delay = staggerMs[lane];
                 final Socket preConnected = (lane == 0) ? lane0Initial : null;
-                workerPool.execute(() -> {
+                if (!executeWorker(() -> {
                     Socket sock = preConnected;
                     boolean won = false;
                     try {
@@ -3713,7 +3810,16 @@ public class ColgramDpiBypass {
                             latch.countDown();
                         }
                     }
-                });
+                })) {
+                    if (preConnected != null) {
+                        if (call != null) call.untrackUpstream(preConnected);
+                        closeQuietly(preConnected);
+                    }
+                    if (pending.decrementAndGet() == 0) {
+                        waveDone.set(true);
+                        latch.countDown();
+                    }
+                }
             }
 
             try {
@@ -3830,7 +3936,7 @@ public class ColgramDpiBypass {
         // bypass skips ALL TLS SNI / HTTP desync!
         final boolean overlayActive = (call == null) && isOverlayVpnActive();
 
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             byte[] firstPayload;
             try {
                 // Read full TLS ClientHello (including ~1800-2100B Chrome/YouTube/Discord Post-Quantum X25519MLKEM768!)
@@ -3859,7 +3965,11 @@ public class ColgramDpiBypass {
             }
             pipeStandardOrWsSession(client, dest, call, generation, telegram, destHost, destPort,
                     overlayActive, firstPayload, looksTls, hostKey, isMedia);
-        });
+        })) {
+            closeQuietly(dest);
+            closeQuietly(client);
+            if (call != null) call.done(client, dest);
+        }
     }
 
     private static final int POST_HALF_CLOSE_TIMEOUT_MS = 15_000;
@@ -3899,7 +4009,7 @@ public class ColgramDpiBypass {
         final java.util.concurrent.atomic.AtomicLong lastRxAt =
                 new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis());
 
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             boolean cleanEof = false;
             try {
                 InputStream cin = client.getInputStream();
@@ -3923,7 +4033,14 @@ public class ColgramDpiBypass {
                     closeQuietly(client);
                 }
             }
-        });
+        })) {
+            t2cDone.set(true);
+            t2cLatch.countDown();
+            closeQuietly(upstream);
+            closeQuietly(client);
+            if (call != null) call.done(client, upstream);
+            return;
+        }
 
         try {
             InputStream din = upstream.getInputStream();
@@ -4105,7 +4222,7 @@ public class ColgramDpiBypass {
         }
 
         // Client -> Target
-        workerPool.execute(() -> {
+        if (!executeWorker(() -> {
             boolean clientClosed = false;
             boolean cleanClientEof = false;
             boolean c2sAttachedHandoff = false;
@@ -4265,7 +4382,12 @@ public class ColgramDpiBypass {
                     closeQuietly(dest);
                 }
             }
-        });
+        })) {
+            closeQuietly(dest);
+            closeQuietly(client);
+            if (call != null) call.done(client, dest);
+            return;
+        }
 
         // Target -> Client (direct with automatic in-session WebSocket -> Layer-2 L3-relay failover when silent)
         ColgramTelegramWsBridge.WsSession ws = null;
@@ -4485,6 +4607,12 @@ public class ColgramDpiBypass {
         if (telegram && !overlayActive) {
             dcRawFailed.incrementAndGet(dcBucketFor(host));
             String key = host.toLowerCase(java.util.Locale.US) + ":" + port;
+            if (silentEndpointCounts.size() >= MAX_TRACKED_MAP_ENTRIES) {
+                silentEndpointCounts.clear();
+            }
+            if (silentEndpoints.size() >= MAX_TRACKED_MAP_ENTRIES) {
+                silentEndpoints.clear();
+            }
             int count = silentEndpointCounts.merge(key, 1, Integer::sum);
             if (count >= 2 || ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()) {
                 silentEndpoints.add(key);
@@ -4492,18 +4620,11 @@ public class ColgramDpiBypass {
         }
     }
 
-    /**
-     * Carries an associated datagram stream: each SOCKS5 datagram becomes one TCP connection to the
-     * destination, and what comes back is handed to the client as a datagram.
-     *
-     * <p>One stream per datagram is what a TCP-shaped tunnel can offer, and it is what the client sees
-     * as MTProto over a connection: Telegram frames each message for a stream anyway, so nothing
-     * downstream depends on the datagram being long-lived. What matters is that the association now
-     * completes at all -- previously it was refused, and every connection through this front died
-     * before a byte of Telegram traffic moved.
-     */
+    private static final java.util.concurrent.Semaphore ASSOCIATE_DATAGRAM_SLOTS =
+            new java.util.concurrent.Semaphore(16);
+
     private static void pumpAssociated(final java.net.DatagramSocket udp, final Socket client, long generation) {
-        Thread inbound = new Thread(() -> {
+        if (!executeWorker(() -> {
             java.net.DatagramPacket packet = new java.net.DatagramPacket(new byte[65535], 65535);
             try {
                 while (isCurrentListener(generation)) {
@@ -4568,9 +4689,11 @@ public class ColgramDpiBypass {
             } finally {
                 udp.close();
             }
-        }, "ColgramDpiBypass-associate-in");
-        inbound.setDaemon(true);
-        inbound.start();
+        })) {
+            udp.close();
+            closeQuietly(client);
+            return;
+        }
 
         // Outbound: the client's framed datagrams arrive on the control connection, and this is the
         // loop that turns them into connections.
@@ -4610,13 +4733,18 @@ public class ColgramDpiBypass {
                 int payloadLen = rest.length - payloadAt;
                 if (payloadLen <= 0) continue;
 
+                if (!ASSOCIATE_DATAGRAM_SLOTS.tryAcquire()) continue;
                 Socket up = connectWithBackoff(host, port, generation);
-                if (up == null) continue;
+                if (up == null) {
+                    ASSOCIATE_DATAGRAM_SLOTS.release();
+                    continue;
+                }
                 final Socket sock = up;
                 final byte[] payload = new byte[payloadLen];
                 System.arraycopy(rest, payloadAt, payload, 0, payloadLen);
-                Thread one = new Thread(() -> {
+                if (!executeWorker(() -> {
                     try {
+                        sock.setSoTimeout(5000);
                         sock.getOutputStream().write(payload);
                         sock.getOutputStream().flush();
                         byte[] chunk = new byte[65535];
@@ -4628,10 +4756,12 @@ public class ColgramDpiBypass {
                     } catch (Throwable ignored) {
                     } finally {
                         closeQuietly(sock);
+                        ASSOCIATE_DATAGRAM_SLOTS.release();
                     }
-                }, "ColgramDpiBypass-associate-one");
-                one.setDaemon(true);
-                one.start();
+                })) {
+                    closeQuietly(sock);
+                    ASSOCIATE_DATAGRAM_SLOTS.release();
+                }
             }
         } catch (Throwable ignored) {
         }

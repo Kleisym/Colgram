@@ -21,6 +21,7 @@ public class ColgramHookHandler {
         if (context == null || ColgramProcess.isMasqueProcess(context)) return;
         try {
             appContext = context.getApplicationContext();
+            ColgramCrashGuard.install(appContext);
             ColgramOptimizer.optimizeStartup(appContext);
             ColgramConfig.init(appContext);
             try {

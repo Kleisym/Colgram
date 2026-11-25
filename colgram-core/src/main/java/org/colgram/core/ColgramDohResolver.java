@@ -52,6 +52,7 @@ public final class ColgramDohResolver {
     private static final int CELLULAR_READ_TIMEOUT_MS = 2500;
     private static final long RACE_WAVE_DEADLINE_MS = 3800L;
     private static final long CACHE_TTL_MS = 180_000L;
+    private static final int MAX_DNS_CACHE = 2048;
     private static final long CUT_COOLDOWN_MS = 30_000L;
     private static final int MAX_POOLED_PER_ENDPOINT = 2;
     private static final long POOL_IDLE_TTL_MS = 45_000L;
@@ -379,11 +380,67 @@ public final class ColgramDohResolver {
         PooledTlsConn conn;
         while ((conn = q.pollFirst()) != null) {
             if (conn.isUsable(now)) {
+                pruneExpiredPoolTail(q, now);
                 return conn;
             }
             conn.closeQuietly();
         }
         return null;
+    }
+
+    private static void pruneExpiredPoolTail(java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q, long now) {
+        if (q == null) return;
+        PooledTlsConn tail;
+        while ((tail = q.peekLast()) != null && !tail.isUsable(now)) {
+            if (q.remove(tail)) {
+                tail.closeQuietly();
+            } else {
+                break;
+            }
+        }
+    }
+
+    private static void pruneAllExpiredTlsPool(long now) {
+        for (java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q : tlsPool.values()) {
+            pruneExpiredPoolTail(q, now);
+        }
+    }
+
+    static int tlsPoolTotalSizeForTest() {
+        int total = 0;
+        for (java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q : tlsPool.values()) {
+            total += q.size();
+        }
+        return total;
+    }
+
+    static int dnsCacheSizeForTest() {
+        return cache.size();
+    }
+
+    static void putDnsCacheEntry(String key, String[] found, long nowMs) {
+        if (key == null || found == null || found.length == 0) return;
+        if (cache.size() >= MAX_DNS_CACHE) {
+            for (Map.Entry<String, long[]> entry : cache.entrySet()) {
+                long[] ts = entry.getValue();
+                if (ts == null || ts.length == 0 || (nowMs - ts[0]) >= CACHE_TTL_MS) {
+                    if (cache.remove(entry.getKey(), ts)) {
+                        answers.remove(entry.getKey());
+                    }
+                }
+            }
+            if (cache.size() >= MAX_DNS_CACHE) {
+                cache.clear();
+                answers.clear();
+            }
+        }
+        cache.put(key, new long[]{nowMs});
+        answers.put(key, found);
+    }
+
+    static void clearDnsCacheForTest() {
+        cache.clear();
+        answers.clear();
     }
 
     private static void returnPooledConn(PooledTlsConn conn) {
@@ -393,9 +450,11 @@ public final class ColgramDohResolver {
             conn.closeQuietly();
             return;
         }
+        pruneAllExpiredTlsPool(now);
         conn.lastUsedAt = now;
         java.util.concurrent.ConcurrentLinkedDeque<PooledTlsConn> q =
                 tlsPool.computeIfAbsent(conn.poolKey, k -> new java.util.concurrent.ConcurrentLinkedDeque<>());
+        pruneExpiredPoolTail(q, now);
         if (q.size() >= MAX_POOLED_PER_ENDPOINT) {
             conn.closeQuietly();
             return;
@@ -410,11 +469,15 @@ public final class ColgramDohResolver {
     private static volatile String lastResolver;
     private static volatile Endpoint lastWorkingEndpoint;
     private static final java.util.concurrent.ExecutorService DOH_RACE_POOL =
-            java.util.concurrent.Executors.newCachedThreadPool(r -> {
-                Thread t = new Thread(r, "colgram-doh-race");
-                t.setDaemon(true);
-                return t;
-            });
+            new java.util.concurrent.ThreadPoolExecutor(
+                    0, 32, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.SynchronousQueue<>(),
+                    r -> {
+                        Thread t = new Thread(r, "colgram-doh-race");
+                        t.setDaemon(true);
+                        t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "doh worker err: " + ex));
+                        return t;
+                    });
 
     private ColgramDohResolver() {}
 
@@ -911,41 +974,47 @@ public final class ColgramDohResolver {
                 java.util.Collections.synchronizedList(new ArrayList<java.net.Socket>(wave.size()));
 
         for (final Endpoint ep : wave) {
-            DOH_RACE_POOL.execute(() -> {
-                try {
-                    if (winner.get() != null) return;
-                    byte[] reply = queryWire(ep, wireQuery, sockProtector, fdProtector, deadlineAt, activeSockets);
-                    if (reply != null && reply.length >= 12) {
-                        cutUntil.remove(ep.key());
-                        boolean acceptable = true;
-                        if (requireQtype == 1) {
-                            acceptable = parseARecords(reply).length > 0;
-                        } else if (requireQtype == 28) {
-                            acceptable = parseRecords(reply, true).length > 0;
-                        }
-                        if (acceptable) {
-                            if (winner.compareAndSet(null, reply)) {
-                                lastWorkingEndpoint = ep;
-                                lastResolver = ep.key();
-                                latch.countDown();
+            try {
+                DOH_RACE_POOL.execute(() -> {
+                    try {
+                        if (winner.get() != null) return;
+                        byte[] reply = queryWire(ep, wireQuery, sockProtector, fdProtector, deadlineAt, activeSockets);
+                        if (reply != null && reply.length >= 12) {
+                            cutUntil.remove(ep.key());
+                            boolean acceptable = true;
+                            if (requireQtype == 1) {
+                                acceptable = parseARecords(reply).length > 0;
+                            } else if (requireQtype == 28) {
+                                acceptable = parseRecords(reply, true).length > 0;
                             }
+                            if (acceptable) {
+                                if (winner.compareAndSet(null, reply)) {
+                                    lastWorkingEndpoint = ep;
+                                    lastResolver = ep.key();
+                                    latch.countDown();
+                                }
+                                return;
+                            }
+                            // Valid DNS reply with 0 records (e.g. AAAA absent) — endpoint is healthy, don't cut it
+                            emptyValidReply.compareAndSet(null, reply);
                             return;
                         }
-                        // Valid DNS reply with 0 records (e.g. AAAA absent) — endpoint is healthy, don't cut it
-                        emptyValidReply.compareAndSet(null, reply);
-                        return;
-                    }
-                    markCut(ep.key(), System.currentTimeMillis());
-                } catch (Throwable ignored) {
-                    if (winner.get() == null) {
                         markCut(ep.key(), System.currentTimeMillis());
+                    } catch (Throwable ignored) {
+                        if (winner.get() == null) {
+                            markCut(ep.key(), System.currentTimeMillis());
+                        }
+                    } finally {
+                        if (remaining.decrementAndGet() == 0) {
+                            latch.countDown();
+                        }
                     }
-                } finally {
-                    if (remaining.decrementAndGet() == 0) {
-                        latch.countDown();
-                    }
+                });
+            } catch (Throwable rejected) {
+                if (remaining.decrementAndGet() == 0) {
+                    latch.countDown();
                 }
-            });
+            }
         }
         try {
             latch.await(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -1052,8 +1121,7 @@ public final class ColgramDohResolver {
                     if (found.length > 0) {
                         lastResolver = pinned.key();
                         if (qtype == 1) {
-                            cache.put(key, new long[]{System.currentTimeMillis()});
-                            answers.put(key, found);
+                            putDnsCacheEntry(key, found, System.currentTimeMillis());
                         }
                         return toAddresses(found);
                     }
@@ -1078,8 +1146,7 @@ public final class ColgramDohResolver {
                     String[] found = qtype == 28 ? parseRecords(ecsReply, true) : parseARecords(ecsReply);
                     if (found.length > 0) {
                         if (qtype == 1) {
-                            cache.put(key, new long[]{System.currentTimeMillis()});
-                            answers.put(key, found);
+                            putDnsCacheEntry(key, found, System.currentTimeMillis());
                         }
                         return toAddresses(found);
                     }

@@ -64,6 +64,9 @@ public class ColgramFloatWindowManager {
         final Callbacks callbacks;
         WindowManager.LayoutParams params;
         WindowManager windowManager;
+        FrameLayout.LayoutParams inAppParams;
+        FrameLayout inAppHost;
+        boolean inAppOverlay;
         boolean attached;
         boolean collapsed;
         int expandedWidthPx;
@@ -121,8 +124,14 @@ public class ColgramFloatWindowManager {
         return new ArrayList<>(windows);
     }
 
-    public static boolean isSupported(Context context) {
+    private static final String IN_APP_HOST_TAG = "colgram_inapp_float_host";
+
+    public static boolean hasSystemOverlayPermission(Context context) {
         return context != null && (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context));
+    }
+
+    public static boolean isSupported(Context context) {
+        return context != null && (hasSystemOverlayPermission(context) || AndroidUtilities.findActivity(context) != null);
     }
 
     public static FloatWindow open(Context context, View content, CharSequence title) {
@@ -134,7 +143,9 @@ public class ColgramFloatWindowManager {
             return null;
         }
         final Context appContext = context.getApplicationContext();
-        if (!isSupported(appContext)) {
+        final boolean useSystemOverlay = hasSystemOverlayPermission(appContext);
+        final Activity hostActivity = useSystemOverlay ? null : AndroidUtilities.findActivity(context);
+        if (!useSystemOverlay && hostActivity == null) {
             return null;
         }
 
@@ -158,10 +169,18 @@ public class ColgramFloatWindowManager {
         ViewGroup.LayoutParams oldLayoutParams = null;
         FrameLayout root = null;
         WindowManager windowManager = null;
+        FrameLayout inAppHost = null;
         try {
-            windowManager = (WindowManager) appContext.getSystemService(Context.WINDOW_SERVICE);
-            if (windowManager == null) {
-                return null;
+            if (useSystemOverlay) {
+                windowManager = (WindowManager) appContext.getSystemService(Context.WINDOW_SERVICE);
+                if (windowManager == null) {
+                    return null;
+                }
+            } else {
+                inAppHost = obtainInAppHost(hostActivity);
+                if (inAppHost == null) {
+                    return null;
+                }
             }
 
             final String appKey = (title != null ? title.toString() : "miniapp");
@@ -218,6 +237,8 @@ public class ColgramFloatWindowManager {
             final FloatWindow window = new FloatWindow(
                     nextId++, appKey, content, root, column, bodyWrapper, resizeGrip, titleView, title, callbacks);
             window.windowManager = windowManager;
+            window.inAppHost = inAppHost;
+            window.inAppOverlay = !useSystemOverlay;
 
             // Header action controls: Shrink (-), Enlarge (+), Restore full (<->), Close (X)
             // Tapping the header/title (without dragging) collapses or expands the window cleanly!
@@ -278,23 +299,10 @@ public class ColgramFloatWindowManager {
 
             final int slotKey = Math.abs(appKey.hashCode() % 12) * 100 + (nextSlot++ % 8);
             DisplayMetrics dm = appContext.getResources().getDisplayMetrics();
-            int initW = Math.min(AndroidUtilities.dp(DEFAULT_WIDTH_DP), maxWindowWidthPx(dm));
-            int initH = Math.min(AndroidUtilities.dp(DEFAULT_HEIGHT_DP), maxWindowHeightPx(dm));
-
-            WindowManager.LayoutParams params = new WindowManager.LayoutParams();
-            params.width = Math.max(AndroidUtilities.dp(MIN_WIDTH_DP), initW);
-            params.height = Math.max(AndroidUtilities.dp(MIN_HEIGHT_DP), initH);
-            window.expandedWidthPx = params.width;
-            window.expandedHeightPx = params.height;
-            params.gravity = Gravity.TOP | Gravity.LEFT;
-            params.format = PixelFormat.TRANSLUCENT;
-            params.type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                    ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                    : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
-            params.flags = WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                    | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
-                    | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+            int initW = Math.max(AndroidUtilities.dp(MIN_WIDTH_DP), Math.min(AndroidUtilities.dp(DEFAULT_WIDTH_DP), maxWindowWidthPx(dm)));
+            int initH = Math.max(AndroidUtilities.dp(MIN_HEIGHT_DP), Math.min(AndroidUtilities.dp(DEFAULT_HEIGHT_DP), maxWindowHeightPx(dm)));
+            window.expandedWidthPx = initW;
+            window.expandedHeightPx = initH;
 
             final String remembered = org.colgram.core.ColgramConfig.getMiniAppPipPosition(slotKey);
             int startX = AndroidUtilities.dp(14 + (windows.size() % 4) * 24);
@@ -308,9 +316,31 @@ public class ColgramFloatWindowManager {
                     } catch (NumberFormatException ignored) {}
                 }
             }
-            params.x = Math.max(0, Math.min(startX, Math.max(0, dm.widthPixels - params.width)));
-            params.y = Math.max(0, Math.min(startY, Math.max(0, dm.heightPixels - params.height)));
-            window.params = params;
+            int clampedX = Math.max(0, Math.min(startX, Math.max(0, dm.widthPixels - initW)));
+            int clampedY = Math.max(0, Math.min(startY, Math.max(0, dm.heightPixels - initH)));
+
+            if (useSystemOverlay) {
+                WindowManager.LayoutParams params = new WindowManager.LayoutParams();
+                params.width = initW;
+                params.height = initH;
+                params.gravity = Gravity.TOP | Gravity.LEFT;
+                params.format = PixelFormat.TRANSLUCENT;
+                params.type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                        : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
+                params.flags = WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                params.x = clampedX;
+                params.y = clampedY;
+                window.params = params;
+            } else {
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(initW, initH, Gravity.TOP | Gravity.LEFT);
+                lp.leftMargin = clampedX;
+                lp.topMargin = clampedY;
+                window.inAppParams = lp;
+            }
 
             root.setOnTouchListener((v, ev) -> {
                 if (ev.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
@@ -322,10 +352,15 @@ public class ColgramFloatWindowManager {
                 return false;
             });
 
-            makeDraggable(headerBar, root, params, windowManager, window, slotKey);
-            makeResizable(resizeGrip, root, params, windowManager, window);
+            makeDraggable(headerBar, window, slotKey);
+            makeResizable(resizeGrip, window);
 
-            windowManager.addView(root, params);
+            if (useSystemOverlay) {
+                windowManager.addView(root, window.params);
+            } else {
+                inAppHost.addView(root, window.inAppParams);
+                root.bringToFront();
+            }
             window.attached = true;
             windows.add(window);
 
@@ -338,8 +373,12 @@ public class ColgramFloatWindowManager {
 
         } catch (Throwable t) {
             try {
-                if (root != null && root.getParent() != null && windowManager != null) {
-                    windowManager.removeViewImmediate(root);
+                if (root != null && root.getParent() != null) {
+                    if (!useSystemOverlay && root.getParent() instanceof ViewGroup) {
+                        ((ViewGroup) root.getParent()).removeView(root);
+                    } else if (windowManager != null) {
+                        windowManager.removeViewImmediate(root);
+                    }
                 }
                 if (content.getParent() instanceof ViewGroup) {
                     ((ViewGroup) content.getParent()).removeView(content);
@@ -375,8 +414,101 @@ public class ColgramFloatWindowManager {
         return btn;
     }
 
+    private static FrameLayout obtainInAppHost(Activity activity) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+            return null;
+        }
+        ViewGroup parent = activity.findViewById(android.R.id.content);
+        if (parent == null && activity.getWindow() != null) {
+            View decor = activity.getWindow().getDecorView();
+            if (decor instanceof ViewGroup) {
+                parent = (ViewGroup) decor;
+            }
+        }
+        if (parent == null) {
+            return null;
+        }
+        View existing = parent.findViewWithTag(IN_APP_HOST_TAG);
+        if (existing instanceof FrameLayout) {
+            existing.bringToFront();
+            return (FrameLayout) existing;
+        }
+        FrameLayout host = new FrameLayout(activity);
+        host.setTag(IN_APP_HOST_TAG);
+        host.setClickable(false);
+        host.setFocusable(false);
+        host.setClipChildren(false);
+        host.setClipToPadding(false);
+        host.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View v) {}
+
+            @Override
+            public void onViewDetachedFromWindow(View v) {
+                for (int i = windows.size() - 1; i >= 0; i--) {
+                    FloatWindow w = windows.get(i);
+                    if (w != null && w.inAppHost == v) {
+                        windows.remove(i);
+                        w.attached = false;
+                        detachWindowImmediate(w, true);
+                    }
+                }
+            }
+        });
+        parent.addView(host, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        host.bringToFront();
+        return host;
+    }
+
+    private static boolean hasLayoutTarget(FloatWindow window) {
+        if (window == null || !window.attached) {
+            return false;
+        }
+        return window.inAppOverlay
+                ? (window.inAppHost != null && window.inAppParams != null)
+                : (window.windowManager != null && window.params != null);
+    }
+
+    private static int getWindowWidth(FloatWindow w) {
+        return w.inAppOverlay ? w.inAppParams.width : w.params.width;
+    }
+
+    private static int getWindowHeight(FloatWindow w) {
+        return w.inAppOverlay ? w.inAppParams.height : w.params.height;
+    }
+
+    private static int getWindowX(FloatWindow w) {
+        return w.inAppOverlay ? w.inAppParams.leftMargin : w.params.x;
+    }
+
+    private static int getWindowY(FloatWindow w) {
+        return w.inAppOverlay ? w.inAppParams.topMargin : w.params.y;
+    }
+
+    private static void applyWindowBounds(FloatWindow w, int width, int height, int x, int y) {
+        if (!hasLayoutTarget(w)) {
+            return;
+        }
+        if (w.inAppOverlay) {
+            w.inAppParams.width = width;
+            w.inAppParams.height = height;
+            w.inAppParams.leftMargin = x;
+            w.inAppParams.topMargin = y;
+            w.root.setLayoutParams(w.inAppParams);
+        } else {
+            w.params.width = width;
+            w.params.height = height;
+            w.params.x = x;
+            w.params.y = y;
+            try {
+                w.windowManager.updateViewLayout(w.root, w.params);
+            } catch (Throwable ignored) {}
+        }
+    }
+
     private static void setWindowFocusable(FloatWindow window, boolean focusable) {
-        if (window == null || !window.attached || window.windowManager == null || window.params == null) {
+        if (!hasLayoutTarget(window) || window.inAppOverlay) {
             return;
         }
         int want = focusable
@@ -391,7 +523,7 @@ public class ColgramFloatWindowManager {
     }
 
     private static void animateWindowSize(final FloatWindow window, int targetW, int targetH, Runnable onEnd) {
-        if (window == null || !window.attached || window.windowManager == null || window.params == null) {
+        if (!hasLayoutTarget(window)) {
             if (onEnd != null) onEnd.run();
             return;
         }
@@ -402,10 +534,10 @@ public class ColgramFloatWindowManager {
         final int clampedH = window.collapsed
                 ? targetH
                 : Math.max(AndroidUtilities.dp(MIN_HEIGHT_DP), Math.min(maxWindowHeightPx(dm), targetH));
-        final int startW = window.params.width;
-        final int startH = window.params.height;
-        final int startX = window.params.x;
-        final int startY = window.params.y;
+        final int startW = getWindowWidth(window);
+        final int startH = getWindowHeight(window);
+        final int startX = getWindowX(window);
+        final int startY = getWindowY(window);
         final int targetX = Math.max(0, Math.min(startX, Math.max(0, dm.widthPixels - clampedW - AndroidUtilities.dp(4))));
         final int targetY = Math.max(0, Math.min(startY, Math.max(0, dm.heightPixels - clampedH - AndroidUtilities.dp(16))));
 
@@ -418,13 +550,12 @@ public class ColgramFloatWindowManager {
                 return;
             }
             float f = (float) a.getAnimatedValue();
-            window.params.width = Math.round(startW + (clampedW - startW) * f);
-            window.params.height = Math.round(startH + (clampedH - startH) * f);
-            window.params.x = Math.round(startX + (targetX - startX) * f);
-            window.params.y = Math.round(startY + (targetY - startY) * f);
-            try {
-                window.windowManager.updateViewLayout(window.root, window.params);
-            } catch (Throwable ignored) {}
+            applyWindowBounds(
+                    window,
+                    Math.round(startW + (clampedW - startW) * f),
+                    Math.round(startH + (clampedH - startH) * f),
+                    Math.round(startX + (targetX - startX) * f),
+                    Math.round(startY + (targetY - startY) * f));
         });
         if (onEnd != null) {
             anim.addListener(new AnimatorListenerAdapter() {
@@ -438,11 +569,11 @@ public class ColgramFloatWindowManager {
     }
 
     private static void toggleCollapse(FloatWindow window) {
-        if (window == null || !window.attached || window.windowManager == null) return;
+        if (!hasLayoutTarget(window)) return;
         window.collapsed = !window.collapsed;
         if (window.collapsed) {
-            window.expandedWidthPx = window.params.width;
-            window.expandedHeightPx = window.params.height;
+            window.expandedWidthPx = getWindowWidth(window);
+            window.expandedHeightPx = getWindowHeight(window);
             setWindowFocusable(window, false);
             if (window.resizeGrip != null) window.resizeGrip.setVisibility(View.GONE);
             window.bodyContainer.animate().alpha(0f).setDuration(110).withEndAction(() -> {
@@ -463,15 +594,17 @@ public class ColgramFloatWindowManager {
     }
 
     private static void stepResize(FloatWindow window, int dir) {
-        if (window == null || !window.attached || window.windowManager == null || window.params == null) return;
+        if (!hasLayoutTarget(window)) return;
         DisplayMetrics dm = window.root.getContext().getResources().getDisplayMetrics();
         int minW = AndroidUtilities.dp(MIN_WIDTH_DP);
         int minH = AndroidUtilities.dp(MIN_HEIGHT_DP);
         int maxW = maxWindowWidthPx(dm);
         int maxH = maxWindowHeightPx(dm);
-        int nextW = Math.max(minW, Math.min(maxW, window.params.width + dir * AndroidUtilities.dp(STEP_WIDTH_DP)));
-        int nextH = Math.max(minH, Math.min(maxH, window.params.height + dir * AndroidUtilities.dp(STEP_HEIGHT_DP)));
-        if (dir < 0 && window.params.width <= minW + AndroidUtilities.dp(8) && window.params.height <= minH + AndroidUtilities.dp(8)) {
+        int curW = getWindowWidth(window);
+        int curH = getWindowHeight(window);
+        int nextW = Math.max(minW, Math.min(maxW, curW + dir * AndroidUtilities.dp(STEP_WIDTH_DP)));
+        int nextH = Math.max(minH, Math.min(maxH, curH + dir * AndroidUtilities.dp(STEP_HEIGHT_DP)));
+        if (dir < 0 && curW <= minW + AndroidUtilities.dp(8) && curH <= minH + AndroidUtilities.dp(8)) {
             toggleCollapse(window);
             return;
         }
@@ -481,8 +614,19 @@ public class ColgramFloatWindowManager {
     }
 
     public static void bringToFront(FloatWindow window) {
-        if (window == null || !window.attached || window.windowManager == null) return;
+        if (!hasLayoutTarget(window)) return;
         int idx = windows.indexOf(window);
+        if (window.inAppOverlay) {
+            if (window.inAppHost != null) {
+                window.inAppHost.bringToFront();
+            }
+            window.root.bringToFront();
+            if (idx >= 0 && idx < windows.size() - 1) {
+                windows.remove(window);
+                windows.add(window);
+            }
+            return;
+        }
         if (idx >= 0 && idx == windows.size() - 1) return;
         try {
             window.windowManager.removeViewImmediate(window.root);
@@ -492,11 +636,7 @@ public class ColgramFloatWindowManager {
         } catch (Throwable ignored) {}
     }
 
-    private static void makeResizable(final View resizeGrip,
-                                      final View root,
-                                      final WindowManager.LayoutParams params,
-                                      final WindowManager windowManager,
-                                      final FloatWindow window) {
+    private static void makeResizable(final View resizeGrip, final FloatWindow window) {
         resizeGrip.setOnTouchListener(new View.OnTouchListener() {
             private int startW;
             private int startH;
@@ -508,26 +648,24 @@ public class ColgramFloatWindowManager {
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         bringToFront(window);
-                        startW = params.width;
-                        startH = params.height;
+                        startW = getWindowWidth(window);
+                        startH = getWindowHeight(window);
                         startRawX = event.getRawX();
                         startRawY = event.getRawY();
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        DisplayMetrics dm = root.getContext().getResources().getDisplayMetrics();
+                        DisplayMetrics dm = window.root.getContext().getResources().getDisplayMetrics();
                         int minW = AndroidUtilities.dp(MIN_WIDTH_DP);
                         int minH = AndroidUtilities.dp(MIN_HEIGHT_DP);
                         int maxW = maxWindowWidthPx(dm);
                         int maxH = maxWindowHeightPx(dm);
                         int dx = Math.round(event.getRawX() - startRawX);
                         int dy = Math.round(event.getRawY() - startRawY);
-                        params.width = Math.max(minW, Math.min(maxW, startW + dx));
-                        params.height = Math.max(minH, Math.min(maxH, startH + dy));
-                        window.expandedWidthPx = params.width;
-                        window.expandedHeightPx = params.height;
-                        try {
-                            windowManager.updateViewLayout(root, params);
-                        } catch (Throwable ignored) {}
+                        int nextW = Math.max(minW, Math.min(maxW, startW + dx));
+                        int nextH = Math.max(minH, Math.min(maxH, startH + dy));
+                        window.expandedWidthPx = nextW;
+                        window.expandedHeightPx = nextH;
+                        applyWindowBounds(window, nextW, nextH, getWindowX(window), getWindowY(window));
                         return true;
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
@@ -539,12 +677,7 @@ public class ColgramFloatWindowManager {
         });
     }
 
-    private static void makeDraggable(final View dragHandle,
-                                      final View root,
-                                      final WindowManager.LayoutParams params,
-                                      final WindowManager windowManager,
-                                      final FloatWindow window,
-                                      final int slotKey) {
+    private static void makeDraggable(final View dragHandle, final FloatWindow window, final int slotKey) {
         dragHandle.setOnTouchListener(new View.OnTouchListener() {
             private int initialX;
             private int initialY;
@@ -557,8 +690,8 @@ public class ColgramFloatWindowManager {
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         bringToFront(window);
-                        initialX = params.x;
-                        initialY = params.y;
+                        initialX = getWindowX(window);
+                        initialY = getWindowY(window);
                         touchX = event.getRawX();
                         touchY = event.getRawY();
                         moved = false;
@@ -570,21 +703,20 @@ public class ColgramFloatWindowManager {
                             moved = true;
                         }
                         if (!moved) return true;
-                        DisplayMetrics dm = root.getContext().getResources().getDisplayMetrics();
+                        DisplayMetrics dm = window.root.getContext().getResources().getDisplayMetrics();
                         int maxX = Math.max(0, dm.widthPixels - AndroidUtilities.dp(72));
                         int maxY = Math.max(0, dm.heightPixels - AndroidUtilities.dp(48));
-                        params.x = Math.max(-AndroidUtilities.dp(40), Math.min(maxX, initialX + (int) dx));
-                        params.y = Math.max(0, Math.min(maxY, initialY + (int) dy));
-                        try {
-                            windowManager.updateViewLayout(root, params);
-                        } catch (Throwable ignored) {}
+                        int nextX = Math.max(-AndroidUtilities.dp(40), Math.min(maxX, initialX + (int) dx));
+                        int nextY = Math.max(0, Math.min(maxY, initialY + (int) dy));
+                        applyWindowBounds(window, getWindowWidth(window), getWindowHeight(window), nextX, nextY);
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!moved) {
                             toggleCollapse(window);
                         } else {
                             try {
-                                org.colgram.core.ColgramConfig.setMiniAppPipPosition(slotKey, params.x, params.y);
+                                org.colgram.core.ColgramConfig.setMiniAppPipPosition(
+                                        slotKey, getWindowX(window), getWindowY(window));
                             } catch (Throwable ignored) {}
                         }
                         return true;
@@ -647,14 +779,24 @@ public class ColgramFloatWindowManager {
 
     private static void detachWindowImmediate(FloatWindow window, boolean notifyClosed) {
         try {
-            WindowManager wm = window.windowManager != null
-                    ? window.windowManager
-                    : (WindowManager) window.root.getContext().getSystemService(Context.WINDOW_SERVICE);
             if (window.content.getParent() instanceof ViewGroup) {
                 ((ViewGroup) window.content.getParent()).removeView(window.content);
             }
-            if (wm != null && window.root.getParent() != null) {
-                wm.removeViewImmediate(window.root);
+            if (window.inAppOverlay) {
+                if (window.root.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) window.root.getParent()).removeView(window.root);
+                }
+                if (window.inAppHost != null && window.inAppHost.getChildCount() == 0
+                        && window.inAppHost.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) window.inAppHost.getParent()).removeView(window.inAppHost);
+                }
+            } else {
+                WindowManager wm = window.windowManager != null
+                        ? window.windowManager
+                        : (WindowManager) window.root.getContext().getSystemService(Context.WINDOW_SERVICE);
+                if (wm != null && window.root.getParent() != null) {
+                    wm.removeViewImmediate(window.root);
+                }
             }
         } catch (Throwable t) {
             FileLog.e(t);

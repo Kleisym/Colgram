@@ -170,6 +170,19 @@ public final class ColgramDcRemap {
 
     // ---------------------------------------------------------------------- socket plumbing
 
+    private static final java.util.concurrent.Semaphore CLIENT_SLOTS =
+            new java.util.concurrent.Semaphore(64);
+    private static final java.util.concurrent.ExecutorService REMAP_POOL =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    0, 128, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.SynchronousQueue<>(),
+                    r -> {
+                        Thread t = new Thread(r, "colgram-dc-remap-worker");
+                        t.setDaemon(true);
+                        t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "dc remap worker err: " + ex));
+                        return t;
+                    });
+
     private static void acceptLoop() {
         while (true) {
             final Socket client;
@@ -182,9 +195,23 @@ public final class ColgramDcRemap {
                 Log.w(TAG, "accept: " + t.getClass().getSimpleName());
                 continue;
             }
-            Thread t = new Thread(() -> serve(client), "colgram-dc-remap-conn");
-            t.setDaemon(true);
-            t.start();
+            if (!CLIENT_SLOTS.tryAcquire()) {
+                close(client);
+                continue;
+            }
+            try {
+                REMAP_POOL.execute(() -> {
+                    try {
+                        serve(client);
+                    } catch (Throwable ignored) {
+                    } finally {
+                        CLIENT_SLOTS.release();
+                    }
+                });
+            } catch (Throwable rejected) {
+                CLIENT_SLOTS.release();
+                close(client);
+            }
         }
     }
 
@@ -855,22 +882,35 @@ public final class ColgramDcRemap {
     private static long pipe(final Socket a, final Socket b, final int firstByteMs) {
         final java.util.concurrent.atomic.AtomicLong upstreamBytes =
                 new java.util.concurrent.atomic.AtomicLong();
-        Thread t = new Thread(() -> {
-            try {
-                b.setSoTimeout(firstByteMs);
-            } catch (Throwable ignored) {
-            }
-            upstreamBytes.set(copy(b, a));
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        boolean submitted = false;
+        try {
+            REMAP_POOL.execute(() -> {
+                try {
+                    try {
+                        b.setSoTimeout(firstByteMs);
+                    } catch (Throwable ignored) {
+                    }
+                    upstreamBytes.set(copy(b, a));
+                    close(a);
+                } finally {
+                    done.countDown();
+                }
+            });
+            submitted = true;
+        } catch (Throwable rejected) {
             close(a);
-        }, "colgram-dc-remap-back");
-        t.setDaemon(true);
-        t.start();
+            close(b);
+            return 0L;
+        }
         copy(a, b);
         close(b);
-        try {
-            t.join(2000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (submitted) {
+            try {
+                done.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         return upstreamBytes.get();
     }

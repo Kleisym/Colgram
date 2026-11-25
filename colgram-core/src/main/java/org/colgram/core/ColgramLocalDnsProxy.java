@@ -72,11 +72,15 @@ final class ColgramLocalDnsProxy implements Closeable {
     private final ConcurrentHashMap<String, CompletableFuture<byte[]>> inflightByKey =
             new ConcurrentHashMap<>();
     private final Semaphore inflight = new Semaphore(128);
-    private final ExecutorService workers = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "colgram-local-dns");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService workers = new java.util.concurrent.ThreadPoolExecutor(
+            0, 64, 30L, TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "colgram-local-dns");
+                t.setDaemon(true);
+                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "local dns worker err: " + ex));
+                return t;
+            });
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile VpnService vpn;
 
@@ -159,13 +163,18 @@ final class ColgramLocalDnsProxy implements Closeable {
                 final InetAddress clientAddr = pkt.getAddress();
                 final int clientPort = pkt.getPort();
                 if (!inflight.tryAcquire()) continue;
-                workers.execute(() -> {
-                    try {
-                        handleQuery(query, clientAddr, clientPort);
-                    } finally {
-                        inflight.release();
-                    }
-                });
+                try {
+                    workers.execute(() -> {
+                        try {
+                            handleQuery(query, clientAddr, clientPort);
+                        } catch (Throwable ignored) {
+                        } finally {
+                            inflight.release();
+                        }
+                    });
+                } catch (Throwable rejected) {
+                    inflight.release();
+                }
             } catch (IOException ignored) {
                 if (closed.get() || socket.isClosed()) break;
             } catch (Throwable ignored) {
@@ -215,11 +224,15 @@ final class ColgramLocalDnsProxy implements Closeable {
 
     private void triggerBackgroundRefresh(final String key, final Question q, final byte[] queryCopy) {
         if (key == null || closed.get() || inflightByKey.containsKey(key)) return;
-        workers.execute(() -> {
-            if (!closed.get()) {
-                resolveCoalesced(key, q, queryCopy);
-            }
-        });
+        try {
+            workers.execute(() -> {
+                try {
+                    if (!closed.get()) {
+                        resolveCoalesced(key, q, queryCopy);
+                    }
+                } catch (Throwable ignored) {}
+            });
+        } catch (Throwable ignored) {}
     }
 
     private byte[] resolveCoalesced(String key, Question q, byte[] query) {

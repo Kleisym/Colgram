@@ -16,9 +16,15 @@ import java.util.concurrent.Semaphore;
 /** Byte-preserving local shaping in front of the exact selected proxy, not another relay. */
 public final class ColgramLocalTcpFront implements AutoCloseable {
     private static final Semaphore SLOTS = new Semaphore(48);
-    private static final ExecutorService IO = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "colgram-base-pipe"); t.setDaemon(true); return t;
-    });
+    private static final ExecutorService IO = new java.util.concurrent.ThreadPoolExecutor(
+            0, 96, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "colgram-base-pipe");
+                t.setDaemon(true);
+                t.setUncaughtExceptionHandler((th, ex) -> {});
+                return t;
+            });
     private final ServerSocket listener;
     private final String host;
     private final int targetPort;
@@ -42,7 +48,13 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
                 Socket client = listener.accept();
                 if (closed || !SLOTS.tryAcquire()) { client.close(); continue; }
                 sockets.add(client);
-                IO.execute(() -> relay(client));
+                try {
+                    IO.execute(() -> relay(client));
+                } catch (Throwable rejected) {
+                    sockets.remove(client);
+                    closeSocket(client);
+                    SLOTS.release();
+                }
             }
         } catch (IOException ignored) {
         } finally { close(); }
@@ -65,17 +77,23 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
             target.connect(new InetSocketAddress(host, targetPort), 4500);
             if (closed) return;
             java.util.concurrent.CountDownLatch downstream = new java.util.concurrent.CountDownLatch(1);
-            IO.execute(() -> {
-                try { copy(target.getInputStream(), client.getOutputStream(), false); }
-                catch (IOException ignored) {}
-                finally { try { client.shutdownOutput(); } catch (IOException ignored) {} downstream.countDown(); }
-            });
+            try {
+                IO.execute(() -> {
+                    try { copy(target.getInputStream(), client.getOutputStream(), false); }
+                    catch (Throwable ignored) {}
+                    finally { try { client.shutdownOutput(); } catch (IOException ignored) {} downstream.countDown(); }
+                });
+            } catch (Throwable rejected) {
+                downstream.countDown();
+                return;
+            }
             copy(client.getInputStream(), target.getOutputStream(), true);
             target.shutdownOutput();
             // Preserve downstream after the caller's FIN (TLS close_notify / final response).
             downstream.await();
         } catch (IOException ignored) {
         } catch (InterruptedException interrupted) { Thread.currentThread().interrupt();
+        } catch (Throwable ignored) {
         } finally {
             closeSocket(client); closeSocket(target);
             sockets.remove(client); sockets.remove(target); SLOTS.release();

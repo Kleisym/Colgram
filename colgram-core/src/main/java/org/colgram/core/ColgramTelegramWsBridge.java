@@ -193,11 +193,15 @@ public final class ColgramTelegramWsBridge {
     private static final int WS_IDLE_PING_TIMEOUT_MS = 25_000;
     private static final int WS_PONG_WAIT_TIMEOUT_MS = 9_000;
 
-    private static final ExecutorService RACE_POOL = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "colgram-ws-dial");
-        t.setDaemon(true);
-        return t;
-    });
+    private static final ExecutorService RACE_POOL = new java.util.concurrent.ThreadPoolExecutor(
+            0, 48, 30L, TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "colgram-ws-dial");
+                t.setDaemon(true);
+                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws dial err: " + ex));
+                return t;
+            });
     private static final ScheduledExecutorService KEEPALIVE_WATCHDOG =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "colgram-ws-watchdog");
@@ -480,7 +484,11 @@ public final class ColgramTelegramWsBridge {
         long now = System.currentTimeMillis();
         if (now - resolvedAt < DNS_CACHE_TTL_MS && !perHostIps.isEmpty()) return;
         if (!refreshInFlight.compareAndSet(false, true)) return;
-        RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
+        try {
+            RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
+        } catch (Throwable rejected) {
+            refreshInFlight.set(false);
+        }
     }
 
     public static WsSession dial(String destHost, int destPort) {
@@ -658,38 +666,45 @@ public final class ColgramTelegramWsBridge {
         for (int i = 0; i < modes.length; i++) {
             final int mode = modes[i];
             final long delay = i * 60L;
-            RACE_POOL.execute(() -> {
-                WsSession sess = null;
-                try {
-                    if (delay > 0L) Thread.sleep(delay);
-                    if (done.get()) return;
-                    DialedTcp tcp = connectEdgeRace(candidates, protector, fdProtector, mode);
-                    if (tcp == null || done.get()) {
-                        if (tcp != null) { try { tcp.socket.close(); } catch (Throwable ignored) {} }
-                        return;
-                    }
-                    HandshakeResult res = tryHandshake(tcp, normDc, media, mode);
-                    if (res.session != null) {
-                        synchronized (winnerLock) {
-                            if (!timedOut[0] && winner.get() == null) {
-                                winner.set(res.session);
-                                done.set(true);
-                                preferredFragMode = mode;
-                                latch.countDown();
-                            } else {
-                                sess = res.session;
+            try {
+                RACE_POOL.execute(() -> {
+                    WsSession sess = null;
+                    try {
+                        if (delay > 0L) Thread.sleep(delay);
+                        if (done.get()) return;
+                        DialedTcp tcp = connectEdgeRace(candidates, protector, fdProtector, mode);
+                        if (tcp == null || done.get()) {
+                            if (tcp != null) { try { tcp.socket.close(); } catch (Throwable ignored) {} }
+                            return;
+                        }
+                        HandshakeResult res = tryHandshake(tcp, normDc, media, mode);
+                        if (res.session != null) {
+                            synchronized (winnerLock) {
+                                if (!timedOut[0] && winner.get() == null) {
+                                    winner.set(res.session);
+                                    done.set(true);
+                                    preferredFragMode = mode;
+                                    latch.countDown();
+                                } else {
+                                    sess = res.session;
+                                }
                             }
                         }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (sess != null) sess.close();
+                        if (left.decrementAndGet() == 0) {
+                            done.set(true);
+                            latch.countDown();
+                        }
                     }
-                } catch (Throwable ignored) {
-                } finally {
-                    if (sess != null) sess.close();
-                    if (left.decrementAndGet() == 0) {
-                        done.set(true);
-                        latch.countDown();
-                    }
+                });
+            } catch (Throwable rejected) {
+                if (left.decrementAndGet() == 0) {
+                    done.set(true);
+                    latch.countDown();
                 }
-            });
+            }
         }
         try {
             latch.await(budgetMs, TimeUnit.MILLISECONDS);
@@ -1670,7 +1685,11 @@ public final class ColgramTelegramWsBridge {
     private static List<EdgeEndpoint> candidateEndpointsFor(int dcId, boolean media) {
         long now = System.currentTimeMillis();
         if (now - resolvedAt > DNS_CACHE_TTL_MS && refreshInFlight.compareAndSet(false, true)) {
-            RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
+            try {
+                RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
+            } catch (Throwable rejected) {
+                refreshInFlight.set(false);
+            }
         }
         int bucket = bucketFor(dcId, media);
         return buildCandidateEndpoints(dcId, lastWorkingByDc.get(bucket), perHostIps, activeDeprioritizedKeys(now), media);
@@ -1947,45 +1966,52 @@ public final class ColgramTelegramWsBridge {
         for (int i = 0; i < plan.length; i++) {
             final EdgeEndpoint ep = plan[i];
             final long delay = delaysMs[i];
-            RACE_POOL.execute(() -> {
-                Socket sock = null;
-                try {
-                    if (delay > 0L) Thread.sleep(delay);
-                    if (done.get()) return;
-                    if (useNative) {
-                        sock = ColgramNativeDesync.connect(
-                                ep.ip, 443, connectAttemptTimeoutMs(), mssClamp, windowClamp, fdProtector);
-                    } else {
-                        sock = new Socket();
-                        sock.setTcpNoDelay(true);
-                        if (protector != null && !protector.protect(sock)) {
-                            return;
+            try {
+                RACE_POOL.execute(() -> {
+                    Socket sock = null;
+                    try {
+                        if (delay > 0L) Thread.sleep(delay);
+                        if (done.get()) return;
+                        if (useNative) {
+                            sock = ColgramNativeDesync.connect(
+                                    ep.ip, 443, connectAttemptTimeoutMs(), mssClamp, windowClamp, fdProtector);
+                        } else {
+                            sock = new Socket();
+                            sock.setTcpNoDelay(true);
+                            if (protector != null && !protector.protect(sock)) {
+                                return;
+                            }
+                            sock.connect(new InetSocketAddress(ep.ip, 443), connectAttemptTimeoutMs());
                         }
-                        sock.connect(new InetSocketAddress(ep.ip, 443), connectAttemptTimeoutMs());
-                    }
-                    DialedTcp candidate = new DialedTcp(ep, sock);
-                    synchronized (winnerLock) {
-                        if (!timedOut[0] && winner.get() == null) {
-                            winner.set(candidate);
+                        DialedTcp candidate = new DialedTcp(ep, sock);
+                        synchronized (winnerLock) {
+                            if (!timedOut[0] && winner.get() == null) {
+                                winner.set(candidate);
+                                done.set(true);
+                                latch.countDown();
+                                sock = null;
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (sock != null) {
+                            try {
+                                sock.close();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        if (pending.decrementAndGet() == 0) {
                             done.set(true);
                             latch.countDown();
-                            sock = null;
                         }
                     }
-                } catch (Throwable ignored) {
-                } finally {
-                    if (sock != null) {
-                        try {
-                            sock.close();
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    if (pending.decrementAndGet() == 0) {
-                        done.set(true);
-                        latch.countDown();
-                    }
+                });
+            } catch (Throwable rejected) {
+                if (pending.decrementAndGet() == 0) {
+                    done.set(true);
+                    latch.countDown();
                 }
-            });
+            }
         }
         try {
             latch.await(connectRaceBudgetMs(), TimeUnit.MILLISECONDS);

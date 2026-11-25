@@ -50,6 +50,18 @@ public final class ColgramProxyChain {
     private static final int MAX_RELAY_ROUTE_ATTEMPTS = 8;
     /** Hard cap: one listening socket per (target, relay) pair, and pairs are cheap to lose. */
     private static final int MAX_FORWARDERS = 8;
+    private static final java.util.concurrent.Semaphore CLIENT_SLOTS =
+            new java.util.concurrent.Semaphore(64);
+    private static final java.util.concurrent.ExecutorService RELAY_POOL =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    0, 128, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.SynchronousQueue<>(),
+                    r -> {
+                        Thread t = new Thread(r, "ColgramChain-worker");
+                        t.setDaemon(true);
+                        t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "chain worker err: " + ex));
+                        return t;
+                    });
 
     /** A relay we can tunnel through. Not a Telegram proxy, so it never enters the pool UI. */
     public static final class Relay {
@@ -143,10 +155,24 @@ public final class ColgramProxyChain {
                     if (!closed) Log.w(TAG, "accept failed on " + port(), t);
                     return;
                 }
+                if (!CLIENT_SLOTS.tryAcquire()) {
+                    closeQuietly(client);
+                    continue;
+                }
                 served++;
-                Thread pump = new Thread(() -> relayOne(client), "ColgramChain-pump-" + port());
-                pump.setDaemon(true);
-                pump.start();
+                try {
+                    RELAY_POOL.execute(() -> {
+                        try {
+                            relayOne(client);
+                        } catch (Throwable ignored) {
+                        } finally {
+                            CLIENT_SLOTS.release();
+                        }
+                    });
+                } catch (Throwable rejected) {
+                    CLIENT_SLOTS.release();
+                    closeQuietly(client);
+                }
             }
         }
 
@@ -175,9 +201,7 @@ public final class ColgramProxyChain {
                     upstream.setKeepAlive(true);
                 } catch (Throwable ignored) {}
                 final Socket up = upstream;
-                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramChain-up-" + port());
-                toUpstream.setDaemon(true);
-                toUpstream.start();
+                RELAY_POOL.execute(() -> pump(client, up));
                 pump(up, client);
             } catch (Throwable t) {
                 Log.w(TAG, "chain relay error", t);
@@ -474,9 +498,7 @@ public final class ColgramProxyChain {
                 ColgramRelayMissCache.recordSuccess(uplink.key(), host, port);
                 writeSocksReply(out, 0);
                 final Socket up = upstream;
-                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramSocksFront-up");
-                toUpstream.setDaemon(true);
-                toUpstream.start();
+                RELAY_POOL.execute(() -> pump(client, up));
                 pump(upstream, client);
             } catch (Throwable t) {
                 // Plain TCP sweepers intentionally close without a SOCKS greeting; that EOF is
@@ -655,9 +677,7 @@ public final class ColgramProxyChain {
                         "HTTP/1.1 200 Connection established\r\n\r\n".getBytes("UTF-8"));
                 client.getOutputStream().flush();
                 final Socket up = upstream;
-                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramFront-up");
-                toUpstream.setDaemon(true);
-                toUpstream.start();
+                RELAY_POOL.execute(() -> pump(client, up));
                 pump(up, client);
             } catch (Throwable t) {
                 Log.w(TAG, "proxy front request failed", t);
@@ -916,9 +936,7 @@ public final class ColgramProxyChain {
                     out.flush();
                 }
                 final Socket up = upstream;
-                Thread toUpstream = new Thread(() -> pump(client, up), "ColgramMimic-up");
-                toUpstream.setDaemon(true);
-                toUpstream.start();
+                RELAY_POOL.execute(() -> pump(client, up));
                 pump(up, client);
             } catch (Throwable t) {
                 Log.w(TAG, "mimic front relay failed for " + targetHost + ":" + targetPort, t);

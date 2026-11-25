@@ -186,6 +186,10 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             return START_NOT_STICKY;
         }
         if (!ACTION_START.equals(action)) {
+            if (intent == null) {
+                startForegroundCompat();
+                stopForeground(true);
+            }
             stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -196,7 +200,10 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         synchronized (ColgramVpnService.class) {
             if (requestedGeneration != controlGeneration || !"starting".equals(controlState)
                     || path == null || !path.equals(controlProfile)) {
-                if (server == null) stopSelf(startId);
+                if (server == null) {
+                    stopForeground(true);
+                    stopSelf(startId);
+                }
                 return START_NOT_STICKY;
             }
             if (appProfile != null) appProfile.close();
@@ -354,11 +361,15 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     }
 
     private void startForegroundCompat() {
-        Notification notification = buildOngoingNotification();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(FOREGROUND_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        } else {
-            startForeground(FOREGROUND_ID, notification);
+        try {
+            Notification notification = buildOngoingNotification();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(FOREGROUND_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else {
+                startForeground(FOREGROUND_ID, notification);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "startForegroundCompat failed: " + t.getMessage());
         }
     }
 
@@ -428,6 +439,9 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     public void onDestroy() {
         if (runningService == this) runningService = null;
         releaseResources();
+        try {
+            vpnExecutor.shutdownNow();
+        } catch (Throwable ignored) {}
         synchronized (ColgramVpnService.class) {
             if ("stopping".equals(controlState)) controlState = "stopped";
             else if (!"failed".equals(controlState)) publishState("stopped");
