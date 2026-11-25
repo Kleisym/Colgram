@@ -8286,6 +8286,380 @@ def inject_zero_perm_pip_patches(repo_path):
         )
 
 
+def inject_reliability_and_backup_patches(repo_path):
+    """Unconditional upstream hooks for PM Mute race fix, pure-global search, wake reconnect,
+    bot/cloak logout protection, and uninstall-surviving persistent account backup."""
+    src_main = os.path.join(repo_path, "TMessagesProj", "src", "main")
+    tg_msg = os.path.join(src_main, "java", "org", "telegram", "messenger")
+    tg_net = os.path.join(src_main, "java", "org", "telegram", "tgnet")
+    tg_ui = os.path.join(src_main, "java", "org", "telegram", "ui")
+
+    # 1. PM Mute: skip inserting purged/PM-muted incoming messages into open ChatActivity
+    chat_act = os.path.join(tg_ui, "ChatActivity.java")
+    if os.path.exists(chat_act):
+        patch_file(
+            chat_act,
+            '            FileLog.d("processNewMessages " + a + " our of " + N);\n'
+            '            MessageObject messageObject = arr.get(a);\n'
+            '            if (!isAd) {',
+            '            FileLog.d("processNewMessages " + a + " our of " + N);\n'
+            '            MessageObject messageObject = arr.get(a);\n'
+            '            if (messageObject != null && messageObject.getId() > 0 && !messageObject.isOutOwner()\n'
+            '                    && (org.colgram.core.ColgramHookHandler.isForcePurged(dialog_id, messageObject.getId())\n'
+            '                        || (dialog_id > 0L && currentEncryptedChat == null && chatMode == MODE_DEFAULT\n'
+            '                            && org.colgram.core.ColgramColemailerEngine.getInstance().isDmAutoDeleteMuted(currentAccount, dialog_id)))) {\n'
+            '                continue;\n'
+            '            }\n'
+            '            if (!isAd) {',
+            "ChatActivity PM Mute / force-purged visual skip",
+        )
+
+    # 2. PM Mute: clamp local clock skew against Telegram server time in colgramDispatchPlugins
+    msg_storage = os.path.join(tg_msg, "MessagesStorage.java")
+    if os.path.exists(msg_storage):
+        patch_file(
+            msg_storage,
+            "            long colgramNowSec = System.currentTimeMillis() / 1000L;\n"
+            "            long colgramSelfId = UserConfig.getInstance(currentAccount).getClientUserId();",
+            "            long colgramNowSec = System.currentTimeMillis() / 1000L;\n"
+            "            try {\n"
+            "                int srvSec = org.telegram.tgnet.ConnectionsManager.getInstance(currentAccount).getCurrentTime();\n"
+            "                if (srvSec > 1_600_000_000) {\n"
+            "                    colgramNowSec = Math.min(colgramNowSec, (long) srvSec);\n"
+            "                }\n"
+            "            } catch (Throwable ignored) {}\n"
+            "            long colgramSelfId = UserConfig.getInstance(currentAccount).getClientUserId();",
+            "MessagesStorage server-time skew clamp for PM Mute",
+        )
+
+    # 3. Global Search: pass reset flag and channel recommendations callback to ColgramGlobalSearchView
+    svp = os.path.join(tg_ui, "Components", "SearchViewPager.java")
+    if os.path.exists(svp):
+        patch_file(
+            svp,
+            "        } else if (view == colgramGlobalSearchView) {\n"
+            "            colgramGlobalSearchView.search(query);\n"
+            "        } else if (view == hashtagSearchContainer) {",
+            "        } else if (view == colgramGlobalSearchView) {\n"
+            "            colgramGlobalSearchView.search(query, reset);\n"
+            "        } else if (view == hashtagSearchContainer) {",
+            "SearchViewPager forward reset flag to ColgramGlobalSearchView",
+        )
+        patch_file(
+            svp,
+            "        if (id == NotificationCenter.channelRecommendationsLoaded) {\n"
+            "            channelsEmptyView.showProgress(MessagesController.getInstance(currentAccount).getChannelRecommendations(0) != null, true);\n"
+            "            channelsSearchAdapter.updateMyChannels();\n"
+            "            channelsSearchAdapter.update(true);\n"
+            "        } else if (id == NotificationCenter.dialogDeleted || id == NotificationCenter.dialogsNeedReload) {",
+            "        if (id == NotificationCenter.channelRecommendationsLoaded) {\n"
+            "            channelsEmptyView.showProgress(MessagesController.getInstance(currentAccount).getChannelRecommendations(0) != null, true);\n"
+            "            channelsSearchAdapter.updateMyChannels();\n"
+            "            channelsSearchAdapter.update(true);\n"
+            "            if (colgramGlobalSearchView != null) {\n"
+            "                colgramGlobalSearchView.onChannelRecommendationsLoaded();\n"
+            "            }\n"
+            "        } else if (id == NotificationCenter.dialogDeleted || id == NotificationCenter.dialogsNeedReload) {",
+            "SearchViewPager forward channelRecommendationsLoaded to ColgramGlobalSearchView",
+        )
+
+    # 4. Local Bypass: wake & screen-on stale-socket recovery hook
+    screen_rx = os.path.join(tg_msg, "ScreenReceiver.java")
+    if os.path.exists(screen_rx):
+        patch_file(
+            screen_rx,
+            "            ConnectionsManager.getInstance(UserConfig.selectedAccount).setAppPaused(false, true);\n"
+            "            ApplicationLoader.isScreenOn = true;\n"
+            "        }",
+            "            ConnectionsManager.getInstance(UserConfig.selectedAccount).setAppPaused(false, true);\n"
+            "            ApplicationLoader.isScreenOn = true;\n"
+            "            try {\n"
+            "                org.colgram.core.ColgramProxyManager.onScreenTurnedOn();\n"
+            "            } catch (Throwable ignored) {}\n"
+            "        }",
+            "ScreenReceiver ColgramProxyManager.onScreenTurnedOn hook",
+        )
+
+    # 5. Anti-Logout: initialize ColgramConfig before initConnection spoof & guard Bot accounts in onLogout
+    conn_mgr = os.path.join(tg_net, "ConnectionsManager.java")
+    if os.path.exists(conn_mgr):
+        patch_file(
+            conn_mgr,
+            "        try {\n"
+            "            systemLangCode = LocaleController.getSystemLocaleStringIso639().toLowerCase();\n"
+            "            langCode = LocaleController.getLocaleStringIso639().toLowerCase();\n"
+            "            deviceModel = org.colgram.core.ColgramConfig.getSpoofDeviceModel();",
+            "        try {\n"
+            "            try {\n"
+            "                org.colgram.core.ColgramConfig.init(ApplicationLoader.applicationContext);\n"
+            "            } catch (Throwable ignored) {}\n"
+            "            systemLangCode = LocaleController.getSystemLocaleStringIso639().toLowerCase();\n"
+            "            langCode = LocaleController.getLocaleStringIso639().toLowerCase();\n"
+            "            deviceModel = org.colgram.core.ColgramConfig.getSpoofDeviceModel();",
+            "ConnectionsManager eager ColgramConfig.init before spoof device read",
+        )
+        patch_file(
+            conn_mgr,
+            "    public static void onLogout(final int currentAccount) {\n"
+            "        if (ColgramGuestProxyService.inProbeProcess()) return;\n"
+            "        AndroidUtilities.runOnUIThread(() -> {\n"
+            "            AccountInstance accountInstance = AccountInstance.getInstance(currentAccount);\n"
+            "            if (accountInstance.getUserConfig().getClientUserId() != 0) {\n"
+            "                accountInstance.getUserConfig().clearConfig();\n"
+            "                accountInstance.getMessagesController().performLogout(0);\n"
+            "            }\n"
+            "        });\n"
+            "    }",
+            "    public static void onLogout(final int currentAccount) {\n"
+            "        if (ColgramGuestProxyService.inProbeProcess()) return;\n"
+            "        AndroidUtilities.runOnUIThread(() -> {\n"
+            "            AccountInstance accountInstance = AccountInstance.getInstance(currentAccount);\n"
+            "            TLRPC.User currentUser = accountInstance.getUserConfig().getCurrentUser();\n"
+            "            if (currentUser != null && currentUser.bot) {\n"
+            "                FileLog.w(\"Colgram: suppressed spurious MTProto onLogout for bot slot=\" + currentAccount);\n"
+            "                return;\n"
+            "            }\n"
+            "            if (accountInstance.getUserConfig().getClientUserId() != 0) {\n"
+            "                FileLog.w(\"Colgram: MTProto onLogout slot=\" + currentAccount\n"
+            "                        + \" uid=\" + accountInstance.getUserConfig().getClientUserId());\n"
+            "                accountInstance.getUserConfig().clearConfig();\n"
+            "                accountInstance.getMessagesController().performLogout(0);\n"
+            "            }\n"
+            "        });\n"
+            "    }",
+            "ConnectionsManager.onLogout bot account guard and logging",
+        )
+
+    # 6. Persistent Account & Data Backup across Updates and Uninstall/Reinstall
+    manifest = os.path.join(src_main, "AndroidManifest.xml")
+    if os.path.exists(manifest):
+        patch_file(
+            manifest,
+            '        android:allowBackup="true"\n'
+            '        android:restoreAnyVersion="true"',
+            '        android:allowBackup="true"\n'
+            '        android:hasFragileUserData="true"\n'
+            '        android:restoreAnyVersion="true"',
+            "AndroidManifest hasFragileUserData for uninstall retention prompt",
+        )
+
+    backup_agent = os.path.join(tg_msg, "BackupAgent.java")
+    if os.path.exists(backup_agent):
+        patch_file(
+            backup_agent,
+            '    @Override\n'
+            '    public void onCreate() {\n'
+            '        SharedPreferencesBackupHelper helper = new SharedPreferencesBackupHelper(this, "saved_tokens", "saved_tokens_login");\n'
+            '        addHelper("prefs", helper);\n'
+            '    }',
+            '    @Override\n'
+            '    public void onCreate() {\n'
+            '        SharedPreferencesBackupHelper helper = new SharedPreferencesBackupHelper(\n'
+            '                this,\n'
+            '                "saved_tokens",\n'
+            '                "saved_tokens_login",\n'
+            '                "colgram_secure_config",\n'
+            '                "colgram_account_vault",\n'
+            '                "colgram_bot_tokens_global",\n'
+            '                "colgram_bot_account_0",\n'
+            '                "colgram_bot_account_1",\n'
+            '                "colgram_bot_account_2",\n'
+            '                "colgram_bot_account_3",\n'
+            '                "colgram_bot_account_4",\n'
+            '                "userconfing",\n'
+            '                "userconfig1",\n'
+            '                "userconfig2",\n'
+            '                "userconfig3",\n'
+            '                "userconfig4"\n'
+            '        );\n'
+            '        addHelper("prefs", helper);\n'
+            '    }',
+            "BackupAgent expanded Colgram and account preferences",
+        )
+
+    app_loader = os.path.join(tg_msg, "ApplicationLoader.java")
+    if os.path.exists(app_loader):
+        patch_file(
+            app_loader,
+            "        // COLGRAM_GUEST_PROXY_BOOTSTRAP\n"
+            "        if (org.colgram.core.ColgramProcess.isGuestProxyProcess(this)) {\n"
+            "            org.telegram.tgnet.ColgramGuestProxyService.enterProbeProcess();\n"
+            "            return;\n"
+            "        }",
+            "        // COLGRAM_GUEST_PROXY_BOOTSTRAP\n"
+            "        if (org.colgram.core.ColgramProcess.isGuestProxyProcess(this)) {\n"
+            "            org.telegram.tgnet.ColgramGuestProxyService.enterProbeProcess();\n"
+            "            return;\n"
+            "        }\n"
+            "        // COLGRAM_PERSISTENT_BACKUP_RESTORE\n"
+            "        try {\n"
+            "            org.colgram.core.ColgramPersistentBackup.restoreIfFreshInstallSync(\n"
+            "                    applicationContext != null ? applicationContext : this);\n"
+            "        } catch (Throwable ignored) {}",
+            "ApplicationLoader pre-load persistent backup auto-restore",
+        )
+
+    user_cfg = os.path.join(tg_msg, "UserConfig.java")
+    if os.path.exists(user_cfg):
+        patch_file(
+            user_cfg,
+            "                    editor.apply();\n"
+            "                } catch (Exception e) {",
+            "                    editor.apply();\n"
+            "                    if (currentUser != null && ApplicationLoader.applicationContext != null) {\n"
+            "                        try {\n"
+            "                            org.colgram.core.ColgramPersistentBackup.scheduleAutoBackup(ApplicationLoader.applicationContext);\n"
+            "                        } catch (Throwable ignored) {}\n"
+            "                    }\n"
+            "                } catch (Exception e) {",
+            "UserConfig.saveConfig persistent auto-backup trigger",
+        )
+
+    launch_act = os.path.join(tg_ui, "LaunchActivity.java")
+    if os.path.exists(launch_act):
+        patch_file(
+            launch_act,
+            "        // COLGRAM_PRIVATE_CALL_ROUTE_CONSENT\n"
+            "        if (org.telegram.ui.ColgramCallRoutes.onActivityResult(this, requestCode, resultCode)) {\n"
+            "            super.onActivityResult(requestCode, resultCode, data);\n"
+            "            return;\n"
+            "        }",
+            "        // COLGRAM_PRIVATE_CALL_ROUTE_CONSENT\n"
+            "        if (org.telegram.ui.ColgramCallRoutes.onActivityResult(this, requestCode, resultCode)) {\n"
+            "            super.onActivityResult(requestCode, resultCode, data);\n"
+            "            return;\n"
+            "        }\n"
+            "        // COLGRAM_PERSISTENT_BACKUP_SAF\n"
+            "        if (org.telegram.ui.ColgramAccountSwitcherHelper.onPersistentBackupActivityResult(this, requestCode, resultCode, data)) {\n"
+            "            super.onActivityResult(requestCode, resultCode, data);\n"
+            "            return;\n"
+            "        }",
+            "LaunchActivity SAF persistent backup result handler",
+        )
+
+    intro_act = os.path.join(tg_ui, "IntroActivity.java")
+    if os.path.exists(intro_act):
+        patch_file(
+            intro_act,
+            "    private TextView switchLanguageTextView;\n"
+            "    private GradientDrawable startMessagingButtonBackground;",
+            "    private TextView switchLanguageTextView;\n"
+            "    private TextView restoreBackupTextView;\n"
+            "    private GradientDrawable startMessagingButtonBackground;",
+            "IntroActivity restoreBackupTextView field",
+        )
+        patch_file(
+            intro_act,
+            "                int btnH = startMessagingButton.getMeasuredHeight();\n"
+            "                int btnBottom = usableBottom - dp(compactH ? 18 : 24);\n"
+            "                int btnTop = btnBottom - btnH;\n"
+            "                int switchH = switchLanguageTextView.getMeasuredHeight();\n"
+            "                int switchBottom = btnTop - dp(compactH ? 10 : 14);\n"
+            "                int switchTop = switchBottom - switchH;\n\n"
+            "                // Prevent overlap on very compact landscape screens\n"
+            "                int minSwitchTop = y + dp(14);\n"
+            "                if (switchTop < minSwitchTop) {\n"
+            "                    switchTop = minSwitchTop;\n"
+            "                    switchBottom = switchTop + switchH;\n"
+            "                    btnTop = switchBottom + dp(10);\n"
+            "                    btnBottom = btnTop + btnH;\n"
+            "                }\n\n"
+            "                x = (w - startMessagingButton.getMeasuredWidth()) / 2;\n"
+            "                startMessagingButton.layout(x, btnTop, x + startMessagingButton.getMeasuredWidth(), btnBottom);\n"
+            "                x = (w - switchLanguageTextView.getMeasuredWidth()) / 2;\n"
+            "                switchLanguageTextView.layout(x, switchTop, x + switchLanguageTextView.getMeasuredWidth(), switchBottom);",
+            "                int btnH = startMessagingButton.getMeasuredHeight();\n"
+            "                int btnBottom = usableBottom - dp(compactH ? 18 : 24);\n"
+            "                int btnTop = btnBottom - btnH;\n"
+            "                int restoreH = restoreBackupTextView != null ? restoreBackupTextView.getMeasuredHeight() : 0;\n"
+            "                int restoreBottom = btnTop - dp(compactH ? 6 : 8);\n"
+            "                int restoreTop = restoreBottom - restoreH;\n"
+            "                int switchH = switchLanguageTextView.getMeasuredHeight();\n"
+            "                int switchBottom = (restoreH > 0 ? restoreTop : btnTop) - dp(compactH ? 4 : 6);\n"
+            "                int switchTop = switchBottom - switchH;\n\n"
+            "                // Prevent overlap on very compact landscape screens\n"
+            "                int minSwitchTop = y + dp(14);\n"
+            "                if (switchTop < minSwitchTop) {\n"
+            "                    switchTop = minSwitchTop;\n"
+            "                    switchBottom = switchTop + switchH;\n"
+            "                    if (restoreH > 0) {\n"
+            "                        restoreTop = switchBottom + dp(4);\n"
+            "                        restoreBottom = restoreTop + restoreH;\n"
+            "                        btnTop = restoreBottom + dp(6);\n"
+            "                    } else {\n"
+            "                        btnTop = switchBottom + dp(10);\n"
+            "                    }\n"
+            "                    btnBottom = btnTop + btnH;\n"
+            "                }\n\n"
+            "                x = (w - startMessagingButton.getMeasuredWidth()) / 2;\n"
+            "                startMessagingButton.layout(x, btnTop, x + startMessagingButton.getMeasuredWidth(), btnBottom);\n"
+            "                if (restoreBackupTextView != null) {\n"
+            "                    x = (w - restoreBackupTextView.getMeasuredWidth()) / 2;\n"
+            "                    restoreBackupTextView.layout(x, restoreTop, x + restoreBackupTextView.getMeasuredWidth(), restoreBottom);\n"
+            "                }\n"
+            "                x = (w - switchLanguageTextView.getMeasuredWidth()) / 2;\n"
+            "                switchLanguageTextView.layout(x, switchTop, x + switchLanguageTextView.getMeasuredWidth(), switchBottom);",
+            "IntroActivity restoreBackupTextView layout",
+        )
+        patch_file(
+            intro_act,
+            "        frameContainerView.addView(switchLanguageTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 38, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0, 0, 88));",
+            "        frameContainerView.addView(switchLanguageTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 38, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0, 0, 88));\n\n"
+            "        // COLGRAM_PERSISTENT_BACKUP_INTRO_RESTORE\n"
+            "        restoreBackupTextView = new TextView(context);\n"
+            "        restoreBackupTextView.setGravity(Gravity.CENTER);\n"
+            "        restoreBackupTextView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);\n"
+            "        restoreBackupTextView.setTypeface(AndroidUtilities.bold());\n"
+            "        restoreBackupTextView.setPadding(dp(16), dp(6), dp(16), dp(6));\n"
+            "        restoreBackupTextView.setText(isRuStart ? \"Восстановить аккаунты из копии\" : \"Restore accounts from backup\");\n"
+            "        ColgramMenuChrome.attachSpringPress(restoreBackupTextView);\n"
+            "        frameContainerView.addView(restoreBackupTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, 36, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL, 0, 0, 0, 84));\n"
+            "        restoreBackupTextView.setOnClickListener(v -> {\n"
+            "            Activity act = getParentActivity();\n"
+            "            if (act != null && !act.isFinishing()) {\n"
+            "                ColgramAccountSwitcherHelper.launchPersistentBackupRestore(act);\n"
+            "            }\n"
+            "        });",
+            "IntroActivity 1-tap restore accounts button",
+        )
+        patch_file(
+            intro_act,
+            '                startMessagingButton.setText(target.equals("ru") ? "Начать общение" : "Start Messaging");\n'
+            '                switchLanguageTextView.setText(target.equals("ru") ? "Continue in English" : "Продолжить на русском");',
+            '                startMessagingButton.setText(target.equals("ru") ? "Начать общение" : "Start Messaging");\n'
+            '                switchLanguageTextView.setText(target.equals("ru") ? "Continue in English" : "Продолжить на русском");\n'
+            '                if (restoreBackupTextView != null) {\n'
+            '                    restoreBackupTextView.setText(target.equals("ru") ? "Восстановить аккаунты из копии" : "Restore accounts from backup");\n'
+            '                }',
+            "IntroActivity restoreBackupTextView langBadge sync",
+        )
+        patch_file(
+            intro_act,
+            '        if (switchLanguageTextView != null) {\n'
+            '            switchLanguageTextView.setText(isRu ? "Continue in English" : "Продолжить на русском");\n'
+            '        }',
+            '        if (switchLanguageTextView != null) {\n'
+            '            switchLanguageTextView.setText(isRu ? "Continue in English" : "Продолжить на русском");\n'
+            '        }\n'
+            '        if (restoreBackupTextView != null) {\n'
+            '            restoreBackupTextView.setText(isRu ? "Восстановить аккаунты из копии" : "Restore accounts from backup");\n'
+            '        }',
+            "IntroActivity restoreBackupTextView checkContinueText sync",
+        )
+        patch_file(
+            intro_act,
+            "        switchLanguageTextView.setTextColor(pal.textSecondary);\n"
+            "        switchLanguageTextView.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(14), Color.TRANSPARENT, pal.accentSoft));",
+            "        switchLanguageTextView.setTextColor(pal.textSecondary);\n"
+            "        switchLanguageTextView.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(14), Color.TRANSPARENT, pal.accentSoft));\n"
+            "        if (restoreBackupTextView != null) {\n"
+            "            restoreBackupTextView.setTextColor(pal.accentPrimary);\n"
+            "            restoreBackupTextView.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(14), Color.TRANSPARENT, pal.accentSoft));\n"
+            "        }",
+            "IntroActivity restoreBackupTextView colors",
+        )
+
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
@@ -8322,6 +8696,7 @@ def main():
     from guest_proxy_patches import apply as inject_guest_proxy_probe
     inject_guest_proxy_probe(target_repo)
     inject_zero_perm_pip_patches(target_repo)
+    inject_reliability_and_backup_patches(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

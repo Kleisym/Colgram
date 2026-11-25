@@ -785,20 +785,41 @@ public final class ColgramNativeColemailerBridge {
 
     private static void executeDmInstantAutoDelete(int account, long dialogId, int msgId, int msgDate) {
         if (dialogId <= 0L || msgId <= 0) return;
-        // Mark force-purged immediately so Anti-Delete has zero race window.
+        // Mark force-purged synchronously BEFORE UI/storage dispatch so neither Anti-Delete nor
+        // ChatActivity.processNewMessages() can ever insert or keep this spam message visible.
         ColgramHookHandler.markForcePurged(dialogId, msgId);
         AndroidUtilities.runOnUIThread(() -> {
             try {
                 ColgramHookHandler.markForcePurged(dialogId, msgId);
-                MessagesController mc = MessagesController.getInstance(account);
+                final MessagesController mc = MessagesController.getInstance(account);
+                final ArrayList<Integer> ids = new ArrayList<>(1);
+                ids.add(msgId);
                 if (mc != null) {
-                    ArrayList<Integer> ids = new ArrayList<>(1);
-                    ids.add(msgId);
                     // revoke=true deletes for BOTH sides on Telegram servers instantaneously.
                     mc.deleteMessages(ids, null, null, dialogId, 0, true, 0);
                     if (!ColgramHookHandler.shouldPreventReadReceipt(dialogId)) {
                         mc.markDialogAsRead(dialogId, msgId, msgId, msgDate, false, 0, 0, true, 0);
                     }
+                    // Post-frame reconciliation: if MessagesController posted didReceiveNewMessages or
+                    // storageQueue wrote putMessagesInternal AFTER the immediate deleteMessages() ran,
+                    // this second local purge guarantees 0 sticky rows remain in ChatActivity or SQLite.
+                    AndroidUtilities.runOnUIThread(() -> {
+                        try {
+                            ColgramHookHandler.markForcePurged(dialogId, msgId);
+                            ColgramHookHandler.unmarkMessageDeleted(dialogId, msgId);
+                            MessagesStorage ms = MessagesStorage.getInstance(account);
+                            if (ms != null) {
+                                ms.markMessagesAsDeletedLocal(dialogId, ids, true, true, 0, 0);
+                                ms.updateDialogsWithDeletedMessages(dialogId, 0L, ids, null);
+                            }
+                            NotificationCenter.getInstance(account).postNotificationName(
+                                    NotificationCenter.messagesDeleted, ids, 0L, false, false, false, 0);
+                            NotificationsController nc2 = NotificationsController.getInstance(account);
+                            if (nc2 != null) {
+                                nc2.removeNotificationsForDialog(dialogId);
+                            }
+                        } catch (Throwable ignored) {}
+                    }, 220L);
                 }
                 NotificationsController nc = NotificationsController.getInstance(account);
                 if (nc != null) {

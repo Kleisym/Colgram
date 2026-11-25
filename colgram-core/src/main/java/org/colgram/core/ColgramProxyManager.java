@@ -559,6 +559,7 @@ public class ColgramProxyManager {
                     }
                     lastActiveNetworkHandle = -1L;
                     updateTransportCapabilities(manager, null);
+                    ColgramDpiBypass.reapStaleSessions(2_000L, 0L);
                     ColgramDpiBypass.clearTransientCooldowns();
                 }
             };
@@ -656,6 +657,9 @@ public class ColgramProxyManager {
         directRouteCheckedAt = 0L;
         localRouteUnavailableUntil = 0L;
         final boolean networkSwitched = "network available".equals(reason) || "cellular transport changed".equals(reason);
+        if (networkSwitched || "overlay transport changed".equals(reason)) {
+            ColgramDpiBypass.closeAllActiveSessions();
+        }
         if (manual || networkSwitched) {
             lastCatalogCycleFinishedAtMs = 0L;
         }
@@ -668,7 +672,11 @@ public class ColgramProxyManager {
             }
             publishPoolToStock();
             if (manual || (networkSwitched && !isTelegramConnected())) {
-                tgnetCheckConnection();
+                if (networkSwitched) {
+                    executor.execute(() -> tgnetForceReconnect(reason));
+                } else {
+                    tgnetCheckConnection();
+                }
             }
             if (backgroundProxySelection != null) backgroundProxyTick(backgroundProxySelection);
             else if (manual || (!connected && backgroundRelayOrProxyWorkNeeded(false))) {
@@ -721,7 +729,10 @@ public class ColgramProxyManager {
             if (localRouteWatchTask == null || localRouteWatchTask.isCancelled() || localRouteWatchTask.isDone()) {
                 localRouteWatchTask = scheduler.scheduleWithFixedDelay(() -> {
                     // Event-driven 127.0.0.1:9876 bypass stays alive 24/7 (even in background);
-                    // when already bound this 30s passive check returns immediately at 0% CPU.
+                    // passively reap half-open carrier sockets (pending reply >=15s) at ~0% CPU.
+                    try {
+                        ColgramDpiBypass.reapStaleSessions(15_000L, 0L);
+                    } catch (Throwable ignored) {}
                     if (!ColgramDpiBypass.wasExplicitlyStopped()
                             && (!ColgramDpiBypass.isBound()
                                 || (ColgramUiBridge.isAppInForeground() && currentActiveProxy == null))) {
@@ -777,7 +788,7 @@ public class ColgramProxyManager {
                     } catch (Throwable t) {
                         Log.w(TAG, "connection watchdog: " + t);
                     }
-                }, 15, 10, TimeUnit.SECONDS);
+                }, 8, 5, TimeUnit.SECONDS);
             }
             if (feedRefreshTask == null || feedRefreshTask.isCancelled() || feedRefreshTask.isDone()) {
                 feedRefreshTask = scheduler.scheduleWithFixedDelay(() -> {
@@ -866,6 +877,12 @@ public class ColgramProxyManager {
         int state = tgnetConnectionState();
         ProxyItem applied = currentActiveProxy;
         if (applied != null && applied.isLocalDpi()) {
+            // Proactively reap dead half-open carrier sockets (pending reply >=8s) before tgnet stalls.
+            int reaped = ColgramDpiBypass.reapStaleSessions(8_000L, 0L);
+            if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                ColgramDpiBypass.startImmediately();
+                mainHandler.post(() -> ensureLocalBaseRoute(ctx));
+            }
             // The permanent listener is not an external proxy. Do not treat local TCP accept
             // as success or try to rotate it away. Recover signed DC settings independently
             // of the catalog, without changing the chosen route or using a public relay.
@@ -880,33 +897,40 @@ public class ColgramProxyManager {
                 localBaseUpdatingTicks = 0;
                 return;
             }
+            if (reaped > 0) {
+                Log.i(TAG, "reaped " + reaped + " half-open local DPI sessions while state=" + state);
+            }
             if (state == TG_STATE_UPDATING) {
                 localBaseUnconnectedTicks = 0;
-                int updatingLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 6 : 4;
+                int updatingLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 5 : 3;
                 if (++localBaseUpdatingTicks >= updatingLimit) {
                     localBaseUpdatingTicks = 0;
-                    Log.w(TAG, "local base stuck in TG_STATE_UPDATING; clearing transient cooldowns and nudging tgnet");
+                    Log.w(TAG, "local base stuck in TG_STATE_UPDATING; reaping stale sessions and resetting tgnet");
                     localRouteUnavailableUntil = 0L;
+                    ColgramDpiBypass.reapStaleSessions(4_000L, 0L);
+                    ColgramDpiBypass.resetL3WhitelistCache();
                     ColgramDpiBypass.clearTransientCooldowns();
                     if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
                         executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
                     }
-                    tgnetCheckConnection();
+                    tgnetForceReconnect("local base updating stalled");
                     requestFreshDcAddresses("local base updating stalled");
                     if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
                 }
                 return;
             }
             localBaseUpdatingTicks = 0;
-            int unconnectedLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 5 : 3;
+            int unconnectedLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 4 : 2;
             if (++localBaseUnconnectedTicks >= unconnectedLimit) {
                 localBaseUnconnectedTicks = 0;
                 localRouteUnavailableUntil = 0L;
+                ColgramDpiBypass.reapStaleSessions(4_000L, 0L);
+                ColgramDpiBypass.resetL3WhitelistCache();
                 ColgramDpiBypass.clearTransientCooldowns();
                 if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
                     executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
                 }
-                tgnetCheckConnection();
+                tgnetForceReconnect("local base stalled");
                 requestFreshDcAddresses("local base stalled");
                 if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
             }
@@ -1104,6 +1128,11 @@ public class ColgramProxyManager {
         executor.execute(ColgramProxyManager::tgnetCheckConnection);
     }
 
+    private static volatile long lastForceReconnectAtMs = 0L;
+    private static final long FORCE_RECONNECT_COOLDOWN_MS = 4_000L;
+    private static volatile long lastAutoExitSwitchAtMs = 0L;
+    private static final long AUTO_EXIT_IP_SWITCH_COOLDOWN_MS = 60_000L;
+
     /** Ask tgnet to re-evaluate the network and rebuild its connections. */
     private static void tgnetCheckConnection() {
         try {
@@ -1112,6 +1141,56 @@ public class ColgramProxyManager {
             cm.getMethod("checkConnection").invoke(inst);
         } catch (Throwable t) {
             Log.w(TAG, "could not ask tgnet to re-dial: " + t);
+        }
+    }
+
+    /**
+     * Forces native tgnet across all activated accounts to drop wedged loopback/proxy sockets
+     * even when Android's networkType did not change across Doze/LTE sleep (4G -> 4G).
+     */
+    private static void tgnetForceReconnect(String reason) {
+        long now = safeClockMs();
+        long prev = lastForceReconnectAtMs;
+        if (prev > 0L && now >= prev && (now - prev) < FORCE_RECONNECT_COOLDOWN_MS) {
+            tgnetCheckConnection();
+            return;
+        }
+        lastForceReconnectAtMs = now;
+        try {
+            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            Class<?> uc = Class.forName("org.telegram.messenger.UserConfig");
+            java.lang.reflect.Method cmGet = cm.getMethod("getInstance", int.class);
+            java.lang.reflect.Method setNetAvail = cm.getMethod(
+                    "native_setNetworkAvailable", int.class, boolean.class, int.class, boolean.class);
+            java.lang.reflect.Method checkConn = cm.getMethod("checkConnection");
+            java.lang.reflect.Method resumeNet = cm.getMethod("resumeNetworkMaybe");
+            java.lang.reflect.Method ucGet = uc.getMethod("getInstance", int.class);
+            java.lang.reflect.Method isAct = uc.getMethod("isClientActivated");
+            int selected = selectedAccountSlot();
+            int nudged = 0;
+            for (int a = 0; a < colgramAccountSlots; a++) {
+                boolean active = (a == selected);
+                if (!active) {
+                    try {
+                        Object ucInst = ucGet.invoke(null, a);
+                        Object res = isAct.invoke(ucInst);
+                        active = (res instanceof Boolean) && (Boolean) res;
+                    } catch (Throwable ignored) {}
+                }
+                if (!active) continue;
+                Object inst = cmGet.invoke(null, a);
+                try {
+                    setNetAvail.invoke(null, a, false, 1, false);
+                } finally {
+                    checkConn.invoke(inst);
+                    try { resumeNet.invoke(inst); } catch (Throwable ignored) {}
+                }
+                nudged++;
+            }
+            Log.i(TAG, "TGNET_FORCE_RECONNECT accounts=" + nudged + " reason=" + reason);
+        } catch (Throwable t) {
+            Log.w(TAG, "tgnetForceReconnect fallback (" + reason + "): " + t);
+            tgnetCheckConnection();
         }
     }
 
@@ -1707,6 +1786,15 @@ public class ColgramProxyManager {
             return;
         }
         final ProxyItem picked = chosen;
+        if (!picked.isLocalDpi()) {
+            long nowExit = safeClockMs();
+            if (lastAutoExitSwitchAtMs > 0L && nowExit >= lastAutoExitSwitchAtMs
+                    && (nowExit - lastAutoExitSwitchAtMs) < AUTO_EXIT_IP_SWITCH_COOLDOWN_MS) {
+                Log.i(TAG, "holding exit-IP switch cooldown to protect MTProto auth_key stability");
+                return;
+            }
+            lastAutoExitSwitchAtMs = nowExit;
+        }
         if (!autoConnectPending.compareAndSet(false, true)) return;
         picked.autoSelected = true;
         Log.i(TAG, "Telegram unreachable directly; auto-connecting through "
@@ -2838,6 +2926,11 @@ public static void reportProxyFailure() {
         }
 
         if (now - lastRotationAt < ROTATION_DEBOUNCE_MS) {
+            return;
+        }
+        if (!force && lastAutoExitSwitchAtMs > 0L && now >= lastAutoExitSwitchAtMs
+                && (now - lastAutoExitSwitchAtMs) < AUTO_EXIT_IP_SWITCH_COOLDOWN_MS) {
+            Log.i(TAG, "holding automatic proxy rotation (60s exit-IP stability cooldown)");
             return;
         }
 
@@ -4395,12 +4488,31 @@ public static void reportProxyFailure() {
         mainHandler.post(() -> finishScheduledCatalogCheck(false));
     }
 
+    private static volatile long lastBackgroundedAtMs = 0L;
+    private static final Runnable postWakeVerifyRunner = () -> {
+        if (!ColgramUiBridge.isAppInForeground() || appContext == null) return;
+        if (ColgramConfig.isWarpEnabled() || hasSystemVpn(appContext)) return;
+        int state = tgnetConnectionState();
+        if (state == TG_STATE_CONNECTED || state == TG_STATE_WAITING_FOR_NETWORK || state < 0) return;
+        executor.execute(() -> {
+            ColgramDpiBypass.reapStaleSessions(2_000L, 0L);
+            ColgramDpiBypass.clearTransientCooldowns();
+            if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                ColgramDpiBypass.startImmediately();
+                mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+            }
+            tgnetForceReconnect("post-wake stalled state=" + state);
+        });
+    };
+
     /** Pauses heavy background feed scraping while keeping 127.0.0.1:9876 bypass & passive watchdog alive 24/7. */
     public static void onAppBackgrounded() {
+        lastBackgroundedAtMs = safeClockMs();
         stopBackgroundFeedScraping();
         if (mainHandler == null) return;
         mainHandler.post(() -> {
             if (ColgramUiBridge.isAppInForeground()) return;
+            mainHandler.removeCallbacks(postWakeVerifyRunner);
             stopBackgroundFeedScraping();
             ensureLocalWatchSchedulerRunning();
             backgroundProxyScheduledAt = Long.MAX_VALUE;
@@ -4414,25 +4526,52 @@ public static void reportProxyFailure() {
         });
     }
 
+    /** Called by ScreenReceiver on ACTION_SCREEN_ON to recycle NAT-expired pre-sleep carrier sockets. */
+    public static void onScreenTurnedOn() {
+        if (mainHandler == null || appContext == null) return;
+        executor.execute(() -> {
+            ColgramDpiBypass.resetL3WhitelistCache();
+            ColgramDpiBypass.clearTransientCooldowns();
+            ColgramTelegramWsBridge.clearCooldowns();
+            int reaped = ColgramDpiBypass.reapStaleSessions(5_000L, 15_000L);
+            if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                ColgramDpiBypass.startImmediately();
+                mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+            }
+            if (reaped > 0 || !isTelegramConnected()) {
+                tgnetForceReconnect("screen turned on reaped=" + reaped);
+            }
+        });
+    }
+
     /** Resumes foreground discovery and kicks an immediate <1s reconnect when returning to foreground. */
     public static void onAppForegrounded() {
         if (mainHandler == null || appContext == null) return;
+        final long bgAt = lastBackgroundedAtMs;
+        final long now = safeClockMs();
+        final long awayMs = (bgAt > 0L && now >= bgAt) ? (now - bgAt) : 0L;
         mainHandler.post(() -> {
             if (!ColgramUiBridge.isAppInForeground()) return;
             ensureLocalWatchSchedulerRunning();
             ensurePeriodicSchedulersRunning();
             localRouteUnavailableUntil = 0L;
+            mainHandler.removeCallbacks(postWakeVerifyRunner);
             executor.execute(() -> {
+                ColgramDpiBypass.resetL3WhitelistCache();
                 ColgramDpiBypass.clearTransientCooldowns();
                 ColgramTelegramWsBridge.clearCooldowns();
+                int reaped = awayMs >= 12_000L
+                        ? ColgramDpiBypass.reapStaleSessions(5_000L, 12_000L)
+                        : ColgramDpiBypass.reapStaleSessions(8_000L, 0L);
                 if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                     ColgramDpiBypass.startImmediately();
                     mainHandler.post(() -> ensureLocalBaseRoute(appContext));
                 }
-                if (!isTelegramConnected()) {
-                    tgnetCheckConnection();
+                if (!isTelegramConnected() || reaped > 0 || awayMs >= 20_000L) {
+                    tgnetForceReconnect("app foregrounded awayMs=" + awayMs + " reaped=" + reaped);
                 }
             });
+            mainHandler.postDelayed(postWakeVerifyRunner, 2_500L);
             if (backgroundRelayOrProxyWorkNeeded(false)) {
                 startProber();
                 scheduleBackgroundProxyCheck(1_500L);

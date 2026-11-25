@@ -144,10 +144,12 @@ public class ColgramAccountManager {
         int cur = prefs.getInt(key, 0);
         if (cur > 0) {
             prefs.edit().remove(key).apply();
+            ColgramPersistentBackup.scheduleAutoBackup(context);
             return false;
         }
         int next = prefs.getInt(KEY_PIN_COUNTER, 0) + 1;
         prefs.edit().putInt(KEY_PIN_COUNTER, next).putInt(key, next).apply();
+        ColgramPersistentBackup.scheduleAutoBackup(context);
         return true;
     }
 
@@ -159,10 +161,12 @@ public class ColgramAccountManager {
         int cur = prefs.getInt(key, 0);
         if (cur > 0) {
             prefs.edit().remove(key).apply();
+            ColgramPersistentBackup.scheduleAutoBackup(context);
             return false;
         }
         int next = prefs.getInt(KEY_PIN_COUNTER, 0) + 1;
         prefs.edit().putInt(KEY_PIN_COUNTER, next).putInt(key, next).apply();
+        ColgramPersistentBackup.scheduleAutoBackup(context);
         return true;
     }
 
@@ -282,6 +286,7 @@ public class ColgramAccountManager {
             File target = new File(vaultDir(app), vaultKey + ".cgv");
             writeAtomic(target, encrypted);
             upsertIndexEntry(app, entry);
+            ColgramPersistentBackup.scheduleAutoBackup(app);
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "archiveSlot failed for slot " + accountIndex, t);
@@ -430,6 +435,71 @@ public class ColgramAccountManager {
             prefs.edit().putString(KEY_VAULT_INDEX, dst.toString()).apply();
         } catch (Throwable ignored) {}
         return deleted;
+    }
+
+    /**
+     * Exports all locally archived vault bundles as decrypted serialized payloads so
+     * {@link ColgramPersistentBackup} can re-encrypt them under its reinstall-stable key
+     * (surviving AndroidKeyStore wipe on uninstall).
+     */
+    public static Map<String, byte[]> exportDecryptedVaultBundles(Context context) {
+        Map<String, byte[]> out = new java.util.LinkedHashMap<>();
+        if (context == null) return out;
+        Context app = context.getApplicationContext();
+        List<VaultEntry> entries = listVaultedAccounts(app);
+        if (entries.isEmpty()) return out;
+        try {
+            byte[] key = getOrCreateMasterKey(app);
+            File dir = vaultDir(app);
+            for (VaultEntry e : entries) {
+                String safeKey = sanitizeKey(e.vaultKey);
+                File src = new File(dir, safeKey + ".cgv");
+                if (!src.isFile()) continue;
+                try {
+                    byte[] enc = readFileBytes(src);
+                    byte[] plain = ColgramCryptoVault.decryptWithAad(
+                            key, enc, safeKey.getBytes(StandardCharsets.UTF_8));
+                    out.put(safeKey, plain);
+                } catch (Throwable err) {
+                    Log.w(TAG, "exportDecryptedVaultBundles skipped " + safeKey + ": " + err.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "exportDecryptedVaultBundles failed: " + t.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * Re-imports decrypted vault bundles onto a freshly installed instance, sealing them under
+     * this installation's own AndroidKeyStore master key and rebuilding the vault index.
+     */
+    public static int importDecryptedVaultBundles(Context context, Map<String, byte[]> rawBundles) {
+        if (context == null || rawBundles == null || rawBundles.isEmpty()) return 0;
+        Context app = context.getApplicationContext();
+        int imported = 0;
+        try {
+            byte[] key = getOrCreateMasterKey(app);
+            File dir = vaultDir(app);
+            for (Map.Entry<String, byte[]> e : rawBundles.entrySet()) {
+                byte[] plain = e.getValue();
+                if (plain == null || plain.length == 0) continue;
+                try {
+                    VaultBundle bundle = deserializeBundle(plain);
+                    String safeKey = sanitizeKey(bundle.entry.vaultKey);
+                    byte[] enc = ColgramCryptoVault.encryptWithAad(
+                            key, plain, safeKey.getBytes(StandardCharsets.UTF_8));
+                    writeAtomic(new File(dir, safeKey + ".cgv"), enc);
+                    upsertIndexEntry(app, bundle.entry);
+                    imported++;
+                } catch (Throwable err) {
+                    Log.w(TAG, "importDecryptedVaultBundles skipped " + e.getKey() + ": " + err.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "importDecryptedVaultBundles failed: " + t.getMessage());
+        }
+        return imported;
     }
 
     /** Backwards-compatible helper: exports encrypted snapshot and returns true if saved. */

@@ -162,6 +162,71 @@ class StabilityAndOverlayContractsTest(unittest.TestCase):
         self.assertIn("ProxyRotationController.java", src)
         self.assertIn("!SharedConfig.isProxyEnabled() || !SharedConfig.proxyRotationEnabled", src)
 
+    def test_pm_mute_sticky_message_race_eliminated(self):
+        bridge = read_text("scripts/templates/ColgramNativeColemailerBridge.java")
+        auto_del = extract_method(bridge, "private static void executeDmInstantAutoDelete(")
+        self.assertIn("ColgramHookHandler.markForcePurged(dialogId, msgId)", auto_del)
+        self.assertIn("NotificationCenter.messagesDeleted", auto_del)
+        self.assertIn("220L", auto_del)
+
+        ap = read_text("scripts/apply-patches.py")
+        self.assertIn("inject_reliability_and_backup_patches(", ap)
+        self.assertIn("isForcePurged(dialog_id, messageObject.getId())", ap)
+        self.assertIn("isDmAutoDeleteMuted(currentAccount, dialog_id)", ap)
+        self.assertIn("ConnectionsManager.getInstance(currentAccount).getCurrentTime()", ap)
+
+    def test_global_search_is_pure_global_without_local_chats_pollution(self):
+        gs = read_text("scripts/templates/ColgramGlobalSearchView.java")
+        self.assertNotIn("runLocalSearch", gs)
+        self.assertNotIn("Чаты и контакты", gs)
+        self.assertNotIn("Недавние чаты", gs)
+        self.assertIn("TL_contacts_search", gs)
+        self.assertIn("TL_contacts_resolveUsername", gs)
+        self.assertIn("TL_channels_searchPosts", gs)
+        self.assertIn("isPublicDiscoverablePeer", gs)
+        self.assertIn("getTranslitString", gs)
+        self.assertIn("getChannelRecommendations(0)", gs)
+        self.assertIn("onChannelRecommendationsLoaded()", gs)
+
+    def test_bypass_wake_reaper_and_anti_logout_contracts(self):
+        dpi = read_text("colgram-core/src/main/java/org/colgram/core/ColgramDpiBypass.java")
+        self.assertIn("reapStaleSessions(", dpi)
+        self.assertIn("pinnedTelegramL3Relay", dpi)
+        self.assertIn("resetL3WhitelistCache()", dpi)
+        self.assertIn("!overlayActive && !telegram && isEligibleForL3RelayCascade", dpi)
+
+        pm = read_text("colgram-core/src/main/java/org/colgram/core/ColgramProxyManager.java")
+        self.assertIn("public static void onScreenTurnedOn()", pm)
+        self.assertIn("tgnetForceReconnect(", pm)
+        self.assertIn("AUTO_EXIT_IP_SWITCH_COOLDOWN_MS", pm)
+        self.assertIn("postWakeVerifyRunner", pm)
+
+        defender = read_text("colgram-core/src/main/java/org/colgram/core/ColgramSecurityDefender.java")
+        audit_body = extract_method(defender, "public static synchronized AuditReport runFullAuditAndHeal(")
+        self.assertNotIn("ColgramConfig.setCloakEnabled(true)", audit_body)
+
+    def test_persistent_account_backup_and_restore_contracts(self):
+        pb = read_text("colgram-core/src/main/java/org/colgram/core/ColgramPersistentBackup.java")
+        self.assertIn("restoreIfFreshInstallSync(", pb)
+        self.assertIn("scheduleAutoBackup(", pb)
+        self.assertIn("backupNow(", pb)
+        self.assertIn("buildOpenBackupIntent()", pb)
+        self.assertIn("Documents/ColgramBackup", pb)
+        self.assertNotIn("MANAGE_EXTERNAL_STORAGE", pb)
+        self.assertNotIn("READ_PHONE_STATE", pb)
+
+        am = read_text("colgram-core/src/main/java/org/colgram/core/ColgramAccountManager.java")
+        self.assertIn("exportDecryptedVaultBundles(", am)
+        self.assertIn("importDecryptedVaultBundles(", am)
+
+        ap = read_text("scripts/apply-patches.py")
+        self.assertIn('android:hasFragileUserData="true"', ap)
+        self.assertIn("restoreIfFreshInstallSync", ap)
+        self.assertIn("ColgramPersistentBackup.scheduleAutoBackup", ap)
+        self.assertIn("onPersistentBackupActivityResult", ap)
+        self.assertIn("restoreBackupTextView", ap)
+        self.assertIn("suppressed spurious MTProto onLogout for bot slot=", ap)
+
 
 if __name__ == "__main__":
     unittest.main()

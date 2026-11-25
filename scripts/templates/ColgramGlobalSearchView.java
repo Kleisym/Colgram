@@ -66,15 +66,15 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Native-grade Telegram Global & Local Search:
- * - Instant offline search across local dialogs & contacts (including RU/EN transliteration,
- *   secondary collectible usernames, phones, and recent chats when query is empty)
- * - Parallel remote RPCs:
- *     1) TL_contacts_search (limit=50): populates BOTH res.my_results ("Чаты и контакты")
- *        and res.results ("Глобальный поиск")
+ * Pure Global Telegram Search:
+ * - Never pollutes Global Search with local private chats, personal contacts, or private messages
+ *   (Tab 0 "Чаты" / DialogsSearchAdapter already handles local chats & contacts).
+ * - Parallel remote global RPCs:
+ *     1) TL_contacts_search (limit=50): worldwide public channels, groups, bots, and public users
+ *        (plus automatic Cyrillic/Latin transliteration query in parallel when applicable)
  *     2) TL_contacts_resolveUsername: exact resolution for @username and t.me/... links
- *     3) TL_messages_searchGlobal (limit=25): global message search across user's chats
- *     4) TL_channels_searchPosts (limit=20): public channel post / #hashtag search
+ *     3) TL_channels_searchPosts (limit=20): worldwide public channel posts & #hashtags
+ *     4) Recommended public channels (getChannelRecommendations) when query is empty
  */
 public class ColgramGlobalSearchView extends FrameLayout {
 
@@ -83,7 +83,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
     private static final int FILTER_BOTS = 2;
     private static final int FILTER_GROUPS = 3;
     private static final int FILTER_PEOPLE = 4;
-    private static final int FILTER_MESSAGES = 5;
+    private static final int FILTER_POSTS = 5;
 
     private static final int VIEW_TYPE_FILTERS = 0;
     private static final int VIEW_TYPE_HEADER = 1;
@@ -91,6 +91,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
     private static final int VIEW_TYPE_MESSAGE = 3;
     private static final int VIEW_TYPE_EMPTY = 4;
     private static final int VIEW_TYPE_ACTION = 5;
+    private static final String ACTION_RETRY_TOKEN = "__colgram_retry_global_search__";
 
     private static final class PeerEntry {
         final long dialogId;
@@ -127,7 +128,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
     }
 
     private final BaseFragment parentFragment;
-    private final int currentAccount;
+    private int currentAccount;
     public final RecyclerListView listView;
     private final GlobalAdapter adapter;
     private final ProgressBar loadingSpinner;
@@ -137,19 +138,20 @@ public class ColgramGlobalSearchView extends FrameLayout {
     private int pendingRequests = 0;
     private boolean searchInFlight = false;
     private boolean searchCompletedForQuery = false;
+    private String lastErrorText = null;
 
     private int contactsReqId = 0;
+    private int translitContactsReqId = 0;
     private int resolveReqId = 0;
-    private int globalMessagesReqId = 0;
     private int publicPostsReqId = 0;
     private Runnable pendingSearchRunnable;
     private long lastOpenTapMs;
 
-    private final ArrayList<PeerEntry> localResults = new ArrayList<>();
-    private final ArrayList<PeerEntry> myServerResults = new ArrayList<>();
+    private final ArrayList<PeerEntry> recommendedChannels = new ArrayList<>();
     private final ArrayList<PeerEntry> globalResults = new ArrayList<>();
+    private final ArrayList<PeerEntry> globalTranslitResults = new ArrayList<>();
+    private final ArrayList<PeerEntry> publicJoinedResults = new ArrayList<>();
     private PeerEntry resolvedEntry = null;
-    private final ArrayList<TLRPC.Message> foundMessages = new ArrayList<>();
     private final ArrayList<TLRPC.Message> foundPublicPosts = new ArrayList<>();
     private final ArrayList<RowItem> rows = new ArrayList<>();
 
@@ -160,10 +162,19 @@ public class ColgramGlobalSearchView extends FrameLayout {
         return new ColgramGlobalSearchActivity();
     }
 
+    private int resolveAccount() {
+        int acc = parentFragment != null ? parentFragment.getCurrentAccount() : UserConfig.selectedAccount;
+        if (acc < 0 || acc >= UserConfig.MAX_ACCOUNT_COUNT) {
+            acc = UserConfig.selectedAccount;
+        }
+        currentAccount = acc;
+        return acc;
+    }
+
     public ColgramGlobalSearchView(Context context, BaseFragment fragment) {
         super(context);
         this.parentFragment = fragment;
-        this.currentAccount = fragment != null ? fragment.getCurrentAccount() : UserConfig.selectedAccount;
+        this.currentAccount = resolveAccount();
 
         listView = new RecyclerListView(context);
         listView.setClipToPadding(false);
@@ -178,7 +189,11 @@ public class ColgramGlobalSearchView extends FrameLayout {
             } else if (item.viewType == VIEW_TYPE_MESSAGE && item.message != null) {
                 openMessage(item.message);
             } else if (item.viewType == VIEW_TYPE_ACTION) {
-                performQuickAction(item.subText);
+                if (ACTION_RETRY_TOKEN.equals(item.subText)) {
+                    search(lastQuery, true);
+                } else {
+                    performQuickAction(item.subText);
+                }
             }
         });
         listView.setOnItemLongClickListener((view, position) -> {
@@ -197,8 +212,45 @@ public class ColgramGlobalSearchView extends FrameLayout {
         loadingSpinner.setVisibility(GONE);
         addView(loadingSpinner, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
 
-        runLocalSearch("");
+        loadRecommendedChannels();
         rebuildRows();
+    }
+
+    public void onChannelRecommendationsLoaded() {
+        if (lastQuery.isEmpty()) {
+            loadRecommendedChannels();
+            rebuildRows();
+        }
+    }
+
+    private void loadRecommendedChannels() {
+        recommendedChannels.clear();
+        try {
+            int acc = resolveAccount();
+            TLRPC.User self = UserConfig.getInstance(acc).getCurrentUser();
+            if (self != null && self.bot) return;
+            MessagesController mc = MessagesController.getInstance(acc);
+            if (mc == null) return;
+            MessagesController.ChannelRecommendations rec = mc.getChannelRecommendations(0);
+            if (rec == null || rec.chats == null) return;
+            HashSet<Long> seen = new HashSet<>();
+            int order = 0;
+            for (int i = 0; i < rec.chats.size() && recommendedChannels.size() < 25; i++) {
+                Object obj = rec.chats.get(i);
+                if (obj instanceof TLRPC.Chat) {
+                    TLRPC.Chat c = (TLRPC.Chat) obj;
+                    long did = -c.id;
+                    if (did != 0 && seen.add(did)) {
+                        recommendedChannels.add(new PeerEntry(did, c, null, false, 0, order++));
+                    }
+                } else if (obj instanceof TLRPC.User) {
+                    TLRPC.User u = (TLRPC.User) obj;
+                    if (u.id != 0 && seen.add(u.id)) {
+                        recommendedChannels.add(new PeerEntry(u.id, null, u, false, 0, order++));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     public void setPagesPaddings(int top, int bottom, boolean doNotRequestLayout) {
@@ -221,14 +273,13 @@ public class ColgramGlobalSearchView extends FrameLayout {
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        resolveAccount();
         if (!searchCompletedForQuery && !searchInFlight) {
             if (lastQuery.isEmpty()) {
-                runLocalSearch("");
+                loadRecommendedChannels();
                 rebuildRows();
             } else {
-                String q = lastQuery;
-                lastQuery = "";
-                search(q);
+                search(lastQuery, true);
             }
         }
     }
@@ -248,30 +299,34 @@ public class ColgramGlobalSearchView extends FrameLayout {
     }
 
     public void search(String rawQuery) {
+        search(rawQuery, false);
+    }
+
+    public void search(String rawQuery, boolean force) {
+        resolveAccount();
         String q = rawQuery == null ? "" : rawQuery.trim();
         if (pendingSearchRunnable != null) {
             AndroidUtilities.cancelRunOnUIThread(pendingSearchRunnable);
             pendingSearchRunnable = null;
         }
-        if (q.equals(lastQuery) && (searchCompletedForQuery || searchInFlight)) {
+        if (!force && q.equals(lastQuery) && (searchCompletedForQuery || searchInFlight)) {
             return;
         }
         cancelActiveRequests();
         lastQuery = q;
+        lastErrorText = null;
         searchCompletedForQuery = false;
         searchInFlight = false;
         pendingRequests = 0;
 
-        myServerResults.clear();
         globalResults.clear();
+        globalTranslitResults.clear();
+        publicJoinedResults.clear();
         resolvedEntry = null;
-        foundMessages.clear();
         foundPublicPosts.clear();
 
-        // Instant offline search across local dialogs & contacts (including recent chats when empty)
-        runLocalSearch(q);
-
         if (q.isEmpty()) {
+            loadRecommendedChannels();
             searchCompletedForQuery = true;
             loadingSpinner.setVisibility(GONE);
             rebuildRows();
@@ -291,22 +346,22 @@ public class ColgramGlobalSearchView extends FrameLayout {
 
         final String targetQuery = q;
         pendingSearchRunnable = () -> executeGlobalSearch(targetQuery);
-        AndroidUtilities.runOnUIThread(pendingSearchRunnable, 240L);
+        AndroidUtilities.runOnUIThread(pendingSearchRunnable, 220L);
     }
 
     private void cancelActiveRequests() {
-        ConnectionsManager cm = ConnectionsManager.getInstance(currentAccount);
+        ConnectionsManager cm = ConnectionsManager.getInstance(resolveAccount());
         if (contactsReqId != 0) {
             cm.cancelRequest(contactsReqId, true);
             contactsReqId = 0;
         }
+        if (translitContactsReqId != 0) {
+            cm.cancelRequest(translitContactsReqId, true);
+            translitContactsReqId = 0;
+        }
         if (resolveReqId != 0) {
             cm.cancelRequest(resolveReqId, true);
             resolveReqId = 0;
-        }
-        if (globalMessagesReqId != 0) {
-            cm.cancelRequest(globalMessagesReqId, true);
-            globalMessagesReqId = 0;
         }
         if (publicPostsReqId != 0) {
             cm.cancelRequest(publicPostsReqId, true);
@@ -314,131 +369,27 @@ public class ColgramGlobalSearchView extends FrameLayout {
         }
     }
 
-    private void runLocalSearch(String query) {
-        localResults.clear();
-        MessagesController mc = MessagesController.getInstance(currentAccount);
-        ContactsController cc = ContactsController.getInstance(currentAccount);
-        ArrayList<TLRPC.Dialog> dialogs = mc.getAllDialogs();
-        HashSet<Long> seen = new HashSet<>();
-
-        if (query == null || query.isEmpty()) {
-            int order = 0;
-            if (dialogs != null) {
-                for (int i = 0; i < dialogs.size() && localResults.size() < 15; i++) {
-                    TLRPC.Dialog d = dialogs.get(i);
-                    if (d == null || DialogObject.isEncryptedDialog(d.id) || !seen.add(d.id)) continue;
-                    TLRPC.Chat c = d.id < 0 ? mc.getChat(-d.id) : null;
-                    TLRPC.User u = d.id > 0 ? mc.getUser(d.id) : null;
-                    if (c == null && u == null) continue;
-                    localResults.add(new PeerEntry(d.id, c, u, true, 1, order++));
-                }
-            }
-            return;
-        }
-
-        String qLower = query.toLowerCase(Locale.ROOT);
-        String qHandle = extractUsernameCandidate(query);
-        String qAlt = qHandle != null ? qHandle.toLowerCase(Locale.ROOT)
-                : (qLower.startsWith("@") && qLower.length() > 1 ? qLower.substring(1) : qLower);
-        String translitRaw = LocaleController.getInstance().getTranslitString(qAlt);
-        String qTranslit = (translitRaw != null && !translitRaw.isEmpty() && !translitRaw.equals(qAlt))
-                ? translitRaw.toLowerCase(Locale.ROOT) : null;
-
-        int order = 0;
-        if (dialogs != null) {
-            for (int i = 0; i < dialogs.size(); i++) {
-                TLRPC.Dialog d = dialogs.get(i);
-                if (d == null || DialogObject.isEncryptedDialog(d.id) || !seen.add(d.id)) continue;
-                TLRPC.Chat c = d.id < 0 ? mc.getChat(-d.id) : null;
-                TLRPC.User u = d.id > 0 ? mc.getUser(d.id) : null;
-                int score = scoreLocalPeer(c, u, qLower, qAlt, qTranslit);
-                if (score > 0) {
-                    localResults.add(new PeerEntry(d.id, c, u, true, score, order++));
-                }
-            }
-        }
-
-        if (cc != null && cc.contacts != null) {
-            for (int i = 0; i < cc.contacts.size(); i++) {
-                TLRPC.TL_contact contact = cc.contacts.get(i);
-                if (contact == null || !seen.add(contact.user_id)) continue;
-                TLRPC.User u = mc.getUser(contact.user_id);
-                if (u == null) continue;
-                int score = scoreLocalPeer(null, u, qLower, qAlt, qTranslit);
-                if (score > 0) {
-                    localResults.add(new PeerEntry(contact.user_id, null, u, true, score, order++));
-                }
-            }
-        }
-
-        Collections.sort(localResults, (a, b) -> {
-            if (a.matchScore != b.matchScore) {
-                return Integer.compare(b.matchScore, a.matchScore);
-            }
-            return Integer.compare(a.orderIndex, b.orderIndex);
-        });
-    }
-
-    private static int scoreLocalPeer(TLRPC.Chat c, TLRPC.User u, String qLower, String qAlt, String qTranslit) {
-        int best = 0;
+    private static boolean isPublicDiscoverablePeer(TLRPC.Chat c, TLRPC.User u) {
         if (c != null) {
-            best = Math.max(best, scoreText(c.title, qLower, qAlt, qTranslit));
-            best = Math.max(best, scoreText(ChatObject.getPublicUsername(c), qLower, qAlt, qTranslit));
+            if (!TextUtils.isEmpty(ChatObject.getPublicUsername(c))) return true;
             if (c.usernames != null) {
                 for (TLRPC.TL_username un : c.usernames) {
-                    if (un != null && un.active) {
-                        best = Math.max(best, scoreText(un.username, qLower, qAlt, qTranslit));
-                    }
+                    if (un != null && un.active && !TextUtils.isEmpty(un.username)) return true;
                 }
             }
-            return best;
+            return false;
         }
         if (u != null) {
-            best = Math.max(best, scoreText(UserObject.getUserName(u), qLower, qAlt, qTranslit));
-            best = Math.max(best, scoreText(u.first_name, qLower, qAlt, qTranslit));
-            best = Math.max(best, scoreText(u.last_name, qLower, qAlt, qTranslit));
-            best = Math.max(best, scoreText(UserObject.getPublicUsername(u), qLower, qAlt, qTranslit));
+            if (UserObject.isUserSelf(u)) return false;
+            if (!TextUtils.isEmpty(UserObject.getPublicUsername(u))) return true;
             if (u.usernames != null) {
                 for (TLRPC.TL_username un : u.usernames) {
-                    if (un != null && un.active) {
-                        best = Math.max(best, scoreText(un.username, qLower, qAlt, qTranslit));
-                    }
+                    if (un != null && un.active && !TextUtils.isEmpty(un.username)) return true;
                 }
             }
-            if (UserObject.isUserSelf(u)) {
-                best = Math.max(best, scoreText("Избранное", qLower, qAlt, qTranslit));
-                best = Math.max(best, scoreText("Saved Messages", qLower, qAlt, qTranslit));
-            }
-            if (!TextUtils.isEmpty(u.phone)) {
-                String cleanPhone = u.phone.replaceAll("[^0-9]", "");
-                String cleanQ = qLower.replaceAll("[^0-9]", "");
-                if (!cleanQ.isEmpty() && cleanPhone.contains(cleanQ)) {
-                    best = Math.max(best, 2);
-                }
-            }
+            return false;
         }
-        return best;
-    }
-
-    private static int scoreText(String candidate, String qLower, String qAlt, String qTranslit) {
-        if (TextUtils.isEmpty(candidate)) return 0;
-        String low = candidate.toLowerCase(Locale.ROOT);
-        int best = scoreSingle(low, qLower);
-        if (!qAlt.equals(qLower)) {
-            best = Math.max(best, scoreSingle(low, qAlt));
-        }
-        if (qTranslit != null) {
-            best = Math.max(best, scoreSingle(low, qTranslit));
-        }
-        return best;
-    }
-
-    private static int scoreSingle(String textLower, String queryLower) {
-        if (TextUtils.isEmpty(queryLower)) return 0;
-        if (textLower.equals(queryLower)) return 3;
-        if (textLower.startsWith(queryLower) || textLower.contains(" " + queryLower)) return 2;
-        if (textLower.contains(queryLower)) return 1;
-        return 0;
+        return false;
     }
 
     private static String extractDirectUrl(String query) {
@@ -486,12 +437,26 @@ public class ColgramGlobalSearchView extends FrameLayout {
         return s;
     }
 
+    private static String formatRpcError(TLRPC.TL_error error) {
+        if (error == null || TextUtils.isEmpty(error.text)) return null;
+        String t = error.text;
+        if (t.startsWith("FLOOD_WAIT_")) {
+            String sec = t.substring("FLOOD_WAIT_".length());
+            return "Telegram временно ограничил поиск (подождите " + sec + " сек.)";
+        }
+        if (t.contains("SEARCH_QUERY_EMPTY")) {
+            return null;
+        }
+        return "Ошибка глобального поиска: " + t;
+    }
+
     private void executeGlobalSearch(final String query) {
         if (!TextUtils.equals(query, lastQuery)) return;
-        final MessagesController mc = MessagesController.getInstance(currentAccount);
-        final MessagesStorage ms = MessagesStorage.getInstance(currentAccount);
-        final ConnectionsManager cm = ConnectionsManager.getInstance(currentAccount);
-        final TLRPC.User self = UserConfig.getInstance(currentAccount).getCurrentUser();
+        final int acc = resolveAccount();
+        final MessagesController mc = MessagesController.getInstance(acc);
+        final MessagesStorage ms = MessagesStorage.getInstance(acc);
+        final ConnectionsManager cm = ConnectionsManager.getInstance(acc);
+        final TLRPC.User self = UserConfig.getInstance(acc).getCurrentUser();
 
         if (self != null && self.bot) {
             pendingRequests = 0;
@@ -503,14 +468,14 @@ public class ColgramGlobalSearchView extends FrameLayout {
         }
 
         final String usernameCand = extractUsernameCandidate(query);
+        final String rpcQuery = usernameCand != null ? usernameCand
+                : (query.startsWith("@") && query.length() > 1 ? query.substring(1) : query);
         int reqCount = 0;
 
-        // 1. Official Telegram Global & Own Server Search (TL_contacts_search limit=50)
-        if (query.length() >= 2) {
+        // 1. Official Telegram Global Peer Search (TL_contacts_search limit=50)
+        if (rpcQuery.length() >= 2) {
             reqCount++;
             TLRPC.TL_contacts_search contactsReq = new TLRPC.TL_contacts_search();
-            String rpcQuery = usernameCand != null ? usernameCand
-                    : (query.startsWith("@") && query.length() > 1 ? query.substring(1) : query);
             contactsReq.q = rpcQuery;
             contactsReq.limit = 50;
             contactsReqId = cm.sendRequest(contactsReq, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
@@ -535,23 +500,9 @@ public class ColgramGlobalSearchView extends FrameLayout {
                         }
                     }
 
-                    myServerResults.clear();
                     globalResults.clear();
-                    HashSet<Long> mySeen = new HashSet<>();
+                    publicJoinedResults.clear();
                     HashSet<Long> globalSeen = new HashSet<>();
-                    int myOrder = 0;
-                    if (res.my_results != null) {
-                        for (TLRPC.Peer peer : res.my_results) {
-                            if (peer == null) continue;
-                            long did = DialogObject.getPeerDialogId(peer);
-                            if (did == 0 || !mySeen.add(did)) continue;
-                            TLRPC.Chat c = did < 0 ? chatById.get(-did) : null;
-                            TLRPC.User u = did > 0 ? userById.get(did) : null;
-                            if (c == null && u == null) continue;
-                            myServerResults.add(new PeerEntry(did, c, u, true, 0, myOrder++));
-                        }
-                    }
-
                     int gOrder = 0;
                     if (res.results != null) {
                         for (TLRPC.Peer peer : res.results) {
@@ -561,12 +512,78 @@ public class ColgramGlobalSearchView extends FrameLayout {
                             TLRPC.Chat c = did < 0 ? chatById.get(-did) : null;
                             TLRPC.User u = did > 0 ? userById.get(did) : null;
                             if (c == null && u == null) continue;
-                            globalResults.add(new PeerEntry(did, c, u, mySeen.contains(did), 0, gOrder++));
+                            if (u != null && UserObject.isUserSelf(u)) continue;
+                            globalResults.add(new PeerEntry(did, c, u, false, 0, gOrder++));
                         }
                     }
+                    // Include ONLY public discoverable peers (with @username) from my_results
+                    // so private personal DMs / private contacts NEVER leak into Global Search!
+                    int pubOrder = 0;
+                    if (res.my_results != null) {
+                        for (TLRPC.Peer peer : res.my_results) {
+                            if (peer == null) continue;
+                            long did = DialogObject.getPeerDialogId(peer);
+                            if (did == 0 || !globalSeen.add(did)) continue;
+                            TLRPC.Chat c = did < 0 ? chatById.get(-did) : null;
+                            TLRPC.User u = did > 0 ? userById.get(did) : null;
+                            if (!isPublicDiscoverablePeer(c, u)) continue;
+                            publicJoinedResults.add(new PeerEntry(did, c, u, true, 0, pubOrder++));
+                        }
+                    }
+                } else if (error != null) {
+                    String errMsg = formatRpcError(error);
+                    if (errMsg != null) lastErrorText = errMsg;
                 }
                 onOneRequestDone();
-            }));
+            }), ConnectionsManager.RequestFlagFailOnServerErrors);
+
+            // 1b. Parallel transliteration query for Cyrillic/Latin discovery (e.g. "телеграм" -> "telegram")
+            String translitRaw = LocaleController.getInstance().getTranslitString(rpcQuery);
+            final String translitQ = translitRaw != null ? translitRaw.trim() : "";
+            if (translitQ.length() >= 3 && !translitQ.equalsIgnoreCase(rpcQuery)) {
+                reqCount++;
+                TLRPC.TL_contacts_search trReq = new TLRPC.TL_contacts_search();
+                trReq.q = translitQ;
+                trReq.limit = 30;
+                translitContactsReqId = cm.sendRequest(trReq, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+                    translitContactsReqId = 0;
+                    if (!TextUtils.equals(query, lastQuery)) return;
+                    if (error == null && response instanceof TLRPC.TL_contacts_found) {
+                        TLRPC.TL_contacts_found res = (TLRPC.TL_contacts_found) response;
+                        mc.putUsers(res.users, false);
+                        mc.putChats(res.chats, false);
+                        ms.putUsersAndChats(res.users, res.chats, true, true);
+                        HashMap<Long, TLRPC.Chat> chatById = new HashMap<>();
+                        if (res.chats != null) {
+                            for (TLRPC.Chat c : res.chats) {
+                                if (c != null) chatById.put(c.id, c);
+                            }
+                        }
+                        HashMap<Long, TLRPC.User> userById = new HashMap<>();
+                        if (res.users != null) {
+                            for (TLRPC.User u : res.users) {
+                                if (u != null) userById.put(u.id, u);
+                            }
+                        }
+                        globalTranslitResults.clear();
+                        HashSet<Long> seenTr = new HashSet<>();
+                        int trOrder = 0;
+                        if (res.results != null) {
+                            for (TLRPC.Peer peer : res.results) {
+                                if (peer == null) continue;
+                                long did = DialogObject.getPeerDialogId(peer);
+                                if (did == 0 || !seenTr.add(did)) continue;
+                                TLRPC.Chat c = did < 0 ? chatById.get(-did) : null;
+                                TLRPC.User u = did > 0 ? userById.get(did) : null;
+                                if (c == null && u == null) continue;
+                                if (u != null && UserObject.isUserSelf(u)) continue;
+                                globalTranslitResults.add(new PeerEntry(did, c, u, false, 0, trOrder++));
+                            }
+                        }
+                    }
+                    onOneRequestDone();
+                }), ConnectionsManager.RequestFlagFailOnServerErrors);
+            }
         }
 
         // 2. Exact @username / t.me link resolver (TL_contacts_resolveUsername)
@@ -597,41 +614,16 @@ public class ColgramGlobalSearchView extends FrameLayout {
                             }
                         }
                         if (c != null || u != null) {
-                            boolean mine = mc.getDialog(did) != null;
-                            resolvedEntry = new PeerEntry(did, c, u, mine, 4, -1);
+                            resolvedEntry = new PeerEntry(did, c, u, false, 4, -1);
                         }
                     }
                 }
                 onOneRequestDone();
-            }));
+            }), ConnectionsManager.RequestFlagFailOnServerErrors);
         }
 
-        // 3. Global messages across all joined chats/groups/channels (TL_messages_searchGlobal)
-        if (query.length() >= 2) {
-            reqCount++;
-            TLRPC.TL_messages_searchGlobal msgReq = new TLRPC.TL_messages_searchGlobal();
-            msgReq.q = query;
-            msgReq.limit = 25;
-            msgReq.filter = new TLRPC.TL_inputMessagesFilterEmpty();
-            msgReq.offset_peer = new TLRPC.TL_inputPeerEmpty();
-            msgReq.flags = 0;
-            globalMessagesReqId = cm.sendRequest(msgReq, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
-                globalMessagesReqId = 0;
-                if (!TextUtils.equals(query, lastQuery)) return;
-                if (error == null && response instanceof TLRPC.messages_Messages) {
-                    TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
-                    mc.putUsers(res.users, false);
-                    mc.putChats(res.chats, false);
-                    ms.putUsersAndChats(res.users, res.chats, true, true);
-                    foundMessages.clear();
-                    if (res.messages != null) {
-                        foundMessages.addAll(res.messages);
-                    }
-                }
-                onOneRequestDone();
-            }));
-
-            // 4. Worldwide public channel posts (TL_channels_searchPosts)
+        // 3. Worldwide public channel posts & #hashtags (TL_channels_searchPosts)
+        if ((query.startsWith("#") && query.length() > 1) || query.length() >= 3) {
             reqCount++;
             TLRPC.TL_channels_searchPosts postsReq = new TLRPC.TL_channels_searchPosts();
             if (query.startsWith("#") && query.length() > 1) {
@@ -657,7 +649,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
                     }
                 }
                 onOneRequestDone();
-            }));
+            }), ConnectionsManager.RequestFlagFailOnServerErrors);
         }
 
         pendingRequests = reqCount;
@@ -696,25 +688,43 @@ public class ColgramGlobalSearchView extends FrameLayout {
         return false;
     }
 
+    private ArrayList<PeerEntry> collectAllGlobalPeers() {
+        HashSet<Long> seen = new HashSet<>();
+        ArrayList<PeerEntry> merged = new ArrayList<>();
+        if (resolvedEntry != null && seen.add(resolvedEntry.dialogId)) {
+            merged.add(resolvedEntry);
+        }
+        for (PeerEntry e : globalResults) {
+            if (seen.add(e.dialogId)) merged.add(e);
+        }
+        for (PeerEntry e : globalTranslitResults) {
+            if (seen.add(e.dialogId)) merged.add(e);
+        }
+        for (PeerEntry e : publicJoinedResults) {
+            if (seen.add(e.dialogId)) merged.add(e);
+        }
+        return merged;
+    }
+
     private void rebuildRows() {
         rows.clear();
         rows.add(new RowItem(VIEW_TYPE_FILTERS, null, null, null, null));
 
         if (lastQuery.isEmpty()) {
-            ArrayList<PeerEntry> recents = new ArrayList<>();
-            for (PeerEntry e : localResults) {
+            ArrayList<PeerEntry> recs = new ArrayList<>();
+            for (PeerEntry e : recommendedChannels) {
                 if (matchesPeerFilter(e, activeFilter)) {
-                    recents.add(e);
+                    recs.add(e);
                 }
             }
-            if (!recents.isEmpty()) {
-                rows.add(new RowItem(VIEW_TYPE_HEADER, "Недавние чаты", null, null, null));
-                for (PeerEntry e : recents) {
+            if (!recs.isEmpty()) {
+                rows.add(new RowItem(VIEW_TYPE_HEADER, "Популярные публичные каналы", null, null, null));
+                for (PeerEntry e : recs) {
                     rows.add(new RowItem(VIEW_TYPE_PEER, null, null, e, null));
                 }
             } else {
                 rows.add(new RowItem(VIEW_TYPE_EMPTY,
-                        "Введите имя, @username, ссылку t.me/... или слово из сообщений.",
+                        "Глобальный поиск по всему Telegram.\nВведите название канала, бота, группы, @username, ссылку t.me/... или #хэштег.",
                         null, null, null));
             }
             loadingSpinner.setVisibility(GONE);
@@ -730,47 +740,17 @@ public class ColgramGlobalSearchView extends FrameLayout {
             rows.add(new RowItem(VIEW_TYPE_ACTION, "Открыть @" + handleCand, handleCand, null, null));
         }
 
-        if (activeFilter != FILTER_MESSAGES) {
-            HashSet<Long> shownDialogIds = new HashSet<>();
-            ArrayList<PeerEntry> myPeers = new ArrayList<>();
-
-            // Exact resolved peer goes first in its natural section if it belongs to my chats
-            if (resolvedEntry != null && resolvedEntry.isMine && matchesPeerFilter(resolvedEntry, activeFilter)) {
-                if (shownDialogIds.add(resolvedEntry.dialogId)) {
-                    myPeers.add(resolvedEntry);
-                }
-            }
-            for (PeerEntry e : localResults) {
-                if (matchesPeerFilter(e, activeFilter) && shownDialogIds.add(e.dialogId)) {
-                    myPeers.add(e);
-                }
-            }
-            for (PeerEntry e : myServerResults) {
-                if (matchesPeerFilter(e, activeFilter) && shownDialogIds.add(e.dialogId)) {
-                    myPeers.add(e);
-                }
-            }
-
-            if (!myPeers.isEmpty()) {
-                rows.add(new RowItem(VIEW_TYPE_HEADER, "Чаты и контакты", null, null, null));
-                for (PeerEntry e : myPeers) {
-                    rows.add(new RowItem(VIEW_TYPE_PEER, null, null, e, null));
-                }
-            }
-
+        boolean hasRealResults = false;
+        if (activeFilter != FILTER_POSTS) {
+            ArrayList<PeerEntry> allGlobal = collectAllGlobalPeers();
             ArrayList<PeerEntry> remotePeers = new ArrayList<>();
-            if (resolvedEntry != null && !resolvedEntry.isMine && matchesPeerFilter(resolvedEntry, activeFilter)) {
-                if (shownDialogIds.add(resolvedEntry.dialogId)) {
-                    remotePeers.add(resolvedEntry);
-                }
-            }
-            for (PeerEntry e : globalResults) {
-                if (matchesPeerFilter(e, activeFilter) && shownDialogIds.add(e.dialogId)) {
+            for (PeerEntry e : allGlobal) {
+                if (matchesPeerFilter(e, activeFilter)) {
                     remotePeers.add(e);
                 }
             }
-
             if (!remotePeers.isEmpty()) {
+                hasRealResults = true;
                 rows.add(new RowItem(VIEW_TYPE_HEADER, "Глобальный поиск", null, null, null));
                 for (PeerEntry e : remotePeers) {
                     rows.add(new RowItem(VIEW_TYPE_PEER, null, null, e, null));
@@ -778,19 +758,9 @@ public class ColgramGlobalSearchView extends FrameLayout {
             }
         }
 
-        if (activeFilter == FILTER_ALL || activeFilter == FILTER_MESSAGES) {
-            HashSet<String> seenMsgKeys = new HashSet<>();
-            if (!foundMessages.isEmpty()) {
-                rows.add(new RowItem(VIEW_TYPE_HEADER, "Сообщения", null, null, null));
-                for (TLRPC.Message msg : foundMessages) {
-                    if (msg == null) continue;
-                    String key = MessageObject.getDialogId(msg) + ":" + msg.id;
-                    if (seenMsgKeys.add(key)) {
-                        rows.add(new RowItem(VIEW_TYPE_MESSAGE, null, null, null, msg));
-                    }
-                }
-            }
+        if (activeFilter == FILTER_ALL || activeFilter == FILTER_POSTS) {
             if (!foundPublicPosts.isEmpty()) {
+                HashSet<String> seenMsgKeys = new HashSet<>();
                 ArrayList<TLRPC.Message> postsToAdd = new ArrayList<>();
                 for (TLRPC.Message msg : foundPublicPosts) {
                     if (msg == null) continue;
@@ -800,7 +770,8 @@ public class ColgramGlobalSearchView extends FrameLayout {
                     }
                 }
                 if (!postsToAdd.isEmpty()) {
-                    rows.add(new RowItem(VIEW_TYPE_HEADER, "Публичные посты", null, null, null));
+                    hasRealResults = true;
+                    rows.add(new RowItem(VIEW_TYPE_HEADER, "Публичные посты в каналах", null, null, null));
                     for (TLRPC.Message msg : postsToAdd) {
                         rows.add(new RowItem(VIEW_TYPE_MESSAGE, null, null, null, msg));
                     }
@@ -808,13 +779,17 @@ public class ColgramGlobalSearchView extends FrameLayout {
             }
         }
 
-        boolean hasContentRows = rows.size() > 1;
-        loadingSpinner.setVisibility((pendingRequests > 0 || searchInFlight) && !hasContentRows ? VISIBLE : GONE);
+        loadingSpinner.setVisibility((pendingRequests > 0 || searchInFlight) && !hasRealResults ? VISIBLE : GONE);
 
-        if (!hasContentRows && !searchInFlight && pendingRequests == 0) {
-            rows.add(new RowItem(VIEW_TYPE_EMPTY,
-                    "Ничего не найдено по запросу «" + lastQuery + "»",
-                    null, null, null));
+        if (!hasRealResults && !searchInFlight && pendingRequests == 0) {
+            if (lastErrorText != null) {
+                rows.add(new RowItem(VIEW_TYPE_EMPTY, lastErrorText, null, null, null));
+                rows.add(new RowItem(VIEW_TYPE_ACTION, "Повторить глобальный поиск", ACTION_RETRY_TOKEN, null, null));
+            } else {
+                rows.add(new RowItem(VIEW_TYPE_EMPTY,
+                        "В глобальном поиске Telegram ничего не найдено по запросу «" + lastQuery + "»",
+                        null, null, null));
+            }
         }
         adapter.notifyDataSetChanged();
     }
@@ -965,7 +940,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
 
     private final class FilterStripCell extends HorizontalScrollView {
         private final LinearLayout row;
-        private final String[] labels = {"Все", "Каналы", "Боты", "Группы", "Люди", "Сообщения"};
+        private final String[] labels = {"Все", "Каналы", "Боты", "Группы", "Люди", "Посты"};
         private final TextView[] pills = new TextView[labels.length];
         private final GradientDrawable[] pillBgs = new GradientDrawable[labels.length];
 
@@ -1004,10 +979,21 @@ public class ColgramGlobalSearchView extends FrameLayout {
 
         void bind() {
             ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            ArrayList<PeerEntry> pool = lastQuery.isEmpty() ? recommendedChannels : collectAllGlobalPeers();
+            int cAll = pool.size() + foundPublicPosts.size();
+            int cCh = 0, cBots = 0, cGrp = 0, cPpl = 0;
+            for (PeerEntry e : pool) {
+                if (matchesPeerFilter(e, FILTER_CHANNELS)) cCh++;
+                else if (matchesPeerFilter(e, FILTER_GROUPS)) cGrp++;
+                else if (matchesPeerFilter(e, FILTER_BOTS)) cBots++;
+                else if (matchesPeerFilter(e, FILTER_PEOPLE)) cPpl++;
+            }
+            int[] counts = new int[]{cAll, cCh, cBots, cGrp, cPpl, foundPublicPosts.size()};
             for (int i = 0; i < pills.length; i++) {
                 boolean selected = activeFilter == i;
                 TextView pill = pills[i];
                 GradientDrawable bg = pillBgs[i];
+                pill.setText(!lastQuery.isEmpty() && counts[i] > 0 ? (labels[i] + " · " + counts[i]) : labels[i]);
                 if (selected) {
                     bg.setColor(pal.accentPrimary);
                     bg.setStroke(0, 0);
@@ -1300,7 +1286,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
         public View createView(Context context) {
             actionBar.setBackButtonImage(R.drawable.ic_ab_back);
             actionBar.setAllowOverlayTitle(true);
-            actionBar.setTitle("Поиск в Telegram");
+            actionBar.setTitle("Глобальный поиск");
             ColgramMenuChrome.styleActionBar(actionBar);
             actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
                 @Override
@@ -1335,7 +1321,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
 
             searchInput = new EditText(context);
             searchInput.setBackground(null);
-            searchInput.setHint("Поиск чатов, @username, t.me и сообщений…");
+            searchInput.setHint("Глобальный поиск: каналы, боты, @username, #теги…");
             searchInput.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourceProvider));
             searchInput.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourceProvider));
             searchInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15f);

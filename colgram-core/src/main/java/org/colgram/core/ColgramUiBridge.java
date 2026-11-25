@@ -74,6 +74,7 @@ public final class ColgramUiBridge {
                         isForeground = false;
                         try { ColgramProxyManager.onAppBackgrounded(); } catch (Throwable ignored) {}
                         try { ColgramForegroundService.onAppBackgrounded(); } catch (Throwable ignored) {}
+                        try { ColgramPersistentBackup.scheduleAutoBackup(activity); } catch (Throwable ignored) {}
                     }
                 }
 

@@ -734,17 +734,38 @@ public class ColgramSettingsActivity extends BaseFragment {
         final Context appCtx = act.getApplicationContext();
         final java.io.File backupFile = new java.io.File(ColgramStorageSandbox.getRootPath(appCtx), "colgram_settings_backup.json");
         showDialog(new AlertDialog.Builder(act, resourceProvider)
-                .setTitle("Бэкап настроек (JSON / AES-256)")
+                .setTitle("Бэкап аккаунтов и настроек (AES-256)")
                 .setItems(new CharSequence[]{
-                        "Экспорт в файл: " + backupFile.getName(),
-                        "Импорт из файла: " + backupFile.getName(),
+                        "Сохранить ВСЕ аккаунты и данные в Documents/ColgramBackup",
+                        "Восстановить ВСЕ аккаунты и данные из файла (.cgb)",
+                        "Перенести на другой телефон (экспорт .cgb с паролем)",
+                        "Экспорт настроек в файл: " + backupFile.getName(),
+                        "Импорт настроек из файла: " + backupFile.getName(),
                         "Копировать JSON в буфер обмена",
                         "Восстановить JSON из буфера обмена",
-                        "Зашифрованный экспорт в буфер (AES-256)",
+                        "Зашифрованный экспорт настроек в буфер (AES-256)",
                         "Импорт зашифрованного бэкапа из буфера"
                 }, (dialog, which) -> {
                     try {
                         if (which == 0) {
+                            warpOperations.execute(() -> {
+                                for (int a = 0; a < org.telegram.messenger.UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                                    if (org.telegram.messenger.UserConfig.getInstance(a).isClientActivated()) {
+                                        org.telegram.messenger.UserConfig.getInstance(a).saveConfig(true);
+                                    }
+                                }
+                                org.colgram.core.ColgramPersistentBackup.BackupResult res =
+                                        org.colgram.core.ColgramPersistentBackup.backupNow(appCtx, null);
+                                uiHandler.post(() -> Toast.makeText(appCtx,
+                                        res.success ? ("Сохранено (" + res.accountCount + " акк.) -> " + res.location)
+                                                : ("Ошибка: " + res.error),
+                                        Toast.LENGTH_LONG).show());
+                            });
+                        } else if (which == 1) {
+                            ColgramAccountSwitcherHelper.launchPersistentBackupRestore(act);
+                        } else if (which == 2) {
+                            promptPortableVaultPassphrase(act);
+                        } else if (which == 3) {
                             warpOperations.execute(() -> {
                                 try {
                                     java.io.File written = ColgramSettingsBackup.exportToFile(appCtx, backupFile);
@@ -753,7 +774,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                                     uiHandler.post(() -> Toast.makeText(appCtx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show());
                                 }
                             });
-                        } else if (which == 1) {
+                        } else if (which == 4) {
                             warpOperations.execute(() -> {
                                 try {
                                     if (!backupFile.exists()) {
@@ -769,11 +790,11 @@ public class ColgramSettingsActivity extends BaseFragment {
                                     uiHandler.post(() -> Toast.makeText(appCtx, "Ошибка: " + error.getMessage(), Toast.LENGTH_LONG).show());
                                 }
                             });
-                        } else if (which == 2) {
+                        } else if (which == 5) {
                             String json = ColgramSettingsBackup.exportToJson(appCtx);
                             AndroidUtilities.addToClipboard(json);
                             Toast.makeText(appCtx, "JSON бэкап скопирован", Toast.LENGTH_SHORT).show();
-                        } else if (which == 3) {
+                        } else if (which == 6) {
                             ClipboardManager cm = (ClipboardManager) appCtx.getSystemService(Context.CLIPBOARD_SERVICE);
                             ClipData clip = cm != null ? cm.getPrimaryClip() : null;
                             CharSequence raw = (clip != null && clip.getItemCount() > 0) ? clip.getItemAt(0).coerceToText(appCtx) : null;
@@ -784,9 +805,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                             int restored = ColgramSettingsBackup.importFromJson(appCtx, raw.toString());
                             refreshSettings();
                             Toast.makeText(appCtx, "Импортировано настроек: " + restored, Toast.LENGTH_SHORT).show();
-                        } else if (which == 4) {
+                        } else if (which == 7) {
                             promptBackupPassphrase(act, true, null);
-                        } else if (which == 5) {
+                        } else if (which == 8) {
                             ClipboardManager cm = (ClipboardManager) appCtx.getSystemService(Context.CLIPBOARD_SERVICE);
                             ClipData clip = cm != null ? cm.getPrimaryClip() : null;
                             CharSequence raw = (clip != null && clip.getItemCount() > 0) ? clip.getItemAt(0).coerceToText(appCtx) : null;
@@ -801,6 +822,34 @@ public class ColgramSettingsActivity extends BaseFragment {
                     }
                 })
                 .setNegativeButton("Закрыть", null)
+                .create());
+    }
+
+    private void promptPortableVaultPassphrase(android.app.Activity act) {
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed()) return;
+        final EditTextBoldCursor input = new EditTextBoldCursor(act);
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        input.setHint("Придумайте пароль (AES-256)");
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
+        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
+        input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
+        android.widget.FrameLayout container = new android.widget.FrameLayout(act);
+        int pad = AndroidUtilities.dp(16);
+        container.setPadding(pad, pad / 2, pad, 0);
+        container.addView(input);
+
+        showDialog(new AlertDialog.Builder(act, resourceProvider)
+                .setTitle("Перенос всех аккаунтов (.cgb)")
+                .setView(container)
+                .setPositiveButton("Сохранить файл", (d, w) -> {
+                    String pass = input.getText() != null ? input.getText().toString() : "";
+                    if (pass.length() < 4) {
+                        Toast.makeText(act.getApplicationContext(), "Минимум 4 символа", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    ColgramAccountSwitcherHelper.launchPersistentBackupExport(act, pass.toCharArray());
+                })
+                .setNegativeButton("Отмена", null)
                 .create());
     }
 
@@ -1559,7 +1608,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                                 exempt ? "без ограничений ✓" : "настроить без ограничений", true);
                     } else if (position == settingsBackupRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_pin_code, ColgramMenuChrome.COLOR_TEAL);
-                        settingsCell.setTextAndValue("Бэкап настроек (JSON / AES-256)",
+                        settingsCell.setTextAndValue("Бэкап аккаунтов и настроек (AES-256)",
                                 "экспорт / импорт", false);
                     } else if (position == defenderRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.outline_shield_check, ColgramMenuChrome.COLOR_EMERALD);

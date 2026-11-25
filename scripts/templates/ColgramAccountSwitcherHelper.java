@@ -22,6 +22,7 @@ import androidx.annotation.NonNull;
 
 import org.colgram.core.ColgramAccountManager;
 import org.colgram.core.ColgramAccountVaultPolicy;
+import org.colgram.core.ColgramPersistentBackup;
 import org.colgram.core.ColgramThemePolicy;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
@@ -512,6 +513,56 @@ public final class ColgramAccountSwitcherHelper {
         actions.addView(addBtn, LayoutHelper.createLinear(0, 44, 1.35f, Gravity.CENTER_VERTICAL, 6, 0, 0, 0));
         root.addView(actions, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
+        // Full persistent backup / restore row (survives app updates AND full uninstall + reinstall)
+        LinearLayout backupRow = new LinearLayout(activity);
+        backupRow.setOrientation(LinearLayout.HORIZONTAL);
+        backupRow.setGravity(Gravity.CENTER);
+        backupRow.setPadding(0, dp(8), 0, dp(2));
+
+        TextView fullBackupBtn = new TextView(activity);
+        fullBackupBtn.setText("Полный бэкап (на диск)");
+        fullBackupBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        fullBackupBtn.setTypeface(AndroidUtilities.bold());
+        fullBackupBtn.setTextColor(pal.textPrimary);
+        fullBackupBtn.setGravity(Gravity.CENTER);
+        fullBackupBtn.setMinHeight(dp(40));
+        ColgramMenuChrome.attachTactileFeedback(fullBackupBtn, 12, pal.chipSurface, pal.borderSubtle, pal.accentSoft);
+        fullBackupBtn.setOnClickListener(v -> {
+            fullBackupBtn.setEnabled(false);
+            org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                    if (UserConfig.getInstance(a).isClientActivated()) {
+                        UserConfig.getInstance(a).saveConfig(true);
+                    }
+                }
+                ColgramPersistentBackup.BackupResult res = ColgramPersistentBackup.backupNow(ctx, null);
+                AndroidUtilities.runOnUIThread(() -> {
+                    fullBackupBtn.setEnabled(true);
+                    if (res.success) {
+                        Toast.makeText(ctx, "Сохранено (" + res.accountCount + " акк.) -> " + res.location, Toast.LENGTH_LONG).show();
+                    } else {
+                        Toast.makeText(ctx, "Ошибка бэкапа: " + res.error, Toast.LENGTH_LONG).show();
+                    }
+                });
+            });
+        });
+        backupRow.addView(fullBackupBtn, LayoutHelper.createLinear(0, 40, 1f, Gravity.CENTER_VERTICAL, 0, 0, 6, 0));
+
+        TextView restoreBtn = new TextView(activity);
+        restoreBtn.setText("Восстановить копию");
+        restoreBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        restoreBtn.setTypeface(AndroidUtilities.bold());
+        restoreBtn.setTextColor(pal.accentPrimary);
+        restoreBtn.setGravity(Gravity.CENTER);
+        restoreBtn.setMinHeight(dp(40));
+        ColgramMenuChrome.attachTactileFeedback(restoreBtn, 12, pal.chipSurface, pal.borderSubtle, pal.accentSoft);
+        restoreBtn.setOnClickListener(v -> {
+            if (holder[0] != null) holder[0].dismiss();
+            launchPersistentBackupRestore(activity);
+        });
+        backupRow.addView(restoreBtn, LayoutHelper.createLinear(0, 40, 1f, Gravity.CENTER_VERTICAL, 6, 0, 0, 0));
+        root.addView(backupRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
         final int maxH = Math.round(AndroidUtilities.displaySize.y * 0.72f);
         ScrollView scroll = new ScrollView(activity) {
             @Override
@@ -609,6 +660,147 @@ public final class ColgramAccountSwitcherHelper {
             }
         }
         return null;
+    }
+
+    private static volatile char[] pendingExportPassphrase = null;
+
+    /** Opens Android SAF picker pre-navigated to Documents/ColgramBackup to restore a full backup. */
+    public static void launchPersistentBackupRestore(Activity activity) {
+        if (activity == null || activity.isFinishing()) return;
+        try {
+            activity.startActivityForResult(
+                    ColgramPersistentBackup.buildOpenBackupIntent(),
+                    ColgramPersistentBackup.REQ_RESTORE_PERSISTENT_BACKUP);
+        } catch (Throwable t) {
+            Toast.makeText(activity.getApplicationContext(),
+                    "Не удалось открыть выбор файла: " + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** Opens Android SAF save dialog to export a portable passphrase-encrypted full backup. */
+    public static void launchPersistentBackupExport(Activity activity, char[] optionalPassphrase) {
+        if (activity == null || activity.isFinishing()) return;
+        pendingExportPassphrase = optionalPassphrase != null && optionalPassphrase.length > 0
+                ? java.util.Arrays.copyOf(optionalPassphrase, optionalPassphrase.length) : null;
+        try {
+            activity.startActivityForResult(
+                    ColgramPersistentBackup.buildCreateBackupIntent(),
+                    ColgramPersistentBackup.REQ_EXPORT_PERSISTENT_BACKUP);
+        } catch (Throwable t) {
+            pendingExportPassphrase = null;
+            Toast.makeText(activity.getApplicationContext(),
+                    "Не удалось открыть сохранение файла: " + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** Handles SAF results from LaunchActivity.onActivityResult for full-vault backup & restore. */
+    public static boolean onPersistentBackupActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+        if (requestCode != ColgramPersistentBackup.REQ_RESTORE_PERSISTENT_BACKUP
+                && requestCode != ColgramPersistentBackup.REQ_EXPORT_PERSISTENT_BACKUP) {
+            return false;
+        }
+        if (activity == null || resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+            pendingExportPassphrase = null;
+            return true;
+        }
+        final android.net.Uri uri = data.getData();
+        final Context appCtx = activity.getApplicationContext();
+
+        if (requestCode == ColgramPersistentBackup.REQ_EXPORT_PERSISTENT_BACKUP) {
+            final char[] pass = pendingExportPassphrase;
+            pendingExportPassphrase = null;
+            org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                try {
+                    for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                        if (UserConfig.getInstance(a).isClientActivated()) {
+                            UserConfig.getInstance(a).saveConfig(true);
+                        }
+                    }
+                    byte[] encrypted = ColgramPersistentBackup.buildEncryptedBackupBytes(appCtx, pass);
+                    try (java.io.OutputStream os = appCtx.getContentResolver().openOutputStream(uri, "wt")) {
+                        if (os == null) throw new IllegalStateException("Не удалось открыть поток записи");
+                        os.write(encrypted);
+                        os.flush();
+                    }
+                    AndroidUtilities.runOnUIThread(() ->
+                            Toast.makeText(appCtx, "Полная зашифрованная копия сохранена!", Toast.LENGTH_LONG).show());
+                } catch (Throwable t) {
+                    AndroidUtilities.runOnUIThread(() ->
+                            Toast.makeText(appCtx, "Ошибка экспорта: " + t.getMessage(), Toast.LENGTH_LONG).show());
+                } finally {
+                    if (pass != null) java.util.Arrays.fill(pass, '\0');
+                }
+            });
+            return true;
+        }
+
+        // Restore flow
+        org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+            try {
+                final byte[] blob = ColgramPersistentBackup.readUriBytes(appCtx, uri);
+                if (ColgramPersistentBackup.isPassphraseProtected(blob)) {
+                    AndroidUtilities.runOnUIThread(() -> promptRestorePassphraseAndApply(activity, blob));
+                } else {
+                    ColgramPersistentBackup.RestoreResult res = ColgramPersistentBackup.restoreFromBytes(appCtx, blob, null);
+                    AndroidUtilities.runOnUIThread(() -> finishPersistentRestoreUi(activity, res));
+                }
+            } catch (Throwable t) {
+                AndroidUtilities.runOnUIThread(() ->
+                        Toast.makeText(appCtx, "Ошибка чтения копии: " + t.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        });
+        return true;
+    }
+
+    private static void promptRestorePassphraseAndApply(Activity activity, byte[] blob) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+        final Context appCtx = activity.getApplicationContext();
+        final org.telegram.ui.Components.EditTextBoldCursor input = new org.telegram.ui.Components.EditTextBoldCursor(activity);
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        input.setHint("Пароль от резервной копии");
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+        FrameLayout box = new FrameLayout(activity);
+        int p = dp(16);
+        box.setPadding(p, p / 2, p, 0);
+        box.addView(input);
+
+        new AlertDialog.Builder(activity)
+                .setTitle("Расшифровка копии Colgram")
+                .setView(box)
+                .setPositiveButton("Восстановить", (d, w) -> {
+                    String passStr = input.getText() != null ? input.getText().toString() : "";
+                    if (passStr.isEmpty()) {
+                        Toast.makeText(appCtx, "Введите пароль", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    final char[] chars = passStr.toCharArray();
+                    org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                        ColgramPersistentBackup.RestoreResult res = ColgramPersistentBackup.restoreFromBytes(appCtx, blob, chars);
+                        java.util.Arrays.fill(chars, '\0');
+                        AndroidUtilities.runOnUIThread(() -> finishPersistentRestoreUi(activity, res));
+                    });
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
+    private static void finishPersistentRestoreUi(Activity activity, ColgramPersistentBackup.RestoreResult res) {
+        Context appCtx = activity.getApplicationContext();
+        if (!res.success) {
+            Toast.makeText(appCtx, res.error.isEmpty() ? "Не удалось восстановить копию" : res.error, Toast.LENGTH_LONG).show();
+            return;
+        }
+        Toast.makeText(appCtx,
+                "Восстановлено данных: " + res.restoredFiles + " (+сейф: " + res.restoredVaultAccounts + "). Перезапуск…",
+                Toast.LENGTH_LONG).show();
+        Intent relaunch = appCtx.getPackageManager().getLaunchIntentForPackage(appCtx.getPackageName());
+        if (relaunch != null) {
+            relaunch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            activity.startActivity(relaunch);
+        }
+        AndroidUtilities.runOnUIThread(() ->
+                android.os.Process.killProcess(android.os.Process.myPid()), 180L);
     }
 
     private static int countArchivedOnly(Context ctx) {

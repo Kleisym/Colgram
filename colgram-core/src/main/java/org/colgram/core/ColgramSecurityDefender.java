@@ -173,15 +173,17 @@ public final class ColgramSecurityDefender {
         boolean cloakOn = ColgramConfig.isCloakEnabled();
         boolean webUaHardening = ColgramConfig.isDefenderWebViewHardeningEnabled();
         if (!cloakOn || !webUaHardening) {
-            if (autoClose) {
-                ColgramConfig.setCloakEnabled(true);
+            if (autoClose && !webUaHardening) {
+                // Never forcibly flip MTProto cloak mid-session (changing initConnection device
+                // fingerprint mid-session can cause Telegram security logout); harden WebView UA only.
                 ColgramConfig.setDefenderWebViewHardeningEnabled(true);
                 autoFixed++;
                 findings.add(new ColgramSecurityPolicy.AuditFinding(
                         "webview_ua", "Идентификация / Mini App",
-                        "Утечка модели телефона в MTProto и Mini App",
-                        "Включена подмена устройства (" + ColgramConfig.getSpoofDeviceModel()
-                                + ") для MTProto initConnection и заголовка User-Agent.",
+                        "Защита User-Agent в Mini App",
+                        "Включена изоляция заголовка User-Agent для Mini App WebView"
+                                + (cloakOn ? " (подмена устройства «" + ColgramConfig.getSpoofDeviceModel() + "» активна)."
+                                : ". Подмену устройства MTProto можно включить вручную в настройках."),
                         ColgramSecurityPolicy.STATUS_AUTO_FIXED));
             } else {
                 findings.add(new ColgramSecurityPolicy.AuditFinding(
