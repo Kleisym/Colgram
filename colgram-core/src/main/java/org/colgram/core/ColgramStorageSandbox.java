@@ -30,6 +30,20 @@ public class ColgramStorageSandbox {
 
     private static volatile File sandboxRoot;
     private static volatile File cacheRoot;
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, File> sandboxedDirCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile File sandboxedDirCacheRoot;
+    private static volatile File ensuredCacheRootFile;
+    private static volatile File cachedCasDir;
+    private static volatile File cachedCasDirRoot;
+
+    private static void invalidateResolvedDirCaches() {
+        sandboxedDirCache.clear();
+        sandboxedDirCacheRoot = null;
+        ensuredCacheRootFile = null;
+        cachedCasDir = null;
+        cachedCasDirRoot = null;
+    }
 
     public static void init(Context context) {
         if (context == null) return;
@@ -54,13 +68,18 @@ public class ColgramStorageSandbox {
                 ? new File(resolvedRoot, "Cache")
                 : new File(appCtx.getCacheDir(), "Colgram");
 
+        invalidateResolvedDirCaches();
         sandboxRoot = resolvedRoot;
         cacheRoot = resolvedCache;
+        sandboxedDirCacheRoot = resolvedRoot;
 
         // Synchronously create root, cache, and top-level .nomedia guards so any immediate
         // FileLoader call lands in a protected directory.
         ensureDirWithNoMedia(resolvedRoot);
         ensureDirWithNoMedia(resolvedCache);
+        if (resolvedCache != null) {
+            ensuredCacheRootFile = resolvedCache;
+        }
 
         // Complete full subdirectory tree & silence any legacy public Documents/<name> folder off the UI thread.
         Thread t = new Thread(() -> {
@@ -75,9 +94,13 @@ public class ColgramStorageSandbox {
                             : appCtx.getFilesDir();
                     if (internalFallback != null) {
                         ensureDirWithNoMedia(internalFallback);
+                        invalidateResolvedDirCaches();
+                        File fallbackCache = new File(internalFallback, "Cache");
+                        ensureDirWithNoMedia(fallbackCache);
                         sandboxRoot = internalFallback;
-                        cacheRoot = new File(internalFallback, "Cache");
-                        ensureDirWithNoMedia(cacheRoot);
+                        cacheRoot = fallbackCache;
+                        sandboxedDirCacheRoot = internalFallback;
+                        ensuredCacheRootFile = fallbackCache;
                         root = internalFallback;
                     }
                 }
@@ -233,17 +256,28 @@ public class ColgramStorageSandbox {
         if (cacheRoot == null && context != null) {
             init(context);
         }
-        if (cacheRoot != null) {
-            ensureDirWithNoMedia(cacheRoot);
+        File c = cacheRoot;
+        if (c != null && ensuredCacheRootFile != c) {
+            ensureDirWithNoMedia(c);
+            if (cacheRoot == c) {
+                ensuredCacheRootFile = c;
+            }
         }
-        return cacheRoot;
+        return c;
     }
 
     public static File getCasDirectory(Context context) {
         File root = getSandboxRootDir(context);
         if (root == null) return null;
+        if (root == cachedCasDirRoot && cachedCasDir != null) {
+            return cachedCasDir;
+        }
         File cas = new File(root, ".colgram_cas");
         ensureDirWithNoMedia(cas);
+        if (sandboxRoot == root) {
+            cachedCasDirRoot = root;
+            cachedCasDir = cas;
+        }
         return cas;
     }
 
@@ -263,9 +297,16 @@ public class ColgramStorageSandbox {
         File root = getSandboxRootDir(context);
         if (root == null) return null;
         if (type == 4) {
-            File c = cacheRoot != null ? cacheRoot : new File(root, "Cache");
-            ensureDirWithNoMedia(c);
-            return c;
+            return getCacheRootDir(context);
+        }
+
+        if (root != sandboxedDirCacheRoot) {
+            sandboxedDirCache.clear();
+            sandboxedDirCacheRoot = root;
+        }
+        File cached = sandboxedDirCache.get(type);
+        if (cached != null) {
+            return cached;
         }
 
         String subFolder;
@@ -301,6 +342,12 @@ public class ColgramStorageSandbox {
 
         File dir = new File(root, subFolder);
         ensureDirWithNoMedia(dir);
+        if (sandboxRoot == root && sandboxedDirCacheRoot == root) {
+            File existing = sandboxedDirCache.putIfAbsent(type, dir);
+            if (existing != null) {
+                return existing;
+            }
+        }
         return dir;
     }
 

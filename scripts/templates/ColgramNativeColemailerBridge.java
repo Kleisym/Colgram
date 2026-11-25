@@ -144,35 +144,71 @@ public final class ColgramNativeColemailerBridge {
     }
 
     public static void syncFoldersIntoEngine(int account) {
+        syncFoldersIntoEngine(account, true);
+    }
+
+    private static void syncFoldersIntoEngine(int account, boolean reschedule) {
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        Set<String> neededFolders = engine.collectNeededFolderNames(account);
+        if (neededFolders.isEmpty()) {
+            lastFolderSyncMs = System.currentTimeMillis();
+            return;
+        }
         MessagesController mc = MessagesController.getInstance(account);
         if (mc == null) return;
         ArrayList<MessagesController.DialogFilter> filters = mc.getDialogFilters();
         if (filters == null || filters.isEmpty()) return;
+        ArrayList<MessagesController.DialogFilter> matchingFilters = null;
+        for (int i = 0, n = filters.size(); i < n; i++) {
+            MessagesController.DialogFilter f = filters.get(i);
+            if (f == null || TextUtils.isEmpty(f.name)) continue;
+            if (neededFolders.contains(f.name.trim().toLowerCase(Locale.ROOT))) {
+                if (matchingFilters == null) matchingFilters = new ArrayList<>(neededFolders.size());
+                matchingFilters.add(f);
+            }
+        }
+        if (matchingFilters == null || matchingFilters.isEmpty()) {
+            lastFolderSyncMs = System.currentTimeMillis();
+            return;
+        }
         ArrayList<TLRPC.Dialog> dialogs = mc.getAllDialogs();
         if (dialogs == null) return;
+        final long selfId = UserConfig.getInstance(account).getClientUserId();
+        ArrayList<TLRPC.Dialog> eligibleDialogs = new ArrayList<>(dialogs.size());
+        if (selfId != 0L) {
+            for (int i = 0, n = dialogs.size(); i < n; i++) {
+                TLRPC.Dialog d = dialogs.get(i);
+                if (d == null) continue;
+                long did = d.id;
+                if (did == 0L || did == selfId
+                        || DialogObject.isEncryptedDialog(did)
+                        || DialogObject.isFolderDialogId(did)
+                        || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(did)) {
+                    continue;
+                }
+                eligibleDialogs.add(d);
+            }
+        }
         AccountInstance ai = AccountInstance.getInstance(account);
-        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
-        for (MessagesController.DialogFilter f : filters) {
-            if (f == null || TextUtils.isEmpty(f.name)) continue;
+        for (int fIdx = 0, fn = matchingFilters.size(); fIdx < fn; fIdx++) {
+            MessagesController.DialogFilter f = matchingFilters.get(fIdx);
             Set<Long> ids = new LinkedHashSet<>();
-            for (TLRPC.Dialog d : dialogs) {
-                if (d != null && !isBlockedTargetDialog(account, d.id) && f.includesDialog(ai, d.id, d)) {
+            for (int dIdx = 0, dn = eligibleDialogs.size(); dIdx < dn; dIdx++) {
+                TLRPC.Dialog d = eligibleDialogs.get(dIdx);
+                if (f.includesDialog(ai, d.id, d)) {
                     ids.add(d.id);
                 }
             }
             engine.syncFolderTargets(account, f.name, ids);
         }
         lastFolderSyncMs = System.currentTimeMillis();
-        rescheduleScheduler();
+        if (reschedule) {
+            rescheduleScheduler();
+        }
     }
 
     private static boolean anyActiveCampaignNeedsFolderSync(ColgramColemailerEngine engine) {
-        for (ColgramColemailerEngine.BroadcastCampaign c : engine.listCampaigns()) {
-            if (c != null && c.enabled && !TextUtils.isEmpty(c.folderName)) {
-                return true;
-            }
-        }
-        return false;
+        return !engine.collectNeededFolderNames(-1).isEmpty();
     }
 
     private static void runDueBroadcastsOnUi() {
@@ -194,7 +230,7 @@ public final class ColgramNativeColemailerBridge {
                 if (!UserConfig.getInstance(acc).isClientActivated()) continue;
                 if (acc != selectedAcc && !engine.hasActiveCampaigns(acc)) continue;
                 if (needFolderSync) {
-                    syncFoldersIntoEngine(acc);
+                    syncFoldersIntoEngine(acc, false);
                 }
                 List<ColgramColemailerEngine.BroadcastDueEvent> due = engine.collectDueBroadcasts(acc, nowSec);
                 if (due.isEmpty()) continue;
@@ -723,6 +759,12 @@ public final class ColgramNativeColemailerBridge {
                 return false;
             }
 
+            String text = msg.message == null ? "" : msg.message;
+            boolean inlineUrlBtns = hasInlineUrlButtons(msg);
+            if (text.isEmpty() && !inlineUrlBtns && !msg.mentioned) {
+                return false;
+            }
+
             String cacheKey = msg.id > 0 ? (account + ":" + dialogId + ":" + msg.id) : null;
             if (cacheKey != null) {
                 synchronized (recentSuppressVerdicts) {
@@ -739,12 +781,7 @@ public final class ColgramNativeColemailerBridge {
                 isBroadcastChannel = chat != null && ChatObject.isChannelAndNotMegaGroup(chat);
             }
 
-            String text = msg.message == null ? "" : msg.message;
-            boolean inlineUrlBtns = hasInlineUrlButtons(msg);
             boolean fwdFromChannel = isForwardedFromChannel(msg);
-            if (text.isEmpty() && !inlineUrlBtns && !msg.mentioned) {
-                return false;
-            }
 
             List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(msg);
             String ownUname = ownUsername(account);

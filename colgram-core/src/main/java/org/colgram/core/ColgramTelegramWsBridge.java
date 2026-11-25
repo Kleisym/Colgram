@@ -2,6 +2,8 @@ package org.colgram.core;
 
 import android.util.Log;
 
+import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
@@ -132,14 +134,14 @@ public final class ColgramTelegramWsBridge {
             "2001:b28:f23d:8005:7:0:109:337",
             "2001:b28:f23f:9::852:437"
     };
-    private static final int CONNECT_ATTEMPT_TIMEOUT_MS = 1100;
-    private static final int CONNECT_RACE_BUDGET_MS = 1400;
-    private static final int HANDSHAKE_READ_TIMEOUT_MS = 2200;
-    private static final long MAX_DIAL_WALL_MS = 4600L;
-    private static final int CELLULAR_CONNECT_ATTEMPT_TIMEOUT_MS = 1500;
-    private static final int CELLULAR_CONNECT_RACE_BUDGET_MS = 1800;
-    private static final int CELLULAR_HANDSHAKE_READ_TIMEOUT_MS = 2600;
-    private static final long CELLULAR_MAX_DIAL_WALL_MS = 3800L;
+    private static final int CONNECT_ATTEMPT_TIMEOUT_MS = 850;
+    private static final int CONNECT_RACE_BUDGET_MS = 1100;
+    private static final int HANDSHAKE_READ_TIMEOUT_MS = 1700;
+    private static final long MAX_DIAL_WALL_MS = 3500L;
+    private static final int CELLULAR_CONNECT_ATTEMPT_TIMEOUT_MS = 1150;
+    private static final int CELLULAR_CONNECT_RACE_BUDGET_MS = 1450;
+    private static final int CELLULAR_HANDSHAKE_READ_TIMEOUT_MS = 2100;
+    private static final long CELLULAR_MAX_DIAL_WALL_MS = 3200L;
     private static volatile boolean cellularNetwork = false;
 
     public static void setCellularNetwork(boolean cellular) {
@@ -192,12 +194,21 @@ public final class ColgramTelegramWsBridge {
     private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
 
     private static final ExecutorService RACE_POOL = new java.util.concurrent.ThreadPoolExecutor(
-            0, 48, 30L, TimeUnit.SECONDS,
+            0, 64, 30L, TimeUnit.SECONDS,
             new java.util.concurrent.SynchronousQueue<>(),
             r -> {
                 Thread t = new Thread(r, "colgram-ws-dial");
                 t.setDaemon(true);
                 t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws dial err: " + ex));
+                return t;
+            });
+    private static final ExecutorService TCP_RACE_POOL = new java.util.concurrent.ThreadPoolExecutor(
+            0, 96, 30L, TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "colgram-ws-tcp");
+                t.setDaemon(true);
+                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws tcp err: " + ex));
                 return t;
             });
 
@@ -266,14 +277,15 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static int defaultFragModeForNetwork(boolean cellular) {
-        // Spoofed RU-whitelist SNI + 2-record TLS split negotiates TLS 1.3 (cert encrypted!),
-        // bypasses TSPU SNI DPI & L7 whitelists, and uses zero MSG_OOB / TTL=1 / tiny-MSS quirks.
+        // Prefer plain spoofed RU-whitelist SNI once validated (0 fragmentation sleeps),
+        // racing FRAG_SPOOF_SNI_TLSREC on cold start when needed for strict TSPU DPI.
         return FRAG_SPOOF_SNI_TLSREC;
     }
 
     private static final int DC_BUCKET_COUNT = 12; // 0=other, 1..5=generic DC1..5, 6..10=media DC1..5
-    private static final int DIAL_SLOTS_PER_BUCKET = 8;
-    private static final long DIAL_SLOT_ACQUIRE_WAIT_MS = 3500L;
+    private static final int DIAL_SLOTS_PER_BUCKET = 12;
+    private static final long DIAL_SLOT_ACQUIRE_WAIT_MS = 2200L;
+    private static final SecureRandom SHARED_MASK_SEEDER = new SecureRandom();
 
     private static final java.util.concurrent.atomic.AtomicReferenceArray<EdgeEndpoint> lastWorkingByDc =
             new java.util.concurrent.atomic.AtomicReferenceArray<>(DC_BUCKET_COUNT);
@@ -321,7 +333,8 @@ public final class ColgramTelegramWsBridge {
         public final InputStream in;
         public final OutputStream out;
         private final Object writeLock = new Object();
-        private final SecureRandom rng = new SecureRandom();
+        private long prngState;
+        private byte[] writeScratch = new byte[4096];
         private final AtomicBoolean closed = new AtomicBoolean(false);
 
         WsSession(int dcId, String edgeIp, String sniHost, Socket socket,
@@ -338,9 +351,28 @@ public final class ColgramTelegramWsBridge {
             this.socket = socket;
             this.in = in;
             this.out = out;
+            long seed;
+            synchronized (SHARED_MASK_SEEDER) {
+                seed = SHARED_MASK_SEEDER.nextLong();
+            }
+            this.prngState = seed != 0L ? seed : (System.nanoTime() ^ 0x9e3779b97f4a7c15L);
         }
 
         public void sendBinary(byte[] buf, int off, int len) throws IOException {
+            sendBinaryInternal(buf, off, len, true);
+        }
+
+        void sendBinaryUnflushed(byte[] buf, int off, int len) throws IOException {
+            sendBinaryInternal(buf, off, len, false);
+        }
+
+        void flushOut() throws IOException {
+            synchronized (writeLock) {
+                if (!closed.get()) out.flush();
+            }
+        }
+
+        private void sendBinaryInternal(byte[] buf, int off, int len, boolean flush) throws IOException {
             if (len <= 0) return;
             synchronized (writeLock) {
                 int pos = off;
@@ -350,7 +382,7 @@ public final class ColgramTelegramWsBridge {
                     int chunk = Math.min(remaining, MAX_OUTBOUND_FRAME_BYTES);
                     boolean last = (chunk == remaining);
                     int headerByte = (last ? 0x80 : 0x00) | (first ? 0x02 : 0x00);
-                    writeFrameLocked(headerByte, buf, pos, chunk);
+                    writeFrameLocked(headerByte, buf, pos, chunk, flush && last);
                     first = false;
                     pos += chunk;
                     remaining -= chunk;
@@ -377,14 +409,26 @@ public final class ColgramTelegramWsBridge {
 
         private void writeFrame(int firstByte, byte[] data, int off, int len) throws IOException {
             synchronized (writeLock) {
-                writeFrameLocked(firstByte, data, off, len);
+                writeFrameLocked(firstByte, data, off, len, true);
             }
         }
 
-        private void writeFrameLocked(int firstByte, byte[] data, int off, int len) throws IOException {
+        private int nextMaskInt() {
+            long x = prngState;
+            x ^= x >>> 12;
+            x ^= x << 25;
+            x ^= x >>> 27;
+            prngState = x;
+            return (int) ((x * 0x2545F4914F6CDD1DL) >>> 32);
+        }
+
+        private void writeFrameLocked(int firstByte, byte[] data, int off, int len, boolean flush) throws IOException {
             if (closed.get()) throw new IOException("WebSocket closed");
-            byte[] mask = new byte[4];
-            rng.nextBytes(mask);
+            int maskWord = nextMaskInt();
+            byte m0 = (byte) (maskWord >>> 24);
+            byte m1 = (byte) (maskWord >>> 16);
+            byte m2 = (byte) (maskWord >>> 8);
+            byte m3 = (byte) maskWord;
             int headerLen;
             if (len < 126) {
                 headerLen = 2 + 4;
@@ -393,7 +437,11 @@ public final class ColgramTelegramWsBridge {
             } else {
                 headerLen = 10 + 4;
             }
-            byte[] frame = new byte[headerLen + len];
+            int needed = headerLen + len;
+            if (writeScratch.length < needed) {
+                writeScratch = new byte[Math.max(needed, writeScratch.length * 2)];
+            }
+            byte[] frame = writeScratch;
             frame[0] = (byte) firstByte;
             int p = 1;
             if (len < 126) {
@@ -409,13 +457,28 @@ public final class ColgramTelegramWsBridge {
                     frame[p++] = (byte) ((l >>> shift) & 0xff);
                 }
             }
-            System.arraycopy(mask, 0, frame, p, 4);
+            frame[p] = m0;
+            frame[p + 1] = m1;
+            frame[p + 2] = m2;
+            frame[p + 3] = m3;
             p += 4;
-            for (int i = 0; i < len; i++) {
-                frame[p + i] = (byte) (data[off + i] ^ mask[i & 3]);
+            int i = 0;
+            int limit4 = len - 3;
+            while (i < limit4) {
+                frame[p + i] = (byte) (data[off + i] ^ m0);
+                frame[p + i + 1] = (byte) (data[off + i + 1] ^ m1);
+                frame[p + i + 2] = (byte) (data[off + i + 2] ^ m2);
+                frame[p + i + 3] = (byte) (data[off + i + 3] ^ m3);
+                i += 4;
             }
-            out.write(frame);
-            out.flush();
+            while (i < len) {
+                int r = i & 3;
+                byte m = r == 0 ? m0 : (r == 1 ? m1 : (r == 2 ? m2 : m3));
+                frame[p + i] = (byte) (data[off + i] ^ m);
+                i++;
+            }
+            out.write(frame, 0, needed);
+            if (flush) out.flush();
         }
 
         @Override
@@ -555,19 +618,19 @@ public final class ColgramTelegramWsBridge {
                 if (!coldCandidates.isEmpty()) {
                     int[] coldModes = canNative
                             ? new int[]{
-                                    FRAG_SPOOF_SNI_TLSREC,
                                     FRAG_SPOOF_SNI_PLAIN,
+                                    FRAG_SPOOF_SNI_TLSREC,
                                     FRAG_TLS_RECORD_SNI,
                                     FRAG_NATIVE_MULTI_SPLIT_TLSREC
                             }
                             : new int[]{
-                                    FRAG_SPOOF_SNI_TLSREC,
                                     FRAG_SPOOF_SNI_PLAIN,
+                                    FRAG_SPOOF_SNI_TLSREC,
                                     FRAG_TLS_RECORD_SNI
                             };
                     long coldBudget = Math.min(
-                            cellularNetwork ? 2500L : 2000L,
-                            Math.max(1200L, deadlineMs - System.currentTimeMillis()));
+                            cellularNetwork ? 2200L : 1700L,
+                            Math.max(1000L, deadlineMs - System.currentTimeMillis()));
                     WsSession coldWinner = raceHandshakeModes(
                             coldCandidates, normDc, media, coldModes, protector, fdProtector, coldBudget);
                     if (coldWinner != null) {
@@ -577,7 +640,7 @@ public final class ColgramTelegramWsBridge {
             }
 
             Set<String> triedIps = new LinkedHashSet<>();
-            int maxAltPerEndpoint = 2;
+            int maxAltPerEndpoint = workedOnNetwork ? 1 : 2;
             for (int attempt = 0; attempt < 3; attempt++) {
                 if (System.currentTimeMillis() >= deadlineMs) break;
                 List<EdgeEndpoint> candidates = filterUnvisitedIps(candidateEndpointsFor(normDc, media), triedIps);
@@ -585,7 +648,7 @@ public final class ColgramTelegramWsBridge {
 
                 int primaryMode = preferredFragMode;
                 if (!canNative && isNativeFragMode(primaryMode)) {
-                    primaryMode = FRAG_SPOOF_SNI_TLSREC;
+                    primaryMode = FRAG_SPOOF_SNI_PLAIN;
                 }
                 DialedTcp tcp = connectEdgeRace(candidates, protector, fdProtector, primaryMode);
                 if (tcp == null) break;
@@ -597,7 +660,8 @@ public final class ColgramTelegramWsBridge {
                     return res.session;
                 }
 
-                if (!res.hostnameMismatch && System.currentTimeMillis() + 800L < deadlineMs) {
+                if (!res.hostnameMismatch && (res.wrapperRejected || !workedOnNetwork)
+                        && System.currentTimeMillis() + 700L < deadlineMs) {
                     int[] fallbacks = fallbackFragModes(primaryMode, canNative);
                     int altTried = 0;
                     for (int altMode : fallbacks) {
@@ -657,7 +721,7 @@ public final class ColgramTelegramWsBridge {
         final AtomicInteger left = new AtomicInteger(modes.length);
         for (int i = 0; i < modes.length; i++) {
             final int mode = modes[i];
-            final long delay = i * 60L;
+            final long delay = i == 0 ? 0L : (i == 1 ? 35L : (i == 2 ? 80L : 120L));
             try {
                 RACE_POOL.execute(() -> {
                     WsSession sess = null;
@@ -866,6 +930,39 @@ public final class ColgramTelegramWsBridge {
                 || "telesco.pe".equals(s);
     }
 
+    /**
+     * Completes TLS + `/apiws` upgrade directly on an already-connected TCP socket (e.g. a live L3
+     * recovery probe), avoiding a redundant second SYN RTT. Closes {@code tcpSocket} on failure.
+     */
+    public static WsSession dialWithConnectedSocket(Socket tcpSocket, String destHost, boolean preferMediaEdge) {
+        if (tcpSocket == null) return null;
+        int signedDc = ColgramTelegramDcAddresses.signedDcIdFor(destHost);
+        if (signedDc == 0) {
+            try { tcpSocket.close(); } catch (Throwable ignored) {}
+            return null;
+        }
+        int normDc = Math.abs(signedDc);
+        boolean media = preferMediaEdge || signedDc < 0;
+        String ip = tcpSocket.getInetAddress() != null ? tcpSocket.getInetAddress().getHostAddress() : DEFAULT_EDGE_IP;
+        List<EdgeEndpoint> cands = candidateEndpointsFor(normDc, media);
+        String realHost = primaryWssHostForSignedDc(media ? -normDc : normDc);
+        for (EdgeEndpoint ep : cands) {
+            if (ip.equals(ep.ip)) {
+                realHost = ep.sniHost;
+                break;
+            }
+        }
+        int mode = preferredFragMode;
+        if (!(tcpSocket instanceof ColgramNativeDesync.NativeSocket) && isNativeFragMode(mode)) {
+            mode = FRAG_SPOOF_SNI_PLAIN;
+        }
+        HandshakeResult res = tryHandshake(new DialedTcp(new EdgeEndpoint(ip, realHost), tcpSocket), normDc, media, mode);
+        if (res.session != null) {
+            return res.session;
+        }
+        return null;
+    }
+
     private static HandshakeResult tryHandshake(DialedTcp tcp, int normDc, boolean media, int fragMode) {
         boolean wrapperRejected = false;
         boolean hostnameMismatch = false;
@@ -885,7 +982,8 @@ public final class ColgramTelegramWsBridge {
             Socket underlying = wrapSocketForMode(tcp.socket, tlsSni, fragMode);
             SSLSocket ssl;
             try {
-                ssl = (SSLSocket) sf.createSocket(underlying, tlsSni, 443, true);
+                // Key TLS session tickets on realHost (per Telegram edge cluster) while overriding wire SNI via SSLParameters.
+                ssl = (SSLSocket) sf.createSocket(underlying, realHost, 443, true);
             } catch (Throwable wrapErr) {
                 if (fragMode == FRAG_NONE) throw wrapErr;
                 wrapperRejected = true;
@@ -920,7 +1018,7 @@ public final class ColgramTelegramWsBridge {
                 throw new IOException("TLS cert not official Telegram edge for " + realHost);
             }
             OutputStream out = ssl.getOutputStream();
-            InputStream in = ssl.getInputStream();
+            InputStream in = new BufferedInputStream(ssl.getInputStream(), 32768);
             if (!upgradeWebSocket(in, out, realHost)) {
                 throw new IOException("WebSocket upgrade rejected by " + ip + " (" + realHost + ")");
             }
@@ -1009,7 +1107,7 @@ public final class ColgramTelegramWsBridge {
             relayTcpSocket.setTcpNoDelay(true);
             SSLSocketFactory sf = ColgramNativeDesync.createEngineSslSocketFactory();
             Socket underlying = new FragmentedHelloSocket(relayTcpSocket, tlsSni, FRAG_TCP_2BYTE_SNI);
-            SSLSocket ssl = (SSLSocket) sf.createSocket(underlying, tlsSni, 443, true);
+            SSLSocket ssl = (SSLSocket) sf.createSocket(underlying, host, 443, true);
             try {
                 SSLParameters params = ssl.getSSLParameters();
                 if (tlsSni != null && !ColgramDohResolver.isIpLiteral(tlsSni)) {
@@ -1018,13 +1116,13 @@ public final class ColgramTelegramWsBridge {
                 ssl.setSSLParameters(params);
             } catch (Throwable ignored) {}
             ssl.setTcpNoDelay(true);
-            ssl.setSoTimeout(Math.max(3500, handshakeReadTimeoutMs()));
+            ssl.setSoTimeout(Math.max(3000, handshakeReadTimeoutMs()));
             ssl.startHandshake();
             if (!verifyOfficialTelegramSession(ssl.getSession(), host)) {
                 throw new IOException("TLS cert not official Telegram edge over relay for " + host);
             }
             OutputStream out = ssl.getOutputStream();
-            InputStream in = ssl.getInputStream();
+            InputStream in = new BufferedInputStream(ssl.getInputStream(), 32768);
             if (!upgradeWebSocket(in, out, host)) {
                 throw new IOException("WebSocket upgrade rejected over relay " + label + " (" + host + ")");
             }
@@ -1074,7 +1172,9 @@ public final class ColgramTelegramWsBridge {
         private int hdrFilled = 0;
         private int payloadRemaining = -1;
         private boolean fallbackPassthrough = false;
-        private ByteArrayOutputStream packetBuf = new ByteArrayOutputStream(2048);
+        private byte[] plainScratch = new byte[4096];
+        private byte[] txBuf = new byte[2048];
+        private int txLen = 0;
 
         private Obfuscated2FrameSplitter(int proto, Cipher shadowCtr, int rawDcId) {
             this.proto = proto;
@@ -1143,6 +1243,48 @@ public final class ColgramTelegramWsBridge {
             }
         }
 
+        public synchronized void feedInitAndTailToSession(byte[] initBuf, int initLen, WsSession session)
+                throws IOException {
+            if (initLen <= 64) {
+                session.sendBinary(initBuf, 0, 64);
+                return;
+            }
+            session.sendBinaryUnflushed(initBuf, 0, 64);
+            feed(initBuf, 64, initLen - 64, session::sendBinaryUnflushed);
+            session.flushOut();
+        }
+
+        public synchronized void feedToSession(byte[] data, int off, int len, WsSession session)
+                throws IOException {
+            if (len <= 0) return;
+            feed(data, off, len, session::sendBinaryUnflushed);
+            session.flushOut();
+        }
+
+        private void appendTx(byte b) {
+            if (txLen + 1 > txBuf.length) {
+                growTx(txLen + 1);
+            }
+            txBuf[txLen++] = b;
+        }
+
+        private void appendTx(byte[] data, int off, int count) {
+            if (count <= 0) return;
+            if (txLen + count > txBuf.length) {
+                growTx(txLen + count);
+            }
+            System.arraycopy(data, off, txBuf, txLen, count);
+            txLen += count;
+        }
+
+        private void growTx(int needed) {
+            int cap = txBuf.length;
+            while (cap < needed) cap = cap * 2;
+            byte[] next = new byte[cap];
+            if (txLen > 0) System.arraycopy(txBuf, 0, next, 0, txLen);
+            txBuf = next;
+        }
+
         public synchronized void feed(byte[] data, int off, int len, FrameConsumer sink)
                 throws IOException {
             if (len <= 0) return;
@@ -1150,15 +1292,18 @@ public final class ColgramTelegramWsBridge {
                 flushPartialAndRaw(data, off, len, sink);
                 return;
             }
-            byte[] plain;
+            if (plainScratch.length < len) {
+                plainScratch = new byte[Math.max(len, plainScratch.length * 2)];
+            }
+            int produced;
             try {
-                plain = shadowCtr.update(data, off, len);
+                produced = shadowCtr.update(data, off, len, plainScratch, 0);
             } catch (Throwable err) {
                 fallbackPassthrough = true;
                 flushPartialAndRaw(data, off, len, sink);
                 return;
             }
-            if (plain == null || plain.length != len) {
+            if (produced != len) {
                 fallbackPassthrough = true;
                 flushPartialAndRaw(data, off, len, sink);
                 return;
@@ -1167,10 +1312,11 @@ public final class ColgramTelegramWsBridge {
             int pos = 0;
             while (pos < len) {
                 if (payloadRemaining < 0) {
+                    int hdrBytePos = pos;
                     byte cByte = data[off + pos];
-                    byte pByte = plain[pos];
+                    byte pByte = plainScratch[pos];
                     pos++;
-                    packetBuf.write(cByte);
+                    appendTx(cByte);
                     hdrPlain[hdrFilled++] = pByte;
 
                     if (hdrFilled == 1 && proto == 0xef) {
@@ -1204,9 +1350,21 @@ public final class ColgramTelegramWsBridge {
                         payloadRemaining = payloadBytes;
                         hdrFilled = 0;
                     }
+                    // Fast zero-copy path when complete payload sits contiguously after its header
+                    if (payloadRemaining > 0 && txLen <= 4 && (pos + payloadRemaining <= len)) {
+                        int hdrStart = hdrBytePos - (txLen - 1);
+                        if (hdrStart >= 0) {
+                            int fullLen = txLen + payloadRemaining;
+                            pos += payloadRemaining;
+                            payloadRemaining = -1;
+                            txLen = 0;
+                            sink.onFrame(data, off + hdrStart, fullLen);
+                            continue;
+                        }
+                    }
                 } else {
                     int take = Math.min(payloadRemaining, len - pos);
-                    packetBuf.write(data, off + pos, take);
+                    appendTx(data, off + pos, take);
                     pos += take;
                     payloadRemaining -= take;
                     if (payloadRemaining == 0) {
@@ -1218,21 +1376,23 @@ public final class ColgramTelegramWsBridge {
         }
 
         private void emitPacket(FrameConsumer sink) throws IOException {
-            byte[] pkt = packetBuf.toByteArray();
-            if (pkt.length > RESET_BUFFER_THRESHOLD) {
-                packetBuf = new ByteArrayOutputStream(2048);
-            } else {
-                packetBuf.reset();
+            int outLen = txLen;
+            txLen = 0;
+            sink.onFrame(txBuf, 0, outLen);
+            if (txBuf.length > RESET_BUFFER_THRESHOLD) {
+                txBuf = new byte[4096];
             }
-            sink.onFrame(pkt, 0, pkt.length);
         }
 
         private void flushPartialAndRaw(byte[] data, int off, int len, FrameConsumer sink)
                 throws IOException {
-            if (packetBuf.size() > 0) {
-                byte[] pending = packetBuf.toByteArray();
-                packetBuf = new ByteArrayOutputStream(2048);
-                sink.onFrame(pending, 0, pending.length);
+            if (txLen > 0) {
+                int pendingLen = txLen;
+                txLen = 0;
+                sink.onFrame(txBuf, 0, pendingLen);
+                if (txBuf.length > RESET_BUFFER_THRESHOLD) {
+                    txBuf = new byte[4096];
+                }
             }
             if (len > 0) {
                 sink.onFrame(data, off, len);
@@ -1290,7 +1450,11 @@ public final class ColgramTelegramWsBridge {
                                           OnBytes onReply) throws IOException {
         long total = 0L;
         byte[] buf = new byte[65536];
+        byte[] maskBuf = new byte[4];
         InputStream in = session.in;
+        if (!(in instanceof BufferedInputStream) && !(in instanceof ByteArrayInputStream)) {
+            in = new BufferedInputStream(in, 32768);
+        }
         boolean inFragmentedData = false;
         if (session.socket != null) {
             try { session.socket.setSoTimeout(0); } catch (Throwable ignored) {}
@@ -1317,8 +1481,8 @@ public final class ColgramTelegramWsBridge {
                 }
                 byte[] mask = null;
                 if (masked) {
-                    mask = new byte[4];
-                    readFully(in, mask, 4);
+                    readFully(in, maskBuf, 4);
+                    mask = maskBuf;
                 }
 
                 if (opcode >= 0x8 && (!fin || payloadLen > 125L)) {
@@ -1897,9 +2061,9 @@ public final class ColgramTelegramWsBridge {
         EdgeEndpoint[] plan = {ep0, ep1, ep2, ep3};
         long[] delaysMs = {
                 0L,
-                100L,
-                200L,
-                300L
+                60L,
+                120L,
+                180L
         };
 
         final boolean useNative = isNativeFragMode(fragMode) && ColgramNativeDesync.isAvailable()
@@ -1907,9 +2071,8 @@ public final class ColgramTelegramWsBridge {
         // Never pass invalid TCP_MAXSEG < 88 (Linux TCP_MIN_MSS=88 -> EINVAL).
         final int mssClamp = (fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC
                 || fragMode == FRAG_NATIVE_MSS64_OOB1_TLSREC) ? 88 : 0;
-        // Avoid pre-SYN TCP_WINDOW_CLAMP on primary modes (caps TCP Window Scale permanently).
-        final int windowClamp = (useNative && cellularNetwork
-                && (fragMode == FRAG_NATIVE_OOB_DISORDER_TLSREC || fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC))
+        // Avoid pre-SYN TCP_WINDOW_CLAMP on primary/media/OOB modes (permanently caps TCP Window Scale).
+        final int windowClamp = (useNative && cellularNetwork && fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC)
                 ? 2048 : 0;
 
         final Object winnerLock = new Object();
@@ -1923,7 +2086,7 @@ public final class ColgramTelegramWsBridge {
             final EdgeEndpoint ep = plan[i];
             final long delay = delaysMs[i];
             try {
-                RACE_POOL.execute(() -> {
+                TCP_RACE_POOL.execute(() -> {
                     Socket sock = null;
                     try {
                         if (delay > 0L) Thread.sleep(delay);
@@ -1934,6 +2097,8 @@ public final class ColgramTelegramWsBridge {
                         } else {
                             sock = new Socket();
                             sock.setTcpNoDelay(true);
+                            try { sock.setReceiveBufferSize(262144); } catch (Throwable ignored) {}
+                            try { sock.setSendBufferSize(262144); } catch (Throwable ignored) {}
                             if (protector != null && !protector.protect(sock)) {
                                 return;
                             }
@@ -1989,7 +2154,9 @@ public final class ColgramTelegramWsBridge {
     private static boolean upgradeWebSocket(InputStream in, OutputStream out, String host)
             throws Exception {
         byte[] keyBytes = new byte[16];
-        new SecureRandom().nextBytes(keyBytes);
+        synchronized (SHARED_MASK_SEEDER) {
+            SHARED_MASK_SEEDER.nextBytes(keyBytes);
+        }
         String wsKey = encodeBase64(keyBytes);
         String expectedAccept = encodeBase64(MessageDigest.getInstance("SHA-1")
                 .digest((wsKey + WS_GUID).getBytes(StandardCharsets.US_ASCII)));
@@ -2032,8 +2199,28 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static void unmask(byte[] buf, int off, int len, byte[] mask, int maskOffset) {
-        for (int i = 0; i < len; i++) {
-            buf[off + i] ^= mask[(maskOffset + i) & 3];
+        if (len <= 0) return;
+        byte m0 = mask[maskOffset & 3];
+        byte m1 = mask[(maskOffset + 1) & 3];
+        byte m2 = mask[(maskOffset + 2) & 3];
+        byte m3 = mask[(maskOffset + 3) & 3];
+        int i = 0;
+        int limit4 = len - 3;
+        while (i < limit4) {
+            buf[off + i] ^= m0;
+            buf[off + i + 1] ^= m1;
+            buf[off + i + 2] ^= m2;
+            buf[off + i + 3] ^= m3;
+            i += 4;
+        }
+        if (i < len) {
+            buf[off + i] ^= m0;
+            if (i + 1 < len) {
+                buf[off + i + 1] ^= m1;
+                if (i + 2 < len) {
+                    buf[off + i + 2] ^= m2;
+                }
+            }
         }
     }
 

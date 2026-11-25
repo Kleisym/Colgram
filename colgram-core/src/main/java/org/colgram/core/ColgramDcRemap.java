@@ -170,11 +170,13 @@ public final class ColgramDcRemap {
 
     // ---------------------------------------------------------------------- socket plumbing
 
+    private static final int SOCKET_BUFFER_BYTES = 262144;
+    private static final int STREAM_COPY_BUFFER_BYTES = 65536;
     private static final java.util.concurrent.Semaphore CLIENT_SLOTS =
-            new java.util.concurrent.Semaphore(64);
+            new java.util.concurrent.Semaphore(96);
     private static final java.util.concurrent.ExecutorService REMAP_POOL =
             new java.util.concurrent.ThreadPoolExecutor(
-                    0, 128, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    0, 256, 30L, java.util.concurrent.TimeUnit.SECONDS,
                     new java.util.concurrent.SynchronousQueue<>(),
                     r -> {
                         Thread t = new Thread(r, "colgram-dc-remap-worker");
@@ -281,6 +283,7 @@ public final class ColgramDcRemap {
             }
 
             upstream = new Socket();
+            tuneSocketBuffers(upstream);
             try {
                 upstream.connect(new InetSocketAddress(
                         InetAddress.getByName(target), port), CONNECT_TIMEOUT_MS);
@@ -299,8 +302,8 @@ public final class ColgramDcRemap {
             out.flush();
             client.setSoTimeout(0);
             upstream.setSoTimeout(0);
-            client.setTcpNoDelay(true);
-            upstream.setTcpNoDelay(true);
+            tuneSocketBuffers(client);
+            tuneSocketBuffers(upstream);
 
             if (!target.equals(host)) {
                 remapped.incrementAndGet();
@@ -442,7 +445,7 @@ public final class ColgramDcRemap {
                 out.flush();
             } catch (Throwable ignored) {
             }
-            relay.close();
+            close(relay);
         } finally {
             close(control);
         }
@@ -916,23 +919,45 @@ public final class ColgramDcRemap {
     }
 
     private static long copy(Socket from, Socket to) {
-        byte[] buf = new byte[16384];
+        byte[] buf = new byte[STREAM_COPY_BUFFER_BYTES];
         long total = 0;
         try {
             InputStream in = from.getInputStream();
             OutputStream out = to.getOutputStream();
             int n;
             while ((n = in.read(buf)) > 0) {
-                if (total == 0) {
+                boolean first = (total == 0);
+                if (first) {
                     try { from.setSoTimeout(0); } catch (Throwable ignored) {}
                 }
                 out.write(buf, 0, n);
-                out.flush();
+                if (first) {
+                    out.flush();
+                } else {
+                    flushIfDrained(in, out);
+                }
                 total += n;
+            }
+            if (total > 0) {
+                out.flush();
             }
         } catch (Throwable ignored) {
         }
         return total;
+    }
+
+    private static void tuneSocketBuffers(Socket s) {
+        if (s == null) return;
+        try { s.setTcpNoDelay(true); } catch (Throwable ignored) {}
+        try { s.setKeepAlive(true); } catch (Throwable ignored) {}
+        try { s.setReceiveBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+        try { s.setSendBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+    }
+
+    private static void flushIfDrained(InputStream in, OutputStream out) throws IOException {
+        if (in.available() <= 0) {
+            out.flush();
+        }
     }
 
     private static void close(java.io.Closeable c) {

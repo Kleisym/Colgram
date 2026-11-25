@@ -1,5 +1,6 @@
 package org.colgram.core;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -7,6 +8,7 @@ import android.os.BatteryManager;
 import android.os.Build;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Battery-, screen-, and Doze-aware eco governor for Colgram's 24/7 background engine.
@@ -19,23 +21,31 @@ public final class ColgramPowerGuard {
 
     private static final int THROTTLE_BELOW_PERCENT = 20;
     private static final long BATTERY_CACHE_MS = 15_000L;
+    private static final long POWER_SAVE_CACHE_MS = 15_000L;
 
     private static volatile long cachedBatteryUpdatedAtMs = 0L;
     private static volatile boolean cachedCharging = false;
     private static volatile int cachedBatteryPercent = 100;
     private static volatile int cachedTempTenthsC = 0;
 
+    private static volatile long cachedPowerSaveUpdatedAtMs = 0L;
+    private static volatile boolean cachedPowerSaveMode = false;
+    private static final AtomicBoolean powerSaveReceiverRegistered = new AtomicBoolean(false);
+
     private ColgramPowerGuard() {
+    }
+
+    private static long elapsedMs() {
+        try {
+            return SystemClock.elapsedRealtime();
+        } catch (Throwable ignored) {
+            return System.currentTimeMillis();
+        }
     }
 
     private static void refreshBatterySnapshotIfNeeded(Context context) {
         if (context == null) return;
-        long now;
-        try {
-            now = SystemClock.elapsedRealtime();
-        } catch (Throwable ignored) {
-            now = System.currentTimeMillis();
-        }
+        long now = elapsedMs();
         long prev = cachedBatteryUpdatedAtMs;
         if (prev > 0L && now - prev >= 0L && now - prev < BATTERY_CACHE_MS) {
             return;
@@ -69,14 +79,51 @@ public final class ColgramPowerGuard {
         }
     }
 
-    /** True when Android's system Battery Saver mode is enabled. */
+    /** Clears cached Battery Saver state so the next {@link #isPowerSaveMode(Context)} call refreshes immediately. */
+    public static void invalidatePowerSaveCache() {
+        cachedPowerSaveUpdatedAtMs = 0L;
+    }
+
+    private static void registerPowerSaveReceiverOnce(Context context) {
+        if (powerSaveReceiverRegistered.get() || Build.VERSION.SDK_INT < 21) return;
+        Context app = context.getApplicationContext();
+        if (app == null || !powerSaveReceiverRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context c, Intent intent) {
+                    invalidatePowerSaveCache();
+                }
+            };
+            IntentFilter filter = new IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
+            if (Build.VERSION.SDK_INT >= 33) {
+                app.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                app.registerReceiver(receiver, filter);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** True when Android's system Battery Saver mode is enabled (cached for 15s + broadcast-invalidated). */
     public static boolean isPowerSaveMode(Context context) {
         if (context == null || Build.VERSION.SDK_INT < 21) return false;
+        long now = elapsedMs();
+        long prev = cachedPowerSaveUpdatedAtMs;
+        if (prev > 0L && now - prev >= 0L && now - prev < POWER_SAVE_CACHE_MS) {
+            return cachedPowerSaveMode;
+        }
+        registerPowerSaveReceiverOnce(context);
         try {
             PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-            return pm != null && pm.isPowerSaveMode();
+            boolean mode = pm != null && pm.isPowerSaveMode();
+            cachedPowerSaveMode = mode;
+            cachedPowerSaveUpdatedAtMs = now > 0L ? now : 1L;
+            return mode;
         } catch (Throwable t) {
-            return false;
+            return cachedPowerSaveMode;
         }
     }
 

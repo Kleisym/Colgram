@@ -15,9 +15,11 @@ import java.util.concurrent.Semaphore;
 
 /** Byte-preserving local shaping in front of the exact selected proxy, not another relay. */
 public final class ColgramLocalTcpFront implements AutoCloseable {
-    private static final Semaphore SLOTS = new Semaphore(48);
+    private static final int SOCKET_BUFFER_BYTES = 262144;
+    private static final int STREAM_COPY_BUFFER_BYTES = 64 * 1024;
+    private static final Semaphore SLOTS = new Semaphore(64);
     private static final ExecutorService IO = new java.util.concurrent.ThreadPoolExecutor(
-            0, 96, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            0, 192, 30L, java.util.concurrent.TimeUnit.SECONDS,
             new java.util.concurrent.SynchronousQueue<>(),
             r -> {
                 Thread t = new Thread(r, "colgram-base-pipe");
@@ -36,7 +38,7 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
             throw new IllegalArgumentException("Invalid base destination");
         this.host = host;
         this.targetPort = port;
-        listener = new ServerSocket(0, 32, InetAddress.getByName("127.0.0.1"));
+        listener = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
         IO.execute(this::accept);
     }
 
@@ -65,17 +67,14 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
         sockets.add(target);
         try {
             if (closed) return;
-            client.setTcpNoDelay(true);
-            target.setTcpNoDelay(true);
-            try {
-                client.setReceiveBufferSize(262144);
-                client.setSendBufferSize(262144);
-                target.setReceiveBufferSize(262144);
-                target.setSendBufferSize(262144);
-                target.setKeepAlive(true);
-            } catch (Throwable ignored) {}
+            tuneSocketBuffers(client);
+            tuneSocketBuffers(target);
             target.connect(new InetSocketAddress(host, targetPort), 4500);
             if (closed) return;
+            try {
+                client.setSoTimeout(0);
+                target.setSoTimeout(0);
+            } catch (Throwable ignored) {}
             java.util.concurrent.CountDownLatch downstream = new java.util.concurrent.CountDownLatch(1);
             try {
                 IO.execute(() -> {
@@ -101,7 +100,7 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
     }
 
     private static void copy(InputStream in, OutputStream out, boolean shape) throws IOException {
-        byte[] buffer = new byte[64 * 1024];
+        byte[] buffer = new byte[STREAM_COPY_BUFFER_BYTES];
         int count, shaped = 0;
         while ((count = in.read(buffer)) != -1) {
             // Shape SOCKS5 CONNECT requests (10-byte IPv4 / 22-byte IPv6 / domain) into
@@ -144,11 +143,23 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
                 sleepQuiet(2);
                 out.write(buffer, cut, count - cut); shaped++;
             } else out.write(buffer, 0, count);
-            if (in.available() <= 0) {
-                out.flush();
-            }
+            flushIfDrained(in, out);
         }
         out.flush();
+    }
+
+    private static void tuneSocketBuffers(Socket socket) {
+        if (socket == null) return;
+        try { socket.setTcpNoDelay(true); } catch (Throwable ignored) {}
+        try { socket.setKeepAlive(true); } catch (Throwable ignored) {}
+        try { socket.setReceiveBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+        try { socket.setSendBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+    }
+
+    private static void flushIfDrained(InputStream in, OutputStream out) throws IOException {
+        if (in.available() <= 0) {
+            out.flush();
+        }
     }
 
     private static void sleepQuiet(long ms) throws IOException {

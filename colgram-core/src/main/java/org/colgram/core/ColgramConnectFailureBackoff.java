@@ -15,10 +15,16 @@ public final class ColgramConnectFailureBackoff {
         long retryAtMs;
     }
 
+    private static final class InFlight {
+        long generation;
+        int count;
+    }
+
     private final long baseDelayMs;
     private final long maxDelayMs;
+    private final int maxConcurrentPerEndpoint;
     private final Map<String, Failure> failures = new LinkedHashMap<>(16, 0.75f, true);
-    private final Map<String, Long> inFlightGeneration = new HashMap<>();
+    private final Map<String, InFlight> inFlightGeneration = new HashMap<>();
     private long generation;
 
     /**
@@ -69,11 +75,16 @@ public final class ColgramConnectFailureBackoff {
     }
 
     public ColgramConnectFailureBackoff(long baseDelayMs, long maxDelayMs) {
+        this(baseDelayMs, maxDelayMs, 1);
+    }
+
+    public ColgramConnectFailureBackoff(long baseDelayMs, long maxDelayMs, int maxConcurrentPerEndpoint) {
         if (baseDelayMs <= 0L || maxDelayMs < baseDelayMs) {
             throw new IllegalArgumentException("invalid connect failure backoff bounds");
         }
         this.baseDelayMs = baseDelayMs;
         this.maxDelayMs = maxDelayMs;
+        this.maxConcurrentPerEndpoint = Math.max(1, maxConcurrentPerEndpoint);
     }
 
     /**
@@ -83,31 +94,35 @@ public final class ColgramConnectFailureBackoff {
      */
     public synchronized Decision acquire(String endpoint, long nowMs) {
         if (endpoint == null || endpoint.isEmpty()) return new Decision(false, -1L, false);
-        Long active = inFlightGeneration.get(endpoint);
-        if (active != null && active == generation) return new Decision(false, -1L, true);
+        InFlight active = inFlightGeneration.get(endpoint);
+        if (active != null && active.generation == generation && active.count >= maxConcurrentPerEndpoint) {
+            return new Decision(false, -1L, true);
+        }
         Failure failure = failures.get(endpoint);
         if (failure != null && nowMs < failure.retryAtMs) return new Decision(false, -1L, false);
-        inFlightGeneration.put(endpoint, generation);
+        if (active == null || active.generation != generation) {
+            active = new InFlight();
+            active.generation = generation;
+            inFlightGeneration.put(endpoint, active);
+        }
+        active.count++;
         return new Decision(true, generation, false);
     }
 
     /** Returns this generation's ticket, or -1 if another dial/cooldown should be honored. */
     public synchronized long tryBegin(String endpoint, long nowMs) {
-        if (endpoint == null || endpoint.isEmpty()) return -1L;
-        Long active = inFlightGeneration.get(endpoint);
-        if (active != null && active == generation) return -1L;
-        Failure failure = failures.get(endpoint);
-        if (failure != null && nowMs < failure.retryAtMs) return -1L;
-        inFlightGeneration.put(endpoint, generation);
-        return generation;
+        Decision d = acquire(endpoint, nowMs);
+        return d.granted() ? d.ticket() : -1L;
     }
 
     /** Completes only the matching dial, so an old network's late failure cannot poison a new one. */
     public synchronized long finish(String endpoint, long ticket, boolean connected, long nowMs) {
         if (endpoint == null || endpoint.isEmpty()) return 0L;
-        Long active = inFlightGeneration.get(endpoint);
-        if (active == null || active != ticket || ticket != generation) return 0L;
-        inFlightGeneration.remove(endpoint);
+        InFlight active = inFlightGeneration.get(endpoint);
+        if (active == null || active.generation != ticket || ticket != generation) return 0L;
+        if (--active.count <= 0) {
+            inFlightGeneration.remove(endpoint);
+        }
         if (connected) {
             failures.remove(endpoint);
             return 0L;
@@ -127,14 +142,18 @@ public final class ColgramConnectFailureBackoff {
 
     /** Release a ticket that never touched the network; keep the previous failure history. */
     public synchronized void release(String endpoint, long ticket) {
-        Long active = inFlightGeneration.get(endpoint);
-        if (active != null && active == ticket && ticket == generation) inFlightGeneration.remove(endpoint);
+        InFlight active = inFlightGeneration.get(endpoint);
+        if (active != null && active.generation == ticket && ticket == generation) {
+            if (--active.count <= 0) {
+                inFlightGeneration.remove(endpoint);
+            }
+        }
     }
 
     public synchronized boolean shouldSkip(String endpoint, long nowMs) {
         if (endpoint == null || endpoint.isEmpty()) return false;
-        Long active = inFlightGeneration.get(endpoint);
-        if (active != null && active == generation) return true;
+        InFlight active = inFlightGeneration.get(endpoint);
+        if (active != null && active.generation == generation && active.count >= maxConcurrentPerEndpoint) return true;
         Failure failure = failures.get(endpoint);
         return failure != null && nowMs < failure.retryAtMs;
     }

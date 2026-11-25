@@ -565,6 +565,7 @@ public final class ColgramNativeDesync {
         private final boolean sniPlusOne;
         private final boolean cellular;
         private final int decoyVariant;
+        private volatile boolean handshakeDone;
         private volatile OutputStream wrappedOut;
 
         FirstTlsNativeSocket(NativeSocket base, int nativeMode, int fakeTtl,
@@ -615,35 +616,68 @@ public final class ColgramNativeDesync {
 
         @Override
         public OutputStream getOutputStream() throws IOException {
+            if (handshakeDone) return base.getOutputStream();
             OutputStream existing = wrappedOut;
             if (existing != null) return existing;
-            final OutputStream raw = base.getOutputStream();
-            OutputStream fresh = new OutputStream() {
-                private boolean firstSent;
-
-                @Override
-                public synchronized void write(int b) throws IOException {
-                    write(new byte[]{(byte) b}, 0, 1);
-                }
-
-                @Override
-                public synchronized void write(byte[] b, int off, int len) throws IOException {
-                    if (!firstSent && len >= 11 && (b[off] & 0xFF) == 0x16 && b[off + 1] == 0x03
-                            && (b[off + 5] & 0xFF) == 0x01) {
-                        firstSent = true;
-                        base.sendDesynced(b, off, len, nativeMode, fakeTtl, tlsRecordSplit,
-                                sniPlusOne, cellular, decoyVariant);
-                        return;
+            synchronized (this) {
+                if (handshakeDone) return base.getOutputStream();
+                if (wrappedOut != null) return wrappedOut;
+                final OutputStream raw = base.getOutputStream();
+                OutputStream fresh = new OutputStream() {
+                    @Override
+                    public void write(int b) throws IOException {
+                        if (handshakeDone) {
+                            raw.write(b);
+                            return;
+                        }
+                        writeSingleLocked(b);
                     }
-                    firstSent = true;
-                    raw.write(b, off, len);
-                }
 
-                @Override public void flush() throws IOException { raw.flush(); }
-                @Override public void close() throws IOException { base.close(); }
-            };
-            wrappedOut = fresh;
-            return fresh;
+                    @Override
+                    public void write(byte[] b, int off, int len) throws IOException {
+                        if (handshakeDone) {
+                            raw.write(b, off, len);
+                            return;
+                        }
+                        writeFirstLocked(b, off, len);
+                    }
+
+                    private synchronized void writeSingleLocked(int b) throws IOException {
+                        if (handshakeDone) {
+                            raw.write(b);
+                            return;
+                        }
+                        try {
+                            raw.write(b);
+                        } finally {
+                            handshakeDone = true;
+                        }
+                    }
+
+                    private synchronized void writeFirstLocked(byte[] b, int off, int len) throws IOException {
+                        if (handshakeDone) {
+                            raw.write(b, off, len);
+                            return;
+                        }
+                        try {
+                            if (len >= 11 && (b[off] & 0xFF) == 0x16 && b[off + 1] == 0x03
+                                    && (b[off + 5] & 0xFF) == 0x01) {
+                                base.sendDesynced(b, off, len, nativeMode, fakeTtl, tlsRecordSplit,
+                                        sniPlusOne, cellular, decoyVariant);
+                                return;
+                            }
+                            raw.write(b, off, len);
+                        } finally {
+                            handshakeDone = true;
+                        }
+                    }
+
+                    @Override public void flush() throws IOException { raw.flush(); }
+                    @Override public void close() throws IOException { base.close(); }
+                };
+                wrappedOut = fresh;
+                return fresh;
+            }
         }
     }
 

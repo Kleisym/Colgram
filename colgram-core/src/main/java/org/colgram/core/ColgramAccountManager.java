@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +59,14 @@ public class ColgramAccountManager {
     private static volatile File sessionsDir = null;
     private static volatile byte[] cachedMasterKey = null;
     private static final Object MASTER_LOCK = new Object();
+    private static final Object VAULT_CACHE_LOCK = new Object();
+    private static volatile List<VaultEntry> cachedVaultedAccounts = null;
+
+    public static void invalidateVaultCache() {
+        synchronized (VAULT_CACHE_LOCK) {
+            cachedVaultedAccounts = null;
+        }
+    }
 
     public static final class VaultEntry {
         public final String vaultKey;
@@ -149,6 +158,7 @@ public class ColgramAccountManager {
         }
         int next = prefs.getInt(KEY_PIN_COUNTER, 0) + 1;
         prefs.edit().putInt(KEY_PIN_COUNTER, next).putInt(key, next).apply();
+        invalidateVaultCache();
         ColgramPersistentBackup.scheduleAutoBackup(context);
         return true;
     }
@@ -166,6 +176,7 @@ public class ColgramAccountManager {
         }
         int next = prefs.getInt(KEY_PIN_COUNTER, 0) + 1;
         prefs.edit().putInt(KEY_PIN_COUNTER, next).putInt(key, next).apply();
+        invalidateVaultCache();
         ColgramPersistentBackup.scheduleAutoBackup(context);
         return true;
     }
@@ -360,6 +371,7 @@ public class ColgramAccountManager {
             } else {
                 patchSelectedAccountInXml(xmlTarget, 0);
             }
+            invalidateVaultCache();
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "writeVaultBundleToSlot failed", t);
@@ -379,33 +391,46 @@ public class ColgramAccountManager {
     }
 
     public static List<VaultEntry> listVaultedAccounts(Context context) {
-        List<VaultEntry> list = new ArrayList<>();
-        if (context == null) return list;
-        Context app = context.getApplicationContext();
-        SharedPreferences prefs = app.getSharedPreferences(PREFS_VAULT, Context.MODE_PRIVATE);
-        String raw = prefs.getString(KEY_VAULT_INDEX, "[]");
-        try {
-            JSONArray arr = new JSONArray(raw);
-            File dir = vaultDir(app);
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject o = arr.optJSONObject(i);
-                if (o == null) continue;
-                String vk = sanitizeKey(o.optString("vaultKey", ""));
-                if (vk.isEmpty() || !new File(dir, vk + ".cgv").exists()) continue;
-                list.add(new VaultEntry(
-                        vk,
-                        o.optLong("userId", 0L),
-                        o.optString("name", ""),
-                        o.optString("username", ""),
-                        o.optString("phone", ""),
-                        o.optBoolean("isBot", false),
-                        o.optLong("savedAt", 0L)
-                ));
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "listVaultedAccounts parse error: " + t.getMessage());
+        if (context == null) return new ArrayList<>();
+        List<VaultEntry> cached = cachedVaultedAccounts;
+        if (cached != null) {
+            return new ArrayList<>(cached);
         }
-        return sortVaultEntries(app, list);
+        Context app = context.getApplicationContext();
+        if (app == null) app = context;
+        synchronized (VAULT_CACHE_LOCK) {
+            cached = cachedVaultedAccounts;
+            if (cached != null) {
+                return new ArrayList<>(cached);
+            }
+            List<VaultEntry> list = new ArrayList<>();
+            SharedPreferences prefs = app.getSharedPreferences(PREFS_VAULT, Context.MODE_PRIVATE);
+            String raw = prefs.getString(KEY_VAULT_INDEX, "[]");
+            try {
+                JSONArray arr = new JSONArray(raw);
+                File dir = vaultDir(app);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    if (o == null) continue;
+                    String vk = sanitizeKey(o.optString("vaultKey", ""));
+                    if (vk.isEmpty() || !new File(dir, vk + ".cgv").exists()) continue;
+                    list.add(new VaultEntry(
+                            vk,
+                            o.optLong("userId", 0L),
+                            o.optString("name", ""),
+                            o.optString("username", ""),
+                            o.optString("phone", ""),
+                            o.optBoolean("isBot", false),
+                            o.optLong("savedAt", 0L)
+                    ));
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "listVaultedAccounts parse error: " + t.getMessage());
+            }
+            List<VaultEntry> sorted = Collections.unmodifiableList(sortVaultEntries(app, list));
+            cachedVaultedAccounts = sorted;
+            return new ArrayList<>(sorted);
+        }
     }
 
     public static VaultEntry findVaultEntryByUserId(Context context, long userId) {
@@ -434,6 +459,7 @@ public class ColgramAccountManager {
             }
             prefs.edit().putString(KEY_VAULT_INDEX, dst.toString()).apply();
         } catch (Throwable ignored) {}
+        invalidateVaultCache();
         return deleted;
     }
 
@@ -635,6 +661,7 @@ public class ColgramAccountManager {
             obj.put("savedAt", entry.savedAt);
             dst.put(obj);
             prefs.edit().putString(KEY_VAULT_INDEX, dst.toString()).apply();
+            invalidateVaultCache();
         } catch (Throwable t) {
             Log.w(TAG, "upsertIndexEntry failed", t);
         }

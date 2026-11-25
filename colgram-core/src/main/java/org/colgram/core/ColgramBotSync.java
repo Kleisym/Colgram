@@ -46,7 +46,10 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ColgramBotSync — Full Dialog History Synchronizer, Real-time Poller & Profile Manager for Bot Accounts.
@@ -60,7 +63,30 @@ import java.util.concurrent.Executors;
 public class ColgramBotSync {
 
     private static final String TAG = "ColgramBotSync";
-    private static final ExecutorService executor = Executors.newCachedThreadPool();
+    private static final ExecutorService executor = createBoundedExecutor("colgram-bot-sync-", 6, 256,
+            new ThreadPoolExecutor.DiscardOldestPolicy());
+    private static final ExecutorService avatarExecutor = createBoundedExecutor("colgram-bot-avatar-", 4, 64,
+            new ThreadPoolExecutor.DiscardOldestPolicy());
+
+    private static ExecutorService createBoundedExecutor(String threadPrefix, int maxThreads, int queueCapacity,
+                                                         java.util.concurrent.RejectedExecutionHandler rejectedHandler) {
+        AtomicInteger seq = new AtomicInteger(1);
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                maxThreads,
+                maxThreads,
+                30L,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queueCapacity),
+                r -> {
+                    Thread t = new Thread(r, threadPrefix + seq.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                },
+                rejectedHandler
+        );
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
     /** The phantom-dialog sweep runs once per process, after the first cache seed. */
     private static final java.util.concurrent.atomic.AtomicBoolean phantomCleanupDone =
@@ -2781,6 +2807,10 @@ public class ColgramBotSync {
      *         carrying the transport failure so callers still report something honest
      */
     private static JSONObject botApiPost(String token, String method, JSONObject payload) {
+        return botApiPost(token, method, payload, 15000);
+    }
+
+    private static JSONObject botApiPost(String token, String method, JSONObject payload, int readTimeoutMs) {
         final String urlStr = "https://api.telegram.org/bot" + token + "/" + method;
         // A POST cannot be probed the way a GET can: HttpURLConnection rejects setDoOutput() once
         // the socket has been dialled, so the transport ladder has to be walked here, around the
@@ -2806,7 +2836,7 @@ public class ColgramBotSync {
         for (java.net.Proxy rung : withBestRungRetry(rungs)) {
             HttpURLConnection conn = null;
             try {
-                conn = openVia(new URL(urlStr), rung, 15000,
+                conn = openVia(new URL(urlStr), rung, readTimeoutMs,
                         Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000));
                 conn.setRequestMethod("POST");
                 conn.setDoOutput(true);
@@ -3541,11 +3571,15 @@ public class ColgramBotSync {
 
     private static final ConcurrentHashMap<Integer, Long> lastBotUiNotifyAt = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Long> botAvatarAttemptedAt = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, File> botCacheDirs = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, File> botAvatarFileCache = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> botAvatarMissingAt = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Integer, Long> botAvatarUiPostedAt = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Integer, Boolean> botAvatarUiPending = new ConcurrentHashMap<>();
     private static final java.util.Set<String> botAvatarInFlight =
             java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
-    private static final long BOT_AVATAR_NEGATIVE_TTL_MS = 30_000L;
+    private static final long BOT_AVATAR_NEGATIVE_TTL_MS = 120_000L;
+    private static final long BOT_AVATAR_FILE_MISS_TTL_MS = 10_000L;
 
     public interface BotEmojiCallback {
         void onDocumentsLoaded(ArrayList<Object> documents);
@@ -3564,25 +3598,51 @@ public class ColgramBotSync {
     }
 
     private static File getBotCacheDir(Context context, String sub) {
+        if (sub == null) sub = "";
+        File cached = botCacheDirs.get(sub);
+        if (cached != null) {
+            return cached;
+        }
         Context app = resolveAppContext(context);
         if (app == null) return null;
         File dir = new File(new File(app.getFilesDir(), "colgram_bot_cache"), sub);
         if (!dir.exists()) {
             dir.mkdirs();
         }
+        botCacheDirs.putIfAbsent(sub, dir);
         return dir;
     }
 
     public static File getCachedBotAvatarFile(int account, long peerId) {
         if (peerId == 0) return null;
+        final String key = account + ":" + peerId;
+        File cached = botAvatarFileCache.get(key);
+        if (cached != null) {
+            if (cached.length() > 64) {
+                return cached;
+            }
+            botAvatarFileCache.remove(key, cached);
+        }
+        Long missingAt = botAvatarMissingAt.get(key);
+        if (missingAt != null && System.currentTimeMillis() - missingAt < BOT_AVATAR_FILE_MISS_TTL_MS) {
+            return null;
+        }
         File dir = getBotCacheDir(null, "avatars");
         if (dir == null) return null;
         File scoped = new File(dir, "acc_" + account + "_peer_" + peerId + ".jpg");
         if (scoped.exists() && scoped.length() > 64) {
+            botAvatarMissingAt.remove(key);
+            botAvatarFileCache.put(key, scoped);
             return scoped;
         }
         File legacy = new File(dir, "peer_" + peerId + ".jpg");
-        return (legacy.exists() && legacy.length() > 64) ? legacy : null;
+        if (legacy.exists() && legacy.length() > 64) {
+            botAvatarMissingAt.remove(key);
+            botAvatarFileCache.put(key, legacy);
+            return legacy;
+        }
+        botAvatarMissingAt.put(key, System.currentTimeMillis());
+        return null;
     }
 
     public static void requestBotAvatarAsync(Context context, int account, long peerId, boolean isChat) {
@@ -3603,7 +3663,7 @@ public class ColgramBotSync {
 
         long now = System.currentTimeMillis();
         Long attempted = botAvatarAttemptedAt.get(key);
-        if (needAvatar && attempted != null && now - attempted < BOT_AVATAR_NEGATIVE_TTL_MS) {
+        if (attempted != null && now - attempted < BOT_AVATAR_NEGATIVE_TTL_MS) {
             return;
         }
         if (!botAvatarInFlight.add(key)) {
@@ -3620,15 +3680,47 @@ public class ColgramBotSync {
             botAvatarInFlight.remove(key);
             return;
         }
-        executor.execute(() -> {
+        avatarExecutor.execute(() -> {
             try {
                 botAvatarAttemptedAt.put(key, System.currentTimeMillis());
                 String fileId = null;
-                if (needAvatar && !isChat && peerId > 0) {
+                boolean chatAnswered = false;
+                if (needMeta || needAvatar) {
+                    long[] candidateChatIds;
+                    if (explicitBotApiChatId != 0) {
+                        candidateChatIds = new long[]{explicitBotApiChatId};
+                    } else if (peerId > 0) {
+                        candidateChatIds = new long[]{peerId};
+                    } else {
+                        long abs = -peerId;
+                        candidateChatIds = new long[]{-1000000000000L - abs, peerId};
+                    }
+                    for (long cid : candidateChatIds) {
+                        JSONObject chatPayload = new JSONObject();
+                        chatPayload.put("chat_id", cid);
+                        JSONObject chatResp = botApiPost(token, "getChat", chatPayload, 6000);
+                        if (chatResp != null && chatResp.optBoolean("ok", false)) {
+                            JSONObject res = chatResp.optJSONObject("result");
+                            if (res != null) {
+                                chatAnswered = true;
+                                botPeerMetaSynced.add(key);
+                                applyBotChatProfileMetadata(app, account, peerId, isChat, res);
+                                if (needAvatar) {
+                                    JSONObject photo = res.optJSONObject("photo");
+                                    if (photo != null) {
+                                        fileId = photo.optString("small_file_id", photo.optString("big_file_id", ""));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (needAvatar && !isChat && peerId > 0 && !chatAnswered && (fileId == null || fileId.isEmpty())) {
                     JSONObject photosPayload = new JSONObject();
                     photosPayload.put("user_id", peerId);
                     photosPayload.put("limit", 1);
-                    JSONObject photosResp = botApiPost(token, "getUserProfilePhotos", photosPayload);
+                    JSONObject photosResp = botApiPost(token, "getUserProfilePhotos", photosPayload, 6000);
                     if (photosResp != null && photosResp.optBoolean("ok", false)) {
                         JSONObject res = photosResp.optJSONObject("result");
                         JSONArray photos = res != null ? res.optJSONArray("photos") : null;
@@ -3644,41 +3736,13 @@ public class ColgramBotSync {
                         }
                     }
                 }
-                if (needMeta || (needAvatar && (fileId == null || fileId.isEmpty()))) {
-                    long[] candidateChatIds;
-                    if (explicitBotApiChatId != 0) {
-                        candidateChatIds = new long[]{explicitBotApiChatId};
-                    } else if (peerId > 0) {
-                        candidateChatIds = new long[]{peerId};
-                    } else {
-                        long abs = -peerId;
-                        candidateChatIds = new long[]{-1000000000000L - abs, peerId};
-                    }
-                    for (long cid : candidateChatIds) {
-                        JSONObject chatPayload = new JSONObject();
-                        chatPayload.put("chat_id", cid);
-                        JSONObject chatResp = botApiPost(token, "getChat", chatPayload);
-                        if (chatResp != null && chatResp.optBoolean("ok", false)) {
-                            JSONObject res = chatResp.optJSONObject("result");
-                            if (res != null) {
-                                botPeerMetaSynced.add(key);
-                                applyBotChatProfileMetadata(app, account, peerId, isChat, res);
-                                if (needAvatar && (fileId == null || fileId.isEmpty())) {
-                                    JSONObject photo = res.optJSONObject("photo");
-                                    if (photo != null) {
-                                        fileId = photo.optString("small_file_id", photo.optString("big_file_id", ""));
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
                 if (needAvatar && fileId != null && !fileId.isEmpty()) {
                     File dir = getBotCacheDir(app, "avatars");
                     if (dir != null) {
                         File dest = new File(dir, "acc_" + account + "_peer_" + peerId + ".jpg");
-                        if (downloadBotFileById(token, fileId, dest)) {
+                        if (downloadBotFileById(token, fileId, dest, 8000)) {
+                            botAvatarMissingAt.remove(key);
+                            botAvatarFileCache.put(key, dest);
                             postDebouncedAvatarRefresh(account);
                         }
                     }
@@ -5727,13 +5791,17 @@ public class ColgramBotSync {
     }
 
     private static boolean downloadBotFileById(String token, String fileId, File destFile) {
+        return downloadBotFileById(token, fileId, destFile, 15000);
+    }
+
+    private static boolean downloadBotFileById(String token, String fileId, File destFile, int readTimeoutMs) {
         if (token == null || token.isEmpty() || fileId == null || fileId.isEmpty() || destFile == null) {
             return false;
         }
         try {
             JSONObject req = new JSONObject();
             req.put("file_id", fileId);
-            JSONObject resp = botApiPost(token, "getFile", req);
+            JSONObject resp = botApiPost(token, "getFile", req, readTimeoutMs);
             if (resp == null || !resp.optBoolean("ok", false)) {
                 return false;
             }
@@ -5752,7 +5820,7 @@ public class ColgramBotSync {
             for (java.net.Proxy rung : withBestRungRetry(rungs)) {
                 HttpURLConnection conn = null;
                 try {
-                    conn = openVia(url, rung, 15000, Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000));
+                    conn = openVia(url, rung, readTimeoutMs, Math.min(COLGRAM_CONNECT_TIMEOUT_MS, 4000));
                     int code = conn.getResponseCode();
                     if (code >= 200 && code < 300) {
                         try (InputStream is = conn.getInputStream();

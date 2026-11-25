@@ -100,16 +100,19 @@ public class ColgramHookHandler {
     public static void notifyColemailerIncoming(int account, Object tlMessage) {
         if (tlMessage == null) return;
         try {
-            Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
-            Class<?> msgCls = Class.forName("org.telegram.tgnet.TLRPC$Message");
-            bridge.getMethod("onIncomingMessage", int.class, msgCls).invoke(null, account, tlMessage);
+            initBridgeHandles();
+            if (cachedBridgeOnIncomingMethod != null) {
+                cachedBridgeOnIncomingMethod.invoke(null, account, tlMessage);
+            }
         } catch (Throwable ignored) {}
     }
 
     private static void invokeBridgeStartScheduler() {
         try {
-            Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
-            bridge.getMethod("startScheduler").invoke(null);
+            initBridgeHandles();
+            if (cachedBridgeStartSchedulerMethod != null) {
+                cachedBridgeStartSchedulerMethod.invoke(null);
+            }
         } catch (Throwable ignored) {}
     }
 
@@ -134,16 +137,16 @@ public class ColgramHookHandler {
         }
         if (!trimmed.startsWith(".")) return false;
         try {
-            Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
-            try {
-                Object res = bridge.getMethod("handleChatCommand", int.class, long.class, int.class, String.class, long.class)
-                        .invoke(null, account, dialogId, replyToMsgId, text, replySenderId);
-                return Boolean.TRUE.equals(res);
-            } catch (NoSuchMethodException fallbackOld) {
-                Object res = bridge.getMethod("handleChatCommand", long.class, int.class, String.class, long.class)
-                        .invoke(null, dialogId, replyToMsgId, text, replySenderId);
+            initBridgeHandles();
+            if (cachedBridgeHandleCmd5Method != null) {
+                Object res = cachedBridgeHandleCmd5Method.invoke(null, account, dialogId, replyToMsgId, text, replySenderId);
                 return Boolean.TRUE.equals(res);
             }
+            if (cachedBridgeHandleCmd4Method != null) {
+                Object res = cachedBridgeHandleCmd4Method.invoke(null, dialogId, replyToMsgId, text, replySenderId);
+                return Boolean.TRUE.equals(res);
+            }
+            return false;
         } catch (Throwable ignored) {
             return false;
         }
@@ -170,38 +173,172 @@ public class ColgramHookHandler {
             if (ColgramColemailerEngine.getInstance().isWhitelisted(senderId)) {
                 return ColgramSpamGuard.VERDICT_OK;
             }
-            boolean isContact = false;
-            try {
-                Class<?> ccClass = Class.forName("org.telegram.messenger.ContactsController");
-                Object cc = ccClass.getMethod("getInstance", int.class).invoke(null, account);
-                Object res = ccClass.getMethod("isContact", long.class).invoke(cc, senderId);
-                isContact = Boolean.TRUE.equals(res);
-            } catch (Throwable ignored) {
-            }
+            boolean isContact = isTelegramContact(account, senderId);
             return ColgramSpamGuard.judge(dialogId, senderId, text, isContact, isGroup);
         } catch (Throwable t) {
             return ColgramSpamGuard.VERDICT_OK;
         }
     }
 
+    private static final Object REFLECTION_LOCK = new Object();
+    private static volatile boolean bridgeInitAttempted = false;
+    private static volatile java.lang.reflect.Method cachedBridgeOnIncomingMethod;
+    private static volatile java.lang.reflect.Method cachedBridgeStartSchedulerMethod;
+    private static volatile java.lang.reflect.Method cachedBridgeHandleCmd5Method;
+    private static volatile java.lang.reflect.Method cachedBridgeHandleCmd4Method;
+
+    private static volatile boolean userConfigInitAttempted = false;
+    private static volatile java.lang.reflect.Field cachedUcSelectedAccountField;
+    private static volatile java.lang.reflect.Method cachedUcGetInstanceMethod;
+    private static volatile java.lang.reflect.Method cachedUcGetClientUserIdMethod;
+
+    private static volatile boolean contactsInitAttempted = false;
+    private static volatile java.lang.reflect.Method cachedCcGetInstanceMethod;
+    private static volatile java.lang.reflect.Method cachedCcIsContactMethod;
+
+    private static volatile boolean messagesInitAttempted = false;
+    private static volatile java.lang.reflect.Method cachedMcGetInstanceMethod;
+    private static volatile java.lang.reflect.Method cachedMcGetUserMethod;
+    private static volatile java.lang.reflect.Method cachedMcGetChatMethod;
+
+    private static volatile boolean tlInitAttempted = false;
+    private static volatile java.lang.reflect.Field cachedUserFirstNameField;
+    private static volatile java.lang.reflect.Field cachedUserLastNameField;
+    private static volatile java.lang.reflect.Field cachedUserUsernameField;
+    private static volatile java.lang.reflect.Field cachedUserBotField;
+    private static volatile java.lang.reflect.Field cachedChatTitleField;
+    private static volatile java.lang.reflect.Field cachedChatBroadcastField;
+    private static volatile java.lang.reflect.Field cachedChatMegagroupField;
+
+    private static void initBridgeHandles() {
+        if (bridgeInitAttempted) return;
+        synchronized (REFLECTION_LOCK) {
+            if (bridgeInitAttempted) return;
+            try {
+                Class<?> bridge = Class.forName("org.telegram.messenger.ColgramNativeColemailerBridge");
+                try {
+                    Class<?> msgCls = Class.forName("org.telegram.tgnet.TLRPC$Message");
+                    cachedBridgeOnIncomingMethod = bridge.getMethod("onIncomingMessage", int.class, msgCls);
+                } catch (Throwable ignored) {}
+                try {
+                    cachedBridgeStartSchedulerMethod = bridge.getMethod("startScheduler");
+                } catch (Throwable ignored) {}
+                try {
+                    cachedBridgeHandleCmd5Method = bridge.getMethod("handleChatCommand", int.class, long.class, int.class, String.class, long.class);
+                } catch (Throwable ignored) {}
+                try {
+                    cachedBridgeHandleCmd4Method = bridge.getMethod("handleChatCommand", long.class, int.class, String.class, long.class);
+                } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            } finally {
+                bridgeInitAttempted = true;
+            }
+        }
+    }
+
+    private static void initUserConfigHandles() {
+        if (userConfigInitAttempted) return;
+        synchronized (REFLECTION_LOCK) {
+            if (userConfigInitAttempted) return;
+            try {
+                Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+                cachedUcSelectedAccountField = ucClass.getField("selectedAccount");
+                cachedUcGetInstanceMethod = ucClass.getMethod("getInstance", int.class);
+                cachedUcGetClientUserIdMethod = ucClass.getMethod("getClientUserId");
+            } catch (Throwable ignored) {
+            } finally {
+                userConfigInitAttempted = true;
+            }
+        }
+    }
+
+    private static void initContactsHandles() {
+        if (contactsInitAttempted) return;
+        synchronized (REFLECTION_LOCK) {
+            if (contactsInitAttempted) return;
+            try {
+                Class<?> ccClass = Class.forName("org.telegram.messenger.ContactsController");
+                cachedCcGetInstanceMethod = ccClass.getMethod("getInstance", int.class);
+                cachedCcIsContactMethod = ccClass.getMethod("isContact", long.class);
+            } catch (Throwable ignored) {
+            } finally {
+                contactsInitAttempted = true;
+            }
+        }
+    }
+
+    private static void initMessagesHandles() {
+        if (messagesInitAttempted) return;
+        synchronized (REFLECTION_LOCK) {
+            if (messagesInitAttempted) return;
+            try {
+                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+                cachedMcGetInstanceMethod = mcClass.getMethod("getInstance", int.class);
+                cachedMcGetUserMethod = mcClass.getMethod("getUser", Long.class);
+                cachedMcGetChatMethod = mcClass.getMethod("getChat", Long.class);
+            } catch (Throwable ignored) {
+            } finally {
+                messagesInitAttempted = true;
+            }
+        }
+    }
+
+    private static void initTlHandles() {
+        if (tlInitAttempted) return;
+        synchronized (REFLECTION_LOCK) {
+            if (tlInitAttempted) return;
+            try {
+                Class<?> userClass = Class.forName("org.telegram.tgnet.TLRPC$User");
+                cachedUserFirstNameField = userClass.getField("first_name");
+                cachedUserLastNameField = userClass.getField("last_name");
+                cachedUserUsernameField = userClass.getField("username");
+                cachedUserBotField = userClass.getField("bot");
+            } catch (Throwable ignored) {}
+            try {
+                Class<?> chatClass = Class.forName("org.telegram.tgnet.TLRPC$Chat");
+                cachedChatTitleField = chatClass.getField("title");
+                cachedChatBroadcastField = chatClass.getField("broadcast");
+                cachedChatMegagroupField = chatClass.getField("megagroup");
+            } catch (Throwable ignored) {}
+            tlInitAttempted = true;
+        }
+    }
+
+    private static boolean isTelegramContact(int account, long userId) {
+        try {
+            initContactsHandles();
+            if (cachedCcGetInstanceMethod != null && cachedCcIsContactMethod != null) {
+                Object cc = cachedCcGetInstanceMethod.invoke(null, account);
+                if (cc != null) {
+                    return Boolean.TRUE.equals(cachedCcIsContactMethod.invoke(cc, userId));
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     private static int resolveSelectedAccount() {
         try {
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            int acc = ucClass.getField("selectedAccount").getInt(null);
-            return acc >= 0 && acc < 5 ? acc : 0;
+            initUserConfigHandles();
+            if (cachedUcSelectedAccountField != null) {
+                int acc = cachedUcSelectedAccountField.getInt(null);
+                return acc >= 0 && acc < 5 ? acc : 0;
+            }
         } catch (Throwable ignored) {
-            return 0;
         }
+        return 0;
     }
 
     private static long resolveSelfUserId(int account) {
         if (account < 0 || account >= 5) return 0L;
         try {
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, account);
-            if (uc != null) {
-                Object id = ucClass.getMethod("getClientUserId").invoke(uc);
-                if (id instanceof Long) return ((Long) id).longValue();
+            initUserConfigHandles();
+            if (cachedUcGetInstanceMethod != null && cachedUcGetClientUserIdMethod != null) {
+                Object uc = cachedUcGetInstanceMethod.invoke(null, account);
+                if (uc != null) {
+                    Object id = cachedUcGetClientUserIdMethod.invoke(uc);
+                    if (id instanceof Long) return ((Long) id).longValue();
+                }
             }
         } catch (Throwable ignored) {}
         return 0L;
@@ -244,8 +381,18 @@ public class ColgramHookHandler {
 
     /** Per-(account, dialog) timestamp of the last automatic answer. */
     private static final java.util.HashMap<String, Long> colgramAutoReplyAt = new java.util.HashMap<>();
-    private static final java.util.concurrent.ExecutorService hookIoExecutor =
-            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private static final java.util.concurrent.ScheduledExecutorService hookIoExecutor =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "colgram-hook-io");
+                t.setDaemon(true);
+                return t;
+            });
+    private static final java.util.concurrent.ExecutorService editHistoryExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "colgram-edit-history");
+                t.setDaemon(true);
+                return t;
+            });
 
     /**
      * Built-in keyword alerts (was plugins/keyword_alerts.py).
@@ -262,19 +409,28 @@ public class ColgramHookHandler {
         final int acct = account >= 0 ? account : resolveSelectedAccount();
         hookIoExecutor.execute(() -> {
             String title = "🔔 Ключевое слово";
-            String who;
+            String who = Long.toString(dialog);
             try {
-                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-                Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, acct);
-                if (dialog > 0) {
-                    Object user = mcClass.getMethod("getUser", Long.class).invoke(mc, dialog);
-                    who = user == null ? Long.toString(dialog) : (String)
-                            firstNonNull(user.getClass().getField("first_name").get(user),
-                                    user.getClass().getField("username").get(user), "чат " + dialog);
-                } else {
-                    Object chat = mcClass.getMethod("getChat", Long.class).invoke(mc, -dialog);
-                    who = chat == null ? Long.toString(dialog) : String.valueOf(
-                            chat.getClass().getField("title").get(chat));
+                initMessagesHandles();
+                initTlHandles();
+                if (cachedMcGetInstanceMethod != null) {
+                    Object mc = cachedMcGetInstanceMethod.invoke(null, acct);
+                    if (mc != null) {
+                        if (dialog > 0 && cachedMcGetUserMethod != null) {
+                            Object user = cachedMcGetUserMethod.invoke(mc, dialog);
+                            if (user != null && cachedUserFirstNameField != null && cachedUserUsernameField != null) {
+                                who = (String) firstNonNull(
+                                        cachedUserFirstNameField.get(user),
+                                        cachedUserUsernameField.get(user),
+                                        "чат " + dialog);
+                            }
+                        } else if (dialog <= 0 && cachedMcGetChatMethod != null) {
+                            Object chat = cachedMcGetChatMethod.invoke(mc, -dialog);
+                            if (chat != null && cachedChatTitleField != null) {
+                                who = String.valueOf(cachedChatTitleField.get(chat));
+                            }
+                        }
+                    }
                 }
             } catch (Throwable t) {
                 who = Long.toString(dialog);
@@ -299,8 +455,37 @@ public class ColgramHookHandler {
         return null;
     }
 
-    /** One JSONL writer for the built-in message log; appends are cheap and crash-safe. */
+    /** One buffered JSONL writer for the built-in message log with periodic flush. */
     private static final Object messageLogLock = new Object();
+    private static java.io.BufferedWriter messageLogWriter = null;
+    private static File messageLogFile = null;
+    private static int messageLogPendingWrites = 0;
+    private static int messageLogTotalWrites = 0;
+    private static long messageLogLastFlushMs = 0L;
+    private static java.util.concurrent.ScheduledFuture<?> messageLogFlushTask = null;
+
+    private static void closeMessageLogWriterLocked() {
+        if (messageLogWriter != null) {
+            try { messageLogWriter.close(); } catch (Throwable ignored) {}
+            messageLogWriter = null;
+        }
+        messageLogPendingWrites = 0;
+    }
+
+    private static void flushMessageLogSafe() {
+        synchronized (messageLogLock) {
+            messageLogFlushTask = null;
+            if (messageLogWriter != null && messageLogPendingWrites > 0) {
+                try {
+                    messageLogWriter.flush();
+                    messageLogPendingWrites = 0;
+                    messageLogLastFlushMs = System.currentTimeMillis();
+                } catch (Throwable ignored) {
+                    closeMessageLogWriterLocked();
+                }
+            }
+        }
+    }
 
     private static String jsonEscapeLog(String raw) {
         if (raw == null) return "";
@@ -333,21 +518,58 @@ public class ColgramHookHandler {
         final int mid = messageId;
         final String safeText = jsonEscapeLog(text);
         final boolean out = isOut;
+        final long tsSec = System.currentTimeMillis() / 1000L;
         hookIoExecutor.execute(() -> {
             synchronized (messageLogLock) {
                 try {
-                    java.io.File dir = new java.io.File(appContext.getFilesDir(), "Colgram");
-                    if (!dir.exists()) dir.mkdirs();
-                    java.io.File file = new java.io.File(dir, "messages_log.jsonl");
-                    try (java.io.FileWriter w = new java.io.FileWriter(file, true)) {
-                        w.write("{\"ts\":" + System.currentTimeMillis() / 1000L
-                                + ",\"account\":" + acct
-                                + ",\"dialog\":" + dialog
-                                + ",\"id\":" + mid
-                                + ",\"out\":" + out
-                                + ",\"text\":\"" + safeText + "\"}\n");
+                    if (messageLogFile == null) {
+                        java.io.File dir = new java.io.File(appContext.getFilesDir(), "Colgram");
+                        if (!dir.exists()) dir.mkdirs();
+                        messageLogFile = new java.io.File(dir, "messages_log.jsonl");
+                    } else if (messageLogWriter != null && (messageLogTotalWrites++ & 63) == 0 && !messageLogFile.exists()) {
+                        closeMessageLogWriterLocked();
                     }
-                } catch (Throwable ignored) {}
+                    if (messageLogWriter == null) {
+                        java.io.File parent = messageLogFile.getParentFile();
+                        if (parent != null && !parent.exists()) parent.mkdirs();
+                        messageLogWriter = new java.io.BufferedWriter(
+                                new java.io.OutputStreamWriter(
+                                        new java.io.FileOutputStream(messageLogFile, true),
+                                        java.nio.charset.StandardCharsets.UTF_8),
+                                8192);
+                    }
+                    messageLogWriter.write("{\"ts\":");
+                    messageLogWriter.write(Long.toString(tsSec));
+                    messageLogWriter.write(",\"account\":");
+                    messageLogWriter.write(Integer.toString(acct));
+                    messageLogWriter.write(",\"dialog\":");
+                    messageLogWriter.write(Long.toString(dialog));
+                    messageLogWriter.write(",\"id\":");
+                    messageLogWriter.write(Integer.toString(mid));
+                    messageLogWriter.write(",\"out\":");
+                    messageLogWriter.write(Boolean.toString(out));
+                    messageLogWriter.write(",\"text\":\"");
+                    messageLogWriter.write(safeText);
+                    messageLogWriter.write("\"}\n");
+                    messageLogPendingWrites++;
+                    long now = System.currentTimeMillis();
+                    if (messageLogPendingWrites >= 16 || (now - messageLogLastFlushMs) >= 2000L) {
+                        messageLogWriter.flush();
+                        messageLogPendingWrites = 0;
+                        messageLogLastFlushMs = now;
+                        if (messageLogFlushTask != null) {
+                            messageLogFlushTask.cancel(false);
+                            messageLogFlushTask = null;
+                        }
+                    } else if (messageLogFlushTask == null || messageLogFlushTask.isDone()) {
+                        messageLogFlushTask = hookIoExecutor.schedule(
+                                ColgramHookHandler::flushMessageLogSafe,
+                                2000L,
+                                java.util.concurrent.TimeUnit.MILLISECONDS);
+                    }
+                } catch (Throwable ignored) {
+                    closeMessageLogWriterLocked();
+                }
             }
         });
     }
@@ -375,16 +597,19 @@ public class ColgramHookHandler {
             if (selfUserId <= 0L || dialogId == selfUserId || (senderId != 0L && senderId == selfUserId)) {
                 return;
             }
-            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
-            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, account);
+            initMessagesHandles();
+            initTlHandles();
+            Object mc = cachedMcGetInstanceMethod != null ? cachedMcGetInstanceMethod.invoke(null, account) : null;
             if (mc != null) {
-                if (dialogId > 0) {
-                    Object user = mcClass.getMethod("getUser", Long.class).invoke(mc, dialogId);
+                if (dialogId > 0 && cachedMcGetUserMethod != null) {
+                    Object user = cachedMcGetUserMethod.invoke(mc, dialogId);
                     if (user != null) {
-                        isBotPeer = user.getClass().getField("bot").getBoolean(user);
-                        Object fn = user.getClass().getField("first_name").get(user);
-                        Object ln = user.getClass().getField("last_name").get(user);
-                        Object un = user.getClass().getField("username").get(user);
+                        if (cachedUserBotField != null) {
+                            isBotPeer = cachedUserBotField.getBoolean(user);
+                        }
+                        Object fn = cachedUserFirstNameField != null ? cachedUserFirstNameField.get(user) : null;
+                        Object ln = cachedUserLastNameField != null ? cachedUserLastNameField.get(user) : null;
+                        Object un = cachedUserUsernameField != null ? cachedUserUsernameField.get(user) : null;
                         StringBuilder sb = new StringBuilder();
                         if (fn != null) sb.append(fn);
                         if (ln != null && !String.valueOf(ln).isEmpty()) {
@@ -394,23 +619,18 @@ public class ColgramHookHandler {
                         peerName = sb.toString();
                         peerUsername = un != null ? String.valueOf(un) : "";
                     }
-                    try {
-                        Class<?> ccClass = Class.forName("org.telegram.messenger.ContactsController");
-                        Object cc = ccClass.getMethod("getInstance", int.class).invoke(null, account);
-                        if (cc != null) {
-                            Boolean res = (Boolean) ccClass.getMethod("isContact", long.class).invoke(cc, dialogId);
-                            isContact = Boolean.TRUE.equals(res);
-                        }
-                    } catch (Throwable ignored) {}
-                } else {
-                    Object chat = mcClass.getMethod("getChat", Long.class).invoke(mc, -dialogId);
+                    isContact = isTelegramContact(account, dialogId);
+                } else if (dialogId <= 0 && cachedMcGetChatMethod != null) {
+                    Object chat = cachedMcGetChatMethod.invoke(mc, -dialogId);
                     if (chat != null) {
-                        Object title = chat.getClass().getField("title").get(chat);
+                        Object title = cachedChatTitleField != null ? cachedChatTitleField.get(chat) : null;
                         peerName = title != null ? String.valueOf(title) : "";
                         try {
-                            boolean broadcast = chat.getClass().getField("broadcast").getBoolean(chat);
-                            boolean megagroup = chat.getClass().getField("megagroup").getBoolean(chat);
-                            isChannel = broadcast && !megagroup;
+                            if (cachedChatBroadcastField != null && cachedChatMegagroupField != null) {
+                                boolean broadcast = cachedChatBroadcastField.getBoolean(chat);
+                                boolean megagroup = cachedChatMegagroupField.getBoolean(chat);
+                                isChannel = broadcast && !megagroup;
+                            }
                         } catch (Throwable ignored) {}
                     }
                 }
@@ -526,6 +746,43 @@ public class ColgramHookHandler {
 
         // Return true to tell Telegram's storage layer NOT to delete the row
         return true;
+    }
+
+    /**
+     * Batched anti-delete check + tombstone write so bulk deletes/clears run in ONE SQLite transaction.
+     *
+     * @return set of messageIds whose deletion MUST be prevented.
+     */
+    public static java.util.Set<Integer> hookShouldPreventDeleteBatch(
+            long dialogId, java.util.Collection<Integer> messageIds) {
+        if (dialogId == 0L || messageIds == null || messageIds.isEmpty()) {
+            return java.util.Collections.emptySet();
+        }
+        if (!ColgramConfig.isAntiDeleteEnabled()) {
+            return java.util.Collections.emptySet();
+        }
+        java.util.ArrayList<Integer> toPreserve = null;
+        java.util.HashSet<Integer> prevented = null;
+        for (Integer midObj : messageIds) {
+            if (midObj == null) continue;
+            int mid = midObj.intValue();
+            if (mid == 0) continue;
+            if (isForcePurged(dialogId, mid)) {
+                unmarkMessageDeleted(dialogId, mid);
+                continue;
+            }
+            if (toPreserve == null) {
+                toPreserve = new java.util.ArrayList<>(messageIds.size());
+                prevented = new java.util.HashSet<>(messageIds.size());
+            }
+            if (prevented.add(mid)) {
+                toPreserve.add(mid);
+            }
+        }
+        if (toPreserve != null && !toPreserve.isEmpty() && appContext != null) {
+            ColgramDatabase.getInstance(appContext).markMessagesDeleted(dialogId, toPreserve);
+        }
+        return prevented != null ? prevented : java.util.Collections.emptySet();
     }
 
     /**
@@ -675,6 +932,28 @@ public class ColgramHookHandler {
                                                   String fallbackStoredText, String fallbackEntitiesJson,
                                                   String newText, String newEntitiesJson,
                                                   long editTimestampMs) {
+        processMessageEditWithNew(
+                dialogId, messageId, fallbackStoredText, fallbackEntitiesJson,
+                newText, newEntitiesJson, editTimestampMs, false);
+    }
+
+    /**
+     * Captures live text snapshots synchronously in FIFO order while offloading SQLite
+     * deduplication/insert onto the background edit-history executor.
+     */
+    public static void hookOnMessageEditedWithNewAsync(long dialogId, int messageId,
+                                                       String fallbackStoredText, String fallbackEntitiesJson,
+                                                       String newText, String newEntitiesJson,
+                                                       long editTimestampMs) {
+        processMessageEditWithNew(
+                dialogId, messageId, fallbackStoredText, fallbackEntitiesJson,
+                newText, newEntitiesJson, editTimestampMs, true);
+    }
+
+    private static void processMessageEditWithNew(long dialogId, int messageId,
+                                                  String fallbackStoredText, String fallbackEntitiesJson,
+                                                  String newText, String newEntitiesJson,
+                                                  long editTimestampMs, boolean asyncPersist) {
         if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) {
             return;
         }
@@ -692,8 +971,14 @@ public class ColgramHookHandler {
         boolean textChanged = prevText != null && !prevText.equals(safeNew);
         boolean entChanged = prevText != null && !safePrevEnt.equals(safeNewEnt);
         if (prevText != null && !prevText.trim().isEmpty() && (textChanged || entChanged)) {
-            long ts = editTimestampMs > 0 ? editTimestampMs : System.currentTimeMillis();
-            ColgramDatabase.getInstance(appContext).saveMessageEdit(dialogId, messageId, prevText, prevEnt, ts);
+            final long ts = editTimestampMs > 0 ? editTimestampMs : System.currentTimeMillis();
+            final Context ctx = appContext;
+            if (asyncPersist) {
+                editHistoryExecutor.execute(() ->
+                        ColgramDatabase.getInstance(ctx).saveMessageEdit(dialogId, messageId, prevText, prevEnt, ts));
+            } else {
+                ColgramDatabase.getInstance(ctx).saveMessageEdit(dialogId, messageId, prevText, prevEnt, ts);
+            }
         }
         if (!safeNew.isEmpty()) {
             LIVE_TEXT_SNAPSHOTS.put(key, safeNew);
@@ -883,6 +1168,30 @@ public class ColgramHookHandler {
         ColgramDatabase.getInstance(appContext).saveMediaRevision(
                 dialogId, messageId, mediaType, localPath, fileName, fileSize,
                 mimeType, remoteId, editDate);
+    }
+
+    /**
+     * Offloads sandbox file copy (SHA-256 + GZIP index flush) and SQLite media revision
+     * insert onto the serialized background edit-history executor so MTProto stageQueue stays unblocked.
+     */
+    public static void hookOnMediaReplacedAsync(long dialogId, int messageId, int mediaType,
+                                                String sourcePath, String fileName, long fileSize,
+                                                String mimeType, long remoteId, long editDate) {
+        if (!ColgramConfig.isEditHistoryEnabled() || appContext == null) return;
+        if (dialogId == 0 || messageId == 0) return;
+        final Context ctx = appContext;
+        editHistoryExecutor.execute(() -> {
+            String sandboxPath = null;
+            if (sourcePath != null) {
+                sandboxPath = colgramCopyRevisionFile(sourcePath, fileName);
+                if (sandboxPath == null) {
+                    sandboxPath = sourcePath;
+                }
+            }
+            ColgramDatabase.getInstance(ctx).saveMediaRevision(
+                    dialogId, messageId, mediaType, sandboxPath, fileName, fileSize,
+                    mimeType, remoteId, editDate);
+        });
     }
 
     /** All stored media revisions of a message, oldest first. */

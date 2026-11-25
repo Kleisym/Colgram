@@ -43,10 +43,10 @@ public final class ColgramStabilityGuardsTest {
     private static void testDpiBypassPoolAndClientCaps() throws Exception {
         int maxThreads = ColgramDpiBypass.maxWorkerPoolThreadsForTest();
         int sysCap = ColgramDpiBypass.systemWideClientCapForTest();
-        assertTrue(maxThreads > 0 && maxThreads <= 256,
-                "workerPool max threads must be bounded <= 256, got " + maxThreads);
-        assertTrue(sysCap > 0 && sysCap <= 192,
-                "system-wide CallListener cap must be bounded <= 192, got " + sysCap);
+        assertTrue(maxThreads > 0 && maxThreads <= 384,
+                "workerPool max threads must be bounded <= 384, got " + maxThreads);
+        assertTrue(sysCap > 0 && sysCap <= 256,
+                "system-wide CallListener cap must be bounded <= 256, got " + sysCap);
 
         CountDownLatch latch = new CountDownLatch(1);
         assertTrue(ColgramDpiBypass.executeWorker(latch::countDown),

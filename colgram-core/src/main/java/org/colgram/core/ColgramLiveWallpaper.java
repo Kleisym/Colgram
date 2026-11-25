@@ -47,7 +47,24 @@ public final class ColgramLiveWallpaper {
     private static final Path crestPath = new Path();
     private static final float[] starPx = new float[STAR_X.length];
     private static final float[] starPy = new float[STAR_X.length];
-    private static final float[] hsvTmp = new float[3];
+
+    private static final class TintSnapshot {
+        final int baseTint;
+        final boolean isDark;
+        final boolean isCyber;
+        final int deepTint;
+        final int crestTint;
+
+        TintSnapshot(int baseTint, boolean isDark, boolean isCyber, int deepTint, int crestTint) {
+            this.baseTint = baseTint;
+            this.isDark = isDark;
+            this.isCyber = isCyber;
+            this.deepTint = deepTint;
+            this.crestTint = crestTint;
+        }
+    }
+
+    private static volatile TintSnapshot cachedTintSnapshot;
 
     private static final float[] MENU_BASE_FRACS = {0.69f, 0.81f};
     private static final float[] CHAT_BASE_FRACS = {0.67f, 0.80f};
@@ -129,8 +146,16 @@ public final class ColgramLiveWallpaper {
                                   int accentColor, boolean isDark, boolean isCyber,
                                   boolean menuMode, float timeSec, float d) {
         int baseTint = resolveMonochromeBase(accentColor, isDark, isCyber);
-        int deepTint = shadeTone(baseTint, isDark ? 0.62f : 0.88f, isDark ? 0.90f : 0.72f);
-        int crestTint = isCyber ? 0xFFFF4D6A : shadeTone(baseTint, isDark ? 1.18f : 0.95f, isDark ? 0.82f : 0.95f);
+        TintSnapshot snap = cachedTintSnapshot;
+        if (snap == null || snap.baseTint != baseTint || snap.isDark != isDark || snap.isCyber != isCyber) {
+            float[] hsv = new float[3];
+            int deepTint = shadeTone(baseTint, isDark ? 0.62f : 0.88f, isDark ? 0.90f : 0.72f, hsv);
+            int crestTint = isCyber ? 0xFFFF4D6A : shadeTone(baseTint, isDark ? 1.18f : 0.95f, isDark ? 0.82f : 0.95f, hsv);
+            snap = new TintSnapshot(baseTint, isDark, isCyber, deepTint, crestTint);
+            cachedTintSnapshot = snap;
+        }
+        int deepTint = snap.deepTint;
+        int crestTint = snap.crestTint;
 
         switch (style) {
             case STYLE_AURORA:
@@ -158,11 +183,11 @@ public final class ColgramLiveWallpaper {
         return isDark ? 0xFF2B6CB0 : 0xFF3B82F6;
     }
 
-    private static int shadeTone(int color, float valueScale, float satScale) {
-        Color.colorToHSV(color, hsvTmp);
-        hsvTmp[1] = Math.max(0f, Math.min(1f, hsvTmp[1] * satScale));
-        hsvTmp[2] = Math.max(0f, Math.min(1f, hsvTmp[2] * valueScale));
-        return Color.HSVToColor(hsvTmp);
+    private static int shadeTone(int color, float valueScale, float satScale, float[] hsv) {
+        Color.colorToHSV(color, hsv);
+        hsv[1] = Math.max(0f, Math.min(1f, hsv[1] * satScale));
+        hsv[2] = Math.max(0f, Math.min(1f, hsv[2] * valueScale));
+        return Color.HSVToColor(hsv);
     }
 
     private static void ensureWaveShaders(int slot, int w, int h, int deepTint, int baseTint,

@@ -871,14 +871,20 @@ public class ColgramProxyManager {
         return true;
     }
 
+    private static long lastWatchdogTrafficBytes = 0L;
+
     private static void connectionWatchdogTick() {
         Context ctx = appContext;
         if (ctx == null || ColgramConfig.isWarpEnabled() || !ColgramUiBridge.isAppInForeground()) return;
         int state = tgnetConnectionState();
         ProxyItem applied = currentActiveProxy;
         if (applied != null && applied.isLocalDpi()) {
-            // Proactively reap dead half-open carrier sockets (pending reply >=8s) before tgnet stalls.
-            int reaped = ColgramDpiBypass.reapStaleSessions(8_000L, 0L);
+            // Proactively reap dead half-open carrier sockets (pending reply >=12s) before tgnet stalls,
+            // without killing live media uploads/streams that are actively pushing bytes.
+            int reaped = ColgramDpiBypass.reapStaleSessions(12_000L, 0L);
+            long curTrafficBytes = ColgramDpiBypass.bytesFromTarget();
+            boolean activeTrafficFlowing = curTrafficBytes > lastWatchdogTrafficBytes;
+            lastWatchdogTrafficBytes = curTrafficBytes;
             if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                 ColgramDpiBypass.startImmediately();
                 mainHandler.post(() -> ensureLocalBaseRoute(ctx));
@@ -888,8 +894,9 @@ public class ColgramProxyManager {
             // of the catalog, without changing the chosen route or using a public relay.
             if (hasSystemVpn(ctx) || state < 0
                     || state == TG_STATE_CONNECTED
-                    || state == TG_STATE_WAITING_FOR_NETWORK) {
-                if (state == TG_STATE_CONNECTED) {
+                    || state == TG_STATE_WAITING_FOR_NETWORK
+                    || activeTrafficFlowing) {
+                if (state == TG_STATE_CONNECTED || activeTrafficFlowing) {
                     applied.nativeFailures = 0;
                     applied.failedVerdicts = 0;
                 }

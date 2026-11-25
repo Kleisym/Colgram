@@ -104,7 +104,8 @@ def main():
             tests = sorted((root / "tests/java").rglob("*.java"))
             if not tests:
                 raise RuntimeError("--jvm-tests requested, but tests/java is empty")
-            code = run([javac, "-encoding", "UTF-8", "-cp", classes, "-d", classes, *tests], root)
+            test_cp = os.pathsep.join([str(classes), str(sdk)])
+            code = run([javac, "-encoding", "UTF-8", "-cp", test_cp, "-d", classes, *tests], root)
             if code:
                 return code
             java = javac.with_name("java.exe" if os.name == "nt" else "java")
@@ -115,7 +116,7 @@ def main():
                     continue
                 package = re.search(r"^package\s+([\w.]+);", text, re.M)
                 classname = (package[1] + "." if package else "") + test.stem
-                code = run([java, "-ea", "-cp", classes, classname], root)
+                code = run([java, "-ea", "-cp", test_cp, classname], root)
                 if code:
                     return code
                 mains += 1

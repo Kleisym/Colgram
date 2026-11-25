@@ -672,10 +672,10 @@ public final class ColgramUnlimitedMemory {
             Runtime rt = Runtime.getRuntime();
             long usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
             long maxMb = Math.max(128L, rt.maxMemory() / (1024L * 1024L));
-            // Only trim transient RAM cache under genuine memory pressure (>= 80% of Java heap ceiling).
+            // Only trim transient RAM cache under genuine memory pressure (>= 90% of Java heap ceiling).
             // ImageLoader.clearMemory() touches UI-thread-only LruCache/mapFilters/bitmaps, so ALWAYS
             // dispatch it on the main Looper rather than a background worker thread.
-            if (usedMb >= (maxMb * 80L) / 100L) {
+            if (usedMb >= (maxMb * 90L) / 100L) {
                 lastTrimAtMs = now;
                 Runnable clearTask = () -> {
                     try {

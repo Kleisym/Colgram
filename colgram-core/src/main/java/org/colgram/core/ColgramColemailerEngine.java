@@ -126,14 +126,16 @@ public final class ColgramColemailerEngine {
         public int counterThreshold;
         public String folderName;
         public final LinkedHashSet<Long> targetChats = new LinkedHashSet<>();
-        public final Map<Long, Integer> chatCounters = new HashMap<>();
-        public final Map<Long, Long> chatCounterUpdatedAt = new HashMap<>();
-        public final Map<Long, Long> chatLastSentAt = new HashMap<>();
+        public final Map<Long, Integer> chatCounters = new ConcurrentHashMap<>();
+        public final Map<Long, Long> chatCounterUpdatedAt = new ConcurrentHashMap<>();
+        public final Map<Long, Long> chatLastSentAt = new ConcurrentHashMap<>();
         public final List<List<ButtonSpec>> buttons = new ArrayList<>();
-        public boolean disablePreview;
-        public boolean enabled = true;
+        public volatile boolean disablePreview;
+        public volatile boolean enabled = true;
         /** Account slot that owns this campaign (-1 = legacy/unassigned, >=0 = pinned to that account). */
-        public int ownerAccount = -1;
+        public volatile int ownerAccount = -1;
+        final Object counterLock = new Object();
+        private volatile Set<Long> targetChatsSnapshot = Collections.emptySet();
 
         public BroadcastCampaign(String name, String text, int mode, long intervalSec,
                                  int counterThreshold, String folderName) {
@@ -143,6 +145,16 @@ public final class ColgramColemailerEngine {
             this.intervalSec = intervalSec;
             this.counterThreshold = counterThreshold;
             this.folderName = folderName == null ? "" : folderName.trim();
+        }
+
+        void refreshTargetSnapshot() {
+            targetChatsSnapshot = targetChats.isEmpty()
+                    ? Collections.emptySet()
+                    : Collections.unmodifiableSet(new LinkedHashSet<>(targetChats));
+        }
+
+        Set<Long> fastTargets() {
+            return targetChatsSnapshot;
         }
     }
 
@@ -237,6 +249,8 @@ public final class ColgramColemailerEngine {
     private final ConcurrentHashMap<String, Set<Long>> folderTargetsCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> floodWaitUntilMs = new ConcurrentHashMap<>();
     private final AtomicInteger activeCampaignCount = new AtomicInteger(0);
+    private final AtomicInteger activeCounterCampaignCount = new AtomicInteger(0);
+    private volatile List<BroadcastCampaign> campaignsSnapshot = Collections.emptyList();
 
     private final boolean persistent;
     private boolean loadedFromConfig = false;
@@ -468,12 +482,43 @@ public final class ColgramColemailerEngine {
 
     private void recomputeActiveCampaignCountLocked() {
         int active = 0;
+        int activeCounters = 0;
         for (BroadcastCampaign c : campaigns.values()) {
             if (c != null && c.enabled && !c.text.isEmpty()) {
                 active++;
+                if (c.mode != MODE_INTERVAL) {
+                    activeCounters++;
+                }
+            } else if (c != null && c.enabled && c.mode != MODE_INTERVAL) {
+                activeCounters++;
             }
         }
         activeCampaignCount.set(active);
+        activeCounterCampaignCount.set(activeCounters);
+        campaignsSnapshot = campaigns.isEmpty()
+                ? Collections.emptyList()
+                : Collections.unmodifiableList(new ArrayList<>(campaigns.values()));
+    }
+
+    public Set<String> collectNeededFolderNames(int account) {
+        if (activeCampaignCount.get() == 0) {
+            return Collections.emptySet();
+        }
+        List<BroadcastCampaign> snapshot = campaignsSnapshot;
+        if (snapshot.isEmpty()) {
+            return Collections.emptySet();
+        }
+        Set<String> folders = null;
+        for (int i = 0, n = snapshot.size(); i < n; i++) {
+            BroadcastCampaign c = snapshot.get(i);
+            if (c == null || !c.enabled || c.text.isEmpty()) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            String fn = c.folderName;
+            if (fn == null || fn.trim().isEmpty()) continue;
+            if (folders == null) folders = new LinkedHashSet<>();
+            folders.add(fn.trim().toLowerCase(Locale.ROOT));
+        }
+        return folders != null ? folders : Collections.emptySet();
     }
 
     public int getActiveCampaignCount() {
@@ -501,6 +546,7 @@ public final class ColgramColemailerEngine {
 
     public synchronized void addOrUpdateCampaign(BroadcastCampaign campaign) {
         if (campaign == null || campaign.name.trim().isEmpty()) return;
+        campaign.refreshTargetSnapshot();
         campaigns.put(campaign.name.trim(), campaign);
         recomputeActiveCampaignCountLocked();
         persistIfBound();
@@ -563,7 +609,11 @@ public final class ColgramColemailerEngine {
                 safeIds.add(id);
             }
         }
-        folderTargetsCache.put(folderCacheKey(account, folderName), Collections.unmodifiableSet(new LinkedHashSet<>(safeIds)));
+        String cacheKey = folderCacheKey(account, folderName);
+        Set<Long> prevCached = folderTargetsCache.get(cacheKey);
+        if (prevCached == null || !prevCached.equals(safeIds)) {
+            folderTargetsCache.put(cacheKey, Collections.unmodifiableSet(new LinkedHashSet<>(safeIds)));
+        }
         boolean changed = false;
         for (BroadcastCampaign c : campaigns.values()) {
             if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
@@ -571,6 +621,7 @@ public final class ColgramColemailerEngine {
                 if (!c.targetChats.equals(safeIds)) {
                     c.targetChats.clear();
                     c.targetChats.addAll(safeIds);
+                    c.refreshTargetSnapshot();
                     changed = true;
                 }
             }
@@ -646,14 +697,18 @@ public final class ColgramColemailerEngine {
      * Returns true if at least one counter/hybrid campaign reached its threshold and may now need scheduling.
      */
     public boolean onIncomingChatMessageAndCheckDue(int account, long chatId, long nowSec) {
-        if (activeCampaignCount.get() == 0) return false;
+        if (activeCounterCampaignCount.get() == 0) return false;
         if (ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) return false;
+        List<BroadcastCampaign> snapshot = campaignsSnapshot;
+        if (snapshot.isEmpty()) return false;
         boolean thresholdReached = false;
-        synchronized (this) {
-            for (BroadcastCampaign c : campaigns.values()) {
-                if (!c.enabled || c.mode == MODE_INTERVAL) continue;
-                if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
-                if (!c.targetChats.contains(chatId)) continue;
+        for (int i = 0, n = snapshot.size(); i < n; i++) {
+            BroadcastCampaign c = snapshot.get(i);
+            if (c == null || !c.enabled || c.mode == MODE_INTERVAL) continue;
+            if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            if (!c.fastTargets().contains(chatId)) continue;
+            int nextCount;
+            synchronized (c.counterLock) {
                 if (c.mode == MODE_HYBRID) {
                     long staleWindow = Math.max(c.intervalSec * 3L, HYBRID_STALE_MIN_SEC);
                     Long updatedAt = c.chatCounterUpdatedAt.get(chatId);
@@ -661,12 +716,12 @@ public final class ColgramColemailerEngine {
                         c.chatCounters.put(chatId, 0);
                     }
                 }
-                int nextCount = c.chatCounters.getOrDefault(chatId, 0) + 1;
+                nextCount = c.chatCounters.getOrDefault(chatId, 0) + 1;
                 c.chatCounters.put(chatId, nextCount);
                 c.chatCounterUpdatedAt.put(chatId, nowSec);
-                if (c.counterThreshold > 0 && nextCount >= c.counterThreshold) {
-                    thresholdReached = true;
-                }
+            }
+            if (c.counterThreshold > 0 && nextCount >= c.counterThreshold) {
+                thresholdReached = true;
             }
         }
         return thresholdReached;
@@ -697,16 +752,21 @@ public final class ColgramColemailerEngine {
         return getNextDueCampaignDelayMs(-1, nowMs);
     }
 
-    public synchronized long getNextDueCampaignDelayMs(int account, long nowMs) {
+    public long getNextDueCampaignDelayMs(int account, long nowMs) {
         if (activeCampaignCount.get() == 0) return -1L;
+        List<BroadcastCampaign> snapshot = campaignsSnapshot;
+        if (snapshot.isEmpty()) return -1L;
         long minDelay = Long.MAX_VALUE;
         long nowSec = nowMs / 1000L;
-        for (BroadcastCampaign c : campaigns.values()) {
-            if (!c.enabled || c.text.isEmpty() || c.targetChats.isEmpty()) continue;
+        for (int i = 0, n = snapshot.size(); i < n; i++) {
+            BroadcastCampaign c = snapshot.get(i);
+            if (c == null || !c.enabled || c.text.isEmpty()) continue;
             if (account >= 0 && c.ownerAccount >= 0 && c.ownerAccount != account) continue;
+            Set<Long> targets = c.fastTargets();
+            if (targets.isEmpty()) continue;
             long intervalMs = Math.max(MIN_INTERVAL_SEC, c.intervalSec) * 1000L;
             int effAccount = account >= 0 ? account : (c.ownerAccount >= 0 ? c.ownerAccount : 0);
-            for (Long chatId : c.targetChats) {
+            for (Long chatId : targets) {
                 if (chatId == null || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(chatId)) continue;
                 long floodRemMs = getFloodBackoffRemainingMs(effAccount, chatId, nowMs);
                 Long lastSentObj = c.chatLastSentAt.get(chatId);
@@ -782,11 +842,13 @@ public final class ColgramColemailerEngine {
         return due;
     }
 
-    public synchronized void markBroadcastSent(BroadcastCampaign c, long chatId, long nowSec) {
+    public void markBroadcastSent(BroadcastCampaign c, long chatId, long nowSec) {
         if (c == null) return;
-        c.chatLastSentAt.put(chatId, nowSec);
-        c.chatCounters.put(chatId, 0);
-        c.chatCounterUpdatedAt.put(chatId, nowSec);
+        synchronized (c.counterLock) {
+            c.chatLastSentAt.put(chatId, nowSec);
+            c.chatCounters.put(chatId, 0);
+            c.chatCounterUpdatedAt.put(chatId, nowSec);
+        }
     }
 
     // --- Rotations ---
@@ -1214,6 +1276,7 @@ public final class ColgramColemailerEngine {
                             c.ownerAccount = -1;
                         }
                     }
+                    c.refreshTargetSnapshot();
                     campaigns.put(c.name, c);
                 } else if ("ROT".equals(p[0]) && p.length >= 3) {
                     String name = unesc(p[1]);

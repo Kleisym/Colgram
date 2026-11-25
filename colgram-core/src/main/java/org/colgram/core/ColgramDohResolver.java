@@ -46,17 +46,17 @@ import javax.net.ssl.SSLSession;
 public final class ColgramDohResolver {
 
     private static final String TAG = "ColgramDoh";
-    private static final int CONNECT_TIMEOUT_MS = 1800;
-    private static final int CELLULAR_CONNECT_TIMEOUT_MS = 2400;
-    private static final int READ_TIMEOUT_MS = 2000;
-    private static final int CELLULAR_READ_TIMEOUT_MS = 2500;
-    private static final long RACE_WAVE_DEADLINE_MS = 3800L;
+    private static final int CONNECT_TIMEOUT_MS = 1400;
+    private static final int CELLULAR_CONNECT_TIMEOUT_MS = 1900;
+    private static final int READ_TIMEOUT_MS = 1600;
+    private static final int CELLULAR_READ_TIMEOUT_MS = 2100;
+    private static final long RACE_WAVE_DEADLINE_MS = 3000L;
     private static final long CACHE_TTL_MS = 180_000L;
     private static final int MAX_DNS_CACHE = 2048;
     private static final long CUT_COOLDOWN_MS = 30_000L;
-    private static final int MAX_POOLED_PER_ENDPOINT = 2;
-    private static final long POOL_IDLE_TTL_MS = 45_000L;
-    private static final long POOL_MAX_AGE_MS = 120_000L;
+    private static final int MAX_POOLED_PER_ENDPOINT = 4;
+    private static final long POOL_IDLE_TTL_MS = 60_000L;
+    private static final long POOL_MAX_AGE_MS = 180_000L;
     private static final String[] SPOOFED_RU_SNIS = {"vk.com", "max.ru"};
 
     /** Distinct exception thrown when TCP connect itself fails so we never retry TLS modes on a dead IP. */
@@ -414,33 +414,56 @@ public final class ColgramDohResolver {
         return total;
     }
 
+    private static final class DnsCacheEntry {
+        final long timestampMs;
+        final InetAddress[] addresses;
+
+        DnsCacheEntry(long timestampMs, InetAddress[] addresses) {
+            this.timestampMs = timestampMs;
+            this.addresses = addresses;
+        }
+    }
+
     static int dnsCacheSizeForTest() {
         return cache.size();
     }
 
-    static void putDnsCacheEntry(String key, String[] found, long nowMs) {
-        if (key == null || found == null || found.length == 0) return;
-        if (cache.size() >= MAX_DNS_CACHE) {
-            for (Map.Entry<String, long[]> entry : cache.entrySet()) {
-                long[] ts = entry.getValue();
-                if (ts == null || ts.length == 0 || (nowMs - ts[0]) >= CACHE_TTL_MS) {
-                    if (cache.remove(entry.getKey(), ts)) {
-                        answers.remove(entry.getKey());
-                    }
+    private static void putCacheEntry(Map<String, DnsCacheEntry> target, String key,
+                                      InetAddress[] addrs, long nowMs) {
+        if (key == null || addrs == null) return;
+        if (target.size() >= MAX_DNS_CACHE) {
+            for (Map.Entry<String, DnsCacheEntry> entry : target.entrySet()) {
+                DnsCacheEntry val = entry.getValue();
+                if (val == null || (nowMs - val.timestampMs) >= CACHE_TTL_MS) {
+                    target.remove(entry.getKey(), val);
                 }
             }
-            if (cache.size() >= MAX_DNS_CACHE) {
-                cache.clear();
-                answers.clear();
+            if (target.size() >= MAX_DNS_CACHE) {
+                target.clear();
             }
         }
-        cache.put(key, new long[]{nowMs});
-        answers.put(key, found);
+        target.put(key, new DnsCacheEntry(nowMs, addrs));
+    }
+
+    private static InetAddress[] getCachedEntry(Map<String, DnsCacheEntry> source, String key, long nowMs) {
+        if (key == null) return null;
+        DnsCacheEntry entry = source.get(key);
+        if (entry != null && (nowMs - entry.timestampMs) < CACHE_TTL_MS) {
+            return entry.addresses;
+        }
+        return null;
+    }
+
+    static void putDnsCacheEntry(String key, String[] found, long nowMs) {
+        if (key == null || found == null || found.length == 0) return;
+        InetAddress[] addrs = toAddresses(found);
+        if (addrs == null || addrs.length == 0) return;
+        putCacheEntry(cache, key, addrs, nowMs);
     }
 
     static void clearDnsCacheForTest() {
         cache.clear();
-        answers.clear();
+        aaaaCache.clear();
     }
 
     private static void returnPooledConn(PooledTlsConn conn) {
@@ -462,15 +485,17 @@ public final class ColgramDohResolver {
         q.offerFirst(conn);
     }
 
-    private static final Map<String, long[]> cache = new ConcurrentHashMap<>();
-    private static final Map<String, String[]> answers = new ConcurrentHashMap<>();
+    private static final Map<String, DnsCacheEntry> cache = new ConcurrentHashMap<>();
+    private static final Map<String, DnsCacheEntry> aaaaCache = new ConcurrentHashMap<>();
+    private static final Map<String, java.util.concurrent.CompletableFuture<InetAddress[]>> inflightLookups =
+            new ConcurrentHashMap<>();
     /** Endpoints temporarily skipped after timeout/reset until their cooldown expires. */
     private static final Map<String, Long> cutUntil = new ConcurrentHashMap<>();
     private static volatile String lastResolver;
     private static volatile Endpoint lastWorkingEndpoint;
     private static final java.util.concurrent.ExecutorService DOH_RACE_POOL =
             new java.util.concurrent.ThreadPoolExecutor(
-                    0, 32, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    0, 96, 30L, java.util.concurrent.TimeUnit.SECONDS,
                     new java.util.concurrent.SynchronousQueue<>(),
                     r -> {
                         Thread t = new Thread(r, "colgram-doh-race");
@@ -597,18 +622,29 @@ public final class ColgramDohResolver {
             }
             return true;
         }
-        String[] parts = trimmed.split("\\.", -1);
-        if (parts.length != 4) return false;
-        for (String p : parts) {
-            if (p.isEmpty() || p.length() > 3) return false;
-            for (int i = 0; i < p.length(); i++) {
-                char c = p.charAt(i);
+        int len = trimmed.length();
+        int octetCount = 0;
+        int i = 0;
+        while (i < len) {
+            if (octetCount >= 4) return false;
+            int digits = 0;
+            int val = 0;
+            while (i < len) {
+                char c = trimmed.charAt(i);
+                if (c == '.') break;
                 if (c < '0' || c > '9') return false;
+                if (++digits > 3) return false;
+                val = val * 10 + (c - '0');
+                i++;
             }
-            int v = Integer.parseInt(p);
-            if (v < 0 || v > 255) return false;
+            if (digits == 0 || val > 255) return false;
+            octetCount++;
+            if (i < len) {
+                i++;
+                if (i == len) return false;
+            }
         }
-        return true;
+        return octetCount == 4;
     }
 
     public static boolean isLoopbackHost(String host) {
@@ -633,10 +669,9 @@ public final class ColgramDohResolver {
         if (ColgramConfig.isDohEnabled()) {
             String key = cleaned.toLowerCase(java.util.Locale.ROOT);
             long now = System.currentTimeMillis();
-            long[] stamp = cache.get(key);
-            String[] cached = answers.get(key);
-            if (stamp != null && cached != null && now - stamp[0] < CACHE_TTL_MS) {
-                return toAddresses(cached);
+            InetAddress[] cached = getCachedEntry(cache, key, now);
+            if (cached != null && cached.length > 0) {
+                return cached.clone();
             }
 
             InetAddress[] result = queryEndpoints(key, cleaned, now, false);
@@ -663,6 +698,22 @@ public final class ColgramDohResolver {
         if (cleaned.isEmpty()) return null;
         if (isIpLiteral(cleaned)) return resolveSystem(cleaned);
         List<InetAddress> merged = new ArrayList<>();
+        String key = cleaned.toLowerCase(java.util.Locale.ROOT);
+        InetAddress[] cachedV6 = null;
+        java.util.concurrent.CompletableFuture<InetAddress[]> v6Future = null;
+        if (ColgramConfig.isDohEnabled()) {
+            InetAddress[] hit6 = getCachedEntry(aaaaCache, key, System.currentTimeMillis());
+            if (hit6 != null) {
+                cachedV6 = hit6;
+            } else {
+                try {
+                    v6Future = java.util.concurrent.CompletableFuture.supplyAsync(
+                            () -> queryEndpointsQtype(key, cleaned, 28, null), DOH_RACE_POOL);
+                } catch (Throwable rejected) {
+                    v6Future = null;
+                }
+            }
+        }
         InetAddress[] v4 = resolve(cleaned);
         if (v4 != null) {
             for (InetAddress a : v4) {
@@ -670,7 +721,17 @@ public final class ColgramDohResolver {
             }
         }
         if (ColgramConfig.isDohEnabled()) {
-            InetAddress[] v6 = queryEndpointsQtype(cleaned.toLowerCase(java.util.Locale.ROOT), cleaned, 28, null);
+            InetAddress[] v6 = cachedV6;
+            if (v6 == null) {
+                if (v6Future != null) {
+                    long waitMs = !merged.isEmpty() ? (cellularNetwork ? 600L : 450L) : 3500L;
+                    try {
+                        v6 = v6Future.get(waitMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignored) {}
+                } else if (merged.isEmpty()) {
+                    v6 = queryEndpointsQtype(key, cleaned, 28, null);
+                }
+            }
             if (v6 != null) {
                 for (InetAddress a : v6) {
                     if (a != null && !merged.contains(a)) merged.add(a);
@@ -705,10 +766,9 @@ public final class ColgramDohResolver {
         }
         String key = cleaned.toLowerCase(java.util.Locale.ROOT);
         long now = System.currentTimeMillis();
-        long[] stamp = cache.get(key);
-        String[] cached = answers.get(key);
-        if (stamp != null && cached != null && now - stamp[0] < CACHE_TTL_MS) {
-            InetAddress picked = pickReachable(toAddresses(cached));
+        InetAddress[] cached = getCachedEntry(cache, key, now);
+        if (cached != null && cached.length > 0) {
+            InetAddress picked = pickReachable(cached);
             if (picked != null) return picked;
         }
         InetAddress[] found = queryEndpointsInternal(key, cleaned, now, false, 1, protector, fdProtector);
@@ -731,14 +791,42 @@ public final class ColgramDohResolver {
         if (cleaned.isEmpty()) return null;
         if (isIpLiteral(cleaned)) return resolveSystem(cleaned);
         List<InetAddress> merged = new ArrayList<>();
-        InetAddress v4 = resolveProtected(cleaned, protector, fdProtector);
-        if (v4 != null) merged.add(v4);
+        String key = cleaned.toLowerCase(java.util.Locale.ROOT);
         boolean isProtected = (protector != null || fdProtector != null
                 || ColgramDpiBypass.activeSystemDpiVpn() != null);
-        if (includeIpv6 && hasRoutableIpv6ForCurrentSocket(isProtected)) {
-            InetAddress[] v6 = queryEndpointsInternal(
-                    cleaned.toLowerCase(java.util.Locale.ROOT), cleaned,
-                    System.currentTimeMillis(), false, 28, protector, fdProtector);
+        boolean wantIpv6 = includeIpv6 && hasRoutableIpv6ForCurrentSocket(isProtected);
+        InetAddress[] cachedV6 = null;
+        java.util.concurrent.CompletableFuture<InetAddress[]> v6Future = null;
+        if (wantIpv6) {
+            InetAddress[] hit6 = getCachedEntry(aaaaCache, key, System.currentTimeMillis());
+            if (hit6 != null) {
+                cachedV6 = hit6;
+            } else {
+                try {
+                    v6Future = java.util.concurrent.CompletableFuture.supplyAsync(
+                            () -> queryEndpointsInternal(key, cleaned, System.currentTimeMillis(),
+                                    false, 28, protector, fdProtector),
+                            DOH_RACE_POOL);
+                } catch (Throwable rejected) {
+                    v6Future = null;
+                }
+            }
+        }
+        InetAddress v4 = resolveProtected(cleaned, protector, fdProtector);
+        if (v4 != null) merged.add(v4);
+        if (wantIpv6) {
+            InetAddress[] v6 = cachedV6;
+            if (v6 == null) {
+                if (v6Future != null) {
+                    long waitMs = !merged.isEmpty() ? (cellularNetwork ? 600L : 450L) : 3500L;
+                    try {
+                        v6 = v6Future.get(waitMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignored) {}
+                } else if (merged.isEmpty()) {
+                    v6 = queryEndpointsInternal(
+                            key, cleaned, System.currentTimeMillis(), false, 28, protector, fdProtector);
+                }
+            }
             if (v6 != null) {
                 for (InetAddress a : v6) {
                     if (a != null && !merged.contains(a)) merged.add(a);
@@ -808,7 +896,7 @@ public final class ColgramDohResolver {
                 && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
             pinnedTried = pinned;
             try {
-                long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2500L : 1900L);
+                long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2000L : 1400L);
                 byte[] reply = queryWire(pinned, wireQuery, sockProtector, fdProtector, fastDeadline, null);
                 if (reply != null && reply.length >= 12) {
                     cutUntil.remove(pinned.key());
@@ -832,7 +920,7 @@ public final class ColgramDohResolver {
             if (!ecsWave.isEmpty()) {
                 for (Endpoint ep : ecsWave) triedKeys.add(ep.key());
                 byte[] ecsReply = raceEndpointsWave(ecsWave, wireQuery, sockProtector, fdProtector,
-                        cellularNetwork ? 2500L : 2000L, 0);
+                        cellularNetwork ? 2200L : 1600L, 0);
                 if (ecsReply != null && ecsReply.length >= 12) {
                     return ecsReply;
                 }
@@ -1090,10 +1178,32 @@ public final class ColgramDohResolver {
         return queryEndpointsInternal(key, hostname, System.currentTimeMillis(), false, qtype, protector, null);
     }
 
+    private static InetAddress[] cacheAndConvertRecords(String key, int qtype, String[] found) {
+        long nowMs = System.currentTimeMillis();
+        if (found != null && found.length > 0) {
+            InetAddress[] addrs = toAddresses(found);
+            if (addrs != null && addrs.length > 0) {
+                putCacheEntry(qtype == 28 ? aaaaCache : cache, key, addrs, nowMs);
+                return addrs;
+            }
+        }
+        if (qtype == 28) {
+            putCacheEntry(aaaaCache, key, new InetAddress[0], nowMs);
+        }
+        return null;
+    }
+
     private static InetAddress[] queryEndpointsInternal(String key, String hostname, long now,
                                                         boolean ignoreCut, int qtype,
                                                         SocketProtector protector,
                                                         ColgramNativeDesync.FdProtector fdProtector) {
+        if (qtype == 28 && !ignoreCut) {
+            InetAddress[] cached6 = getCachedEntry(aaaaCache, key, now);
+            if (cached6 != null) {
+                return cached6.length == 0 ? null : cached6.clone();
+            }
+        }
+
         byte[] wireQuery;
         try {
             wireQuery = buildQuery(hostname, qtype);
@@ -1105,72 +1215,104 @@ public final class ColgramDohResolver {
         boolean isProtected = (protector != null || fdProtector != null
                 || ColgramDpiBypass.activeSystemDpiVpn() != null);
         boolean allowIpv6 = hasRoutableIpv6ForCurrentSocket(isProtected);
-        // 1. Fast path: pinned last-working endpoint with bounded budget (skip non-ECS pinned for YouTube/media)
-        Endpoint pinned = lastWorkingEndpoint;
-        Endpoint pinnedTried = null;
-        if (pinned != null && (ignoreCut || !isCut(pinned.key(), now))
-                && (allowIpv6 || pinned.ip.indexOf(':') < 0)
-                && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
-            pinnedTried = pinned;
-            try {
-                long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2400L : 1800L);
-                byte[] reply = queryWire(pinned, wireQuery, protector, fdProtector, fastDeadline, null);
-                if (reply != null && reply.length >= 12) {
-                    cutUntil.remove(pinned.key());
-                    String[] found = qtype == 28 ? parseRecords(reply, true) : parseARecords(reply);
-                    if (found.length > 0) {
-                        lastResolver = pinned.key();
-                        if (qtype == 1) {
-                            putDnsCacheEntry(key, found, System.currentTimeMillis());
-                        }
-                        return toAddresses(found);
-                    }
-                    // Valid empty AAAA answer on a healthy resolver
-                    if (qtype == 28) return null;
+
+        String inflightKey = !ignoreCut ? (qtype + "|" + (isProtected ? "P|" : "D|") + key) : null;
+        java.util.concurrent.CompletableFuture<InetAddress[]> ownerFuture = null;
+        if (inflightKey != null) {
+            java.util.concurrent.CompletableFuture<InetAddress[]> existing = inflightLookups.get(inflightKey);
+            if (existing == null) {
+                java.util.concurrent.CompletableFuture<InetAddress[]> created = new java.util.concurrent.CompletableFuture<>();
+                existing = inflightLookups.putIfAbsent(inflightKey, created);
+                if (existing == null) {
+                    ownerFuture = created;
                 }
-            } catch (Throwable t) {
-                Log.i(TAG, pinned.key() + " cut or unreachable: " + t.getClass().getSimpleName());
-                markCut(pinned.key(), System.currentTimeMillis());
-                if (lastWorkingEndpoint == pinned) lastWorkingEndpoint = null;
+            }
+            if (existing != null) {
+                try {
+                    InetAddress[] shared = existing.get(4000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    return (shared != null && shared.length > 0) ? shared.clone() : null;
+                } catch (Throwable ignored) {
+                    return null;
+                }
             }
         }
 
-        // 2. Concurrent waves (Google ECS first for YouTube/media, then 3-way diverse waves under 3.8s each)
-        List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, ignoreCut, preferGoogleEcs, allowIpv6);
-        if (preferGoogleEcs) {
-            List<Endpoint> ecsWave = extractGoogleWave(remaining, 3);
-            if (!ecsWave.isEmpty()) {
-                byte[] ecsReply = raceEndpointsWave(ecsWave, wireQuery, protector, fdProtector,
-                        cellularNetwork ? 2500L : 2000L, qtype);
-                if (ecsReply != null && ecsReply.length >= 12) {
-                    String[] found = qtype == 28 ? parseRecords(ecsReply, true) : parseARecords(ecsReply);
-                    if (found.length > 0) {
-                        if (qtype == 1) {
-                            putDnsCacheEntry(key, found, System.currentTimeMillis());
+        InetAddress[] resolved = null;
+        try {
+            // 1. Fast path: pinned last-working endpoint with bounded budget (skip non-ECS pinned for YouTube/media)
+            Endpoint pinned = lastWorkingEndpoint;
+            Endpoint pinnedTried = null;
+            if (pinned != null && (ignoreCut || !isCut(pinned.key(), now))
+                    && (allowIpv6 || pinned.ip.indexOf(':') < 0)
+                    && (!preferGoogleEcs || "google".equals(pinned.providerGroup))) {
+                pinnedTried = pinned;
+                try {
+                    long fastDeadline = System.currentTimeMillis() + (cellularNetwork ? 2000L : 1400L);
+                    byte[] reply = queryWire(pinned, wireQuery, protector, fdProtector, fastDeadline, null);
+                    if (reply != null && reply.length >= 12) {
+                        cutUntil.remove(pinned.key());
+                        String[] found = qtype == 28 ? parseRecords(reply, true) : parseARecords(reply);
+                        if (found.length > 0) {
+                            lastResolver = pinned.key();
+                            resolved = cacheAndConvertRecords(key, qtype, found);
+                            if (resolved != null) return resolved;
                         }
-                        return toAddresses(found);
+                        // Valid empty AAAA answer on a healthy resolver
+                        if (qtype == 28) {
+                            cacheAndConvertRecords(key, 28, null);
+                            return null;
+                        }
                     }
-                    if (qtype == 28) return null;
+                } catch (Throwable t) {
+                    Log.i(TAG, pinned.key() + " cut or unreachable: " + t.getClass().getSimpleName());
+                    markCut(pinned.key(), System.currentTimeMillis());
+                    if (lastWorkingEndpoint == pinned) lastWorkingEndpoint = null;
                 }
             }
-        }
-        for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
-            List<Endpoint> wave = pickDiverseWave(remaining, 3);
-            byte[] reply = raceEndpointsWave(wave, wireQuery, protector, fdProtector,
-                    RACE_WAVE_DEADLINE_MS, qtype);
-            if (reply != null && reply.length >= 12) {
-                String[] found = qtype == 28 ? parseRecords(reply, true) : parseARecords(reply);
-                if (found.length > 0) {
-                    if (qtype == 1) {
-                        cache.put(key, new long[]{System.currentTimeMillis()});
-                        answers.put(key, found);
+
+            // 2. Concurrent waves (Google ECS first for YouTube/media, then 3-way diverse waves under deadline)
+            List<Endpoint> remaining = buildHealthyCandidates(pinnedTried, now, ignoreCut, preferGoogleEcs, allowIpv6);
+            if (preferGoogleEcs) {
+                List<Endpoint> ecsWave = extractGoogleWave(remaining, 3);
+                if (!ecsWave.isEmpty()) {
+                    byte[] ecsReply = raceEndpointsWave(ecsWave, wireQuery, protector, fdProtector,
+                            cellularNetwork ? 2200L : 1600L, qtype);
+                    if (ecsReply != null && ecsReply.length >= 12) {
+                        String[] found = qtype == 28 ? parseRecords(ecsReply, true) : parseARecords(ecsReply);
+                        if (found.length > 0) {
+                            resolved = cacheAndConvertRecords(key, qtype, found);
+                            if (resolved != null) return resolved;
+                        }
+                        if (qtype == 28) {
+                            cacheAndConvertRecords(key, 28, null);
+                            return null;
+                        }
                     }
-                    return toAddresses(found);
                 }
-                if (qtype == 28) return null;
+            }
+            for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
+                List<Endpoint> wave = pickDiverseWave(remaining, 3);
+                byte[] reply = raceEndpointsWave(wave, wireQuery, protector, fdProtector,
+                        RACE_WAVE_DEADLINE_MS, qtype);
+                if (reply != null && reply.length >= 12) {
+                    String[] found = qtype == 28 ? parseRecords(reply, true) : parseARecords(reply);
+                    if (found.length > 0) {
+                        resolved = cacheAndConvertRecords(key, qtype, found);
+                        if (resolved != null) return resolved;
+                    }
+                    if (qtype == 28) {
+                        cacheAndConvertRecords(key, 28, null);
+                        return null;
+                    }
+                }
+            }
+            return null;
+        } finally {
+            if (ownerFuture != null) {
+                inflightLookups.remove(inflightKey, ownerFuture);
+                ownerFuture.complete(resolved);
             }
         }
-        return null;
     }
 
     private static InetAddress[] toAddresses(String[] ips) {
@@ -1303,38 +1445,67 @@ public final class ColgramDohResolver {
         public OutputStream getOutputStream() throws java.io.IOException {
             OutputStream existing = wrappedOut;
             if (existing != null) return existing;
-            final OutputStream raw = base.getOutputStream();
-            OutputStream fresh = new OutputStream() {
-                private boolean firstHelloSent;
+            synchronized (this) {
+                if (wrappedOut != null) return wrappedOut;
+                final OutputStream raw = base.getOutputStream();
+                OutputStream fresh = new OutputStream() {
+                    private volatile boolean firstHelloSent;
 
-                @Override public synchronized void write(int b) throws java.io.IOException {
-                    write(new byte[]{(byte) b}, 0, 1);
-                }
-
-                @Override public synchronized void write(byte[] b, int off, int len) throws java.io.IOException {
-                    if (!firstHelloSent && len >= 11 && (b[off] & 0xFF) == 22 && b[off + 1] == 3 && (b[off + 5] & 0xFF) == 1) {
-                        firstHelloSent = true;
-                        byte[] copy = new byte[len];
-                        System.arraycopy(b, off, copy, 0, len);
-                        byte[][] pieces = ColgramTlsMimic.fragment(copy, new java.util.Random());
-                        for (int i = 0; i < pieces.length; i++) {
-                            raw.write(pieces[i]);
-                            raw.flush();
-                            if (i + 1 < pieces.length) {
-                                try { Thread.sleep(2L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    @Override public void write(int b) throws java.io.IOException {
+                        if (firstHelloSent) {
+                            raw.write(b);
+                            return;
+                        }
+                        synchronized (this) {
+                            if (firstHelloSent) {
+                                raw.write(b);
+                                return;
+                            }
+                            try {
+                                raw.write(b);
+                            } finally {
+                                firstHelloSent = true;
                             }
                         }
-                        return;
                     }
-                    firstHelloSent = true;
-                    raw.write(b, off, len);
-                }
 
-                @Override public void flush() throws java.io.IOException { raw.flush(); }
-                @Override public void close() throws java.io.IOException { raw.close(); }
-            };
-            wrappedOut = fresh;
-            return fresh;
+                    @Override public void write(byte[] b, int off, int len) throws java.io.IOException {
+                        if (firstHelloSent) {
+                            raw.write(b, off, len);
+                            return;
+                        }
+                        synchronized (this) {
+                            if (firstHelloSent) {
+                                raw.write(b, off, len);
+                                return;
+                            }
+                            try {
+                                if (len >= 11 && (b[off] & 0xFF) == 22 && b[off + 1] == 3 && (b[off + 5] & 0xFF) == 1) {
+                                    byte[] copy = new byte[len];
+                                    System.arraycopy(b, off, copy, 0, len);
+                                    byte[][] pieces = ColgramTlsMimic.fragment(copy, new java.util.Random());
+                                    for (int i = 0; i < pieces.length; i++) {
+                                        raw.write(pieces[i]);
+                                        raw.flush();
+                                        if (i + 1 < pieces.length) {
+                                            try { Thread.sleep(2L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                                        }
+                                    }
+                                    return;
+                                }
+                                raw.write(b, off, len);
+                            } finally {
+                                firstHelloSent = true;
+                            }
+                        }
+                    }
+
+                    @Override public void flush() throws java.io.IOException { raw.flush(); }
+                    @Override public void close() throws java.io.IOException { raw.close(); }
+                };
+                wrappedOut = fresh;
+                return fresh;
+            }
         }
     }
 
@@ -1576,8 +1747,19 @@ public final class ColgramDohResolver {
             raw.setSoTimeout(readTimeout);
 
             javax.net.ssl.SSLSocketFactory engineFactory = ColgramNativeDesync.createEngineSslSocketFactory();
-            ssl = (javax.net.ssl.SSLSocket) engineFactory.createSocket(transport, tlsSni, endpoint.port, true);
+            String sessionHost = (endpoint.verifyName != null && !endpoint.verifyName.isEmpty())
+                    ? endpoint.verifyName
+                    : tlsSni;
+            ssl = (javax.net.ssl.SSLSocket) engineFactory.createSocket(transport, sessionHost, endpoint.port, true);
             hardenTlsSocket(ssl);
+            if (tlsSni != null && !tlsSni.isEmpty() && !tlsSni.equals(sessionHost) && !isIpLiteral(tlsSni)) {
+                try {
+                    javax.net.ssl.SSLParameters params = ssl.getSSLParameters();
+                    params.setServerNames(java.util.Collections.<javax.net.ssl.SNIServerName>singletonList(
+                            new javax.net.ssl.SNIHostName(tlsSni)));
+                    ssl.setSSLParameters(params);
+                } catch (Throwable ignored) {}
+            }
             ssl.setSoTimeout(readTimeout);
             ssl.startHandshake();
             if (!matches(ssl.getSession(), endpoint.verifyName)) {
@@ -1897,13 +2079,22 @@ public final class ColgramDohResolver {
         body.write(0x00); body.write(0x00);            // ANCOUNT = 0
         body.write(0x00); body.write(0x00);            // NSCOUNT = 0
         body.write(0x00); body.write(0x00);            // ARCOUNT = 0
-        for (String label : hostname.split("\\.")) {
+        int hostLen = hostname.length();
+        while (hostLen > 0 && hostname.charAt(hostLen - 1) == '.') {
+            hostLen--;
+        }
+        int pos = 0;
+        while (pos < hostLen) {
+            int dot = hostname.indexOf('.', pos);
+            int end = (dot < 0 || dot >= hostLen) ? hostLen : dot;
+            String label = hostname.substring(pos, end);
             byte[] bytes = label.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             if (bytes.length == 0 || bytes.length > 63) {
                 throw new IllegalArgumentException("bad label in " + hostname);
             }
             body.write(bytes.length);
             body.write(bytes, 0, bytes.length);
+            pos = end + 1;
         }
         body.write(0x00);                              // root
         body.write((qtype >> 8) & 0xff); body.write(qtype & 0xff); // QTYPE

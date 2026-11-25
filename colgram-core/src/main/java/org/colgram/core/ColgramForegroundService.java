@@ -416,6 +416,45 @@ public class ColgramForegroundService extends Service {
         }
     }
 
+    private static volatile Class<?> cachedUserConfigClass;
+    private static volatile java.lang.reflect.Method cachedUcGetInstance;
+    private static volatile java.lang.reflect.Method cachedUcIsActivated;
+    private static volatile java.lang.reflect.Method cachedUcGetCurrentUser;
+    private static volatile java.lang.reflect.Field cachedUserBotField;
+    private static volatile Class<?> cachedConnectionsManagerClass;
+    private static volatile java.lang.reflect.Method cachedCmGetInstance;
+    private static volatile java.lang.reflect.Method cachedCmSetPushConnectionEnabled;
+    private static volatile java.lang.reflect.Method cachedCmResumeNetworkMaybe;
+    private static volatile java.lang.reflect.Method cachedCmCheckConnection;
+    private static volatile boolean reflectionInitDone = false;
+
+    private static void ensureReflectionHandles() {
+        if (reflectionInitDone) return;
+        synchronized (ColgramForegroundService.class) {
+            if (reflectionInitDone) return;
+            try {
+                Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+                cachedUserConfigClass = ucClass;
+                cachedUcGetInstance = ucClass.getMethod("getInstance", int.class);
+                cachedUcIsActivated = ucClass.getMethod("isClientActivated");
+                cachedUcGetCurrentUser = ucClass.getMethod("getCurrentUser");
+            } catch (Throwable ignored) {}
+            try {
+                Class<?> userClass = Class.forName("org.telegram.tgnet.TLRPC$User");
+                cachedUserBotField = userClass.getField("bot");
+            } catch (Throwable ignored) {}
+            try {
+                Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                cachedConnectionsManagerClass = cmClass;
+                cachedCmGetInstance = cmClass.getMethod("getInstance", int.class);
+                try { cachedCmSetPushConnectionEnabled = cmClass.getMethod("setPushConnectionEnabled", boolean.class); } catch (Throwable ignored) {}
+                try { cachedCmResumeNetworkMaybe = cmClass.getMethod("resumeNetworkMaybe"); } catch (Throwable ignored) {}
+                try { cachedCmCheckConnection = cmClass.getMethod("checkConnection"); } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+            reflectionInitDone = true;
+        }
+    }
+
     private void ensureHumanAccountBackgroundSync() {
         if (ColgramUiBridge.isAppInForeground()
                 || !ColgramConfig.isAlwaysBackgroundEnabled()
@@ -438,38 +477,33 @@ public class ColgramForegroundService extends Service {
         }
         lastHumanSyncAtMs = now;
         try {
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+            ensureReflectionHandles();
+            if (cachedUcGetInstance == null || cachedUcIsActivated == null || cachedCmGetInstance == null) {
+                return;
+            }
             for (int a = 0; a < 5; a++) {
-                Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, a);
+                Object uc = cachedUcGetInstance.invoke(null, a);
                 if (uc == null) continue;
-                Boolean active = (Boolean) ucClass.getMethod("isClientActivated").invoke(uc);
+                Boolean active = (Boolean) cachedUcIsActivated.invoke(uc);
                 if (active == null || !active) continue;
-                Object user = ucClass.getMethod("getCurrentUser").invoke(uc);
-                if (user != null) {
+                Object user = cachedUcGetCurrentUser != null ? cachedUcGetCurrentUser.invoke(uc) : null;
+                if (user != null && cachedUserBotField != null) {
                     try {
-                        boolean isBot = user.getClass().getField("bot").getBoolean(user);
+                        boolean isBot = cachedUserBotField.getBoolean(user);
                         if (isBot) continue; // bot pollers already handled via Bot API loop
                     } catch (Throwable ignored) {}
                 }
-                Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
+                Object cm = cachedCmGetInstance.invoke(null, a);
                 if (cm != null) {
-                    try { cmClass.getMethod("setPushConnectionEnabled", boolean.class).invoke(cm, true); } catch (Throwable ignored) {}
-                    try { cmClass.getMethod("resumeNetworkMaybe").invoke(cm); } catch (Throwable ignored) {}
-                    cmClass.getMethod("checkConnection").invoke(cm);
-                }
-                if (screenOn && handler != null) {
-                    final int acc = a;
-                    handler.postDelayed(() -> {
-                        try {
-                            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, acc);
-                            if (mc != null) {
-                                mcClass.getMethod("loadDialogs", int.class, int.class, boolean.class)
-                                        .invoke(mc, 0, 15, false);
-                            }
-                        } catch (Throwable ignored) {}
-                    }, 300L * (a + 1));
+                    if (cachedCmSetPushConnectionEnabled != null) {
+                        try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
+                    }
+                    if (cachedCmResumeNetworkMaybe != null) {
+                        try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
+                    }
+                    if (cachedCmCheckConnection != null) {
+                        try { cachedCmCheckConnection.invoke(cm); } catch (Throwable ignored) {}
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -623,17 +657,22 @@ public class ColgramForegroundService extends Service {
                 if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                     ColgramDpiBypass.restartIfDeadAndWait(2000L);
                 }
-                Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
-                Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
-                for (int a = 0; a < 5; a++) {
-                    Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, a);
-                    if (uc == null) continue;
-                    Boolean activated = (Boolean) ucClass.getMethod("isClientActivated").invoke(uc);
-                    if (activated == null || !activated) continue;
-                    Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
-                    if (cm != null) {
-                        try { cmClass.getMethod("setPushConnectionEnabled", boolean.class).invoke(cm, true); } catch (Throwable ignored) {}
-                        try { cmClass.getMethod("resumeNetworkMaybe").invoke(cm); } catch (Throwable ignored) {}
+                ensureReflectionHandles();
+                if (cachedUcGetInstanceMethodAvailable() && cachedCmGetInstance != null) {
+                    for (int a = 0; a < 5; a++) {
+                        Object uc = cachedUcGetInstance.invoke(null, a);
+                        if (uc == null) continue;
+                        Boolean activated = (Boolean) cachedUcIsActivated.invoke(uc);
+                        if (activated == null || !activated) continue;
+                        Object cm = cachedCmGetInstance.invoke(null, a);
+                        if (cm != null) {
+                            if (cachedCmSetPushConnectionEnabled != null) {
+                                try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
+                            }
+                            if (cachedCmResumeNetworkMaybe != null) {
+                                try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
+                            }
+                        }
                     }
                 }
             } catch (Throwable err) {
@@ -648,6 +687,10 @@ public class ColgramForegroundService extends Service {
         t.setDaemon(true);
         t.setPriority(Thread.MIN_PRIORITY + 1);
         t.start();
+    }
+
+    private static boolean cachedUcGetInstanceMethodAvailable() {
+        return cachedUcGetInstance != null && cachedUcIsActivated != null;
     }
 
     /** Resumes lightweight foreground heartbeat and triggers instant <1s reconnect on UI return. */
@@ -671,17 +714,26 @@ public class ColgramForegroundService extends Service {
             if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                 ColgramDpiBypass.startImmediately();
             }
-            Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Class<?> ucClass = Class.forName("org.telegram.messenger.UserConfig");
+            ensureReflectionHandles();
+            if (!cachedUcGetInstanceMethodAvailable() || cachedCmGetInstance == null) {
+                return;
+            }
             for (int a = 0; a < 5; a++) {
-                Object uc = ucClass.getMethod("getInstance", int.class).invoke(null, a);
-                boolean activated = (boolean) ucClass.getMethod("isClientActivated").invoke(uc);
-                if (!activated) continue;
-                Object cm = cmClass.getMethod("getInstance", int.class).invoke(null, a);
+                Object uc = cachedUcGetInstance.invoke(null, a);
+                if (uc == null) continue;
+                Boolean activated = (Boolean) cachedUcIsActivated.invoke(uc);
+                if (activated == null || !activated) continue;
+                Object cm = cachedCmGetInstance.invoke(null, a);
                 if (cm != null) {
-                    try { cmClass.getMethod("setPushConnectionEnabled", boolean.class).invoke(cm, true); } catch (Throwable ignored) {}
-                    try { cmClass.getMethod("resumeNetworkMaybe").invoke(cm); } catch (Throwable ignored) {}
-                    cmClass.getMethod("checkConnection").invoke(cm);
+                    if (cachedCmSetPushConnectionEnabled != null) {
+                        try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
+                    }
+                    if (cachedCmResumeNetworkMaybe != null) {
+                        try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
+                    }
+                    if (cachedCmCheckConnection != null) {
+                        try { cachedCmCheckConnection.invoke(cm); } catch (Throwable ignored) {}
+                    }
                 }
             }
         } catch (Throwable ignored) {}

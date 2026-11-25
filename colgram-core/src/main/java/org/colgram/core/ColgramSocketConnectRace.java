@@ -8,12 +8,34 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Small endpoint race under a single deadline. The result is only a TCP socket, not MTProto. */
 public final class ColgramSocketConnectRace {
+    private static final int SOCKET_BUFFER_BYTES = 262144;
+    private static final ExecutorService RACE_POOL = new ThreadPoolExecutor(
+            0, 64, 30L, TimeUnit.SECONDS,
+            new SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "colgram-race-dial");
+                t.setDaemon(true);
+                return t;
+            });
+
     private ColgramSocketConnectRace() {}
+
+    private static void preTuneSocket(Socket socket) {
+        if (socket == null) return;
+        try { socket.setTcpNoDelay(true); } catch (Throwable ignored) {}
+        try { socket.setKeepAlive(true); } catch (Throwable ignored) {}
+        try { socket.setReceiveBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+        try { socket.setSendBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
+    }
 
     /** Keep a reachable primary; give it part, not all, of the shared deadline. */
     public static Socket connectPreferred(InetSocketAddress primary, InetSocketAddress[] alternatives, int timeoutMs) {
@@ -23,16 +45,20 @@ public final class ColgramSocketConnectRace {
             if (address != null && !address.equals(primary) && address.getPort() > 0) distinct.add(address);
         }
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        int primaryCap = ColgramDpiBypass.isCellularNetwork() ? 1400 : 800;
-        Socket socket = new Socket(Proxy.NO_PROXY);
-        try {
-            socket.setTcpNoDelay(true);
-            socket.connect(primary, distinct.isEmpty() ? timeoutMs : Math.min(timeoutMs, primaryCap));
-            return socket;
-        } catch (IOException | RuntimeException unavailable) {
-            close(socket);
+        int primaryHeadStartMs = ColgramDpiBypass.isCellularNetwork() ? 240 : 160;
+        if (distinct.isEmpty()) {
+            Socket socket = new Socket(Proxy.NO_PROXY);
+            try {
+                preTuneSocket(socket);
+                socket.connect(primary, timeoutMs);
+                return socket;
+            } catch (IOException | RuntimeException unavailable) {
+                close(socket);
+                return null;
+            }
         }
-        return distinct.isEmpty() ? null : race(new ArrayList<>(distinct), deadline);
+        return raceNativeWithHeadStart(primary, new ArrayList<>(distinct), deadline, primaryHeadStartMs,
+                0, 0, null, null, false);
     }
 
     /**
@@ -54,13 +80,8 @@ public final class ColgramSocketConnectRace {
                                                 int timeoutMs, int mssClamp, int windowClamp,
                                                 ColgramDohResolver.SocketProtector sockProtector,
                                                 ColgramNativeDesync.FdProtector fdProtector) {
-        if (!ColgramNativeDesync.isAvailable() || primary == null || timeoutMs <= 0) {
-            return connectPreferredProtected(primary, alternatives, timeoutMs, sockProtector);
-        }
-        String primaryIp = extractIpLiteral(primary);
-        if (primaryIp == null) {
-            return connectPreferredProtected(primary, alternatives, timeoutMs, sockProtector);
-        }
+        if (primary == null || timeoutMs <= 0) return null;
+        boolean nativeOk = ColgramNativeDesync.isAvailable() && extractIpLiteral(primary) != null;
         LinkedHashSet<InetSocketAddress> distinct = new LinkedHashSet<>();
         if (alternatives != null) {
             for (InetSocketAddress address : alternatives) {
@@ -71,39 +92,37 @@ public final class ColgramSocketConnectRace {
         }
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         int safeMss = (mssClamp > 0 && mssClamp < 88) ? 88 : mssClamp;
-        int primaryCap = ColgramDpiBypass.isCellularNetwork() ? 1400 : 750;
-        try {
-            int firstWait = distinct.isEmpty() ? timeoutMs : Math.min(timeoutMs, primaryCap);
-            return ColgramNativeDesync.connect(primaryIp, primary.getPort(), firstWait, safeMss, windowClamp, fdProtector);
-        } catch (IOException | RuntimeException unavailable) {
-            // Fall through to parallel race across same-DC IPv4 + IPv6 + multi-port aliases
+        int primaryHeadStartMs = ColgramDpiBypass.isCellularNetwork() ? 240 : 160;
+        if (distinct.isEmpty()) {
+            if (nativeOk) {
+                try {
+                    return ColgramNativeDesync.connect(
+                            extractIpLiteral(primary), primary.getPort(), timeoutMs, safeMss, windowClamp, fdProtector);
+                } catch (IOException | RuntimeException unavailable) {
+                    return null;
+                }
+            }
+            return connectSingleProtected(primary, timeoutMs, sockProtector);
         }
-        return distinct.isEmpty() ? null
-                : raceNative(new ArrayList<>(distinct), deadline, safeMss, windowClamp, sockProtector, fdProtector);
+        return raceNativeWithHeadStart(primary, new ArrayList<>(distinct), deadline, primaryHeadStartMs,
+                safeMss, windowClamp, sockProtector, fdProtector, nativeOk);
     }
 
-    private static Socket connectPreferredProtected(InetSocketAddress primary, InetSocketAddress[] alternatives,
-                                                    int timeoutMs, ColgramDohResolver.SocketProtector sockProtector) {
-        if (sockProtector == null) {
-            return connectPreferred(primary, alternatives, timeoutMs);
-        }
-        if (primary == null || timeoutMs <= 0) return null;
-        LinkedHashSet<InetSocketAddress> distinct = new LinkedHashSet<>();
-        if (alternatives != null) for (InetSocketAddress address : alternatives) {
-            if (address != null && !address.equals(primary) && address.getPort() > 0) distinct.add(address);
-        }
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        int primaryCap = ColgramDpiBypass.isCellularNetwork() ? 1400 : 800;
+    private static Socket connectSingleProtected(InetSocketAddress endpoint, int timeoutMs,
+                                                 ColgramDohResolver.SocketProtector sockProtector) {
         Socket socket = new Socket(Proxy.NO_PROXY);
         try {
-            socket.setTcpNoDelay(true);
-            if (!sockProtector.protect(socket)) throw new IOException("Socket protection failed");
-            socket.connect(primary, distinct.isEmpty() ? timeoutMs : Math.min(timeoutMs, primaryCap));
+            preTuneSocket(socket);
+            if (sockProtector != null && !sockProtector.protect(socket)) {
+                close(socket);
+                return null;
+            }
+            socket.connect(endpoint, timeoutMs);
             return socket;
         } catch (IOException | RuntimeException unavailable) {
             close(socket);
+            return null;
         }
-        return distinct.isEmpty() ? null : raceProtected(new ArrayList<>(distinct), deadline, sockProtector);
     }
 
     private static String extractIpLiteral(InetSocketAddress addr) {
@@ -115,19 +134,101 @@ public final class ColgramSocketConnectRace {
         return ColgramDohResolver.isIpLiteral(host) ? host : null;
     }
 
-    private static Socket raceNative(List<InetSocketAddress> endpoints, long deadline,
-                                     int mssClamp, int windowClamp,
-                                     ColgramDohResolver.SocketProtector sockProtector,
-                                     ColgramNativeDesync.FdProtector fdProtector) {
+    private static Socket raceNativeWithHeadStart(InetSocketAddress primary,
+                                                  List<InetSocketAddress> alternatives,
+                                                  long deadline,
+                                                  int headStartMs,
+                                                  int mssClamp,
+                                                  int windowClamp,
+                                                  ColgramDohResolver.SocketProtector sockProtector,
+                                                  ColgramNativeDesync.FdProtector fdProtector,
+                                                  boolean allowNative) {
         final Object gate = new Object();
         final Socket[] winner = new Socket[1];
         final boolean[] finished = new boolean[1];
         final List<Socket> pending = new ArrayList<>();
-        final List<Thread> workers = new ArrayList<>(endpoints.size());
+        final List<Future<?>> futures = new ArrayList<>(1 + alternatives.size());
         final CountDownLatch outcome = new CountDownLatch(1);
-        final AtomicInteger remaining = new AtomicInteger(endpoints.size());
-        for (InetSocketAddress endpoint : endpoints) {
-            Thread attempt = new Thread(() -> {
+        final CountDownLatch primaryDone = new CountDownLatch(1);
+        final int totalAttempts = 1 + alternatives.size();
+        final AtomicInteger remaining = new AtomicInteger(totalAttempts);
+
+        Runnable primaryTask = () -> {
+            Socket socket = null;
+            boolean selected = false;
+            try {
+                long left = nanosLeft(deadline);
+                if (left <= 0) return;
+                synchronized (gate) {
+                    if (finished[0] || winner[0] != null) return;
+                }
+                int waitMs = (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left));
+                String ip = allowNative ? extractIpLiteral(primary) : null;
+                if (ip != null) {
+                    socket = ColgramNativeDesync.connect(ip, primary.getPort(), waitMs, mssClamp, windowClamp, fdProtector);
+                } else {
+                    Socket j = new Socket(Proxy.NO_PROXY);
+                    preTuneSocket(j);
+                    synchronized (gate) {
+                        if (finished[0] || winner[0] != null || nanosLeft(deadline) <= 0) {
+                            close(j);
+                            return;
+                        }
+                        pending.add(j);
+                    }
+                    socket = j;
+                    if (sockProtector != null && !sockProtector.protect(j)) {
+                        return;
+                    }
+                    j.connect(primary, waitMs);
+                }
+                synchronized (gate) {
+                    if (!finished[0] && winner[0] == null && nanosLeft(deadline) > 0) {
+                        winner[0] = socket;
+                        selected = true;
+                        pending.remove(socket);
+                        outcome.countDown();
+                    }
+                }
+            } catch (IOException | RuntimeException unavailable) {
+            } finally {
+                if (!selected && socket != null) close(socket);
+                synchronized (gate) { if (socket != null) pending.remove(socket); }
+                primaryDone.countDown();
+                if (remaining.decrementAndGet() == 0) outcome.countDown();
+            }
+        };
+
+        try {
+            futures.add(RACE_POOL.submit(primaryTask));
+        } catch (Throwable rejected) {
+            primaryDone.countDown();
+            if (remaining.decrementAndGet() == 0) outcome.countDown();
+        }
+
+        // True Happy-Eyeballs stagger: give primary a brief head-start, then launch alternates in parallel
+        try {
+            long waitHead = Math.min(Math.max(10L, TimeUnit.NANOSECONDS.toMillis(nanosLeft(deadline))), headStartMs);
+            primaryDone.await(waitHead, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+
+        synchronized (gate) {
+            if (winner[0] != null) {
+                finished[0] = true;
+                return winner[0];
+            }
+        }
+
+        for (final InetSocketAddress endpoint : alternatives) {
+            synchronized (gate) {
+                if (finished[0] || winner[0] != null || nanosLeft(deadline) <= 0) {
+                    if (remaining.decrementAndGet() == 0) outcome.countDown();
+                    continue;
+                }
+            }
+            Runnable altTask = () -> {
                 Socket socket = null;
                 boolean selected = false;
                 try {
@@ -137,11 +238,12 @@ public final class ColgramSocketConnectRace {
                         if (finished[0] || winner[0] != null) return;
                     }
                     int waitMs = (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left));
-                    String ip = extractIpLiteral(endpoint);
+                    String ip = allowNative ? extractIpLiteral(endpoint) : null;
                     if (ip != null) {
                         socket = ColgramNativeDesync.connect(ip, endpoint.getPort(), waitMs, mssClamp, windowClamp, fdProtector);
                     } else {
                         Socket j = new Socket(Proxy.NO_PROXY);
+                        preTuneSocket(j);
                         synchronized (gate) {
                             if (finished[0] || winner[0] != null || nanosLeft(deadline) <= 0) {
                                 close(j);
@@ -150,7 +252,6 @@ public final class ColgramSocketConnectRace {
                             pending.add(j);
                         }
                         socket = j;
-                        j.setTcpNoDelay(true);
                         if (sockProtector != null && !sockProtector.protect(j)) {
                             return;
                         }
@@ -170,11 +271,14 @@ public final class ColgramSocketConnectRace {
                     synchronized (gate) { if (socket != null) pending.remove(socket); }
                     if (remaining.decrementAndGet() == 0) outcome.countDown();
                 }
-            }, "colgram-native-dial");
-            attempt.setDaemon(true);
-            workers.add(attempt);
-            attempt.start();
+            };
+            try {
+                futures.add(RACE_POOL.submit(altTask));
+            } catch (Throwable rejected) {
+                if (remaining.decrementAndGet() == 0) outcome.countDown();
+            }
         }
+
         try {
             outcome.await(Math.max(0L, nanosLeft(deadline)), TimeUnit.NANOSECONDS);
         } catch (InterruptedException interrupted) {
@@ -186,11 +290,20 @@ public final class ColgramSocketConnectRace {
                 if (socket != winner[0]) close(socket);
             }
             pending.clear();
-            for (Thread worker : workers) {
-                if (worker.isAlive()) worker.interrupt();
+            for (Future<?> f : futures) {
+                f.cancel(true);
             }
             return winner[0];
         }
+    }
+
+    private static Socket raceNative(List<InetSocketAddress> endpoints, long deadline,
+                                     int mssClamp, int windowClamp,
+                                     ColgramDohResolver.SocketProtector sockProtector,
+                                     ColgramNativeDesync.FdProtector fdProtector) {
+        if (endpoints == null || endpoints.isEmpty()) return null;
+        return raceNativeWithHeadStart(endpoints.get(0), endpoints.subList(1, endpoints.size()),
+                deadline, 0, mssClamp, windowClamp, sockProtector, fdProtector, true);
     }
 
     private static Socket raceProtected(List<InetSocketAddress> endpoints, long deadline,

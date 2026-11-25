@@ -30,11 +30,11 @@ public final class ColgramTelegramDcAddresses {
 
     /** Known media_only DC endpoints for production DC 1..5 (signed DC -1..-5). Never includes generic IPs. */
     private static final String[][] MEDIA_DC_ADDRESSES = {
-            {"149.154.175.54", "2001:b28:f23d:f001:0:0:0:b"},
-            {"149.154.167.222", "149.154.167.151", "2001:67c:4e8:f002:0:0:0:b"},
-            {},
-            {"149.154.167.43", "149.154.167.92", "149.154.165.120", "2001:67c:4e8:f004:0:0:0:b"},
-            {"91.108.56.131", "91.108.56.140", "91.108.56.170", "2001:b28:f23f:f005:0:0:0:b"}
+            {"149.154.175.54", "2001:b28:f23d:f001:0:0:0:b", "2001:b28:f23d:f001:0:0:0:e"},
+            {"149.154.167.222", "149.154.167.151", "2001:67c:4e8:f002:0:0:0:b", "2001:67c:4e8:f002:0:0:0:e"},
+            {"149.154.175.118", "2001:b28:f23d:f003:0:0:0:b", "2001:b28:f23d:f003:0:0:0:e"},
+            {"149.154.167.43", "149.154.167.92", "149.154.165.120", "2001:67c:4e8:f004:0:0:0:b", "2001:67c:4e8:f004:0:0:0:e"},
+            {"91.108.56.131", "91.108.56.140", "91.108.56.170", "2001:b28:f23f:f005:0:0:0:b", "2001:b28:f23f:f005:0:0:0:e"}
     };
 
     /** Dynamic signed DC map learned from live TL_config.dc_options (+1..+5 generic, -1..-5 media_only, 0 CDN). */
@@ -61,6 +61,9 @@ public final class ColgramTelegramDcAddresses {
         putCold(m, "2001:b28:f23d:f001::e", -1);
         putCold(m, "2001:67c:4e8:f002::b", -2);
         putCold(m, "2001:67c:4e8:f002::e", -2);
+        putCold(m, "149.154.175.118", -3);
+        putCold(m, "2001:b28:f23d:f003::b", -3);
+        putCold(m, "2001:b28:f23d:f003::e", -3);
         putCold(m, "2001:67c:4e8:f004::b", -4);
         putCold(m, "2001:67c:4e8:f004::e", -4);
         putCold(m, "2001:b28:f23f:f005::b", -5);

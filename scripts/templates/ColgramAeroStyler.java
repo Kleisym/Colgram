@@ -2,8 +2,10 @@ package org.telegram.ui;
 
 import android.animation.ValueAnimator;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorFilter;
 import android.graphics.LinearGradient;
 import android.graphics.Matrix;
 import android.graphics.Paint;
@@ -261,10 +263,14 @@ public final class ColgramAeroStyler {
     private static final RectF ROW_RECT = new RectF();
     private static final RectF ROW_BAR_RECT = new RectF();
 
-    // Cached badge shader + Matrix (0 allocations per DialogCell.onDraw!)
+    // Cached immutable origin-anchored badge shader + Paint (0 local-matrix mutations & 0 allocations per DialogCell)
     private static LinearGradient cachedBadgeShader;
     private static boolean cachedBadgeCyber;
-    private static final Matrix BADGE_MATRIX = new Matrix();
+    private static boolean cachedBadgeDark;
+    private static int cachedBadgeAccent;
+    private static final Paint AERO_BADGE_PAINT = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static ColorFilter cachedBadgeColorFilter;
+    private static int cachedBadgeAlpha = -1;
 
     static {
         ROW_STROKE_PAINT.setStyle(Paint.Style.STROKE);
@@ -443,14 +449,14 @@ public final class ColgramAeroStyler {
         }
     }
 
-    private static int cachedBadgeAccent;
-
-    /** Zero-allocation cached Colgram gradient shader for unread counter badges. */
-    public static Shader getAeroBadgeShader(float cx, float cy, float w, boolean muted) {
+    /** Returns the immutable origin-anchored Colgram gradient shader for unread counter badges (0 matrix mutations). */
+    public static Shader getAeroBadgeShader(boolean muted) {
         if (muted) return null;
-        boolean cyber = ColgramConfig.isCyberThemeEnabled();
+        boolean dark = Theme.isCurrentThemeDark();
+        boolean cyber = dark && ColgramConfig.isCyberThemeEnabled();
         int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
-        if (cachedBadgeShader == null || cachedBadgeCyber != cyber || cachedBadgeAccent != customAccent) {
+        if (cachedBadgeShader == null || cachedBadgeDark != dark || cachedBadgeCyber != cyber || cachedBadgeAccent != customAccent) {
+            cachedBadgeDark = dark;
             cachedBadgeCyber = cyber;
             cachedBadgeAccent = customAccent;
             int[] cols;
@@ -464,11 +470,31 @@ public final class ColgramAeroStyler {
                     -dp(18), -dp(10), dp(18), dp(10),
                     cols,
                     null, Shader.TileMode.CLAMP);
+            AERO_BADGE_PAINT.setShader(cachedBadgeShader);
         }
-        BADGE_MATRIX.reset();
-        BADGE_MATRIX.setTranslate(cx, cy);
-        cachedBadgeShader.setLocalMatrix(BADGE_MATRIX);
         return cachedBadgeShader;
+    }
+
+    /** Backwards-compatible overload: ignores per-cell coords so HWUI shader batches without setLocalMatrix. */
+    public static Shader getAeroBadgeShader(float cx, float cy, float w, boolean muted) {
+        return getAeroBadgeShader(muted);
+    }
+
+    /**
+     * Dedicated cached badge Paint holding the immutable origin-anchored Aero gradient shader.
+     * Draw centered around (0, 0) inside {@code canvas.save(); canvas.translate(cx, cy); ... canvas.restore()}.
+     */
+    public static Paint getAeroBadgePaint(int alpha, ColorFilter colorFilter) {
+        getAeroBadgeShader(false);
+        if (cachedBadgeAlpha != alpha) {
+            cachedBadgeAlpha = alpha;
+            AERO_BADGE_PAINT.setAlpha(alpha);
+        }
+        if (cachedBadgeColorFilter != colorFilter) {
+            cachedBadgeColorFilter = colorFilter;
+            AERO_BADGE_PAINT.setColorFilter(colorFilter);
+        }
+        return AERO_BADGE_PAINT;
     }
 
     /** Allocation-free flowing dual-sine shimmer wave ribbon for DialogsActivity ActionBar (auto-pauses when hidden). */
@@ -557,13 +583,34 @@ public final class ColgramAeroStyler {
         }
     }
 
-    /** Zero-allocation static ambient wave/aurora backdrop for the main menu (DialogsActivity) & onboarding. */
+    /** Pre-rendered static offscreen bitmap backdrop for main menu (DialogsActivity) & onboarding. */
     public static final class AmbientMenuBackdropView extends View {
+        private Bitmap cachedBitmap;
+        private Canvas cachedCanvas;
+        private int cachedWidth;
+        private int cachedHeight;
+        private int cachedStyle = -1;
+        private int cachedAccent;
+        private boolean cachedDark;
+        private boolean cachedCyber;
+        private float cachedDensity;
+
         public AmbientMenuBackdropView(Context ctx) {
             super(ctx);
             setWillNotDraw(false);
             setClickable(false);
             setFocusable(false);
+        }
+
+        private void releaseCachedBitmap() {
+            cachedCanvas = null;
+            if (cachedBitmap != null) {
+                cachedBitmap.recycle();
+                cachedBitmap = null;
+            }
+            cachedWidth = 0;
+            cachedHeight = 0;
+            cachedStyle = -1;
         }
 
         @Override
@@ -573,11 +620,19 @@ public final class ColgramAeroStyler {
         }
 
         @Override
+        protected void onDetachedFromWindow() {
+            super.onDetachedFromWindow();
+            releaseCachedBitmap();
+        }
+
+        @Override
         protected void onDraw(Canvas canvas) {
             int w = getWidth();
             int h = getHeight();
             if (w <= 0 || h <= 0) return;
-            if (org.colgram.core.ColgramConfig.getLiveWallpaperStyle() == org.colgram.core.ColgramLiveWallpaper.STYLE_OFF) {
+            int style = org.colgram.core.ColgramConfig.getLiveWallpaperStyle();
+            if (style == org.colgram.core.ColgramLiveWallpaper.STYLE_OFF) {
+                releaseCachedBitmap();
                 return;
             }
             if (!isAttachedToWindow() || getWindowVisibility() != VISIBLE
@@ -587,10 +642,37 @@ public final class ColgramAeroStyler {
             boolean dark = Theme.isCurrentThemeDark();
             boolean cyber = dark && ColgramConfig.isCyberThemeEnabled();
             int accent = Theme.getColor(Theme.key_featuredStickers_addButton);
-            org.colgram.core.ColgramLiveWallpaper.drawMainMenuAmbient(
-                    canvas, w, h, accent, dark, cyber,
-                    0f,
-                    AndroidUtilities.density);
+            float density = AndroidUtilities.density;
+            if (cachedBitmap == null || cachedBitmap.isRecycled()
+                    || cachedWidth != w || cachedHeight != h
+                    || cachedStyle != style || cachedAccent != accent
+                    || cachedDark != dark || cachedCyber != cyber
+                    || cachedDensity != density) {
+                try {
+                    if (cachedBitmap == null || cachedBitmap.isRecycled() || cachedWidth != w || cachedHeight != h) {
+                        releaseCachedBitmap();
+                        cachedBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                        cachedCanvas = new Canvas(cachedBitmap);
+                        cachedWidth = w;
+                        cachedHeight = h;
+                    } else {
+                        cachedBitmap.eraseColor(Color.TRANSPARENT);
+                    }
+                    cachedStyle = style;
+                    cachedAccent = accent;
+                    cachedDark = dark;
+                    cachedCyber = cyber;
+                    cachedDensity = density;
+                    org.colgram.core.ColgramLiveWallpaper.drawMainMenuAmbient(
+                            cachedCanvas, w, h, accent, dark, cyber, 0f, density);
+                } catch (OutOfMemoryError oom) {
+                    releaseCachedBitmap();
+                    org.colgram.core.ColgramLiveWallpaper.drawMainMenuAmbient(
+                            canvas, w, h, accent, dark, cyber, 0f, density);
+                    return;
+                }
+            }
+            canvas.drawBitmap(cachedBitmap, 0f, 0f, null);
         }
     }
 
