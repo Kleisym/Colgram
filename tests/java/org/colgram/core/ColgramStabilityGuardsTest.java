@@ -196,10 +196,11 @@ public final class ColgramStabilityGuardsTest {
             }
             s2.close();
 
-            Socket s3 = ColgramDpiBypass.connectViaL3RelayCascade("149.154.167.52", 443, 2000, null, relays);
+            Socket s3 = ColgramDpiBypass.connectViaL3RelayCascade("149.154.175.50", 443, 2000, null, relays);
             assertTrue(s3 != null, "failover to surviving L3 relay must succeed after pinned relay dies");
-            assertTrue(!firstPinned.equals(ColgramDpiBypass.pinnedTelegramL3RelayKeyForTest()),
-                    "surviving L3 relay must become the new pinned exit relay");
+            String secondPinned = ColgramDpiBypass.pinnedTelegramL3RelayKeyForTest();
+            assertTrue(!secondPinned.isEmpty() && !firstPinned.equals(secondPinned),
+                    "surviving L3 relay must become the new pinned exit relay (first=" + firstPinned + ", second=" + secondPinned + ")");
             s3.close();
         } finally {
             running.set(false);
