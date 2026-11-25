@@ -189,10 +189,12 @@ public final class ColgramStabilityGuardsTest {
                 assertTrue(hitsA.get() == aAfter1 + 1 && hitsB.get() == bAfter1,
                         "pinned relay A must handle second dial without hitting relay B");
                 mockRelayA.close(); // Kill pinned relay A -> next dial must fail over cleanly to relay B!
+                tA.join(2000);
             } else {
                 assertTrue(hitsB.get() == bAfter1 + 1 && hitsA.get() == aAfter1,
                         "pinned relay B must handle second dial without hitting relay A");
                 mockRelayB.close();
+                tB.join(2000);
             }
             s2.close();
 
@@ -217,6 +219,10 @@ public final class ColgramStabilityGuardsTest {
         while (running.get() && !ss.isClosed()) {
             try {
                 Socket c = ss.accept();
+                if (!running.get() || ss.isClosed()) {
+                    try { c.close(); } catch (Throwable ignored) {}
+                    break;
+                }
                 hits.incrementAndGet();
                 Thread worker = new Thread(() -> {
                     try (Socket sock = c) {
