@@ -182,7 +182,7 @@ jobs:
           trap 'rm -f colgram.keystore /tmp/colgram-main-aligned.apk' EXIT
           ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name zipalign | sort -V | tail -n 1)
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
-          "$ZIPALIGN" -p -f -P 16 4 "$APK" /tmp/colgram-main-aligned.apk
+          "$ZIPALIGN" -f -P 16 4 "$APK" /tmp/colgram-main-aligned.apk
           rm -f "$APK"
           "$ZIPALIGN" -c -P 16 4 /tmp/colgram-main-aligned.apk
           MAIN_OUT="Colgram-${UPSTREAM_TAG}.apk"
@@ -318,7 +318,7 @@ jobs:
           trap 'rm -f colgram.keystore /tmp/colgram-koliti-aligned.apk' EXIT
           ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name zipalign | sort -V | tail -n 1)
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
-          "$ZIPALIGN" -p -f -P 16 4 "$APK" /tmp/colgram-koliti-aligned.apk
+          "$ZIPALIGN" -f -P 16 4 "$APK" /tmp/colgram-koliti-aligned.apk
           rm -f "$APK"
           "$ZIPALIGN" -c -P 16 4 /tmp/colgram-koliti-aligned.apk
           KOLITI_OUT="Colgram-${UPSTREAM_TAG}-Koliti.apk"

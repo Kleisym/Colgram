@@ -155,7 +155,7 @@ class KolitiSplitContractsTest(unittest.TestCase):
         self.assertIn("COLGRAM_KOLITI: \"0\"", yml)
         self.assertIn("COLGRAM_KOLITI: \"1\"", yml)
         self.assertIn("-PcolgramAbis=arm64-v8a,x86_64", yml)
-        self.assertIn('"$ZIPALIGN" -p -f -P 16 4', yml)
+        self.assertIn('"$ZIPALIGN" -f -P 16 4', yml)
         self.assertIn('"$ZIPALIGN" -c -P 16 4 "$MAIN_OUT"', yml)
         self.assertIn('"$ZIPALIGN" -c -P 16 4 "$KOLITI_OUT"', yml)
         self.assertIn("3c5326960d586b6906a7ab09f7f3039f2385c0c5f8190527614569169e132d41", yml)
