@@ -50,7 +50,7 @@ public final class ColgramSocketConnectRace {
             Socket socket = new Socket(Proxy.NO_PROXY);
             try {
                 preTuneSocket(socket);
-                socket.connect(primary, timeoutMs);
+                ColgramDpiBypass.connectTracked(socket, primary, timeoutMs);
                 return socket;
             } catch (IOException | RuntimeException unavailable) {
                 close(socket);
@@ -117,7 +117,7 @@ public final class ColgramSocketConnectRace {
                 close(socket);
                 return null;
             }
-            socket.connect(endpoint, timeoutMs);
+            ColgramDpiBypass.connectTracked(socket, endpoint, timeoutMs);
             return socket;
         } catch (IOException | RuntimeException unavailable) {
             close(socket);
@@ -180,7 +180,7 @@ public final class ColgramSocketConnectRace {
                     if (sockProtector != null && !sockProtector.protect(j)) {
                         return;
                     }
-                    j.connect(primary, waitMs);
+                    ColgramDpiBypass.connectTracked(j, primary, waitMs);
                 }
                 synchronized (gate) {
                     if (!finished[0] && winner[0] == null && nanosLeft(deadline) > 0) {
@@ -255,7 +255,7 @@ public final class ColgramSocketConnectRace {
                         if (sockProtector != null && !sockProtector.protect(j)) {
                             return;
                         }
-                        j.connect(endpoint, waitMs);
+                        ColgramDpiBypass.connectTracked(j, endpoint, waitMs);
                     }
                     synchronized (gate) {
                         if (!finished[0] && winner[0] == null && nanosLeft(deadline) > 0) {
@@ -331,7 +331,7 @@ public final class ColgramSocketConnectRace {
                     if (left <= 0) return;
                     socket.setTcpNoDelay(true);
                     if (sockProtector != null && !sockProtector.protect(socket)) return;
-                    socket.connect(endpoint, (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left)));
+                    ColgramDpiBypass.connectTracked(socket, endpoint, (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left)));
                     synchronized (gate) {
                         if (!finished[0] && winner[0] == null && nanosLeft(deadline) > 0) {
                             winner[0] = socket;
@@ -384,7 +384,7 @@ public final class ColgramSocketConnectRace {
                     long left = nanosLeft(deadline);
                     if (left <= 0) return;
                     socket.setTcpNoDelay(true);
-                    socket.connect(endpoint, (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left)));
+                    ColgramDpiBypass.connectTracked(socket, endpoint, (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(left)));
                     synchronized (gate) {
                         if (!finished[0] && winner[0] == null && nanosLeft(deadline) > 0) {
                             winner[0] = socket;

@@ -33,60 +33,27 @@ public final class ColgramBypassNotice {
 
     private ColgramBypassNotice() {}
 
-    /** Report the current direct-route failure without introducing another route switch. */
+    /**
+     * Previously posted a persistent status banner; "Локальный слой всегда включён", so this is
+     * intentionally silent and clears any stale notice instead of nagging the user.
+     */
     public static void showBlocked(Context context, String diagnosis) {
-        if (context == null) return;
-        try {
-            NotificationManager nm = notificationManager(context);
-            if (nm == null) return;
-            if (Build.VERSION.SDK_INT >= 26) {
-                if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                    NotificationChannel ch = new NotificationChannel(CHANNEL_ID,
-                            "Доступ к Telegram", NotificationManager.IMPORTANCE_DEFAULT);
-                    ch.setShowBadge(false);
-                    ch.setDescription("Показывает, когда Telegram недоступен напрямую и есть чем это заменить");
-                    nm.createNotificationChannel(ch);
-                }
-            }
-            if (!nm.areNotificationsEnabled()) {
-                // Without permission the notification is silently dropped. The caller still
-                // toasts, so say so in the log rather than pretending the user was told.
-                Log.i(TAG, "notifications are disabled; cannot offer the bypass");
-                return;
-            }
-
-            Notification.Builder b = Build.VERSION.SDK_INT >= 26
-                    ? new Notification.Builder(context, CHANNEL_ID)
-                    : new Notification.Builder(context);
-            b.setContentTitle("Telegram недоступен напрямую")
-                    .setStyle(new Notification.BigTextStyle().bigText(
-                            diagnosis + "\n\nЛокальный слой всегда включён. "
-                                    + "Его состояние и доступные транспорты находятся в настройках подключения."))
-                    .setSmallIcon(android.R.drawable.stat_notify_sync)
-                    .setOngoing(true)
-                    .setShowWhen(false)
-                    .setAutoCancel(false);
-
-            Intent open = openAppIntent(context);
-            if (open != null) {
-                b.setContentIntent(pending(context, 0, open));
-            }
-            nm.notify(NOTIFICATION_ID, b.build());
-            showing = true;
-        } catch (Throwable t) {
-            Log.w(TAG, "could not post the notice: " + t);
-        }
+        clear(context);
     }
 
-    /** Clear the old diagnosis after a successful connection or an explicit recheck. */
+    /** Clear any legacy or stale blocked notice unconditionally. */
     public static void clear(Context context) {
-        if (context == null || !showing) return;
         showing = false;
+        if (context == null) return;
         try {
             NotificationManager nm = notificationManager(context);
             if (nm != null) nm.cancel(NOTIFICATION_ID);
         } catch (Throwable ignored) {
         }
+    }
+
+    static boolean isShowingForTest() {
+        return showing;
     }
 
     private static Intent openAppIntent(Context context) {

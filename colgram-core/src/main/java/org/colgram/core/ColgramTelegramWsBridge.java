@@ -2102,7 +2102,7 @@ public final class ColgramTelegramWsBridge {
                             if (protector != null && !protector.protect(sock)) {
                                 return;
                             }
-                            sock.connect(new InetSocketAddress(ep.ip, 443), connectAttemptTimeoutMs());
+                            ColgramDpiBypass.connectTracked(sock, new InetSocketAddress(ep.ip, 443), connectAttemptTimeoutMs());
                         }
                         DialedTcp candidate = new DialedTcp(ep, sock);
                         synchronized (winnerLock) {

@@ -8,7 +8,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
-import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -295,6 +294,10 @@ public class ColgramProxyManager {
     private static final AtomicBoolean networkCallbackRegistered = new AtomicBoolean(false);
     private static volatile Object networkCallback;
     private static volatile long lastActiveNetworkHandle = -1L;
+    private static volatile boolean initialNetworkSeen = false;
+    private static volatile boolean defaultNetworkLost = false;
+    private static volatile boolean lastNetworkValidated = false;
+    private static volatile String lastLinkSignature = "";
 
     private static long networkHandleOf(Network network) {
         if (network == null) return -1L;
@@ -487,10 +490,59 @@ public class ColgramProxyManager {
         ConnectivityManager manager = (ConnectivityManager) service;
         updateTransportCapabilities(manager, null);
         try {
+            if (android.os.Build.VERSION.SDK_INT >= 23) {
+                Network activeNet = manager.getActiveNetwork();
+                if (activeNet != null) {
+                    android.net.NetworkCapabilities activeCaps = manager.getNetworkCapabilities(activeNet);
+                    if (!isOwnSystemDpiVpn(activeCaps)) {
+                        lastActiveNetworkHandle = networkHandleOf(activeNet);
+                        lastNetworkValidated = activeCaps != null
+                                && activeCaps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                        lastLinkSignature = linkSignatureOf(manager, activeNet);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
             networkCallback = NetworkCallbackBridge.register(manager);
         } catch (Throwable t) {
             networkCallbackRegistered.set(false);
             Log.w(TAG, "could not observe network changes: " + t);
+        }
+    }
+
+    private static boolean isOwnSystemDpiVpn(android.net.NetworkCapabilities caps) {
+        return caps != null
+                && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
+                && ColgramCallSocksTunnel.isSystemDpiRunning(appContext);
+    }
+
+    private static String linkSignatureOf(ConnectivityManager manager, Network network) {
+        if (manager == null || network == null) return "";
+        try {
+            return linkSignatureOf(manager.getLinkProperties(network));
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static String linkSignatureOf(android.net.LinkProperties lp) {
+        if (lp == null) return "";
+        try {
+            String iface = lp.getInterfaceName();
+            java.util.List<java.net.InetAddress> dns = lp.getDnsServers();
+            StringBuilder sb = new StringBuilder(iface != null ? iface : "");
+            sb.append('|');
+            if (dns != null) {
+                for (int i = 0; i < dns.size(); i++) {
+                    if (i > 0) sb.append(',');
+                    java.net.InetAddress addr = dns.get(i);
+                    if (addr != null) sb.append(addr.getHostAddress());
+                }
+            }
+            return sb.toString();
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 
@@ -502,37 +554,7 @@ public class ColgramProxyManager {
                 public void onAvailable(Network network) {
                     android.net.NetworkCapabilities caps = null;
                     try { caps = manager.getNetworkCapabilities(network); } catch (Throwable ignored) {}
-                    boolean isOwnSysDpiVpn = caps != null
-                            && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
-                            && ColgramCallSocksTunnel.isSystemDpiRunning(appContext);
-                    if (isOwnSysDpiVpn) {
-                        updateTransportCapabilities(manager, null);
-                        return;
-                    }
-                    long handle = networkHandleOf(network);
-                    boolean prevCellular = ColgramDpiBypass.isCellularNetwork();
-                    updateTransportCapabilities(manager, network);
-                    boolean cellularChanged = (ColgramDpiBypass.isCellularNetwork() != prevCellular);
-                    if (lastActiveNetworkHandle == -1L) {
-                        // Initial registration callback on startup: record handle without wiping learned state.
-                        lastActiveNetworkHandle = handle;
-                        if (cellularChanged) {
-                            invalidateNetworkProbeState("cellular transport changed");
-                        }
-                        return;
-                    }
-                    if (handle == lastActiveNetworkHandle && !cellularChanged) {
-                        return;
-                    }
-                    lastActiveNetworkHandle = handle;
-                    invalidateNetworkProbeState(cellularChanged ? "cellular transport changed" : "network available");
-                }
-
-                @Override
-                public void onCapabilitiesChanged(Network network, android.net.NetworkCapabilities caps) {
-                    if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
-                        // Never clear cellularNetwork when our own VPN/local-DPI TUN comes up;
-                        // inspect the underlying physical network instead.
+                    if (isOwnSystemDpiVpn(caps)) {
                         boolean prevCellular = ColgramDpiBypass.isCellularNetwork();
                         updateTransportCapabilities(manager, null);
                         if (ColgramDpiBypass.isCellularNetwork() != prevCellular) {
@@ -540,14 +562,100 @@ public class ColgramProxyManager {
                         }
                         return;
                     }
-                    if (caps != null) {
-                        boolean cellular = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)
-                                && !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI);
-                        if (cellular != ColgramDpiBypass.isCellularNetwork()) {
-                            ColgramDpiBypass.setCellularNetwork(cellular);
-                            Log.i(TAG, "network transport changed: cellular=" + cellular);
+                    long handle = networkHandleOf(network);
+                    boolean validated = caps != null
+                            && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                    String linkSig = (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN))
+                            ? "" : linkSignatureOf(manager, network);
+                    boolean prevCellular = ColgramDpiBypass.isCellularNetwork();
+                    updateTransportCapabilities(manager, network);
+                    boolean cellularChanged = (ColgramDpiBypass.isCellularNetwork() != prevCellular);
+                    boolean firstStartup = !initialNetworkSeen;
+                    initialNetworkSeen = true;
+                    boolean wasLost = defaultNetworkLost;
+                    defaultNetworkLost = false;
+                    boolean handleChanged = (handle != lastActiveNetworkHandle);
+                    boolean linkChanged = !linkSig.isEmpty() && !lastLinkSignature.isEmpty() && !linkSig.equals(lastLinkSignature);
+                    boolean validatedRecovered = !lastNetworkValidated && validated;
+                    lastActiveNetworkHandle = handle;
+                    lastNetworkValidated = validated;
+                    if (!linkSig.isEmpty()) lastLinkSignature = linkSig;
+                    if (firstStartup) {
+                        // Initial registration callback on startup: record handle without wiping learned state.
+                        if (cellularChanged) {
                             invalidateNetworkProbeState("cellular transport changed");
                         }
+                        return;
+                    }
+                    if (!wasLost && !handleChanged && !cellularChanged && !linkChanged && !validatedRecovered) {
+                        return;
+                    }
+                    String reason = cellularChanged ? "cellular transport changed"
+                            : (linkChanged ? "link properties changed"
+                            : (validatedRecovered && !wasLost && !handleChanged ? "network validated" : "network available"));
+                    invalidateNetworkProbeState(reason);
+                }
+
+                @Override
+                public void onCapabilitiesChanged(Network network, android.net.NetworkCapabilities caps) {
+                    if (caps == null) return;
+                    if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
+                        // Never clear cellularNetwork when our own VPN/local-DPI TUN comes up;
+                        // inspect the underlying physical network instead.
+                        boolean prevCellular = ColgramDpiBypass.isCellularNetwork();
+                        updateTransportCapabilities(manager, null);
+                        android.net.NetworkCapabilities physical = findPhysicalNetworkCapabilities(manager);
+                        boolean physValidated = physical != null
+                                && physical.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                        boolean validatedRecovered = !lastNetworkValidated && physValidated;
+                        lastNetworkValidated = physValidated;
+                        if (ColgramDpiBypass.isCellularNetwork() != prevCellular) {
+                            invalidateNetworkProbeState("cellular transport changed");
+                        } else if (validatedRecovered && initialNetworkSeen) {
+                            invalidateNetworkProbeState("network validated");
+                        }
+                        return;
+                    }
+                    boolean cellular = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)
+                            && !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI);
+                    boolean cellularChanged = (cellular != ColgramDpiBypass.isCellularNetwork());
+                    boolean validated = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                    boolean validatedRecovered = (!lastNetworkValidated && validated);
+                    lastNetworkValidated = validated;
+                    long handle = networkHandleOf(network);
+                    boolean handleChanged = initialNetworkSeen
+                            && lastActiveNetworkHandle != -1L
+                            && handle != lastActiveNetworkHandle;
+                    if (handleChanged) {
+                        lastActiveNetworkHandle = handle;
+                    }
+                    if (cellularChanged) {
+                        ColgramDpiBypass.setCellularNetwork(cellular);
+                        Log.i(TAG, "network transport changed: cellular=" + cellular);
+                        invalidateNetworkProbeState("cellular transport changed");
+                    } else if (handleChanged) {
+                        invalidateNetworkProbeState("network available");
+                    } else if (validatedRecovered && initialNetworkSeen) {
+                        Log.i(TAG, "network became validated");
+                        invalidateNetworkProbeState("network validated");
+                    }
+                }
+
+                @Override
+                public void onLinkPropertiesChanged(Network network, android.net.LinkProperties lp) {
+                    android.net.NetworkCapabilities caps = null;
+                    try { caps = manager.getNetworkCapabilities(network); } catch (Throwable ignored) {}
+                    if (isOwnSystemDpiVpn(caps)
+                            || (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN))) {
+                        return;
+                    }
+                    String newSig = linkSignatureOf(lp);
+                    if (newSig.isEmpty()) return;
+                    String prevSig = lastLinkSignature;
+                    lastLinkSignature = newSig;
+                    if (initialNetworkSeen && !prevSig.isEmpty() && !prevSig.equals(newSig)) {
+                        Log.i(TAG, "network link properties changed: " + prevSig + " -> " + newSig);
+                        invalidateNetworkProbeState("link properties changed");
                     }
                 }
 
@@ -557,6 +665,9 @@ public class ColgramProxyManager {
                     if (lastActiveNetworkHandle != -1L && handle != lastActiveNetworkHandle) {
                         return;
                     }
+                    defaultNetworkLost = true;
+                    lastNetworkValidated = false;
+                    lastLinkSignature = "";
                     lastActiveNetworkHandle = -1L;
                     updateTransportCapabilities(manager, null);
                     ColgramDpiBypass.reapStaleSessions(2_000L, 0L);
@@ -646,9 +757,12 @@ public class ColgramProxyManager {
         deadRelayUntil.clear();
         ColgramDohResolver.resetHealth();
         ColgramDcRemap.invalidateFailedProbes();
-        boolean fullReset = manual
+        final boolean networkSwitched = "network available".equals(reason)
+                || "cellular transport changed".equals(reason)
                 || "overlay transport changed".equals(reason)
-                || "cellular transport changed".equals(reason);
+                || "network validated".equals(reason)
+                || "link properties changed".equals(reason);
+        boolean fullReset = manual || networkSwitched;
         if (fullReset) {
             ColgramDpiBypass.clearConnectionFailureBackoff();
         } else {
@@ -656,27 +770,34 @@ public class ColgramProxyManager {
         }
         directRouteCheckedAt = 0L;
         localRouteUnavailableUntil = 0L;
-        final boolean networkSwitched = "network available".equals(reason) || "cellular transport changed".equals(reason);
-        if (networkSwitched || "overlay transport changed".equals(reason)) {
+        if (networkSwitched) {
             ColgramDpiBypass.closeAllActiveSessions();
         }
         if (manual || networkSwitched) {
             lastCatalogCycleFinishedAtMs = 0L;
         }
         mainHandler.post(() -> {
-            if (networkSwitched && active != null && active.autoSelected && !active.isLocalDpi()
-                    && !ColgramConfig.isAutoProxyEnabled() && !ColgramConfig.isWarpEnabled()
-                    && !isUserProxyDisabled() && currentActiveProxy == active) {
-                currentActiveProxy = null;
-                ensureLocalBaseRoute(appContext);
+            localRouteUnavailableUntil = 0L;
+            if (networkSwitched) {
+                if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
+                    ColgramDpiBypass.startImmediately();
+                }
+                if (active != null && active.autoSelected && !active.isLocalDpi()
+                        && !ColgramConfig.isAutoProxyEnabled() && !ColgramConfig.isWarpEnabled()
+                        && !isUserProxyDisabled() && currentActiveProxy == active) {
+                    currentActiveProxy = null;
+                    ensureLocalBaseRoute(appContext);
+                } else if (currentActiveProxy == null && !ColgramConfig.isWarpEnabled() && !isUserProxyDisabled()) {
+                    ensureLocalBaseRoute(appContext);
+                }
             }
             publishPoolToStock();
-            if (manual || (networkSwitched && !isTelegramConnected())) {
-                if (networkSwitched) {
-                    executor.execute(() -> tgnetForceReconnect(reason));
-                } else {
-                    tgnetCheckConnection();
-                }
+            if (networkSwitched) {
+                // Always kick tgnet on a real network switch even while isTelegramConnected()
+                // still transiently reads true for a half-dead socket on the previous interface.
+                executor.execute(() -> tgnetForceReconnect(reason));
+            } else if (manual) {
+                tgnetCheckConnection();
             }
             if (backgroundProxySelection != null) backgroundProxyTick(backgroundProxySelection);
             else if (manual || (!connected && backgroundRelayOrProxyWorkNeeded(false))) {
@@ -909,12 +1030,12 @@ public class ColgramProxyManager {
             }
             if (state == TG_STATE_UPDATING) {
                 localBaseUnconnectedTicks = 0;
-                int updatingLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 5 : 3;
+                int updatingLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 4 : 2;
                 if (++localBaseUpdatingTicks >= updatingLimit) {
                     localBaseUpdatingTicks = 0;
                     Log.w(TAG, "local base stuck in TG_STATE_UPDATING; reaping stale sessions and resetting tgnet");
                     localRouteUnavailableUntil = 0L;
-                    ColgramDpiBypass.reapStaleSessions(4_000L, 0L);
+                    ColgramDpiBypass.reapStaleSessions(4_000L, 8_000L);
                     ColgramDpiBypass.resetL3WhitelistCache();
                     ColgramDpiBypass.clearTransientCooldowns();
                     if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
@@ -1035,9 +1156,6 @@ public class ColgramProxyManager {
                 // native side only asks for them when a real DC connection fails - which never
                 // happens while the remap's loopback socket opens happily.
                 requestFreshDcAddresses("direct remap exhausted");
-                mainHandler.post(() -> toast("Напрямую ни один адрес Telegram не отвечает."));
-                ColgramBypassNotice.showBlocked(ctx,
-                        "Напрямую ни один адрес Telegram не отвечает. " + ColgramDcRemap.describe());
                 if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
             }
             return;
@@ -1136,7 +1254,10 @@ public class ColgramProxyManager {
     }
 
     private static volatile long lastForceReconnectAtMs = 0L;
-    private static final long FORCE_RECONNECT_COOLDOWN_MS = 4_000L;
+    private static final long FORCE_RECONNECT_COOLDOWN_MS = 1_500L;
+    private static final Object forceReconnectLock = new Object();
+    private static volatile String pendingForceReconnectReason = null;
+    private static java.util.concurrent.ScheduledFuture<?> pendingForceReconnectTask = null;
     private static volatile long lastAutoExitSwitchAtMs = 0L;
     private static final long AUTO_EXIT_IP_SWITCH_COOLDOWN_MS = 60_000L;
 
@@ -1151,18 +1272,82 @@ public class ColgramProxyManager {
         }
     }
 
+    /** Returns {online (0/1), tgNetType (0=mobile, 1=wifi, 2=roaming), slow (0/1)} from ConnectivityManager. */
+    @SuppressWarnings("deprecation")
+    private static int[] queryOnlineNetworkState(Context ctx) {
+        if (ctx == null) return new int[]{1, 0, 0};
+        try {
+            ConnectivityManager cm = (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return new int[]{1, 0, 0};
+            boolean online = false;
+            int netType = 0;
+            if (android.os.Build.VERSION.SDK_INT >= 23) {
+                Network active = cm.getActiveNetwork();
+                android.net.NetworkCapabilities caps = active != null ? cm.getNetworkCapabilities(active) : null;
+                if (caps == null || caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
+                    android.net.NetworkCapabilities physical = findPhysicalNetworkCapabilities(cm);
+                    if (physical != null) caps = physical;
+                }
+                if (caps != null && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                    online = true;
+                    if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+                            || caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                        netType = 1;
+                    }
+                }
+            }
+            android.net.NetworkInfo info = null;
+            try { info = cm.getActiveNetworkInfo(); } catch (Throwable ignored) {}
+            if (!online && info != null && (info.isConnectedOrConnecting() || info.isAvailable())) {
+                online = true;
+            }
+            if (info != null) {
+                if (info.getType() == ConnectivityManager.TYPE_WIFI
+                        || info.getType() == ConnectivityManager.TYPE_ETHERNET) {
+                    netType = 1;
+                } else if (info.isRoaming()) {
+                    netType = 2;
+                }
+            }
+            return new int[]{online ? 1 : 0, netType, 0};
+        } catch (Throwable ignored) {
+            return new int[]{1, 0, 0};
+        }
+    }
+
     /**
      * Forces native tgnet across all activated accounts to drop wedged loopback/proxy sockets
-     * even when Android's networkType did not change across Doze/LTE sleep (4G -> 4G).
+     * even when Android's networkType did not change across Wi-Fi <-> 4G/LTE handoffs or Doze sleep.
      */
     private static void tgnetForceReconnect(String reason) {
         long now = safeClockMs();
-        long prev = lastForceReconnectAtMs;
-        if (prev > 0L && now >= prev && (now - prev) < FORCE_RECONNECT_COOLDOWN_MS) {
-            tgnetCheckConnection();
-            return;
+        synchronized (forceReconnectLock) {
+            long elapsed = (lastForceReconnectAtMs > 0L && now >= lastForceReconnectAtMs)
+                    ? (now - lastForceReconnectAtMs) : Long.MAX_VALUE;
+            if (elapsed < FORCE_RECONNECT_COOLDOWN_MS) {
+                pendingForceReconnectReason = reason != null ? reason : "cooldown retry";
+                if (pendingForceReconnectTask == null
+                        || pendingForceReconnectTask.isDone()
+                        || pendingForceReconnectTask.isCancelled()) {
+                    long delayMs = Math.max(250L, Math.min(1_200L, FORCE_RECONNECT_COOLDOWN_MS - elapsed + 50L));
+                    pendingForceReconnectTask = scheduler.schedule(() -> {
+                        String pending;
+                        synchronized (forceReconnectLock) {
+                            pendingForceReconnectTask = null;
+                            pending = pendingForceReconnectReason;
+                            pendingForceReconnectReason = null;
+                        }
+                        if (pending != null) {
+                            executor.execute(() -> tgnetForceReconnect(pending));
+                        }
+                    }, delayMs, TimeUnit.MILLISECONDS);
+                }
+                tgnetCheckConnection();
+                return;
+            }
+            lastForceReconnectAtMs = now;
+            pendingForceReconnectReason = null;
         }
-        lastForceReconnectAtMs = now;
         try {
             Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
             Class<?> uc = Class.forName("org.telegram.messenger.UserConfig");
@@ -1174,6 +1359,10 @@ public class ColgramProxyManager {
             java.lang.reflect.Method ucGet = uc.getMethod("getInstance", int.class);
             java.lang.reflect.Method isAct = uc.getMethod("isClientActivated");
             int selected = selectedAccountSlot();
+            int[] netState = queryOnlineNetworkState(appContext);
+            boolean online = netState[0] != 0;
+            int netType = netState[1];
+            boolean isSlow = netState[2] != 0;
             int nudged = 0;
             for (int a = 0; a < colgramAccountSlots; a++) {
                 boolean active = (a == selected);
@@ -1188,13 +1377,16 @@ public class ColgramProxyManager {
                 Object inst = cmGet.invoke(null, a);
                 try {
                     setNetAvail.invoke(null, a, false, 1, false);
+                    if (online) {
+                        setNetAvail.invoke(null, a, true, netType, isSlow);
+                    }
                 } finally {
                     checkConn.invoke(inst);
                     try { resumeNet.invoke(inst); } catch (Throwable ignored) {}
                 }
                 nudged++;
             }
-            Log.i(TAG, "TGNET_FORCE_RECONNECT accounts=" + nudged + " reason=" + reason);
+            Log.i(TAG, "TGNET_FORCE_RECONNECT accounts=" + nudged + " online=" + online + " reason=" + reason);
         } catch (Throwable t) {
             Log.w(TAG, "tgnetForceReconnect fallback (" + reason + "): " + t);
             tgnetCheckConnection();
@@ -1219,9 +1411,14 @@ public class ColgramProxyManager {
                 try {
                     Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
                     Object instance = cm.getMethod("getInstance", int.class).invoke(null, account);
+                    int[] netState = queryOnlineNetworkState(context);
+                    java.lang.reflect.Method setNetAvail = cm.getMethod(
+                            "native_setNetworkAvailable", int.class, boolean.class, int.class, boolean.class);
                     try {
-                        cm.getMethod("native_setNetworkAvailable", int.class, boolean.class, int.class, boolean.class)
-                                .invoke(null, account, false, 1, false);
+                        setNetAvail.invoke(null, account, false, 1, false);
+                        if (netState[0] != 0) {
+                            setNetAvail.invoke(null, account, true, netState[1], netState[2] != 0);
+                        }
                     } finally {
                         // Always restore the captured account, even if the user changed routes meanwhile.
                         cm.getMethod("checkConnection").invoke(instance);
@@ -1669,12 +1866,8 @@ public class ColgramProxyManager {
     private static void reportBlockedOnce(Context ctx) {
         if (blockedReported) return;
         blockedReported = true;
-        final String text = describeBlockType()
-                + ". Нажми на щит вверху экрана, чтобы открыть настройки обхода и прокси.";
-        mainHandler.post(() -> toast(text));
-        // The toast is gone in two seconds and the header keeps spinning, so the state also gets a
-        // notification with a button that turns the bypass on.
-        ColgramBypassNotice.showBlocked(ctx, describeBlockType());
+        Log.i(TAG, "direct route status: " + describeBlockType());
+        ColgramBypassNotice.clear(ctx);
     }
 
     private static final long DIRECT_ROUTE_CACHE_MS = 20000L;
@@ -2996,11 +3189,6 @@ public static void reportProxyFailure() {
                     || (!ColgramConfig.isAutoProxyEnabled() && (appContext == null || !isProxyEnabled(appContext)))))) return;
             forceApplyProxy(target);
             if (currentActiveProxy == target) proxySelectionStatus = "Прокси включён: " + target;
-            if (appContext != null) {
-                try {
-                    Toast.makeText(appContext, "Сеть: " + target.toString(), Toast.LENGTH_SHORT).show();
-                } catch (Throwable ignored) {}
-            }
         }));
     }
 
@@ -3011,7 +3199,6 @@ public static void reportProxyFailure() {
                     || isFreshProtocolVerified(failed)) return;
             disableProxy(appContext);
             proxySelectionStatus = "Прокси недоступен; соединение через него выключено";
-            toast(proxySelectionStatus);
             notifyProxySettingsChanged();
         }));
     }
@@ -5548,7 +5735,6 @@ public static void reportProxyFailure() {
             proxySelection = null;
             scheduleBackgroundProxyCheck(BACKGROUND_PROXY_BUSY_RETRY_MS);
             notifyProxySettingsChanged();
-            toast(proxySelectionStatus);
             startFastNativeChecks();
             if (selection.requested == null && ColgramConfig.isBuiltinProxyEnabled()) sweepFast(null);
         });
@@ -5617,7 +5803,6 @@ public static void reportProxyFailure() {
                 ColgramDcRemap.stop();
             }
             disableProxy(ctx);
-            toast("Прокси: выключен");
             return;
         }
         SharedPreferences prefs = ctx.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
@@ -5787,18 +5972,6 @@ public static void reportProxyFailure() {
                 requestFreshDcAddresses("local base recheck");
                 tgnetCheckConnection();
             }
-        });
-    }
-
-    private static void toast(final CharSequence text) {
-        // Toast needs a Looper; callers come from the pool checker's worker thread as well as
-        // from the UI, so the hop belongs here rather than at every call site.
-        mainHandler.post(() -> {
-            Context ctx = appContext;
-            if (ctx == null) return;
-            try {
-                Toast.makeText(ctx, text, Toast.LENGTH_LONG).show();
-            } catch (Throwable ignored) {}
         });
     }
 

@@ -147,6 +147,45 @@ public class ColgramDpiBypass {
     private static volatile ColgramProxyChain.Relay pinnedTelegramL3Relay = null;
     private static final java.util.concurrent.CopyOnWriteArrayList<ActiveSession> ACTIVE_SESSIONS =
             new java.util.concurrent.CopyOnWriteArrayList<>();
+    private static final java.util.Set<Socket> ACTIVE_DIAL_SOCKETS =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    private static final java.util.concurrent.atomic.AtomicLong networkEpoch =
+            new java.util.concurrent.atomic.AtomicLong(0L);
+
+    static long currentNetworkEpoch() {
+        return networkEpoch.get();
+    }
+
+    static long bumpNetworkEpoch() {
+        return networkEpoch.incrementAndGet();
+    }
+
+    static void trackDialSocket(Socket socket) {
+        if (socket != null) {
+            ACTIVE_DIAL_SOCKETS.add(socket);
+        }
+    }
+
+    static void untrackDialSocket(Socket socket) {
+        if (socket != null) {
+            ACTIVE_DIAL_SOCKETS.remove(socket);
+        }
+    }
+
+    /** Track a dialing socket so closeAllActiveSessions() aborts hung old-network dials immediately. */
+    static void connectTracked(Socket socket, java.net.SocketAddress endpoint, int timeoutMs) throws java.io.IOException {
+        if (socket == null) throw new java.io.IOException("null socket");
+        trackDialSocket(socket);
+        try {
+            socket.connect(endpoint, timeoutMs);
+        } finally {
+            untrackDialSocket(socket);
+        }
+    }
+
+    static int activeDialSocketCountForTest() {
+        return ACTIVE_DIAL_SOCKETS.size();
+    }
 
     static final class ActiveSession {
         final Socket client;
@@ -264,9 +303,16 @@ public class ColgramDpiBypass {
     }
 
     public static int closeAllActiveSessions() {
+        networkEpoch.incrementAndGet();
         int closed = 0;
         for (ActiveSession s : ACTIVE_SESSIONS) {
             if (s != null && s.closeNow()) {
+                closed++;
+            }
+        }
+        for (Socket dial : new java.util.ArrayList<>(ACTIVE_DIAL_SOCKETS)) {
+            if (dial != null && ACTIVE_DIAL_SOCKETS.remove(dial)) {
+                closeQuietly(dial);
                 closed++;
             }
         }
@@ -577,7 +623,7 @@ public class ColgramDpiBypass {
                     }
                     sock = new Socket(java.net.Proxy.NO_PROXY);
                     if (sysVpn != null && !sysVpn.protect(sock)) return;
-                    sock.connect(new InetSocketAddress(addr, port), timeoutMs);
+                    connectTracked(sock, new InetSocketAddress(addr, port), timeoutMs);
                     if (anyOk.compareAndSet(false, true)) {
                         latch.countDown();
                     }
@@ -1110,7 +1156,7 @@ public class ColgramDpiBypass {
             try {
                 tuneSocketBuffers(socket);
                 if (!owner.protect(socket)) throw new java.io.IOException("Socket protection failed");
-                socket.connect(new InetSocketAddress(host, port), budgetMs);
+                connectTracked(socket, new InetSocketAddress(host, port), budgetMs);
                 return socket;
             } catch (Exception failure) {
                 sockets.remove(socket);
@@ -1196,7 +1242,7 @@ public class ColgramDpiBypass {
             try {
                 tuneSocketBuffers(socket);
                 if (!owner.protect(socket)) throw new java.io.IOException("Socket protection failed");
-                socket.connect(new InetSocketAddress(ipLiteral, port), budgetMs);
+                connectTracked(socket, new InetSocketAddress(ipLiteral, port), budgetMs);
                 return socket;
             } catch (Exception failure) {
                 sockets.remove(socket);
@@ -1389,6 +1435,8 @@ public class ColgramDpiBypass {
             boolean l3Eligible = !overlayActive && isEligibleForL3RelayCascade(destHost, destPort);
             ColgramTelegramWsBridge.WsSession wsSession = null;
 
+            final long startEpoch = currentNetworkEpoch();
+
             // When strict L3-whitelist blocking is already detected on this mobile tower, immediately
             // race Layer-2 L3-relay cascade (segmented SOCKS5/HTTP CONNECT + WSS-over-SOCKS5 failover)
             // alongside a 900ms direct SYN recovery probe so Telegram connects in <2s AND auto-recovers
@@ -1431,7 +1479,7 @@ public class ColgramDpiBypass {
                 wsSession = (sysVpn != null)
                         ? ColgramTelegramWsBridge.dialProtected(destHost, destPort, sysVpn::protect, sysVpn::protect, isMedia)
                         : ColgramTelegramWsBridge.dial(destHost, destPort, isMedia);
-                if (wsSession != null) {
+                if (wsSession != null && startEpoch == currentNetworkEpoch()) {
                     onDirectLayer1Success();
                     int wsBucket = dcBucketForSignedDc(wsSession.rawDcId != 0 ? wsSession.rawDcId : wsSession.dcId);
                     if (wsBucket == 0) wsBucket = dcBucket;
@@ -1532,7 +1580,7 @@ public class ColgramDpiBypass {
                         try {
                             Socket chained = new Socket();
                             tuneSocketBuffers(chained);
-                            chained.connect(new InetSocketAddress("127.0.0.1", chainPort), 3000);
+                            connectTracked(chained, new InetSocketAddress("127.0.0.1", chainPort), 3000);
                             targetSocket = chained;
                             Log.i(TAG, "direct dial refused; routed " + destHost + ":" + destPort
                                     + " through relay front 127.0.0.1:" + chainPort);
@@ -1593,7 +1641,7 @@ public class ColgramDpiBypass {
             } else {
                 pipeWithAdvancedDesync(client, targetSocket, call, generation,
                         (call == null || call.systemWide) && ColgramTelegramDcAddresses.isKnownAddress(destHost),
-                        destHost, destPort, isMedia);
+                        destHost, destPort, isMedia, startEpoch);
             }
             handedOff = true;
 
@@ -1643,6 +1691,7 @@ public class ColgramDpiBypass {
             return null;
         }
         long ticket = decision.ticket();
+        final long startEpoch = currentNetworkEpoch();
         InetSocketAddress primary = resolveBypassEndpoint(host, port);
         if (primary == null) {
             connectFailures.release(endpoint, ticket);
@@ -1665,6 +1714,11 @@ public class ColgramDpiBypass {
             socket = establishConnection(host, port, primary);
         } finally {
             DIAL_GROUPS.release();
+        }
+        if (startEpoch != currentNetworkEpoch()) {
+            closeQuietly(socket);
+            connectFailures.release(endpoint, ticket);
+            return null;
         }
         if (telegram) {
             publishUpstream(generation, socket == null ? UPSTREAM_NO_SOCKET : UPSTREAM_SOCKET);
@@ -1698,6 +1752,7 @@ public class ColgramDpiBypass {
 
     /** Drop stale dial failures as soon as Android reports a network or tunnel transition. */
     public static void clearConnectionFailureBackoff() {
+        networkEpoch.incrementAndGet();
         connectFailures.clear();
         silentEndpoints.clear();
         silentEndpointCounts.clear();
@@ -1706,6 +1761,7 @@ public class ColgramDpiBypass {
             dcBackoffUntil.set(i, 0L);
         }
         l3RelayPenaltyUntil.clear();
+        l3RawMtprotoSilentStreak.set(0);
         lastTunCheckAt = 0L;
         onDirectLayer1Success();
         l3WhitelistCheckedAt = 0L;
@@ -1893,7 +1949,7 @@ public class ColgramDpiBypass {
                 closeQuietly(s);
                 return null;
             }
-            s.connect(new InetSocketAddress(ipLiteral, port), timeoutMs);
+            connectTracked(s, new InetSocketAddress(ipLiteral, port), timeoutMs);
             return s;
         } catch (Throwable ignored) {
             closeQuietly(s);
@@ -2170,16 +2226,21 @@ public class ColgramDpiBypass {
                 closeQuietly(sock);
                 return null;
             }
-            sock.connect(new InetSocketAddress(relayAddr, relay.port), perRelayTimeoutMs);
-            sock.setSoTimeout(perRelayTimeoutMs);
-            boolean ok = relay.socks
-                    ? performSocks5Connect(sock.getOutputStream(), sock.getInputStream(),
-                            targetHost, targetPort, relay.username, relay.password)
-                    : performHttpConnect(sock.getOutputStream(), sock.getInputStream(),
-                            targetHost, targetPort, relay.username, relay.password);
-            if (!ok) {
-                closeQuietly(sock);
-                return null;
+            trackDialSocket(sock);
+            try {
+                sock.connect(new InetSocketAddress(relayAddr, relay.port), perRelayTimeoutMs);
+                sock.setSoTimeout(perRelayTimeoutMs);
+                boolean ok = relay.socks
+                        ? performSocks5Connect(sock.getOutputStream(), sock.getInputStream(),
+                                targetHost, targetPort, relay.username, relay.password)
+                        : performHttpConnect(sock.getOutputStream(), sock.getInputStream(),
+                                targetHost, targetPort, relay.username, relay.password);
+                if (!ok) {
+                    closeQuietly(sock);
+                    return null;
+                }
+            } finally {
+                untrackDialSocket(sock);
             }
             sock.setSoTimeout(0);
             return sock;
@@ -2560,7 +2621,7 @@ public class ColgramDpiBypass {
                         probe.setTcpNoDelay(true);
                         tuneSocketBuffers(probe);
                         if (protector == null || protector.protect(probe)) {
-                            probe.connect(new InetSocketAddress(edgeIp, 443), L3_DIRECT_RECOVERY_PROBE_MS);
+                            connectTracked(probe, new InetSocketAddress(edgeIp, 443), L3_DIRECT_RECOVERY_PROBE_MS);
                             if (wsCapableDest) {
                                 ColgramTelegramWsBridge.WsSession wsSess =
                                         ColgramTelegramWsBridge.dialWithConnectedSocket(probe, destHost, isMedia);
@@ -2606,7 +2667,7 @@ public class ColgramDpiBypass {
                         s.setTcpNoDelay(true);
                         tuneSocketBuffers(s);
                         if (protector == null || protector.protect(s)) {
-                            s.connect(new InetSocketAddress(addr, destPort), L3_DIRECT_RECOVERY_PROBE_MS);
+                            connectTracked(s, new InetSocketAddress(addr, destPort), L3_DIRECT_RECOVERY_PROBE_MS);
                             directSock = s;
                             if (isTelegramDcIp(destHost)) onDirectLayer1Success();
                             synchronized (gate) {
@@ -2705,6 +2766,7 @@ public class ColgramDpiBypass {
                                        final CallListener call, final long generation,
                                        final byte[] initialPayload, final int initialLen,
                                        final boolean telegramTarget) {
+        final long startEpoch = currentNetworkEpoch();
         tuneSocketBuffers(client);
         tuneSocketBuffers(relayDest);
         try { client.setSoTimeout(0); } catch (Throwable ignored) {}
@@ -2785,7 +2847,7 @@ public class ColgramDpiBypass {
             } catch (Throwable ignored) {
             } finally {
                 unregisterActiveSession(tracked);
-                if (telegramTarget && !firstReplySeen.get()) {
+                if (telegramTarget && !firstReplySeen.get() && startEpoch == currentNetworkEpoch()) {
                     l3RawMtprotoSilentStreak.incrementAndGet();
                     penalizeL3Relay(relayLabel);
                 }
@@ -3109,10 +3171,18 @@ public class ColgramDpiBypass {
     }
 
     static void reportHostStrategyResult(String hostKey, int strategy, boolean carried) {
-        reportHostStrategyResult(hostKey, strategy, carried, false);
+        reportHostStrategyResult(hostKey, strategy, carried, false, -1L);
     }
 
     static void reportHostStrategyResult(String hostKey, int strategy, boolean carried, boolean promoteGlobal) {
+        reportHostStrategyResult(hostKey, strategy, carried, promoteGlobal, -1L);
+    }
+
+    static void reportHostStrategyResult(String hostKey, int strategy, boolean carried,
+                                         boolean promoteGlobal, long expectedEpoch) {
+        if (expectedEpoch >= 0L && expectedEpoch != networkEpoch.get()) {
+            return;
+        }
         boolean cell = cellularNetwork;
         if (carried && mssClampForStrategy(strategy) == 0
                 && (promoteGlobal || (cell && strategy != STRATEGY_SPLIT_1))) {
@@ -3145,7 +3215,7 @@ public class ColgramDpiBypass {
                     state.strategy = next;
                     state.consecutiveFails = 0;
                     state.confirmed = false;
-                    Log.i(TAG, "host=" + scoped + " strategy " + strategy + " failed -> next=" + next);
+                    safeLogI("host=" + scoped + " strategy " + strategy + " failed -> next=" + next);
                 }
             }
         }
@@ -3265,13 +3335,39 @@ public class ColgramDpiBypass {
      * from the target is what separates "connected" from "screamed into the void".
      */
     private static synchronized void reportStrategyResult(int strategy, boolean carried, int dcBucket) {
+        reportStrategyResult(strategy, carried, dcBucket, -1L);
+    }
+
+    private static synchronized void reportStrategyResult(int strategy, boolean carried,
+                                                          int dcBucket, long expectedEpoch) {
         reportStrategyResultInternal(strategy, carried, dcBucket,
-                activeLadderFor(cellularNetwork, ColgramNativeDesync.isAvailable()));
+                activeLadderFor(cellularNetwork, ColgramNativeDesync.isAvailable()), expectedEpoch);
     }
 
     static synchronized void reportStrategyResultWithLadderForTest(int strategy, boolean carried,
                                                                    int dcBucket, int[] ladder) {
-        reportStrategyResultInternal(strategy, carried, dcBucket, ladder);
+        reportStrategyResultInternal(strategy, carried, dcBucket, ladder, -1L);
+    }
+
+    static synchronized void reportStrategyResultForEpochForTest(int strategy, boolean carried,
+                                                                 int dcBucket, int[] ladder, long expectedEpoch) {
+        reportStrategyResultInternal(strategy, carried, dcBucket, ladder, expectedEpoch);
+    }
+
+    static synchronized int strategyFailCountForTest(int strategy) {
+        return (strategy >= 0 && strategy < STRATEGY_COUNT) ? strategyFails[strategy] : -1;
+    }
+
+    static int hostStrategyCountForTest() {
+        return hostStrategies.size();
+    }
+
+    static int l3RawMtprotoSilentStreakForTest() {
+        return l3RawMtprotoSilentStreak.get();
+    }
+
+    static void setL3RawMtprotoSilentStreakForTest(int streak) {
+        l3RawMtprotoSilentStreak.set(Math.max(0, streak));
     }
 
     static synchronized void resetStrategyStateForTest(boolean cellular, int initialStrategy) {
@@ -3310,7 +3406,9 @@ public class ColgramDpiBypass {
     }
 
     private static synchronized void reportStrategyResultInternal(int strategy, boolean carried,
-                                                                  int dcBucket, int[] ladder) {
+                                                                  int dcBucket, int[] ladder,
+                                                                  long expectedEpoch) {
+        if (expectedEpoch >= 0L && expectedEpoch != networkEpoch.get()) return;
         if (strategy < 0 || strategy >= STRATEGY_COUNT || ladder == null || ladder.length == 0) return;
         int bucket = (dcBucket >= 0 && dcBucket < MAX_DC_BUCKETS) ? dcBucket : 0;
         if (carried) {
@@ -4260,7 +4358,7 @@ public class ColgramDpiBypass {
     private static void pipeWithAdvancedDesync(final Socket client, final Socket dest, final CallListener call,
                                                final long generation, final boolean telegram,
                                                final String destHost, final int destPort,
-                                               final boolean isMedia) {
+                                               final boolean isMedia, final long startEpoch) {
         // CRITICAL: when call != null, CallListener explicitly called VpnService.protect(dest),
         // bypassing our own TUN straight onto the raw carrier/ISP network where TSPU sits.
         // overlayActive MUST be false whenever call != null, otherwise whole-device local DPI
@@ -4291,11 +4389,11 @@ public class ColgramDpiBypass {
 
             if (!overlayActive && firstPayload.length > 1 && (looksTls || looksHttp)) {
                 runReplayableTlsOrHttpSession(client, dest, call, generation, destHost, destPort,
-                        firstPayload, looksTls, sniHost, hostKey);
+                        firstPayload, looksTls, sniHost, hostKey, startEpoch);
                 return;
             }
             pipeStandardOrWsSession(client, dest, call, generation, telegram, destHost, destPort,
-                    overlayActive, firstPayload, looksTls, hostKey, isMedia);
+                    overlayActive, firstPayload, looksTls, hostKey, isMedia, startEpoch);
         })) {
             closeQuietly(dest);
             closeQuietly(client);
@@ -4428,7 +4526,8 @@ public class ColgramDpiBypass {
                                                       final CallListener call, final long generation,
                                                       final String destHost, final int destPort,
                                                       final byte[] firstPayload, final boolean looksTls,
-                                                      final String sniHost, final String hostKey) {
+                                                      final String sniHost, final String hostKey,
+                                                      final long startEpoch) {
         final String resolvedIp = (initialDest instanceof ColgramNativeDesync.NativeSocket)
                 ? ((ColgramNativeDesync.NativeSocket) initialDest).getRemoteIp()
                 : (initialDest.getInetAddress() != null ? initialDest.getInetAddress().getHostAddress() : destHost);
@@ -4455,7 +4554,7 @@ public class ColgramDpiBypass {
 
         if (outcome.winningUpstream == null) {
             for (int i = 0; i < Math.min(outcome.attempts, plan.length); i++) {
-                reportHostStrategyResult(hostKey, plan[i], false, false);
+                reportHostStrategyResult(hostKey, plan[i], false, false, startEpoch);
             }
             if (looksTls && isEligibleForL3RelayCascade(destHost, destPort)) {
                 android.net.VpnService protVpn = (call != null) ? call.vpn : activeSystemDpiVpn;
@@ -4480,14 +4579,14 @@ public class ColgramDpiBypass {
         }
 
         final Socket winner = outcome.winningUpstream;
-        if (isTelegramDcIp(destHost)) {
+        if (isTelegramDcIp(destHost) && startEpoch == currentNetworkEpoch()) {
             onDirectLayer1Success();
         }
-        reportHostStrategyResult(hostKey, outcome.winningStrategy, true, outcome.attempts > 1);
+        reportHostStrategyResult(hostKey, outcome.winningStrategy, true, outcome.attempts > 1, startEpoch);
         if (call == null && isCurrentListener(generation)) {
             toTargetBytes.addAndGet(firstPayload.length);
             fromTargetBytes.addAndGet(outcome.firstReplyLen);
-            reportStrategyResult(outcome.winningStrategy, true, dcBucketFor(destHost));
+            reportStrategyResult(outcome.winningStrategy, true, dcBucketFor(destHost), startEpoch);
         }
         if (outcome.attempts > 1 || (call != null && call.systemWide)) {
             Log.i(TAG, "DESYNC_OK host=" + hostKey + " strat=" + outcome.winningStrategy
@@ -4518,7 +4617,7 @@ public class ColgramDpiBypass {
                                                 final String destHost, final int destPort,
                                                 final boolean overlayActive, final byte[] firstPayload,
                                                 final boolean looksTls, final String hostKey,
-                                                final boolean isMedia) {
+                                                final boolean isMedia, final long startEpoch) {
         tuneSocketBuffers(client);
         tuneSocketBuffers(dest);
         final boolean wsCapable = isWsCapableForSession(call != null, call != null && call.systemWide, "149.154.167.220".equals(destHost))
@@ -4803,17 +4902,17 @@ public class ColgramDpiBypass {
             } else if (call == null) {
                 if (telegram) publishUpstream(generation, UPSTREAM_SILENT);
                 Log.w(TAG, "upstream stayed silent (EOF) on " + dest.getRemoteSocketAddress());
-                recordSilentEndpoint(dest, telegram, overlayActive, wsCapable);
+                recordSilentEndpoint(dest, telegram, overlayActive, wsCapable, startEpoch);
             }
         } catch (SocketTimeoutException silent) {
             if (telegram && call == null) publishUpstream(generation, UPSTREAM_SILENT);
             Log.w(TAG, "upstream stayed silent on " + dest.getRemoteSocketAddress()
                     + " host=" + hostKey + " strat=" + chosenStrategyVal);
-            if (call == null) recordSilentEndpoint(dest, telegram, overlayActive, wsCapable);
+            if (call == null) recordSilentEndpoint(dest, telegram, overlayActive, wsCapable, startEpoch);
         } catch (Throwable failed) {
             if (call == null && fromTarget.get() == 0L) {
                 if (telegram) publishUpstream(generation, UPSTREAM_SILENT);
-                recordSilentEndpoint(dest, telegram, overlayActive, wsCapable);
+                recordSilentEndpoint(dest, telegram, overlayActive, wsCapable, startEpoch);
             }
         } finally {
             t2cDone.set(true);
@@ -4855,11 +4954,13 @@ public class ColgramDpiBypass {
                                 ws == null ? null : ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
                                         replayBytes, replayBytes.length, hdrDc);
                         if (ws != null && splitter != null && !clientSideClosed.get()) {
-                            int wsBucket = dcBucketForSignedDc(ws.rawDcId != 0 ? ws.rawDcId : ws.dcId);
-                            if (wsBucket == 0) wsBucket = dcBucketFor(destHost);
-                            dcWsPreferred.set(wsBucket, 1);
-                            dcBackoffUntil.set(wsBucket, 0L);
-                            onDirectLayer1Success();
+                            if (startEpoch == currentNetworkEpoch()) {
+                                int wsBucket = dcBucketForSignedDc(ws.rawDcId != 0 ? ws.rawDcId : ws.dcId);
+                                if (wsBucket == 0) wsBucket = dcBucketFor(destHost);
+                                dcWsPreferred.set(wsBucket, 1);
+                                dcBackoffUntil.set(wsBucket, 0L);
+                                onDirectLayer1Success();
+                            }
                             wsSplitterRef.set(splitter);
                             splitter.feedInitAndTailToSession(replayBytes, replayBytes.length, ws);
                             if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(replayBytes.length);
@@ -4951,11 +5052,11 @@ public class ColgramDpiBypass {
             if (call == null && isCurrentListener(generation)) completedRelays.incrementAndGet();
             boolean rawCarried = firstReplySeen.get();
             boolean carried = fromTarget.get() > 0L;
-            if (call == null && isCurrentListener(generation)) {
+            if (call == null && isCurrentListener(generation) && startEpoch == currentNetworkEpoch()) {
                 int bucket = dcBucketFor(destHost);
                 if (!overlayActive && !l3Carried) {
-                    reportHostStrategyResult(hostKey, chosenStrategyVal, rawCarried, false);
-                    reportStrategyResult(chosenStrategyVal, rawCarried, bucket);
+                    reportHostStrategyResult(hostKey, chosenStrategyVal, rawCarried, false, startEpoch);
+                    reportStrategyResult(chosenStrategyVal, rawCarried, bucket, startEpoch);
                 }
                 if (carried && !rawCarried && !l3Carried) {
                     // WSS handoff succeeded even though raw MTProto stayed silent
@@ -4968,7 +5069,9 @@ public class ColgramDpiBypass {
         }
     }
 
-    private static void recordSilentEndpoint(Socket dest, boolean telegram, boolean overlayActive, boolean wsCapable) {
+    private static void recordSilentEndpoint(Socket dest, boolean telegram, boolean overlayActive,
+                                             boolean wsCapable, long expectedEpoch) {
+        if (expectedEpoch >= 0L && expectedEpoch != networkEpoch.get()) return;
         if (dest == null || dest.getInetAddress() == null) return;
         String host = dest.getInetAddress().getHostAddress();
         int port = dest.getPort();

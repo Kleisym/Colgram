@@ -13983,6 +13983,133 @@ def inject_performance_patches(repo_path):
         _patch_file_eol(full_path, target, replacement, label)
 
 
+_NETWORK_SWITCH_PATCH_SPECS = [
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java networkCallback handoff fix',
+        (
+            '                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {\n'
+            '                    if (networkCallback == null) {\n'
+            '                        networkCallback = new ConnectivityManager.NetworkCallback() {\n'
+            '                            @Override\n'
+            '                            public void onAvailable(@NonNull Network network) {\n'
+            '                                lastKnownNetworkType = -1;\n'
+            '                            }\n'
+            '\n'
+            '                            @Override\n'
+            '                            public void onCapabilitiesChanged(@NonNull Network network, @NonNull NetworkCapabilities networkCapabilities) {\n'
+            '                                lastKnownNetworkType = -1;\n'
+            '                            }\n'
+            '                        };\n'
+            '                        connectivityManager.registerDefaultNetworkCallback(networkCallback);\n'
+            '                    }\n'
+            '                }\n'
+            '            } catch (Throwable ignore) {\n'
+            '\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+        ),
+        (
+            '                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {\n'
+            '                    if (networkCallback == null) {\n'
+            '                        networkCallback = new ConnectivityManager.NetworkCallback() {\n'
+            '                            @Override\n'
+            '                            public void onAvailable(@NonNull Network network) {\n'
+            '                                refreshNetworkAndNotify();\n'
+            '                            }\n'
+            '\n'
+            '                            @Override\n'
+            '                            public void onLost(@NonNull Network network) {\n'
+            '                                refreshNetworkAndNotify();\n'
+            '                            }\n'
+            '\n'
+            '                            @Override\n'
+            '                            public void onCapabilitiesChanged(@NonNull Network network, @NonNull NetworkCapabilities networkCapabilities) {\n'
+            '                                refreshNetworkAndNotify();\n'
+            '                            }\n'
+            '                        };\n'
+            '                        connectivityManager.registerDefaultNetworkCallback(networkCallback);\n'
+            '                    }\n'
+            '                }\n'
+            '            } catch (Throwable ignore) {\n'
+            '\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    private static void refreshNetworkAndNotify() {\n'
+            '        lastKnownNetworkType = -1;\n'
+            '        lastNetworkCheckTypeTime = 0;\n'
+            '        try {\n'
+            '            if (connectivityManager != null) {\n'
+            '                currentNetworkInfo = connectivityManager.getActiveNetworkInfo();\n'
+            '            }\n'
+            '        } catch (Throwable ignore) {\n'
+            '        }\n'
+            '        if (!applicationInited) {\n'
+            '            return;\n'
+            '        }\n'
+            '        boolean isSlow = isConnectionSlow();\n'
+            '        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {\n'
+            '            try {\n'
+            '                if (a == UserConfig.selectedAccount || UserConfig.getInstance(a).isClientActivated()) {\n'
+            '                    ConnectionsManager.getInstance(a).checkConnection();\n'
+            '                    FileLoader.getInstance(a).onNetworkChanged(isSlow);\n'
+            '                }\n'
+            '            } catch (Throwable ignore) {\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java isNetworkOnlineRealtime NetworkCapabilities fix',
+        (
+            '    public static boolean isNetworkOnlineRealtime() {\n'
+            '        try {\n'
+            '            ConnectivityManager connectivityManager = (ConnectivityManager) ApplicationLoader.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE);\n'
+            '            NetworkInfo netInfo = connectivityManager.getActiveNetworkInfo();\n'
+        ),
+        (
+            '    public static boolean isNetworkOnlineRealtime() {\n'
+            '        try {\n'
+            '            ConnectivityManager connectivityManager = (ConnectivityManager) ApplicationLoader.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE);\n'
+            '            if (connectivityManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {\n'
+            '                Network activeNet = connectivityManager.getActiveNetwork();\n'
+            '                if (activeNet != null) {\n'
+            '                    NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(activeNet);\n'
+            '                    if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {\n'
+            '                        return true;\n'
+            '                    }\n'
+            '                }\n'
+            '                Network[] allNets = connectivityManager.getAllNetworks();\n'
+            '                if (allNets != null) {\n'
+            '                    for (Network net : allNets) {\n'
+            '                        if (net == null) continue;\n'
+            '                        NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(net);\n'
+            '                        if (caps != null\n'
+            '                                && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)\n'
+            '                                && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {\n'
+            '                            return true;\n'
+            '                        }\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '            NetworkInfo netInfo = connectivityManager.getActiveNetworkInfo();\n'
+        ),
+    ),
+]
+
+
+def inject_network_switch_patches(repo_path):
+    """Apply and converge modern NetworkCallback & online detection hunks in ApplicationLoader."""
+    for rel_path, label, target, replacement in _NETWORK_SWITCH_PATCH_SPECS:
+        full_path = os.path.join(repo_path, *rel_path.split("/"))
+        _patch_file_eol(full_path, target, replacement, label)
+
+
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     core_dir = os.path.join(root_dir, "colgram-core")
@@ -14021,6 +14148,9 @@ def main():
     inject_zero_perm_pip_patches(target_repo)
     inject_reliability_and_backup_patches(target_repo)
     inject_performance_patches(target_repo)
+    inject_network_switch_patches(target_repo)
+    from theme_repairs import patch_video_wallpaper_fixes
+    patch_video_wallpaper_fixes(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

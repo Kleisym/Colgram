@@ -1372,7 +1372,7 @@ public final class ColgramDohResolver {
                     try { raw.close(); } catch (Throwable ignored) {}
                     throw new java.io.IOException("System DPI socket protection failed");
                 }
-                raw.connect(new java.net.InetSocketAddress(targetIp, port), timeoutMs);
+                ColgramDpiBypass.connectTracked(raw, new java.net.InetSocketAddress(targetIp, port), timeoutMs);
                 return raw;
             }
 
@@ -1725,7 +1725,7 @@ public final class ColgramDohResolver {
                     throw new TcpConnectException("DoH/DoT socket protection failed for " + endpoint.key());
                 }
                 try {
-                    raw.connect(new java.net.InetSocketAddress(endpoint.ip, endpoint.port), connectTimeout);
+                    ColgramDpiBypass.connectTracked(raw, new java.net.InetSocketAddress(endpoint.ip, endpoint.port), connectTimeout);
                 } catch (Throwable connectErr) {
                     throw new TcpConnectException("TCP connect failed to " + endpoint.key(), connectErr);
                 }
