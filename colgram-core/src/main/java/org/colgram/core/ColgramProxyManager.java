@@ -442,6 +442,8 @@ public class ColgramProxyManager {
         appContext = context.getApplicationContext();
         ColgramDpiBypass.setAppContext(appContext);
         ColgramTelegramDcAddresses.init(appContext);
+        ColgramDohResolver.prefetchCriticalHosts();
+        ColgramTelegramWsBridge.warmUp();
         // Handed to the MASQUE client so its availability probe can answer from the package without
         // loading the library into this process - see ColgramMasqueNative.isAvailableForProbe().
         ColgramMasqueNative.setProbeContext(appContext);
@@ -453,7 +455,10 @@ public class ColgramProxyManager {
             startupSavedProxy = findSavedProxy(startupPrefs);
         executor.execute(() -> {
             ColgramDpiBypass.startImmediately();
-            mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+            if (ColgramDpiBypass.awaitReady(500L)) {
+                if (mainHandler != null) mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+                else ensureLocalBaseRoute(appContext);
+            }
         });
         ensureLocalWatchSchedulerRunning();
 
@@ -467,7 +472,7 @@ public class ColgramProxyManager {
         final long startupEpoch = ColgramRouteEpoch.snapshot();
         STARTUP_DEFERRED.execute(() -> {
             try {
-                Thread.sleep(PROXY_START_DELAY_MS);
+                Thread.sleep(STARTUP_ACTIVATION_DELAY_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
@@ -772,6 +777,7 @@ public class ColgramProxyManager {
         localRouteUnavailableUntil = 0L;
         if (networkSwitched) {
             ColgramDpiBypass.closeAllActiveSessions();
+            ColgramDohResolver.prefetchCriticalHosts();
         }
         if (manual || networkSwitched) {
             lastCatalogCycleFinishedAtMs = 0L;
@@ -814,6 +820,8 @@ public class ColgramProxyManager {
     });
     /** Delay before any proxy-side socket work begins. */
     private static final long PROXY_START_DELAY_MS = 10_000L;
+    /** Fast settle window before checking persisted built-in proxy config on startup. */
+    private static final long STARTUP_ACTIVATION_DELAY_MS = 150L;
 
     private static void activateBuiltinProxyNow(long startupEpoch) {
         mainHandler.post(() -> ColgramRouteEpoch.runIfCurrent(startupEpoch, () -> {

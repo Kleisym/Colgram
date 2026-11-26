@@ -105,7 +105,10 @@ public final class ColgramTelegramWsBridge {
             "gosuslugi.ru",
             "ya.ru",
             "ozon.ru",
-            "sberbank.ru"
+            "sberbank.ru",
+            "yandex.ru",
+            "dzen.ru",
+            "mail.ru"
     };
     private static final String[] VERIFIED_WSS_IPS_DC1_DC3 = {
             "149.154.174.100",
@@ -147,7 +150,9 @@ public final class ColgramTelegramWsBridge {
     public static void setCellularNetwork(boolean cellular) {
         if (cellularNetwork != cellular) {
             cellularNetwork = cellular;
-            preferredFragMode = defaultFragModeForNetwork(cellular);
+            preferredFragMode = cellular ? cellularPreferredFragMode : wifiPreferredFragMode;
+            spoofSniCursor.set(cellular ? cellularSniCursor : wifiSniCursor);
+            PREWARMED_POOL.clearAll();
         }
     }
 
@@ -286,10 +291,29 @@ public final class ColgramTelegramWsBridge {
     private static final int DIAL_SLOTS_PER_BUCKET = 12;
     private static final long DIAL_SLOT_ACQUIRE_WAIT_MS = 2200L;
     private static final SecureRandom SHARED_MASK_SEEDER = new SecureRandom();
+    static final int PREWARM_MAX_PER_BUCKET = 2;
+    static final long PREWARM_TTL_MS = 18_000L;
+    private static final int[] PREWARM_TARGET_DCS = {2, 4, -2, -4};
+    private static final ExecutorService PREWARM_POOL = new java.util.concurrent.ThreadPoolExecutor(
+            0, 8, 20L, TimeUnit.SECONDS,
+            new java.util.concurrent.SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "colgram-ws-prewarm");
+                t.setDaemon(true);
+                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws prewarm err: " + ex));
+                return t;
+            });
+
+    private static final PrewarmedWsPool PREWARMED_POOL = new PrewarmedWsPool();
+    private static volatile boolean prewarmEnabled = true;
 
     private static final java.util.concurrent.atomic.AtomicReferenceArray<EdgeEndpoint> lastWorkingByDc =
             new java.util.concurrent.atomic.AtomicReferenceArray<>(DC_BUCKET_COUNT);
+    private static volatile int wifiPreferredFragMode = defaultFragModeForNetwork(false);
+    private static volatile int cellularPreferredFragMode = defaultFragModeForNetwork(true);
     private static volatile int preferredFragMode = defaultFragModeForNetwork(false);
+    private static volatile int wifiSniCursor = 0;
+    private static volatile int cellularSniCursor = 0;
     private static volatile boolean workedOnNetwork = false;
     private static volatile long resolvedAt = 0L;
     private static final AtomicBoolean refreshInFlight = new AtomicBoolean(false);
@@ -481,6 +505,10 @@ public final class ColgramTelegramWsBridge {
             if (flush) out.flush();
         }
 
+        public boolean isClosed() {
+            return closed.get();
+        }
+
         @Override
         public void close() {
             if (!closed.compareAndSet(false, true)) return;
@@ -489,6 +517,174 @@ public final class ColgramTelegramWsBridge {
             } catch (Throwable ignored) {
             }
         }
+    }
+
+    private static final class PrewarmedEntry {
+        final WsSession session;
+        final long createdAtMs;
+        final long generation;
+        final boolean protectedSocket;
+        final int bucket;
+
+        PrewarmedEntry(WsSession session, long createdAtMs, long generation,
+                       boolean protectedSocket, int bucket) {
+            this.session = session;
+            this.createdAtMs = createdAtMs;
+            this.generation = generation;
+            this.protectedSocket = protectedSocket;
+            this.bucket = bucket;
+        }
+    }
+
+    /**
+     * Bounded, thread-safe Zero-RTT pool of already-upgraded (101 Switching Protocols) Telegram
+     * /apiws sessions awaiting the 64-byte obfuscated2 init frame.
+     */
+    private static final class PrewarmedWsPool {
+        @SuppressWarnings("unchecked")
+        private final java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry>[] buckets =
+                new java.util.concurrent.ConcurrentLinkedDeque[DC_BUCKET_COUNT];
+        private final java.util.concurrent.atomic.AtomicLong generation =
+                new java.util.concurrent.atomic.AtomicLong(1L);
+        private final java.util.concurrent.atomic.AtomicIntegerArray inFlight =
+                new java.util.concurrent.atomic.AtomicIntegerArray(DC_BUCKET_COUNT);
+
+        PrewarmedWsPool() {
+            for (int i = 0; i < buckets.length; i++) {
+                buckets[i] = new java.util.concurrent.ConcurrentLinkedDeque<>();
+            }
+        }
+
+        long currentGeneration() {
+            return generation.get();
+        }
+
+        boolean isPrewarmUsable(PrewarmedEntry entry, long nowMs) {
+            if (entry == null || entry.session == null) return false;
+            if (entry.generation != generation.get()) return false;
+            if (nowMs < entry.createdAtMs || (nowMs - entry.createdAtMs) > PREWARM_TTL_MS) {
+                return false;
+            }
+            return ColgramTelegramWsBridge.isPrewarmUsable(entry.session);
+        }
+
+        WsSession take(int normDc, boolean media, boolean wantProtected, long nowMs) {
+            int bucket = bucketFor(normDc, media);
+            java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q = buckets[bucket];
+            PrewarmedEntry entry;
+            while ((entry = q.pollFirst()) != null) {
+                if (!isPrewarmUsable(entry, nowMs) || entry.protectedSocket != wantProtected) {
+                    entry.session.close();
+                    continue;
+                }
+                pruneTail(q, nowMs);
+                return entry.session;
+            }
+            return null;
+        }
+
+        boolean hasUsable(int normDc, boolean media, boolean wantProtected, long nowMs) {
+            int bucket = bucketFor(normDc, media);
+            java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q = buckets[bucket];
+            for (PrewarmedEntry entry : q) {
+                if (isPrewarmUsable(entry, nowMs) && entry.protectedSocket == wantProtected) {
+                    return true;
+                }
+                if (!isPrewarmUsable(entry, nowMs) && q.remove(entry)) {
+                    entry.session.close();
+                }
+            }
+            return false;
+        }
+
+        boolean offer(PrewarmedEntry entry, long nowMs) {
+            if (entry == null || entry.session == null || !isPrewarmUsable(entry, nowMs)) {
+                if (entry != null && entry.session != null) entry.session.close();
+                return false;
+            }
+            java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q = buckets[entry.bucket];
+            pruneExpired(q, nowMs);
+            synchronized (q) {
+                if (entry.generation != generation.get() || q.size() >= PREWARM_MAX_PER_BUCKET) {
+                    entry.session.close();
+                    return false;
+                }
+                q.offerFirst(entry);
+                return true;
+            }
+        }
+
+        int evictExpired(long nowMs) {
+            int evicted = 0;
+            for (java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q : buckets) {
+                evicted += pruneExpired(q, nowMs);
+            }
+            return evicted;
+        }
+
+        int clearAll() {
+            generation.incrementAndGet();
+            int closed = 0;
+            for (java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q : buckets) {
+                PrewarmedEntry entry;
+                while ((entry = q.pollFirst()) != null) {
+                    entry.session.close();
+                    closed++;
+                }
+            }
+            return closed;
+        }
+
+        int size(int bucket) {
+            return buckets[bucket].size();
+        }
+
+        int totalSize() {
+            int sum = 0;
+            for (java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q : buckets) {
+                sum += q.size();
+            }
+            return sum;
+        }
+
+        private void pruneTail(java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q, long nowMs) {
+            PrewarmedEntry tail;
+            while ((tail = q.peekLast()) != null && !isPrewarmUsable(tail, nowMs)) {
+                if (q.remove(tail)) {
+                    tail.session.close();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        private int pruneExpired(java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q, long nowMs) {
+            int removed = 0;
+            for (PrewarmedEntry entry : q) {
+                if (!isPrewarmUsable(entry, nowMs) && q.remove(entry)) {
+                    entry.session.close();
+                    removed++;
+                }
+            }
+            return removed;
+        }
+    }
+
+    static boolean isPrewarmUsable(WsSession session) {
+        if (session == null || session.isClosed()) return false;
+        Socket s = session.socket;
+        if (s != null) {
+            if (s.isClosed() || s.isInputShutdown() || s.isOutputShutdown()) return false;
+            if (!s.isConnected()) return false;
+        }
+        if (session.in != null) {
+            try {
+                if (session.in.available() > 0) return false;
+            } catch (IOException e) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public static boolean supports(String host, int port) {
@@ -501,13 +697,18 @@ public final class ColgramTelegramWsBridge {
     }
 
     public static void resetNetworkState() {
+        PREWARMED_POOL.clearAll();
         for (int i = 0; i < lastWorkingByDc.length(); i++) {
             lastWorkingByDc.set(i, null);
             lastSuccessAtByDc.set(i, 0L);
         }
+        wifiPreferredFragMode = defaultFragModeForNetwork(false);
+        cellularPreferredFragMode = defaultFragModeForNetwork(true);
         preferredFragMode = defaultFragModeForNetwork(cellularNetwork);
         workedOnNetwork = false;
         resolvedAt = 0L;
+        wifiSniCursor = 0;
+        cellularSniCursor = 0;
         spoofSniCursor.set(0);
         perHostIps.clear();
         clearCooldowns();
@@ -534,15 +735,169 @@ public final class ColgramTelegramWsBridge {
         }
     }
 
-    /** Pre-resolve Telegram WebSocket edge hosts via DoH off-thread so the first dial has backups ready. */
+    /**
+     * Pre-resolve Telegram WebSocket edge hosts via DoH and pre-warm Zero-RTT /apiws sessions
+     * for DC2/DC4 generic & media edges off-thread.
+     */
     public static void warmUp() {
         long now = System.currentTimeMillis();
-        if (now - resolvedAt < DNS_CACHE_TTL_MS && !perHostIps.isEmpty()) return;
-        if (!refreshInFlight.compareAndSet(false, true)) return;
-        try {
-            RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
-        } catch (Throwable rejected) {
-            refreshInFlight.set(false);
+        if (now - resolvedAt >= DNS_CACHE_TTL_MS || perHostIps.isEmpty()) {
+            if (refreshInFlight.compareAndSet(false, true)) {
+                try {
+                    RACE_POOL.execute(ColgramTelegramWsBridge::refreshResolvedIps);
+                } catch (Throwable rejected) {
+                    refreshInFlight.set(false);
+                }
+            }
+        }
+        prewarmDefaultBucketsAsync();
+    }
+
+    public static boolean hasPrewarmed(int dcId, boolean media) {
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (norm < 1 || norm > 5) return false;
+        boolean wantProtected = ColgramDpiBypass.activeSystemDpiVpn() != null;
+        return PREWARMED_POOL.hasUsable(norm, media, wantProtected, System.currentTimeMillis());
+    }
+
+    static boolean hasPrewarmed(int dcId, boolean media, boolean wantProtected) {
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
+        if (norm < 1 || norm > 5) return false;
+        return PREWARMED_POOL.hasUsable(norm, media, wantProtected, System.currentTimeMillis());
+    }
+
+    public static WsSession takePrewarmed(int normDc, boolean media) {
+        boolean wantProtected = ColgramDpiBypass.activeSystemDpiVpn() != null;
+        return takePrewarmed(normDc, media, wantProtected);
+    }
+
+    static WsSession takePrewarmed(int normDc, boolean media, boolean wantProtected) {
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(normDc);
+        if (norm < 1 || norm > 5) return null;
+        long now = System.currentTimeMillis();
+        WsSession hit = PREWARMED_POOL.take(norm, media, wantProtected, now);
+        if (hit != null) {
+            replenishPrewarmedAsync(norm, media);
+        }
+        return hit;
+    }
+
+    private static void prewarmDefaultBucketsAsync() {
+        if (!prewarmEnabled) return;
+        for (int signedDc : PREWARM_TARGET_DCS) {
+            replenishPrewarmedAsync(Math.abs(signedDc), signedDc < 0);
+        }
+    }
+
+    private static void replenishPrewarmedAsync(final int normDc, final boolean media) {
+        if (!prewarmEnabled || normDc < 1 || normDc > 5) return;
+        if (ColgramDpiBypass.wasExplicitlyStopped()
+                || ColgramDpiBypass.isOverlayVpnActive()
+                || ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+            return;
+        }
+        final int bucket = bucketFor(normDc, media);
+        if (System.currentTimeMillis() < cooldownUntilByDc.get(bucket)) return;
+        final android.net.VpnService sysVpn = ColgramDpiBypass.activeSystemDpiVpn();
+        final boolean wantProtected = sysVpn != null;
+        final long now = System.currentTimeMillis();
+        PREWARMED_POOL.evictExpired(now);
+        int current = PREWARMED_POOL.size(bucket);
+        int pending = PREWARMED_POOL.inFlight.get(bucket);
+        int deficit = PREWARM_MAX_PER_BUCKET - (current + pending);
+        if (deficit <= 0) return;
+
+        final long gen = PREWARMED_POOL.currentGeneration();
+        final ColgramDohResolver.SocketProtector protector = sysVpn != null ? sysVpn::protect : null;
+        final ColgramNativeDesync.FdProtector fdProtector = sysVpn != null ? sysVpn::protect : null;
+        for (int i = 0; i < deficit; i++) {
+            if (PREWARMED_POOL.inFlight.incrementAndGet(bucket) > PREWARM_MAX_PER_BUCKET) {
+                PREWARMED_POOL.inFlight.decrementAndGet(bucket);
+                break;
+            }
+            try {
+                PREWARM_POOL.execute(() -> {
+                    WsSession session = null;
+                    try {
+                        if (gen != PREWARMED_POOL.currentGeneration()
+                                || ColgramDpiBypass.wasExplicitlyStopped()
+                                || ColgramDpiBypass.isOverlayVpnActive()
+                                || ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+                            return;
+                        }
+                        if (!dialSlotsByDc[bucket].tryAcquire()) {
+                            return;
+                        }
+                        try {
+                            long deadlineMs = System.currentTimeMillis() + Math.min(2000L, maxDialWallMs());
+                            session = dialFreshInternal(normDc, media, protector, fdProtector, deadlineMs, true);
+                        } finally {
+                            dialSlotsByDc[bucket].release();
+                        }
+                        if (session != null) {
+                            if (gen == PREWARMED_POOL.currentGeneration()
+                                    && !ColgramDpiBypass.wasExplicitlyStopped()
+                                    && PREWARMED_POOL.offer(
+                                            new PrewarmedEntry(session, System.currentTimeMillis(), gen, wantProtected, bucket),
+                                            System.currentTimeMillis())) {
+                                session = null;
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (session != null) session.close();
+                        PREWARMED_POOL.inFlight.decrementAndGet(bucket);
+                    }
+                });
+            } catch (Throwable rejected) {
+                PREWARMED_POOL.inFlight.decrementAndGet(bucket);
+                break;
+            }
+        }
+    }
+
+    static boolean offerPrewarmedForTest(WsSession session, long createdAtMs, boolean wantProtected) {
+        if (session == null) return false;
+        int norm = Obfuscated2FrameSplitter.normalizeDcId(session.dcId);
+        boolean media = Obfuscated2FrameSplitter.isMediaDcId(session.rawDcId != 0 ? session.rawDcId : session.dcId);
+        int bucket = bucketFor(norm, media);
+        return PREWARMED_POOL.offer(
+                new PrewarmedEntry(session, createdAtMs, PREWARMED_POOL.currentGeneration(), wantProtected, bucket),
+                System.currentTimeMillis());
+    }
+
+    static int prewarmedPoolSizeForTest() {
+        return PREWARMED_POOL.totalSize();
+    }
+
+    static int prewarmedPoolSizeForTest(int normDc, boolean media) {
+        return PREWARMED_POOL.size(bucketFor(normDc, media));
+    }
+
+    static int evictExpiredPrewarmedForTest(long nowMs) {
+        return PREWARMED_POOL.evictExpired(nowMs);
+    }
+
+    static void setPrewarmEnabledForTest(boolean enabled) {
+        prewarmEnabled = enabled;
+    }
+
+    static int preferredFragModeForTest() {
+        return preferredFragMode;
+    }
+
+    static void restoreBypassHint(boolean cellular, int fragMode, int sniCursor) {
+        int safeSni = Math.floorMod(sniCursor, WHITELIST_SPOOF_SNIS.length);
+        if (cellular) {
+            cellularPreferredFragMode = fragMode;
+            cellularSniCursor = safeSni;
+        } else {
+            wifiPreferredFragMode = fragMode;
+            wifiSniCursor = safeSni;
+        }
+        if (cellularNetwork == cellular) {
+            preferredFragMode = fragMode;
+            spoofSniCursor.set(safeSni);
         }
     }
 
@@ -589,7 +944,19 @@ public final class ColgramTelegramWsBridge {
         long now = System.currentTimeMillis();
         if (now < cooldownUntilByDc.get(bucket)) return null;
 
-        // Coalesce concurrent tgnet dial storms per (DC, generic|media) bucket with 8 parallel slots
+        boolean wantProtected = (protector != null || fdProtector != null
+                || ColgramDpiBypass.activeSystemDpiVpn() != null);
+        WsSession prewarmed = takePrewarmed(normDc, media, wantProtected);
+        if (prewarmed != null) {
+            workedOnNetwork = true;
+            lastSuccessAtByDc.set(bucket, now);
+            consecutiveFailuresByDc.set(bucket, 0);
+            cooldownUntilByDc.set(bucket, 0L);
+            ColgramDpiBypass.onDirectLayer1Success();
+            return prewarmed;
+        }
+
+        // Coalesce concurrent tgnet dial storms per (DC, generic|media) bucket with 12 parallel slots
         // so parallel photo/avatar/emoji downloads never starve behind generic traffic.
         Semaphore dcSlot = dialSlotsByDc[bucket];
         boolean acquired = false;
@@ -606,86 +973,109 @@ public final class ColgramTelegramWsBridge {
             now = System.currentTimeMillis();
             if (now < cooldownUntilByDc.get(bucket)) return null;
             long deadlineMs = now + maxDialWallMs();
-
-            boolean canNative = ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null);
-
-            // Cold-start Wave-1 parallel race on BOTH cellular and Wi-Fi:
-            // Race carrier-safe spoofed RU-whitelist SNI (TLS 1.3, split + plain) alongside
-            // real-SNI Java TLS-record-split and native MODE_MULTI_SPLIT_SNI (zero MSG_OOB,
-            // zero TTL=1, zero tiny MSS).
-            if (!workedOnNetwork) {
-                List<EdgeEndpoint> coldCandidates = candidateEndpointsFor(normDc, media);
-                if (!coldCandidates.isEmpty()) {
-                    int[] coldModes = canNative
-                            ? new int[]{
-                                    FRAG_SPOOF_SNI_PLAIN,
-                                    FRAG_SPOOF_SNI_TLSREC,
-                                    FRAG_TLS_RECORD_SNI,
-                                    FRAG_NATIVE_MULTI_SPLIT_TLSREC
-                            }
-                            : new int[]{
-                                    FRAG_SPOOF_SNI_PLAIN,
-                                    FRAG_SPOOF_SNI_TLSREC,
-                                    FRAG_TLS_RECORD_SNI
-                            };
-                    long coldBudget = Math.min(
-                            cellularNetwork ? 2200L : 1700L,
-                            Math.max(1000L, deadlineMs - System.currentTimeMillis()));
-                    WsSession coldWinner = raceHandshakeModes(
-                            coldCandidates, normDc, media, coldModes, protector, fdProtector, coldBudget);
-                    if (coldWinner != null) {
-                        return coldWinner;
-                    }
-                }
+            WsSession dialed = dialFreshInternal(normDc, media, protector, fdProtector, deadlineMs, false);
+            if (dialed != null) {
+                replenishPrewarmedAsync(normDc, media);
             }
-
-            Set<String> triedIps = new LinkedHashSet<>();
-            int maxAltPerEndpoint = workedOnNetwork ? 1 : 2;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                if (System.currentTimeMillis() >= deadlineMs) break;
-                List<EdgeEndpoint> candidates = filterUnvisitedIps(candidateEndpointsFor(normDc, media), triedIps);
-                if (candidates.isEmpty()) break;
-
-                int primaryMode = preferredFragMode;
-                if (!canNative && isNativeFragMode(primaryMode)) {
-                    primaryMode = FRAG_SPOOF_SNI_PLAIN;
-                }
-                DialedTcp tcp = connectEdgeRace(candidates, protector, fdProtector, primaryMode);
-                if (tcp == null) break;
-                triedIps.add(tcp.endpoint.ip);
-
-                HandshakeResult res = tryHandshake(tcp, normDc, media, primaryMode);
-                if (res.session != null) {
-                    preferredFragMode = primaryMode;
-                    return res.session;
-                }
-
-                if (!res.hostnameMismatch && (res.wrapperRejected || !workedOnNetwork)
-                        && System.currentTimeMillis() + 700L < deadlineMs) {
-                    int[] fallbacks = fallbackFragModes(primaryMode, canNative);
-                    int altTried = 0;
-                    for (int altMode : fallbacks) {
-                        if (altTried >= maxAltPerEndpoint
-                                || System.currentTimeMillis() + 800L >= deadlineMs) break;
-                        altTried++;
-                        DialedTcp altTcp = connectEdgeRace(
-                                Collections.singletonList(tcp.endpoint), protector, fdProtector, altMode);
-                        if (altTcp == null) break;
-                        HandshakeResult altRes = tryHandshake(altTcp, normDc, media, altMode);
-                        if (altRes.session != null) {
-                            preferredFragMode = altMode;
-                            return altRes.session;
-                        }
-                        if (altRes.hostnameMismatch) break;
-                    }
-                }
-                deprioritizedUntil.put(tcp.endpoint.key(), System.currentTimeMillis() + DEPRIORITIZE_TTL_MS);
-            }
-            recordBurstFailure(normDc, media);
-            return null;
+            return dialed;
         } finally {
             dcSlot.release();
         }
+    }
+
+    private static WsSession dialFreshInternal(int normDc, boolean media,
+                                               ColgramDohResolver.SocketProtector protector,
+                                               ColgramNativeDesync.FdProtector fdProtector,
+                                               long deadlineMs, boolean forPrewarm) {
+        boolean canNative = ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null);
+
+        // Cold-start Wave-1 parallel race on BOTH cellular and Wi-Fi:
+        // Race carrier-safe spoofed RU-whitelist SNI (TLS 1.3, split + plain) alongside
+        // real-SNI Java TLS-record-split and native MODE_MULTI_SPLIT_SNI (zero MSG_OOB,
+        // zero TTL=1, zero tiny MSS).
+        if (!workedOnNetwork) {
+            List<EdgeEndpoint> coldCandidates = candidateEndpointsFor(normDc, media);
+            if (!coldCandidates.isEmpty()) {
+                int[] coldModes = canNative
+                        ? new int[]{
+                                FRAG_SPOOF_SNI_PLAIN,
+                                FRAG_SPOOF_SNI_TLSREC,
+                                FRAG_TLS_RECORD_SNI,
+                                FRAG_NATIVE_MULTI_SPLIT_TLSREC
+                        }
+                        : new int[]{
+                                FRAG_SPOOF_SNI_PLAIN,
+                                FRAG_SPOOF_SNI_TLSREC,
+                                FRAG_TLS_RECORD_SNI
+                        };
+                long coldBudget = Math.min(
+                        cellularNetwork ? 2200L : 1700L,
+                        Math.max(1000L, deadlineMs - System.currentTimeMillis()));
+                WsSession coldWinner = raceHandshakeModes(
+                        coldCandidates, normDc, media, coldModes, protector, fdProtector, coldBudget, forPrewarm);
+                if (coldWinner != null) {
+                    return coldWinner;
+                }
+            }
+        }
+
+        Set<String> triedIps = new LinkedHashSet<>();
+        int maxAltPerEndpoint = workedOnNetwork ? 1 : 2;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (System.currentTimeMillis() >= deadlineMs) break;
+            List<EdgeEndpoint> candidates = filterUnvisitedIps(candidateEndpointsFor(normDc, media), triedIps);
+            if (candidates.isEmpty()) break;
+
+            int primaryMode = preferredFragMode;
+            if (!canNative && isNativeFragMode(primaryMode)) {
+                primaryMode = FRAG_SPOOF_SNI_PLAIN;
+            }
+            DialedTcp tcp = connectEdgeRace(candidates, protector, fdProtector, primaryMode);
+            if (tcp == null) break;
+            triedIps.add(tcp.endpoint.ip);
+
+            HandshakeResult res = tryHandshake(tcp, normDc, media, primaryMode, forPrewarm);
+            if (res.session != null) {
+                setPreferredFragMode(primaryMode);
+                return res.session;
+            }
+
+            if (!res.hostnameMismatch && (res.wrapperRejected || !workedOnNetwork)
+                    && System.currentTimeMillis() + 700L < deadlineMs) {
+                int[] fallbacks = fallbackFragModes(primaryMode, canNative);
+                int altTried = 0;
+                for (int altMode : fallbacks) {
+                    if (altTried >= maxAltPerEndpoint
+                            || System.currentTimeMillis() + 800L >= deadlineMs) break;
+                    altTried++;
+                    DialedTcp altTcp = connectEdgeRace(
+                            Collections.singletonList(tcp.endpoint), protector, fdProtector, altMode);
+                    if (altTcp == null) break;
+                    HandshakeResult altRes = tryHandshake(altTcp, normDc, media, altMode, forPrewarm);
+                    if (altRes.session != null) {
+                        setPreferredFragMode(altMode);
+                        return altRes.session;
+                    }
+                    if (altRes.hostnameMismatch) break;
+                }
+            }
+            deprioritizedUntil.put(tcp.endpoint.key(), System.currentTimeMillis() + DEPRIORITIZE_TTL_MS);
+        }
+        if (!forPrewarm) {
+            recordBurstFailure(normDc, media);
+        }
+        return null;
+    }
+
+    private static void setPreferredFragMode(int mode) {
+        preferredFragMode = mode;
+        boolean cell = cellularNetwork;
+        if (cell) cellularPreferredFragMode = mode;
+        else wifiPreferredFragMode = mode;
+        int curSni = Math.floorMod(spoofSniCursor.get(), WHITELIST_SPOOF_SNIS.length);
+        if (cell) cellularSniCursor = curSni;
+        else wifiSniCursor = curSni;
+        ColgramDpiBypass.persistWssHint(cell, mode, curSni);
     }
 
     private static List<EdgeEndpoint> filterUnvisitedIps(List<EdgeEndpoint> all, Set<String> triedIps) {
@@ -712,7 +1102,8 @@ public final class ColgramTelegramWsBridge {
                                                 final int[] modes,
                                                 final ColgramDohResolver.SocketProtector protector,
                                                 final ColgramNativeDesync.FdProtector fdProtector,
-                                                final long budgetMs) {
+                                                final long budgetMs,
+                                                final boolean forPrewarm) {
         final Object winnerLock = new Object();
         final AtomicReference<WsSession> winner = new AtomicReference<>();
         final boolean[] timedOut = new boolean[]{false};
@@ -721,7 +1112,7 @@ public final class ColgramTelegramWsBridge {
         final AtomicInteger left = new AtomicInteger(modes.length);
         for (int i = 0; i < modes.length; i++) {
             final int mode = modes[i];
-            final long delay = i == 0 ? 0L : (i == 1 ? 35L : (i == 2 ? 80L : 120L));
+            final long delay = i <= 1 ? 0L : (i == 2 ? 15L : 30L);
             try {
                 RACE_POOL.execute(() -> {
                     WsSession sess = null;
@@ -733,13 +1124,13 @@ public final class ColgramTelegramWsBridge {
                             if (tcp != null) { try { tcp.socket.close(); } catch (Throwable ignored) {} }
                             return;
                         }
-                        HandshakeResult res = tryHandshake(tcp, normDc, media, mode);
+                        HandshakeResult res = tryHandshake(tcp, normDc, media, mode, forPrewarm);
                         if (res.session != null) {
                             synchronized (winnerLock) {
                                 if (!timedOut[0] && winner.get() == null) {
                                     winner.set(res.session);
                                     done.set(true);
-                                    preferredFragMode = mode;
+                                    setPreferredFragMode(mode);
                                     latch.countDown();
                                 } else {
                                     sess = res.session;
@@ -865,7 +1256,7 @@ public final class ColgramTelegramWsBridge {
     private static String pickSpoofSni(int fragMode) {
         int baseIdx = Math.floorMod(spoofSniCursor.get(), WHITELIST_SPOOF_SNIS.length);
         if (fragMode == FRAG_SPOOF_SNI_ALT) {
-            return WHITELIST_SPOOF_SNIS[(baseIdx + 1) % WHITELIST_SPOOF_SNIS.length];
+            return WHITELIST_SPOOF_SNIS[(baseIdx + 2) % WHITELIST_SPOOF_SNIS.length];
         }
         if (fragMode == FRAG_SPOOF_SNI_PLAIN) {
             return WHITELIST_SPOOF_SNIS[(baseIdx + 1) % WHITELIST_SPOOF_SNIS.length];
@@ -956,14 +1347,15 @@ public final class ColgramTelegramWsBridge {
         if (!(tcpSocket instanceof ColgramNativeDesync.NativeSocket) && isNativeFragMode(mode)) {
             mode = FRAG_SPOOF_SNI_PLAIN;
         }
-        HandshakeResult res = tryHandshake(new DialedTcp(new EdgeEndpoint(ip, realHost), tcpSocket), normDc, media, mode);
+        HandshakeResult res = tryHandshake(new DialedTcp(new EdgeEndpoint(ip, realHost), tcpSocket), normDc, media, mode, false);
         if (res.session != null) {
             return res.session;
         }
         return null;
     }
 
-    private static HandshakeResult tryHandshake(DialedTcp tcp, int normDc, boolean media, int fragMode) {
+    private static HandshakeResult tryHandshake(DialedTcp tcp, int normDc, boolean media, int fragMode,
+                                                boolean forPrewarm) {
         boolean wrapperRejected = false;
         boolean hostnameMismatch = false;
         String ip = tcp.endpoint.ip;
@@ -1029,8 +1421,10 @@ public final class ColgramTelegramWsBridge {
             lastWorkingByDc.set(bucket, tcp.endpoint);
             lastSuccessAtByDc.set(bucket, System.currentTimeMillis());
             deprioritizedUntil.remove(tcp.endpoint.key());
-            workedOnNetwork = true;
-            ColgramDpiBypass.onDirectLayer1Success();
+            if (!forPrewarm) {
+                workedOnNetwork = true;
+                ColgramDpiBypass.onDirectLayer1Success();
+            }
             consecutiveFailuresByDc.set(bucket, 0);
             cooldownUntilByDc.set(bucket, 0L);
             Log.i(TAG, "WSS upgraded ok: " + tcp.endpoint + " tlsSni=" + tlsSni
@@ -1694,19 +2088,14 @@ public final class ColgramTelegramWsBridge {
                                 for (int pos = 0; pos < headCut; pos += 2) {
                                     raw.write(r0, pos, Math.min(2, headCut - pos));
                                     raw.flush();
-                                    try { Thread.sleep(3L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                                 }
                                 if (headCut < r0.length) {
                                     raw.write(r0, headCut, r0.length - headCut);
                                     raw.flush();
                                 }
-                                try { Thread.sleep(4L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                                 for (int r = 1; r < recs.length; r++) {
                                     raw.write(recs[r]);
                                     raw.flush();
-                                    if (r + 1 < recs.length) {
-                                        try { Thread.sleep(3L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                                    }
                                 }
                                 return;
                             }
@@ -1716,12 +2105,10 @@ public final class ColgramTelegramWsBridge {
                             if (segStart > 0) {
                                 raw.write(copy, 0, segStart);
                                 raw.flush();
-                                try { Thread.sleep(3L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                             }
                             for (int pos = segStart; pos < segEnd; pos += 2) {
                                 raw.write(copy, pos, Math.min(2, segEnd - pos));
                                 raw.flush();
-                                try { Thread.sleep(3L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                             }
                             if (segEnd < copy.length) {
                                 raw.write(copy, segEnd, copy.length - segEnd);
@@ -1742,13 +2129,6 @@ public final class ColgramTelegramWsBridge {
                         for (int i = 0; i < pieces.length; i++) {
                             raw.write(pieces[i]);
                             raw.flush();
-                            if (i + 1 < pieces.length) {
-                                try {
-                                    Thread.sleep(2L);
-                                } catch (InterruptedException ie) {
-                                    Thread.currentThread().interrupt();
-                                }
-                            }
                         }
                         return;
                     }
@@ -2061,9 +2441,9 @@ public final class ColgramTelegramWsBridge {
         EdgeEndpoint[] plan = {ep0, ep1, ep2, ep3};
         long[] delaysMs = {
                 0L,
-                60L,
-                120L,
-                180L
+                15L,
+                45L,
+                90L
         };
 
         final boolean useNative = isNativeFragMode(fragMode) && ColgramNativeDesync.isAvailable()

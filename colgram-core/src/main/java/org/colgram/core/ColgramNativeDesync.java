@@ -44,6 +44,7 @@ public final class ColgramNativeDesync {
     public static final int MODE_OOB_BYTE1_ONLY     = 9;
     public static final int MODE_SPLIT_BYTE1        = 10;
     public static final int MODE_MULTI_SPLIT_SNI    = 11;
+    public static final int MODE_HYBRID_MULTI_RECORD = 12;
     public static final int MAX_SAFE_FAKE_TTL       = 12;
 
     private static volatile SSLSocketFactory cachedEngineSslFactory;

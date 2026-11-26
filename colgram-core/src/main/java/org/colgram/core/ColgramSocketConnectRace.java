@@ -45,7 +45,7 @@ public final class ColgramSocketConnectRace {
             if (address != null && !address.equals(primary) && address.getPort() > 0) distinct.add(address);
         }
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        int primaryHeadStartMs = ColgramDpiBypass.isCellularNetwork() ? 240 : 160;
+        int primaryHeadStartMs = ColgramDpiBypass.isCellularNetwork() ? 65 : 35;
         if (distinct.isEmpty()) {
             Socket socket = new Socket(Proxy.NO_PROXY);
             try {
@@ -92,7 +92,7 @@ public final class ColgramSocketConnectRace {
         }
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         int safeMss = (mssClamp > 0 && mssClamp < 88) ? 88 : mssClamp;
-        int primaryHeadStartMs = ColgramDpiBypass.isCellularNetwork() ? 240 : 160;
+        int primaryHeadStartMs = ColgramDpiBypass.isCellularNetwork() ? 65 : 35;
         if (distinct.isEmpty()) {
             if (nativeOk) {
                 try {

@@ -56,13 +56,10 @@ final class ColgramSocks5Codec {
             output.write(data, off, step);
             output.flush();
             off += step;
-            if (realStream && gapMs > 0L && off < data.length) {
-                try {
-                    Thread.sleep(gapMs);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted during segmented SOCKS5 write", ie);
-                }
+            // Yield ~2ms only on the leading SOCKS5 header bytes for real sockets so the OS kernel
+            // never coalesces 05 01 00 01 <IP> into a single TSPU-matchable TCP segment.
+            if (realStream && gapMs > 0L && off < data.length && off <= 4) {
+                java.util.concurrent.locks.LockSupport.parkNanos(gapMs * 1_000_000L);
             }
         }
     }
@@ -91,7 +88,6 @@ final class ColgramSocks5Codec {
         }
         req.append("\r\n");
         byte[] bytes = req.toString().getBytes("ISO-8859-1");
-        boolean realStream = !(output instanceof java.io.ByteArrayOutputStream);
         int hostMid = Math.max(1, cleanHost.length() / 2);
         String prefix = cleanHost.substring(0, hostMid);
         String full = req.toString();
@@ -109,14 +105,6 @@ final class ColgramSocks5Codec {
                 output.write(bytes, pos, end - pos);
                 output.flush();
                 pos = end;
-                if (realStream && pos < bytes.length) {
-                    try {
-                        Thread.sleep(16L);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted during segmented HTTP CONNECT", ie);
-                    }
-                }
             }
         }
     }
@@ -147,7 +135,7 @@ final class ColgramSocks5Codec {
         System.arraycopy(target, 0, req, 4, target.length);
         req[4 + target.length] = (byte) (port >>> 8);
         req[5 + target.length] = (byte) port;
-        writeSegmented(output, req, 2, 10L);
+        writeSegmented(output, req, 2, 2L);
         if (input.next() != 5 || input.next() != 0 || input.next() != 0) return false;
         int type = input.next();
         int addressLength = type == 1 ? 4 : type == 4 ? 16 : type == 3 ? input.next() : -1;
@@ -178,11 +166,13 @@ final class ColgramSocks5Codec {
             byte[] userBytes = username.getBytes("UTF-8");
             byte[] passBytes = (password == null ? "" : password).getBytes("UTF-8");
             if (userBytes.length > 255 || passBytes.length > 255) return false;
-            output.write(1);
-            output.write(userBytes.length);
-            output.write(userBytes);
-            output.write(passBytes.length);
-            output.write(passBytes);
+            byte[] auth = new byte[3 + userBytes.length + passBytes.length];
+            auth[0] = 1;
+            auth[1] = (byte) userBytes.length;
+            System.arraycopy(userBytes, 0, auth, 2, userBytes.length);
+            auth[2 + userBytes.length] = (byte) passBytes.length;
+            System.arraycopy(passBytes, 0, auth, 3 + userBytes.length, passBytes.length);
+            output.write(auth);
             output.flush();
             if (readByte(input) != 1 || readByte(input) != 0) return false;
         } else if (method != 0) {
@@ -211,7 +201,7 @@ final class ColgramSocks5Codec {
         System.arraycopy(hostBytes, 0, req, 5, hostBytes.length);
         req[5 + hostBytes.length] = (byte) (port >>> 8);
         req[6 + hostBytes.length] = (byte) port;
-        writeSegmented(output, req, 2, 10L);
+        writeSegmented(output, req, 2, 0L);
         if (readByte(input) != 5 || readByte(input) != 0 || readByte(input) != 0) return false;
         int type = readByte(input);
         int addressLength = type == 1 ? 4 : type == 4 ? 16 : type == 3 ? readByte(input) : -1;

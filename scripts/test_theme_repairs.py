@@ -702,5 +702,66 @@ class VideoWallpaperFixesTest(unittest.TestCase):
         self.assertEqual(tpl, synced)
 
 
+class ChatWallpaperUnlockContractsTest(unittest.TestCase):
+    def test_colgram_config_per_chat_video_and_image_do_not_shadow_each_other(self):
+        cfg = (ROOT / "colgram-core" / "src" / "main" / "java" / "org" / "colgram" / "core" / "ColgramConfig.java").read_text(encoding="utf-8")
+        self.assertIn("if (!getExactChatImageWallpaper(dialogId).isEmpty()) return \"\";", cfg)
+        self.assertIn("if (!getExactChatVideoWallpaper(dialogId).isEmpty()) return \"\";", cfg)
+
+    def test_groups_and_channels_custom_wallpaper_contracts(self):
+        repo = ROOT / "Telegram-Src"
+        if not (repo / TG_UI_REL / "ChatActivity.java").is_file():
+            self.skipTest("Telegram-Src checkout is not installed")
+        chat = (repo / TG_UI_REL / "ChatActivity.java").read_text(encoding="utf-8")
+        self.assertIn("!canEdit || currentChat != null || currentUser != null", chat)
+        show_sheet = chat.split("private void showChatThemeBottomSheet()", 1)[1].split("}", 1)[0]
+        self.assertNotIn("GroupColorActivity", show_sheet)
+        self.assertNotIn("ChannelColorActivity", show_sheet)
+        self.assertIn("new ChatThemeBottomSheet(ChatActivity.this, themeDelegate)", show_sheet)
+        self.assertIn("hasExplicitPerChatTheme", chat)
+
+        sheet = (repo / TG_UI_REL / "Components" / "ChatThemeBottomSheet.java").read_text(encoding="utf-8")
+        self.assertNotIn("ReactionLevelRequiredBtn", sheet)
+        self.assertNotIn("TYPE_BOOSTS_FOR_WALLPAPER", sheet)
+        self.assertIn("clearLocalWallpaper(dId, false);", sheet)
+        self.assertIn("setDialogTheme(dId, tlChatTheme, sendServerTheme);", sheet)
+
+        preview = (repo / TG_UI_REL / "ThemePreviewActivity.java").read_text(encoding="utf-8")
+        self.assertNotIn("TYPE_BOOSTS_FOR_CUSTOM_WALLPAPER", preview)
+        self.assertIn("private boolean colgramRenderCurrentWallpaperToFile(File outFile)", preview)
+        self.assertIn("boolean localOnlyChat = dialogId < 0 || isBotAccount;", preview)
+        self.assertIn("if (selectedPattern != null || localOnlyChat)", preview)
+
+        ctrl = (repo / "TMessagesProj" / "src" / "main" / "java" / "org" / "telegram" / "messenger" / "ChatThemeController.java").read_text(encoding="utf-8")
+        self.assertIn("public void clearLocalWallpaper(long dialogId, boolean notify)", ctrl)
+        self.assertIn("if (chatFull != null && chatFull.wallpaper != null)", ctrl)
+
+    def test_apply_patches_converges_chat_wallpaper_unlock_specs(self):
+        import importlib.util
+        import shutil
+        import tempfile
+
+        ap = ROOT / "scripts" / "apply-patches.py"
+        src = ap.read_text(encoding="utf-8")
+        self.assertIn("inject_chat_wallpaper_unlock_patches(target_repo)", src.split("def main():", 1)[1])
+
+        spec = importlib.util.spec_from_file_location("apply_patches_wp_unlock_mod", ap)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        repo = ROOT / "Telegram-Src"
+        if not (repo / TG_UI_REL / "ChatActivity.java").is_file():
+            self.skipTest("Telegram-Src checkout is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_tg = Path(tmp) / "Telegram-Src"
+            for rel in {r for r, _, _, _ in mod._CHAT_WALLPAPER_UNLOCK_PATCH_SPECS}:
+                dst = tmp_tg / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(repo / rel, dst)
+            mod.PATCH_MISSES.clear()
+            mod.inject_chat_wallpaper_unlock_patches(str(tmp_tg))
+            self.assertEqual([], mod.PATCH_MISSES)
+
+
 if __name__ == "__main__":
     unittest.main()

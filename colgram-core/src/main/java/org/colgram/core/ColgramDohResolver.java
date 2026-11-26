@@ -52,7 +52,24 @@ public final class ColgramDohResolver {
     private static final int CELLULAR_READ_TIMEOUT_MS = 2100;
     private static final long RACE_WAVE_DEADLINE_MS = 3000L;
     private static final long CACHE_TTL_MS = 180_000L;
+    private static final long SWR_REFRESH_AGE_MS = (CACHE_TTL_MS * 60L) / 100L;
+    private static final long SWR_COOLDOWN_MS = 10_000L;
+    private static final long CRITICAL_PREFETCH_COOLDOWN_MS = 30_000L;
     private static final int MAX_DNS_CACHE = 2048;
+    private static final String[] CRITICAL_PREFETCH_HOSTS = {
+            "kws1.web.telegram.org",
+            "kws2.web.telegram.org",
+            "kws3.web.telegram.org",
+            "kws4.web.telegram.org",
+            "kws5.web.telegram.org",
+            "kws2-1.web.telegram.org",
+            "kws4-1.web.telegram.org",
+            "api.telegram.org",
+            "discord.com",
+            "gateway.discord.gg",
+            "www.youtube.com",
+            "github.com"
+    };
     private static final long CUT_COOLDOWN_MS = 30_000L;
     private static final int MAX_POOLED_PER_ENDPOINT = 4;
     private static final long POOL_IDLE_TTL_MS = 60_000L;
@@ -445,10 +462,23 @@ public final class ColgramDohResolver {
         target.put(key, new DnsCacheEntry(nowMs, addrs));
     }
 
+    static boolean needsSwrRefresh(long timestampMs, long nowMs) {
+        long age = nowMs - timestampMs;
+        return age > SWR_REFRESH_AGE_MS && age < CACHE_TTL_MS;
+    }
+
     private static InetAddress[] getCachedEntry(Map<String, DnsCacheEntry> source, String key, long nowMs) {
+        return getCachedEntryWithSwr(source, key, nowMs, null);
+    }
+
+    private static InetAddress[] getCachedEntryWithSwr(Map<String, DnsCacheEntry> source, String key,
+                                                       long nowMs, boolean[] outNeedsRefresh) {
         if (key == null) return null;
         DnsCacheEntry entry = source.get(key);
         if (entry != null && (nowMs - entry.timestampMs) < CACHE_TTL_MS) {
+            if (outNeedsRefresh != null && outNeedsRefresh.length > 0) {
+                outNeedsRefresh[0] = needsSwrRefresh(entry.timestampMs, nowMs);
+            }
             return entry.addresses;
         }
         return null;
@@ -464,6 +494,17 @@ public final class ColgramDohResolver {
     static void clearDnsCacheForTest() {
         cache.clear();
         aaaaCache.clear();
+        swrLastRefreshAt.clear();
+        swrTriggerCount.set(0);
+        lastCriticalPrefetchAt = 0L;
+    }
+
+    static int swrTriggerCountForTest() {
+        return swrTriggerCount.get();
+    }
+
+    static String[] criticalPrefetchHostsForTest() {
+        return CRITICAL_PREFETCH_HOSTS.clone();
     }
 
     private static void returnPooledConn(PooledTlsConn conn) {
@@ -489,6 +530,10 @@ public final class ColgramDohResolver {
     private static final Map<String, DnsCacheEntry> aaaaCache = new ConcurrentHashMap<>();
     private static final Map<String, java.util.concurrent.CompletableFuture<InetAddress[]>> inflightLookups =
             new ConcurrentHashMap<>();
+    private static final Map<String, Long> swrLastRefreshAt = new ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicInteger swrTriggerCount =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+    private static volatile long lastCriticalPrefetchAt = 0L;
     /** Endpoints temporarily skipped after timeout/reset until their cooldown expires. */
     private static final Map<String, Long> cutUntil = new ConcurrentHashMap<>();
     private static volatile String lastResolver;
@@ -564,10 +609,61 @@ public final class ColgramDohResolver {
      */
     public static void prefetch(final String hostname) {
         if (hostname == null || hostname.isEmpty()) return;
-        Thread thread = new Thread(() -> resolve(hostname), "colgram-doh-prefetch");
-        thread.setDaemon(true);
-        thread.start();
+        try {
+            DOH_RACE_POOL.execute(() -> resolve(hostname));
+        } catch (Throwable rejected) {
+            Thread thread = new Thread(() -> resolve(hostname), "colgram-doh-prefetch");
+            thread.setDaemon(true);
+            thread.start();
+        }
     }
+
+    /**
+     * Asynchronously pre-resolves critical Telegram WSS edges, Discord, YouTube, and GitHub hosts
+     * so first connections resolve from cache in 0 ms. Rate-limited across calls.
+     */
+    public static void prefetchCriticalHosts() {
+        if (!ColgramConfig.isDohEnabled()) return;
+        long now = System.currentTimeMillis();
+        long prev = lastCriticalPrefetchAt;
+        if (prev > 0L && now - prev < CRITICAL_PREFETCH_COOLDOWN_MS) return;
+        lastCriticalPrefetchAt = now;
+        for (final String host : CRITICAL_PREFETCH_HOSTS) {
+            String key = host.toLowerCase(java.util.Locale.ROOT);
+            boolean[] needsRefresh = new boolean[1];
+            InetAddress[] hit = getCachedEntryWithSwr(cache, key, now, needsRefresh);
+            if (hit != null && hit.length > 0 && !needsRefresh[0]) continue;
+            prefetch(host);
+        }
+    }
+
+    private static void triggerSwrRefreshAsync(final String key, final String hostname, final int qtype,
+                                               final SocketProtector protector,
+                                               final ColgramNativeDesync.FdProtector fdProtector) {
+        long now = System.currentTimeMillis();
+        String swrKey = qtype + "|" + key;
+        if (swrLastRefreshAt.size() >= MAX_DNS_CACHE) {
+            swrLastRefreshAt.clear();
+        }
+        Long prev = swrLastRefreshAt.get(swrKey);
+        if (prev != null && (now - prev) < SWR_COOLDOWN_MS) {
+            return;
+        }
+        if (prev == null) {
+            if (swrLastRefreshAt.putIfAbsent(swrKey, now) != null) return;
+        } else if (!swrLastRefreshAt.replace(swrKey, prev, now)) {
+            return;
+        }
+        swrTriggerCount.incrementAndGet();
+        try {
+            DOH_RACE_POOL.execute(() -> {
+                try {
+                    queryEndpointsInternal(key, hostname, System.currentTimeMillis(), false, qtype, protector, fdProtector);
+                } catch (Throwable ignored) {}
+            });
+        } catch (Throwable ignored) {}
+    }
+
     /** The platform resolver, isolated so a failure inside it cannot recurse into us. */
     private static InetAddress[] resolveSystem(String hostname) {
         try {
@@ -580,6 +676,8 @@ public final class ColgramDohResolver {
     public static void resetHealth() {
         cutUntil.clear();
         clearConnectionPool();
+        swrLastRefreshAt.clear();
+        lastCriticalPrefetchAt = 0L;
         lastResolver = null;
         lastWorkingEndpoint = null;
         lastIpv6CheckAt = 0L;
@@ -669,8 +767,12 @@ public final class ColgramDohResolver {
         if (ColgramConfig.isDohEnabled()) {
             String key = cleaned.toLowerCase(java.util.Locale.ROOT);
             long now = System.currentTimeMillis();
-            InetAddress[] cached = getCachedEntry(cache, key, now);
+            boolean[] needsRefresh = new boolean[1];
+            InetAddress[] cached = getCachedEntryWithSwr(cache, key, now, needsRefresh);
             if (cached != null && cached.length > 0) {
+                if (needsRefresh[0]) {
+                    triggerSwrRefreshAsync(key, cleaned, 1, null, null);
+                }
                 return cached.clone();
             }
 
@@ -766,10 +868,16 @@ public final class ColgramDohResolver {
         }
         String key = cleaned.toLowerCase(java.util.Locale.ROOT);
         long now = System.currentTimeMillis();
-        InetAddress[] cached = getCachedEntry(cache, key, now);
+        boolean[] needsRefresh = new boolean[1];
+        InetAddress[] cached = getCachedEntryWithSwr(cache, key, now, needsRefresh);
         if (cached != null && cached.length > 0) {
             InetAddress picked = pickReachable(cached);
-            if (picked != null) return picked;
+            if (picked != null) {
+                if (needsRefresh[0]) {
+                    triggerSwrRefreshAsync(key, cleaned, 1, protector, fdProtector);
+                }
+                return picked;
+            }
         }
         InetAddress[] found = queryEndpointsInternal(key, cleaned, now, false, 1, protector, fdProtector);
         if (found == null && !cutUntil.isEmpty()) {
@@ -1487,9 +1595,6 @@ public final class ColgramDohResolver {
                                     for (int i = 0; i < pieces.length; i++) {
                                         raw.write(pieces[i]);
                                         raw.flush();
-                                        if (i + 1 < pieces.length) {
-                                            try { Thread.sleep(2L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                                        }
                                     }
                                     return;
                                 }

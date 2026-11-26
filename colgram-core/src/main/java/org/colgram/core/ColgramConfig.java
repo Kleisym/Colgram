@@ -1581,6 +1581,7 @@ public class ColgramConfig {
         if (dialogId != 0L) {
             String specific = getExactChatVideoWallpaper(dialogId);
             if (!specific.isEmpty()) return specific;
+            if (!getExactChatImageWallpaper(dialogId).isEmpty()) return "";
         }
         return getExactChatVideoWallpaper(0L);
     }
@@ -1614,6 +1615,7 @@ public class ColgramConfig {
         if (dialogId != 0L) {
             String exact = getExactChatImageWallpaper(dialogId);
             if (!exact.isEmpty()) return exact;
+            if (!getExactChatVideoWallpaper(dialogId).isEmpty()) return "";
         }
         return getExactChatImageWallpaper(0L);
     }

@@ -8854,9 +8854,11 @@ _PERFORMANCE_PATCH_SPECS = [
             '\n'
             '        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {\n'
             '            boolean isAvatarOrSmallImage = parentObject instanceof TLRPC.User\n'
+            '                    || parentObject instanceof TLRPC.UserFull\n'
             '                    || parentObject instanceof TLRPC.Chat\n'
+            '                    || parentObject instanceof TLRPC.ChatFull\n'
             '                    || parentObject instanceof TLRPC.Dialog\n'
-            '                    || (imageLocation != null && imageLocation.photoPeer != null)\n'
+            '                    || (imageLocation != null && (imageLocation.photoPeer != null || imageLocation.thumbSize != null || imageLocation.stickerSet != null))\n'
             '                    || (location != null && cacheType != 10 && locationSize <= 256 * 1024);\n'
             '            if (isAvatarOrSmallImage && priority < PRIORITY_HIGH) {\n'
             '                priority = PRIORITY_HIGH;\n'
@@ -8884,7 +8886,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '        }\n'
             '        checkOperationsScheduled = true;\n'
             '        workerQueue.cancelRunnable(checkOperationsRunnable);\n'
-            '        long checkDelayMs = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled() ? 4 : 20;\n'
+            '        long checkDelayMs = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled() ? 1 : 20;\n'
             '        workerQueue.postRunnable(checkOperationsRunnable, checkDelayMs);\n'
             '    }\n'
             '\n'
@@ -8907,7 +8909,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '        boolean pauseAllNextOperations = false;\n'
             '        int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;\n'
             '        if (org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled()) {\n'
-            '            max = Math.max(max, type == TYPE_LARGE ? 6 : 12);\n'
+            '            max = Math.max(max, type == TYPE_LARGE ? 8 : 24);\n'
             '        }\n'
             '        tmpListOperations.clear();\n'
             '        for (int i = 0; i < allOperations.size(); i++) {\n'
@@ -8946,12 +8948,15 @@ _PERFORMANCE_PATCH_SPECS = [
             '    private void updateParams() {\n'
             '        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();\n'
             '        boolean experimental = preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams;\n'
+            '        boolean isAvatarOrSmall = location instanceof TLRPC.TL_inputPeerPhotoFileLocation\n'
+            '                || (totalBytesCount > 0 && totalBytesCount <= 256 * 1024);\n'
             '        if (boost && !forceSmallChunk) {\n'
-            '            downloadChunkSize = totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;\n'
+            '            downloadChunkSize = (isAvatarOrSmall && (totalBytesCount <= 0 || totalBytesCount > 64 * 1024))\n'
+            '                    || totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;\n'
             '            downloadChunkSizeBig = 1024 * 512;\n'
-            '            maxDownloadRequests = 8;\n'
-            '            maxDownloadRequestsBig = 8;\n'
-            '            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 8);\n'
+            '            maxDownloadRequests = 12;\n'
+            '            maxDownloadRequestsBig = 12;\n'
+            '            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);\n'
             '        } else if (experimental && !forceSmallChunk) {\n'
             '            downloadChunkSize = 1024 * 32;\n'
             '            downloadChunkSizeBig = 1024 * 512;\n'
@@ -8985,8 +8990,8 @@ _PERFORMANCE_PATCH_SPECS = [
             '    private SparseArray<String> waitingForQualityThumbByTag = new SparseArray<>();\n'
             '    private LinkedList<HttpImageTask> httpTasks = new LinkedList<>();\n'
             '    private LinkedList<ArtworkLoadTask> artworkTasks = new LinkedList<>();\n'
-            '    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 3);\n'
-            '    private DispatchQueue cacheThumbOutQueue = new DispatchQueue("cacheThumbOutQueue");\n'
+            '    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 4);\n'
+            '    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);\n'
             '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue");\n'
             '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue");\n'
         ),
@@ -9032,8 +9037,8 @@ _PERFORMANCE_PATCH_SPECS = [
             '                URL downloadUrl = new URL(url);\n'
             '                httpConnection = org.telegram.ui.ColgramBrowserRoutes.openConnection(downloadUrl);\n'
             '                httpConnection.addRequestProperty("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 10_0 like Mac OS X) AppleWebKit/602.1.38 (KHTML, like Gecko) Version/10.0 Mobile/14A5297c Safari/602.1");\n'
-            '                httpConnection.setConnectTimeout(4500);\n'
-            '                httpConnection.setReadTimeout(6000);\n'
+            '                httpConnection.setConnectTimeout(3500);\n'
+            '                httpConnection.setReadTimeout(5000);\n'
             '                if (httpConnection instanceof HttpURLConnection) {\n'
             '                    HttpURLConnection httpURLConnection = (HttpURLConnection) httpConnection;\n'
             '                    httpURLConnection.setInstanceFollowRedirects(true);\n'
@@ -9055,8 +9060,8 @@ _PERFORMANCE_PATCH_SPECS = [
             '                        String cookies = httpURLConnection.getHeaderField("Set-Cookie");\n'
             '                        downloadUrl = new URL(newUrl);\n'
             '                        httpConnection = org.telegram.ui.ColgramBrowserRoutes.openConnection(downloadUrl);\n'
-            '                        httpConnection.setConnectTimeout(4500);\n'
-            '                        httpConnection.setReadTimeout(6000);\n'
+            '                        httpConnection.setConnectTimeout(3500);\n'
+            '                        httpConnection.setReadTimeout(5000);\n'
             '                        if (httpConnection instanceof HttpURLConnection) {\n'
             '                            ((HttpURLConnection) httpConnection).setInstanceFollowRedirects(true);\n'
             '                        }\n'
@@ -9085,8 +9090,8 @@ _PERFORMANCE_PATCH_SPECS = [
             '                URL downloadUrl = new URL(location.replace("athumb://", "https://"));\n'
             '                httpConnection = (HttpURLConnection) org.telegram.ui.ColgramBrowserRoutes.openConnection(downloadUrl);\n'
             '                //httpConnection.addRequestProperty("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 10_0 like Mac OS X) AppleWebKit/602.1.38 (KHTML, like Gecko) Version/10.0 Mobile/14A5297c Safari/602.1");\n'
-            '                httpConnection.setConnectTimeout(4500);\n'
-            '                httpConnection.setReadTimeout(6000);\n'
+            '                httpConnection.setConnectTimeout(3500);\n'
+            '                httpConnection.setReadTimeout(5000);\n'
             '                httpConnection.connect();\n'
             '                try {\n'
             '                    if (httpConnection != null) {\n'
@@ -9109,8 +9114,8 @@ _PERFORMANCE_PATCH_SPECS = [
             '                    try {\n'
             '                        httpConnection = (HttpURLConnection) org.telegram.ui.ColgramBrowserRoutes.openConnection(downloadUrl);\n'
             '                        httpConnection.addRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36");\n'
-            '                        httpConnection.setConnectTimeout(4500);\n'
-            '                        httpConnection.setReadTimeout(6000);\n'
+            '                        httpConnection.setConnectTimeout(3500);\n'
+            '                        httpConnection.setReadTimeout(5000);\n'
             '                        httpConnection.setInstanceFollowRedirects(true);\n'
             '                        if (!isCancelled()) {\n'
             '                            httpConnection.connect();\n'
@@ -9133,8 +9138,8 @@ _PERFORMANCE_PATCH_SPECS = [
             '                            try { if (httpConnection != null) httpConnection.disconnect(); } catch (Throwable ignored) {}\n'
             '                            httpConnection = (HttpURLConnection) downloadUrl.openConnection(java.net.Proxy.NO_PROXY);\n'
             '                            httpConnection.addRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36");\n'
-            '                            httpConnection.setConnectTimeout(4500);\n'
-            '                            httpConnection.setReadTimeout(6000);\n'
+            '                            httpConnection.setConnectTimeout(3500);\n'
+            '                            httpConnection.setReadTimeout(5000);\n'
             '                            httpConnection.setInstanceFollowRedirects(true);\n'
             '                            httpConnection.connect();\n'
             '                            httpConnectionStream = httpConnection.getInputStream();\n'
@@ -9174,7 +9179,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '\n'
             '                if (httpConnectionStream != null) {\n'
             '                    try {\n'
-            '                        byte[] data = new byte[1024 * 32];\n'
+            '                        byte[] data = new byte[1024 * 64];\n'
             '                        int totalLoaded = 0;\n'
             '                        while (true) {\n'
             '                            if (isCancelled()) {\n'
@@ -9351,13 +9356,17 @@ _PERFORMANCE_PATCH_SPECS = [
             '                    boolean isEncrypted = imageLocation.isEncrypted();\n'
             '                    CacheImage img = new CacheImage();\n'
             '                    boolean isAvatarRequest = parentObject instanceof TLRPC.User\n'
+            '                            || parentObject instanceof TLRPC.UserFull\n'
             '                            || parentObject instanceof TLRPC.Chat\n'
+            '                            || parentObject instanceof TLRPC.ChatFull\n'
             '                            || parentObject instanceof TLRPC.Dialog\n'
-            '                            || imageLocation.photoPeer != null;\n'
+            '                            || imageLocation.photoPeer != null\n'
+            '                            || imageLocation.thumbSize != null\n'
+            '                            || imageLocation.stickerSet != null;\n'
             '                    int effectivePriority = imageReceiver.getFileLoadingPriority();\n'
             '                    if (effectivePriority == FileLoader.PRIORITY_LOW) {\n'
             '                        img.priority = 0;\n'
-            '                    } else if (isAvatarRequest || effectivePriority >= FileLoader.PRIORITY_HIGH) {\n'
+            '                    } else if (thumb != 0 || isAvatarRequest || effectivePriority >= FileLoader.PRIORITY_HIGH) {\n'
             '                        img.priority = 2;\n'
             '                    } else {\n'
             '                        img.priority = 1;\n'
@@ -9383,7 +9392,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '                                runHttpTasks(false);\n'
             '                            }\n'
             '                        } else {\n'
-            '                            int loadingPriority = (thumb != 0 || isAvatarRequest || (imageLocation.location != null && cacheType != 10 && size <= 256 * 1024))\n'
+            '                            int loadingPriority = (thumb != 0 || isAvatarRequest || (cacheType != 10 && size > 0 && size <= 256 * 1024) || (imageLocation.location != null && cacheType != 10 && size <= 256 * 1024))\n'
             '                                    ? Math.max(FileLoader.PRIORITY_HIGH, imageReceiver.getFileLoadingPriority())\n'
             '                                    : imageReceiver.getFileLoadingPriority();\n'
             '                            if (imageLocation.location != null) {\n'
@@ -9407,7 +9416,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '        if (complete) {\n'
             '            currentHttpTasksCount--;\n'
             '        }\n'
-            '        while (currentHttpTasksCount < 8 && !httpTasks.isEmpty()) {\n'
+            '        while (currentHttpTasksCount < 12 && !httpTasks.isEmpty()) {\n'
             '            HttpImageTask task = httpTasks.poll();\n'
             '            if (task != null) {\n'
             '                task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);\n'
@@ -9429,7 +9438,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '        if (complete) {\n'
             '            currentArtworkTasksCount--;\n'
             '        }\n'
-            '        while (currentArtworkTasksCount < 8 && !artworkTasks.isEmpty()) {\n'
+            '        while (currentArtworkTasksCount < 12 && !artworkTasks.isEmpty()) {\n'
             '            try {\n'
             '                ArtworkLoadTask task = artworkTasks.poll();\n'
             '                task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);\n'
@@ -9451,7 +9460,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '                    NotificationCenter.getInstance(oldTask.currentAccount).postNotificationName(NotificationCenter.httpFileDidLoad, oldTask.url, result);\n'
             '                }\n'
             '            }\n'
-            '            while (currentHttpFileLoadTasksCount < 4 && !httpFileLoadTasks.isEmpty()) {\n'
+            '            while (currentHttpFileLoadTasksCount < 6 && !httpFileLoadTasks.isEmpty()) {\n'
             '                HttpFileTask task = httpFileLoadTasks.poll();\n'
             '                task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);\n'
             '                currentHttpFileLoadTasksCount++;\n'
@@ -9474,8 +9483,13 @@ _PERFORMANCE_PATCH_SPECS = [
             '\n'
             '    public int getFileLoadingPriority() {\n'
             '        if (fileLoadingPriority > FileLoader.PRIORITY_LOW && fileLoadingPriority < FileLoader.PRIORITY_HIGH\n'
-            '                && (currentParentObject instanceof TLRPC.User || currentParentObject instanceof TLRPC.Chat || currentParentObject instanceof TLRPC.Dialog\n'
-            '                || (currentImageLocation != null && currentImageLocation.photoPeer != null))) {\n'
+            '                && (currentParentObject instanceof TLRPC.User\n'
+            '                || currentParentObject instanceof TLRPC.UserFull\n'
+            '                || currentParentObject instanceof TLRPC.Chat\n'
+            '                || currentParentObject instanceof TLRPC.ChatFull\n'
+            '                || currentParentObject instanceof TLRPC.Dialog\n'
+            '                || (currentImageLocation != null && (currentImageLocation.photoPeer != null || currentImageLocation.thumbSize != null || currentImageLocation.stickerSet != null))\n'
+            '                || (currentThumbLocation != null && (currentThumbLocation.photoPeer != null || currentThumbLocation.thumbSize != null)))) {\n'
             '            return FileLoader.PRIORITY_HIGH;\n'
             '        }\n'
             '        return fileLoadingPriority;\n'
@@ -14054,7 +14068,9 @@ _NETWORK_SWITCH_PATCH_SPECS = [
             '        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {\n'
             '            try {\n'
             '                if (a == UserConfig.selectedAccount || UserConfig.getInstance(a).isClientActivated()) {\n'
-            '                    ConnectionsManager.getInstance(a).checkConnection();\n'
+            '                    ConnectionsManager cm = ConnectionsManager.getInstance(a);\n'
+            '                    cm.checkConnection();\n'
+            '                    cm.resumeNetworkMaybe();\n'
             '                    FileLoader.getInstance(a).onNetworkChanged(isSlow);\n'
             '                }\n'
             '            } catch (Throwable ignore) {\n'
@@ -14109,6 +14125,1946 @@ def inject_network_switch_patches(repo_path):
         full_path = os.path.join(repo_path, *rel_path.split("/"))
         _patch_file_eol(full_path, target, replacement, label)
 
+_TURBO_MESSAGING_PATCH_SPECS = [
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java',
+        'FileLoader.java turbo #1',
+        (
+            '        loadOperationPaths.put(finalFileName, operation);\n'
+            '        operation.setPriority(priority);\n'
+            '        if (stream == null) {\n'
+            '            stream = FileStreamLoadOperation.allStreams.get(documentId);\n'
+        ),
+        (
+            '        loadOperationPaths.put(finalFileName, operation);\n'
+            '        operation.setPriority(priority);\n'
+            '        if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX) {\n'
+            '            operation.setForceRequest(true);\n'
+            '        }\n'
+            '        if (stream == null) {\n'
+            '            stream = FileStreamLoadOperation.allStreams.get(documentId);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
+        'ImageLoader.java turbo #1',
+        (
+            '                            }\n'
+            '                        }\n'
+            '                    } catch (Exception e) {\n'
+            '                        FileLog.e(e);\n'
+            '                    }\n'
+            '                }\n'
+            '\n'
+            '                if (httpConnectionStream != null) {\n'
+            '                    try {\n'
+            '                        byte[] data = new byte[1024 * 32];\n'
+            '                        int totalLoaded = 0;\n'
+            '                        while (true) {\n'
+            '                            if (isCancelled()) {\n'
+            '                                break;\n'
+            '                            }\n'
+            '                            try {\n'
+            '                                int read = httpConnectionStream.read(data);\n'
+            '                                if (read > 0) {\n'
+            '                                    fileOutputStream.write(data, 0, read);\n'
+        ),
+        (
+            '                            }\n'
+            '                        }\n'
+            '                    } catch (Exception e) {\n'
+            '                        FileLog.e(e);\n'
+            '                    }\n'
+            '                }\n'
+            '\n'
+            '                if (httpConnectionStream != null) {\n'
+            '                    try {\n'
+            '                        byte[] data = new byte[1024 * 64];\n'
+            '                        int totalLoaded = 0;\n'
+            '                        while (true) {\n'
+            '                            if (isCancelled()) {\n'
+            '                                break;\n'
+            '                            }\n'
+            '                            try {\n'
+            '                                int read = httpConnectionStream.read(data);\n'
+            '                                if (read > 0) {\n'
+            '                                    fileOutputStream.write(data, 0, read);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
+        'ImageLoader.java turbo #2',
+        (
+            '                outbuf = new ByteArrayOutputStream();\n'
+            '\n'
+            '                byte[] data = new byte[1024 * 32];\n'
+            '                while (true) {\n'
+            '                    if (isCancelled()) {\n'
+        ),
+        (
+            '                outbuf = new ByteArrayOutputStream();\n'
+            '\n'
+            '                byte[] data = new byte[1024 * 64];\n'
+            '                while (true) {\n'
+            '                    if (isCancelled()) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
+        'ImageLoader.java turbo #3',
+        (
+            '                                CacheOutTask task = tasks.get(a);\n'
+            '                                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {\n'
+            '                                    cacheThumbOutQueue.postRunnable(task);\n'
+            '                                } else {\n'
+            '                                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);\n'
+        ),
+        (
+            '                                CacheOutTask task = tasks.get(a);\n'
+            '                                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {\n'
+            '                                    cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority);\n'
+            '                                } else {\n'
+            '                                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
+        'ImageLoader.java turbo #4',
+        (
+            '                        imageLoadingKeys.add(cutFilter(key));\n'
+            '                        if (thumb != 0) {\n'
+            '                            cacheThumbOutQueue.postRunnable(img.cacheTask);\n'
+            '                        } else {\n'
+            '                            img.runningTask = cacheOutQueue.postRunnable(img.cacheTask, img.priority);\n'
+        ),
+        (
+            '                        imageLoadingKeys.add(cutFilter(key));\n'
+            '                        if (thumb != 0) {\n'
+            '                            cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority);\n'
+            '                        } else {\n'
+            '                            img.runningTask = cacheOutQueue.postRunnable(img.cacheTask, img.priority);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
+        'ImageLoader.java turbo #5',
+        (
+            '                CacheOutTask task = tasks.get(a);\n'
+            '                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {\n'
+            '                    cacheThumbOutQueue.postRunnable(task);\n'
+            '                } else {\n'
+            '                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);\n'
+        ),
+        (
+            '                CacheOutTask task = tasks.get(a);\n'
+            '                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {\n'
+            '                    cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority);\n'
+            '                } else {\n'
+            '                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #1',
+        (
+            '\n'
+            '    public boolean isPushConnectionEnabled() {\n'
+            '        SharedPreferences preferences = MessagesController.getGlobalNotificationsSettings();\n'
+            '        if (preferences.contains("pushConnection")) {\n'
+            '            return preferences.getBoolean("pushConnection", true);\n'
+            '        } else {\n'
+            '            return MessagesController.getMainSettings(UserConfig.selectedAccount).getBoolean("backgroundConnection", false);\n'
+            '        }\n'
+            '    }\n'
+        ),
+        (
+            '\n'
+            '    public boolean isPushConnectionEnabled() {\n'
+            '        if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {\n'
+            '            return true;\n'
+            '        }\n'
+            '        SharedPreferences preferences = MessagesController.getGlobalNotificationsSettings();\n'
+            '        if (preferences.contains("pushConnection")) {\n'
+            '            return preferences.getBoolean("pushConnection", true);\n'
+            '        } else {\n'
+            '            return MessagesController.getMainSettings(UserConfig.selectedAccount).getBoolean("backgroundConnection", true);\n'
+            '        }\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #2',
+        (
+            '                || object instanceof TLRPC.TL_messages_sendVote;\n'
+            '    }\n'
+            '\n'
+            '    private void sendRequestInternal(TLObject object, RequestDelegate onComplete, RequestDelegateTimestamp onCompleteTimestamp, QuickAckDelegate onQuickAck, WriteToSocketDelegate onWriteToSocket, int flags, int datacenterId, int connectionType, boolean immediate, int requestToken) {\n'
+            '        if (object instanceof org.telegram.tgnet.tl.TL_account.updateStatus\n'
+            '                && !((org.telegram.tgnet.tl.TL_account.updateStatus) object).offline\n'
+        ),
+        (
+            '                || object instanceof TLRPC.TL_messages_sendVote;\n'
+            '    }\n'
+            '\n'
+            '    private static boolean colgramIsInstantSendRequest(TLObject object) {\n'
+            '        return colgramIsOnlineTriggeringRequest(object)\n'
+            '                || object instanceof TLRPC.TL_messages_addPollAnswer\n'
+            '                || object instanceof TLRPC.TL_messages_deletePollAnswer\n'
+            '                || object instanceof TLRPC.TL_messages_toggleTodoCompleted\n'
+            '                || object instanceof TLRPC.TL_messages_getBotCallbackAnswer\n'
+            '                || object instanceof TLRPC.TL_messages_uploadMedia;\n'
+            '    }\n'
+            '\n'
+            '    private void sendRequestInternal(TLObject object, RequestDelegate onComplete, RequestDelegateTimestamp onCompleteTimestamp, QuickAckDelegate onQuickAck, WriteToSocketDelegate onWriteToSocket, int flags, int datacenterId, int connectionType, boolean immediate, int requestToken) {\n'
+            '        if (object instanceof org.telegram.tgnet.tl.TL_account.updateStatus\n'
+            '                && !((org.telegram.tgnet.tl.TL_account.updateStatus) object).offline\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #3',
+        (
+            '        }\n'
+            '        final boolean colgramTriggersOnline = colgramIsOnlineTriggeringRequest(object);\n'
+            '        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot && colgramIsBotForbiddenRequest(object)) {\n'
+            '            final TLRPC.TL_error botErr = new TLRPC.TL_error();\n'
+        ),
+        (
+            '        }\n'
+            '        final boolean colgramTriggersOnline = colgramIsOnlineTriggeringRequest(object);\n'
+            '        final boolean colgramInstantWake = immediate || colgramIsInstantSendRequest(object) || (flags & RequestFlagNeedQuickAck) != 0;\n'
+            '        if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot && colgramIsBotForbiddenRequest(object)) {\n'
+            '            final TLRPC.TL_error botErr = new TLRPC.TL_error();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #4',
+        (
+            '            });\n'
+            '            return;\n'
+            '        }\n'
+            '        if (BuildVars.LOGS_ENABLED) {\n'
+        ),
+        (
+            '            });\n'
+            '            return;\n'
+            '        }\n'
+            '        if (colgramInstantWake) {\n'
+            '            if (lastPauseTime != 0 || appPaused) {\n'
+            '                resumeNetworkMaybe();\n'
+            '            }\n'
+            '            if (connectionState != ConnectionStateConnected) {\n'
+            '                checkConnection();\n'
+            '            }\n'
+            '            if (!org.colgram.core.ColgramDpiBypass.isBound()\n'
+            '                    && org.colgram.core.ColgramConfig.isBuiltinProxyEnabled()) {\n'
+            '                try {\n'
+            '                    org.colgram.core.ColgramDpiBypass.restartIfDead();\n'
+            '                } catch (Throwable ignored) {}\n'
+            '            }\n'
+            '        }\n'
+            '        if (BuildVars.LOGS_ENABLED) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #5',
+        (
+            '\n'
+            '    public void setPushConnectionEnabled(boolean value) {\n'
+            '        native_setPushConnectionEnabled(currentAccount, value);\n'
+            '    }\n'
+        ),
+        (
+            '\n'
+            '    public void setPushConnectionEnabled(boolean value) {\n'
+            '        if (!value && org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {\n'
+            '            value = true;\n'
+            '        }\n'
+            '        native_setPushConnectionEnabled(currentAccount, value);\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #6',
+        (
+            '        }\n'
+            '\n'
+            '        native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, logPath, regId, cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, enablePushConnection, ApplicationLoader.isNetworkOnline(), ApplicationLoader.getCurrentNetworkType(), SharedConfig.measureDevicePerformanceClass());\n'
+            '        checkConnection();\n'
+            '    }\n'
+        ),
+        (
+            '        }\n'
+            '\n'
+            '        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();\n'
+            '        native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, logPath, regId, cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, effectivePush, ApplicationLoader.isNetworkOnline(), ApplicationLoader.getCurrentNetworkType(), SharedConfig.measureDevicePerformanceClass());\n'
+            '        if (effectivePush) {\n'
+            '            native_setPushConnectionEnabled(currentAccount, true);\n'
+            '        }\n'
+            '        checkConnection();\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #7',
+        (
+            '        }\n'
+            '        if (appResumeCount == 0) {\n'
+            '            if (lastPauseTime == 0) {\n'
+            '                lastPauseTime = System.currentTimeMillis();\n'
+            '            }\n'
+            '            if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {\n'
+            '                try {\n'
+            '                    native_setPushConnectionEnabled(currentAccount, true);\n'
+        ),
+        (
+            '        }\n'
+            '        if (appResumeCount == 0) {\n'
+            '            if (!value && byScreenState) {\n'
+            '                if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled() || isPushConnectionEnabled()) {\n'
+            '                    try {\n'
+            '                        native_setPushConnectionEnabled(currentAccount, true);\n'
+            '                    } catch (Throwable ignored) {}\n'
+            '                }\n'
+            '                resumeNetworkMaybe();\n'
+            '                checkConnection();\n'
+            '                return;\n'
+            '            }\n'
+            '            if (lastPauseTime == 0) {\n'
+            '                lastPauseTime = System.currentTimeMillis();\n'
+            '            }\n'
+            '            if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled() || isPushConnectionEnabled()) {\n'
+            '                try {\n'
+            '                    native_setPushConnectionEnabled(currentAccount, true);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java turbo #8',
+        (
+            '            lastPauseTime = 0;\n'
+            '            native_resumeNetwork(currentAccount, false);\n'
+            '        }\n'
+            '    }\n'
+        ),
+        (
+            '            lastPauseTime = 0;\n'
+            '            native_resumeNetwork(currentAccount, false);\n'
+            '            checkConnection();\n'
+            '            if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled() || isPushConnectionEnabled()) {\n'
+            '                try {\n'
+            '                    native_setPushConnectionEnabled(currentAccount, true);\n'
+            '                } catch (Throwable ignored) {}\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java turbo #1',
+        (
+            '                    boolean isSlow = isConnectionSlow();\n'
+            '                    for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {\n'
+            '                        ConnectionsManager.getInstance(a).checkConnection();\n'
+            '                        FileLoader.getInstance(a).onNetworkChanged(isSlow);\n'
+            '                    }\n'
+            '                }\n'
+        ),
+        (
+            '                    boolean isSlow = isConnectionSlow();\n'
+            '                    for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {\n'
+            '                        if (a == UserConfig.selectedAccount || UserConfig.getInstance(a).isClientActivated()) {\n'
+            '                            ConnectionsManager cm = ConnectionsManager.getInstance(a);\n'
+            '                            cm.checkConnection();\n'
+            '                            cm.resumeNetworkMaybe();\n'
+            '                            FileLoader.getInstance(a).onNetworkChanged(isSlow);\n'
+            '                        }\n'
+            '                    }\n'
+            '                }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java turbo #2',
+        (
+            '            final BroadcastReceiver mReceiver = new ScreenReceiver();\n'
+            '            applicationContext.registerReceiver(mReceiver, filter);\n'
+            '        } catch (Exception e) {\n'
+            '            e.printStackTrace();\n'
+        ),
+        (
+            '            final BroadcastReceiver mReceiver = new ScreenReceiver();\n'
+            '            applicationContext.registerReceiver(mReceiver, filter);\n'
+            '            NotificationCenter.getGlobalInstance().addObserver((id, account, args) -> {\n'
+            '                if (id == NotificationCenter.screenStateChanged && isScreenOn) {\n'
+            '                    ensureCurrentNetworkGet(true);\n'
+            '                    refreshNetworkAndNotify();\n'
+            '                }\n'
+            '            }, NotificationCenter.screenStateChanged);\n'
+            '        } catch (Exception e) {\n'
+            '            e.printStackTrace();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java turbo #3',
+        (
+            '                if (wasInBackground) {\n'
+            '                    ensureCurrentNetworkGet(true);\n'
+            '                }\n'
+            '            }\n'
+        ),
+        (
+            '                if (wasInBackground) {\n'
+            '                    ensureCurrentNetworkGet(true);\n'
+            '                    refreshNetworkAndNotify();\n'
+            '                }\n'
+            '            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java turbo #4',
+        (
+            '            }\n'
+            '        } else {\n'
+            '            try {\n'
+            '                applicationContext.stopService(new Intent(applicationContext, NotificationsService.class));\n'
+            '            } catch (Throwable ignore) {}\n'
+            '        }\n'
+            '    }\n'
+        ),
+        (
+            '            }\n'
+            '        } else {\n'
+            '            if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {\n'
+            '                for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {\n'
+            '                    try {\n'
+            '                        if (UserConfig.getInstance(a).isClientActivated()) {\n'
+            '                            ConnectionsManager.getInstance(a).setPushConnectionEnabled(true);\n'
+            '                        }\n'
+            '                    } catch (Throwable ignored) {}\n'
+            '                }\n'
+            '            } else {\n'
+            '                try {\n'
+            '                    applicationContext.stopService(new Intent(applicationContext, NotificationsService.class));\n'
+            '                } catch (Throwable ignore) {}\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #1',
+        (
+            '            ApplicationLoader.startPushService();\n'
+            '            ConnectionsManager connectionsManager = getConnectionsManager();\n'
+            '            connectionsManager.setPushConnectionEnabled(connectionsManager.isPushConnectionEnabled());\n'
+            '        }\n'
+            '        if (storiesChanged) {\n'
+        ),
+        (
+            '            ApplicationLoader.startPushService();\n'
+            '            ConnectionsManager connectionsManager = getConnectionsManager();\n'
+            '            connectionsManager.setPushConnectionEnabled(connectionsManager.isPushConnectionEnabled() || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled());\n'
+            '        }\n'
+            '        if (storiesChanged) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #2',
+        (
+            '            long updatesStartWaitTime = updatesStartWaitTimeChannels.get(channelId);\n'
+            '            boolean gettingDifferenceChannel = gettingDifferenceChannels.get(channelId, false);\n'
+            '            if (gettingDifferenceChannel || updatesStartWaitTime == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTime) <= 1500) {\n'
+            '                if (BuildVars.LOGS_ENABLED) {\n'
+            '                    FileLog.d("ADD CHANNEL UPDATE TO QUEUE pts = " + pts + " pts_count = " + pts_count);\n'
+        ),
+        (
+            '            long updatesStartWaitTime = updatesStartWaitTimeChannels.get(channelId);\n'
+            '            boolean gettingDifferenceChannel = gettingDifferenceChannels.get(channelId, false);\n'
+            '            if (gettingDifferenceChannel || updatesStartWaitTime == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTime) <= 500) {\n'
+            '                if (BuildVars.LOGS_ENABLED) {\n'
+            '                    FileLog.d("ADD CHANNEL UPDATE TO QUEUE pts = " + pts + " pts_count = " + pts_count);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #3',
+        (
+            '                getMessagesStorage().saveDiffParams(getMessagesStorage().getLastSeqValue(), getMessagesStorage().getLastPtsValue(), getMessagesStorage().getLastDateValue(), getMessagesStorage().getLastQtsValue());\n'
+            '            } else if (getMessagesStorage().getLastPtsValue() != pts) {\n'
+            '                if (gettingDifference || updatesStartWaitTimePts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimePts) <= 1500) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d("ADD UPDATE TO QUEUE pts = " + pts + " pts_count = " + pts_count);\n'
+        ),
+        (
+            '                getMessagesStorage().saveDiffParams(getMessagesStorage().getLastSeqValue(), getMessagesStorage().getLastPtsValue(), getMessagesStorage().getLastDateValue(), getMessagesStorage().getLastQtsValue());\n'
+            '            } else if (getMessagesStorage().getLastPtsValue() != pts) {\n'
+            '                if (gettingDifference || updatesStartWaitTimePts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimePts) <= 500) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d("ADD UPDATE TO QUEUE pts = " + pts + " pts_count = " + pts_count);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #4',
+        (
+            '                getMessagesStorage().saveDiffParams(getMessagesStorage().getLastSeqValue(), getMessagesStorage().getLastPtsValue(), getMessagesStorage().getLastDateValue(), getMessagesStorage().getLastQtsValue());\n'
+            '            } else if (getMessagesStorage().getLastSeqValue() != seq) {\n'
+            '                if (gettingDifference || updatesStartWaitTimeSeq == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimeSeq) <= 1500) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d("ADD UPDATE TO QUEUE seq = " + seq);\n'
+        ),
+        (
+            '                getMessagesStorage().saveDiffParams(getMessagesStorage().getLastSeqValue(), getMessagesStorage().getLastPtsValue(), getMessagesStorage().getLastDateValue(), getMessagesStorage().getLastQtsValue());\n'
+            '            } else if (getMessagesStorage().getLastSeqValue() != seq) {\n'
+            '                if (gettingDifference || updatesStartWaitTimeSeq == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimeSeq) <= 500) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d("ADD UPDATE TO QUEUE seq = " + seq);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #5',
+        (
+            '                    long key = updatesQueueChannels.keyAt(a);\n'
+            '                    long updatesStartWaitTime = updatesStartWaitTimeChannels.valueAt(a);\n'
+            '                    if (Math.abs(currentTime - updatesStartWaitTime) >= 1500) {\n'
+            '                        if (BuildVars.LOGS_ENABLED) {\n'
+            '                            FileLog.d("QUEUE CHANNEL " + key + " UPDATES WAIT TIMEOUT - CHECK QUEUE");\n'
+        ),
+        (
+            '                    long key = updatesQueueChannels.keyAt(a);\n'
+            '                    long updatesStartWaitTime = updatesStartWaitTimeChannels.valueAt(a);\n'
+            '                    if (Math.abs(currentTime - updatesStartWaitTime) >= 500) {\n'
+            '                        if (BuildVars.LOGS_ENABLED) {\n'
+            '                            FileLog.d("QUEUE CHANNEL " + key + " UPDATES WAIT TIMEOUT - CHECK QUEUE");\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #6',
+        (
+            '\n'
+            '            for (int a = 0; a < 3; a++) {\n'
+            '                if (getUpdatesStartTime(a) != 0 && Math.abs(currentTime - getUpdatesStartTime(a)) >= 1500) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d(a + " QUEUE UPDATES WAIT TIMEOUT - CHECK QUEUE");\n'
+        ),
+        (
+            '\n'
+            '            for (int a = 0; a < 3; a++) {\n'
+            '                if (getUpdatesStartTime(a) != 0 && Math.abs(currentTime - getUpdatesStartTime(a)) >= 500) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d(a + " QUEUE UPDATES WAIT TIMEOUT - CHECK QUEUE");\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #7',
+        (
+            '            } else if (updateState == 1) {\n'
+            '                long updatesStartWaitTime = updatesStartWaitTimeChannels.get(channelId);\n'
+            '                if (updatesStartWaitTime != 0 && (anyProceed || Math.abs(System.currentTimeMillis() - updatesStartWaitTime) <= 1500)) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d("HOLE IN CHANNEL " + channelId + " UPDATES QUEUE - will wait more time");\n'
+        ),
+        (
+            '            } else if (updateState == 1) {\n'
+            '                long updatesStartWaitTime = updatesStartWaitTimeChannels.get(channelId);\n'
+            '                if (updatesStartWaitTime != 0 && (anyProceed || Math.abs(System.currentTimeMillis() - updatesStartWaitTime) <= 500)) {\n'
+            '                    if (BuildVars.LOGS_ENABLED) {\n'
+            '                        FileLog.d("HOLE IN CHANNEL " + channelId + " UPDATES QUEUE - will wait more time");\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #8',
+        (
+            '                    a--;\n'
+            '                } else if (updateState == 1) {\n'
+            '                    if (getUpdatesStartTime(type) != 0 && (anyProceed || Math.abs(System.currentTimeMillis() - getUpdatesStartTime(type)) <= 1500)) {\n'
+            '                        if (BuildVars.LOGS_ENABLED) {\n'
+            '                            FileLog.d("HOLE IN UPDATES QUEUE - will wait more time");\n'
+        ),
+        (
+            '                    a--;\n'
+            '                } else if (updateState == 1) {\n'
+            '                    if (getUpdatesStartTime(type) != 0 && (anyProceed || Math.abs(System.currentTimeMillis() - getUpdatesStartTime(type)) <= 500)) {\n'
+            '                        if (BuildVars.LOGS_ENABLED) {\n'
+            '                            FileLog.d("HOLE IN UPDATES QUEUE - will wait more time");\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #9',
+        (
+            '                        FileLog.d("need get diff short message, pts: " + getMessagesStorage().getLastPtsValue() + " " + updates.pts + " count = " + updates.pts_count);\n'
+            '                    }\n'
+            '                    if (gettingDifference || updatesStartWaitTimePts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimePts) <= 1500) {\n'
+            '                        if (updatesStartWaitTimePts == 0) {\n'
+            '                            updatesStartWaitTimePts = System.currentTimeMillis();\n'
+        ),
+        (
+            '                        FileLog.d("need get diff short message, pts: " + getMessagesStorage().getLastPtsValue() + " " + updates.pts + " count = " + updates.pts_count);\n'
+            '                    }\n'
+            '                    if (gettingDifference || updatesStartWaitTimePts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimePts) <= 500) {\n'
+            '                        if (updatesStartWaitTimePts == 0) {\n'
+            '                            updatesStartWaitTimePts = System.currentTimeMillis();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #10',
+        (
+            '                                FileLog.d(update + " need get diff, pts: " + getMessagesStorage().getLastPtsValue() + " " + updatesNew.pts + " count = " + updatesNew.pts_count);\n'
+            '                            }\n'
+            '                            if (gettingDifference || updatesStartWaitTimePts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimePts) <= 1500) {\n'
+            '                                if (updatesStartWaitTimePts == 0) {\n'
+            '                                    updatesStartWaitTimePts = System.currentTimeMillis();\n'
+        ),
+        (
+            '                                FileLog.d(update + " need get diff, pts: " + getMessagesStorage().getLastPtsValue() + " " + updatesNew.pts + " count = " + updatesNew.pts_count);\n'
+            '                            }\n'
+            '                            if (gettingDifference || updatesStartWaitTimePts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimePts) <= 500) {\n'
+            '                                if (updatesStartWaitTimePts == 0) {\n'
+            '                                    updatesStartWaitTimePts = System.currentTimeMillis();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #11',
+        (
+            '                                FileLog.d(update + " need get diff, qts: " + getMessagesStorage().getLastQtsValue() + " " + updatesNew.pts);\n'
+            '                            }\n'
+            '                            if (gettingDifference || updatesStartWaitTimeQts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimeQts) <= 1500) {\n'
+            '                                if (updatesStartWaitTimeQts == 0) {\n'
+            '                                    updatesStartWaitTimeQts = System.currentTimeMillis();\n'
+        ),
+        (
+            '                                FileLog.d(update + " need get diff, qts: " + getMessagesStorage().getLastQtsValue() + " " + updatesNew.pts);\n'
+            '                            }\n'
+            '                            if (gettingDifference || updatesStartWaitTimeQts == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimeQts) <= 500) {\n'
+            '                                if (updatesStartWaitTimeQts == 0) {\n'
+            '                                    updatesStartWaitTimeQts = System.currentTimeMillis();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #12',
+        (
+            '                                long updatesStartWaitTime = updatesStartWaitTimeChannels.get(channelId);\n'
+            '                                boolean gettingDifferenceChannel = gettingDifferenceChannels.get(channelId, false);\n'
+            '                                if (gettingDifferenceChannel || updatesStartWaitTime == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTime) <= 1500) {\n'
+            '                                    if (updatesStartWaitTime == 0) {\n'
+            '                                        updatesStartWaitTimeChannels.put(channelId, System.currentTimeMillis());\n'
+        ),
+        (
+            '                                long updatesStartWaitTime = updatesStartWaitTimeChannels.get(channelId);\n'
+            '                                boolean gettingDifferenceChannel = gettingDifferenceChannels.get(channelId, false);\n'
+            '                                if (gettingDifferenceChannel || updatesStartWaitTime == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTime) <= 500) {\n'
+            '                                    if (updatesStartWaitTime == 0) {\n'
+            '                                        updatesStartWaitTimeChannels.put(channelId, System.currentTimeMillis());\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java turbo #13',
+        (
+            '                    }\n'
+            '\n'
+            '                    if (gettingDifference || updatesStartWaitTimeSeq == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimeSeq) <= 1500) {\n'
+            '                        if (updatesStartWaitTimeSeq == 0) {\n'
+            '                            updatesStartWaitTimeSeq = System.currentTimeMillis();\n'
+        ),
+        (
+            '                    }\n'
+            '\n'
+            '                    if (gettingDifference || updatesStartWaitTimeSeq == 0 || Math.abs(System.currentTimeMillis() - updatesStartWaitTimeSeq) <= 500) {\n'
+            '                        if (updatesStartWaitTimeSeq == 0) {\n'
+            '                            updatesStartWaitTimeSeq = System.currentTimeMillis();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #1',
+        (
+            '                    final boolean scheduledOnline = scheduleDate == 0x7FFFFFFE;\n'
+            '                    final Runnable send = () -> {\n'
+            '                        getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '                            if (error == null) {\n'
+        ),
+        (
+            '                    final boolean scheduledOnline = scheduleDate == 0x7FFFFFFE;\n'
+            '                    final Runnable send = () -> {\n'
+            '                        colgramPrepareInstantSend();\n'
+            '                        getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '                            if (error == null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #2',
+        (
+            '                                });\n'
+            '                            }\n'
+            '                        }, ConnectionsManager.RequestFlagCanCompress | ConnectionsManager.RequestFlagInvokeAfter);\n'
+            '                    };\n'
+            '\n'
+        ),
+        (
+            '                                });\n'
+            '                            }\n'
+            '                        }, () -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                            for (int a1 = 0, sz = newMsgObjArr.size(); a1 < sz; a1++) {\n'
+            '                                TLRPC.Message msg = newMsgObjArr.get(a1);\n'
+            '                                if (msg.send_state == MessageObject.MESSAGE_SEND_STATE_SENDING) {\n'
+            '                                    msg.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;\n'
+            '                                    getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByAck, msg.id);\n'
+            '                                }\n'
+            '                            }\n'
+            '                        }), null, ConnectionsManager.RequestFlagCanCompress | ConnectionsManager.RequestFlagInvokeAfter | ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '                    };\n'
+            '\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #3',
+        (
+            '            }\n'
+            '        }\n'
+            '        return getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+        (
+            '            }\n'
+            '        }\n'
+            '        colgramPrepareInstantSend();\n'
+            '        return getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #4',
+        (
+            '                AndroidUtilities.runOnUIThread(() -> AlertsCreator.processError(currentAccount, error, fragment, req));\n'
+            '            }\n'
+            '        });\n'
+            '    }\n'
+            '\n'
+        ),
+        (
+            '                AndroidUtilities.runOnUIThread(() -> AlertsCreator.processError(currentAccount, error, fragment, req));\n'
+            '            }\n'
+            '        }, null, null, ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '    }\n'
+            '\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #5',
+        (
+            '\n'
+            '    private int sendEditRichMessageRequest(final TLRPC.TL_messages_editMessage req, final MessageObject messageObject, final BaseFragment fragment, final boolean onlyCheckbox) {\n'
+            '        final int reqId = getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+        (
+            '\n'
+            '    private int sendEditRichMessageRequest(final TLRPC.TL_messages_editMessage req, final MessageObject messageObject, final BaseFragment fragment, final boolean onlyCheckbox) {\n'
+            '        colgramPrepareInstantSend();\n'
+            '        final int reqId = getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #6',
+        (
+            '                }\n'
+            '            }\n'
+            '        });\n'
+            '        if (messageObject != null && messageObject.messageOwner != null) {\n'
+            '            messageObject.messageOwner.reqId = reqId;\n'
+        ),
+        (
+            '                }\n'
+            '            }\n'
+            '        }, null, null, ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '        if (messageObject != null && messageObject.messageOwner != null) {\n'
+            '            messageObject.messageOwner.reqId = reqId;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #7',
+        (
+            '        }\n'
+            '        waitingForVote.put(key, options);\n'
+            '        return getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+        (
+            '        }\n'
+            '        waitingForVote.put(key, options);\n'
+            '        colgramPrepareInstantSend();\n'
+            '        return getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #8',
+        (
+            '                    finishRunnable.run();\n'
+            '                }\n'
+            '            });\n'
+            '        });\n'
+            '    }\n'
+            '\n'
+            '    private final HashMap<Integer, Boolean> waitingForTodoUpdate = new HashMap<>();\n'
+        ),
+        (
+            '                    finishRunnable.run();\n'
+            '                }\n'
+            '            });\n'
+            '        }, null, null, ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '    }\n'
+            '\n'
+            '    private final HashMap<Integer, Boolean> waitingForTodoUpdate = new HashMap<>();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #9',
+        (
+            '            req.incompleted.add(task.id);\n'
+            '        }\n'
+            '        return getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+        (
+            '            req.incompleted.add(task.id);\n'
+            '        }\n'
+            '        colgramPrepareInstantSend();\n'
+            '        return getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #10',
+        (
+            '                    finishRunnable.run();\n'
+            '                }\n'
+            '            });\n'
+            '        });\n'
+            '    }\n'
+            '\n'
+            '    protected long getVoteSendTime(long pollId) {\n'
+        ),
+        (
+            '                    finishRunnable.run();\n'
+            '                }\n'
+            '            });\n'
+            '        }, null, null, ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '    }\n'
+            '\n'
+            '    protected long getVoteSendTime(long pollId) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #11',
+        (
+            '            return;\n'
+            '        }\n'
+            '        getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (response != null) {\n'
+        ),
+        (
+            '            return;\n'
+            '        }\n'
+            '        colgramPrepareInstantSend();\n'
+            '        getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (response != null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #12',
+        (
+            '                org.colgram.core.ColgramBotSync.sendBotReaction(currentAccount, messageObject.getDialogId(), req.msg_id, chosenEmoji, chosenCustomDocId, big, callback);\n'
+            '            }\n'
+            '        });\n'
+            '    }\n'
+            '\n'
+        ),
+        (
+            '                org.colgram.core.ColgramBotSync.sendBotReaction(currentAccount, messageObject.getDialogId(), req.msg_id, chosenEmoji, chosenCustomDocId, big, callback);\n'
+            '            }\n'
+            '        }, null, null, ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '    }\n'
+            '\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #13',
+        (
+            '            newTaskId = taskId;\n'
+            '        }\n'
+            '        getConnectionsManager().sendRequest(request, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+        (
+            '            newTaskId = taskId;\n'
+            '        }\n'
+            '        colgramPrepareInstantSend();\n'
+            '        getConnectionsManager().sendRequest(request, (response, error) -> {\n'
+            '            if (error == null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #14',
+        (
+            '                getMessagesStorage().removePendingTask(newTaskId);\n'
+            '            }\n'
+            '        });\n'
+            '    }\n'
+            '\n'
+        ),
+        (
+            '                getMessagesStorage().removePendingTask(newTaskId);\n'
+            '            }\n'
+            '        }, null, null, ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '    }\n'
+            '\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #15',
+        (
+            '                        media.video_cover = null;\n'
+            '                        req.media = media;\n'
+            '                        getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                            if (res instanceof TLRPC.TL_messageMediaDocument) {\n'
+        ),
+        (
+            '                        media.video_cover = null;\n'
+            '                        req.media = media;\n'
+            '                        colgramPrepareInstantSend();\n'
+            '                        getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                            if (res instanceof TLRPC.TL_messageMediaDocument) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #16',
+        (
+            '                                message.markAsError();\n'
+            '                            }\n'
+            '                        }));\n'
+            '                    } else if (media.video_cover == null && message.coverFile != null && message.performCoverUpload) {\n'
+            '                        final TLRPC.TL_messages_uploadMedia req = new TLRPC.TL_messages_uploadMedia();\n'
+        ),
+        (
+            '                                message.markAsError();\n'
+            '                            }\n'
+            '                        }), null, null, 0, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '                    } else if (media.video_cover == null && message.coverFile != null && message.performCoverUpload) {\n'
+            '                        final TLRPC.TL_messages_uploadMedia req = new TLRPC.TL_messages_uploadMedia();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #17',
+        (
+            '                        coverMedia.file = message.coverFile;\n'
+            '                        req.media = coverMedia;\n'
+            '                        getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                            if (res instanceof TLRPC.TL_messageMediaPhoto) {\n'
+        ),
+        (
+            '                        coverMedia.file = message.coverFile;\n'
+            '                        req.media = coverMedia;\n'
+            '                        colgramPrepareInstantSend();\n'
+            '                        getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                            if (res instanceof TLRPC.TL_messageMediaPhoto) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #18',
+        (
+            '                                message.markAsError();\n'
+            '                            }\n'
+            '                        }));\n'
+            '                    } else {\n'
+            '                        String ext = "jpg";\n'
+        ),
+        (
+            '                                message.markAsError();\n'
+            '                            }\n'
+            '                        }), null, null, 0, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '                    } else {\n'
+            '                        String ext = "jpg";\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #19',
+        (
+            '                                req.peer = peer;\n'
+            '                                req.media = finalMedia;\n'
+            '                                getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                                    if (res instanceof TLRPC.TL_messageMediaDocument) {\n'
+        ),
+        (
+            '                                req.peer = peer;\n'
+            '                                req.media = finalMedia;\n'
+            '                                colgramPrepareInstantSend();\n'
+            '                                getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                                    if (res instanceof TLRPC.TL_messageMediaDocument) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #20',
+        (
+            '                                        message.markAsError();\n'
+            '                                    }\n'
+            '                                }));\n'
+            '                            } else if (message.coverPhotoSize != null && message.coverFile != null && media != null && media.video_cover == null) {\n'
+            '                                final TLRPC.InputMedia finalMedia = media;\n'
+        ),
+        (
+            '                                        message.markAsError();\n'
+            '                                    }\n'
+            '                                }), null, null, 0, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '                            } else if (message.coverPhotoSize != null && message.coverFile != null && media != null && media.video_cover == null) {\n'
+            '                                final TLRPC.InputMedia finalMedia = media;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #21',
+        (
+            '                                req.media = coverMedia;\n'
+            '                                final String videoLocation = documentLocation;\n'
+            '                                getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                                    if (res instanceof TLRPC.TL_messageMediaPhoto) {\n'
+        ),
+        (
+            '                                req.media = coverMedia;\n'
+            '                                final String videoLocation = documentLocation;\n'
+            '                                colgramPrepareInstantSend();\n'
+            '                                getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                                    if (res instanceof TLRPC.TL_messageMediaPhoto) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #22',
+        (
+            '                                        message.markAsError();\n'
+            '                                    }\n'
+            '                                }));\n'
+            '                            } else if (message.photoSize != null) {\n'
+            '                                String location = FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE) + "/" + message.photoSize.location.volume_id + "_" + message.photoSize.location.local_id + ".jpg";\n'
+        ),
+        (
+            '                                        message.markAsError();\n'
+            '                                    }\n'
+            '                                }), null, null, 0, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '                            } else if (message.photoSize != null) {\n'
+            '                                String location = FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE) + "/" + message.photoSize.location.volume_id + "_" + message.photoSize.location.local_id + ".jpg";\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #23',
+        (
+            '                }\n'
+            '            }\n'
+            '            getConnectionsManager().sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                TLRPC.InputMedia newInputMedia = null;\n'
+        ),
+        (
+            '                }\n'
+            '            }\n'
+            '            colgramPrepareInstantSend();\n'
+            '            getConnectionsManager().sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                TLRPC.InputMedia newInputMedia = null;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #24',
+        (
+            '                    message.markAsError();\n'
+            '                }\n'
+            '            }));\n'
+            '        } else if (inputEncryptedFile != null) {\n'
+            '            TLRPC.TL_messages_sendEncryptedMultiMedia multiMedia = (TLRPC.TL_messages_sendEncryptedMultiMedia) message.sendEncryptedRequest;\n'
+        ),
+        (
+            '                    message.markAsError();\n'
+            '                }\n'
+            '            }), null, null, 0, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '        } else if (inputEncryptedFile != null) {\n'
+            '            TLRPC.TL_messages_sendEncryptedMultiMedia multiMedia = (TLRPC.TL_messages_sendEncryptedMultiMedia) message.sendEncryptedRequest;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #25',
+        (
+            '        }\n'
+            '\n'
+            '        getConnectionsManager().sendRequest(request, (response, error) -> {\n'
+            '            if (error != null && FileRefController.isFileRefError(error.text)) {\n'
+        ),
+        (
+            '        }\n'
+            '\n'
+            '        colgramPrepareInstantSend();\n'
+            '        getConnectionsManager().sendRequest(request, (response, error) -> {\n'
+            '            if (error != null && FileRefController.isFileRefError(error.text)) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #26',
+        (
+            '                }\n'
+            '            });\n'
+            '        }, null, ConnectionsManager.RequestFlagCanCompress | ConnectionsManager.RequestFlagInvokeAfter);\n'
+            '    }\n'
+            '\n'
+        ),
+        (
+            '                }\n'
+            '            });\n'
+            '        }, () -> {\n'
+            '            if (request instanceof TLRPC.TL_messages_editMessage) {\n'
+            '                return;\n'
+            '            }\n'
+            '            AndroidUtilities.runOnUIThread(() -> {\n'
+            '                for (int a = 0, size = msgObjs.size(); a < size; a++) {\n'
+            '                    TLRPC.Message msg = msgObjs.get(a).messageOwner;\n'
+            '                    if (msg.send_state == MessageObject.MESSAGE_SEND_STATE_SENDING) {\n'
+            '                        msg.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;\n'
+            '                        getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByAck, msg.id);\n'
+            '                    }\n'
+            '                }\n'
+            '            });\n'
+            '        }, null, ConnectionsManager.RequestFlagCanCompress | ConnectionsManager.RequestFlagInvokeAfter | ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '    }\n'
+            '\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #27',
+        (
+            '        return maxDelayedMessage;\n'
+            '    }\n'
+            '\n'
+            '    protected void performSendMessageRequest(final TLObject req, final MessageObject msgObj, final String originalPath, DelayedMessage parentMessage, boolean check, DelayedMessage delayedMessage, Object parentObject, HashMap<String, String> params, boolean scheduled) {\n'
+            '        if (req instanceof TLRPC.TL_messages_addPollAnswer) {\n'
+            '            TLRPC.TL_messages_addPollAnswer r = (TLRPC.TL_messages_addPollAnswer) req;\n'
+        ),
+        (
+            '        return maxDelayedMessage;\n'
+            '    }\n'
+            '\n'
+            '    private void colgramPrepareInstantSend() {\n'
+            '        ConnectionsManager connectionsManager = getConnectionsManager();\n'
+            '        if (connectionsManager.getPauseTime() != 0 || connectionsManager.getConnectionState() != ConnectionsManager.ConnectionStateConnected) {\n'
+            '            connectionsManager.resumeNetworkMaybe();\n'
+            '            connectionsManager.checkConnection();\n'
+            '        }\n'
+            '        if (org.colgram.core.ColgramConfig.isBuiltinProxyEnabled() && !org.colgram.core.ColgramDpiBypass.isBound()) {\n'
+            '            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    protected void performSendMessageRequest(final TLObject req, final MessageObject msgObj, final String originalPath, DelayedMessage parentMessage, boolean check, DelayedMessage delayedMessage, Object parentObject, HashMap<String, String> params, boolean scheduled) {\n'
+            '        if (req instanceof TLRPC.TL_messages_addPollAnswer) {\n'
+            '            TLRPC.TL_messages_addPollAnswer r = (TLRPC.TL_messages_addPollAnswer) req;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #28',
+        (
+            '                req2.peer = r.peer;\n'
+            '                req2.media = r.answer.input_media;\n'
+            '                getConnectionsManager().sendRequest(req2, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                    if (res instanceof TLRPC.TL_messageMediaDocument) {\n'
+        ),
+        (
+            '                req2.peer = r.peer;\n'
+            '                req2.media = r.answer.input_media;\n'
+            '                colgramPrepareInstantSend();\n'
+            '                getConnectionsManager().sendRequest(req2, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n'
+            '                    if (res instanceof TLRPC.TL_messageMediaDocument) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #29',
+        (
+            '                        delayedMessage.markAsError();\n'
+            '                    }\n'
+            '                }));\n'
+            '                return;\n'
+            '            }\n'
+        ),
+        (
+            '                        delayedMessage.markAsError();\n'
+            '                    }\n'
+            '                }), null, null, 0, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '                return;\n'
+            '            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #30',
+        (
+            '        }\n'
+            '\n'
+            '        newMsgObj.reqId = getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error != null && (req instanceof TLRPC.TL_messages_sendMedia || req instanceof TL_ephemeral.TL_sendMessage || req instanceof TLRPC.TL_messages_editMessage || req instanceof TLRPC.TL_messages_addPollAnswer) && FileRefController.isFileRefError(error.text)) {\n'
+        ),
+        (
+            '        }\n'
+            '\n'
+            '        colgramPrepareInstantSend();\n'
+            '        newMsgObj.reqId = getConnectionsManager().sendRequest(req, (response, error) -> {\n'
+            '            if (error != null && (req instanceof TLRPC.TL_messages_sendMedia || req instanceof TL_ephemeral.TL_sendMessage || req instanceof TLRPC.TL_messages_editMessage || req instanceof TLRPC.TL_messages_addPollAnswer) && FileRefController.isFileRefError(error.text)) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java turbo #31',
+        (
+            '            }\n'
+            '        }, () -> {\n'
+            '            final int msg_id = newMsgObj.id;\n'
+            '            AndroidUtilities.runOnUIThread(() -> {\n'
+            '                newMsgObj.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;\n'
+            '                getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByAck, msg_id);\n'
+            '            });\n'
+            '        }, ConnectionsManager.RequestFlagCanCompress | ConnectionsManager.RequestFlagInvokeAfter | (req instanceof TLRPC.TL_messages_sendMessage ? ConnectionsManager.RequestFlagNeedQuickAck : 0));\n'
+            '        if (parentMessage != null) {\n'
+            '            parentMessage.sendDelayedRequests();\n'
+        ),
+        (
+            '            }\n'
+            '        }, () -> {\n'
+            '            if (req instanceof TLRPC.TL_messages_editMessage) {\n'
+            '                return;\n'
+            '            }\n'
+            '            final int msg_id = newMsgObj.id;\n'
+            '            AndroidUtilities.runOnUIThread(() -> {\n'
+            '                if (newMsgObj.send_state == MessageObject.MESSAGE_SEND_STATE_SENDING) {\n'
+            '                    newMsgObj.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;\n'
+            '                    getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByAck, msg_id);\n'
+            '                }\n'
+            '            });\n'
+            '        }, null, ConnectionsManager.RequestFlagCanCompress | ConnectionsManager.RequestFlagInvokeAfter | ((req instanceof TLRPC.TL_messages_sendMessage || req instanceof TLRPC.TL_messages_sendMedia || req instanceof TLRPC.TL_messages_sendMultiMedia || req instanceof TLRPC.TL_messages_editMessage || req instanceof TLRPC.TL_messages_forwardMessages || req instanceof TLRPC.TL_messages_sendReaction) ? ConnectionsManager.RequestFlagNeedQuickAck : 0), ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);\n'
+            '        if (parentMessage != null) {\n'
+            '            parentMessage.sendDelayedRequests();\n'
+        ),
+    ),
+]
+
+def inject_turbo_messaging_patches(repo_path):
+    """Apply and converge instant TX/RX, push keepalive, and turbo avatar/media hunks."""
+    for rel_path, label, target, replacement in _TURBO_MESSAGING_PATCH_SPECS:
+        full_path = os.path.join(repo_path, *rel_path.split("/"))
+        _patch_file_eol(full_path, target, replacement, label)
+
+
+_CHAT_WALLPAPER_UNLOCK_PATCH_SPECS = [
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ChatThemeController.java',
+        'ChatThemeController.java per-chat wallpaper fallback',
+        (
+            '    public TLRPC.WallPaper getDialogWallpaper(long dialogId) {\n'
+            '        if (dialogId >= 0) {\n'
+            '            TLRPC.UserFull userFull = getMessagesController().getUserFull(dialogId);\n'
+            '            if (userFull != null) {\n'
+            '                return userFull.wallpaper;\n'
+            '            }\n'
+            '        } else {\n'
+            '            TLRPC.ChatFull chatFull = getMessagesController().getChatFull(-dialogId);\n'
+            '            if (chatFull != null) {\n'
+            '                return chatFull.wallpaper;\n'
+            '            }\n'
+            '        }\n'
+        ),
+        (
+            '    public TLRPC.WallPaper getDialogWallpaper(long dialogId) {\n'
+            '        if (dialogId >= 0) {\n'
+            '            TLRPC.UserFull userFull = getMessagesController().getUserFull(dialogId);\n'
+            '            if (userFull != null && userFull.wallpaper != null) {\n'
+            '                return userFull.wallpaper;\n'
+            '            }\n'
+            '        } else {\n'
+            '            TLRPC.ChatFull chatFull = getMessagesController().getChatFull(-dialogId);\n'
+            '            if (chatFull != null && chatFull.wallpaper != null) {\n'
+            '                return chatFull.wallpaper;\n'
+            '            }\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ChatThemeController.java',
+        'ChatThemeController.java clearLocalWallpaper helper',
+        (
+            '    public void clearWallpaper(long dialogId, boolean notify) {\n'
+            '        clearWallpaper(dialogId, notify, false);\n'
+            '    }\n'
+        ),
+        (
+            '    public void clearLocalWallpaper(long dialogId, boolean notify) {\n'
+            '        if (dialogId >= 0) {\n'
+            '            TLRPC.UserFull userFull = getMessagesController().getUserFull(dialogId);\n'
+            '            if (userFull != null) {\n'
+            '                userFull.wallpaper = null;\n'
+            '                userFull.flags &= ~16777216;\n'
+            '                getMessagesStorage().updateUserInfo(userFull, false);\n'
+            '            }\n'
+            '            saveChatWallpaper(dialogId, null);\n'
+            '            if (notify) {\n'
+            '                NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.userInfoDidLoad, dialogId, userFull);\n'
+            '            }\n'
+            '        } else {\n'
+            '            TLRPC.ChatFull chatFull = getMessagesController().getChatFull(-dialogId);\n'
+            '            if (chatFull != null) {\n'
+            '                chatFull.wallpaper = null;\n'
+            '                chatFull.flags2 &= ~128;\n'
+            '                getMessagesStorage().updateChatInfo(chatFull, false);\n'
+            '            }\n'
+            '            saveChatWallpaper(dialogId, null);\n'
+            '            if (notify) {\n'
+            '                NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.chatInfoDidLoad, chatFull, 0, false, false);\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    public void clearWallpaper(long dialogId, boolean notify) {\n'
+            '        clearWallpaper(dialogId, notify, false);\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java open ChatThemeBottomSheet for groups & channels',
+        (
+            '    private void showChatThemeBottomSheet() {\n'
+            '        if (currentChat != null) {\n'
+            '            if (ChatObject.isMegagroup(currentChat)) {\n'
+            '                if (ChatObject.hasAdminRights(currentChat)) {\n'
+            '                    presentFragment(new GroupColorActivity(getDialogId()).setOnApplied(ChatActivity.this));\n'
+            '                }\n'
+            '            } else {\n'
+            '                if (ChatObject.canChangeChatInfo(currentChat)) {\n'
+            '                    presentFragment(new ChannelColorActivity(getDialogId()).setOnApplied(ChatActivity.this));\n'
+            '                }\n'
+            '            }\n'
+            '            return;\n'
+            '        }\n'
+            '        chatThemeBottomSheet = new ChatThemeBottomSheet(ChatActivity.this, themeDelegate);\n'
+        ),
+        (
+            '    private void showChatThemeBottomSheet() {\n'
+            '        chatThemeBottomSheet = new ChatThemeBottomSheet(ChatActivity.this, themeDelegate);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java allow group/channel/bot wallpaper menu',
+        (
+            '        public boolean isThemeChangeAvailable(boolean canEdit) {\n'
+            '            return currentEncryptedChat == null && (\n'
+            '                (!canEdit /*|| currentChat != null && ChatObject.isChannelAndNotMegaGroup(currentChat) && ChatObject.canChangeChatInfo(currentChat)*/) ||\n'
+            '                currentChat == null && currentUser != null && !currentUser.bot\n'
+            '            );\n'
+            '        }\n'
+        ),
+        (
+            '        public boolean isThemeChangeAvailable(boolean canEdit) {\n'
+            '            return currentEncryptedChat == null && (\n'
+            '                !canEdit || currentChat != null || currentUser != null\n'
+            '            );\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java updateBackground per-chat theme precedence',
+        (
+            '        final Context bgCtx = getContext() != null ? getContext() : ApplicationLoader.applicationContext;\n'
+            '        final String videoPath = org.colgram.core.ColgramConfig.getChatVideoWallpaper(dialog_id);\n'
+            '        final String customImgPath = org.colgram.core.ColgramConfig.getChatImageWallpaper(dialog_id);\n'
+            '        final boolean hasServerChatWp = themeDelegate != null && themeDelegate.getCurrentWallpaper() != null;\n'
+            '        final int loadGen = ++colgramWallpaperLoadGen;\n'
+        ),
+        (
+            '        final Context bgCtx = getContext() != null ? getContext() : ApplicationLoader.applicationContext;\n'
+            '        final String exactVidPath = dialog_id != 0L ? org.colgram.core.ColgramConfig.getExactChatVideoWallpaper(dialog_id) : "";\n'
+            '        final String exactImgPath = dialog_id != 0L ? org.colgram.core.ColgramConfig.getExactChatImageWallpaper(dialog_id) : "";\n'
+            '        final boolean hasServerChatWp = themeDelegate != null && themeDelegate.getCurrentWallpaper() != null;\n'
+            '        final boolean hasExplicitPerChatTheme = dialog_id != 0L && themeDelegate != null\n'
+            '                && (themeDelegate.getCurrentTheme() != null || hasServerChatWp);\n'
+            '        final String videoPath = hasExplicitPerChatTheme && exactVidPath.isEmpty() && exactImgPath.isEmpty()\n'
+            '                ? ""\n'
+            '                : org.colgram.core.ColgramConfig.getChatVideoWallpaper(dialog_id);\n'
+            '        final String customImgPath = hasExplicitPerChatTheme && exactVidPath.isEmpty() && exactImgPath.isEmpty()\n'
+            '                ? ""\n'
+            '                : org.colgram.core.ColgramConfig.getChatImageWallpaper(dialog_id);\n'
+            '        final int loadGen = ++colgramWallpaperLoadGen;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java colgramResetChatWallpaperNow local group/channel clear',
+        (
+            '        if (themeDelegate != null) {\n'
+            '            if (themeDelegate.getCurrentWallpaper() != null) {\n'
+            '                ChatThemeController.getInstance(currentAccount).clearWallpaper(dialog_id, true);\n'
+            '            }\n'
+            '            if (themeDelegate.getCurrentTheme() != null) {\n'
+            '                ChatThemeController.getInstance(currentAccount).setDialogTheme(dialog_id, (TLRPC.ChatTheme) null, true);\n'
+            '                themeDelegate.setCurrentTheme(null, null, true, Theme.isCurrentThemeDark());\n'
+            '            }\n'
+            '            themeDelegate.backgroundDrawable = null;\n'
+            '        }\n'
+        ),
+        (
+            '        if (themeDelegate != null) {\n'
+            '            final boolean sendServerTheme = dialog_id > 0L && (currentUser == null || !currentUser.bot);\n'
+            '            if (themeDelegate.getCurrentWallpaper() != null) {\n'
+            '                if (sendServerTheme) {\n'
+            '                    ChatThemeController.getInstance(currentAccount).clearWallpaper(dialog_id, true);\n'
+            '                } else {\n'
+            '                    ChatThemeController.getInstance(currentAccount).clearLocalWallpaper(dialog_id, true);\n'
+            '                }\n'
+            '            }\n'
+            '            if (themeDelegate.getCurrentTheme() != null) {\n'
+            '                ChatThemeController.getInstance(currentAccount).setDialogTheme(dialog_id, (TLRPC.ChatTheme) null, sendServerTheme);\n'
+            '                themeDelegate.setCurrentTheme(null, null, true, Theme.isCurrentThemeDark());\n'
+            '            }\n'
+            '            themeDelegate.backgroundDrawable = null;\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/ChatThemeBottomSheet.java',
+        'ChatThemeBottomSheet.java skip boost check',
+        (
+            '    private ColoredImageSpan lockSpan;\n'
+            '    private void updateState(boolean animated) {\n'
+            '        TLRPC.Chat chat = chatActivity.getCurrentChat();\n'
+            '        if (chat != null) {\n'
+            '            checkBoostsLevel();\n'
+            '        }\n'
+            '        if (!dataLoaded) {\n'
+        ),
+        (
+            '    private ColoredImageSpan lockSpan;\n'
+            '    private void updateState(boolean animated) {\n'
+            '        if (!dataLoaded) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/ChatThemeBottomSheet.java',
+        'ChatThemeBottomSheet.java remove level required lock label',
+        (
+            '                if (selectedItem != null && selectedItem.chatTheme != null && selectedItem.chatTheme.showAsDefaultStub && selectedItem.chatTheme.wallpaper == null) {\n'
+            '                    applyTextView.setText(LocaleController.getString(R.string.ChatResetTheme));\n'
+            '                } else {\n'
+            '                    applyTextView.setText(LocaleController.getString(R.string.ChatApplyTheme));\n'
+            '                    if (chat != null && boostsStatus != null && boostsStatus.level < chatActivity.getMessagesController().channelWallpaperLevelMin) {\n'
+            '                        showSubText = true;\n'
+            '                        SpannableStringBuilder text = new SpannableStringBuilder("l");\n'
+            '                        if (lockSpan == null) {\n'
+            '                            lockSpan = new ColoredImageSpan(R.drawable.mini_switch_lock);\n'
+            '                            lockSpan.setTopOffset(1);\n'
+            '                        }\n'
+            '                        text.setSpan(lockSpan, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n'
+            '                        text.append(" ").append(LocaleController.formatPluralString("ReactionLevelRequiredBtn", chatActivity.getMessagesController().channelWallpaperLevelMin));\n'
+            '                        applySubTextView.setText(text);\n'
+            '                    }\n'
+            '                }\n'
+        ),
+        (
+            '                if (selectedItem != null && selectedItem.chatTheme != null && selectedItem.chatTheme.showAsDefaultStub && selectedItem.chatTheme.wallpaper == null) {\n'
+            '                    applyTextView.setText(LocaleController.getString(R.string.ChatResetTheme));\n'
+            '                } else {\n'
+            '                    applyTextView.setText(LocaleController.getString(R.string.ChatApplyTheme));\n'
+            '                }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/ChatThemeBottomSheet.java',
+        'ChatThemeBottomSheet.java applySelectedTheme local group/channel support',
+        (
+            '    private void applySelectedTheme(boolean ignoreGiftReplace) {\n'
+            '        if (checkingBoostsLevel) {\n'
+            '            return;\n'
+            '        }\n'
+            '        if (boostsStatus != null && boostsStatus.level < chatActivity.getMessagesController().channelWallpaperLevelMin) {\n'
+            '            chatActivity.getMessagesController().getBoostsController().userCanBoostChannel(chatActivity.getDialogId(), boostsStatus, canApplyBoost -> {\n'
+            '                if (getContext() == null) {\n'
+            '                    return;\n'
+            '                }\n'
+            '                LimitReachedBottomSheet limitReachedBottomSheet = new LimitReachedBottomSheet(chatActivity, getContext(), LimitReachedBottomSheet.TYPE_BOOSTS_FOR_WALLPAPER, currentAccount, resourcesProvider);\n'
+            '                limitReachedBottomSheet.setCanApplyBoost(canApplyBoost);\n'
+            '                limitReachedBottomSheet.setBoostsStats(boostsStatus, true);\n'
+            '                limitReachedBottomSheet.setDialogId(chatActivity.getDialogId());\n'
+            '                limitReachedBottomSheet.showStatisticButtonInLink(() -> {\n'
+            '                    TLRPC.Chat chat = chatActivity.getMessagesController().getChat(-chatActivity.getDialogId());\n'
+            '                    showAsSheet(StatisticActivity.create(chat));\n'
+            '                });\n'
+            '                limitReachedBottomSheet.show();\n'
+            '            });\n'
+            '            return;\n'
+            '        }\n'
+            '        Bulletin bulletin = null;\n'
+            '        EmojiThemes newTheme = selectedItem.chatTheme;\n'
+            '        if (selectedItem != null && newTheme != currentTheme) {\n'
+            '            EmojiThemes chatTheme = selectedItem.chatTheme;\n'
+            '            TLRPC.ChatTheme tlChatTheme = !chatTheme.showAsDefaultStub ? chatTheme.getChatTheme() : null;\n'
+            '            final long isBusyByUserId = chatTheme.getBusyByUserId();\n'
+            '            final TL_stars.TL_starGiftUnique gift = chatTheme.getThemeGift();\n'
+            '            if (isBusyByUserId != 0 && gift != null && !ignoreGiftReplace) {\n'
+            '                AlertsCreator.showGiftThemeApplyConfirm(getContext(), resourcesProvider,\n'
+            '                    currentAccount, gift, isBusyByUserId,\n'
+            '                    () -> applySelectedTheme(true));\n'
+            '                return;\n'
+            '            }\n'
+            '            ChatThemeController.getInstance(currentAccount).clearWallpaper(chatActivity.getDialogId(), false);\n'
+            '            ChatThemeController.getInstance(currentAccount).setDialogTheme(chatActivity.getDialogId(), tlChatTheme, true);\n'
+            '            TLRPC.WallPaper wallpaper = hasChanges() ? null : themeDelegate.getCurrentWallpaper();\n'
+            '            if (!chatTheme.showAsDefaultStub) {\n'
+            '                themeDelegate.setCurrentTheme(chatTheme, wallpaper, true, originalIsDark);\n'
+            '            } else {\n'
+            '                themeDelegate.setCurrentTheme(null, wallpaper, true, originalIsDark);\n'
+            '            }\n'
+            '            isApplyClicked = true;\n'
+            '\n'
+            '            TLRPC.User user = chatActivity.getCurrentUser();\n'
+            '            if (user != null && !user.self) {\n'
+        ),
+        (
+            '    private void applySelectedTheme(boolean ignoreGiftReplace) {\n'
+            '        Bulletin bulletin = null;\n'
+            '        EmojiThemes newTheme = selectedItem.chatTheme;\n'
+            '        if (selectedItem != null && newTheme != currentTheme) {\n'
+            '            EmojiThemes chatTheme = selectedItem.chatTheme;\n'
+            '            TLRPC.ChatTheme tlChatTheme = !chatTheme.showAsDefaultStub ? chatTheme.getChatTheme() : null;\n'
+            '            final long isBusyByUserId = chatTheme.getBusyByUserId();\n'
+            '            final TL_stars.TL_starGiftUnique gift = chatTheme.getThemeGift();\n'
+            '            if (isBusyByUserId != 0 && gift != null && !ignoreGiftReplace) {\n'
+            '                AlertsCreator.showGiftThemeApplyConfirm(getContext(), resourcesProvider,\n'
+            '                    currentAccount, gift, isBusyByUserId,\n'
+            '                    () -> applySelectedTheme(true));\n'
+            '                return;\n'
+            '            }\n'
+            '            final long dId = chatActivity.getDialogId();\n'
+            '            final TLRPC.User user = chatActivity.getCurrentUser();\n'
+            '            final boolean sendServerTheme = dId > 0L && user != null && !user.bot;\n'
+            '            org.telegram.ui.ColgramVideoWallpaperView.clearSavedWallpaper(dId, true, true);\n'
+            '            if (sendServerTheme) {\n'
+            '                ChatThemeController.getInstance(currentAccount).clearWallpaper(dId, false);\n'
+            '            } else {\n'
+            '                ChatThemeController.getInstance(currentAccount).clearLocalWallpaper(dId, false);\n'
+            '            }\n'
+            '            ChatThemeController.getInstance(currentAccount).setDialogTheme(dId, tlChatTheme, sendServerTheme);\n'
+            '            TLRPC.WallPaper wallpaper = hasChanges() ? null : themeDelegate.getCurrentWallpaper();\n'
+            '            if (!chatTheme.showAsDefaultStub) {\n'
+            '                themeDelegate.setCurrentTheme(chatTheme, wallpaper, true, originalIsDark);\n'
+            '            } else {\n'
+            '                themeDelegate.setCurrentTheme(null, wallpaper, true, originalIsDark);\n'
+            '            }\n'
+            '            isApplyClicked = true;\n'
+            '\n'
+            '            if (sendServerTheme && !user.self) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java',
+        'ThemePreviewActivity.java unlock channel/group apply button',
+        (
+            '        } else if (dialogId < 0) {\n'
+            '            TLRPC.Chat chat = getMessagesController().getChat(-dialogId);\n'
+            '            if (chat != null) {\n'
+            '                applyButton1.setText(LocaleController.formatString(R.string.ApplyWallpaperForChannel, chat.title));\n'
+            '                if (boostsStatus != null && boostsStatus.level < getCustomWallpaperLevelMin()) {\n'
+            '                    SpannableStringBuilder text = new SpannableStringBuilder("l");\n'
+            '                    if (lockSpan == null) {\n'
+            '                        lockSpan = new ColoredImageSpan(R.drawable.mini_switch_lock);\n'
+            '                        lockSpan.setTopOffset(1);\n'
+            '                    }\n'
+            '                    text.setSpan(lockSpan, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n'
+            '                    text.append(" ").append(LocaleController.formatPluralString("ReactionLevelRequiredBtn", getCustomWallpaperLevelMin()));\n'
+            '                    applyButton1.setSubText(text, animated);\n'
+            '                } else if (boostsStatus == null) {\n'
+            '                    checkBoostsLevel();\n'
+            '                } else {\n'
+            '                    applyButton1.setSubText(null, animated);\n'
+            '                }\n'
+            '            } else {\n'
+            '                applyButton1.setText(LocaleController.formatString(R.string.ApplyWallpaperForChannel, LocaleController.getString(R.string.AccDescrChannel).toLowerCase()));\n'
+            '            }\n'
+            '        } else {\n'
+        ),
+        (
+            '        } else if (dialogId < 0) {\n'
+            '            TLRPC.Chat chat = getMessagesController().getChat(-dialogId);\n'
+            '            if (chat != null) {\n'
+            '                applyButton1.setText(LocaleController.formatString(R.string.ApplyWallpaperForChannel, chat.title));\n'
+            '            } else {\n'
+            '                applyButton1.setText(LocaleController.getString(R.string.ApplyWallpaperForMe));\n'
+            '            }\n'
+            '            applyButton1.setSubText(null, animated);\n'
+            '        } else {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java',
+        'ThemePreviewActivity.java render & bypass boost gate on apply',
+        (
+            '    private void applyWallpaperBackground(boolean forBoth) {\n'
+            '        if (dialogId < 0) {\n'
+            '            if (boostsStatus != null && boostsStatus.level < getCustomWallpaperLevelMin()) {\n'
+            '                getMessagesController().getBoostsController().userCanBoostChannel(dialogId, boostsStatus, canApplyBoost -> {\n'
+            '                    if (getContext() == null) {\n'
+            '                        return;\n'
+            '                    }\n'
+            '                    LimitReachedBottomSheet limitReachedBottomSheet = new LimitReachedBottomSheet(this, getContext(), LimitReachedBottomSheet.TYPE_BOOSTS_FOR_CUSTOM_WALLPAPER, currentAccount, getResourceProvider());\n'
+            '                    limitReachedBottomSheet.setCanApplyBoost(canApplyBoost);\n'
+            '                    limitReachedBottomSheet.setBoostsStats(boostsStatus, true);\n'
+            '                    limitReachedBottomSheet.setDialogId(dialogId);\n'
+            '                    if (!insideBottomSheet()) {\n'
+            '                        limitReachedBottomSheet.showStatisticButtonInLink(() -> {\n'
+            '                            TLRPC.Chat chat = getMessagesController().getChat(-dialogId);\n'
+            '                            presentFragment(StatisticActivity.create(chat));\n'
+            '                        });\n'
+            '                    }\n'
+            '                    showDialog(limitReachedBottomSheet);\n'
+            '                });\n'
+            '                return;\n'
+            '            } else if (boostsStatus == null) {\n'
+            '                return;\n'
+            '            }\n'
+            '        }\n'
+            '        if (!getUserConfig().isPremium() && forBoth) {\n'
+        ),
+        (
+            '    private boolean colgramRenderCurrentWallpaperToFile(File outFile) {\n'
+            '        if (outFile == null) {\n'
+            '            return false;\n'
+            '        }\n'
+            '        try {\n'
+            '            int w = backgroundImage != null ? backgroundImage.getWidth() : 0;\n'
+            '            int h = backgroundImage != null ? backgroundImage.getHeight() : 0;\n'
+            '            if (w <= 0 || h <= 0) {\n'
+            '                w = AndroidUtilities.displaySize != null ? AndroidUtilities.displaySize.x : 1080;\n'
+            '                h = AndroidUtilities.displaySize != null ? AndroidUtilities.displaySize.y : 1920;\n'
+            '            }\n'
+            '            if (w <= 0 || h <= 0) {\n'
+            '                w = 1080;\n'
+            '                h = 1920;\n'
+            '            }\n'
+            '            if (w > 1080) {\n'
+            '                h = Math.max(1, Math.round(h * (1080f / w)));\n'
+            '                w = 1080;\n'
+            '            }\n'
+            '            if (h > 1920) {\n'
+            '                w = Math.max(1, Math.round(w * (1920f / h)));\n'
+            '                h = 1920;\n'
+            '            }\n'
+            '            Bitmap dst = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);\n'
+            '            Canvas canvas = new Canvas(dst);\n'
+            '            Drawable bg = backgroundImage != null ? backgroundImage.getBackground() : null;\n'
+            '            if (currentWallpaper instanceof WallpapersListActivity.ColorWallpaper) {\n'
+            '                if (backgroundGradientColor2 != 0) {\n'
+            '                    if (bg instanceof MotionBackgroundDrawable && ((MotionBackgroundDrawable) bg).getBitmap() != null) {\n'
+            '                        Bitmap mb = ((MotionBackgroundDrawable) bg).getBitmap();\n'
+            '                        Paint p = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);\n'
+            '                        canvas.drawBitmap(mb, null, new android.graphics.Rect(0, 0, w, h), p);\n'
+            '                    } else {\n'
+            '                        int[] gradColors = backgroundGradientColor3 != 0\n'
+            '                                ? new int[]{backgroundColor, backgroundGradientColor1, backgroundGradientColor2, backgroundGradientColor3}\n'
+            '                                : new int[]{backgroundColor, backgroundGradientColor1, backgroundGradientColor2};\n'
+            '                        GradientDrawable gradientDrawable = new GradientDrawable(\n'
+            '                                BackgroundGradientDrawable.getGradientOrientation(backgroundRotation), gradColors);\n'
+            '                        gradientDrawable.setBounds(0, 0, w, h);\n'
+            '                        gradientDrawable.draw(canvas);\n'
+            '                    }\n'
+            '                } else if (backgroundGradientColor1 != 0) {\n'
+            '                    GradientDrawable gradientDrawable = new GradientDrawable(\n'
+            '                            BackgroundGradientDrawable.getGradientOrientation(backgroundRotation),\n'
+            '                            new int[]{backgroundColor, backgroundGradientColor1});\n'
+            '                    gradientDrawable.setBounds(0, 0, w, h);\n'
+            '                    gradientDrawable.draw(canvas);\n'
+            '                } else if (bg != null) {\n'
+            '                    android.graphics.Rect oldBounds = new android.graphics.Rect(bg.getBounds());\n'
+            '                    bg.setBounds(0, 0, w, h);\n'
+            '                    bg.draw(canvas);\n'
+            '                    bg.setBounds(oldBounds);\n'
+            '                } else {\n'
+            '                    canvas.drawColor(backgroundColor);\n'
+            '                }\n'
+            '                if (selectedPattern != null && backgroundImage != null) {\n'
+            '                    Bitmap patternBmp = backgroundImage.getImageReceiver().getBitmap();\n'
+            '                    if (patternBmp != null) {\n'
+            '                        Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);\n'
+            '                        p.setColorFilter(new PorterDuffColorFilter(patternColor, blendMode));\n'
+            '                        p.setAlpha(Math.max(0, Math.min(255, (int) (255 * Math.abs(currentIntensity)))));\n'
+            '                        float scale = Math.max(w / (float) patternBmp.getWidth(), h / (float) patternBmp.getHeight());\n'
+            '                        float sw = patternBmp.getWidth() * scale;\n'
+            '                        float sh = patternBmp.getHeight() * scale;\n'
+            '                        float left = (w - sw) / 2f;\n'
+            '                        float top = (h - sh) / 2f;\n'
+            '                        canvas.drawBitmap(patternBmp, null, new android.graphics.RectF(left, top, left + sw, top + sh), p);\n'
+            '                    }\n'
+            '                }\n'
+            '            } else if (backgroundImage != null) {\n'
+            '                Bitmap bmp = backgroundImage.getImageReceiver().getBitmap();\n'
+            '                if (bmp != null) {\n'
+            '                    float scale = Math.max(w / (float) bmp.getWidth(), h / (float) bmp.getHeight());\n'
+            '                    float sw = bmp.getWidth() * scale;\n'
+            '                    float sh = bmp.getHeight() * scale;\n'
+            '                    float left = (w - sw) / 2f;\n'
+            '                    float top = (h - sh) / 2f;\n'
+            '                    Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);\n'
+            '                    canvas.drawBitmap(bmp, null, new android.graphics.RectF(left, top, left + sw, top + sh), p);\n'
+            '                } else if (bg != null) {\n'
+            '                    android.graphics.Rect oldBounds = new android.graphics.Rect(bg.getBounds());\n'
+            '                    bg.setBounds(0, 0, w, h);\n'
+            '                    bg.draw(canvas);\n'
+            '                    bg.setBounds(oldBounds);\n'
+            '                } else {\n'
+            '                    dst.recycle();\n'
+            '                    return false;\n'
+            '                }\n'
+            '            }\n'
+            '            if (shouldShowBrightnessControll && dimAmount > 0f && progressToDarkTheme > 0f) {\n'
+            '                canvas.drawColor(ColorUtils.setAlphaComponent(Color.BLACK, Math.max(0, Math.min(255, (int) (255 * dimAmount * progressToDarkTheme)))));\n'
+            '            }\n'
+            '            try (FileOutputStream stream = new FileOutputStream(outFile)) {\n'
+            '                boolean usePng = backgroundGradientColor2 != 0;\n'
+            '                boolean ok = dst.compress(usePng ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG, usePng ? 100 : 90, stream);\n'
+            '                stream.flush();\n'
+            '                dst.recycle();\n'
+            '                return ok && outFile.isFile() && outFile.length() > 0;\n'
+            '            }\n'
+            '        } catch (Throwable e) {\n'
+            '            FileLog.e(e);\n'
+            '            return false;\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    private void applyWallpaperBackground(boolean forBoth) {\n'
+            '        if (!getUserConfig().isPremium() && forBoth) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java',
+        'ThemePreviewActivity.java localOnlyChat flags',
+        (
+            '        boolean done;\n'
+            '        boolean sameFile = false;\n'
+            '        Theme.ThemeInfo theme = Theme.getActiveTheme();\n'
+        ),
+        (
+            '        TLRPC.User selfUser = getUserConfig().getCurrentUser();\n'
+            '        boolean isBotAccount = selfUser != null && selfUser.bot;\n'
+            '        boolean localOnlyChat = dialogId < 0 || isBotAccount;\n'
+            '\n'
+            '        boolean done;\n'
+            '        boolean sameFile = false;\n'
+            '        Theme.ThemeInfo theme = Theme.getActiveTheme();\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java',
+        'ThemePreviewActivity.java render ColorWallpaper & FileWallpaper resId',
+        (
+            '        } else if (currentWallpaper instanceof WallpapersListActivity.ColorWallpaper) {\n'
+            '            if (selectedPattern != null) {\n'
+            '                try {\n'
+            '                    WallpapersListActivity.ColorWallpaper wallPaper = (WallpapersListActivity.ColorWallpaper) currentWallpaper;\n'
+            '                    Bitmap bitmap = backgroundImage.getImageReceiver().getBitmap();\n'
+            '                    @SuppressLint("DrawAllocation")\n'
+            '                    Bitmap dst = Bitmap.createBitmap(bitmap.getWidth(), bitmap.getHeight(), Bitmap.Config.ARGB_8888);\n'
+            '                    Canvas canvas = new Canvas(dst);\n'
+            '                    if (backgroundGradientColor2 != 0) {\n'
+            '\n'
+            '                    } else if (backgroundGradientColor1 != 0) {\n'
+            '                        GradientDrawable gradientDrawable = new GradientDrawable(BackgroundGradientDrawable.getGradientOrientation(backgroundRotation), new int[]{backgroundColor, backgroundGradientColor1});\n'
+            '                        gradientDrawable.setBounds(0, 0, dst.getWidth(), dst.getHeight());\n'
+            '                        gradientDrawable.draw(canvas);\n'
+            '                    } else {\n'
+            '                        canvas.drawColor(backgroundColor);\n'
+            '                    }\n'
+            '                    Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);\n'
+            '                    paint.setColorFilter(new PorterDuffColorFilter(patternColor, blendMode));\n'
+            '                    paint.setAlpha((int) (255 * Math.abs(currentIntensity)));\n'
+            '                    canvas.drawBitmap(bitmap, 0, 0, paint);\n'
+            '\n'
+            '                    FileOutputStream stream = new FileOutputStream(toFile);\n'
+            '                    if (backgroundGradientColor2 != 0) {\n'
+            '                        dst.compress(Bitmap.CompressFormat.PNG, 100, stream);\n'
+            '                    } else {\n'
+            '                        dst.compress(Bitmap.CompressFormat.JPEG, 87, stream);\n'
+            '                    }\n'
+            '                    stream.close();\n'
+            '                    done = true;\n'
+            '                } catch (Throwable e) {\n'
+            '                    FileLog.e(e);\n'
+            '                    done = false;\n'
+            '                }\n'
+            '            } else {\n'
+            '                done = true;\n'
+            '            }\n'
+            '        } else if (currentWallpaper instanceof WallpapersListActivity.FileWallpaper) {\n'
+            '            WallpapersListActivity.FileWallpaper wallpaper = (WallpapersListActivity.FileWallpaper) currentWallpaper;\n'
+            '            if (wallpaper.resId != 0 || Theme.THEME_BACKGROUND_SLUG.equals(wallpaper.slug)) {\n'
+            '                done = true;\n'
+            '            } else {\n'
+        ),
+        (
+            '        } else if (currentWallpaper instanceof WallpapersListActivity.ColorWallpaper) {\n'
+            '            if (selectedPattern != null || localOnlyChat) {\n'
+            '                done = colgramRenderCurrentWallpaperToFile(toFile);\n'
+            '            } else {\n'
+            '                done = true;\n'
+            '            }\n'
+            '        } else if (currentWallpaper instanceof WallpapersListActivity.FileWallpaper) {\n'
+            '            WallpapersListActivity.FileWallpaper wallpaper = (WallpapersListActivity.FileWallpaper) currentWallpaper;\n'
+            '            if (wallpaper.resId != 0 || Theme.THEME_BACKGROUND_SLUG.equals(wallpaper.slug)) {\n'
+            '                done = localOnlyChat ? colgramRenderCurrentWallpaperToFile(toFile) : true;\n'
+            '            } else {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ThemePreviewActivity.java',
+        'ThemePreviewActivity.java localOnlyChat wallpaper persistence',
+        (
+            '        wallpaperInfo.forBoth = forBoth;\n'
+            '        TLRPC.User selfUser = getUserConfig().getCurrentUser();\n'
+            '        boolean isBotAccount = selfUser != null && selfUser.bot;\n'
+            '        boolean localOnlyCustomGallery = dialogId != 0 && !forBoth && path != null && path.isFile();\n'
+            '        if (!isBotAccount && !localOnlyCustomGallery) {\n'
+            '            MessagesController.getInstance(currentAccount).saveWallpaperToServer(path, wallpaperInfo, slug != null && dialogId == 0, 0);\n'
+            '        }\n'
+            '\n'
+            '        boolean needFinishFragment = true;\n'
+            '        if (done) {\n'
+            '            boolean isPhotoLikeWallpaper = (currentWallpaper instanceof WallpapersListActivity.FileWallpaper)\n'
+            '                    || (currentWallpaper instanceof MediaController.SearchImage)\n'
+            '                    || (currentWallpaper instanceof TLRPC.TL_wallPaper);\n'
+            '            if (dialogId != 0) {\n'
+            '                needFinishFragment = false;\n'
+            '                File persistSrc = isBlurred ? new File(ApplicationLoader.getFilesDirFixed(), fileName) : path;\n'
+            '                if ((persistSrc == null || !persistSrc.isFile()) && toFile != null && toFile.isFile()) {\n'
+            '                    persistSrc = toFile;\n'
+            '                }\n'
+            '                if (isBotAccount || (isPhotoLikeWallpaper && persistSrc != null && persistSrc.isFile())) {\n'
+            '                    // Persist custom photo/gallery/TL wallpaper locally so re-entering the chat ALWAYS\n'
+            '                    // renders the exact crisp photo (never solid gray on bot, offline, or non-uploaded chats)!\n'
+            '                    if (persistSrc != null && persistSrc.isFile()) {\n'
+            '                        ColgramVideoWallpaperView.copyImageAndSaveWallpaper(persistSrc, dialogId);\n'
+            '                    } else {\n'
+            '                        ColgramVideoWallpaperView.clearSavedWallpaper(dialogId, true, true);\n'
+            '                    }\n'
+            '                    if (!isBotAccount && !localOnlyCustomGallery && path != null && getMessagesController().uploadingWallpaperInfo == wallpaperInfo) {\n'
+            '                        tlwallPaper = new TLRPC.TL_wallPaper();\n'
+            '                        tlwallPaper.settings = new TLRPC.TL_wallPaperSettings();\n'
+            '                        tlwallPaper.settings.intensity = (int) (wallpaperInfo.intensity * 100);\n'
+            '                        tlwallPaper.settings.blur = wallpaperInfo.isBlurred;\n'
+            '                        tlwallPaper.settings.motion = wallpaperInfo.isMotion;\n'
+            '                        tlwallPaper.uploadingImage = path.getAbsolutePath();\n'
+            '                    }\n'
+            '                    NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.didSetNewWallpapper);\n'
+            '                } else {\n'
+        ),
+        (
+            '        wallpaperInfo.forBoth = forBoth;\n'
+            '        boolean localOnlyCustomGallery = dialogId != 0 && !forBoth && (localOnlyChat || (path != null && path.isFile()));\n'
+            '        if (!localOnlyChat && !localOnlyCustomGallery) {\n'
+            '            MessagesController.getInstance(currentAccount).saveWallpaperToServer(path, wallpaperInfo, slug != null && dialogId == 0, 0);\n'
+            '        }\n'
+            '\n'
+            '        boolean needFinishFragment = true;\n'
+            '        if (done) {\n'
+            '            boolean isPhotoLikeWallpaper = (currentWallpaper instanceof WallpapersListActivity.FileWallpaper)\n'
+            '                    || (currentWallpaper instanceof MediaController.SearchImage)\n'
+            '                    || (currentWallpaper instanceof TLRPC.TL_wallPaper)\n'
+            '                    || (localOnlyChat && currentWallpaper instanceof WallpapersListActivity.ColorWallpaper);\n'
+            '            if (dialogId != 0) {\n'
+            '                needFinishFragment = false;\n'
+            '                File persistSrc = isBlurred ? new File(ApplicationLoader.getFilesDirFixed(), fileName) : path;\n'
+            '                if ((persistSrc == null || !persistSrc.isFile()) && toFile != null && toFile.isFile()) {\n'
+            '                    persistSrc = toFile;\n'
+            '                }\n'
+            '                if (localOnlyChat || (isPhotoLikeWallpaper && persistSrc != null && persistSrc.isFile())) {\n'
+            '                    // Persist custom photo/gallery/TL/color wallpaper locally so re-entering any group,\n'
+            '                    // channel, bot, or DM ALWAYS renders the exact crisp wallpaper without server boost locks!\n'
+            '                    if (persistSrc != null && persistSrc.isFile()) {\n'
+            '                        ColgramVideoWallpaperView.copyImageAndSaveWallpaper(persistSrc, dialogId);\n'
+            '                    } else {\n'
+            '                        ColgramVideoWallpaperView.clearSavedWallpaper(dialogId, true, true);\n'
+            '                    }\n'
+            '                    if (localOnlyChat) {\n'
+            '                        ChatThemeController.getInstance(currentAccount).clearLocalWallpaper(dialogId, false);\n'
+            '                        ChatThemeController.getInstance(currentAccount).setDialogTheme(dialogId, (TLRPC.ChatTheme) null, false);\n'
+            '                    }\n'
+            '                    if (!localOnlyChat && !localOnlyCustomGallery && path != null && getMessagesController().uploadingWallpaperInfo == wallpaperInfo) {\n'
+            '                        tlwallPaper = new TLRPC.TL_wallPaper();\n'
+            '                        tlwallPaper.settings = new TLRPC.TL_wallPaperSettings();\n'
+            '                        tlwallPaper.settings.intensity = (int) (wallpaperInfo.intensity * 100);\n'
+            '                        tlwallPaper.settings.blur = wallpaperInfo.isBlurred;\n'
+            '                        tlwallPaper.settings.motion = wallpaperInfo.isMotion;\n'
+            '                        tlwallPaper.uploadingImage = path.getAbsolutePath();\n'
+            '                    }\n'
+            '                    NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.didSetNewWallpapper);\n'
+            '                } else {\n'
+        ),
+    ),
+]
+
+
+def inject_chat_wallpaper_unlock_patches(repo_path):
+    """Unlock custom per-chat wallpapers/themes in groups, channels, and bot chats."""
+    for rel_path, label, target, replacement in _CHAT_WALLPAPER_UNLOCK_PATCH_SPECS:
+        full_path = os.path.join(repo_path, *rel_path.split("/"))
+        _patch_file_eol(full_path, target, replacement, label)
+
+
 
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14149,8 +16105,10 @@ def main():
     inject_reliability_and_backup_patches(target_repo)
     inject_performance_patches(target_repo)
     inject_network_switch_patches(target_repo)
+    inject_turbo_messaging_patches(target_repo)
     from theme_repairs import patch_video_wallpaper_fixes
     patch_video_wallpaper_fixes(target_repo)
+    inject_chat_wallpaper_unlock_patches(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

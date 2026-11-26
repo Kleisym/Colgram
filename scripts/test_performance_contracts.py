@@ -199,11 +199,13 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
     def test_file_load_operation_boost_and_two_conn_abi_safety(self):
         flo = read_text(MSG / "FileLoadOperation.java")
         update_params = extract_method(flo, "private void updateParams()")
-        self.assertIn("maxDownloadRequests = 8;", update_params)
-        self.assertIn("maxDownloadRequestsBig = 8;", update_params)
-        self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 8);", update_params)
+        self.assertIn("TLRPC.TL_inputPeerPhotoFileLocation", update_params)
+        self.assertIn("totalBytesCount <= 256 * 1024", update_params)
+        self.assertIn("totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;", update_params)
+        self.assertIn("maxDownloadRequests = 12;", update_params)
+        self.assertIn("maxDownloadRequestsBig = 12;", update_params)
+        self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);", update_params)
         self.assertIn("downloadChunkSizeBig = 1024 * 512;", update_params)
-        self.assertIn("totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64", update_params)
         self.assertNotIn("maxDownloadRequests = boost ? 6 : 8;", update_params)
         # Prebuilt libtmessages.49.so uses DOWNLOAD_CONNECTIONS_COUNT == 2
         self.assertNotIn("waitingDownloadSize = new int[4]", flo)
@@ -213,34 +215,55 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         fl = read_text(MSG / "FileLoader.java")
         load_int = extract_method(fl, "private FileLoadOperation loadFileInternal(")
         self.assertIn("parentObject instanceof TLRPC.User", load_int)
+        self.assertIn("parentObject instanceof TLRPC.UserFull", load_int)
+        self.assertIn("parentObject instanceof TLRPC.Chat", load_int)
+        self.assertIn("parentObject instanceof TLRPC.ChatFull", load_int)
         self.assertIn("imageLocation.photoPeer != null", load_int)
+        self.assertIn("imageLocation.thumbSize != null", load_int)
+        self.assertIn("imageLocation.stickerSet != null", load_int)
         self.assertIn("locationSize <= 256 * 1024", load_int)
         self.assertIn("priority = PRIORITY_HIGH;", load_int)
+        self.assertIn("operation.setForceRequest(true);", load_int)
 
         ir = read_text(MSG / "ImageReceiver.java")
         get_prio = extract_method(ir, "public int getFileLoadingPriority()")
         self.assertIn("currentParentObject instanceof TLRPC.User", get_prio)
+        self.assertIn("currentParentObject instanceof TLRPC.UserFull", get_prio)
+        self.assertIn("currentParentObject instanceof TLRPC.ChatFull", get_prio)
+        self.assertIn("currentImageLocation.thumbSize != null", get_prio)
+        self.assertIn("currentImageLocation.stickerSet != null", get_prio)
+        self.assertIn("currentThumbLocation != null", get_prio)
         self.assertIn("return FileLoader.PRIORITY_HIGH;", get_prio)
 
         fpq = read_text(MSG / "FileLoaderPriorityQueue.java")
-        self.assertIn("type == TYPE_LARGE ? 6 : 12", fpq)
-        self.assertIn("isDownloadSpeedBoostEnabled() ? 4 : 20", fpq)
+        self.assertIn("type == TYPE_LARGE ? 8 : 24", fpq)
+        self.assertIn("isDownloadSpeedBoostEnabled() ? 1 : 20", fpq)
 
     def test_image_loader_parallel_decode_and_http_concurrency(self):
         il = read_text(MSG / "ImageLoader.java")
-        self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il)
+        self.assertIn('new DispatchQueuePriority("cacheOutQueue", 4)', il)
+        self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il)
+        self.assertIn("cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority)", il)
+        self.assertIn("cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority)", il)
         self.assertIn("ThreadLocal<byte[]> header = new ThreadLocal<>()", il)
         self.assertIn("ThreadLocal<byte[]> headerThumb = new ThreadLocal<>()", il)
         self.assertIn("public synchronized SparseArray<File> createMediaPaths()", il)
-        self.assertIn("currentHttpTasksCount < 8", il)
-        self.assertIn("currentArtworkTasksCount < 8", il)
-        self.assertIn("currentHttpFileLoadTasksCount < 4", il)
-        self.assertIn("new byte[1024 * 32]", il)
-        self.assertIn("setConnectTimeout(4500)", il)
-        self.assertIn("setReadTimeout(6000)", il)
+        self.assertIn("currentHttpTasksCount < 12", il)
+        self.assertIn("currentArtworkTasksCount < 12", il)
+        self.assertIn("currentHttpFileLoadTasksCount < 6", il)
+        self.assertIn("new byte[1024 * 64]", il)
+        self.assertNotIn("new byte[1024 * 32]", il)
+        self.assertIn("setConnectTimeout(3500)", il)
+        self.assertIn("setReadTimeout(5000)", il)
+        self.assertNotIn("setConnectTimeout(4500)", il)
+        self.assertNotIn("setReadTimeout(6000)", il)
         self.assertIn("maxSize = unlimited ? 30 : 24;", il)
         self.assertIn("maxSize = unlimited ? 15 : 12;", il)
         self.assertIn("img.priority = 2;", il)
+        self.assertIn("parentObject instanceof TLRPC.UserFull", il)
+        self.assertIn("parentObject instanceof TLRPC.ChatFull", il)
+        self.assertIn("imageLocation.thumbSize != null", il)
+        self.assertIn("imageLocation.stickerSet != null", il)
 
         cache_task = extract_method(il, "private class CacheOutTask implements Runnable")
         self.assertIn("runningThread = null;", cache_task)
@@ -342,6 +365,131 @@ class ThemeCacheAndDialogsAdapterContractsTest(unittest.TestCase):
             ok2 = mod._patch_file_eol(str(lf_file), "    int x = 1;\n", "    int x = 2;\n", "eol test")
             self.assertTrue(ok2)
             self.assertEqual(lf_file.read_bytes(), b"class A {\n    int x = 2;\n}\n")
+
+
+class TurboMessagingAndPushContractsTest(unittest.TestCase):
+    def test_send_messages_helper_instant_tx_and_nonblocking_bypass_wake(self):
+        sm = read_text(MSG / "SendMessagesHelper.java")
+        prep = extract_method(sm, "private void colgramPrepareInstantSend()")
+        self.assertIn("connectionsManager.getPauseTime() != 0", prep)
+        self.assertIn("connectionsManager.resumeNetworkMaybe()", prep)
+        self.assertIn("connectionsManager.checkConnection()", prep)
+        self.assertIn("!org.colgram.core.ColgramDpiBypass.isBound()", prep)
+        self.assertIn("Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead)", prep)
+        self.assertNotIn("Thread.sleep", prep)
+
+        perf_send = extract_method(sm, "protected void performSendMessageRequest(")
+        self.assertIn("colgramPrepareInstantSend();", perf_send)
+        self.assertIn("ConnectionsManager.ConnectionTypeGeneric, true);", perf_send)
+        self.assertIn("if (req instanceof TLRPC.TL_messages_editMessage)", perf_send)
+        self.assertIn("TLRPC.TL_messages_sendReaction", perf_send)
+        self.assertIn("ConnectionsManager.RequestFlagNeedQuickAck", perf_send)
+
+        perf_multi = extract_method(sm, "protected void performSendMessageRequestMulti(")
+        self.assertIn("colgramPrepareInstantSend();", perf_multi)
+        self.assertIn("ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);", perf_multi)
+
+        for method_sig in (
+            "public int editMessage(",
+            "private int sendEditRichMessageRequest(",
+            "public int sendVote(",
+            "public int toggleTodo(",
+            "public void sendReaction(",
+            "public void sendGame(",
+        ):
+            body = extract_method(sm, method_sig)
+            self.assertIn("colgramPrepareInstantSend();", body, method_sig)
+            self.assertIn("ConnectionsManager.RequestFlagNeedQuickAck, ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true);", body, method_sig)
+
+    def test_connections_manager_instant_wake_push_keepalive_and_jni_abi(self):
+        cm = read_text(ROOT / "Telegram-Src/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java")
+        self.assertIn(
+            "public static native void native_sendRequest(int currentAccount, long object, int flags, int datacenterId, int connectionType, boolean immediate, int requestToken);",
+            cm,
+        )
+        push_fn = extract_method(cm, "public boolean isPushConnectionEnabled()")
+        self.assertIn("ColgramConfig.isAlwaysBackgroundEnabled()", push_fn)
+        self.assertIn('getBoolean("backgroundConnection", true)', push_fn)
+
+        set_push = extract_method(cm, "public void setPushConnectionEnabled(boolean value)")
+        self.assertIn("ColgramConfig.isAlwaysBackgroundEnabled()", set_push)
+
+        init_fn = extract_method(cm, "public void init(")
+        self.assertIn("boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();", init_fn)
+        self.assertIn("native_setPushConnectionEnabled(currentAccount, true);", init_fn)
+
+        paused_fn = extract_method(cm, "public void setAppPaused(")
+        self.assertIn("if (!value && byScreenState)", paused_fn)
+        self.assertIn("resumeNetworkMaybe();", paused_fn)
+        self.assertIn("native_resumeNetwork(currentAccount, false);", paused_fn)
+        self.assertIn("checkConnection();", paused_fn)
+        self.assertIn("isPushConnectionEnabled()", paused_fn)
+
+        send_internal = extract_method(cm, "private void sendRequestInternal(")
+        self.assertIn("colgramInstantWake", send_internal)
+        self.assertIn("colgramIsInstantSendRequest(object)", send_internal)
+        self.assertIn("!org.colgram.core.ColgramDpiBypass.isBound()", send_internal)
+
+    def test_application_loader_and_messages_controller_fast_sync(self):
+        al = read_text(MSG / "ApplicationLoader.java")
+        self.assertIn("NotificationCenter.screenStateChanged", al)
+        self.assertIn("cm.resumeNetworkMaybe();", al)
+        refresh_fn = extract_method(al, "private static void refreshNetworkAndNotify()")
+        self.assertIn("cm.checkConnection();", refresh_fn)
+        self.assertIn("cm.resumeNetworkMaybe();", refresh_fn)
+        fg_fn = extract_method(al, "public void onActivityStarted(")
+        self.assertIn("refreshNetworkAndNotify();", fg_fn)
+        push_svc = extract_method(al, "public static void startPushService()")
+        self.assertIn("ColgramConfig.isAlwaysBackgroundEnabled()", push_svc)
+        self.assertIn("setPushConnectionEnabled(true)", push_svc)
+
+        mc = read_text(MSG / "MessagesController.java")
+        self.assertIn("connectionsManager.isPushConnectionEnabled() || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()", mc)
+        self.assertIn("updatesStartWaitTime) <= 500", mc)
+        self.assertIn("updatesStartWaitTimePts) <= 500", mc)
+        self.assertIn("updatesStartWaitTimeSeq) <= 500", mc)
+        self.assertIn("updatesStartWaitTimeQts) <= 500", mc)
+        self.assertNotIn("updatesStartWaitTime) <= 1500", mc)
+        self.assertNotIn("updatesStartWaitTimePts) <= 1500", mc)
+        self.assertNotIn("updatesStartWaitTimeSeq) <= 1500", mc)
+        self.assertNotIn("updatesStartWaitTimeQts) <= 1500", mc)
+        self.assertNotIn("updatesStartWaitTime) >= 1500", mc)
+        self.assertNotIn("getUpdatesStartTime(a)) >= 1500", mc)
+        self.assertNotIn("getUpdatesStartTime(type)) <= 1500", mc)
+
+    def test_apply_patches_registers_and_converges_turbo_messaging_patches(self):
+        import importlib.util
+        import shutil
+        import tempfile
+
+        ap = ROOT / "scripts/apply-patches.py"
+        src = read_text(ap)
+        self.assertIn("def inject_turbo_messaging_patches(repo_path):", src)
+        self.assertIn("inject_turbo_messaging_patches(target_repo)", src.split("def main():", 1)[1])
+
+        spec = importlib.util.spec_from_file_location("apply_patches_turbo_mod", ap)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        owned_rels = {rel for rel, _, _, _ in mod._TURBO_MESSAGING_PATCH_SPECS} | {
+            "TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java",
+            "TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java",
+            "TMessagesProj/src/main/java/org/telegram/messenger/ImageReceiver.java",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_tg = Path(tmp) / "Telegram-Src"
+            for rel in owned_rels:
+                src_file = ROOT / "Telegram-Src" / rel
+                dst_file = tmp_tg / rel
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+            mod.PATCH_MISSES.clear()
+            for rel, label, target, replacement in mod._PERFORMANCE_PATCH_SPECS:
+                if rel in owned_rels:
+                    mod._patch_file_eol(str(tmp_tg / rel), target, replacement, label)
+            mod.inject_network_switch_patches(str(tmp_tg))
+            mod.inject_turbo_messaging_patches(str(tmp_tg))
+            self.assertEqual(mod.PATCH_MISSES, [])
 
 
 if __name__ == "__main__":
