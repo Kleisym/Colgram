@@ -31,6 +31,8 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
     private final String host;
     private final int targetPort;
     private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.CountDownLatch acceptExited = new java.util.concurrent.CountDownLatch(1);
+    private volatile Thread acceptThread;
     private volatile boolean closed;
 
     public ColgramLocalTcpFront(String host, int port) throws IOException {
@@ -39,12 +41,19 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
         this.host = host;
         this.targetPort = port;
         listener = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
-        IO.execute(this::accept);
+        try {
+            IO.execute(this::accept);
+        } catch (Throwable rejected) {
+            acceptExited.countDown();
+            close();
+            throw rejected;
+        }
     }
 
     public int port() { return closed ? 0 : listener.getLocalPort(); }
 
     private void accept() {
+        acceptThread = Thread.currentThread();
         try {
             while (!closed) {
                 Socket client = listener.accept();
@@ -59,7 +68,10 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
                 }
             }
         } catch (IOException ignored) {
-        } finally { close(); }
+        } finally {
+            close();
+            acceptExited.countDown();
+        }
     }
 
     private void relay(Socket client) {
@@ -174,6 +186,10 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
     @Override public void close() {
         closed = true;
         try { listener.close(); } catch (IOException ignored) {}
+        if (Thread.currentThread() != acceptThread) {
+            try { acceptExited.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
         for (Socket socket : sockets) closeSocket(socket);
         sockets.clear();
     }
