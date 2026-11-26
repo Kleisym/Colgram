@@ -13,7 +13,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.widget.Toast;
-import androidx.core.content.FileProvider;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -96,9 +95,17 @@ public class ColgramUpdater {
 
                 JSONObject release = null;
                 if (resp.code == 200) {
-                    release = new JSONObject(resp.body);
-                } else if (resp.code == 404 || resp.code == 403) {
-                    // Repository may publish only pre-releases (CI tags) with no "latest" pointer.
+                    JSONObject cand = new JSONObject(resp.body);
+                    if (hasMatchingEditionApkAsset(cand.optJSONArray("assets"))) {
+                        release = cand;
+                    }
+                } else if (resp.code != 404 && resp.code != 403) {
+                    final int code = resp.code;
+                    mainHandler.post(() -> callback.onError("Server returned code " + code));
+                    return;
+                }
+                if (release == null) {
+                    // Repository may publish pre-releases (CI tags) or /latest without matching-edition APK.
                     ColgramHttp.Response listResp = ColgramHttp.get(
                             "https://api.github.com/repos/" + repo + "/releases?per_page=10");
                     if (listResp.code == 200) {
@@ -107,7 +114,7 @@ public class ColgramUpdater {
                             JSONObject cand = arr.optJSONObject(i);
                             if (cand == null) continue;
                             JSONArray assets = cand.optJSONArray("assets");
-                            if (assets != null && hasApkAsset(assets)) {
+                            if (assets != null && hasMatchingEditionApkAsset(assets)) {
                                 release = cand;
                                 break;
                             }
@@ -117,10 +124,6 @@ public class ColgramUpdater {
                         mainHandler.post(() -> callback.onError("Server returned code " + listCode));
                         return;
                     }
-                } else {
-                    final int code = resp.code;
-                    mainHandler.post(() -> callback.onError("Server returned code " + code));
-                    return;
                 }
 
                 if (release == null) {
@@ -136,27 +139,32 @@ public class ColgramUpdater {
                 if (release.has("assets")) {
                     JSONArray assets = release.getJSONArray("assets");
                     java.util.HashMap<String, String> shaByName = new java.util.HashMap<>();
+                    String shaSumsUrl = null;
                     for (int i = 0; i < assets.length(); i++) {
                         JSONObject asset = assets.optJSONObject(i);
                         if (asset == null) continue;
                         String name = asset.optString("name", "");
                         String dl = asset.optString("browser_download_url", "");
-                        if (name.endsWith(".apk") && !dl.isEmpty()) {
+                        if (dl.isEmpty()) continue;
+                        String low = name.toLowerCase(java.util.Locale.US);
+                        if (low.endsWith(".apk")) {
                             apkAssets.add(new ColgramUpdatePolicy.ApkAsset(name, dl));
-                        } else if (name.endsWith(".sha256") && !dl.isEmpty()) {
-                            shaByName.put(name, dl);
-                            if (shaAssetUrl == null) shaAssetUrl = dl;
+                        } else if (low.endsWith(".sha256")) {
+                            shaByName.put(low, dl);
+                        } else if ("sha256sums.txt".equals(low)) {
+                            shaSumsUrl = dl;
                         }
                     }
                     ColgramUpdatePolicy.ApkAsset preBest = ColgramUpdatePolicy.pickBestApkAsset(
-                            apkAssets, Build.SUPPORTED_ABIS);
-                    if (preBest != null && shaByName.containsKey(preBest.name + ".sha256")) {
-                        shaAssetUrl = shaByName.get(preBest.name + ".sha256");
+                            apkAssets, Build.SUPPORTED_ABIS, ColgramBuildFlags.KOLITI_ENABLED);
+                    if (preBest != null) {
+                        String exactKey = (preBest.name + ".sha256").toLowerCase(java.util.Locale.US);
+                        shaAssetUrl = shaByName.containsKey(exactKey) ? shaByName.get(exactKey) : shaSumsUrl;
                     }
                 }
 
                 ColgramUpdatePolicy.ApkAsset bestApk = ColgramUpdatePolicy.pickBestApkAsset(
-                        apkAssets, Build.SUPPORTED_ABIS);
+                        apkAssets, Build.SUPPORTED_ABIS, ColgramBuildFlags.KOLITI_ENABLED);
                 String apkDownloadUrl = bestApk != null ? bestApk.downloadUrl : null;
 
                 if (apkDownloadUrl != null && isNewerTag(tagName, currentVersion)) {
@@ -223,18 +231,19 @@ public class ColgramUpdater {
         });
     }
 
-    private static boolean hasApkAsset(JSONArray assets) {
+    private static boolean hasMatchingEditionApkAsset(JSONArray assets) {
         if (assets == null) return false;
+        List<ColgramUpdatePolicy.ApkAsset> apks = new ArrayList<>();
         for (int i = 0; i < assets.length(); i++) {
             JSONObject asset = assets.optJSONObject(i);
             if (asset == null) continue;
             String name = asset.optString("name", "");
             String dl = asset.optString("browser_download_url", "");
-            if (name.endsWith(".apk") && !dl.isEmpty()) {
-                return true;
+            if (name.toLowerCase(java.util.Locale.US).endsWith(".apk") && !dl.isEmpty()) {
+                apks.add(new ColgramUpdatePolicy.ApkAsset(name, dl));
             }
         }
-        return false;
+        return ColgramUpdatePolicy.pickBestApkAsset(apks, Build.SUPPORTED_ABIS, ColgramBuildFlags.KOLITI_ENABLED) != null;
     }
 
     public static int[] parseSemver(String version) {
@@ -322,7 +331,7 @@ public class ColgramUpdater {
                         success = statusCol >= 0 && cursor.getInt(statusCol) == DownloadManager.STATUS_SUCCESSFUL;
                     }
                 } catch (Exception ignored) {
-                    success = true;
+                    success = false;
                 }
 
                 final File dlDir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
@@ -427,11 +436,7 @@ public class ColgramUpdater {
             intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                Uri contentUri = FileProvider.getUriForFile(
-                        context,
-                        context.getPackageName() + ".provider",
-                        apkFile
-                );
+                Uri contentUri = resolveFileProviderUri(context, apkFile);
                 intent.setDataAndType(contentUri, "application/vnd.android.package-archive");
             } else {
                 intent.setDataAndType(Uri.fromFile(apkFile), "application/vnd.android.package-archive");
@@ -439,6 +444,24 @@ public class ColgramUpdater {
             context.startActivity(intent);
         } catch (Throwable t) {
             Toast.makeText(context, "Не удалось запустить установщик: " + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private static Uri resolveFileProviderUri(Context context, File apkFile) throws Exception {
+        try {
+            Class<?> fpClass = Class.forName("androidx.core.content.FileProvider");
+            java.lang.reflect.Method method = fpClass.getMethod(
+                    "getUriForFile", Context.class, String.class, File.class);
+            Object uri = method.invoke(null, context, context.getPackageName() + ".provider", apkFile);
+            if (!(uri instanceof Uri)) {
+                throw new IllegalStateException("FileProvider returned null URI");
+            }
+            return (Uri) uri;
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            Throwable cause = ite.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            if (cause instanceof Error) throw (Error) cause;
+            throw ite;
         }
     }
 }

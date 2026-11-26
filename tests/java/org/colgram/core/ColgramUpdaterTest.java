@@ -122,11 +122,49 @@ public final class ColgramUpdaterTest {
         }
     }
 
+    private static void testDualEditionAssetAndShaSelection() {
+        java.util.List<ColgramUpdatePolicy.ApkAsset> dualAssets = java.util.Arrays.asList(
+                new ColgramUpdatePolicy.ApkAsset("Colgram-12.10.6-Koliti.apk", "https://example.com/Colgram-12.10.6-Koliti.apk"),
+                new ColgramUpdatePolicy.ApkAsset("Colgram-12.10.6.apk", "https://example.com/Colgram-12.10.6.apk")
+        );
+        String[] abis = new String[]{"arm64-v8a", "armeabi-v7a"};
+
+        ColgramUpdatePolicy.ApkAsset mainPick = ColgramUpdatePolicy.pickBestApkAsset(dualAssets, abis, false);
+        check(mainPick != null && "Colgram-12.10.6.apk".equals(mainPick.name),
+                "Main edition must select Main APK, got: " + (mainPick == null ? "null" : mainPick.name));
+
+        ColgramUpdatePolicy.ApkAsset kolitiPick = ColgramUpdatePolicy.pickBestApkAsset(dualAssets, abis, true);
+        check(kolitiPick != null && "Colgram-12.10.6-Koliti.apk".equals(kolitiPick.name),
+                "Koliti edition must select Koliti APK, got: " + (kolitiPick == null ? "null" : kolitiPick.name));
+
+        java.util.List<ColgramUpdatePolicy.ApkAsset> onlyKoliti = java.util.Collections.singletonList(
+                new ColgramUpdatePolicy.ApkAsset("Colgram-12.10.6-Koliti.apk", "https://example.com/Colgram-12.10.6-Koliti.apk")
+        );
+        check(ColgramUpdatePolicy.pickBestApkAsset(onlyKoliti, abis, false) == null,
+                "Main edition must not auto-switch to Koliti-only release");
+
+        java.util.List<ColgramUpdatePolicy.ApkAsset> onlyMain = java.util.Collections.singletonList(
+                new ColgramUpdatePolicy.ApkAsset("Colgram-12.10.6.apk", "https://example.com/Colgram-12.10.6.apk")
+        );
+        check(ColgramUpdatePolicy.pickBestApkAsset(onlyMain, abis, true) == null,
+                "Koliti edition must not silently downgrade to Main-only release");
+
+        String shaMain = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        String shaKoliti = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        String sums = shaMain + "  Colgram-12.10.6.apk\n"
+                + shaKoliti + "  Colgram-12.10.6-Koliti.apk\n";
+        check(shaMain.equals(ColgramUpdatePolicy.extractSha256FromText(sums, "Colgram-12.10.6.apk")),
+                "SHA256SUMS main lookup mismatch");
+        check(shaKoliti.equals(ColgramUpdatePolicy.extractSha256FromText(sums, "Colgram-12.10.6-Koliti.apk")),
+                "SHA256SUMS koliti lookup mismatch");
+    }
+
     public static void main(String[] args) throws Exception {
         testParseAndCompareSemver();
         testIsNewerTag();
         testSha256Helpers();
         testAbiSelectionAndUpstreamCompare();
+        testDualEditionAssetAndShaSelection();
         System.out.println("ColgramUpdaterTest: PASS");
     }
 }

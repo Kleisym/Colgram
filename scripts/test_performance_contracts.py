@@ -51,7 +51,7 @@ class BypassConcurrencyAndNoSleepContractsTest(unittest.TestCase):
             r"SYSTEM_WIDE_CLIENT_CAP\s*=\s*256\b",
             r"HANDSHAKE_SLOTS\s*=\s*new\s+java\.util\.concurrent\.Semaphore\(\s*96\s*\)",
             r"DIAL_GROUPS\s*=\s*new\s+java\.util\.concurrent\.Semaphore\(\s*28\s*\)",
-            r"MAX_ACTIVE_SESSIONS\s*=\s*192\b",
+            r"MAX_ACTIVE_SESSIONS\s*=\s*160\b",
             r"REJECT_RETRY_DELAY_MS\s*=\s*120L\b",
             r"CONNECT_FAILURE_BASE_DELAY_MS\s*=\s*1200L\b",
             r"CONNECT_FAILURE_MAX_DELAY_MS\s*=\s*15000L\b",
@@ -84,9 +84,9 @@ class BypassConcurrencyAndNoSleepContractsTest(unittest.TestCase):
         self.assertIn("ColgramTelegramWsBridge.dialWithConnectedSocket(probe, destHost, isMedia)", l3_race)
         self.assertIn("tuneSocketBuffers(probe);", l3_race)
 
-        # Parallel Telegram + RU whitelist SYN probes
+        # Parallel Telegram + RU whitelist SYN probes (on dedicated dialRacePool)
         wl = extract_method(dpi, "public static boolean probeStrictL3WhitelistStatus(")
-        self.assertIn("executeWorker(", wl)
+        self.assertIn("executeDialRace(", wl)
         self.assertIn("CountDownLatch", wl)
 
         # Hot WS pipes use batched feed*ToSession and drop hot-loop WS_C2S_CHUNK debug logging
@@ -121,8 +121,8 @@ class BypassConcurrencyAndNoSleepContractsTest(unittest.TestCase):
         self.assertIn("flushIfDrained(in, out);", front)
 
         remap = read_text(CORE / "ColgramDcRemap.java")
-        self.assertIn("SOCKET_BUFFER_BYTES = 262144", remap)
-        self.assertIn("STREAM_COPY_BUFFER_BYTES = 65536", remap)
+        self.assertNotIn("SOCKET_BUFFER_BYTES = 262144", remap)
+        self.assertIn("STREAM_COPY_BUFFER_BYTES = 32768", remap)
         self.assertIn("flushIfDrained(in, out);", remap)
 
         native = read_text(CORE / "ColgramNativeDesync.java")
@@ -200,12 +200,15 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         flo = read_text(MSG / "FileLoadOperation.java")
         update_params = extract_method(flo, "private void updateParams()")
         self.assertIn("TLRPC.TL_inputPeerPhotoFileLocation", update_params)
-        self.assertIn("totalBytesCount <= 256 * 1024", update_params)
-        self.assertIn("totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;", update_params)
-        self.assertIn("maxDownloadRequests = 12;", update_params)
-        self.assertIn("maxDownloadRequestsBig = 12;", update_params)
-        self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);", update_params)
-        self.assertIn("downloadChunkSizeBig = 1024 * 512;", update_params)
+        self.assertIn("TLRPC.TL_inputStickerSetThumb", update_params)
+        self.assertIn("TLRPC.TL_inputPhotoFileLocation", update_params)
+        self.assertIn("!allowDisordererFileSave", update_params)
+        self.assertIn("totalBytesCount < 256 * 1024", update_params)
+        self.assertIn("downloadChunkSize = isSmallOrThumbOrAvatar ? 1024 * 32 : 1024 * 128;", update_params)
+        self.assertIn("downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;", update_params)
+        self.assertIn("maxDownloadRequests = 4;", update_params)
+        self.assertIn("maxDownloadRequestsBig = 6;", update_params)
+        self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);", update_params)
         self.assertNotIn("maxDownloadRequests = boost ? 6 : 8;", update_params)
         # Prebuilt libtmessages.49.so uses DOWNLOAD_CONNECTIONS_COUNT == 2
         self.assertNotIn("waitingDownloadSize = new int[4]", flo)
@@ -214,15 +217,9 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
     def test_avatar_priority_elevation_and_queue_slots(self):
         fl = read_text(MSG / "FileLoader.java")
         load_int = extract_method(fl, "private FileLoadOperation loadFileInternal(")
-        self.assertIn("parentObject instanceof TLRPC.User", load_int)
-        self.assertIn("parentObject instanceof TLRPC.UserFull", load_int)
-        self.assertIn("parentObject instanceof TLRPC.Chat", load_int)
-        self.assertIn("parentObject instanceof TLRPC.ChatFull", load_int)
-        self.assertIn("imageLocation.photoPeer != null", load_int)
-        self.assertIn("imageLocation.thumbSize != null", load_int)
-        self.assertIn("imageLocation.stickerSet != null", load_int)
-        self.assertIn("locationSize <= 256 * 1024", load_int)
-        self.assertIn("priority = PRIORITY_HIGH;", load_int)
+        self.assertNotIn("priority = PRIORITY_HIGH;", load_int)
+        self.assertNotIn("operation.setForceRequest(priority > 0);", load_int)
+        self.assertIn("if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX)", load_int)
         self.assertIn("operation.setForceRequest(true);", load_int)
 
         ir = read_text(MSG / "ImageReceiver.java")
@@ -236,13 +233,14 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         self.assertIn("return FileLoader.PRIORITY_HIGH;", get_prio)
 
         fpq = read_text(MSG / "FileLoaderPriorityQueue.java")
-        self.assertIn("type == TYPE_LARGE ? 8 : 24", fpq)
+        self.assertIn("type == TYPE_LARGE ? 3 : 6", fpq)
         self.assertIn("isDownloadSpeedBoostEnabled() ? 1 : 20", fpq)
 
     def test_image_loader_parallel_decode_and_http_concurrency(self):
         il = read_text(MSG / "ImageLoader.java")
-        self.assertIn('new DispatchQueuePriority("cacheOutQueue", 4)', il)
-        self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il)
+        self.assertIn('new DispatchQueuePriority("cacheOutQueue", 2)', il)
+        self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 1)', il)
+        self.assertIn("colgramLottiePrecacheLock", il)
         self.assertIn("cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority)", il)
         self.assertIn("cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority)", il)
         self.assertIn("ThreadLocal<byte[]> header = new ThreadLocal<>()", il)
@@ -317,7 +315,8 @@ class ThemeCacheAndDialogsAdapterContractsTest(unittest.TestCase):
     def test_chat_cell_aero_power_guard_and_wallpaper_caches(self):
         msg_cell = read_text(UI / "Cells/ChatMessageCell.java")
         self.assertIn("colgramReplyCacheBg", msg_cell)
-        self.assertIn("!colgramPendingDeleteAnims.isEmpty()", msg_cell)
+        self.assertIn("colgramHasPendingDeleteAnim(", msg_cell)
+        self.assertIn("colgramConsumePendingDeleteAnim(", msg_cell)
         self.assertIn("COLGRAM_SHARED_WHITE_CHECK_FILTER", msg_cell)
         self.assertIn("colgramSharedCheckTintFilter", msg_cell)
         self.assertIn("colgramSyncCheckDrawable(", msg_cell)

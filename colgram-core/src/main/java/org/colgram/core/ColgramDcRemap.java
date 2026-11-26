@@ -170,8 +170,7 @@ public final class ColgramDcRemap {
 
     // ---------------------------------------------------------------------- socket plumbing
 
-    private static final int SOCKET_BUFFER_BYTES = 262144;
-    private static final int STREAM_COPY_BUFFER_BYTES = 65536;
+    private static final int STREAM_COPY_BUFFER_BYTES = 32768;
     private static final java.util.concurrent.Semaphore CLIENT_SLOTS =
             new java.util.concurrent.Semaphore(96);
     private static final java.util.concurrent.ExecutorService REMAP_POOL =
@@ -313,7 +312,7 @@ public final class ColgramDcRemap {
             long openedAt = System.currentTimeMillis();
             long upstreamBytes = pipe(client, upstream, FIRST_BYTE_MS);
             long lived = System.currentTimeMillis() - openedAt;
-            if (upstreamBytes < MIN_ANSWER_BYTES || lived < MIN_TUNNEL_MS) {
+            if (upstreamBytes < MIN_ANSWER_BYTES) {
                 // Not a server that can carry a session. Two things have to be true of a real API
                 // address, and both are read off traffic tgnet generates anyway: it answers the
                 // handshake with at least one MTProto message (the smallest one Telegram sends is
@@ -950,8 +949,6 @@ public final class ColgramDcRemap {
         if (s == null) return;
         try { s.setTcpNoDelay(true); } catch (Throwable ignored) {}
         try { s.setKeepAlive(true); } catch (Throwable ignored) {}
-        try { s.setReceiveBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
-        try { s.setSendBufferSize(SOCKET_BUFFER_BYTES); } catch (Throwable ignored) {}
     }
 
     private static void flushIfDrained(InputStream in, OutputStream out) throws IOException {

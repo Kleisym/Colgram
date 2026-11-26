@@ -137,8 +137,8 @@ public class ColgramBootJobService extends JobService {
             boolean canSkipInBackground = !ColgramUiBridge.isAppInForeground()
                     && !ColgramForegroundService.hasConfiguredBotTokens()
                     && ColgramDpiBypass.isBound()
-                    && (ColgramProxyManager.isTelegramConnected()
-                        || ColgramDpiBypass.bytesFromTarget() > 0);
+                    && ColgramProxyManager.isTelegramConnected()
+                    && ColgramDpiBypass.hasRecentRxWithin(180_000L);
             if (canSkipInBackground) {
                 jobFinished(params, false);
                 return false;

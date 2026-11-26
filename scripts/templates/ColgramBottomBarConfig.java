@@ -20,6 +20,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramConfig;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
@@ -174,10 +175,14 @@ public final class ColgramBottomBarConfig {
         return "+" + count + " доп. · " + getPageCount() + " стр.";
     }
 
+    private static boolean isButtonAvailable(ButtonDef def) {
+        return def != null && (ColgramBuildFlags.KOLITI_ENABLED || !"koliti".equals(def.id));
+    }
+
     public static ButtonDef findDef(String id) {
         if (id == null) return null;
         for (ButtonDef def : ALL_BUTTONS) {
-            if (def.id.equals(id)) return def;
+            if (def.id.equals(id) && isButtonAvailable(def)) return def;
         }
         return null;
     }
@@ -243,7 +248,9 @@ public final class ColgramBottomBarConfig {
 
         switch (id) {
             case "koliti":
-                ColgramAiSheet.show(hostFragment, null, null);
+                if (ColgramBuildFlags.KOLITI_ENABLED) {
+                    ColgramAiSheet.show(hostFragment, null, null);
+                }
                 break;
             case "saved": {
                 long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
@@ -302,7 +309,7 @@ public final class ColgramBottomBarConfig {
         final List<String> current = getEnabledIds();
         final boolean[] checked = new boolean[ALL_BUTTONS.length];
         for (int i = 0; i < ALL_BUTTONS.length; i++) {
-            checked[i] = current.contains(ALL_BUTTONS[i].id);
+            checked[i] = isButtonAvailable(ALL_BUTTONS[i]) && current.contains(ALL_BUTTONS[i].id);
         }
 
         final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
@@ -379,6 +386,7 @@ public final class ColgramBottomBarConfig {
         for (int i = 0; i < ALL_BUTTONS.length; i++) {
             final int idx = i;
             final ButtonDef def = ALL_BUTTONS[i];
+            if (!isButtonAvailable(def)) continue;
             LinearLayout row = new LinearLayout(act);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
@@ -461,9 +469,11 @@ public final class ColgramBottomBarConfig {
         });
 
         popularQuickBtn.setOnClickListener(v -> {
-            List<String> pop = Arrays.asList("koliti", "saved", "proxy", "ghost");
+            List<String> pop = ColgramBuildFlags.KOLITI_ENABLED
+                    ? Arrays.asList("koliti", "saved", "proxy", "ghost")
+                    : Arrays.asList("saved", "proxy", "ghost", "colgram");
             for (int i = 0; i < ALL_BUTTONS.length; i++) {
-                checked[i] = pop.contains(ALL_BUTTONS[i].id);
+                checked[i] = isButtonAvailable(ALL_BUTTONS[i]) && pop.contains(ALL_BUTTONS[i].id);
                 if (rowSyncs[i] != null) rowSyncs[i].run();
             }
             updateHeaderMeta.run();
@@ -483,7 +493,7 @@ public final class ColgramBottomBarConfig {
         saveBtn.setOnClickListener(v -> {
             ArrayList<String> selected = new ArrayList<>();
             for (int i = 0; i < ALL_BUTTONS.length; i++) {
-                if (checked[i]) selected.add(ALL_BUTTONS[i].id);
+                if (checked[i] && isButtonAvailable(ALL_BUTTONS[i])) selected.add(ALL_BUTTONS[i].id);
             }
             setEnabledIds(selected);
             if (onApplied != null) onApplied.run();

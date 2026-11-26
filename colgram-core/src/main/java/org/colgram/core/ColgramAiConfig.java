@@ -35,6 +35,7 @@ public final class ColgramAiConfig {
     private static final String KEY_VOICE_SPEECH_RATE = "voice_speech_rate";
     private static final String KEY_VOICE_PITCH = "voice_pitch";
     private static final String KEY_EMBEDDED_CORE_REV = "embedded_core_rev";
+    private static final String DEFAULT_MODEL_ID = "koliti-core-ultra";
 
     private ColgramAiConfig() {}
 
@@ -59,9 +60,23 @@ public final class ColgramAiConfig {
     }
 
     public static String getActiveModelId(Context ctx) {
-        if (ctx == null) return ColgramAiModels.KOLITI_MODEL_ID;
-        String saved = prefs(ctx).getString(KEY_MODEL_ID, ColgramAiModels.KOLITI_MODEL_ID);
-        return ColgramAiModels.findById(saved).id;
+        if (ctx == null) return DEFAULT_MODEL_ID;
+        String saved = prefs(ctx).getString(KEY_MODEL_ID, DEFAULT_MODEL_ID);
+        if (!ColgramBuildFlags.KOLITI_ENABLED) {
+            return saved != null && !saved.isEmpty() ? saved : DEFAULT_MODEL_ID;
+        }
+        try {
+            Object spec = Class.forName("org.colgram.core.ColgramAiModels")
+                    .getMethod("findById", String.class)
+                    .invoke(null, saved);
+            if (spec != null) {
+                Object id = spec.getClass().getField("id").get(spec);
+                if (id instanceof String && !((String) id).isEmpty()) {
+                    return (String) id;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return saved != null && !saved.isEmpty() ? saved : DEFAULT_MODEL_ID;
     }
 
     public static void setActiveModelId(Context ctx, String modelId) {

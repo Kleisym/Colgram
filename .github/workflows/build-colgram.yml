@@ -1,20 +1,23 @@
-name: Build Colgram (Automated Privacy Telegram)
+name: Build Colgram (Dual-APK Privacy Telegram)
 
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'config/telegram-native.json'
+      - 'README.md'
+      - 'docs/**'
   workflow_dispatch:
     inputs:
       telegram_version:
-        description: 'Telegram Upstream Tag or Branch (default: master / latest)'
+        description: 'Telegram Upstream Tag or Branch (default: pinned / latest)'
         required: false
         default: 'latest'
       release_label:
-        description: 'Optional label appended to the release name (e.g. "12.10.3-fixview")'
+        description: 'Optional label appended to the release name (e.g. "Stable")'
         required: false
         default: ''
   schedule:
-    # Check for upstream Telegram updates daily at 04:00 UTC
     - cron: '0 4 * * *'
 
 permissions:
@@ -22,10 +25,16 @@ permissions:
 
 jobs:
   build:
-    name: Build & Publish Colgram APK
+    name: Build & Verify Dual Colgram APKs
     runs-on: ubuntu-latest
 
     steps:
+      - name: Free Runner Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/android/sdk/ndk/25* /usr/local/lib/android/sdk/ndk/26* || true
+          df -h
+
       - name: Checkout Colgram Mod Repository
         uses: actions/checkout@v4
 
@@ -42,6 +51,10 @@ jobs:
 
       - name: Set up Gradle Cache
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Host JVM Verification
+        run: |
+          python3 scripts/host_verify.py --jvm-tests --android-sdk "$ANDROID_HOME"
 
       - name: Clone Telegram Upstream (Official Base)
         run: |
@@ -62,18 +75,13 @@ jobs:
           fi
           cd Telegram-Src
           git submodule update --init --depth 1 TMessagesProj_Modules/media TMessagesProj/lib/jlatexmath
-          # Record the real upstream Telegram base version (from gradle.properties APP_VERSION_NAME)
-          # instead of a short git commit SHA so ColgramUpdater semver comparison works even on cron/latest builds.
           RAW_VER=$(grep '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2 | tr -d '\r' | sed 's/-colgram.*//')
           TAG_VER=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
           UPSTREAM_TAG="${RAW_VER:-$TAG_VER}"
-          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
-          echo "UPSTREAM_REF=$TAG_VER" >> $GITHUB_ENV
+          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> "$GITHUB_ENV"
+          echo "UPSTREAM_REF=$TAG_VER" >> "$GITHUB_ENV"
+          echo "REQUESTED_TAG=$TARGET_VERSION" >> "$GITHUB_ENV"
           echo "Base Telegram Version: $UPSTREAM_TAG (ref: $TAG_VER)"
-
-          # Keep the requested tag separately from the resolved one, so the release
-          # notes can show both what was asked for and what was actually checked out.
-          echo "REQUESTED_TAG=$TARGET_VERSION" >> $GITHUB_ENV
 
       - name: Ensure Android SDK Platforms & Licenses
         run: |
@@ -94,27 +102,21 @@ jobs:
             fi
           fi
 
-      - name: Apply Colgram Core & Surgical Patches
-        # COLGRAM_BUILD_STAMP makes every release identifiable on a phone. Without it all
-        # builds share one versionName and it is impossible to tell what a device is running.
-        # The patcher exits non-zero if any injection failed, so a release can no longer ship
-        # with silently missing features.
+      - name: Apply Patches (Main APK — No Koliti)
         env:
+          COLGRAM_KOLITI: "0"
           COLGRAM_BUILD_STAMP: "ci${{ github.run_number }}"
         run: |
-          python3 scripts/apply-patches.py Telegram-Src
-
-      - name: Audit Privacy & Check for Trackers
-        run: |
+          python3 scripts/apply-patches.py Telegram-Src --no-koliti
           python3 scripts/verify-privacy.py Telegram-Src
 
-      - name: Build Colgram APK
+      - name: Build Main APK (Universal 4-ABI, Zero Koliti)
         run: |
           cd Telegram-Src
           chmod +x gradlew
           INIT_SCRIPT="$GITHUB_WORKSPACE/.github/gradle/ci-maven-mirror.init.gradle"
           for attempt in 1 2; do
-            echo "Gradle build attempt $attempt/2..."
+            echo "Main Gradle build attempt $attempt/2..."
             if ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease \
               --init-script "$INIT_SCRIPT" \
               --build-cache --parallel --max-workers=4 \
@@ -123,231 +125,305 @@ jobs:
               -Dorg.gradle.internal.http.socketTimeout=120000; then
               exit 0
             fi
-            echo "Gradle attempt $attempt failed; waiting 15s before retry..."
+            echo "Main Gradle attempt $attempt failed; waiting 15s before retry..."
             sleep 15
           done
           exit 1
 
-      - name: Verify Core Compilation & Host Security/Update JVM Tests
-        run: |
-          python3 scripts/host_verify.py --jvm-tests --android-sdk "$ANDROID_HOME"
-
-      - name: Audit the built APK for trackers
-        # The source audit above cannot catch what it does not look at. Firebase reached every
-        # release for the same reason: it is contributed by the google-services Gradle plugin
-        # during manifest merging, so no source file contains the string, and the script also
-        # runs in advisory mode (no --strict) so findings never failed a build.
-        #
-        # What is checked here is REGISTRATION, not class presence. The firebase-messaging
-        # dependency still ships its classes, and that is inert — Telegram's own code references
-        # FirebaseMessaging, so the jar cannot simply be dropped. What made it a beacon was
-        # FirebaseInitProvider being merged into the manifest plus an explicit
-        # FirebaseApp.initializeApp() call, both of which Colgram now removes. A dex grep for
-        # class names would therefore fail on every build while telling us nothing.
-        run: |
-          APK=$(find Telegram-Src -name "app.apk" -path "*afat/release*" | head -n 1)
-          if [ -z "$APK" ]; then echo "::error::No APK to audit"; exit 1; fi
-          BT=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n 1)
-          MANIFEST=$("$BT" dump xmltree --file AndroidManifest.xml "$APK")
-          status=0
-          # Components that must NOT be live. Each of these starts network traffic at process
-          # creation without any call site of ours.
-          for comp in com.google.firebase.provider.FirebaseInitProvider \
-                      com.google.android.gms.measurement.AppMeasurementReceiver \
-                      com.microsoft.appcenter \
-                      io.sentry \
-                      com.huawei.hms.push; do
-            if echo "$MANIFEST" | grep -qa "$comp"; then
-              echo "::error::$comp is registered in the shipped manifest"
-              status=1
-            else
-              echo "clean (not registered): $comp"
-            fi
-          done
-          # Analytics and Crashlytics were removed outright, so their classes SHOULD be absent.
-          mkdir -p /tmp/dexaudit && unzip -o -q "$APK" 'classes*.dex' -d /tmp/dexaudit
-          for pat in com/google/firebase/crashlytics com/google/android/gms/firebase com/appcenter/android sdk/io/sentry; do
-            if grep -qal -- "$pat" /tmp/dexaudit/classes*.dex 2>/dev/null; then
-              echo "::error::tracker classes present: $pat"
-              status=1
-            else
-              echo "clean (no classes): $pat"
-            fi
-          done
-          rm -rf /tmp/dexaudit
-          exit $status
-
-      # Runs whether or not signing will. The signing step's own log is not always retrievable
-      # afterwards, so this states what the runner actually holds as a workflow annotation, which
-      # the API returns with the run and needs no log download.
-      - name: Report the signing material
-        if: always()
-        env:
-          KEYSTORE_B64: ${{ secrets.COLGRAM_KEYSTORE_B64 }}
-          KEYSTORE_PASS: ${{ secrets.COLGRAM_KEYSTORE_PASS }}
-          KEY_ALIAS: ${{ secrets.COLGRAM_KEY_ALIAS }}
-        run: |
-          # Written as annotations, not log lines: a workflow log is not retrievable from the API
-          # once the run is over on every network tried here, while an annotation comes back with
-          # /check-runs/{id}/annotations and always can be.
-          echo "::notice title=signing secret::length $(printf '%s' "$KEYSTORE_B64" | wc -c) bytes, password $(printf '%s' "$KEYSTORE_PASS" | wc -c) bytes, alias '$KEY_ALIAS'"
-          if printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > /tmp/ks.probe 2>/dev/null; then
-            SIZE=$(stat -c%s /tmp/ks.probe)
-            MAGIC=$(head -c 2 /tmp/ks.probe | od -An -tx1 | tr -d ' \n')
-            echo "::notice title=signing decode::OK, $SIZE bytes, first bytes ${MAGIC}"
-            if keytool -list -keystore /tmp/ks.probe -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
-              echo "::notice title=signing open::opens with the stored password, default type"
-            elif keytool -list -keystore /tmp/ks.probe -storetype PKCS12 -storepass "$KEYSTORE_PASS" >/dev/null 2>&1; then
-              echo "::notice title=signing open::opens as PKCS12 only, so the default type is wrong"
-            else
-              echo "::error title=signing open::the keystore does not open with the stored password"
-            fi
-          else
-            echo "::error title=signing decode::base64 rejected the secret"
-          fi
-          rm -f /tmp/ks.probe
-
-      - name: Sign APK (Production / Self-Signed)
-        # The secrets come in through env, not through ${{ }} interpolation.
-        #
-        # GitHub substitutes ${{ }} into the run script itself, and a 5 KB base64 blob does not
-        # survive that: the runner executed
-        #
-        #   echo "***" | base64 -d > colgram.keystore
-        #   base64: invalid input
-        #
-        # - the log masks the value, and the masked form is what actually reached the shell.
-        # env: passes the value to the process untouched; only echo of it is masked, which is
-        # what masking is for.
+      - name: Audit, Zipalign & Sign Main APK
         env:
           KEYSTORE_B64: ${{ secrets.COLGRAM_KEYSTORE_B64 }}
           KEYSTORE_PASS: ${{ secrets.COLGRAM_KEYSTORE_PASS }}
           KEY_PASS: ${{ secrets.COLGRAM_KEY_PASS }}
           KEY_ALIAS: ${{ secrets.COLGRAM_KEY_ALIAS }}
         run: |
-          # The signing identity MUST be constant across releases. It used to be generated
-          # fresh here with `keytool -genkey`, so every run produced a DIFFERENT certificate -
-          # which made upgrade-in-place impossible (Android refuses an update signed by a
-          # different key, so users had to uninstall and lose their local chats), contradicted
-          # the release notes that promised in-place upgrades, and broke the anonymity story by
-          # making each release a new application identity.
-          #
-          # The keystore is now a repository secret, base64-encoded. Set it once with:
-          #   base64 -w0 colgram.keystore   # paste into secret COLGRAM_KEYSTORE_B64
-          # and keep the alias/password secrets alongside it.
-          if [ -z "$KEYSTORE_B64" ]; then
-            echo "::error::COLGRAM_KEYSTORE_B64 is not set. Refusing to publish a build with a throwaway signing key."
-            exit 1
-          fi
-          # Length only. A base64 keystore is a fixed size, so this distinguishes a truncated
-          # secret from an intact one without printing anything that could be reconstructed.
-          echo "secret length: $(printf '%s' "$KEYSTORE_B64" | wc -c) bytes"
-          # Strip CR and LF before decoding. A secret carried across a Windows editor or a copy
-          # through a web form can arrive with either, and while GNU base64 ignores newlines, the
-          # 76-column wrapping some tools produce also inserts them mid-stream where a decoder
-          # reading a single line will not. Removing both is harmless and makes the input one
-          # continuous stream whatever produced it.
-          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > colgram.keystore
-          # Length and round-trip check before signing, so a truncated or mis-encoded secret says
-          # what is actually wrong instead of surfacing as an apksigner error about a keystore that
-          # never arrived. The size is printed, never the value.
-          echo "keystore bytes: $(stat -c%s colgram.keystore)"
-          if [ "$(stat -c%s colgram.keystore)" -lt 1000 ]; then
-            echo "::error::keystore decoded to $(stat -c%s colgram.keystore) bytes - the secret did not arrive intact."
-            echo "::error::the env value was $(printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | wc -c) characters."
-            exit 1
-          fi
-          # Which format actually arrived, stated as an annotation rather than a log line, because
-          # the step's log is not always retrievable afterwards. A PKCS12 file begins with the
-          # ASN.1 SEQUENCE tag 30 82; a JKS one begins with the magic feedfeed. When --ks-type and
-          # the file disagree apksigner reports it as a keystore problem and nothing else, so the
-          # two bytes here say which of the two it was.
-          MAGIC=$(head -c 2 colgram.keystore | od -An -tx1 | tr -d ' \n')
-          echo "::notice title=keystore format::first bytes ${MAGIC}, size $(stat -c%s colgram.keystore)"
-          APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
-          echo "Using apksigner at: $APKSIGNER"
-          
-          # Find unsigned APK
-          UNSIGNED_APK=$(find Telegram-Src -name "*afat*release*.apk" | head -n 1)
-          if [ -z "$UNSIGNED_APK" ]; then
-            UNSIGNED_APK=$(find Telegram-Src/TMessagesProj_AppStandalone/build/outputs/apk -name "*.apk" | head -n 1)
-          fi
-          if [ -z "$UNSIGNED_APK" ]; then
-            UNSIGNED_APK=$(find Telegram-Src -name "*.apk" | head -n 1)
-          fi
-          echo "Target APK: $UNSIGNED_APK"
-          
-          if [ -n "$UNSIGNED_APK" ] && [ -f "$UNSIGNED_APK" ]; then
-            $APKSIGNER sign --ks colgram.keystore \
-              --ks-type PKCS12 \
-              --ks-pass "pass:$KEYSTORE_PASS" \
-              --key-pass "pass:$KEY_PASS" \
-              --ks-key-alias "$KEY_ALIAS" \
-              --out colgram-signed-release.apk "$UNSIGNED_APK"
-            rm -f colgram.keystore
-            # Fail the release if the certificate drifted: a silent identity change is the
-            # exact bug this step used to introduce on every single run.
-            # SHA-256 of the self-signed certificate in the COLGRAM_KEYSTORE_B64 secret.
-            # Regenerate with:
-            #   keytool -exportcert -keystore colgram.keystore -storepass "$PASS" -alias colgram \
-            #           -file cert.cer && sha256sum cert.cer
-            # and update this line in the same commit as a new keystore - otherwise the signing
-            # step refuses the build, which is the point: an identity change must be deliberate,
-            # because Android refuses an in-place upgrade signed by a different key and every
-            # user would lose their local chats.
-            EXPECTED="3c5326960d586b6906a7ab09f7f3039f2385c0c5f8190527614569169e132d41"
-            ACTUAL=$($APKSIGNER verify --print-certs colgram-signed-release.apk | grep -a "certificate SHA-256 digest" | awk '{print $NF}')
-            if [ "$ACTUAL" != "$EXPECTED" ]; then
-              echo "::error::Signing certificate changed. Expected $EXPECTED, got $ACTUAL."
-              exit 1
+          set -euo pipefail
+          APK=$(find Telegram-Src -name "app.apk" -path "*afat/release*" | head -n 1)
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then echo "::error::No Main APK found"; exit 1; fi
+          BT_AAPT=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n 1)
+          MANIFEST=$("$BT_AAPT" dump xmltree --file AndroidManifest.xml "$APK")
+          status=0
+          for comp in com.google.firebase.provider.FirebaseInitProvider \
+                      com.google.android.gms.measurement.AppMeasurementReceiver \
+                      com.microsoft.appcenter \
+                      io.sentry \
+                      com.huawei.hms.push; do
+            if echo "$MANIFEST" | grep -qa "$comp"; then
+              echo "::error::$comp is registered in Main manifest"
+              status=1
             fi
-            echo "Successfully signed with the expected Colgram identity: $ACTUAL"
-          else
-            echo "No APK found to sign!"
+          done
+          mkdir -p /tmp/dexaudit_main && unzip -o -q "$APK" 'classes*.dex' -d /tmp/dexaudit_main
+          for pat in com/google/firebase/crashlytics com/google/android/gms/firebase com/appcenter/android sdk/io/sentry \
+                     org/colgram/core/ColgramAiEngine org/colgram/core/ColgramNativeLlama org/colgram/core/ColgramKolitiVoice; do
+            if grep -qal -- "$pat" /tmp/dexaudit_main/classes*.dex 2>/dev/null; then
+              echo "::error::Forbidden classes present in Main APK DEX: $pat"
+              status=1
+            fi
+          done
+          rm -rf /tmp/dexaudit_main
+          python3 -c '
+          import sys, zipfile
+          forbidden = ("libcolgram_llama.so", "libsherpa-onnx-jni.so", "libomp.so", ".gguf", "assets/koliti", "res/raw/koliti_", "sherpa-onnx")
+          with zipfile.ZipFile(sys.argv[1]) as zf:
+              bad = [n for n in zf.namelist() if any(f in n.lower() for f in forbidden)]
+          if bad:
+              print("::error::Koliti entries leaked into Main APK:", bad[:10])
+              sys.exit(1)
+          print("Main APK Koliti exclusion audit: PASS")
+          ' "$APK"
+          if [ "$status" -ne 0 ]; then exit 1; fi
+
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::COLGRAM_KEYSTORE_B64 is not set."
             exit 1
           fi
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > colgram.keystore
+          trap 'rm -f colgram.keystore /tmp/colgram-main-aligned.apk' EXIT
+          ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name zipalign | sort -V | tail -n 1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$ZIPALIGN" -p -f -P 16 4 "$APK" /tmp/colgram-main-aligned.apk
+          rm -f "$APK"
+          "$ZIPALIGN" -c -P 16 4 /tmp/colgram-main-aligned.apk
+          MAIN_OUT="Colgram-${UPSTREAM_TAG}.apk"
+          "$APKSIGNER" sign --ks colgram.keystore \
+            --ks-type PKCS12 \
+            --ks-pass "pass:$KEYSTORE_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out "$MAIN_OUT" /tmp/colgram-main-aligned.apk
+          "$ZIPALIGN" -c -P 16 4 "$MAIN_OUT"
+          EXPECTED="3c5326960d586b6906a7ab09f7f3039f2385c0c5f8190527614569169e132d41"
+          ACTUAL=$("$APKSIGNER" verify --print-certs "$MAIN_OUT" | grep -a "certificate SHA-256 digest" | awk '{print $NF}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Main APK signing certificate mismatch: $ACTUAL"
+            exit 1
+          fi
+          SIZE=$(stat -c%s "$MAIN_OUT")
+          if [ "$SIZE" -ge 2147483648 ]; then
+            echo "::error::Main APK exceeds 2 GiB cap ($SIZE bytes)"
+            exit 1
+          fi
+          sha256sum "$MAIN_OUT" > "${MAIN_OUT}.sha256"
+          echo "Main APK verified & signed ($SIZE bytes): $MAIN_OUT"
 
-      - name: Generate APK Checksum
+      - name: Stage Offline Koliti Weights & Apply Koliti Patches
+        env:
+          COLGRAM_KOLITI: "1"
+          COLGRAM_BUILD_STAMP: "ci${{ github.run_number }}"
+        run: |
+          set -euo pipefail
+          rm -rf Telegram-Src/TMessagesProj_AppStandalone/build Telegram-Src/colgram-core/build
+          mkdir -p Telegram-Src/TMessagesProj_AppStandalone/src/main/assets/koliti
+          mkdir -p Telegram-Src/TMessagesProj/src/main/assets
+          curl -fSL --retry 3 -o Telegram-Src/TMessagesProj_AppStandalone/src/main/assets/koliti/koliti_core.gguf \
+            https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-core-v3.gguf
+          curl -fSL --retry 3 -o Telegram-Src/TMessagesProj_AppStandalone/src/main/assets/koliti/koliti_vision.gguf \
+            https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-vision-v3.gguf
+          curl -fSL --retry 3 -o /tmp/koliti-voice-pack-v3.tar.gz \
+            https://github.com/Kleisym/Colgram/releases/download/koliti-models-v3/koliti-voice-pack-v3.tar.gz
+          tar -xzf /tmp/koliti-voice-pack-v3.tar.gz -C Telegram-Src/TMessagesProj/src/main/assets/
+          rm -f /tmp/koliti-voice-pack-v3.tar.gz
+          python3 scripts/apply-patches.py Telegram-Src --koliti
+          python3 scripts/verify-privacy.py Telegram-Src
+          python3 -m unittest discover -s scripts -p "test_*.py"
+
+      - name: Build Koliti APK (64-bit Offline Core + Vision + TTS + ASR)
+        run: |
+          cd Telegram-Src
+          chmod +x gradlew
+          INIT_SCRIPT="$GITHUB_WORKSPACE/.github/gradle/ci-maven-mirror.init.gradle"
+          for attempt in 1 2; do
+            echo "Koliti Gradle build attempt $attempt/2..."
+            if ./gradlew :TMessagesProj_AppStandalone:assembleAfatRelease \
+              -PcolgramAbis=arm64-v8a,x86_64 \
+              --init-script "$INIT_SCRIPT" \
+              --build-cache --parallel --max-workers=4 \
+              -Dorg.gradle.jvmargs="-Xmx4096m -XX:+ParallelRefProcEnabled" \
+              -Dorg.gradle.internal.http.connectionTimeout=120000 \
+              -Dorg.gradle.internal.http.socketTimeout=120000; then
+              exit 0
+            fi
+            echo "Koliti Gradle attempt $attempt failed; waiting 15s before retry..."
+            sleep 15
+          done
+          exit 1
+
+      - name: Audit, Zipalign & Sign Koliti APK
+        env:
+          KEYSTORE_B64: ${{ secrets.COLGRAM_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.COLGRAM_KEYSTORE_PASS }}
+          KEY_PASS: ${{ secrets.COLGRAM_KEY_PASS }}
+          KEY_ALIAS: ${{ secrets.COLGRAM_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          APK=$(find Telegram-Src -name "app.apk" -path "*afat/release*" | head -n 1)
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then echo "::error::No Koliti APK found"; exit 1; fi
+          BT_AAPT=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n 1)
+          MANIFEST=$("$BT_AAPT" dump xmltree --file AndroidManifest.xml "$APK")
+          status=0
+          for comp in com.google.firebase.provider.FirebaseInitProvider \
+                      com.google.android.gms.measurement.AppMeasurementReceiver \
+                      com.microsoft.appcenter \
+                      io.sentry \
+                      com.huawei.hms.push; do
+            if echo "$MANIFEST" | grep -qa "$comp"; then
+              echo "::error::$comp is registered in Koliti manifest"
+              status=1
+            fi
+          done
+          mkdir -p /tmp/dexaudit_koliti && unzip -o -q "$APK" 'classes*.dex' -d /tmp/dexaudit_koliti
+          for pat in com/google/firebase/crashlytics com/google/android/gms/firebase com/appcenter/android sdk/io/sentry; do
+            if grep -qal -- "$pat" /tmp/dexaudit_koliti/classes*.dex 2>/dev/null; then
+              echo "::error::Tracker classes present in Koliti APK DEX: $pat"
+              status=1
+            fi
+          done
+          rm -rf /tmp/dexaudit_koliti
+          python3 -c '
+          import sys, zipfile
+          required_exact = (
+              "lib/arm64-v8a/libcolgram_llama.so",
+              "lib/arm64-v8a/libsherpa-onnx-jni.so",
+              "lib/arm64-v8a/libomp.so",
+              "lib/x86_64/libcolgram_llama.so",
+              "lib/x86_64/libsherpa-onnx-jni.so",
+              "assets/koliti/koliti_core.gguf",
+              "assets/koliti/koliti_vision.gguf",
+              "assets/koliti_tts/espeak-ng-data.zip",
+              "assets/koliti_asr/encoder.int8.onnx",
+              "assets/koliti_asr/decoder.onnx",
+              "assets/koliti_asr/joiner.int8.onnx",
+              "assets/koliti_asr/tokens.txt",
+          )
+          with zipfile.ZipFile(sys.argv[1]) as zf:
+              names = {i.filename: i for i in zf.infolist()}
+              forbidden_32 = [n for n in names if n.startswith(("lib/armeabi-v7a/", "lib/x86/"))]
+              if forbidden_32:
+                  print("::error::Unexpected 32-bit native libraries in Koliti APK:", forbidden_32[:10])
+                  sys.exit(1)
+              for req in required_exact:
+                  if req not in names or names[req].file_size <= 0:
+                      print(f"::error::Missing required Koliti payload: {req}")
+                      sys.exit(1)
+              for gguf in ("assets/koliti/koliti_core.gguf", "assets/koliti/koliti_vision.gguf"):
+                  if names[gguf].file_size < 100 * 1024 * 1024:
+                      print(f"::error::Truncated GGUF in Koliti APK: {gguf}")
+                      sys.exit(1)
+          print("Koliti offline asset audit: PASS")
+          ' "$APK"
+          if [ "$status" -ne 0 ]; then exit 1; fi
+
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > colgram.keystore
+          trap 'rm -f colgram.keystore /tmp/colgram-koliti-aligned.apk' EXIT
+          ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name zipalign | sort -V | tail -n 1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$ZIPALIGN" -p -f -P 16 4 "$APK" /tmp/colgram-koliti-aligned.apk
+          rm -f "$APK"
+          "$ZIPALIGN" -c -P 16 4 /tmp/colgram-koliti-aligned.apk
+          KOLITI_OUT="Colgram-${UPSTREAM_TAG}-Koliti.apk"
+          "$APKSIGNER" sign --ks colgram.keystore \
+            --ks-type PKCS12 \
+            --ks-pass "pass:$KEYSTORE_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out "$KOLITI_OUT" /tmp/colgram-koliti-aligned.apk
+          "$ZIPALIGN" -c -P 16 4 "$KOLITI_OUT"
+          EXPECTED="3c5326960d586b6906a7ab09f7f3039f2385c0c5f8190527614569169e132d41"
+          ACTUAL=$("$APKSIGNER" verify --print-certs "$KOLITI_OUT" | grep -a "certificate SHA-256 digest" | awk '{print $NF}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Koliti APK signing certificate mismatch: $ACTUAL"
+            exit 1
+          fi
+          SIZE=$(stat -c%s "$KOLITI_OUT")
+          if [ "$SIZE" -ge 2147483648 ]; then
+            echo "::error::Koliti APK exceeds 2 GiB GitHub cap ($SIZE bytes)"
+            exit 1
+          fi
+          sha256sum "$KOLITI_OUT" > "${KOLITI_OUT}.sha256"
+          rm -rf Telegram-Src/TMessagesProj_AppStandalone/src/main/assets/koliti \
+                 Telegram-Src/TMessagesProj/src/main/assets/koliti_tts \
+                 Telegram-Src/TMessagesProj/src/main/assets/koliti_asr
+          echo "Koliti APK verified & signed ($SIZE bytes): $KOLITI_OUT"
+
+      - name: Generate Combined SHA-256 Manifest
         id: apk_sha
         run: |
-          sha256sum colgram-signed-release.apk > colgram-signed-release.apk.sha256
-          SHA=$(cut -d' ' -f1 colgram-signed-release.apk.sha256)
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "::notice title=apk sha256::$SHA"
+          MAIN_APK="Colgram-${UPSTREAM_TAG}.apk"
+          KOLITI_APK="Colgram-${UPSTREAM_TAG}-Koliti.apk"
+          MAIN_SHA=$(cut -d' ' -f1 "${MAIN_APK}.sha256")
+          KOLITI_SHA=$(cut -d' ' -f1 "${KOLITI_APK}.sha256")
+          cat "${MAIN_APK}.sha256" "${KOLITI_APK}.sha256" > SHA256SUMS.txt
+          echo "main_sha256=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "koliti_sha256=$KOLITI_SHA" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Main APK SHA-256::$MAIN_SHA"
+          echo "::notice title=Koliti APK SHA-256::$KOLITI_SHA"
 
-      - name: Upload APK Artifact
+      - name: Upload Main APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Colgram-Release-APK
+          name: Colgram-Main-APK
           path: |
-            colgram-signed-release.apk
-            colgram-signed-release.apk.sha256
+            Colgram-${{ env.UPSTREAM_TAG }}.apk
+            Colgram-${{ env.UPSTREAM_TAG }}.apk.sha256
+            SHA256SUMS.txt
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
-        uses: softprops/action-gh-release@v1
+      - name: Upload Koliti APK Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            colgram-signed-release.apk
-            colgram-signed-release.apk.sha256
-          tag_name: colgram-${{ env.UPSTREAM_TAG }}-${{ github.run_number }}
-          name: Colgram v${{ env.UPSTREAM_TAG }} (Build ${{ github.run_number }})${{ inputs.release_label && format(' {0}', inputs.release_label) || '' }}
-          body: |
-            ## Colgram Automated Release
-            - **Telegram Base**: `${{ env.UPSTREAM_TAG }}` (`${{ env.UPSTREAM_REF }}`, Official `DrKLO/Telegram`)
-            - **Requested version**: `${{ env.REQUESTED_TAG }}`
-            - **APK SHA-256**: `${{ steps.apk_sha.outputs.sha256 }}`
-            - **Defender Bot Guard**: Built-in 12-vector leak & hole auto-sealer (`ColgramSecurityDefender`)
-            - **Hardware Cloaking**: Enabled (MTProto + Mini App/WebView User-Agent spoofing)
-            - **Anti-Delete Vault & Unlimited Storage**: Active (Preserves deleted messages, edit logs & media cache)
-            - **Ghost Mode**: Silent read, stealth typing, offline status, FLAG_SECURE bypass
-            - **Storage Sandbox**: Scoped to isolated folder
-            - **Built-in Anti-DPI & Call/Browser Isolation**: Active (WebRTC P2P blocked when strict/defender active)
-            - **Telemetry**: 100% Stripped (No Firebase / Play Services / HMS / AppCenter / Sentry)
+          name: Colgram-Koliti-APK
+          path: |
+            Colgram-${{ env.UPSTREAM_TAG }}-Koliti.apk
+            Colgram-${{ env.UPSTREAM_TAG }}-Koliti.apk.sha256
 
-            ### Install
-            Download `colgram-signed-release.apk` below and install it. The build is
-            self-signed with the shared Colgram keystore, so it upgrades in place over
-            any earlier Colgram build without uninstalling.
+      - name: Publish Dual-APK GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_LABEL: ${{ inputs.release_label }}
+          MAIN_SHA256: ${{ steps.apk_sha.outputs.main_sha256 }}
+          KOLITI_SHA256: ${{ steps.apk_sha.outputs.koliti_sha256 }}
+        run: |
+          set -euo pipefail
+          TAG="${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}-ci{1}', env.UPSTREAM_TAG, github.run_number) }}"
+          TITLE="Colgram ${UPSTREAM_TAG} (Build ${{ github.run_number }})"
+          if [ -n "$RELEASE_LABEL" ]; then
+            TITLE="$TITLE — $RELEASE_LABEL"
+          fi
+          python3 -c '
+          import os
+          ver = os.environ["UPSTREAM_TAG"]
+          main_sha = os.environ.get("MAIN_SHA256", "")
+          koliti_sha = os.environ.get("KOLITI_SHA256", "")
+          body = (
+              f"![Colgram {ver}](https://raw.githubusercontent.com/Kleisym/Colgram/main/docs/media/colgram-release-poster.png)\n\n"
+              f"[![Смотреть видео-обзор Colgram {ver} (1080p60)](https://raw.githubusercontent.com/Kleisym/Colgram/main/docs/media/colgram-release-preview.gif)](https://github.com/Kleisym/Colgram/raw/main/docs/media/colgram-release.mp4)\n\n"
+              f"### Две сборки Colgram {ver}\n"
+              f"- **`Colgram-{ver}.apk`** — Основной Colgram (универсальный 4-ABI, без Koliti AI) · SHA-256: `{main_sha}`\n"
+              f"- **`Colgram-{ver}-Koliti.apk`** — Colgram + встроенный офлайн ИИ Koliti (64-bit Core v3 + Vision + TTS + ASR) · SHA-256: `{koliti_sha}`\n"
+          )
+          with open("/tmp/release_notes.md", "w", encoding="utf-8") as fh:
+              fh.write(body)
+          '
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file /tmp/release_notes.md
+            gh release upload "$TAG" \
+              "Colgram-${UPSTREAM_TAG}.apk" \
+              "Colgram-${UPSTREAM_TAG}-Koliti.apk" \
+              "Colgram-${UPSTREAM_TAG}.apk.sha256" \
+              "Colgram-${UPSTREAM_TAG}-Koliti.apk.sha256" \
+              "SHA256SUMS.txt" \
+              "docs/media/colgram-release.mp4" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file /tmp/release_notes.md \
+              "Colgram-${UPSTREAM_TAG}.apk" \
+              "Colgram-${UPSTREAM_TAG}-Koliti.apk" \
+              "Colgram-${UPSTREAM_TAG}.apk.sha256" \
+              "Colgram-${UPSTREAM_TAG}-Koliti.apk.sha256" \
+              "SHA256SUMS.txt" \
+              "docs/media/colgram-release.mp4"
+          fi

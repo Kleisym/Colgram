@@ -211,21 +211,21 @@ public final class ColgramSecurityPolicy {
             String perfClass) {
         String base = originalUa == null ? "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36" : originalUa;
         // Make idempotent when re-invoked cleanly by multiple WebView setup hooks.
-        base = base.replaceAll("\\s+Telegram-Android/[^)]*\\)", "");
+        base = base.replaceAll("\\s+Telegram-(?:Android|iOS)/[^)]*\\)", "");
         base = base.replace("; wv)", ")");
         base = base.replaceAll("Version/[\\d.]+\\s*", "");
 
         String modelToken = (spoofModel == null || spoofModel.trim().isEmpty()) ? "Google Pixel 8 Pro" : spoofModel.trim();
+        // Keep Android WebView UA strictly coherent with Android WebKit/Chromium engine (never mix iPhone OS + Telegram-Android).
+        if (modelToken.toLowerCase(Locale.US).contains("iphone")
+                || modelToken.toLowerCase(Locale.US).contains("ipad")) {
+            modelToken = "Google Pixel 8 Pro";
+        }
         String androidVer = extractAndroidRelease(spoofSystemVersion);
         String sdkNum = extractSdkInt(spoofSystemVersion);
 
         if (cloakEnabled) {
-            if (modelToken.toLowerCase(Locale.US).contains("iphone")) {
-                String iosVer = extractIosRelease(spoofSystemVersion);
-                base = base.replaceAll("\\(Linux;\\s*Android[^)]*\\)", "(iPhone; CPU iPhone OS " + iosVer.replace('.', '_') + " like Mac OS X)");
-            } else {
-                base = base.replaceAll("\\(Linux;\\s*Android[^)]*\\)", "(Linux; Android " + androidVer + "; K)");
-            }
+            base = base.replaceAll("\\(Linux;\\s*Android[^)]*\\)", "(Linux; Android " + androidVer + "; K)");
         }
 
         if (appendTelegramBotTag) {
@@ -246,11 +246,14 @@ public final class ColgramSecurityPolicy {
     public static String buildWebViewSpoofJs(String spoofModel, String spoofSystemVersion, boolean cloakEnabled) {
         if (!cloakEnabled) return "";
         String model = (spoofModel == null || spoofModel.trim().isEmpty()) ? "Google Pixel 8 Pro" : spoofModel.trim();
+        if (model.toLowerCase(Locale.US).contains("iphone")
+                || model.toLowerCase(Locale.US).contains("ipad")) {
+            model = "Google Pixel 8 Pro";
+        }
         String escModel = jsEscape(model);
-        boolean isIos = model.toLowerCase(Locale.US).contains("iphone");
-        String osVer = jsEscape(isIos ? extractIosRelease(spoofSystemVersion) : extractAndroidRelease(spoofSystemVersion));
-        String platform = isIos ? "iPhone" : "Android";
-        String navPlatform = isIos ? "iPhone" : "Linux armv8l";
+        String osVer = jsEscape(extractAndroidRelease(spoofSystemVersion));
+        String platform = "Android";
+        String navPlatform = "Linux armv8l";
         return "(function(){try{"
                 + "if(window.__colgramCloakApplied)return;window.__colgramCloakApplied=true;"
                 + "var m='" + escModel + "',pv='" + osVer + "',pl='" + platform + "';"

@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -59,7 +60,7 @@ struct PrefixSnapshot {
 std::mutex g_engine_mutex;
 std::mutex g_error_mutex;
 std::atomic<bool> g_cancel{false};
-std::atomic<bool> g_backend_ready{false};
+std::once_flag g_backend_once;
 
 llama_model * g_model = nullptr;
 llama_context * g_ctx = nullptr;
@@ -117,11 +118,11 @@ bool colgram_abort_cb(void * /*data*/) {
 }
 
 void ensure_backend_initialized() {
-    if (!g_backend_ready.exchange(true)) {
+    std::call_once(g_backend_once, []() {
         llama_log_set(colgram_llama_log_cb, nullptr);
         mtmd_helper_log_set(colgram_llama_log_cb, nullptr);
         llama_backend_init();
-    }
+    });
 }
 
 long read_sysfs_long(const std::string & path) {
@@ -311,32 +312,62 @@ jstring utf8_to_jstring(JNIEnv * env, const std::string & utf8) {
     const size_t n = utf8.size();
     size_t i = 0;
     while (i < n) {
-        uint32_t cp = 0;
+        uint32_t cp = 0xFFFDu;
         unsigned char c = p[i];
-        if ((c & 0x80) == 0) {
+        if ((c & 0x80u) == 0u) {
             cp = c;
             i += 1;
-        } else if ((c & 0xE0) == 0xC0 && i + 1 < n) {
-            cp = ((uint32_t)(c & 0x1F) << 6) | (p[i + 1] & 0x3F);
-            i += 2;
-        } else if ((c & 0xF0) == 0xE0 && i + 2 < n) {
-            cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F);
-            i += 3;
-        } else if ((c & 0xF8) == 0xF0 && i + 3 < n) {
-            cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(p[i + 1] & 0x3F) << 12)
-               | ((uint32_t)(p[i + 2] & 0x3F) << 6) | (p[i + 3] & 0x3F);
-            i += 4;
+        } else if ((c & 0xE0u) == 0xC0u) {
+            if (i + 1 < n && (p[i + 1] & 0xC0u) == 0x80u) {
+                uint32_t v = ((uint32_t)(c & 0x1Fu) << 6) | (p[i + 1] & 0x3Fu);
+                if (v >= 0x80u) {
+                    cp = v;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else if ((c & 0xF0u) == 0xE0u) {
+            if (i + 2 < n && (p[i + 1] & 0xC0u) == 0x80u && (p[i + 2] & 0xC0u) == 0x80u) {
+                uint32_t v = ((uint32_t)(c & 0x0Fu) << 12)
+                           | ((uint32_t)(p[i + 1] & 0x3Fu) << 6)
+                           | (p[i + 2] & 0x3Fu);
+                if (v >= 0x800u && !(v >= 0xD800u && v <= 0xDFFFu)) {
+                    cp = v;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else if ((c & 0xF8u) == 0xF0u) {
+            if (i + 3 < n && (p[i + 1] & 0xC0u) == 0x80u && (p[i + 2] & 0xC0u) == 0x80u && (p[i + 3] & 0xC0u) == 0x80u) {
+                uint32_t v = ((uint32_t)(c & 0x07u) << 18)
+                           | ((uint32_t)(p[i + 1] & 0x3Fu) << 12)
+                           | ((uint32_t)(p[i + 2] & 0x3Fu) << 6)
+                           | (p[i + 3] & 0x3Fu);
+                if (v >= 0x10000u && v <= 0x10FFFFu) {
+                    cp = v;
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
         } else {
-            cp = 0xFFFD;
             i += 1;
         }
 
-        if (cp <= 0xFFFF) {
+        if (cp <= 0xFFFFu) {
             utf16.push_back(static_cast<jchar>(cp));
         } else {
-            cp -= 0x10000;
-            utf16.push_back(static_cast<jchar>(0xD800 + (cp >> 10)));
-            utf16.push_back(static_cast<jchar>(0xDC00 + (cp & 0x3FF)));
+            cp -= 0x10000u;
+            utf16.push_back(static_cast<jchar>(0xD800u + (cp >> 10)));
+            utf16.push_back(static_cast<jchar>(0xDC00u + (cp & 0x3FFu)));
         }
     }
     return env->NewString(utf16.empty() ? nullptr : utf16.data(), static_cast<jsize>(utf16.size()));
@@ -635,15 +666,21 @@ extern "C" {
 
 JNIEXPORT jstring JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeGetSystemInfo(JNIEnv * env, jclass /*clazz*/) {
-    ensure_backend_initialized();
-    const char * info = llama_print_system_info();
-    return utf8_to_jstring(env, info ? std::string(info) : std::string("llama.cpp"));
+    try {
+        ensure_backend_initialized();
+        const char * info = llama_print_system_info();
+        return utf8_to_jstring(env, info ? std::string(info) : std::string("llama.cpp"));
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeGetSystemInfo exception: ") + e.what());
+        return utf8_to_jstring(env, "llama.cpp");
+    } catch (...) {
+        set_last_error("nativeGetSystemInfo unknown exception");
+        return utf8_to_jstring(env, "llama.cpp");
+    }
 }
 
-JNIEXPORT jint JNICALL
-Java_org_colgram_core_ColgramNativeLlama_nativeInit(
+static jint native_init_impl(
         JNIEnv * env,
-        jclass /*clazz*/,
         jstring jModelPath,
         jstring jMmprojPath,
         jint nCtx,
@@ -781,10 +818,27 @@ Java_org_colgram_core_ColgramNativeLlama_nativeInit(
 }
 
 JNIEXPORT jint JNICALL
-Java_org_colgram_core_ColgramNativeLlama_nativeWarmUpPrompt(
+Java_org_colgram_core_ColgramNativeLlama_nativeInit(
         JNIEnv * env,
         jclass /*clazz*/,
-        jstring jSystemPrompt) {
+        jstring jModelPath,
+        jstring jMmprojPath,
+        jint nCtx,
+        jint nThreads,
+        jint kvQuantBits,
+        jboolean flashAttn) {
+    try {
+        return native_init_impl(env, jModelPath, jMmprojPath, nCtx, nThreads, kvQuantBits, flashAttn);
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeInit exception: ") + e.what());
+        return -99;
+    } catch (...) {
+        set_last_error("nativeInit unknown exception");
+        return -99;
+    }
+}
+
+static jint native_warmup_impl(JNIEnv * env, jstring jSystemPrompt) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (!g_model || !g_ctx || g_cancel.load(std::memory_order_relaxed)) {
         return 0;
@@ -825,21 +879,45 @@ Java_org_colgram_core_ColgramNativeLlama_nativeWarmUpPrompt(
     return static_cast<jint>(sysTokens.size());
 }
 
+JNIEXPORT jint JNICALL
+Java_org_colgram_core_ColgramNativeLlama_nativeWarmUpPrompt(
+        JNIEnv * env,
+        jclass /*clazz*/,
+        jstring jSystemPrompt) {
+    try {
+        return native_warmup_impl(env, jSystemPrompt);
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeWarmUpPrompt exception: ") + e.what());
+        return -99;
+    } catch (...) {
+        set_last_error("nativeWarmUpPrompt unknown exception");
+        return -99;
+    }
+}
+
 JNIEXPORT jstring JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeGetModelInfo(JNIEnv * env, jclass /*clazz*/) {
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
-    if (!g_model || !g_ctx) {
+    try {
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        if (!g_model || !g_ctx) {
+            return utf8_to_jstring(env, "");
+        }
+        std::ostringstream ss;
+        ss << g_model_desc
+           << " | ctx=" << g_n_ctx
+           << " | thr=" << g_n_threads << "/" << g_n_threads_batch
+           << (g_topology.pin_decode_big ? "(big)" : "")
+           << " | mmap=1"
+           << " | flash=" << (g_flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "1" : "0")
+           << " | vision=" << (g_has_vision ? "ready" : "off");
+        return utf8_to_jstring(env, ss.str());
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeGetModelInfo exception: ") + e.what());
+        return utf8_to_jstring(env, "");
+    } catch (...) {
+        set_last_error("nativeGetModelInfo unknown exception");
         return utf8_to_jstring(env, "");
     }
-    std::ostringstream ss;
-    ss << g_model_desc
-       << " | ctx=" << g_n_ctx
-       << " | thr=" << g_n_threads << "/" << g_n_threads_batch
-       << (g_topology.pin_decode_big ? "(big)" : "")
-       << " | mmap=1"
-       << " | flash=" << (g_flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "1" : "0")
-       << " | vision=" << (g_has_vision ? "ready" : "off");
-    return utf8_to_jstring(env, ss.str());
 }
 
 static jint generate_internal(
@@ -948,8 +1026,9 @@ static jint generate_internal(
     size_t reusedPrefixTokens = 0;
     size_t evaluatedDeltaTokens = 0;
     llama_memory_t mem = llama_get_memory(g_ctx);
+    const bool hadVision = !rawBitmaps.empty();
 
-    if (!rawBitmaps.empty()) {
+    if (hadVision) {
         g_cached_tokens.clear();
         g_turn_snapshot.clear();
         llama_memory_clear(mem, true);
@@ -1248,7 +1327,7 @@ static jint generate_internal(
             llama_memory_clear(mem, true);
             break;
         }
-        if (rawBitmaps.empty()) {
+        if (!hadVision) {
             g_cached_tokens.push_back(tok);
         }
 
@@ -1268,7 +1347,7 @@ static jint generate_internal(
                     }
                     for (llama_token ct : closeToks) {
                         common_sampler_accept(sampler, ct, true);
-                        if (rawBitmaps.empty()) {
+                        if (!hadVision) {
                             g_cached_tokens.push_back(ct);
                         }
                     }
@@ -1334,8 +1413,16 @@ Java_org_colgram_core_ColgramNativeLlama_nativeGenerate(
         jint repeatPenalty100,
         jboolean enableThinking,
         jobject jCallback) {
-    return generate_internal(env, jSystemPrompt, nullptr, jUserPrompt, jImagePaths,
-                             maxTokens, temperature, topP, repeatPenalty100, enableThinking, jCallback);
+    try {
+        return generate_internal(env, jSystemPrompt, nullptr, jUserPrompt, jImagePaths,
+                                 maxTokens, temperature, topP, repeatPenalty100, enableThinking, jCallback);
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeGenerate exception: ") + e.what());
+        return -99;
+    } catch (...) {
+        set_last_error("nativeGenerate unknown exception");
+        return -99;
+    }
 }
 
 JNIEXPORT jint JNICALL
@@ -1352,46 +1439,77 @@ Java_org_colgram_core_ColgramNativeLlama_nativeGenerateWithHistory(
         jint repeatPenalty100,
         jboolean enableThinking,
         jobject jCallback) {
-    return generate_internal(env, jSystemPrompt, jHistoryPairs, jUserPrompt, jImagePaths,
-                             maxTokens, temperature, topP, repeatPenalty100, enableThinking, jCallback);
+    try {
+        return generate_internal(env, jSystemPrompt, jHistoryPairs, jUserPrompt, jImagePaths,
+                                 maxTokens, temperature, topP, repeatPenalty100, enableThinking, jCallback);
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeGenerateWithHistory exception: ") + e.what());
+        return -99;
+    } catch (...) {
+        set_last_error("nativeGenerateWithHistory unknown exception");
+        return -99;
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeClearMemory(JNIEnv * /*env*/, jclass /*clazz*/) {
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
-    g_cached_tokens.clear();
-    g_turn_snapshot.clear();
-    // Preserve g_sys_snapshot so starting a fresh chat still reuses the prefilled system prompt in ~2ms!
-    if (g_ctx) {
-        llama_memory_t mem = llama_get_memory(g_ctx);
-        if (mem) {
-            llama_memory_clear(mem, true);
+    try {
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        g_cached_tokens.clear();
+        g_turn_snapshot.clear();
+        // Preserve g_sys_snapshot so starting a fresh chat still reuses the prefilled system prompt in ~2ms!
+        if (g_ctx) {
+            llama_memory_t mem = llama_get_memory(g_ctx);
+            if (mem) {
+                llama_memory_clear(mem, true);
+            }
         }
+        LOGI("Cleared active KV/recurrent turn memory (kept sys snapshot=%zu tok)", g_sys_snapshot.tokens.size());
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeClearMemory exception: ") + e.what());
+    } catch (...) {
+        set_last_error("nativeClearMemory unknown exception");
     }
-    LOGI("Cleared active KV/recurrent turn memory (kept sys snapshot=%zu tok)", g_sys_snapshot.tokens.size());
 }
 
 JNIEXPORT void JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeCancel(JNIEnv * /*env*/, jclass /*clazz*/) {
-    g_cancel.store(true);
+    try {
+        g_cancel.store(true);
+    } catch (...) {
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeUnload(JNIEnv * /*env*/, jclass /*clazz*/) {
-    g_cancel.store(true);
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
-    unload_locked();
+    try {
+        g_cancel.store(true);
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        unload_locked();
+    } catch (const std::exception & e) {
+        set_last_error(std::string("nativeUnload exception: ") + e.what());
+    } catch (...) {
+        set_last_error("nativeUnload unknown exception");
+    }
 }
 
 JNIEXPORT jstring JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeGetLastError(JNIEnv * env, jclass /*clazz*/) {
-    return utf8_to_jstring(env, get_last_error());
+    try {
+        return utf8_to_jstring(env, get_last_error());
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 JNIEXPORT jstring JNICALL
 Java_org_colgram_core_ColgramNativeLlama_nativeGetLastTimings(JNIEnv * env, jclass /*clazz*/) {
-    std::lock_guard<std::mutex> lock(g_error_mutex);
-    return utf8_to_jstring(env, g_last_timings);
+    try {
+        std::lock_guard<std::mutex> lock(g_error_mutex);
+        return utf8_to_jstring(env, g_last_timings);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 } // extern "C"

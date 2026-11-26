@@ -30,6 +30,7 @@ import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramDesignConfig;
 import org.colgram.core.ColgramThemePolicy;
 import org.telegram.messenger.AndroidUtilities;
@@ -186,13 +187,23 @@ public class ColgramDesignStudioActivity extends BaseFragment {
         bottomBarButtonsRow = rowCount++;
         showHeaderShieldRow = rowCount++;
         customHeaderTitleRow = rowCount++;
-        sectionKolitiRow = rowCount++;
-        kolitiOrbSizeRow = rowCount++;
-        kolitiOrbAlphaRow = rowCount++;
-        kolitiOrbDockRow = rowCount++;
-        kolitiAvatarPickRow = rowCount++;
-        kolitiAvatarResetRow = TextUtils.isEmpty(ColgramDesignConfig.getKolitiCustomAvatarPath()) ? -1 : rowCount++;
-        kolitiNameRow = rowCount++;
+        if (ColgramBuildFlags.KOLITI_ENABLED) {
+            sectionKolitiRow = rowCount++;
+            kolitiOrbSizeRow = rowCount++;
+            kolitiOrbAlphaRow = rowCount++;
+            kolitiOrbDockRow = rowCount++;
+            kolitiAvatarPickRow = rowCount++;
+            kolitiAvatarResetRow = TextUtils.isEmpty(ColgramDesignConfig.getKolitiCustomAvatarPath()) ? -1 : rowCount++;
+            kolitiNameRow = rowCount++;
+        } else {
+            sectionKolitiRow = -1;
+            kolitiOrbSizeRow = -1;
+            kolitiOrbAlphaRow = -1;
+            kolitiOrbDockRow = -1;
+            kolitiAvatarPickRow = -1;
+            kolitiAvatarResetRow = -1;
+            kolitiNameRow = -1;
+        }
         sectionPresetRow = rowCount++;
         exportJsonRow = rowCount++;
         importJsonRow = rowCount++;
@@ -237,7 +248,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
 
     private void applyLiveDesignEverywhere(boolean refreshTheme) {
         if (isFinishing()) return;
-        if (ColgramGlobalOrbController.getInstance() != null) {
+        if (ColgramBuildFlags.KOLITI_ENABLED && ColgramGlobalOrbController.getInstance() != null) {
             ColgramGlobalOrbController.getInstance().applyDesignConfig();
         }
         if (refreshTheme) {
@@ -279,7 +290,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
 
     private void refreshPreviewOnly() {
         if (isFinishing()) return;
-        if (ColgramGlobalOrbController.getInstance() != null) {
+        if (ColgramBuildFlags.KOLITI_ENABLED && ColgramGlobalOrbController.getInstance() != null) {
             ColgramGlobalOrbController.getInstance().applyDesignConfig();
         }
         if (listView != null && previewRow >= 0) {
@@ -365,7 +376,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         ColgramDesignConfig.setCustomHeaderTitle(val);
                         applyLiveDesignEverywhere(false);
                     });
-        } else if (position == kolitiOrbDockRow) {
+        } else if (ColgramBuildFlags.KOLITI_ENABLED && position == kolitiOrbDockRow) {
             final String[] items = {
                     "Слева (не мешает кнопке «Новое сообщение»)",
                     "Справа",
@@ -378,7 +389,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         ColgramDesignConfig.setKolitiOrbDock(which);
                         applyLiveDesignEverywhere(false);
                     }).create());
-        } else if (position == kolitiAvatarPickRow) {
+        } else if (ColgramBuildFlags.KOLITI_ENABLED && position == kolitiAvatarPickRow) {
             try {
                 Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
                 intent.setType("image/*");
@@ -387,7 +398,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             } catch (Throwable t) {
                 Toast.makeText(appCtx, "Не удалось открыть галерею", Toast.LENGTH_SHORT).show();
             }
-        } else if (kolitiAvatarResetRow >= 0 && position == kolitiAvatarResetRow) {
+        } else if (ColgramBuildFlags.KOLITI_ENABLED && kolitiAvatarResetRow >= 0 && position == kolitiAvatarResetRow) {
             final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
             if (!TextUtils.isEmpty(old)) {
                 org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
@@ -398,7 +409,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             ColgramAeroStyler.invalidateKolitiAvatarCache();
             applyLiveDesignEverywhere(false);
             Toast.makeText(appCtx, "Возвращён стандартный аватар Koliti", Toast.LENGTH_SHORT).show();
-        } else if (position == kolitiNameRow) {
+        } else if (ColgramBuildFlags.KOLITI_ENABLED && position == kolitiNameRow) {
             showTextInputDialog(ctx, "Имя ассистента",
                     "Например: Koliti, Jarvis, Nova",
                     ColgramDesignConfig.getKolitiCustomName(),
@@ -433,14 +444,18 @@ public class ColgramDesignStudioActivity extends BaseFragment {
         } else if (position == resetAllRow) {
             showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
                     .setTitle("Сбросить дизайн?")
-                    .setMessage("Все цвета, геометрия карточек, раскладка шапки, размер и аватар Koliti вернутся к заводским.")
+                    .setMessage(ColgramBuildFlags.KOLITI_ENABLED
+                            ? "Все цвета, геометрия карточек, раскладка шапки, размер и аватар Koliti вернутся к заводским."
+                            : "Все цвета, геометрия карточек и раскладка шапки вернутся к заводским.")
                     .setPositiveButton("Сбросить", (d, w) -> {
                         if (isFinishing() || getParentLayout() == null) return;
-                        final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
-                        if (!TextUtils.isEmpty(old)) {
-                            org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
-                                try { new File(old).delete(); } catch (Throwable ignored) {}
-                            });
+                        if (ColgramBuildFlags.KOLITI_ENABLED) {
+                            final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
+                            if (!TextUtils.isEmpty(old)) {
+                                org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                                    try { new File(old).delete(); } catch (Throwable ignored) {}
+                                });
+                            }
                         }
                         ColgramDesignConfig.resetAll();
                         ColgramAeroStyler.invalidateKolitiAvatarCache();
@@ -501,7 +516,8 @@ public class ColgramDesignStudioActivity extends BaseFragment {
     @Override
     public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
         super.onActivityResultFragment(requestCode, resultCode, data);
-        if (requestCode == REQ_PICK_KOLITI_AVATAR && resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
+        if (ColgramBuildFlags.KOLITI_ENABLED
+                && requestCode == REQ_PICK_KOLITI_AVATAR && resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
             Activity act = getParentActivity();
             if (act == null || act.isFinishing() || act.isDestroyed()) return;
             final Context appCtx = act.getApplicationContext();
@@ -764,30 +780,39 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                 bubbleOut.setTextColor(pal.textPrimary);
             }
 
-            int orbDp = ColgramDesignConfig.getKolitiOrbSizeDp();
-            int visualDp = Math.max(32, Math.min(64, Math.round(orbDp * 0.78f)));
-            ViewGroup.LayoutParams rawOlp = orbPreview.getLayoutParams();
-            if (rawOlp instanceof FrameLayout.LayoutParams) {
-                FrameLayout.LayoutParams olp = (FrameLayout.LayoutParams) rawOlp;
-                olp.width = dp(visualDp);
-                olp.height = dp(visualDp);
-                orbPreview.setLayoutParams(olp);
-            }
-            orbPreview.setAlpha(ColgramDesignConfig.getKolitiOrbAlpha());
-            GradientDrawable orbOutline = new GradientDrawable();
-            orbOutline.setShape(GradientDrawable.OVAL);
-            orbOutline.setStroke(dp(2), pal.accentPrimary);
-            orbPreview.setBackground(orbOutline);
-            orbPreview.setPadding(dp(2), dp(2), dp(2), dp(2));
-            ColgramAeroStyler.applyKolitiAvatar(orbPreview);
+            if (ColgramBuildFlags.KOLITI_ENABLED) {
+                orbHost.setVisibility(VISIBLE);
+                int orbDp = ColgramDesignConfig.getKolitiOrbSizeDp();
+                int visualDp = Math.max(32, Math.min(64, Math.round(orbDp * 0.78f)));
+                ViewGroup.LayoutParams rawOlp = orbPreview.getLayoutParams();
+                if (rawOlp instanceof FrameLayout.LayoutParams) {
+                    FrameLayout.LayoutParams olp = (FrameLayout.LayoutParams) rawOlp;
+                    olp.width = dp(visualDp);
+                    olp.height = dp(visualDp);
+                    orbPreview.setLayoutParams(olp);
+                }
+                orbPreview.setAlpha(ColgramDesignConfig.getKolitiOrbAlpha());
+                GradientDrawable orbOutline = new GradientDrawable();
+                orbOutline.setShape(GradientDrawable.OVAL);
+                orbOutline.setStroke(dp(2), pal.accentPrimary);
+                orbPreview.setBackground(orbOutline);
+                orbPreview.setPadding(dp(2), dp(2), dp(2), dp(2));
+                ColgramAeroStyler.applyKolitiAvatar(orbPreview);
 
-            if (orbMetaTv != null) {
-                int dockMode = ColgramDesignConfig.getKolitiOrbDock();
-                String dockTxt = dockMode == ColgramDesignConfig.DOCK_RIGHT ? "справа"
-                        : (dockMode == ColgramDesignConfig.DOCK_REMEMBER ? "свободно" : "слева");
-                orbMetaTv.setText(ColgramDesignConfig.getKolitiDisplayName() + " • " + orbDp + "dp • "
-                        + ColgramDesignConfig.getKolitiOrbAlphaPct() + "% • " + dockTxt);
-                orbMetaTv.setTextColor(pal.textSecondary);
+                if (orbMetaTv != null) {
+                    orbMetaTv.setVisibility(VISIBLE);
+                    int dockMode = ColgramDesignConfig.getKolitiOrbDock();
+                    String dockTxt = dockMode == ColgramDesignConfig.DOCK_RIGHT ? "справа"
+                            : (dockMode == ColgramDesignConfig.DOCK_REMEMBER ? "свободно" : "слева");
+                    orbMetaTv.setText(ColgramDesignConfig.getKolitiDisplayName() + " • " + orbDp + "dp • "
+                            + ColgramDesignConfig.getKolitiOrbAlphaPct() + "% • " + dockTxt);
+                    orbMetaTv.setTextColor(pal.textSecondary);
+                }
+            } else {
+                orbHost.setVisibility(GONE);
+                if (orbMetaTv != null) {
+                    orbMetaTv.setVisibility(GONE);
+                }
             }
         }
     }
@@ -1161,8 +1186,12 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     ColgramMenuChrome.applyDetailIcon(d, "Экспортировать дизайн (JSON)", "Скопировать все настройки дизайна в буфер обмена", R.drawable.msg_share, ColgramMenuChrome.COLOR_EMERALD, true);
                 } else if (position == importJsonRow) {
                     ColgramMenuChrome.applyDetailIcon(d, "Импортировать дизайн (JSON)", "Загрузить сохранённый конфиг из текста", R.drawable.msg_download, ColgramMenuChrome.COLOR_BLUE, true);
-                } else if (position == resetAllRow) {
-                    ColgramMenuChrome.applyDetailIcon(d, "Сбросить всё к стандарту", "Вернуть заводскую тему, раскладку и аватар", R.drawable.msg_clear, ColgramMenuChrome.COLOR_CRIMSON, false);
+                } else if (resetAllRow >= 0 && position == resetAllRow) {
+                    ColgramMenuChrome.applyDetailIcon(d, "Сбросить всё к стандарту",
+                            ColgramBuildFlags.KOLITI_ENABLED
+                                    ? "Вернуть заводскую тему, раскладку и аватар"
+                                    : "Вернуть заводскую тему и раскладку",
+                            R.drawable.msg_clear, ColgramMenuChrome.COLOR_CRIMSON, false);
                 }
             } else if (type == 4) {
                 ((TextInfoPrivacyCell) holder.itemView).setText(

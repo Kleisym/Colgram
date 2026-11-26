@@ -24,9 +24,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import org.colgram.core.ColgramAiEngine;
-import org.colgram.core.ColgramAiModels;
-import org.colgram.core.ColgramNativeLlama;
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramProxyDoctor;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.ui.ActionBar.BaseFragment;
@@ -49,12 +47,19 @@ public final class ColgramEasterEggs {
     private static final String PREFS = "colgram_easter_eggs";
     private static final String KEY_OVERDRIVE = "neon_overdrive_enabled";
 
-    private static final String[] QUOTES = {
-            "Кола-волна запущена! Тапай по горке — Koliti прыгает выше",
-            "Пузырьки газировки можно лопать прямо пальцем",
-            "Пасхалка! 5 тапов по заголовку Colgram откроют секретную аркаду",
-            "Введи .cola или .пузыри в чате с Koliti для мгновенного запуска"
-    };
+    private static final String[] QUOTES = ColgramBuildFlags.KOLITI_ENABLED
+            ? new String[]{
+                "Кола-волна запущена! Тапай по горке — Koliti прыгает выше",
+                "Пузырьки газировки можно лопать прямо пальцем",
+                "Пасхалка! 5 тапов по заголовку Colgram откроют секретную аркаду",
+                "Введи .cola или .пузыри в чате с Koliti для мгновенного запуска"
+            }
+            : new String[]{
+                "Кола-волна запущена! Тапай по горке для прыжка",
+                "Пузырьки газировки можно лопать прямо пальцем",
+                "Пасхалка! 5 тапов по заголовку Colgram откроют секретную аркаду",
+                "Тапни 3 раза по любому баннеру Colgram для запуска пасхалки"
+            };
 
     private static long lastTitleTapMs = 0L;
     private static int titleTapCount = 0;
@@ -151,9 +156,15 @@ public final class ColgramEasterEggs {
                 ColgramConfettiView.burstOver(root, root.getWidth() * 0.5f, root.getHeight() * 0.45f, 110);
             }
         }
+        if (!ColgramBuildFlags.KOLITI_ENABLED) {
+            return "Пасхалка Colgram активирована.\n\n"
+                    + "• Секретные жесты:\n"
+                    + "  — 3 нажатия на иконку любого баннера Colgram — Кола-горка\n"
+                    + "  — 5 нажатий на заголовок Colgram в списке чатов — Секретная аркада";
+        }
         return "Пасхалка Colgram x Koliti активирована.\n\n"
                 + "• Ядро: Koliti Core Ultra (Qwen3.5 Hybrid Gated DeltaNet + FlashAttn)\n"
-                + "• C++ движок: " + ColgramNativeLlama.getSystemInfoSafe() + "\n"
+                + "• C++ движок: " + readNativeSystemInfo() + "\n"
                 + "• Секретные команды и жесты:\n"
                 + "  — .cola / .кола / .горка — интерактивная Кола-горка Koliti\n"
                 + "  — .пузыри / .fizz — душ из лопающихся пузырьков газировки\n"
@@ -238,14 +249,16 @@ public final class ColgramEasterEggs {
         headerRow.addView(titleCol, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
 
         TextView title = new TextView(act);
-        title.setText("Кола-горка Koliti");
+        title.setText(ColgramBuildFlags.KOLITI_ENABLED ? "Кола-горка Koliti" : "Кола-горка Colgram");
         title.setTextColor(0xFFFFF4DC);
         title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18.5f);
         title.setTypeface(AndroidUtilities.bold());
         titleCol.addView(title);
 
         TextView subtitle = new TextView(act);
-        subtitle.setText("Нажимай на горку — Koliti прыгает выше и ловит буст");
+        subtitle.setText(ColgramBuildFlags.KOLITI_ENABLED
+                ? "Нажимай на горку — Koliti прыгает выше и ловит буст"
+                : "Нажимай на горку — персонаж прыгает выше и ловит буст");
         subtitle.setTextColor(0xBBFDBA74);
         subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
         titleCol.addView(subtitle, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
@@ -345,14 +358,22 @@ public final class ColgramEasterEggs {
         TextView telemetry = new TextView(act);
         Runtime rt = Runtime.getRuntime();
         long heapUsed = (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
-        String sysInfo = ColgramNativeLlama.getSystemInfoSafe();
-        if (sysInfo.length() > 96) sysInfo = sysInfo.substring(0, 96) + "…";
-        telemetry.setText(
-                "• Движок ИИ: " + ColgramAiEngine.getInstance().buildStatusSummary(act) + "\n"
-                        + "• C++ Core: " + sysInfo + "\n"
-                        + "• Сеть: " + ColgramProxyDoctor.getStatusSummary() + "\n"
-                        + "• Память JVM: " + heapUsed + " МБ · Моделей: " + ColgramAiModels.catalog().size()
-        );
+        if (ColgramBuildFlags.KOLITI_ENABLED) {
+            String sysInfo = readNativeSystemInfo();
+            if (sysInfo.length() > 96) sysInfo = sysInfo.substring(0, 96) + "…";
+            telemetry.setText(
+                    "• Движок ИИ: " + readAiEngineSummary(act) + "\n"
+                            + "• C++ Core: " + sysInfo + "\n"
+                            + "• Сеть: " + ColgramProxyDoctor.getStatusSummary() + "\n"
+                            + "• Память JVM: " + heapUsed + " МБ · Моделей: " + readAiCatalogCount()
+            );
+        } else {
+            telemetry.setText(
+                    "• Режим: Colgram Privacy Core (без встроенного ИИ)\n"
+                            + "• Сеть: " + ColgramProxyDoctor.getStatusSummary() + "\n"
+                            + "• Память JVM: " + heapUsed + " МБ"
+            );
+        }
         telemetry.setTextColor(0xFFD1FAE5);
         telemetry.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
         telemetry.setTypeface(Typeface.MONOSPACE);
@@ -362,7 +383,7 @@ public final class ColgramEasterEggs {
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
         container.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
 
-        TextView colaBtn = makePillButton(act, "Кола-горка Koliti", 0xFFE11D48);
+        TextView colaBtn = makePillButton(act, ColgramBuildFlags.KOLITI_ENABLED ? "Кола-горка Koliti" : "Кола-горка Colgram", 0xFFE11D48);
         ColgramMenuChrome.attachSpringPress(colaBtn);
         colaBtn.setOnClickListener(v -> {
             sheet.dismiss();
@@ -381,15 +402,17 @@ public final class ColgramEasterEggs {
         });
         btnRow.addView(burstBtn, LayoutHelper.createLinear(0, 44, 0.9f, 0, 0, 0, 0));
 
-        TextView studioBtn = makePillButton(act, "Открыть Koliti Studio", 0xFF1E293B);
-        ColgramMenuChrome.attachSpringPress(studioBtn);
-        studioBtn.setOnClickListener(v -> {
-            sheet.dismiss();
-            if (parentFragment != null) {
-                parentFragment.presentFragment(new ColgramAiActivity());
-            }
-        });
-        container.addView(studioBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 42));
+        if (ColgramBuildFlags.KOLITI_ENABLED) {
+            TextView studioBtn = makePillButton(act, "Открыть Koliti Studio", 0xFF1E293B);
+            ColgramMenuChrome.attachSpringPress(studioBtn);
+            studioBtn.setOnClickListener(v -> {
+                sheet.dismiss();
+                if (parentFragment != null) {
+                    parentFragment.presentFragment(new ColgramAiActivity());
+                }
+            });
+            container.addView(studioBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 42));
+        }
 
         sheet.setCustomView(container);
         sheet.show();
@@ -561,7 +584,9 @@ public final class ColgramEasterEggs {
     }
 
     private static final class MatrixRainView extends View {
-        private static final String GLYPHS = "01COLGRAMKOLITIQWEN35ZX#@$%&*";
+        private static final String GLYPHS = ColgramBuildFlags.KOLITI_ENABLED
+                ? "01COLGRAMKOLITIQWEN35ZX#@$%&*"
+                : "01COLGRAMCYBERAEROZX#@$%&*";
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint headerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Random rnd = new Random();
@@ -633,7 +658,42 @@ public final class ColgramEasterEggs {
                 }
             }
             headerPaint.setShadowLayer(dp(6), 0, 0, 0xFF10B981);
-            canvas.drawText("COLGRAM // KOLITI CORE", w * 0.5f, h * 0.54f, headerPaint);
+            canvas.drawText(ColgramBuildFlags.KOLITI_ENABLED ? "COLGRAM // KOLITI CORE" : "COLGRAM // PRIVACY CORE",
+                    w * 0.5f, h * 0.54f, headerPaint);
+        }
+    }
+
+    private static String readNativeSystemInfo() {
+        try {
+            Object v = Class.forName("org.colgram.core.ColgramNativeLlama")
+                    .getMethod("getSystemInfoSafe")
+                    .invoke(null);
+            return v != null ? String.valueOf(v) : "native";
+        } catch (Throwable ignored) {
+            return "native";
+        }
+    }
+
+    private static String readAiEngineSummary(Activity act) {
+        try {
+            Class<?> cls = Class.forName("org.colgram.core.ColgramAiEngine");
+            Object inst = cls.getMethod("getInstance").invoke(null);
+            if (inst == null) return "unavailable";
+            Object v = cls.getMethod("buildStatusSummary", Activity.class).invoke(inst, act);
+            return v != null ? String.valueOf(v) : "unavailable";
+        } catch (Throwable ignored) {
+            return "unavailable";
+        }
+    }
+
+    private static int readAiCatalogCount() {
+        try {
+            Object list = Class.forName("org.colgram.core.ColgramAiModels")
+                    .getMethod("catalog")
+                    .invoke(null);
+            return (list instanceof java.util.List<?>) ? ((java.util.List<?>) list).size() : 0;
+        } catch (Throwable ignored) {
+            return 0;
         }
     }
 }

@@ -330,85 +330,122 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
         if (texture == null || !shouldBePlaying()) {
             return;
         }
-        if (Boolean.FALSE.equals(FILE_EXISTS_CACHE.get(videoPath))) {
+        final String targetPath = videoPath;
+        if (targetPath == null || targetPath.isEmpty() || Boolean.FALSE.equals(FILE_EXISTS_CACHE.get(targetPath))) {
             return;
         }
         final int gen = playerGeneration;
-        try {
-            // Keep underlying poster crisp during ~100ms codec warmup without triggering HWUI skip-draw (0.01f > 0).
-            setAlpha(0.01f);
-            firstFrameRendered = false;
-            activePlayerPath = videoPath;
-            renderSurface = new Surface(texture);
-            final MediaPlayer mp = new MediaPlayer();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                mp.setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                        .build());
-            }
-            mp.setSurface(renderSurface);
+        // Keep underlying poster crisp during ~100ms codec warmup without triggering HWUI skip-draw (0.01f > 0).
+        setAlpha(0.01f);
+        firstFrameRendered = false;
+        activePlayerPath = targetPath;
+        final Surface surface = new Surface(texture);
+        renderSurface = surface;
+        Utilities.globalQueue.postRunnable(() -> {
+            MediaPlayer mp = null;
             try {
-                mp.setDataSource(videoPath);
-            } catch (Throwable primaryErr) {
-                try (FileInputStream fis = new FileInputStream(videoPath)) {
+                File f = new File(targetPath);
+                if (!f.isFile() || f.length() <= 0L) {
+                    FILE_EXISTS_CACHE.put(targetPath, Boolean.FALSE);
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (gen == playerGeneration) {
+                            handlePlayerFailure();
+                        }
+                    });
+                    return;
+                }
+                FILE_EXISTS_CACHE.put(targetPath, Boolean.TRUE);
+                mp = new MediaPlayer();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    mp.setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                            .build());
+                }
+                try (FileInputStream fis = new FileInputStream(f)) {
                     mp.setDataSource(fis.getFD());
                 }
-            }
-            mp.setLooping(true);
-            mp.setVolume(0f, 0f);
-            mp.setOnVideoSizeChangedListener((player, width, height) -> {
-                if (mediaPlayer != player) return;
-                videoWidth = width;
-                videoHeight = height;
-                applyCenterCropTransform();
-            });
-            mp.setOnInfoListener((player, what, extra) -> {
-                if (mediaPlayer == player && what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
-                    firstFrameRendered = true;
-                    if (shouldBePlaying() && getAlpha() < 1f) {
-                        setAlpha(1f);
+                mp.setLooping(true);
+                mp.setVolume(0f, 0f);
+                final MediaPlayer preparedMp = mp;
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (gen != playerGeneration || !shouldBePlaying() || renderSurface != surface || !surface.isValid()) {
+                        releasePlayerAsync(preparedMp);
+                        return;
                     }
-                    applyCenterCropTransform();
-                }
-                return false;
-            });
-            mp.setOnCompletionListener(player -> {
-                if (mediaPlayer != player || !shouldBePlaying()) return;
-                try {
-                    player.seekTo(0);
-                    player.start();
-                } catch (Throwable ignored) {}
-            });
-            mp.setOnPreparedListener(player -> {
-                if (mediaPlayer != player) return;
-                playerPrepared = true;
-                try {
-                    player.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
-                } catch (Throwable ignored) {}
-                videoWidth = player.getVideoWidth();
-                videoHeight = player.getVideoHeight();
-                applyCenterCropTransform();
-                if (shouldBePlaying()) {
                     try {
-                        player.start();
-                        if ((firstFrameRendered || player.isPlaying()) && getAlpha() < 1f) {
-                            setAlpha(1f);
-                        }
-                        scheduleStartFallbackCheck(gen);
-                    } catch (Throwable ignored) {}
-                }
-            });
-            mp.setOnErrorListener((player, what, extra) -> {
-                if (mediaPlayer != player) return true;
-                handlePlayerFailure();
-                return true;
-            });
-            mediaPlayer = mp;
-            mp.prepareAsync();
-        } catch (Throwable ignored) {
-            handlePlayerFailure();
-        }
+                        preparedMp.setSurface(surface);
+                        preparedMp.setOnVideoSizeChangedListener((player, width, height) -> {
+                            if (mediaPlayer != player) return;
+                            videoWidth = width;
+                            videoHeight = height;
+                            applyCenterCropTransform();
+                        });
+                        preparedMp.setOnInfoListener((player, what, extra) -> {
+                            if (mediaPlayer == player && what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                                firstFrameRendered = true;
+                                if (shouldBePlaying() && getAlpha() < 1f) {
+                                    setAlpha(1f);
+                                }
+                                applyCenterCropTransform();
+                            }
+                            return false;
+                        });
+                        preparedMp.setOnCompletionListener(player -> {
+                            if (mediaPlayer != player || !shouldBePlaying()) return;
+                            try {
+                                player.seekTo(0);
+                                player.start();
+                            } catch (Throwable ignored) {}
+                        });
+                        preparedMp.setOnPreparedListener(player -> {
+                            if (mediaPlayer != player) return;
+                            playerPrepared = true;
+                            try {
+                                player.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
+                            } catch (Throwable ignored) {}
+                            videoWidth = player.getVideoWidth();
+                            videoHeight = player.getVideoHeight();
+                            applyCenterCropTransform();
+                            if (shouldBePlaying()) {
+                                try {
+                                    player.start();
+                                    if ((firstFrameRendered || player.isPlaying()) && getAlpha() < 1f) {
+                                        setAlpha(1f);
+                                    }
+                                    scheduleStartFallbackCheck(gen);
+                                } catch (Throwable ignored) {}
+                            }
+                        });
+                        preparedMp.setOnErrorListener((player, what, extra) -> {
+                            if (mediaPlayer != player) return true;
+                            handlePlayerFailure();
+                            return true;
+                        });
+                        mediaPlayer = preparedMp;
+                        preparedMp.prepareAsync();
+                    } catch (Throwable ignored) {
+                        releasePlayerAsync(preparedMp);
+                        handlePlayerFailure();
+                    }
+                });
+            } catch (Throwable ignored) {
+                releasePlayerAsync(mp);
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (gen == playerGeneration) {
+                        handlePlayerFailure();
+                    }
+                });
+            }
+        });
+    }
+
+    private static void releasePlayerAsync(final MediaPlayer mp) {
+        if (mp == null) return;
+        RELEASE_QUEUE.postRunnable(() -> {
+            try { mp.reset(); } catch (Throwable ignored) {}
+            try { mp.release(); } catch (Throwable ignored) {}
+        });
     }
 
     private void handlePlayerFailure() {

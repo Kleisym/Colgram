@@ -30,6 +30,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.json.JSONArray;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.Emoji;
@@ -60,8 +61,12 @@ import java.util.concurrent.Executors;
  */
 public class ColgramEditHistorySheet {
 
-    private static final SimpleDateFormat DATE_FORMAT =
-            new SimpleDateFormat("dd.MM.yyyy · HH:mm:ss", Locale.getDefault());
+    private static final ThreadLocal<SimpleDateFormat> DATE_FORMAT = new ThreadLocal<SimpleDateFormat>() {
+        @Override
+        protected SimpleDateFormat initialValue() {
+            return new SimpleDateFormat("dd.MM.yyyy · HH:mm:ss", Locale.getDefault());
+        }
+    };
     private static final ExecutorService THUMB_EXEC = Executors.newFixedThreadPool(2);
 
     private static final class TimelineItem {
@@ -223,21 +228,23 @@ public class ColgramEditHistorySheet {
 
         final java.util.concurrent.atomic.AtomicBoolean popped = new java.util.concurrent.atomic.AtomicBoolean(false);
         final Runnable popOnce = () -> {
-            if (popped.compareAndSet(false, true)) {
+            if (ColgramBuildFlags.KOLITI_ENABLED && popped.compareAndSet(false, true)) {
                 ColgramGlobalOrbController.popModalSuppression();
             }
         };
-        root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-            @Override
-            public void onViewAttachedToWindow(View v) {}
+        if (ColgramBuildFlags.KOLITI_ENABLED) {
+            root.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                @Override
+                public void onViewAttachedToWindow(View v) {}
 
-            @Override
-            public void onViewDetachedFromWindow(View v) {
-                popOnce.run();
-            }
-        });
-        ColgramGlobalOrbController.pushModalSuppression();
-        sheet.setOnDismissListener(d -> popOnce.run());
+                @Override
+                public void onViewDetachedFromWindow(View v) {
+                    popOnce.run();
+                }
+            });
+            ColgramGlobalOrbController.pushModalSuppression();
+            sheet.setOnDismissListener(d -> popOnce.run());
+        }
         sheet.setCustomView(root);
         try {
             sheet.show();
@@ -891,9 +898,8 @@ public class ColgramEditHistorySheet {
     private static String formatTs(long ts) {
         try {
             long ms = org.colgram.core.ColgramDatabase.normalizeEpochMillis(ts);
-            synchronized (DATE_FORMAT) {
-                return DATE_FORMAT.format(new Date(ms));
-            }
+            SimpleDateFormat fmt = DATE_FORMAT.get();
+            return fmt != null ? fmt.format(new Date(ms)) : "";
         } catch (Throwable t) {
             return "";
         }

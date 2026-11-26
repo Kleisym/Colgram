@@ -31,6 +31,7 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramConfig;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
@@ -723,8 +724,13 @@ public final class ColgramMenuChrome {
             bg.setStroke(Math.max(1, dp(0.75f)), strokeCol);
             card.setBackground(bg);
 
-            boolean fullColorAsset = iconRes == org.telegram.messenger.R.drawable.koliti_avatar
-                    || iconRes == org.telegram.messenger.R.drawable.colgram_brand_logo;
+            int effectiveIconRes = (!ColgramBuildFlags.KOLITI_ENABLED
+                    && iconRes == org.telegram.messenger.R.drawable.koliti_avatar)
+                    ? org.telegram.messenger.R.drawable.colgram_brand_logo
+                    : iconRes;
+            boolean fullColorAsset = (ColgramBuildFlags.KOLITI_ENABLED
+                    && effectiveIconRes == org.telegram.messenger.R.drawable.koliti_avatar)
+                    || effectiveIconRes == org.telegram.messenger.R.drawable.colgram_brand_logo;
             GradientDrawable badgeBg = new GradientDrawable(
                     GradientDrawable.Orientation.TL_BR,
                     new int[]{lighten(effectiveAccent, 0.08f), darken(effectiveAccent, 0.18f)}
@@ -740,7 +746,7 @@ public final class ColgramMenuChrome {
                 badgeIcon.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
                 badgeIcon.setPadding(dp(9), dp(9), dp(9), dp(9));
             }
-            badgeIcon.setImageResource(iconRes);
+            badgeIcon.setImageResource(effectiveIconRes);
 
             titleView.setTextColor(titleCol);
             titleView.setText(title);

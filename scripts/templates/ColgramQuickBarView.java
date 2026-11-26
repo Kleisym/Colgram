@@ -18,8 +18,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.colgram.core.ColgramAiConfig;
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramConfig;
-import org.colgram.core.ColgramKolitiVoice;
 import org.colgram.core.ColgramProxyManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.MessagesController;
@@ -276,13 +276,13 @@ public class ColgramQuickBarView extends FrameLayout {
     }
 
     private String buildDisplayLabel(Context ctx, ActionDef def, boolean active) {
-        if ("koliti".equals(def.id)) {
+        if (ColgramBuildFlags.KOLITI_ENABLED && "koliti".equals(def.id)) {
             return org.colgram.core.ColgramDesignConfig.getKolitiDisplayName();
         }
         if ("ghost".equals(def.id)) {
             return active ? "Невидимка ВКЛ" : "Невидимка";
         }
-        if ("voice".equals(def.id)) {
+        if (ColgramBuildFlags.KOLITI_ENABLED && "voice".equals(def.id)) {
             return active ? "Озвучка ВКЛ" : "Озвучка";
         }
         return def.label;
@@ -295,7 +295,7 @@ public class ColgramQuickBarView extends FrameLayout {
             case "proxy":
                 return ColgramProxyManager.hasActiveRouteForUi() || ColgramConfig.isDpiBypassEnabled();
             case "voice":
-                return ColgramAiConfig.isVoiceOverEnabled(ctx);
+                return ColgramBuildFlags.KOLITI_ENABLED && ColgramAiConfig.isVoiceOverEnabled(ctx);
             case "antidelete":
                 return ColgramConfig.isAntiDeleteEnabled();
             default:
@@ -340,8 +340,9 @@ public class ColgramQuickBarView extends FrameLayout {
                 break;
             }
             case "koliti": {
-                if (!canLaunchNavAction()) return;
-                ColgramAiSheet.show(hostFragment, null, null);
+                if (ColgramBuildFlags.KOLITI_ENABLED && canLaunchNavAction()) {
+                    ColgramAiSheet.show(hostFragment, null, null);
+                }
                 break;
             }
             case "saved": {
@@ -365,10 +366,15 @@ public class ColgramQuickBarView extends FrameLayout {
                 break;
             }
             case "voice": {
+                if (!ColgramBuildFlags.KOLITI_ENABLED) break;
                 boolean next = !ColgramAiConfig.isVoiceOverEnabled(appCtx);
                 ColgramAiConfig.setVoiceOverEnabled(appCtx, next);
                 if (!next) {
-                    ColgramKolitiVoice.stopSpeaking();
+                    try {
+                        Class.forName("org.colgram.core.ColgramKolitiVoice")
+                                .getMethod("stopSpeaking")
+                                .invoke(null);
+                    } catch (Throwable ignored) {}
                 }
                 rebuild();
                 Toast.makeText(appCtx,
@@ -451,7 +457,7 @@ public class ColgramQuickBarView extends FrameLayout {
         List<String> current = ColgramConfig.getQuickBarItems();
         final boolean[] checked = new boolean[ALL_ACTIONS.length];
         for (int i = 0; i < ALL_ACTIONS.length; i++) {
-            checked[i] = current.contains(ALL_ACTIONS[i].id);
+            checked[i] = isActionAvailable(ALL_ACTIONS[i]) && current.contains(ALL_ACTIONS[i].id);
         }
 
         ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
@@ -509,6 +515,7 @@ public class ColgramQuickBarView extends FrameLayout {
         for (int i = 0; i < ALL_ACTIONS.length; i++) {
             final int idx = i;
             final ActionDef def = ALL_ACTIONS[i];
+            if (!isActionAvailable(def)) continue;
             LinearLayout row = new LinearLayout(act);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
@@ -608,7 +615,7 @@ public class ColgramQuickBarView extends FrameLayout {
         saveBtn.setOnClickListener(v -> {
             ArrayList<String> selected = new ArrayList<>();
             for (int i = 0; i < ALL_ACTIONS.length; i++) {
-                if (checked[i]) selected.add(ALL_ACTIONS[i].id);
+                if (checked[i] && isActionAvailable(ALL_ACTIONS[i])) selected.add(ALL_ACTIONS[i].id);
             }
             ColgramConfig.setQuickBarItems(selected);
             rebuild();
@@ -622,20 +629,33 @@ public class ColgramQuickBarView extends FrameLayout {
         if (hostFragment != null) {
             hostFragment.showDialog(sheet);
         } else {
-            ColgramGlobalOrbController.pushModalSuppression();
-            sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
+            if (ColgramBuildFlags.KOLITI_ENABLED) {
+                ColgramGlobalOrbController.pushModalSuppression();
+                sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
+            }
             try {
                 sheet.show();
             } catch (Throwable ignored) {
-                ColgramGlobalOrbController.popModalSuppression();
+                if (ColgramBuildFlags.KOLITI_ENABLED) {
+                    ColgramGlobalOrbController.popModalSuppression();
+                }
             }
         }
+    }
+
+    private static boolean isActionAvailable(ActionDef def) {
+        if (def == null) return false;
+        if (!ColgramBuildFlags.KOLITI_ENABLED
+                && ("koliti".equals(def.id) || "voice".equals(def.id))) {
+            return false;
+        }
+        return true;
     }
 
     private static ActionDef findDef(String id) {
         if (id == null) return null;
         for (ActionDef def : ALL_ACTIONS) {
-            if (def.id.equals(id)) return def;
+            if (def.id.equals(id) && isActionAvailable(def)) return def;
         }
         return null;
     }

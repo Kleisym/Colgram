@@ -18,6 +18,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.LinearInterpolator;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramConfig;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
@@ -189,29 +190,127 @@ public final class ColgramAeroStyler {
         }
     }
 
+    private static final int MAX_AVATAR_DECODE_PX = 256;
     private static volatile String cachedKolitiAvatarKey = "";
     private static volatile android.graphics.Bitmap cachedKolitiAvatarBitmap;
+    private static volatile String inflightAvatarKey = "";
+    private static final java.util.Set<java.lang.ref.WeakReference<android.widget.ImageView>> pendingAvatarTargets =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+    private static Bitmap decodeSampledFile(java.io.File f, int maxSidePx) {
+        if (f == null || !f.isFile() || f.length() <= 0) return null;
+        try {
+            android.graphics.BitmapFactory.Options bounds = new android.graphics.BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+            int sample = 1;
+            while (bounds.outWidth / sample > maxSidePx || bounds.outHeight / sample > maxSidePx) {
+                sample *= 2;
+            }
+            android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options();
+            opts.inSampleSize = Math.max(1, sample);
+            return android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), opts);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void scheduleCustomAvatarLoad(final Context appCtx, final String customPath) {
+        if (appCtx == null || customPath == null || customPath.isEmpty()) return;
+        if (customPath.equals(inflightAvatarKey)) return;
+        inflightAvatarKey = customPath;
+        org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+            Bitmap loaded = null;
+            String loadedKey = "";
+            try {
+                java.io.File f = new java.io.File(customPath);
+                if (f.isFile() && f.length() > 0) {
+                    String key = f.getAbsolutePath() + "@" + f.lastModified();
+                    if (key.equals(cachedKolitiAvatarKey) && cachedKolitiAvatarBitmap != null && !cachedKolitiAvatarBitmap.isRecycled()) {
+                        loaded = cachedKolitiAvatarBitmap;
+                        loadedKey = key;
+                    } else {
+                        loaded = decodeSampledFile(f, MAX_AVATAR_DECODE_PX);
+                        if (loaded != null) {
+                            loadedKey = key;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (customPath.equals(inflightAvatarKey)) {
+                    inflightAvatarKey = "";
+                }
+            }
+            if (loaded != null) {
+                cachedKolitiAvatarKey = loadedKey;
+                cachedKolitiAvatarBitmap = loaded;
+                final Bitmap ready = loaded;
+                AndroidUtilities.runOnUIThread(() -> {
+                    java.util.ArrayList<android.widget.ImageView> targets = new java.util.ArrayList<>();
+                    synchronized (pendingAvatarTargets) {
+                        java.util.Iterator<java.lang.ref.WeakReference<android.widget.ImageView>> it = pendingAvatarTargets.iterator();
+                        while (it.hasNext()) {
+                            android.widget.ImageView target = it.next().get();
+                            it.remove();
+                            if (target != null) targets.add(target);
+                        }
+                    }
+                    for (android.widget.ImageView target : targets) {
+                        if (Boolean.TRUE.equals(target.getTag(0x636f6c19)) && !ready.isRecycled()) {
+                            target.setImageBitmap(ready);
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     /** Loads the user's custom Koliti avatar (if configured) or falls back cleanly to built-in koliti_avatar. */
     public static android.graphics.Bitmap loadKolitiAvatarBitmap(Context ctx) {
         if (ctx == null) return null;
-        String customPath = org.colgram.core.ColgramDesignConfig.getKolitiCustomAvatarPath();
-        String key = customPath == null ? "" : customPath;
-        if (!key.isEmpty()) {
-            java.io.File f = new java.io.File(key);
-            if (f.isFile() && f.length() > 0) {
-                key = f.getAbsolutePath() + "@" + f.lastModified();
-                if (key.equals(cachedKolitiAvatarKey) && cachedKolitiAvatarBitmap != null && !cachedKolitiAvatarBitmap.isRecycled()) {
-                    return cachedKolitiAvatarBitmap;
+        if (!ColgramBuildFlags.KOLITI_ENABLED) {
+            String brandKey = "res:colgram_brand_logo";
+            if (brandKey.equals(cachedKolitiAvatarKey) && cachedKolitiAvatarBitmap != null && !cachedKolitiAvatarBitmap.isRecycled()) {
+                return cachedKolitiAvatarBitmap;
+            }
+            try {
+                android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeResource(
+                        ctx.getResources(), org.telegram.messenger.R.drawable.colgram_brand_logo);
+                if (bmp != null) {
+                    cachedKolitiAvatarKey = brandKey;
+                    cachedKolitiAvatarBitmap = bmp;
                 }
-                try {
-                    android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+                return bmp;
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+        String customPath = org.colgram.core.ColgramDesignConfig.getKolitiCustomAvatarPath();
+        String path = customPath == null ? "" : customPath;
+        if (!path.isEmpty()) {
+            String curKey = cachedKolitiAvatarKey;
+            if (curKey.startsWith(path + "@") && cachedKolitiAvatarBitmap != null && !cachedKolitiAvatarBitmap.isRecycled()) {
+                return cachedKolitiAvatarBitmap;
+            }
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                // Never stall the UI thread with File.isFile() or unbounded BitmapFactory.decodeFile().
+                scheduleCustomAvatarLoad(ctx.getApplicationContext(), path);
+            } else {
+                java.io.File f = new java.io.File(path);
+                if (f.isFile() && f.length() > 0) {
+                    String key = f.getAbsolutePath() + "@" + f.lastModified();
+                    if (key.equals(cachedKolitiAvatarKey) && cachedKolitiAvatarBitmap != null && !cachedKolitiAvatarBitmap.isRecycled()) {
+                        return cachedKolitiAvatarBitmap;
+                    }
+                    android.graphics.Bitmap bmp = decodeSampledFile(f, MAX_AVATAR_DECODE_PX);
                     if (bmp != null) {
                         cachedKolitiAvatarKey = key;
                         cachedKolitiAvatarBitmap = bmp;
                         return bmp;
                     }
-                } catch (Throwable ignored) {}
+                }
             }
         }
         String defKey = "res:koliti_avatar";
@@ -221,8 +320,10 @@ public final class ColgramAeroStyler {
         try {
             android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeResource(
                     ctx.getResources(), org.telegram.messenger.R.drawable.koliti_avatar);
-            cachedKolitiAvatarKey = defKey;
-            cachedKolitiAvatarBitmap = bmp;
+            if (path.isEmpty()) {
+                cachedKolitiAvatarKey = defKey;
+                cachedKolitiAvatarBitmap = bmp;
+            }
             return bmp;
         } catch (Throwable ignored) {
             return null;
@@ -232,15 +333,32 @@ public final class ColgramAeroStyler {
     public static void invalidateKolitiAvatarCache() {
         cachedKolitiAvatarKey = "";
         cachedKolitiAvatarBitmap = null;
+        inflightAvatarKey = "";
     }
 
     public static void applyKolitiAvatar(android.widget.ImageView iv) {
         if (iv == null) return;
-        android.graphics.Bitmap bmp = loadKolitiAvatarBitmap(iv.getContext());
-        if (bmp != null) {
-            iv.setImageBitmap(bmp);
+        if (!ColgramBuildFlags.KOLITI_ENABLED) {
+            iv.setTag(0x636f6c19, Boolean.FALSE);
+            iv.setImageResource(org.telegram.messenger.R.drawable.colgram_brand_logo);
         } else {
-            iv.setImageResource(org.telegram.messenger.R.drawable.koliti_avatar);
+            String customPath = org.colgram.core.ColgramDesignConfig.getKolitiCustomAvatarPath();
+            boolean hasCustom = customPath != null && !customPath.isEmpty();
+            android.graphics.Bitmap bmp = loadKolitiAvatarBitmap(iv.getContext());
+            if (bmp != null) {
+                iv.setImageBitmap(bmp);
+            } else {
+                iv.setImageResource(org.telegram.messenger.R.drawable.koliti_avatar);
+            }
+            if (hasCustom && !cachedKolitiAvatarKey.startsWith(customPath + "@")) {
+                iv.setTag(0x636f6c19, Boolean.TRUE);
+                synchronized (pendingAvatarTargets) {
+                    pendingAvatarTargets.add(new java.lang.ref.WeakReference<>(iv));
+                }
+                scheduleCustomAvatarLoad(iv.getContext() != null ? iv.getContext().getApplicationContext() : null, customPath);
+            } else {
+                iv.setTag(0x636f6c19, Boolean.FALSE);
+            }
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
             iv.setOutlineProvider(new android.view.ViewOutlineProvider() {
@@ -583,12 +701,17 @@ public final class ColgramAeroStyler {
         }
     }
 
-    /** Pre-rendered static offscreen bitmap backdrop for main menu (DialogsActivity) & onboarding. */
+    /** Pre-rendered static 0.25x offscreen bitmap backdrop for main menu (DialogsActivity) & onboarding. */
     public static final class AmbientMenuBackdropView extends View {
+        private static final float BACKDROP_SCALE = 0.25f;
+        private final android.graphics.Rect dstRect = new android.graphics.Rect();
+        private final Paint backdropPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
         private Bitmap cachedBitmap;
         private Canvas cachedCanvas;
         private int cachedWidth;
         private int cachedHeight;
+        private int cachedScaledW;
+        private int cachedScaledH;
         private int cachedStyle = -1;
         private int cachedAccent;
         private boolean cachedDark;
@@ -610,7 +733,41 @@ public final class ColgramAeroStyler {
             }
             cachedWidth = 0;
             cachedHeight = 0;
+            cachedScaledW = 0;
+            cachedScaledH = 0;
             cachedStyle = -1;
+        }
+
+        private boolean ensureScaledBuffer(int w, int h) {
+            if (w <= 0 || h <= 0) return false;
+            int sw = Math.max(1, Math.round(w * BACKDROP_SCALE));
+            int sh = Math.max(1, Math.round(h * BACKDROP_SCALE));
+            if (cachedBitmap == null || cachedBitmap.isRecycled() || cachedScaledW != sw || cachedScaledH != sh) {
+                releaseCachedBitmap();
+                cachedBitmap = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888);
+                cachedCanvas = new Canvas(cachedBitmap);
+                cachedScaledW = sw;
+                cachedScaledH = sh;
+            }
+            return true;
+        }
+
+        @Override
+        protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            if (w <= 0 || h <= 0 || org.colgram.core.ColgramConfig.getLiveWallpaperStyle() == org.colgram.core.ColgramLiveWallpaper.STYLE_OFF) {
+                releaseCachedBitmap();
+                return;
+            }
+            try {
+                if (ensureScaledBuffer(w, h)) {
+                    cachedWidth = 0;
+                    cachedHeight = 0;
+                    cachedStyle = -1;
+                }
+            } catch (OutOfMemoryError oom) {
+                releaseCachedBitmap();
+            }
         }
 
         @Override
@@ -649,22 +806,22 @@ public final class ColgramAeroStyler {
                     || cachedDark != dark || cachedCyber != cyber
                     || cachedDensity != density) {
                 try {
-                    if (cachedBitmap == null || cachedBitmap.isRecycled() || cachedWidth != w || cachedHeight != h) {
-                        releaseCachedBitmap();
-                        cachedBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                        cachedCanvas = new Canvas(cachedBitmap);
-                        cachedWidth = w;
-                        cachedHeight = h;
-                    } else {
-                        cachedBitmap.eraseColor(Color.TRANSPARENT);
+                    if (!ensureScaledBuffer(w, h)) {
+                        return;
                     }
+                    cachedBitmap.eraseColor(Color.TRANSPARENT);
+                    cachedWidth = w;
+                    cachedHeight = h;
                     cachedStyle = style;
                     cachedAccent = accent;
                     cachedDark = dark;
                     cachedCyber = cyber;
                     cachedDensity = density;
+                    cachedCanvas.save();
+                    cachedCanvas.scale(cachedScaledW / (float) w, cachedScaledH / (float) h);
                     org.colgram.core.ColgramLiveWallpaper.drawMainMenuAmbient(
                             cachedCanvas, w, h, accent, dark, cyber, 0f, density);
+                    cachedCanvas.restore();
                 } catch (OutOfMemoryError oom) {
                     releaseCachedBitmap();
                     org.colgram.core.ColgramLiveWallpaper.drawMainMenuAmbient(
@@ -672,7 +829,8 @@ public final class ColgramAeroStyler {
                     return;
                 }
             }
-            canvas.drawBitmap(cachedBitmap, 0f, 0f, null);
+            dstRect.set(0, 0, w, h);
+            canvas.drawBitmap(cachedBitmap, null, dstRect, backdropPaint);
         }
     }
 

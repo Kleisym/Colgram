@@ -55,7 +55,8 @@ public class ColgramForegroundService extends Service {
     private static final int DOZE_KEEPALIVE_REQUEST_CODE = 771009;
     /** Quiet Doze-proof alarm keepalive every 5 minutes for reliable screen-off delivery & Anti-Delete without heating. */
     private static final long DOZE_KEEPALIVE_INTERVAL_MS = 300_000L;
-    private static final long DOZE_WAKELOCK_MS = 4_000L;
+    private static final long DOZE_WAKELOCK_MS = 12_000L;
+    private static final long DOZE_PULSE_HOLD_MS = 9_000L;
 
     /** Lightweight passive 30-second bypass/poller check interval. */
     private static final long HEARTBEAT_MS = 30_000L;
@@ -135,9 +136,14 @@ public class ColgramForegroundService extends Service {
         // DO NOT unload Koliti weights on normal background switch (TRIM_MEMORY_UI_HIDDEN=20):
         // only release GGUF weights under genuine critical OS memory pressure so reopening Koliti
         // stays instant instead of triggering a 10-15s cold disk reload.
-        if (level == TRIM_MEMORY_RUNNING_CRITICAL || level >= TRIM_MEMORY_COMPLETE) {
+        if (ColgramBuildFlags.KOLITI_ENABLED
+                && (level == TRIM_MEMORY_RUNNING_CRITICAL || level >= TRIM_MEMORY_COMPLETE)) {
             try {
-                ColgramAiEngine.getInstance().unloadIfIdleInBackground();
+                Class<?> aiCls = Class.forName("org.colgram.core.ColgramAiEngine");
+                Object aiInst = aiCls.getMethod("getInstance").invoke(null);
+                if (aiInst != null) {
+                    aiCls.getMethod("unloadIfIdleInBackground").invoke(aiInst);
+                }
             } catch (Throwable ignored) {}
         }
         if (level >= TRIM_MEMORY_UI_HIDDEN) {
@@ -426,6 +432,11 @@ public class ColgramForegroundService extends Service {
     private static volatile java.lang.reflect.Method cachedCmSetPushConnectionEnabled;
     private static volatile java.lang.reflect.Method cachedCmResumeNetworkMaybe;
     private static volatile java.lang.reflect.Method cachedCmCheckConnection;
+    private static volatile Class<?> cachedMessagesControllerClass;
+    private static volatile java.lang.reflect.Method cachedMcGetInstance;
+    private static volatile java.lang.reflect.Method cachedMcGetDifference;
+    private static volatile java.lang.reflect.Field cachedStageQueueField;
+    private static volatile java.lang.reflect.Method cachedStageQueuePostRunnable;
     private static volatile boolean reflectionInitDone = false;
 
     private static void ensureReflectionHandles() {
@@ -451,7 +462,76 @@ public class ColgramForegroundService extends Service {
                 try { cachedCmResumeNetworkMaybe = cmClass.getMethod("resumeNetworkMaybe"); } catch (Throwable ignored) {}
                 try { cachedCmCheckConnection = cmClass.getMethod("checkConnection"); } catch (Throwable ignored) {}
             } catch (Throwable ignored) {}
+            try {
+                Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController");
+                cachedMessagesControllerClass = mcClass;
+                cachedMcGetInstance = mcClass.getMethod("getInstance", int.class);
+                cachedMcGetDifference = mcClass.getMethod("getDifference");
+            } catch (Throwable ignored) {}
+            try {
+                Class<?> utilClass = Class.forName("org.telegram.messenger.Utilities");
+                java.lang.reflect.Field sqField = utilClass.getField("stageQueue");
+                Object sq = sqField.get(null);
+                if (sq != null) {
+                    cachedStageQueuePostRunnable = sq.getClass().getMethod("postRunnable", Runnable.class);
+                    cachedStageQueueField = sqField;
+                }
+            } catch (Throwable ignored) {}
             reflectionInitDone = true;
+        }
+    }
+
+    private static void kickActiveHumanAccounts(boolean triggerCheckConnection, boolean triggerGetDifference) {
+        try {
+            ensureReflectionHandles();
+            if (!cachedUcGetInstanceMethodAvailable() || cachedCmGetInstance == null) {
+                return;
+            }
+            for (int a = 0; a < 5; a++) {
+                Object uc = cachedUcGetInstance.invoke(null, a);
+                if (uc == null) continue;
+                Boolean active = (Boolean) cachedUcIsActivated.invoke(uc);
+                if (active == null || !active) continue;
+                Object user = cachedUcGetCurrentUser != null ? cachedUcGetCurrentUser.invoke(uc) : null;
+                if (user != null && cachedUserBotField != null) {
+                    try {
+                        if (cachedUserBotField.getBoolean(user)) continue;
+                    } catch (Throwable ignored) {}
+                }
+                Object cm = cachedCmGetInstance.invoke(null, a);
+                if (cm != null) {
+                    if (cachedCmSetPushConnectionEnabled != null) {
+                        try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
+                    }
+                    if (cachedCmResumeNetworkMaybe != null) {
+                        try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
+                    }
+                    if (triggerCheckConnection && cachedCmCheckConnection != null) {
+                        try { cachedCmCheckConnection.invoke(cm); } catch (Throwable ignored) {}
+                    }
+                }
+                if (triggerGetDifference && cachedMcGetInstance != null && cachedMcGetDifference != null) {
+                    final int acct = a;
+                    Runnable diffTask = () -> {
+                        try {
+                            Object mc = cachedMcGetInstance.invoke(null, acct);
+                            if (mc != null) cachedMcGetDifference.invoke(mc);
+                        } catch (Throwable ignored) {}
+                    };
+                    if (cachedStageQueueField != null && cachedStageQueuePostRunnable != null) {
+                        try {
+                            Object sq = cachedStageQueueField.get(null);
+                            if (sq != null) {
+                                cachedStageQueuePostRunnable.invoke(sq, diffTask);
+                            }
+                        } catch (Throwable ignored) {}
+                    } else {
+                        diffTask.run();
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "human account sync kick error: " + t.getMessage());
         }
     }
 
@@ -476,39 +556,7 @@ public class ColgramForegroundService extends Service {
             return;
         }
         lastHumanSyncAtMs = now;
-        try {
-            ensureReflectionHandles();
-            if (cachedUcGetInstance == null || cachedUcIsActivated == null || cachedCmGetInstance == null) {
-                return;
-            }
-            for (int a = 0; a < 5; a++) {
-                Object uc = cachedUcGetInstance.invoke(null, a);
-                if (uc == null) continue;
-                Boolean active = (Boolean) cachedUcIsActivated.invoke(uc);
-                if (active == null || !active) continue;
-                Object user = cachedUcGetCurrentUser != null ? cachedUcGetCurrentUser.invoke(uc) : null;
-                if (user != null && cachedUserBotField != null) {
-                    try {
-                        boolean isBot = cachedUserBotField.getBoolean(user);
-                        if (isBot) continue; // bot pollers already handled via Bot API loop
-                    } catch (Throwable ignored) {}
-                }
-                Object cm = cachedCmGetInstance.invoke(null, a);
-                if (cm != null) {
-                    if (cachedCmSetPushConnectionEnabled != null) {
-                        try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
-                    }
-                    if (cachedCmResumeNetworkMaybe != null) {
-                        try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
-                    }
-                    if (cachedCmCheckConnection != null) {
-                        try { cachedCmCheckConnection.invoke(cm); } catch (Throwable ignored) {}
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "human background sync tick error: " + t.getMessage());
-        }
+        kickActiveHumanAccounts(true, false);
     }
 
     @Override
@@ -552,8 +600,8 @@ public class ColgramForegroundService extends Service {
         heartbeat = new Runnable() {
             @Override
             public void run() {
-                if (!ColgramUiBridge.isAppInForeground() && !hasAnyBotTokens()
-                        && !ColgramConfig.isAlwaysBackgroundEnabled()) {
+                final boolean fg = ColgramUiBridge.isAppInForeground();
+                if (!fg && !ColgramConfig.isAlwaysBackgroundEnabled() && !hasAnyBotTokens()) {
                     if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                         ColgramOptimizer.scheduleAfterStartup(() -> {
                             if (ColgramDpiBypass.restartIfDeadAndWait(2000L)) {
@@ -565,7 +613,14 @@ public class ColgramForegroundService extends Service {
                     ensurePollers();
                 }
                 if (handler != null && heartbeat == this) {
-                    long delay = HEARTBEAT_MS * Math.max(1, ColgramPowerGuard.intervalFactor(ColgramForegroundService.this));
+                    long baseMs;
+                    if (fg) {
+                        baseMs = HEARTBEAT_MS;
+                    } else {
+                        baseMs = ColgramPowerGuard.isScreenInteractive(ColgramForegroundService.this)
+                                ? 60_000L : 120_000L;
+                    }
+                    long delay = baseMs * Math.max(1, ColgramPowerGuard.intervalFactor(ColgramForegroundService.this));
                     handler.postDelayed(this, delay);
                 }
             }
@@ -635,6 +690,15 @@ public class ColgramForegroundService extends Service {
      * the pulse, confirms fixed loopback 127.0.0.1:9876 is bound, ensures push connections stay ON,
      * and wakes tgnet via resumeNetworkMaybe() so messages & Anti-Delete save even with screen OFF.
      */
+    private static void finishDozeKeepalivePulse(PowerManager.WakeLock wakeLock) {
+        dozePulseInFlight.set(false);
+        if (wakeLock != null) {
+            try {
+                if (wakeLock.isHeld()) wakeLock.release();
+            } catch (Throwable ignored) {}
+        }
+    }
+
     public static void handleDozeKeepalivePulse(Context context) {
         if (context == null) return;
         final Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
@@ -653,34 +717,40 @@ public class ColgramForegroundService extends Service {
         } catch (Throwable ignored) {}
         final PowerManager.WakeLock wakeLock = wl;
         Thread t = new Thread(() -> {
+            boolean scheduledAsyncRelease = false;
             try {
+                ColgramDpiBypass.reapStaleSessions(10_000L, 0L);
                 if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                     ColgramDpiBypass.restartIfDeadAndWait(2000L);
                 }
-                ensureReflectionHandles();
-                if (cachedUcGetInstanceMethodAvailable() && cachedCmGetInstance != null) {
-                    for (int a = 0; a < 5; a++) {
-                        Object uc = cachedUcGetInstance.invoke(null, a);
-                        if (uc == null) continue;
-                        Boolean activated = (Boolean) cachedUcIsActivated.invoke(uc);
-                        if (activated == null || !activated) continue;
-                        Object cm = cachedCmGetInstance.invoke(null, a);
-                        if (cm != null) {
-                            if (cachedCmSetPushConnectionEnabled != null) {
-                                try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
-                            }
-                            if (cachedCmResumeNetworkMaybe != null) {
-                                try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
-                            }
-                        }
+                kickActiveHumanAccounts(true, true);
+                try {
+                    Looper mainLooper = Looper.getMainLooper();
+                    if (mainLooper != null) {
+                        new Handler(mainLooper).postDelayed(
+                                () -> finishDozeKeepalivePulse(wakeLock), DOZE_PULSE_HOLD_MS);
+                        scheduledAsyncRelease = true;
                     }
+                } catch (Throwable ignored) {}
+                if (!scheduledAsyncRelease) {
+                    Thread releaser = new Thread(() -> {
+                        try {
+                            Thread.sleep(DOZE_PULSE_HOLD_MS);
+                        } catch (InterruptedException ignored) {
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            finishDozeKeepalivePulse(wakeLock);
+                        }
+                    }, "colgram-doze-release");
+                    releaser.setDaemon(true);
+                    releaser.start();
+                    scheduledAsyncRelease = true;
                 }
             } catch (Throwable err) {
                 Log.w(TAG, "doze keepalive tick failed: " + err.getMessage());
             } finally {
-                dozePulseInFlight.set(false);
-                if (wakeLock != null) {
-                    try { if (wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {}
+                if (!scheduledAsyncRelease) {
+                    finishDozeKeepalivePulse(wakeLock);
                 }
             }
         }, "colgram-doze-pulse");
@@ -714,28 +784,7 @@ public class ColgramForegroundService extends Service {
             if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                 ColgramDpiBypass.startImmediately();
             }
-            ensureReflectionHandles();
-            if (!cachedUcGetInstanceMethodAvailable() || cachedCmGetInstance == null) {
-                return;
-            }
-            for (int a = 0; a < 5; a++) {
-                Object uc = cachedUcGetInstance.invoke(null, a);
-                if (uc == null) continue;
-                Boolean activated = (Boolean) cachedUcIsActivated.invoke(uc);
-                if (activated == null || !activated) continue;
-                Object cm = cachedCmGetInstance.invoke(null, a);
-                if (cm != null) {
-                    if (cachedCmSetPushConnectionEnabled != null) {
-                        try { cachedCmSetPushConnectionEnabled.invoke(cm, true); } catch (Throwable ignored) {}
-                    }
-                    if (cachedCmResumeNetworkMaybe != null) {
-                        try { cachedCmResumeNetworkMaybe.invoke(cm); } catch (Throwable ignored) {}
-                    }
-                    if (cachedCmCheckConnection != null) {
-                        try { cachedCmCheckConnection.invoke(cm); } catch (Throwable ignored) {}
-                    }
-                }
-            }
+            kickActiveHumanAccounts(true, false);
         } catch (Throwable ignored) {}
     }
 

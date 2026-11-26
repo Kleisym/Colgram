@@ -156,12 +156,12 @@ public class ColgramSecurityPolicyTest {
         checkEq(true, androidJs.contains("WebGLRenderingContext") && androidJs.contains("WebGL2RenderingContext"),
                 "Android JS masks WebGL renderer");
 
-        String iosJs = ColgramSecurityPolicy.buildWebViewSpoofJs("iPhone 15 Pro Max", "iOS 17.6.1", true);
-        checkEq(true, iosJs.contains("iPhone 15 Pro Max"), "iOS JS includes iPhone model");
-        checkEq(true, iosJs.contains("'iPhone'") || iosJs.contains("\"iPhone\""), "iOS JS spoofs iPhone platform");
-        checkEq(true, iosJs.contains("17.6.1"), "iOS JS includes iOS release");
-        checkEq(true, iosJs.contains("37446") && iosJs.contains("ANGLE (ARM, Immortalis-G715, OpenGL ES 3.2)"),
-                "iOS JS masks WebGL unmasked renderer");
+        String legacyIosJs = ColgramSecurityPolicy.buildWebViewSpoofJs("iPhone 15 Pro Max", "iOS 17.6.1", true);
+        checkEq(true, legacyIosJs.contains("Google Pixel 8 Pro"), "legacy iPhone config normalizes coherently to Android device on Android build");
+        checkEq(true, legacyIosJs.contains("Linux armv8l"), "legacy iPhone config keeps coherent Android Linux armv8l platform");
+        checkEq(false, legacyIosJs.contains("iPhone"), "JS shim never mixes iPhone tokens on Android build");
+        checkEq(true, legacyIosJs.contains("37446") && legacyIosJs.contains("ANGLE (ARM, Immortalis-G715, OpenGL ES 3.2)"),
+                "normalized JS masks WebGL unmasked renderer");
     }
 
     public static void testIdempotentUserAgent() {
@@ -184,8 +184,13 @@ public class ColgramSecurityPolicyTest {
     }
 
     public static void testColgramCloakProfiles() {
-        checkEq("iOS 17.6.1", ColgramCloak.getSystemVersionForModel("iPhone 15 Pro Max", "SDK 34 (Android 14)"),
-                "iPhone preset pairs coherent iOS version");
+        checkEq(true, ColgramCloak.findPresetForModel("iPhone 15 Pro Max") == null,
+                "iPhone preset removed for coherent Android APP_ID");
+        ColgramCloak.DeviceProfile s25 = ColgramCloak.findPresetForModel("Samsung Galaxy S25 Ultra");
+        checkEq(true, s25 != null && "samsung".equals(s25.manufacturer),
+                "coherent Android flagship preset Samsung Galaxy S25 Ultra present");
+        checkEq(true, ColgramCloak.getSystemVersionForModel("Google Pixel 8 Pro", "iOS 17.6.1").contains("Android"),
+                "Android preset ignores stray iOS version");
         String pixelSys = ColgramCloak.getSystemVersionForModel("Google Pixel 9 Pro", "SDK 34 (Android 14)");
         checkEq(true, pixelSys.contains("Android 15"), "Pixel 9 Pro pairs coherent Android 15 version");
 

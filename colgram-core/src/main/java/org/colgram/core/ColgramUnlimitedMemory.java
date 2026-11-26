@@ -401,6 +401,7 @@ public final class ColgramUnlimitedMemory {
             Collection<File> roots = collectOptimizationRoots(appCtx);
             File casDir = ColgramStorageSandbox.getCasDirectory(appCtx);
             File inboxDir = new File(appCtx.getFilesDir(), "colgram_inbox");
+            File externalInboxDir = appCtx.getExternalFilesDir("colgram_inbox");
             Set<String> activePaths = ColgramStorageOptimizer.getActiveTelegramFilePaths();
             long nowMs = System.currentTimeMillis();
             int preset = ColgramConfig.isAutoCompressStorageEnabled()
@@ -409,6 +410,10 @@ public final class ColgramUnlimitedMemory {
 
             // 1. Reclaim regenerable transient waste (acache/.pcache2, stale .temp/.cgtmp, >7d inbox)
             long wasteFreed = ColgramStorageOptimizer.pruneRegenerableWaste(roots, inboxDir, activePaths, nowMs);
+            if (externalInboxDir != null && !externalInboxDir.equals(inboxDir)) {
+                wasteFreed += ColgramStorageOptimizer.pruneRegenerableWaste(
+                        java.util.Collections.emptyList(), externalInboxDir, activePaths, nowMs);
+            }
             total.wasteReclaimedBytes += wasteFreed;
 
             // 2. Content-addressed SHA-256 deduplication across sandbox, media_history, and inbox
@@ -480,6 +485,10 @@ public final class ColgramUnlimitedMemory {
                 File inbox = new File(filesDir, "colgram_inbox");
                 if (inbox.isDirectory()) roots.add(inbox);
             }
+        } catch (Throwable ignored) {}
+        try {
+            File extInbox = appCtx.getExternalFilesDir("colgram_inbox");
+            if (extInbox != null && extInbox.isDirectory()) roots.add(extInbox);
         } catch (Throwable ignored) {}
         try {
             File extCache = appCtx.getExternalCacheDir();

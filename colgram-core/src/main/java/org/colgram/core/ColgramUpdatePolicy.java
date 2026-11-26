@@ -107,8 +107,9 @@ public final class ColgramUpdatePolicy {
     }
 
     /**
-     * Extracts the SHA-256 hex digest matching a specific APK asset name in multi-ABI release notes,
-     * falling back to the first SHA-256 in the text only when no asset-specific line matches.
+     * Extracts the SHA-256 hex digest matching a specific APK asset name in multi-APK release notes
+     * or SHA256SUMS.txt, falling back to the first SHA-256 only when the text does not appear to
+     * describe a different APK asset.
      */
     public static String extractSha256FromText(String text, String assetName) {
         if (text == null || text.isEmpty()) {
@@ -118,15 +119,30 @@ public final class ColgramUpdatePolicy {
             String needle = assetName.trim().toLowerCase(Locale.US);
             String[] lines = text.split("\\r?\\n");
             for (String line : lines) {
-                if (line != null && line.toLowerCase(Locale.US).contains(needle)) {
-                    Matcher m = SHA256_PATTERN.matcher(line);
-                    if (m.find()) {
-                        return m.group(1).toLowerCase(Locale.US);
+                if (line == null) continue;
+                String lowLine = line.toLowerCase(Locale.US);
+                int idx = lowLine.indexOf(needle);
+                if (idx >= 0) {
+                    boolean leftOk = idx == 0 || !isAssetTokenChar(lowLine.charAt(idx - 1));
+                    int end = idx + needle.length();
+                    boolean rightOk = end >= lowLine.length() || !isAssetTokenChar(lowLine.charAt(end));
+                    if (leftOk && rightOk) {
+                        Matcher m = SHA256_PATTERN.matcher(line);
+                        if (m.find()) {
+                            return m.group(1).toLowerCase(Locale.US);
+                        }
                     }
                 }
             }
+            if (text.toLowerCase(Locale.US).contains(".apk")) {
+                return null;
+            }
         }
         return extractSha256FromText(text);
+    }
+
+    private static boolean isAssetTokenChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '-' || c == '.';
     }
 
     /** Computes lowercase SHA-256 hex digest of an in-memory byte array. */
@@ -163,8 +179,49 @@ public final class ColgramUpdatePolicy {
         return compareSemver(upstreamTag, localVersion) > 0;
     }
 
-    /** Picks the best APK asset matching device ABIs, preferring ABI-specific then universal/afat. */
+    /** Returns true when an APK asset filename identifies a Koliti-bundled edition. */
+    public static boolean isKolitiApkName(String assetName) {
+        if (assetName == null) return false;
+        String low = assetName.trim().toLowerCase(Locale.US);
+        return low.endsWith(".apk") && low.contains("koliti");
+    }
+
+    /** Picks the best APK asset matching the running edition (when edition-split assets exist) and device ABIs. */
     public static ApkAsset pickBestApkAsset(List<ApkAsset> assets, String[] supportedAbis) {
+        if (assets == null || assets.isEmpty()) return null;
+        boolean hasKolitiAsset = false;
+        for (ApkAsset asset : assets) {
+            if (asset != null && !asset.downloadUrl.isEmpty() && isKolitiApkName(asset.name)) {
+                hasKolitiAsset = true;
+                break;
+            }
+        }
+        if (hasKolitiAsset) {
+            return pickBestApkAsset(assets, supportedAbis, ColgramBuildFlags.KOLITI_ENABLED);
+        }
+        return pickBestByAbi(assets, supportedAbis);
+    }
+
+    /**
+     * Picks the best APK asset strictly for the requested edition:
+     * preferKoliti=false -> Main APK without Koliti;
+     * preferKoliti=true  -> Koliti-bundled APK.
+     */
+    public static ApkAsset pickBestApkAsset(List<ApkAsset> assets, String[] supportedAbis, boolean preferKoliti) {
+        if (assets == null || assets.isEmpty()) return null;
+        java.util.ArrayList<ApkAsset> matchingEdition = new java.util.ArrayList<>(assets.size());
+        for (ApkAsset asset : assets) {
+            if (asset == null || asset.downloadUrl.isEmpty()) continue;
+            String low = asset.name.toLowerCase(Locale.US);
+            if (!low.endsWith(".apk")) continue;
+            if (isKolitiApkName(low) == preferKoliti) {
+                matchingEdition.add(asset);
+            }
+        }
+        return pickBestByAbi(matchingEdition, supportedAbis);
+    }
+
+    private static ApkAsset pickBestByAbi(List<ApkAsset> assets, String[] supportedAbis) {
         if (assets == null || assets.isEmpty()) return null;
         if (supportedAbis != null) {
             for (String abi : supportedAbis) {
@@ -186,7 +243,14 @@ public final class ColgramUpdatePolicy {
             String low = asset.name.toLowerCase(Locale.US);
             if (!low.endsWith(".apk")) continue;
             if (firstValid == null) firstValid = asset;
-            if (universal == null && (low.contains("universal") || low.contains("afat") || low.contains("colgram-signed-release"))) {
+            boolean hasSpecificAbi = low.contains("arm64-v8a")
+                    || low.contains("armeabi-v7a")
+                    || low.contains("x86_64")
+                    || low.contains("x86");
+            if (universal == null && (low.contains("universal")
+                    || low.contains("afat")
+                    || low.contains("colgram-signed-release")
+                    || !hasSpecificAbi)) {
                 universal = asset;
             }
         }

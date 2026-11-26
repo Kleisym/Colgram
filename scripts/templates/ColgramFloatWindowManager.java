@@ -629,8 +629,10 @@ public class ColgramFloatWindowManager {
         }
         if (idx >= 0 && idx == windows.size() - 1) return;
         try {
-            window.windowManager.removeViewImmediate(window.root);
-            window.windowManager.addView(window.root, window.params);
+            if (window.windowManager != null && window.root.isAttachedToWindow()) {
+                window.windowManager.updateViewLayout(window.root, window.params);
+            }
+            window.root.requestFocus();
             windows.remove(window);
             windows.add(window);
         } catch (Throwable ignored) {}
@@ -766,11 +768,29 @@ public class ColgramFloatWindowManager {
         }
         window.attached = false;
         windows.remove(window);
-        if (notifyClosed && window.root != null && window.root.getParent() != null) {
+        if (notifyClosed && window.root != null && window.root.getParent() != null && window.root.isAttachedToWindow()) {
             window.root.animate().alpha(0f).scaleX(0.90f).scaleY(0.90f)
                     .setDuration(130)
                     .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
-                    .withEndAction(() -> detachWindowImmediate(window, true))
+                    .setListener(new AnimatorListenerAdapter() {
+                        private boolean finalized = false;
+
+                        private void finishOnce() {
+                            if (finalized) return;
+                            finalized = true;
+                            detachWindowImmediate(window, true);
+                        }
+
+                        @Override
+                        public void onAnimationEnd(Animator animation) {
+                            finishOnce();
+                        }
+
+                        @Override
+                        public void onAnimationCancel(Animator animation) {
+                            finishOnce();
+                        }
+                    })
                     .start();
             return;
         }

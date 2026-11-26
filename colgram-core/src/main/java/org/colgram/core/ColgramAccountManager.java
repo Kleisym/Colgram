@@ -552,6 +552,11 @@ public class ColgramAccountManager {
     // Key management & serialization
     // -----------------------------------------------------------------------------------------
 
+    static boolean canOverwriteWrappedMasterKey(String existingWrappedB64, String existingIvB64) {
+        return existingWrappedB64 == null || existingWrappedB64.isEmpty()
+                || existingIvB64 == null || existingIvB64.isEmpty();
+    }
+
     private static byte[] getOrCreateMasterKey(Context context) throws Exception {
         byte[] existing = cachedMasterKey;
         if (existing != null && existing.length == 32) {
@@ -565,8 +570,12 @@ public class ColgramAccountManager {
             String wrappedB64 = prefs.getString(KEY_WRAPPED_MASTER, null);
             String ivB64 = prefs.getString(KEY_WRAPPED_IV, null);
 
+            boolean hasWrappedMaster = !canOverwriteWrappedMasterKey(wrappedB64, ivB64);
             SecretKey ksKey = Build.VERSION.SDK_INT >= 23 ? loadOrCreateKeyStoreAesKey() : null;
-            if (ksKey != null && wrappedB64 != null && ivB64 != null) {
+            if (hasWrappedMaster) {
+                if (ksKey == null) {
+                    throw new java.security.GeneralSecurityException("AndroidKeyStore unavailable while existing wrapped master key is present; refusing overwrite");
+                }
                 try {
                     byte[] iv = Base64.decode(ivB64, Base64.NO_WRAP);
                     byte[] wrapped = Base64.decode(wrappedB64, Base64.NO_WRAP);
@@ -575,7 +584,8 @@ public class ColgramAccountManager {
                     cachedMasterKey = c.doFinal(wrapped);
                     return cachedMasterKey;
                 } catch (Throwable t) {
-                    Log.w(TAG, "KeyStore unwrap retry/fallback: " + t.getMessage());
+                    Log.w(TAG, "KeyStore unwrap failed for existing master key; refusing to overwrite: " + t.getMessage());
+                    throw new java.security.GeneralSecurityException("Failed to unwrap existing vault master key", t);
                 }
             }
 
@@ -699,7 +709,20 @@ public class ColgramAccountManager {
         return baos.toByteArray();
     }
 
-    private static VaultBundle deserializeBundle(byte[] data) throws Exception {
+    private static final int MAX_VAULT_BUNDLE_FIELD_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_VAULT_BUNDLE_FILE_COUNT = 1024;
+
+    static int validateBundleLength(int len, int maxBytes, int containerLength) {
+        if (len < 0 || len > maxBytes || (containerLength >= 0 && len > containerLength)) {
+            throw new IllegalArgumentException("Invalid vault bundle field length: " + len);
+        }
+        return len;
+    }
+
+    static VaultBundle deserializeBundle(byte[] data) throws Exception {
+        if (data == null || data.length < 16) {
+            throw new IllegalArgumentException("Empty or truncated vault bundle");
+        }
         DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
         int version = in.readInt();
         if (version != 1) throw new IllegalStateException("Unsupported vault bundle v" + version);
@@ -712,16 +735,21 @@ public class ColgramAccountManager {
         long savedAt = in.readLong();
         String botToken = in.readUTF();
 
-        int xmlLen = in.readInt();
-        byte[] xmlBytes = new byte[Math.max(0, xmlLen)];
+        int xmlLen = validateBundleLength(in.readInt(), MAX_VAULT_BUNDLE_FIELD_BYTES, data.length);
+        byte[] xmlBytes = new byte[xmlLen];
         if (xmlLen > 0) in.readFully(xmlBytes);
 
-        int count = in.readInt();
+        int count = validateBundleLength(in.readInt(), MAX_VAULT_BUNDLE_FILE_COUNT, data.length);
         Map<String, byte[]> files = new HashMap<>();
+        long totalPayload = xmlLen;
         for (int i = 0; i < count; i++) {
             String fname = in.readUTF();
-            int len = in.readInt();
-            byte[] buf = new byte[Math.max(0, len)];
+            int len = validateBundleLength(in.readInt(), MAX_VAULT_BUNDLE_FIELD_BYTES, data.length);
+            totalPayload += len;
+            if (totalPayload > MAX_VAULT_BUNDLE_FIELD_BYTES || totalPayload > data.length) {
+                throw new IllegalArgumentException("Vault bundle payload exceeds stream bounds");
+            }
+            byte[] buf = new byte[len];
             if (len > 0) in.readFully(buf);
             files.put(fname, buf);
         }

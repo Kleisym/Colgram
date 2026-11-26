@@ -24,7 +24,12 @@ import java.util.Locale;
  */
 public class ColgramEditHistoryDialog {
 
-    private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault());
+    private static final ThreadLocal<SimpleDateFormat> DATE_FORMAT = new ThreadLocal<SimpleDateFormat>() {
+        @Override
+        protected SimpleDateFormat initialValue() {
+            return new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault());
+        }
+    };
 
     public static void show(Context context, long dialogId, int messageId) {
         if (context == null) return;
@@ -89,7 +94,7 @@ public class ColgramEditHistoryDialog {
                 row.setBackground(bg);
 
                 TextView meta = new TextView(context);
-                meta.setText("Редакция #" + (i + 1) + " · " + DATE_FORMAT.format(new Date(entry.timestamp)));
+                meta.setText("Редакция #" + (i + 1) + " · " + DATE_FORMAT.get().format(new Date(entry.timestamp)));
                 meta.setTextColor(mutedColor);
                 meta.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
                 row.addView(meta);

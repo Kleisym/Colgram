@@ -528,23 +528,50 @@ public final class ColgramAccountSwitcherHelper {
         fullBackupBtn.setMinHeight(dp(40));
         ColgramMenuChrome.attachTactileFeedback(fullBackupBtn, 12, pal.chipSurface, pal.borderSubtle, pal.accentSoft);
         fullBackupBtn.setOnClickListener(v -> {
-            fullBackupBtn.setEnabled(false);
-            org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
-                for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
-                    if (UserConfig.getInstance(a).isClientActivated()) {
-                        UserConfig.getInstance(a).saveConfig(true);
-                    }
-                }
-                ColgramPersistentBackup.BackupResult res = ColgramPersistentBackup.backupNow(ctx, null);
-                AndroidUtilities.runOnUIThread(() -> {
-                    fullBackupBtn.setEnabled(true);
-                    if (res.success) {
-                        Toast.makeText(ctx, "Сохранено (" + res.accountCount + " акк.) -> " + res.location, Toast.LENGTH_LONG).show();
-                    } else {
-                        Toast.makeText(ctx, "Ошибка бэкапа: " + res.error, Toast.LENGTH_LONG).show();
-                    }
-                });
-            });
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+            final org.telegram.ui.Components.EditTextBoldCursor input = new org.telegram.ui.Components.EditTextBoldCursor(activity);
+            input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+            input.setHint("Мастер-пароль (мин. 4 символа)");
+            input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+            input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
+            android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
+            int pad = dp(16);
+            container.setPadding(pad, pad / 2, pad, 0);
+            container.addView(input);
+            new AlertDialog.Builder(activity)
+                    .setTitle("Сохранить в Documents/ColgramBackup")
+                    .setView(container)
+                    .setPositiveButton("Сохранить", (d, w) -> {
+                        String pass = input.getText() != null ? input.getText().toString() : "";
+                        if (pass.length() < 4) {
+                            Toast.makeText(ctx, "Минимум 4 символа", Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                        final char[] passChars = pass.toCharArray();
+                        fullBackupBtn.setEnabled(false);
+                        org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
+                            try {
+                                for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                                    if (UserConfig.getInstance(a).isClientActivated()) {
+                                        UserConfig.getInstance(a).saveConfig(true);
+                                    }
+                                }
+                                ColgramPersistentBackup.BackupResult res = ColgramPersistentBackup.backupNow(ctx, passChars);
+                                AndroidUtilities.runOnUIThread(() -> {
+                                    fullBackupBtn.setEnabled(true);
+                                    if (res.success) {
+                                        Toast.makeText(ctx, "Сохранено (" + res.accountCount + " акк.) -> " + res.location, Toast.LENGTH_LONG).show();
+                                    } else {
+                                        Toast.makeText(ctx, "Ошибка бэкапа: " + res.error, Toast.LENGTH_LONG).show();
+                                    }
+                                });
+                            } finally {
+                                java.util.Arrays.fill(passChars, '\0');
+                            }
+                        });
+                    })
+                    .setNegativeButton("Отмена", null)
+                    .show();
         });
         backupRow.addView(fullBackupBtn, LayoutHelper.createLinear(0, 40, 1f, Gravity.CENTER_VERTICAL, 0, 0, 6, 0));
 

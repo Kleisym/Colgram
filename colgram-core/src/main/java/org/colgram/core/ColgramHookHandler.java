@@ -729,7 +729,7 @@ public class ColgramHookHandler {
      * @return true if deletion should be BLOCKED (message preserved locally).
      */
     public static boolean hookShouldPreventDelete(long dialogId, int messageId) {
-        if (dialogId == 0L || messageId == 0) {
+        if (dialogId == 0L || messageId <= 0) {
             return false;
         }
         if (isForcePurged(dialogId, messageId)) {
@@ -766,7 +766,7 @@ public class ColgramHookHandler {
         for (Integer midObj : messageIds) {
             if (midObj == null) continue;
             int mid = midObj.intValue();
-            if (mid == 0) continue;
+            if (mid <= 0) continue;
             if (isForcePurged(dialogId, mid)) {
                 unmarkMessageDeleted(dialogId, mid);
                 continue;
@@ -1111,7 +1111,7 @@ public class ColgramHookHandler {
      * HOOK: Called from ChatMessageCell when drawing or binding a message bubble.
      */
     public static boolean isMessageMarkedDeleted(long dialogId, int messageId) {
-        if (!ColgramConfig.isAntiDeleteEnabled() || appContext == null) {
+        if (!ColgramConfig.isAntiDeleteEnabled() || appContext == null || dialogId == 0L || messageId <= 0) {
             return false;
         }
         return ColgramDatabase.getInstance(appContext).isMessageDeleted(dialogId, messageId);

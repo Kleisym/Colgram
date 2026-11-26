@@ -18,6 +18,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramBotSync;
+import org.colgram.core.ColgramBuildFlags;
 import org.colgram.core.ColgramCloak;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramDpiBypass;
@@ -756,19 +757,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }, (dialog, which) -> {
                     try {
                         if (which == 0) {
-                            warpOperations.execute(() -> {
-                                for (int a = 0; a < org.telegram.messenger.UserConfig.MAX_ACCOUNT_COUNT; a++) {
-                                    if (org.telegram.messenger.UserConfig.getInstance(a).isClientActivated()) {
-                                        org.telegram.messenger.UserConfig.getInstance(a).saveConfig(true);
-                                    }
-                                }
-                                org.colgram.core.ColgramPersistentBackup.BackupResult res =
-                                        org.colgram.core.ColgramPersistentBackup.backupNow(appCtx, null);
-                                uiHandler.post(() -> Toast.makeText(appCtx,
-                                        res.success ? ("Сохранено (" + res.accountCount + " акк.) -> " + res.location)
-                                                : ("Ошибка: " + res.error),
-                                        Toast.LENGTH_LONG).show());
-                            });
+                            promptDocumentsBackupPassphrase(act, appCtx);
                         } else if (which == 1) {
                             ColgramAccountSwitcherHelper.launchPersistentBackupRestore(act);
                         } else if (which == 2) {
@@ -830,6 +819,51 @@ public class ColgramSettingsActivity extends BaseFragment {
                     }
                 })
                 .setNegativeButton("Закрыть", null)
+                .create());
+    }
+
+    private void promptDocumentsBackupPassphrase(android.app.Activity act, Context appCtx) {
+        if (isFinishing() || act == null || act.isFinishing() || act.isDestroyed()) return;
+        final EditTextBoldCursor input = new EditTextBoldCursor(act);
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        input.setHint("Мастер-пароль (мин. 4 символа)");
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
+        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
+        input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
+        android.widget.FrameLayout container = new android.widget.FrameLayout(act);
+        int pad = AndroidUtilities.dp(16);
+        container.setPadding(pad, pad / 2, pad, 0);
+        container.addView(input);
+
+        showDialog(new AlertDialog.Builder(act, resourceProvider)
+                .setTitle("Сохранить в Documents/ColgramBackup")
+                .setView(container)
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    String pass = input.getText() != null ? input.getText().toString() : "";
+                    if (pass.length() < 4) {
+                        Toast.makeText(appCtx, "Минимум 4 символа", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    final char[] passChars = pass.toCharArray();
+                    warpOperations.execute(() -> {
+                        try {
+                            for (int a = 0; a < org.telegram.messenger.UserConfig.MAX_ACCOUNT_COUNT; a++) {
+                                if (org.telegram.messenger.UserConfig.getInstance(a).isClientActivated()) {
+                                    org.telegram.messenger.UserConfig.getInstance(a).saveConfig(true);
+                                }
+                            }
+                            org.colgram.core.ColgramPersistentBackup.BackupResult res =
+                                    org.colgram.core.ColgramPersistentBackup.backupNow(appCtx, passChars);
+                            uiHandler.post(() -> Toast.makeText(appCtx,
+                                    res.success ? ("Сохранено (" + res.accountCount + " акк.) -> " + res.location)
+                                            : ("Ошибка: " + res.error),
+                                    Toast.LENGTH_LONG).show());
+                        } finally {
+                            java.util.Arrays.fill(passChars, '\0');
+                        }
+                    });
+                })
+                .setNegativeButton("Отмена", null)
                 .create());
     }
 
@@ -1704,7 +1738,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                                 org.colgram.core.ColgramLiveWallpaper.styleLabel(ColgramConfig.getLiveWallpaperStyle()), true);
                     } else if (position == easterEggsRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_reactions, ColgramMenuChrome.COLOR_CRIMSON);
-                        settingsCell.setTextAndValue("Кола-горка Koliti и пасхалки",
+                        settingsCell.setTextAndValue(
+                                ColgramBuildFlags.KOLITI_ENABLED ? "Кола-горка Koliti и пасхалки" : "Кола-горка и пасхалки",
                                 "открыть", true);
                     } else if (position == batteryAutostartRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_power, ColgramMenuChrome.COLOR_EMERALD);

@@ -21,6 +21,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.animation.LinearInterpolator;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.R;
 
@@ -130,7 +131,10 @@ public final class ColgramColaSlideView extends View {
         hudTextPaint.setTextAlign(Paint.Align.CENTER);
 
         try {
-            kolitiBitmap = BitmapFactory.decodeResource(context.getResources(), R.drawable.koliti_avatar);
+            int avatarRes = ColgramBuildFlags.KOLITI_ENABLED
+                    ? R.drawable.koliti_avatar
+                    : R.drawable.colgram_brand_logo;
+            kolitiBitmap = BitmapFactory.decodeResource(context.getResources(), avatarRes);
             if (kolitiBitmap != null) {
                 kolitiShader = new BitmapShader(kolitiBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
                 avatarPaint.setShader(kolitiShader);

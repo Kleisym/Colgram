@@ -54,7 +54,7 @@ typedef struct {
     int wake_fd;
     int family;
     int default_ttl;
-    int window_clamped;
+    atomic_int window_clamped;
 } DesyncConn;
 
 typedef struct {
@@ -687,10 +687,6 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
         } else {
             LOGW("setsockopt(TCP_WINDOW_CLAMP=%d) failed: errno=%d (%s)", wc, errno, strerror(errno));
         }
-    } else if (windowClamp == 0) {
-        int buf_sz = 262144;
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
     }
 
     if (!invoke_fd_protector(env, protector, fd)) {
@@ -753,7 +749,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
     conn->wake_fd = wake_fd;
     conn->family = family;
     conn->default_ttl = get_default_ttl(fd, family);
-    conn->window_clamped = clamped;
+    atomic_init(&conn->window_clamped, clamped);
 
     jlong handle = conn_register(conn);
     if (handle == 0) {
@@ -769,10 +765,11 @@ Java_org_colgram_core_ColgramNativeDesync_nativeUnclampWindow(JNIEnv *env, jclas
     (void)clazz;
     DesyncConn *conn = conn_acquire(handle);
     if (conn == NULL) return;
-    if (!atomic_load_explicit(&conn->closed, memory_order_acquire) && conn->window_clamped && conn->fd >= 0) {
+    if (!atomic_load_explicit(&conn->closed, memory_order_acquire)
+            && atomic_exchange_explicit(&conn->window_clamped, 0, memory_order_acq_rel)
+            && conn->fd >= 0) {
         int max_win = 1048576;
         setsockopt(conn->fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &max_win, sizeof(max_win));
-        conn->window_clamped = 0;
     }
     conn_release(conn);
 }
@@ -787,7 +784,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
     (void)clazz;
     if (jPayload == NULL || off < 0 || len <= 0) return -1;
     jsize arr_len = (*env)->GetArrayLength(env, jPayload);
-    if (off + len > arr_len) return -1;
+    if (off > arr_len || len > arr_len - off) return -1;
 
     DesyncConn *conn = conn_acquire(handle);
     if (conn == NULL) return -2;
@@ -798,6 +795,12 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
         return -3;
     }
     (*env)->GetByteArrayRegion(env, jPayload, off, len, (jbyte *)buf);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        free(buf);
+        conn_release(conn);
+        return -1;
+    }
 
     uint8_t *fake_buf = NULL;
     size_t fake_buf_len = 0;
@@ -807,7 +810,13 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
             fake_buf = (uint8_t *)malloc((size_t)flen);
             if (fake_buf != NULL) {
                 (*env)->GetByteArrayRegion(env, jFakePayload, 0, flen, (jbyte *)fake_buf);
-                fake_buf_len = (size_t)flen;
+                if ((*env)->ExceptionCheck(env)) {
+                    (*env)->ExceptionClear(env);
+                    free(fake_buf);
+                    fake_buf = NULL;
+                } else {
+                    fake_buf_len = (size_t)flen;
+                }
             }
         }
     }
@@ -815,6 +824,9 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
     const char *tmp_dir = NULL;
     if (jTmpDir != NULL) {
         tmp_dir = (*env)->GetStringUTFChars(env, jTmpDir, NULL);
+        if (tmp_dir == NULL && (*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
     }
 
     size_t total = (size_t)len;
@@ -1021,7 +1033,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeRead(JNIEnv *env, jclass clazz,
     (void)clazz;
     if (jBuf == NULL || off < 0 || len <= 0) return -3;
     jsize arr_len = (*env)->GetArrayLength(env, jBuf);
-    if (off + len > arr_len) return -3;
+    if (off > arr_len || len > arr_len - off) return -3;
 
     DesyncConn *conn = conn_acquire(handle);
     if (conn == NULL) return -2;
@@ -1044,6 +1056,11 @@ Java_org_colgram_core_ColgramNativeDesync_nativeRead(JNIEnv *env, jclass clazz,
         ssize_t n = recv(conn->fd, tmp, want, 0);
         if (n > 0) {
             (*env)->SetByteArrayRegion(env, jBuf, off, (jsize)n, (const jbyte *)tmp);
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                result = -3;
+                break;
+            }
             result = (int)n;
             break;
         }
@@ -1081,7 +1098,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeWrite(JNIEnv *env, jclass clazz,
     if (jBuf == NULL || off < 0 || len < 0) return -3;
     if (len == 0) return 0;
     jsize arr_len = (*env)->GetArrayLength(env, jBuf);
-    if (off + len > arr_len) return -3;
+    if (off > arr_len || len > arr_len - off) return -3;
 
     DesyncConn *conn = conn_acquire(handle);
     if (conn == NULL) return -2;
@@ -1093,7 +1110,13 @@ Java_org_colgram_core_ColgramNativeDesync_nativeWrite(JNIEnv *env, jclass clazz,
         return -3;
     }
     (*env)->GetByteArrayRegion(env, jBuf, off, len, (jbyte *)tmp);
-    int rc = send_all(conn, tmp, (size_t)len, 0);
+    int rc;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        rc = -3;
+    } else {
+        rc = send_all(conn, tmp, (size_t)len, 0);
+    }
     if (heap_fallback) free(tmp);
     conn_release(conn);
     return (jint)rc;

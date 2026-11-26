@@ -157,6 +157,52 @@ public class ColgramBotSync {
     }
 
     /** Recover missed bot updates over Telegram's authenticated MTProto session. */
+    private static volatile Class<?> cachedMessagesControllerClass;
+    private static volatile Method cachedMcGetInstance;
+    private static volatile Method cachedMcGetDifference;
+    private static volatile Field cachedStageQueueField;
+    private static volatile Method cachedStageQueuePostRunnable;
+
+    private static Object getMessagesControllerInstance(int account) throws Exception {
+        Class<?> cls = cachedMessagesControllerClass;
+        if (cls == null) {
+            cls = Class.forName("org.telegram.messenger.MessagesController");
+            cachedMcGetInstance = cls.getMethod("getInstance", int.class);
+            cachedMcGetDifference = cls.getMethod("getDifference");
+            try {
+                Class<?> util = Class.forName("org.telegram.messenger.Utilities");
+                Field sqField = util.getField("stageQueue");
+                Object sq = sqField.get(null);
+                if (sq != null) {
+                    cachedStageQueuePostRunnable = sq.getClass().getMethod("postRunnable", Runnable.class);
+                    cachedStageQueueField = sqField;
+                }
+            } catch (Throwable ignored) {}
+            cachedMessagesControllerClass = cls;
+        }
+        return cachedMcGetInstance.invoke(null, account);
+    }
+
+    private static void postGetDifferenceOnStageQueue(final int account) throws Exception {
+        final Object instance = getMessagesControllerInstance(account);
+        if (instance == null || cachedMcGetDifference == null) return;
+        Runnable task = () -> {
+            try {
+                cachedMcGetDifference.invoke(instance);
+            } catch (Throwable t) {
+                Log.w(TAG, "MTProto bot getDifference on stageQueue failed: " + t.getMessage());
+            }
+        };
+        if (cachedStageQueueField != null && cachedStageQueuePostRunnable != null) {
+            Object sq = cachedStageQueueField.get(null);
+            if (sq != null) {
+                cachedStageQueuePostRunnable.invoke(sq, task);
+                return;
+            }
+        }
+        task.run();
+    }
+
     private static void ensureMtprotoBotLoop(final Context context, final int account) {
         if (!mtprotoBotLoops.add(account)) return;
         mainHandler.post(new Runnable() {
@@ -167,17 +213,23 @@ public class ColgramBotSync {
                     mtprotoBotLoops.remove(account);
                     return;
                 }
-                if (isMtprotoConnected(account)) {
+                final boolean fg = ColgramUiBridge.isAppInForeground();
+                if ((fg || !ColgramPowerGuard.shouldThrottle(context)) && isMtprotoConnected(account)) {
                     try {
-                        Class<?> controller = Class.forName("org.telegram.messenger.MessagesController");
-                        Object instance = controller.getMethod("getInstance", int.class).invoke(null, account);
-                        controller.getMethod("getDifference").invoke(instance);
+                        postGetDifferenceOnStageQueue(account);
                         Log.i(TAG, "MTProto bot update recovery requested for account " + account);
                     } catch (Throwable t) {
                         Log.w(TAG, "MTProto bot update recovery failed: " + t.getMessage());
                     }
                 }
-                mainHandler.postDelayed(this, 30000L);
+                long delayMs;
+                if (fg) {
+                    delayMs = 30_000L;
+                } else {
+                    long baseBg = ColgramPowerGuard.isScreenInteractive(context) ? 90_000L : 180_000L;
+                    delayMs = baseBg * Math.max(1, ColgramPowerGuard.intervalFactor(context));
+                }
+                mainHandler.postDelayed(this, delayMs);
             }
         });
         refreshMtprotoBotDialogs(context, account);
@@ -193,11 +245,11 @@ public class ColgramBotSync {
                         || isPassiveBotMode(context, account)) {
                     return;
                 }
-                Class<?> controller = Class.forName("org.telegram.messenger.MessagesController");
-                Object instance = controller.getMethod("getInstance", int.class).invoke(null, account);
+                Object instance = getMessagesControllerInstance(account);
+                Class<?> controller = cachedMessagesControllerClass;
                 if (isMtprotoConnected(account)) {
                     try {
-                        controller.getMethod("getDifference").invoke(instance);
+                        postGetDifferenceOnStageQueue(account);
                     } catch (Throwable t) {
                         Log.w(TAG, "MTProto bot manual difference request failed: " + t.getMessage());
                     }

@@ -199,37 +199,43 @@ public final class ColgramTurboBypassBenchmarkTest {
 
         // Loopback SOCKS5 CONNECT host + RFC1929 auth timing check (zero inter-chunk sleep)
         try (ServerSocket srv = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))) {
+            final int totalRuns = 2; // 1st warms classloading/thread dispatch, 2nd measures codec latency
             Thread mockSocks = new Thread(() -> {
-                try (Socket s = srv.accept()) {
-                    InputStream in = s.getInputStream();
-                    OutputStream sout = s.getOutputStream();
-                    byte[] greet = ColgramSocks5Codec.readFully(in, 4);
-                    if (greet[0] == 5) sout.write(new byte[]{5, 2});
-                    int ver = in.read();
-                    int ulen = in.read();
-                    ColgramSocks5Codec.readFully(in, ulen);
-                    int plen = in.read();
-                    ColgramSocks5Codec.readFully(in, plen);
-                    if (ver == 1) sout.write(new byte[]{1, 0});
-                    byte[] hdr = ColgramSocks5Codec.readFully(in, 5);
-                    int hlen = hdr[4] & 0xFF;
-                    ColgramSocks5Codec.readFully(in, hlen + 2);
-                    sout.write(new byte[]{5, 0, 0, 1, 127, 0, 0, 1, 0, 80});
-                    sout.flush();
-                } catch (Exception ignored) {}
+                for (int r = 0; r < totalRuns; r++) {
+                    try (Socket s = srv.accept()) {
+                        InputStream in = s.getInputStream();
+                        OutputStream sout = s.getOutputStream();
+                        byte[] greet = ColgramSocks5Codec.readFully(in, 4);
+                        if (greet[0] == 5) sout.write(new byte[]{5, 2});
+                        int ver = in.read();
+                        int ulen = in.read();
+                        ColgramSocks5Codec.readFully(in, ulen);
+                        int plen = in.read();
+                        ColgramSocks5Codec.readFully(in, plen);
+                        if (ver == 1) sout.write(new byte[]{1, 0});
+                        byte[] hdr = ColgramSocks5Codec.readFully(in, 5);
+                        int hlen = hdr[4] & 0xFF;
+                        ColgramSocks5Codec.readFully(in, hlen + 2);
+                        sout.write(new byte[]{5, 0, 0, 1, 127, 0, 0, 1, 0, 80});
+                        sout.flush();
+                    } catch (Exception ignored) {}
+                }
             }, "test-socks5-mock");
             mockSocks.setDaemon(true);
             mockSocks.start();
 
-            long s0 = System.nanoTime();
-            try (Socket cli = new Socket("127.0.0.1", srv.getLocalPort())) {
-                cli.setTcpNoDelay(true);
-                boolean ok = ColgramSocks5Codec.requestConnectHost(
-                        cli.getOutputStream(), cli.getInputStream(),
-                        "kws2.web.telegram.org", 443, "user", "pass");
-                check(ok, "SOCKS5 requestConnectHost must succeed");
+            long socksMs = 0L;
+            for (int r = 0; r < totalRuns; r++) {
+                long s0 = System.nanoTime();
+                try (Socket cli = new Socket("127.0.0.1", srv.getLocalPort())) {
+                    cli.setTcpNoDelay(true);
+                    boolean ok = ColgramSocks5Codec.requestConnectHost(
+                            cli.getOutputStream(), cli.getInputStream(),
+                            "kws2.web.telegram.org", 443, "user", "pass");
+                    check(ok, "SOCKS5 requestConnectHost must succeed");
+                }
+                socksMs = (System.nanoTime() - s0) / 1_000_000L;
             }
-            long socksMs = (System.nanoTime() - s0) / 1_000_000L;
             check(socksMs < 150L, "SOCKS5 auth+CONNECT expected fast (<150ms), took " + socksMs + "ms");
         }
 

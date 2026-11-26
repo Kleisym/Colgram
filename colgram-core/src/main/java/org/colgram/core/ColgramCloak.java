@@ -41,14 +41,13 @@ public class ColgramCloak {
         new DeviceProfile("OnePlus", "OnePlus 12", "SDK 34 (Android 14)", "12.10.6", "en"),
         new DeviceProfile("Google", "Google Pixel 7a", "SDK 33 (Android 13)", "12.10.6", "en"),
         new DeviceProfile("Sony", "Sony Xperia 1 V", "SDK 34 (Android 14)", "12.10.6", "en"),
-        new DeviceProfile("Apple", "iPhone 15 Pro Max", "iOS 17.6.1", "12.10.6", "en")
+        new DeviceProfile("samsung", "Samsung Galaxy S25 Ultra", "SDK 35 (Android 15)", "12.10.6", "en")
     };
 
     private static String inferManufacturer(String model) {
         if (model == null) return "Google";
         String lower = model.toLowerCase(java.util.Locale.US);
         if (lower.contains("samsung") || lower.startsWith("sm-")) return "samsung";
-        if (lower.contains("iphone") || lower.contains("ipad")) return "Apple";
         if (lower.contains("xiaomi") || lower.contains("redmi") || lower.contains("poco")) return "Xiaomi";
         if (lower.contains("nothing")) return "Nothing";
         if (lower.contains("oneplus")) return "OnePlus";
@@ -71,15 +70,11 @@ public class ColgramCloak {
     public static String getSystemVersionForModel(String model, String configuredSysVersion) {
         DeviceProfile preset = findPresetForModel(model);
         if (preset != null) {
-            boolean modelIsIos = preset.model.toLowerCase(java.util.Locale.US).contains("iphone");
             if (configuredSysVersion == null || configuredSysVersion.trim().isEmpty()) {
                 return preset.systemVersion;
             }
             String sysLower = configuredSysVersion.toLowerCase(java.util.Locale.US);
-            if (modelIsIos && !sysLower.contains("ios")) {
-                return preset.systemVersion;
-            }
-            if (!modelIsIos && sysLower.contains("ios")) {
+            if (sysLower.contains("ios")) {
                 return preset.systemVersion;
             }
             if (preset.model.equalsIgnoreCase("Google Pixel 9 Pro") && sysLower.contains("android 14")) {
@@ -87,7 +82,8 @@ public class ColgramCloak {
             }
             return configuredSysVersion;
         }
-        if (configuredSysVersion == null || configuredSysVersion.trim().isEmpty()) {
+        if (configuredSysVersion == null || configuredSysVersion.trim().isEmpty()
+                || configuredSysVersion.toLowerCase(java.util.Locale.US).contains("ios")) {
             return ColgramConfig.DEFAULT_SYSTEM_VERSION;
         }
         return configuredSysVersion;
@@ -95,7 +91,15 @@ public class ColgramCloak {
 
     public static String getEffectiveDeviceModel() {
         String m = ColgramConfig.getSpoofDeviceModel();
-        return (m == null || m.trim().isEmpty()) ? ColgramConfig.DEFAULT_MODEL : m.trim();
+        if (m == null || m.trim().isEmpty()) {
+            return ColgramConfig.DEFAULT_MODEL;
+        }
+        String lower = m.toLowerCase(java.util.Locale.US);
+        // Never send iOS/iPhone identifiers under Android APP_ID — fall back cleanly to coherent Android profile.
+        if (lower.contains("iphone") || lower.contains("ipad") || lower.contains("ios")) {
+            return ColgramConfig.DEFAULT_MODEL;
+        }
+        return m.trim();
     }
 
     public static String getEffectiveSystemVersion() {

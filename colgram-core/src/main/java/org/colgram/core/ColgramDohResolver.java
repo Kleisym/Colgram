@@ -628,8 +628,14 @@ public final class ColgramDohResolver {
         long prev = lastCriticalPrefetchAt;
         if (prev > 0L && now - prev < CRITICAL_PREFETCH_COOLDOWN_MS) return;
         lastCriticalPrefetchAt = now;
+        final boolean allowNonTelegramPrefetch = ColgramDpiBypass.activeSystemDpiVpn() != null;
         for (final String host : CRITICAL_PREFETCH_HOSTS) {
             String key = host.toLowerCase(java.util.Locale.ROOT);
+            if (!allowNonTelegramPrefetch
+                    && !key.endsWith(".telegram.org")
+                    && !key.endsWith(".telegram.dog")) {
+                continue;
+            }
             boolean[] needsRefresh = new boolean[1];
             InetAddress[] hit = getCachedEntryWithSwr(cache, key, now, needsRefresh);
             if (hit != null && hit.length > 0 && !needsRefresh[0]) continue;

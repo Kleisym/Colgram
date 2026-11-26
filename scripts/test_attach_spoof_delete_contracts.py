@@ -22,6 +22,9 @@ class AttachSpoofDeleteContractsTest(unittest.TestCase):
             "openTypedAssetFileDescriptor",
             "MimeTypeMap",
             "uniqueFile(",
+            "LARGE_FILE_DEDUP_SKIP_BYTES",
+            "OpenableColumns.SIZE",
+            "StatFs",
         ):
             self.assertIn(token, file_import)
 
@@ -137,9 +140,14 @@ class AttachSpoofDeleteContractsTest(unittest.TestCase):
     def test_permanent_local_delete_contracts(self):
         db = read_text(CORE / "ColgramDatabase.java")
         self.assertIn("public void purgeMessagesCompletely(long dialogId, Collection<Integer> messageIds)", db)
+        self.assertIn("drainPoisonedNonPositiveEntries()", db)
 
         hook_handler = read_text(CORE / "ColgramHookHandler.java")
         self.assertIn("public static void purgeMessagesCompletely(long dialogId, java.util.Collection<Integer> messageIds)", hook_handler)
+        self.assertIn("messageId <= 0", hook_handler)
+
+        cloak = read_text(CORE / "ColgramCloak.java")
+        self.assertNotIn('"iPhone 15 Pro Max"', cloak)
 
         mc = read_text(MSG / "MessagesController.java")
         for token in (

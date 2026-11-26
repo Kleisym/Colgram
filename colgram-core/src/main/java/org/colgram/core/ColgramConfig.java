@@ -67,7 +67,9 @@ public class ColgramConfig {
             "Привет, {first_name}! Сейчас занят, отвечу позже. ({time})";
     public static final String DEFAULT_AUTO_REPLY_AWAY_TEXT =
             "Сейчас не в сети (нерабочее время), {first_name}. Отвечу утром!";
-    public static final String DEFAULT_QUICK_BAR_ITEMS = "ghost,proxy,koliti,saved,theme";
+    public static final String DEFAULT_QUICK_BAR_ITEMS = ColgramBuildFlags.KOLITI_ENABLED
+            ? "ghost,proxy,koliti,saved,theme"
+            : "ghost,proxy,saved,theme";
 
     private static volatile SharedPreferences prefs;
 
@@ -1900,6 +1902,10 @@ public class ColgramConfig {
         if (raw != null && !raw.trim().isEmpty()) {
             for (String part : raw.split(",")) {
                 String clean = part.trim();
+                if (!ColgramBuildFlags.KOLITI_ENABLED
+                        && ("koliti".equalsIgnoreCase(clean) || "voice".equalsIgnoreCase(clean))) {
+                    continue;
+                }
                 if (!clean.isEmpty() && !list.contains(clean)) {
                     list.add(clean);
                 }
@@ -1909,7 +1915,16 @@ public class ColgramConfig {
     }
 
     public static java.util.List<String> getQuickBarItems() {
-        return new java.util.ArrayList<>(quickBarItems);
+        if (ColgramBuildFlags.KOLITI_ENABLED) {
+            return new java.util.ArrayList<>(quickBarItems);
+        }
+        java.util.ArrayList<String> filtered = new java.util.ArrayList<>(quickBarItems.size());
+        for (String item : quickBarItems) {
+            if (!"koliti".equalsIgnoreCase(item) && !"voice".equalsIgnoreCase(item)) {
+                filtered.add(item);
+            }
+        }
+        return filtered;
     }
 
     public static void setQuickBarItems(java.util.List<String> items) {
@@ -1917,9 +1932,15 @@ public class ColgramConfig {
         StringBuilder sb = new StringBuilder();
         if (items != null) {
             for (String item : items) {
-                if (item == null || item.trim().isEmpty()) continue;
+                if (item == null) continue;
+                String clean = item.trim();
+                if (clean.isEmpty()) continue;
+                if (!ColgramBuildFlags.KOLITI_ENABLED
+                        && ("koliti".equalsIgnoreCase(clean) || "voice".equalsIgnoreCase(clean))) {
+                    continue;
+                }
                 if (sb.length() > 0) sb.append(',');
-                sb.append(item.trim());
+                sb.append(clean);
             }
         }
         String raw = sb.toString();

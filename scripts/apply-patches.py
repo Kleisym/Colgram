@@ -6911,7 +6911,7 @@ def ensure_device_test_dependencies(content):
     return content[:match.end()] + "\n    " + "\n    ".join(missing) + content[match.end():]
 
 
-def inject_core_device_test_support(repo_path, root_dir):
+def inject_core_device_test_support(repo_path, root_dir, koliti_enabled=True):
     """Mirror the org.colgram.core device tests into the generated test tree.
 
     Telegram-Src/ is gitignored, so a test that only exists there is gone on the next clone. The
@@ -6975,6 +6975,11 @@ def inject_core_device_test_support(repo_path, root_dir):
                  "ColgramWarpChurnDeviceTest.java",
                  "ColgramWarpUdpReachabilityDeviceTest.java",
                  "ColgramNativeAiDeviceTest.java"):
+        if name == "ColgramNativeAiDeviceTest.java" and not koliti_enabled:
+            dst_test = os.path.join(destination_dir, name)
+            if os.path.isfile(dst_test):
+                os.remove(dst_test)
+            continue
         source = os.path.join(template_dir, name)
         if not os.path.isfile(source):
             PATCH_MISSES.append("core device-test template " + name)
@@ -7646,13 +7651,13 @@ def configure_package_and_branding(repo_path):
             m_content = dup.sub(branding_block, m_content, count=1)
             print(" [=] Application branding already present (deduplicated)")
 
-        # Strip phone, contacts, location, notifications, and account permissions from AndroidManifest.xml for full user privacy
+        # Strip phone, contacts, location, and account permissions from AndroidManifest.xml for full user privacy
+        # (POST_NOTIFICATIONS is preserved so Android 13+ background sync / foreground notification works.)
         for perm in [
             "READ_PHONE_STATE", "READ_PHONE_NUMBERS",
             "READ_CONTACTS", "WRITE_CONTACTS", "GET_ACCOUNTS",
             "MANAGE_ACCOUNTS", "READ_PROFILE", "MANAGE_OWN_CALLS",
             "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
-            "POST_NOTIFICATIONS"
         ]:
             m_content = m_content.replace(
                 f'<uses-permission android:name="android.permission.{perm}" />',
@@ -8051,7 +8056,7 @@ def normalize_variant_manifests(repo_path):
                     target.write(fixed)
 
 
-def sync_colgram_extra_templates_and_assets(repo_path, root_dir):
+def sync_colgram_extra_templates_and_assets(repo_path, root_dir, koliti_enabled=True):
     """Copy Colgram UI/messenger-package Java templates and Koliti/brand/widget resources."""
     template_dir = os.path.join(root_dir, "scripts", "templates")
     ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
@@ -8119,10 +8124,10 @@ def sync_colgram_extra_templates_and_assets(repo_path, root_dir):
     main_res = os.path.join(repo_path, "TMessagesProj", "src", "main", "res")
     sa_res = os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "res")
 
-    # Audio assets -> res/raw/
+    # Audio assets -> res/raw/ (only when Koliti is enabled)
     audio_src_dir = os.path.join(assets_dir, "koliti_audio")
     raw_dst_dir = os.path.join(main_res, "raw")
-    if os.path.isdir(audio_src_dir):
+    if koliti_enabled and os.path.isdir(audio_src_dir):
         os.makedirs(raw_dst_dir, exist_ok=True)
         for fn in os.listdir(audio_src_dir):
             src = os.path.join(audio_src_dir, fn)
@@ -8479,25 +8484,30 @@ def inject_reliability_and_backup_patches(repo_path):
 
     app_loader = os.path.join(tg_msg, "ApplicationLoader.java")
     if os.path.exists(app_loader):
-        patch_file(
-            app_loader,
-            "        // COLGRAM_GUEST_PROXY_BOOTSTRAP\n"
-            "        if (org.colgram.core.ColgramProcess.isGuestProxyProcess(this)) {\n"
-            "            org.telegram.tgnet.ColgramGuestProxyService.enterProbeProcess();\n"
-            "            return;\n"
-            "        }",
-            "        // COLGRAM_GUEST_PROXY_BOOTSTRAP\n"
-            "        if (org.colgram.core.ColgramProcess.isGuestProxyProcess(this)) {\n"
-            "            org.telegram.tgnet.ColgramGuestProxyService.enterProbeProcess();\n"
-            "            return;\n"
-            "        }\n"
-            "        // COLGRAM_PERSISTENT_BACKUP_RESTORE\n"
-            "        try {\n"
-            "            org.colgram.core.ColgramPersistentBackup.restoreIfFreshInstallSync(\n"
-            "                    applicationContext != null ? applicationContext : this);\n"
-            "        } catch (Throwable ignored) {}",
-            "ApplicationLoader pre-load persistent backup auto-restore",
-        )
+        with open(app_loader, "r", encoding="utf-8", errors="ignore") as f:
+            _al_src = f.read()
+        if "// COLGRAM_PERSISTENT_BACKUP_RESTORE" not in _al_src:
+            patch_file(
+                app_loader,
+                "        // COLGRAM_GUEST_PROXY_BOOTSTRAP\n"
+                "        if (org.colgram.core.ColgramProcess.isGuestProxyProcess(this)) {\n"
+                "            org.telegram.tgnet.ColgramGuestProxyService.enterProbeProcess();\n"
+                "            return;\n"
+                "        }",
+                "        // COLGRAM_GUEST_PROXY_BOOTSTRAP\n"
+                "        if (org.colgram.core.ColgramProcess.isGuestProxyProcess(this)) {\n"
+                "            org.telegram.tgnet.ColgramGuestProxyService.enterProbeProcess();\n"
+                "            return;\n"
+                "        }\n"
+                "        // COLGRAM_PERSISTENT_BACKUP_RESTORE\n"
+                "        try {\n"
+                "            org.colgram.core.ColgramPersistentBackup.restoreIfFreshInstallSync(\n"
+                "                    applicationContext != null ? applicationContext : this);\n"
+                "        } catch (Throwable ignored) {}",
+                "ApplicationLoader pre-load persistent backup auto-restore",
+            )
+        else:
+            print(" [=] Already patched: ApplicationLoader pre-load persistent backup auto-restore")
 
     user_cfg = os.path.join(tg_msg, "UserConfig.java")
     if os.path.exists(user_cfg):
@@ -8837,39 +8847,7 @@ _PERFORMANCE_PATCH_SPECS = [
         ),
     ),
     # --- FileLoader.java (1 hunks) ---
-    (
-        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java',
-        'FileLoader.java perf #1',
-        (
-            '        final String finalFileName = fileName;\n'
-            '        FileLoadOperation operation = loadOperationPaths.get(finalFileName);\n'
-            '\n'
-            '        priority = getPriorityValue(priority);\n'
-            '\n'
-            '        if (operation != null) {\n'
-        ),
-        (
-            '        final String finalFileName = fileName;\n'
-            '        FileLoadOperation operation = loadOperationPaths.get(finalFileName);\n'
-            '\n'
-            '        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {\n'
-            '            boolean isAvatarOrSmallImage = parentObject instanceof TLRPC.User\n'
-            '                    || parentObject instanceof TLRPC.UserFull\n'
-            '                    || parentObject instanceof TLRPC.Chat\n'
-            '                    || parentObject instanceof TLRPC.ChatFull\n'
-            '                    || parentObject instanceof TLRPC.Dialog\n'
-            '                    || (imageLocation != null && (imageLocation.photoPeer != null || imageLocation.thumbSize != null || imageLocation.stickerSet != null))\n'
-            '                    || (location != null && cacheType != 10 && locationSize <= 256 * 1024);\n'
-            '            if (isAvatarOrSmallImage && priority < PRIORITY_HIGH) {\n'
-            '                priority = PRIORITY_HIGH;\n'
-            '            }\n'
-            '        }\n'
-            '        priority = getPriorityValue(priority);\n'
-            '\n'
-            '        if (operation != null) {\n'
-        ),
-    ),
-    # --- FileLoaderPriorityQueue.java (2 hunks) ---
+    # --- FileLoaderPriorityQueue.java (perf #2 moved to _PRE_BYPASS_BG_SPECS; see bypass_bg_patches.py) ---
     (
         'TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java',
         'FileLoaderPriorityQueue.java perf #1',
@@ -8893,109 +8871,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '    private void checkLoadingOperationInternal() {\n'
         ),
     ),
-    (
-        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java',
-        'FileLoaderPriorityQueue.java perf #2',
-        (
-            '        boolean pauseAllNextOperations = false;\n'
-            '        int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;\n'
-            '        if (org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled()) {\n'
-            '            max = Math.max(max, type == TYPE_LARGE ? 4 : 6);\n'
-            '        }\n'
-            '        tmpListOperations.clear();\n'
-            '        for (int i = 0; i < allOperations.size(); i++) {\n'
-        ),
-        (
-            '        boolean pauseAllNextOperations = false;\n'
-            '        int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;\n'
-            '        if (org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled()) {\n'
-            '            max = Math.max(max, type == TYPE_LARGE ? 8 : 24);\n'
-            '        }\n'
-            '        tmpListOperations.clear();\n'
-            '        for (int i = 0; i < allOperations.size(); i++) {\n'
-        ),
-    ),
-    # --- FileLoadOperation.java (1 hunks) ---
-    (
-        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java',
-        'FileLoadOperation.java perf #1',
-        (
-            '    private void updateParams() {\n'
-            '        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();\n'
-            '        boolean experimental = preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams;\n'
-            '        boolean bigOrStory = isStory || totalBytesCount >= bigFileSizeFrom;\n'
-            '        if ((experimental || (boost && bigOrStory)) && !forceSmallChunk) {\n'
-            '            downloadChunkSizeBig = 1024 * 512;\n'
-            '            maxDownloadRequests = boost ? 6 : 8;\n'
-            '            maxDownloadRequestsBig = boost ? 6 : 8;\n'
-            '            if (boost) {\n'
-            '                maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);\n'
-            '            }\n'
-            '        } else if (boost && !forceSmallChunk) {\n'
-            '            downloadChunkSizeBig = 1024 * 128;\n'
-            '            maxDownloadRequests = 6;\n'
-            '            maxDownloadRequestsBig = 6;\n'
-            '            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);\n'
-            '        } else {\n'
-            '            downloadChunkSizeBig = 1024 * 128;\n'
-            '            maxDownloadRequests = 4;\n'
-            '            maxDownloadRequestsBig = 4;\n'
-            '        }\n'
-            '        maxCdnParts = (int) (FileLoader.DEFAULT_MAX_FILE_SIZE / downloadChunkSizeBig);\n'
-            '    }\n'
-        ),
-        (
-            '    private void updateParams() {\n'
-            '        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();\n'
-            '        boolean experimental = preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams;\n'
-            '        boolean isAvatarOrSmall = location instanceof TLRPC.TL_inputPeerPhotoFileLocation\n'
-            '                || (totalBytesCount > 0 && totalBytesCount <= 256 * 1024);\n'
-            '        if (boost && !forceSmallChunk) {\n'
-            '            downloadChunkSize = (isAvatarOrSmall && (totalBytesCount <= 0 || totalBytesCount > 64 * 1024))\n'
-            '                    || totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;\n'
-            '            downloadChunkSizeBig = 1024 * 512;\n'
-            '            maxDownloadRequests = 12;\n'
-            '            maxDownloadRequestsBig = 12;\n'
-            '            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);\n'
-            '        } else if (experimental && !forceSmallChunk) {\n'
-            '            downloadChunkSize = 1024 * 32;\n'
-            '            downloadChunkSizeBig = 1024 * 512;\n'
-            '            maxDownloadRequests = 8;\n'
-            '            maxDownloadRequestsBig = 8;\n'
-            '        } else {\n'
-            '            downloadChunkSize = 1024 * 32;\n'
-            '            downloadChunkSizeBig = 1024 * 128;\n'
-            '            maxDownloadRequests = 4;\n'
-            '            maxDownloadRequestsBig = 4;\n'
-            '            maxDownloadRequestsAnimation = 4;\n'
-            '        }\n'
-            '        maxCdnParts = (int) (FileLoader.DEFAULT_MAX_FILE_SIZE / downloadChunkSizeBig);\n'
-            '    }\n'
-        ),
-    ),
-    # --- ImageLoader.java (18 hunks) ---
-    (
-        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
-        'ImageLoader.java perf #1',
-        (
-            '    private SparseArray<String> waitingForQualityThumbByTag = new SparseArray<>();\n'
-            '    private LinkedList<HttpImageTask> httpTasks = new LinkedList<>();\n'
-            '    private LinkedList<ArtworkLoadTask> artworkTasks = new LinkedList<>();\n'
-            '    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue");\n'
-            '    private DispatchQueue cacheThumbOutQueue = new DispatchQueue("cacheThumbOutQueue");\n'
-            '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue");\n'
-            '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue");\n'
-        ),
-        (
-            '    private SparseArray<String> waitingForQualityThumbByTag = new SparseArray<>();\n'
-            '    private LinkedList<HttpImageTask> httpTasks = new LinkedList<>();\n'
-            '    private LinkedList<ArtworkLoadTask> artworkTasks = new LinkedList<>();\n'
-            '    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 4);\n'
-            '    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);\n'
-            '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue");\n'
-            '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue");\n'
-        ),
-    ),
+    # --- ImageLoader.java (perf #1 moved to _PRE_BYPASS_BG_SPECS; see bypass_bg_patches.py) ---
     (
         'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
         'ImageLoader.java perf #2',
@@ -13990,10 +13866,193 @@ _PERFORMANCE_PATCH_SPECS = [
 ]
 
 
+_PRE_BYPASS_BG_SPECS = [
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java',
+        'FileLoader.java perf #1',
+        'if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX)',
+        (
+            '        final String finalFileName = fileName;\n'
+            '        FileLoadOperation operation = loadOperationPaths.get(finalFileName);\n'
+            '\n'
+            '        priority = getPriorityValue(priority);\n'
+            '\n'
+            '        if (operation != null) {\n'
+        ),
+        (
+            '        final String finalFileName = fileName;\n'
+            '        FileLoadOperation operation = loadOperationPaths.get(finalFileName);\n'
+            '\n'
+            '        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {\n'
+            '            boolean isAvatarOrSmallImage = parentObject instanceof TLRPC.User\n'
+            '                    || parentObject instanceof TLRPC.UserFull\n'
+            '                    || parentObject instanceof TLRPC.Chat\n'
+            '                    || parentObject instanceof TLRPC.ChatFull\n'
+            '                    || parentObject instanceof TLRPC.Dialog\n'
+            '                    || (imageLocation != null && (imageLocation.photoPeer != null || imageLocation.thumbSize != null || imageLocation.stickerSet != null))\n'
+            '                    || (location != null && cacheType != 10 && locationSize <= 256 * 1024);\n'
+            '            if (isAvatarOrSmallImage && priority < PRIORITY_HIGH) {\n'
+            '                priority = PRIORITY_HIGH;\n'
+            '            }\n'
+            '        }\n'
+            '        priority = getPriorityValue(priority);\n'
+            '\n'
+            '        if (operation != null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java',
+        'FileLoaderPriorityQueue.java perf #2',
+        'type == TYPE_LARGE ? 3 : 6',
+        (
+            '        boolean pauseAllNextOperations = false;\n'
+            '        int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;\n'
+            '        if (org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled()) {\n'
+            '            max = Math.max(max, type == TYPE_LARGE ? 4 : 6);\n'
+            '        }\n'
+            '        tmpListOperations.clear();\n'
+            '        for (int i = 0; i < allOperations.size(); i++) {\n'
+        ),
+        (
+            '        boolean pauseAllNextOperations = false;\n'
+            '        int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;\n'
+            '        if (org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled()) {\n'
+            '            max = Math.max(max, type == TYPE_LARGE ? 8 : 24);\n'
+            '        }\n'
+            '        tmpListOperations.clear();\n'
+            '        for (int i = 0; i < allOperations.size(); i++) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java',
+        'FileLoadOperation.java perf #1',
+        'boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave',
+        (
+            '    private void updateParams() {\n'
+            '        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();\n'
+            '        boolean experimental = preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams;\n'
+            '        boolean bigOrStory = isStory || totalBytesCount >= bigFileSizeFrom;\n'
+            '        if ((experimental || (boost && bigOrStory)) && !forceSmallChunk) {\n'
+            '            downloadChunkSizeBig = 1024 * 512;\n'
+            '            maxDownloadRequests = boost ? 6 : 8;\n'
+            '            maxDownloadRequestsBig = boost ? 6 : 8;\n'
+            '            if (boost) {\n'
+            '                maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);\n'
+            '            }\n'
+            '        } else if (boost && !forceSmallChunk) {\n'
+            '            downloadChunkSizeBig = 1024 * 128;\n'
+            '            maxDownloadRequests = 6;\n'
+            '            maxDownloadRequestsBig = 6;\n'
+            '            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);\n'
+            '        } else {\n'
+            '            downloadChunkSizeBig = 1024 * 128;\n'
+            '            maxDownloadRequests = 4;\n'
+            '            maxDownloadRequestsBig = 4;\n'
+            '        }\n'
+            '        maxCdnParts = (int) (FileLoader.DEFAULT_MAX_FILE_SIZE / downloadChunkSizeBig);\n'
+            '    }\n'
+        ),
+        (
+            '    private void updateParams() {\n'
+            '        boolean boost = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled();\n'
+            '        boolean experimental = preloadPrefixSize > 0 || MessagesController.getInstance(currentAccount).getfileExperimentalParams;\n'
+            '        boolean isAvatarOrSmall = location instanceof TLRPC.TL_inputPeerPhotoFileLocation\n'
+            '                || (totalBytesCount > 0 && totalBytesCount <= 256 * 1024);\n'
+            '        if (boost && !forceSmallChunk) {\n'
+            '            downloadChunkSize = (isAvatarOrSmall && (totalBytesCount <= 0 || totalBytesCount > 64 * 1024))\n'
+            '                    || totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;\n'
+            '            downloadChunkSizeBig = 1024 * 512;\n'
+            '            maxDownloadRequests = 12;\n'
+            '            maxDownloadRequestsBig = 12;\n'
+            '            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);\n'
+            '        } else if (experimental && !forceSmallChunk) {\n'
+            '            downloadChunkSize = 1024 * 32;\n'
+            '            downloadChunkSizeBig = 1024 * 512;\n'
+            '            maxDownloadRequests = 8;\n'
+            '            maxDownloadRequestsBig = 8;\n'
+            '        } else {\n'
+            '            downloadChunkSize = 1024 * 32;\n'
+            '            downloadChunkSizeBig = 1024 * 128;\n'
+            '            maxDownloadRequests = 4;\n'
+            '            maxDownloadRequestsBig = 4;\n'
+            '            maxDownloadRequestsAnimation = 4;\n'
+            '        }\n'
+            '        maxCdnParts = (int) (FileLoader.DEFAULT_MAX_FILE_SIZE / downloadChunkSizeBig);\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
+        'ImageLoader.java perf #1',
+        'new DispatchQueuePriority("cacheOutQueue", 2)',
+        (
+            '    private SparseArray<String> waitingForQualityThumbByTag = new SparseArray<>();\n'
+            '    private LinkedList<HttpImageTask> httpTasks = new LinkedList<>();\n'
+            '    private LinkedList<ArtworkLoadTask> artworkTasks = new LinkedList<>();\n'
+            '    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue");\n'
+            '    private DispatchQueue cacheThumbOutQueue = new DispatchQueue("cacheThumbOutQueue");\n'
+            '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue");\n'
+            '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue");\n'
+        ),
+        (
+            '    private SparseArray<String> waitingForQualityThumbByTag = new SparseArray<>();\n'
+            '    private LinkedList<HttpImageTask> httpTasks = new LinkedList<>();\n'
+            '    private LinkedList<ArtworkLoadTask> artworkTasks = new LinkedList<>();\n'
+            '    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 4);\n'
+            '    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);\n'
+            '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue");\n'
+            '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue");\n'
+        ),
+    ),
+]
+
+
+_SUPERSEDED_PERF_MARKERS = {
+    "MessagesStorage.java perf #1": "ColgramHookHandler.hookShouldPreventDialogDelete(did,",
+    "MessagesStorage.java perf #3": "colgramPositive",
+    "ChatMessageCell.java perf #1": "colgramConsumePendingDeleteAnim(",
+    "ChatMessageCell.java perf #2": "colgramHasPendingDeleteAnim(",
+    "ChatMessageCell.java perf #3": "colgramConsumePendingDeleteAnim(deleteDialogId",
+}
+
+_SUPERSEDED_NETWORK_MARKERS = {
+    "ApplicationLoader.java networkCallback handoff fix": "colgramLastCapRefreshMs",
+}
+
+_SUPERSEDED_TURBO_MARKERS = {
+    "ApplicationLoader.java turbo #4": "ColgramBootJobService.scheduleProxyRefresh(applicationContext);",
+}
+
+_SUPERSEDED_ATTACH_SPOOF_MARKERS = {
+    "ChatAttachAlert.java SAF audio pick null fmessages crash & dismiss fix": "colgram-nonblocking-audio",
+    "ChatAttachAlert.java SAF files pick null fmessages crash & dismiss fix": "colgram-nonblocking-doc",
+    "ChatActivity.java option 9990 complete purge": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount, selectedObject)",
+    "AlertsCreator.java wire colgramDeleteMessages in deleteAction": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
+    "DeleteMessagesBottomSheet.java wire colgramDeleteMessages in proceed": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
+}
+
+
+def _has_superseded_marker(filepath, label, marker_map):
+    marker = marker_map.get(label)
+    if not marker or not os.path.exists(filepath):
+        return False
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        return marker in f.read()
+
+
 def inject_performance_patches(repo_path):
     """Apply and converge performance, caching, and memory-safety hunks in Telegram-Src."""
+    for rel_path, label, bypass_marker, target, replacement in _PRE_BYPASS_BG_SPECS:
+        full_path = os.path.join(repo_path, *rel_path.split("/"))
+        if os.path.exists(full_path):
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                if bypass_marker in f.read():
+                    continue
+        _patch_file_eol(full_path, target, replacement, label)
     for rel_path, label, target, replacement in _PERFORMANCE_PATCH_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
+        if _has_superseded_marker(full_path, label, _SUPERSEDED_PERF_MARKERS):
+            continue
         _patch_file_eol(full_path, target, replacement, label)
 
 
@@ -14123,6 +14182,8 @@ def inject_network_switch_patches(repo_path):
     """Apply and converge modern NetworkCallback & online detection hunks in ApplicationLoader."""
     for rel_path, label, target, replacement in _NETWORK_SWITCH_PATCH_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
+        if _has_superseded_marker(full_path, label, _SUPERSEDED_NETWORK_MARKERS):
+            continue
         _patch_file_eol(full_path, target, replacement, label)
 
 _TURBO_MESSAGING_PATCH_SPECS = [
@@ -15400,6 +15461,8 @@ def inject_turbo_messaging_patches(repo_path):
     """Apply and converge instant TX/RX, push keepalive, and turbo avatar/media hunks."""
     for rel_path, label, target, replacement in _TURBO_MESSAGING_PATCH_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
+        if _has_superseded_marker(full_path, label, _SUPERSEDED_TURBO_MARKERS):
+            continue
         if label == "ConnectionsManager.java turbo #6" and os.path.exists(full_path):
             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                 cm_text = f.read()
@@ -17473,8 +17536,22 @@ def inject_attach_spoof_delete_patches(repo_path):
     """Apply file-attachment crash fixes, full device spoofing, and permanent-delete UI/DB purge."""
     for rel_path, label, target, replacement in _ATTACH_SPOOF_DELETE_PATCH_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
+        if _has_superseded_marker(full_path, label, _SUPERSEDED_ATTACH_SPOOF_MARKERS):
+            continue
         _patch_file_eol(full_path, target, replacement, label)
 
+
+
+def resolve_koliti_enabled(argv=None, environ=None):
+    """Resolve whether Koliti AI edition is enabled via CLI (--no-koliti/--koliti) or COLGRAM_KOLITI env."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    env = os.environ if environ is None else environ
+    if "--no-koliti" in args:
+        return False
+    if "--koliti" in args:
+        return True
+    raw = str(env.get("COLGRAM_KOLITI", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def main():
@@ -17482,7 +17559,10 @@ def main():
     core_dir = os.path.join(root_dir, "colgram-core")
     custom_icon = os.path.join(root_dir, "assets", "app_icon.png")
 
-    target_repo = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root_dir, "Telegram")
+    cli_args = [a for a in sys.argv[1:] if a not in ("--no-koliti", "--koliti")]
+    target_repo = cli_args[0] if cli_args else os.path.join(root_dir, "Telegram")
+    koliti_enabled = resolve_koliti_enabled()
+    print(f"[*] Koliti AI Edition: {'ENABLED' if koliti_enabled else 'DISABLED (Main APK)'}")
 
     if not os.path.exists(target_repo):
         print(f"[!] Target Telegram repo not found at: {target_repo}")
@@ -17500,11 +17580,12 @@ def main():
         os.path.join(root_dir, "vendor", "colgram-wireguard"),
     )
     sync_singbox_module(target_repo, root_dir)
-    sync_llama_module(target_repo, root_dir)
-    sync_colgram_extra_templates_and_assets(target_repo, root_dir)
+    if koliti_enabled:
+        sync_llama_module(target_repo, root_dir)
+    sync_colgram_extra_templates_and_assets(target_repo, root_dir, koliti_enabled=koliti_enabled)
     inject_warp_device_test_support(target_repo, root_dir)
     inject_singbox_device_test_support(target_repo, root_dir)
-    inject_core_device_test_support(target_repo, root_dir)
+    inject_core_device_test_support(target_repo, root_dir, koliti_enabled=koliti_enabled)
     inject_subscription_share_activity(target_repo, root_dir)
     configure_chaquopy_build(target_repo)
     if not consolidated_applied:
@@ -17533,6 +17614,12 @@ def main():
     patch_video_wallpaper_fixes(target_repo)
     inject_chat_wallpaper_unlock_patches(target_repo)
     inject_attach_spoof_delete_patches(target_repo)
+    from bypass_bg_patches import apply as inject_bypass_bg_patches
+    inject_bypass_bg_patches(target_repo, patch_file, _patch_file_eol)
+    from attach_del_perf_patches import apply as inject_attach_del_perf_patches
+    inject_attach_del_perf_patches(target_repo, patch_file, _patch_file_eol)
+    from koliti_split_patches import apply as inject_koliti_split_patches
+    inject_koliti_split_patches(target_repo, patch_file, _patch_file_eol, koliti_enabled)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

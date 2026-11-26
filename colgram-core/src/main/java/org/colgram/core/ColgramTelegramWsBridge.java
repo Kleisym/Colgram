@@ -292,7 +292,7 @@ public final class ColgramTelegramWsBridge {
     private static final long DIAL_SLOT_ACQUIRE_WAIT_MS = 2200L;
     private static final SecureRandom SHARED_MASK_SEEDER = new SecureRandom();
     static final int PREWARM_MAX_PER_BUCKET = 2;
-    static final long PREWARM_TTL_MS = 18_000L;
+    static final long PREWARM_TTL_MS = 8_000L;
     private static final int[] PREWARM_TARGET_DCS = {2, 4, -2, -4};
     private static final ExecutorService PREWARM_POOL = new java.util.concurrent.ThreadPoolExecutor(
             0, 8, 20L, TimeUnit.SECONDS,
@@ -360,6 +360,7 @@ public final class ColgramTelegramWsBridge {
         private long prngState;
         private byte[] writeScratch = new byte[4096];
         private final AtomicBoolean closed = new AtomicBoolean(false);
+        volatile boolean fromPrewarm = false;
 
         WsSession(int dcId, String edgeIp, String sniHost, Socket socket,
                   InputStream in, OutputStream out) {
@@ -503,6 +504,9 @@ public final class ColgramTelegramWsBridge {
             }
             out.write(frame, 0, needed);
             if (flush) out.flush();
+            if (writeScratch.length > 8192 && needed <= 8192) {
+                writeScratch = new byte[8192];
+            }
         }
 
         public boolean isClosed() {
@@ -620,6 +624,17 @@ public final class ColgramTelegramWsBridge {
                 evicted += pruneExpired(q, nowMs);
             }
             return evicted;
+        }
+
+        int clearBucket(int bucket) {
+            if (bucket < 0 || bucket >= buckets.length) return 0;
+            int closed = 0;
+            PrewarmedEntry entry;
+            while ((entry = buckets[bucket].pollFirst()) != null) {
+                entry.session.close();
+                closed++;
+            }
+            return closed;
         }
 
         int clearAll() {
@@ -777,20 +792,29 @@ public final class ColgramTelegramWsBridge {
         long now = System.currentTimeMillis();
         WsSession hit = PREWARMED_POOL.take(norm, media, wantProtected, now);
         if (hit != null) {
+            hit.fromPrewarm = true;
             replenishPrewarmedAsync(norm, media);
         }
         return hit;
     }
 
+    public static int drainPrewarmedPool() {
+        return PREWARMED_POOL.clearAll();
+    }
+
+    public static void evictPrewarmedBucket(int dcId) {
+        PREWARMED_POOL.clearBucket(dcBucket(dcId));
+    }
+
     private static void prewarmDefaultBucketsAsync() {
-        if (!prewarmEnabled) return;
+        if (!prewarmEnabled || !ColgramUiBridge.isAppInForeground()) return;
         for (int signedDc : PREWARM_TARGET_DCS) {
             replenishPrewarmedAsync(Math.abs(signedDc), signedDc < 0);
         }
     }
 
     private static void replenishPrewarmedAsync(final int normDc, final boolean media) {
-        if (!prewarmEnabled || normDc < 1 || normDc > 5) return;
+        if (!prewarmEnabled || !ColgramUiBridge.isAppInForeground() || normDc < 1 || normDc > 5) return;
         if (ColgramDpiBypass.wasExplicitlyStopped()
                 || ColgramDpiBypass.isOverlayVpnActive()
                 || ColgramDpiBypass.isStrictL3WhitelistDetected()) {
@@ -939,21 +963,38 @@ public final class ColgramTelegramWsBridge {
         if (signedDc == 0) return null;
         int normDc = Math.abs(signedDc);
         boolean media = preferMediaEdge || signedDc < 0;
+        return dialDcInternal(normDc, media, protector, fdProtector, true);
+    }
 
+    public static WsSession dialFreshForDc(int signedDc,
+                                           ColgramDohResolver.SocketProtector protector,
+                                           ColgramNativeDesync.FdProtector fdProtector) {
+        int normDc = Obfuscated2FrameSplitter.normalizeDcId(signedDc);
+        if (normDc < 1 || normDc > 5) return null;
+        boolean media = Obfuscated2FrameSplitter.isMediaDcId(signedDc);
+        return dialDcInternal(normDc, media, protector, fdProtector, false);
+    }
+
+    private static WsSession dialDcInternal(int normDc, boolean media,
+                                            ColgramDohResolver.SocketProtector protector,
+                                            ColgramNativeDesync.FdProtector fdProtector,
+                                            boolean allowPrewarm) {
         int bucket = bucketFor(normDc, media);
         long now = System.currentTimeMillis();
         if (now < cooldownUntilByDc.get(bucket)) return null;
 
-        boolean wantProtected = (protector != null || fdProtector != null
-                || ColgramDpiBypass.activeSystemDpiVpn() != null);
-        WsSession prewarmed = takePrewarmed(normDc, media, wantProtected);
-        if (prewarmed != null) {
-            workedOnNetwork = true;
-            lastSuccessAtByDc.set(bucket, now);
-            consecutiveFailuresByDc.set(bucket, 0);
-            cooldownUntilByDc.set(bucket, 0L);
-            ColgramDpiBypass.onDirectLayer1Success();
-            return prewarmed;
+        if (allowPrewarm) {
+            boolean wantProtected = (protector != null || fdProtector != null
+                    || ColgramDpiBypass.activeSystemDpiVpn() != null);
+            WsSession prewarmed = takePrewarmed(normDc, media, wantProtected);
+            if (prewarmed != null) {
+                workedOnNetwork = true;
+                lastSuccessAtByDc.set(bucket, now);
+                consecutiveFailuresByDc.set(bucket, 0);
+                cooldownUntilByDc.set(bucket, 0L);
+                ColgramDpiBypass.onDirectLayer1Success();
+                return prewarmed;
+            }
         }
 
         // Coalesce concurrent tgnet dial storms per (DC, generic|media) bucket with 12 parallel slots
@@ -1212,7 +1253,7 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static Socket wrapSocketForMode(Socket base, String sniHost, int fragMode) {
-        if (base instanceof ColgramNativeDesync.NativeSocket) {
+        if (base instanceof ColgramNativeDesync.NativeSocket && isNativeFragMode(fragMode)) {
             ColgramNativeDesync.NativeSocket ns = (ColgramNativeDesync.NativeSocket) base;
             boolean cell = cellularNetwork;
             switch (fragMode) {
@@ -1836,14 +1877,12 @@ public final class ColgramTelegramWsBridge {
         if (s == null) return;
         try { s.setTcpNoDelay(true); } catch (Throwable ignored) {}
         try { s.setKeepAlive(true); } catch (Throwable ignored) {}
-        try { s.setReceiveBufferSize(262144); } catch (Throwable ignored) {}
-        try { s.setSendBufferSize(262144); } catch (Throwable ignored) {}
     }
 
     public static long pumpUpstreamFrames(WsSession session, OutputStream clientOut,
                                           OnBytes onReply) throws IOException {
         long total = 0L;
-        byte[] buf = new byte[65536];
+        byte[] buf = new byte[32768];
         byte[] maskBuf = new byte[4];
         InputStream in = session.in;
         if (!(in instanceof BufferedInputStream) && !(in instanceof ByteArrayInputStream)) {
@@ -2446,14 +2485,18 @@ public final class ColgramTelegramWsBridge {
                 90L
         };
 
-        final boolean useNative = isNativeFragMode(fragMode) && ColgramNativeDesync.isAvailable()
+        // Prefer NativeSocket for ALL WSS connections when available so every WSS socket inherits
+        // TCP_KEEPIDLE=25s / TCP_KEEPINTVL=8s / TCP_KEEPCNT=3 / TCP_USER_TIMEOUT=25000ms.
+        final boolean useNativeSocket = ColgramNativeDesync.isAvailable()
                 && (protector == null || fdProtector != null);
+        final boolean useNativeDesync = useNativeSocket && isNativeFragMode(fragMode);
         // Never pass invalid TCP_MAXSEG < 88 (Linux TCP_MIN_MSS=88 -> EINVAL).
-        final int mssClamp = (fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC
-                || fragMode == FRAG_NATIVE_MSS64_OOB1_TLSREC) ? 88 : 0;
+        final int mssClamp = (useNativeDesync
+                && (fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC
+                    || fragMode == FRAG_NATIVE_MSS64_OOB1_TLSREC)) ? 88 : 0;
         // Avoid pre-SYN TCP_WINDOW_CLAMP on primary/media/OOB modes (permanently caps TCP Window Scale).
-        final int windowClamp = (useNative && cellularNetwork && fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC)
-                ? 2048 : 0;
+        final int windowClamp = (useNativeDesync && cellularNetwork && fragMode == FRAG_NATIVE_MSS_CLAMP_TLSREC)
+                ? 2048 : -1;
 
         final Object winnerLock = new Object();
         final AtomicReference<DialedTcp> winner = new AtomicReference<>();
@@ -2471,14 +2514,12 @@ public final class ColgramTelegramWsBridge {
                     try {
                         if (delay > 0L) Thread.sleep(delay);
                         if (done.get()) return;
-                        if (useNative) {
+                        if (useNativeSocket) {
                             sock = ColgramNativeDesync.connect(
                                     ep.ip, 443, connectAttemptTimeoutMs(), mssClamp, windowClamp, fdProtector);
                         } else {
                             sock = new Socket();
                             sock.setTcpNoDelay(true);
-                            try { sock.setReceiveBufferSize(262144); } catch (Throwable ignored) {}
-                            try { sock.setSendBufferSize(262144); } catch (Throwable ignored) {}
                             if (protector != null && !protector.protect(sock)) {
                                 return;
                             }

@@ -20,6 +20,7 @@ import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import org.colgram.core.ColgramBuildFlags;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ChatObject;
 import org.telegram.messenger.ContactsController;
@@ -223,12 +224,16 @@ public final class ColgramMessageSeenSheet {
             card.addView(privateSeen, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));
             root.addView(card, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
             sheet.setCustomView(root);
-            ColgramGlobalOrbController.pushModalSuppression();
-            sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
+            if (ColgramBuildFlags.KOLITI_ENABLED) {
+                ColgramGlobalOrbController.pushModalSuppression();
+                sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
+            }
             try {
                 sheet.show();
             } catch (Throwable ignored) {
-                ColgramGlobalOrbController.popModalSuppression();
+                if (ColgramBuildFlags.KOLITI_ENABLED) {
+                    ColgramGlobalOrbController.popModalSuppression();
+                }
             }
             return;
         }
@@ -277,9 +282,13 @@ public final class ColgramMessageSeenSheet {
 
         final int[] reqIds = new int[]{0, 0};
         sheet.setCustomView(root);
-        ColgramGlobalOrbController.pushModalSuppression();
+        if (ColgramBuildFlags.KOLITI_ENABLED) {
+            ColgramGlobalOrbController.pushModalSuppression();
+        }
         sheet.setOnDismissListener(d -> {
-            ColgramGlobalOrbController.popModalSuppression();
+            if (ColgramBuildFlags.KOLITI_ENABLED) {
+                ColgramGlobalOrbController.popModalSuppression();
+            }
             ConnectionsManager cm = ConnectionsManager.getInstance(currentAccount);
             if (reqIds[0] != 0) {
                 cm.cancelRequest(reqIds[0], true);
@@ -293,7 +302,9 @@ public final class ColgramMessageSeenSheet {
         try {
             sheet.show();
         } catch (Throwable ignored) {
-            ColgramGlobalOrbController.popModalSuppression();
+            if (ColgramBuildFlags.KOLITI_ENABLED) {
+                ColgramGlobalOrbController.popModalSuppression();
+            }
             return;
         }
 

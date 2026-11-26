@@ -92,6 +92,7 @@ public class ColgramFilesActivity extends BaseFragment {
     private String searchQuery = "";
     private String dirStatsSummary = "подсчёт...";
 
+    private static final ExecutorService IMPORT_EXECUTOR = Executors.newSingleThreadExecutor();
     private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
     private final Map<String, Integer> folderChildCounts = new ConcurrentHashMap<>();
     private int heroRow = -1;
@@ -126,7 +127,7 @@ public class ColgramFilesActivity extends BaseFragment {
         if (pickMode) {
             pendingPickListener = null;
         }
-        bgExecutor.shutdownNow();
+        bgExecutor.shutdown();
         super.onFragmentDestroy();
     }
 
@@ -407,7 +408,7 @@ public class ColgramFilesActivity extends BaseFragment {
             final File dir = currentDir;
             if (name.isEmpty() || dir == null) return;
             final Context appCtx = act.getApplicationContext();
-            bgExecutor.execute(() -> {
+            IMPORT_EXECUTOR.execute(() -> {
                 File sub = new File(dir, name);
                 final boolean ok = sub.exists() || sub.mkdirs();
                 AndroidUtilities.runOnUIThread(() -> {
@@ -554,7 +555,7 @@ public class ColgramFilesActivity extends BaseFragment {
             final String next = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
             if (next.isEmpty()) return;
             final Context appCtx = act.getApplicationContext();
-            bgExecutor.execute(() -> {
+            IMPORT_EXECUTOR.execute(() -> {
                 File dest = new File(file.getParentFile(), next);
                 final boolean ok = !dest.exists() && file.renameTo(dest);
                 AndroidUtilities.runOnUIThread(() -> {
@@ -653,7 +654,7 @@ public class ColgramFilesActivity extends BaseFragment {
         final File targetDir = currentDir != null ? currentDir : sandboxRoot;
         final Context appContext = act.getApplicationContext();
         if (targetDir == null) return;
-        bgExecutor.execute(() -> {
+        IMPORT_EXECUTOR.execute(() -> {
             int copied = 0;
             for (Uri uri : uris) {
                 if (copyInto(appContext, uri, targetDir)) copied++;
@@ -689,6 +690,23 @@ public class ColgramFilesActivity extends BaseFragment {
                 }
             }
             if (in == null) return false;
+            long knownSize = -1L;
+            try (android.database.Cursor sizeCursor = context.getContentResolver().query(uri,
+                    new String[]{android.provider.OpenableColumns.SIZE}, null, null, null)) {
+                if (sizeCursor != null && sizeCursor.moveToFirst()) {
+                    int sIdx = sizeCursor.getColumnIndex(android.provider.OpenableColumns.SIZE);
+                    if (sIdx >= 0 && !sizeCursor.isNull(sIdx)) {
+                        knownSize = sizeCursor.getLong(sIdx);
+                    }
+                }
+            } catch (Throwable ignored) {}
+            try {
+                android.os.StatFs fs = new android.os.StatFs(targetDir.getAbsolutePath());
+                long avail = fs.getAvailableBytes();
+                if (knownSize > 0L && avail > 0L && avail < knownSize + (64L * 1024L * 1024L)) {
+                    return false;
+                }
+            } catch (Throwable ignored) {}
             String name = displayName(context, uri).replace('/', '_').replace('\\', '_').replace(':', '_');
             if (name.isEmpty()) name = "file-" + System.currentTimeMillis();
             File out = new File(targetDir, name);
@@ -697,14 +715,38 @@ public class ColgramFilesActivity extends BaseFragment {
                 out = new File(targetDir, suffix + "_" + name);
                 suffix++;
             }
-            try (FileOutputStream fos = new FileOutputStream(out)) {
-                byte[] buffer = new byte[64 * 1024];
-                int read;
-                while ((read = in.read(buffer)) > 0) {
-                    fos.write(buffer, 0, read);
+            File tmp = new File(targetDir, ".import_" + System.nanoTime() + ".cgtmp");
+            boolean completed = false;
+            try {
+                try (FileOutputStream fos = new FileOutputStream(tmp)) {
+                    byte[] buffer = new byte[512 * 1024];
+                    int read;
+                    while ((read = in.read(buffer)) > 0) {
+                        fos.write(buffer, 0, read);
+                    }
+                    fos.flush();
+                }
+                if (!tmp.renameTo(out)) {
+                    try (java.io.FileInputStream fis = new java.io.FileInputStream(tmp);
+                         FileOutputStream fos = new FileOutputStream(out)) {
+                        byte[] buffer = new byte[512 * 1024];
+                        int read;
+                        while ((read = fis.read(buffer)) > 0) {
+                            fos.write(buffer, 0, read);
+                        }
+                        fos.flush();
+                    }
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                }
+                completed = true;
+                return true;
+            } finally {
+                if (!completed && tmp.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
                 }
             }
-            return true;
         } catch (Throwable t) {
             return false;
         } finally {

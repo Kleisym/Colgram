@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
@@ -212,17 +213,25 @@ public class ColgramProxyManager {
 
     private static ExecutorService newBgPool(int threads, final String prefix) {
         final java.util.concurrent.atomic.AtomicInteger seq = new java.util.concurrent.atomic.AtomicInteger(1);
-        return Executors.newFixedThreadPool(threads, r -> {
-            Thread t = new Thread(() -> {
-                try {
-                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
-                } catch (Throwable ignored) {}
-                r.run();
-            }, prefix + "-" + seq.getAndIncrement());
-            t.setDaemon(true);
-            t.setPriority(Thread.MIN_PRIORITY + 1);
-            return t;
-        });
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                threads,
+                threads,
+                30L,
+                TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(),
+                r -> {
+                    Thread t = new Thread(() -> {
+                        try {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                        } catch (Throwable ignored) {}
+                        r.run();
+                    }, prefix + "-" + seq.getAndIncrement());
+                    t.setDaemon(true);
+                    t.setPriority(Thread.MIN_PRIORITY + 1);
+                    return t;
+                });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
     }
 
     // Background-priority bounded pools so proxy scanning NEVER overheats CPU/LTE radio or preempts UI.
@@ -238,18 +247,104 @@ public class ColgramProxyManager {
     private static final long SOURCE_BATCH_TIMEOUT_MS = 7_500L;
     private static final int SOURCE_IO_TIMEOUT_MS = 4_000;
     private static final int SOURCE_MAX_BYTES = 512 * 1024;
-    private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(() -> {
-            try {
-                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
-            } catch (Throwable ignored) {}
-            r.run();
-        }, "colgram-proxy-sched");
-        t.setDaemon(true);
-        t.setPriority(Thread.MIN_PRIORITY + 1);
-        return t;
-    });
+    private static final ScheduledExecutorService scheduler = createBgScheduler();
+
+    private static ScheduledExecutorService createBgScheduler() {
+        java.util.concurrent.ScheduledThreadPoolExecutor sched = new java.util.concurrent.ScheduledThreadPoolExecutor(1, r -> {
+            Thread t = new Thread(() -> {
+                try {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
+                r.run();
+            }, "colgram-proxy-sched");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY + 1);
+            return t;
+        });
+        sched.setKeepAliveTime(30L, TimeUnit.SECONDS);
+        sched.allowCoreThreadTimeOut(true);
+        return sched;
+    }
     private static final Handler mainHandler = createMainHandler();
+
+    private static volatile boolean tgReflectInitDone = false;
+    private static volatile Class<?> tgCmClass;
+    private static volatile Method tgCmGetInstance;
+    private static volatile Method tgCmGetConnectionState;
+    private static volatile Method tgCmCheckConnection;
+    private static volatile Method tgCmResumeNetworkMaybe;
+    private static volatile Method tgCmSetNetAvail;
+    private static volatile Method tgCmRequestNewIp;
+    private static volatile Method tgCmSetProxySettings;
+    private static volatile Method tgCmNativeSetProxySettings;
+    private static volatile Method tgCmResetProxySig;
+    private static volatile Class<?> tgUcClass;
+    private static volatile Field tgUcSelectedAccount;
+    private static volatile Method tgUcGetInstance;
+    private static volatile Method tgUcIsActivated;
+    private static volatile Class<?> tgPsClass;
+    private static volatile Method tgPsIsValid;
+    private static volatile Class<?> tgNcClass;
+    private static volatile Method tgNcGetGlobalInstance;
+    private static volatile Field tgNcProxyChangedId;
+    private static volatile Method tgNcPostNotificationName;
+
+    private static void ensureTgReflection() {
+        if (tgReflectInitDone) return;
+        synchronized (ColgramProxyManager.class) {
+            if (tgReflectInitDone) return;
+            try {
+                Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+                tgCmClass = cm;
+                try { tgCmGetInstance = cm.getMethod("getInstance", int.class); } catch (Throwable ignored) {}
+                try { tgCmGetConnectionState = cm.getMethod("getConnectionState"); } catch (Throwable ignored) {}
+                try { tgCmCheckConnection = cm.getMethod("checkConnection"); } catch (Throwable ignored) {}
+                try { tgCmResumeNetworkMaybe = cm.getMethod("resumeNetworkMaybe"); } catch (Throwable ignored) {}
+                try { tgCmSetNetAvail = cm.getMethod("native_setNetworkAvailable", int.class, boolean.class, int.class, boolean.class); } catch (Throwable ignored) {}
+                try { tgCmRequestNewIp = cm.getMethod("onRequestNewServerIpAndPort", int.class, int.class); } catch (Throwable ignored) {}
+                try { tgCmNativeSetProxySettings = cm.getDeclaredMethod("native_setProxySettings", int.class, String.class, int.class, String.class, String.class, String.class); tgCmNativeSetProxySettings.setAccessible(true); } catch (Throwable ignored) {}
+                try { tgCmResetProxySig = cm.getMethod("colgramResetProxySignature"); } catch (Throwable ignored) {}
+                try {
+                    Class<?> ps = Class.forName("org.telegram.utils.proxy.ProxySettings");
+                    tgPsClass = ps;
+                    try { tgPsIsValid = ps.getMethod("isValid"); } catch (Throwable ignored) {}
+                    try { tgCmSetProxySettings = cm.getMethod("setProxySettings", boolean.class, ps); } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+            try {
+                Class<?> uc = Class.forName("org.telegram.messenger.UserConfig");
+                tgUcClass = uc;
+                try { tgUcSelectedAccount = uc.getField("selectedAccount"); } catch (Throwable ignored) {}
+                try { tgUcGetInstance = uc.getMethod("getInstance", int.class); } catch (Throwable ignored) {}
+                try { tgUcIsActivated = uc.getMethod("isClientActivated"); } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+            try {
+                Class<?> nc = Class.forName("org.telegram.messenger.NotificationCenter");
+                tgNcClass = nc;
+                try { tgNcGetGlobalInstance = nc.getDeclaredMethod("getGlobalInstance"); tgNcGetGlobalInstance.setAccessible(true); } catch (Throwable ignored) {}
+                try { tgNcProxyChangedId = nc.getDeclaredField("proxySettingsChanged"); tgNcProxyChangedId.setAccessible(true); } catch (Throwable ignored) {}
+                try { tgNcPostNotificationName = nc.getDeclaredMethod("postNotificationName", int.class, Object[].class); tgNcPostNotificationName.setAccessible(true); } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+            tgReflectInitDone = true;
+        }
+    }
+
+    private static void colgramResetProxySignatureCached() {
+        try {
+            ensureTgReflection();
+            if (tgCmResetProxySig != null) {
+                tgCmResetProxySig.invoke(null);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static volatile long lastCapNetworkHandle = -1L;
+    private static volatile int lastCapTransportMask = -1;
+    private static volatile boolean lastCapValidated = false;
+    private static volatile long lastCapInvalidateAtMs = 0L;
+    private static volatile long lastLinkInvalidateAtMs = 0L;
+    private static volatile long mainDcStallSinceMs = 0L;
+    private static volatile boolean localWatchScheduledForForeground = false;
 
     private static Handler createMainHandler() {
         try {
@@ -604,6 +699,7 @@ public class ColgramProxyManager {
                 @Override
                 public void onCapabilitiesChanged(Network network, android.net.NetworkCapabilities caps) {
                     if (caps == null) return;
+                    long nowMs = SystemClock.elapsedRealtime();
                     if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
                         // Never clear cellularNetwork when our own VPN/local-DPI TUN comes up;
                         // inspect the underlying physical network instead.
@@ -615,19 +711,36 @@ public class ColgramProxyManager {
                         boolean validatedRecovered = !lastNetworkValidated && physValidated;
                         lastNetworkValidated = physValidated;
                         if (ColgramDpiBypass.isCellularNetwork() != prevCellular) {
+                            lastCapInvalidateAtMs = nowMs;
                             invalidateNetworkProbeState("cellular transport changed");
-                        } else if (validatedRecovered && initialNetworkSeen) {
+                        } else if (validatedRecovered && initialNetworkSeen
+                                && (lastCapInvalidateAtMs == 0L || nowMs - lastCapInvalidateAtMs >= 1_500L)) {
+                            lastCapInvalidateAtMs = nowMs;
                             invalidateNetworkProbeState("network validated");
                         }
                         return;
                     }
-                    boolean cellular = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)
-                            && !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI);
-                    boolean cellularChanged = (cellular != ColgramDpiBypass.isCellularNetwork());
+                    boolean hasWifi = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI);
+                    boolean hasCell = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR);
+                    boolean notMetered = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
                     boolean validated = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                    int transportMask = (hasWifi ? 1 : 0) | (hasCell ? 2 : 0) | (notMetered ? 4 : 0);
+                    long handle = networkHandleOf(network);
+
+                    // Ignore LTE RSSI/link-bandwidth ticks when network handle, transport mask, and validation didn't change.
+                    if (handle == lastCapNetworkHandle
+                            && transportMask == lastCapTransportMask
+                            && validated == lastCapValidated) {
+                        return;
+                    }
+                    lastCapNetworkHandle = handle;
+                    lastCapTransportMask = transportMask;
+                    lastCapValidated = validated;
+
+                    boolean cellular = hasCell && !hasWifi;
+                    boolean cellularChanged = (cellular != ColgramDpiBypass.isCellularNetwork());
                     boolean validatedRecovered = (!lastNetworkValidated && validated);
                     lastNetworkValidated = validated;
-                    long handle = networkHandleOf(network);
                     boolean handleChanged = initialNetworkSeen
                             && lastActiveNetworkHandle != -1L
                             && handle != lastActiveNetworkHandle;
@@ -635,12 +748,16 @@ public class ColgramProxyManager {
                         lastActiveNetworkHandle = handle;
                     }
                     if (cellularChanged) {
+                        lastCapInvalidateAtMs = nowMs;
                         ColgramDpiBypass.setCellularNetwork(cellular);
                         Log.i(TAG, "network transport changed: cellular=" + cellular);
                         invalidateNetworkProbeState("cellular transport changed");
                     } else if (handleChanged) {
+                        lastCapInvalidateAtMs = nowMs;
                         invalidateNetworkProbeState("network available");
-                    } else if (validatedRecovered && initialNetworkSeen) {
+                    } else if (validatedRecovered && initialNetworkSeen
+                            && (lastCapInvalidateAtMs == 0L || nowMs - lastCapInvalidateAtMs >= 1_500L)) {
+                        lastCapInvalidateAtMs = nowMs;
                         Log.i(TAG, "network became validated");
                         invalidateNetworkProbeState("network validated");
                     }
@@ -659,6 +776,17 @@ public class ColgramProxyManager {
                     String prevSig = lastLinkSignature;
                     lastLinkSignature = newSig;
                     if (initialNetworkSeen && !prevSig.isEmpty() && !prevSig.equals(newSig)) {
+                        // Ignore pure DNS/RA wobbles on the same interface; debounce genuine iface swaps.
+                        int sepOld = prevSig.indexOf('|');
+                        int sepNew = newSig.indexOf('|');
+                        String prevIface = sepOld >= 0 ? prevSig.substring(0, sepOld) : prevSig;
+                        String newIface = sepNew >= 0 ? newSig.substring(0, sepNew) : newSig;
+                        long nowMs = SystemClock.elapsedRealtime();
+                        if (prevIface.equals(newIface)
+                                || (lastLinkInvalidateAtMs > 0L && nowMs - lastLinkInvalidateAtMs < 2_000L)) {
+                            return;
+                        }
+                        lastLinkInvalidateAtMs = nowMs;
                         Log.i(TAG, "network link properties changed: " + prevSig + " -> " + newSig);
                         invalidateNetworkProbeState("link properties changed");
                     }
@@ -765,11 +893,12 @@ public class ColgramProxyManager {
         final boolean networkSwitched = "network available".equals(reason)
                 || "cellular transport changed".equals(reason)
                 || "overlay transport changed".equals(reason)
-                || "network validated".equals(reason)
-                || "link properties changed".equals(reason);
+                || "network validated".equals(reason);
         boolean fullReset = manual || networkSwitched;
         if (fullReset) {
             ColgramDpiBypass.clearConnectionFailureBackoff();
+            ColgramTelegramWsBridge.drainPrewarmedPool();
+            colgramResetProxySignatureCached();
         } else {
             ColgramDpiBypass.clearTransientCooldowns();
         }
@@ -813,11 +942,7 @@ public class ColgramProxyManager {
         Log.i(TAG, "invalidated direct-route probe cache (" + reason + ", cellular=" + ColgramDpiBypass.isCellularNetwork() + ")");
     }
 
-    private static final ExecutorService STARTUP_DEFERRED = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "colgram-proxy-deferred");
-        t.setDaemon(true);
-        return t;
-    });
+    private static final ExecutorService STARTUP_DEFERRED = newBgPool(1, "colgram-proxy-deferred");
     /** Delay before any proxy-side socket work begins. */
     private static final long PROXY_START_DELAY_MS = 10_000L;
     /** Fast settle window before checking persisted built-in proxy config on startup. */
@@ -854,22 +979,31 @@ public class ColgramProxyManager {
     }
 
     private static void ensureLocalWatchSchedulerRunning() {
+        final boolean foreground = ColgramUiBridge.isAppInForeground();
         synchronized (periodicTasksLock) {
-            if (localRouteWatchTask == null || localRouteWatchTask.isCancelled() || localRouteWatchTask.isDone()) {
-                localRouteWatchTask = scheduler.scheduleWithFixedDelay(() -> {
-                    // Event-driven 127.0.0.1:9876 bypass stays alive 24/7 (even in background);
-                    // passively reap half-open carrier sockets (pending reply >=15s) at ~0% CPU.
-                    try {
-                        ColgramDpiBypass.reapStaleSessions(15_000L, 0L);
-                    } catch (Throwable ignored) {}
-                    if (!ColgramDpiBypass.wasExplicitlyStopped()
-                            && (!ColgramDpiBypass.isBound()
-                                || (ColgramUiBridge.isAppInForeground() && currentActiveProxy == null))) {
-                        ColgramDpiBypass.startImmediately();
-                        mainHandler.post(() -> ensureLocalBaseRoute(appContext));
-                    }
-                }, 30, 30, TimeUnit.SECONDS);
+            boolean needReschedule = (localRouteWatchTask == null
+                    || localRouteWatchTask.isCancelled()
+                    || localRouteWatchTask.isDone()
+                    || localWatchScheduledForForeground != foreground);
+            if (!needReschedule) return;
+            if (localRouteWatchTask != null) {
+                localRouteWatchTask.cancel(false);
             }
+            localWatchScheduledForForeground = foreground;
+            long periodSec = foreground ? 30L : 300L;
+            localRouteWatchTask = scheduler.scheduleWithFixedDelay(() -> {
+                // Event-driven 127.0.0.1:9876 bypass stays alive 24/7 (even in background);
+                // passively reap half-open carrier sockets (pending reply >=15s) at ~0% CPU.
+                try {
+                    ColgramDpiBypass.reapStaleSessions(15_000L, 0L);
+                } catch (Throwable ignored) {}
+                if (!ColgramDpiBypass.wasExplicitlyStopped()
+                        && (!ColgramDpiBypass.isBound()
+                            || (ColgramUiBridge.isAppInForeground() && currentActiveProxy == null))) {
+                    ColgramDpiBypass.startImmediately();
+                    mainHandler.post(() -> ensureLocalBaseRoute(appContext));
+                }
+            }, periodSec, periodSec, TimeUnit.SECONDS);
         }
     }
 
@@ -917,7 +1051,7 @@ public class ColgramProxyManager {
                     } catch (Throwable t) {
                         Log.w(TAG, "connection watchdog: " + t);
                     }
-                }, 8, 5, TimeUnit.SECONDS);
+                }, 8, 8, TimeUnit.SECONDS);
             }
             if (feedRefreshTask == null || feedRefreshTask.isCancelled() || feedRefreshTask.isDone()) {
                 feedRefreshTask = scheduler.scheduleWithFixedDelay(() -> {
@@ -939,13 +1073,15 @@ public class ColgramProxyManager {
     private static void stopBackgroundFeedScraping() {
         synchronized (periodicTasksLock) {
             java.util.concurrent.ScheduledFuture<?>[] tasks = {
-                poolSweepTask, feedRefreshTask
+                poolSweepTask, feedRefreshTask, watchdogTask, healthCheckTask
             };
             for (java.util.concurrent.ScheduledFuture<?> t : tasks) {
                 if (t != null) t.cancel(false);
             }
             poolSweepTask = null;
             feedRefreshTask = null;
+            watchdogTask = null;
+            healthCheckTask = null;
         }
     }
 
@@ -1021,14 +1157,26 @@ public class ColgramProxyManager {
             // The permanent listener is not an external proxy. Do not treat local TCP accept
             // as success or try to rotate it away. Recover signed DC settings independently
             // of the catalog, without changing the chosen route or using a public relay.
+            long nowElapsed = SystemClock.elapsedRealtime();
             if (hasSystemVpn(ctx) || state < 0
                     || state == TG_STATE_CONNECTED
-                    || state == TG_STATE_WAITING_FOR_NETWORK
-                    || activeTrafficFlowing) {
-                if (state == TG_STATE_CONNECTED || activeTrafficFlowing) {
+                    || state == TG_STATE_WAITING_FOR_NETWORK) {
+                mainDcStallSinceMs = 0L;
+                if (state == TG_STATE_CONNECTED) {
                     applied.nativeFailures = 0;
                     applied.failedVerdicts = 0;
                 }
+                localBaseUnconnectedTicks = 0;
+                localBaseUpdatingTicks = 0;
+                return;
+            }
+            if (mainDcStallSinceMs == 0L) {
+                mainDcStallSinceMs = nowElapsed;
+            }
+            boolean mainDcStallTimedOut = (nowElapsed - mainDcStallSinceMs) >= 15_000L;
+            if (activeTrafficFlowing && !mainDcStallTimedOut) {
+                applied.nativeFailures = 0;
+                applied.failedVerdicts = 0;
                 localBaseUnconnectedTicks = 0;
                 localBaseUpdatingTicks = 0;
                 return;
@@ -1041,14 +1189,17 @@ public class ColgramProxyManager {
                 int updatingLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 4 : 2;
                 if (++localBaseUpdatingTicks >= updatingLimit) {
                     localBaseUpdatingTicks = 0;
+                    mainDcStallSinceMs = nowElapsed;
                     Log.w(TAG, "local base stuck in TG_STATE_UPDATING; reaping stale sessions and resetting tgnet");
                     localRouteUnavailableUntil = 0L;
                     ColgramDpiBypass.reapStaleSessions(4_000L, 8_000L);
+                    ColgramTelegramWsBridge.drainPrewarmedPool();
                     ColgramDpiBypass.resetL3WhitelistCache();
                     ColgramDpiBypass.clearTransientCooldowns();
                     if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
                         executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
                     }
+                    colgramResetProxySignatureCached();
                     tgnetForceReconnect("local base updating stalled");
                     requestFreshDcAddresses("local base updating stalled");
                     if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
@@ -1059,13 +1210,16 @@ public class ColgramProxyManager {
             int unconnectedLimit = ColgramPowerGuard.isThermalThrottled(ctx) ? 4 : 2;
             if (++localBaseUnconnectedTicks >= unconnectedLimit) {
                 localBaseUnconnectedTicks = 0;
+                mainDcStallSinceMs = nowElapsed;
                 localRouteUnavailableUntil = 0L;
                 ColgramDpiBypass.reapStaleSessions(4_000L, 0L);
+                ColgramTelegramWsBridge.drainPrewarmedPool();
                 ColgramDpiBypass.resetL3WhitelistCache();
                 ColgramDpiBypass.clearTransientCooldowns();
                 if (!ColgramDpiBypass.isStrictL3WhitelistDetected()) {
                     executor.execute(ColgramDpiBypass::probeStrictL3WhitelistStatus);
                 }
+                colgramResetProxySignatureCached();
                 tgnetForceReconnect("local base stalled");
                 requestFreshDcAddresses("local base stalled");
                 if (ColgramConfig.isAutoProxyEnabled()) autoConnectIfBlocked();
@@ -1209,6 +1363,7 @@ public class ColgramProxyManager {
     }
 
     private static boolean hasSystemVpn(Context context) {
+        if (context == null) return false;
         try {
             // Exclude Colgram's own whole-device local DPI TUN (colgram-system-dpi) so watchdog
             // and listener health checks remain active while whole-device DPI bypass is ON.
@@ -1217,20 +1372,22 @@ public class ColgramProxyManager {
                 return false;
             }
             ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
-            if (manager == null) return true; // Don't reclassify an unknown route as direct.
+            if (manager == null) return false;
             Network network = manager.getActiveNetwork();
-            android.net.NetworkCapabilities capabilities =
-                    network == null ? null : manager.getNetworkCapabilities(network);
-            return capabilities == null
-                    || capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN);
+            if (network == null) return false;
+            android.net.NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+            return capabilities != null
+                    && capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN);
         } catch (RuntimeException unavailable) {
-            return true;
+            return false;
         }
     }
 
     private static int selectedAccountSlot() {
         try {
-            int account = Class.forName("org.telegram.messenger.UserConfig").getField("selectedAccount").getInt(null);
+            ensureTgReflection();
+            if (tgUcSelectedAccount == null) return 0;
+            int account = tgUcSelectedAccount.getInt(null);
             return account >= 0 && account < colgramAccountSlots ? account : 0;
         } catch (ReflectiveOperationException unavailable) {
             return 0;
@@ -1240,9 +1397,10 @@ public class ColgramProxyManager {
     /** Telegram's own connection state for the selected account, or -1 when unavailable. */
     private static int tgnetConnectionState() {
         try {
-            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Object inst = cm.getMethod("getInstance", int.class).invoke(null, selectedAccountSlot());
-            Object state = cm.getMethod("getConnectionState").invoke(inst);
+            ensureTgReflection();
+            if (tgCmGetInstance == null || tgCmGetConnectionState == null) return -1;
+            Object inst = tgCmGetInstance.invoke(null, selectedAccountSlot());
+            Object state = tgCmGetConnectionState.invoke(inst);
             return state instanceof Integer ? (Integer) state : -1;
         } catch (Throwable t) {
             return -1;
@@ -1272,9 +1430,10 @@ public class ColgramProxyManager {
     /** Ask tgnet to re-evaluate the network and rebuild its connections. */
     private static void tgnetCheckConnection() {
         try {
-            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Object inst = cm.getMethod("getInstance", int.class).invoke(null, selectedAccountSlot());
-            cm.getMethod("checkConnection").invoke(inst);
+            ensureTgReflection();
+            if (tgCmGetInstance == null || tgCmCheckConnection == null) return;
+            Object inst = tgCmGetInstance.invoke(null, selectedAccountSlot());
+            tgCmCheckConnection.invoke(inst);
         } catch (Throwable t) {
             Log.w(TAG, "could not ask tgnet to re-dial: " + t);
         }
@@ -1357,15 +1516,16 @@ public class ColgramProxyManager {
             pendingForceReconnectReason = null;
         }
         try {
-            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
-            Class<?> uc = Class.forName("org.telegram.messenger.UserConfig");
-            java.lang.reflect.Method cmGet = cm.getMethod("getInstance", int.class);
-            java.lang.reflect.Method setNetAvail = cm.getMethod(
-                    "native_setNetworkAvailable", int.class, boolean.class, int.class, boolean.class);
-            java.lang.reflect.Method checkConn = cm.getMethod("checkConnection");
-            java.lang.reflect.Method resumeNet = cm.getMethod("resumeNetworkMaybe");
-            java.lang.reflect.Method ucGet = uc.getMethod("getInstance", int.class);
-            java.lang.reflect.Method isAct = uc.getMethod("isClientActivated");
+            ensureTgReflection();
+            if (tgCmGetInstance == null || tgCmSetNetAvail == null || tgCmCheckConnection == null) {
+                throw new ClassNotFoundException("ConnectionsManager unavailable");
+            }
+            java.lang.reflect.Method cmGet = tgCmGetInstance;
+            java.lang.reflect.Method setNetAvail = tgCmSetNetAvail;
+            java.lang.reflect.Method checkConn = tgCmCheckConnection;
+            java.lang.reflect.Method resumeNet = tgCmResumeNetworkMaybe;
+            java.lang.reflect.Method ucGet = tgUcGetInstance;
+            java.lang.reflect.Method isAct = tgUcIsActivated;
             int selected = selectedAccountSlot();
             int[] netState = queryOnlineNetworkState(appContext);
             boolean online = netState[0] != 0;
@@ -1374,7 +1534,7 @@ public class ColgramProxyManager {
             int nudged = 0;
             for (int a = 0; a < colgramAccountSlots; a++) {
                 boolean active = (a == selected);
-                if (!active) {
+                if (!active && ucGet != null && isAct != null) {
                     try {
                         Object ucInst = ucGet.invoke(null, a);
                         Object res = isAct.invoke(ucInst);
@@ -1390,7 +1550,9 @@ public class ColgramProxyManager {
                     }
                 } finally {
                     checkConn.invoke(inst);
-                    try { resumeNet.invoke(inst); } catch (Throwable ignored) {}
+                    if (resumeNet != null) {
+                        try { resumeNet.invoke(inst); } catch (Throwable ignored) {}
+                    }
                 }
                 nudged++;
             }
@@ -1458,11 +1620,11 @@ public class ColgramProxyManager {
         if (now - lastFreshAddressesAt < FRESH_ADDRESSES_INTERVAL_MS) return;
         lastFreshAddressesAt = now;
         try {
-            Class<?> cm = Class.forName("org.telegram.tgnet.ConnectionsManager");
+            ensureTgReflection();
+            if (tgCmRequestNewIp == null) return;
             // The upstream Google task owns fallback to the Mozilla task. Dispatching both
             // callbacks simultaneously only races Telegram's single currentTask slot.
-            cm.getMethod("onRequestNewServerIpAndPort", int.class, int.class)
-                    .invoke(null, 0, selectedAccountSlot());
+            tgCmRequestNewIp.invoke(null, 0, selectedAccountSlot());
             Log.i(TAG, "asked Telegram for its current server addresses (" + reason + ")");
         } catch (Throwable t) {
             Log.w(TAG, "could not ask Telegram for fresh addresses: " + t);
@@ -4447,16 +4609,21 @@ public static void reportProxyFailure() {
             // method accepts an empty/old setting and silently disables the tunnel.
             boolean appliedThroughStockPath = false;
             boolean appliedThroughNativePath = false;
+            ensureTgReflection();
             try {
-                Class<?> psClass = Class.forName("org.telegram.utils.proxy.ProxySettings");
-                Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
                 Object settings = buildProxySettings(proxy);
-                if (settings == null || !Boolean.TRUE.equals(psClass.getMethod("isValid").invoke(settings))) {
+                if (settings == null || tgPsIsValid == null
+                        || !Boolean.TRUE.equals(tgPsIsValid.invoke(settings))) {
                     throw new IllegalArgumentException("Invalid selected proxy: " + proxy.address);
                 }
 
-                Method stockSet = cmClass.getMethod("setProxySettings", boolean.class, psClass);
-                stockSet.invoke(null, true, settings);
+                if (tgCmSetProxySettings == null) {
+                    throw new ClassNotFoundException("ConnectionsManager.setProxySettings unavailable");
+                }
+                if (proxy.isLocalDpi()) {
+                    colgramResetProxySignatureCached();
+                }
+                tgCmSetProxySettings.invoke(null, true, settings);
                 appliedThroughStockPath = true;
                 Log.i(TAG, "proxy applied via ConnectionsManager.setProxySettings (type="
                         + proxy.type + ", " + proxy.address + ")");
@@ -4472,12 +4639,12 @@ public static void reportProxyFailure() {
                 // leave users with no way to set a proxy at all.
                 try {
                     if (proxy.type == 2) throw new IllegalStateException("WEB needs WebProxyTransport");
-                    Class<?> cmClass = Class.forName("org.telegram.tgnet.ConnectionsManager");
-                    Method nativeSetProxy = cmClass.getDeclaredMethod("native_setProxySettings",
-                            int.class, String.class, int.class, String.class, String.class, String.class);
-                    nativeSetProxy.setAccessible(true);
+                    if (tgCmNativeSetProxySettings == null) {
+                        throw new ClassNotFoundException("native_setProxySettings unavailable");
+                    }
+                    colgramResetProxySignatureCached();
                     for (int i = 0; i < colgramAccountSlots; i++) {
-                        nativeSetProxy.invoke(null, i, proxy.effectiveHost(), proxy.effectivePort(),
+                        tgCmNativeSetProxySettings.invoke(null, i, proxy.effectiveHost(), proxy.effectivePort(),
                                 proxy.user, proxy.password, proxy.secret);
                     }
                     appliedThroughNativePath = true;
@@ -6351,17 +6518,11 @@ public static void reportProxyFailure() {
             return;
         }
         try {
-            Class<?> ncClass = Class.forName("org.telegram.messenger.NotificationCenter");
-            Method getGlobalInstance = ncClass.getDeclaredMethod("getGlobalInstance");
-            getGlobalInstance.setAccessible(true);
-            Object globalNc = getGlobalInstance.invoke(null);
-
-            Field changedField = ncClass.getDeclaredField("proxySettingsChanged");
-            changedField.setAccessible(true);
-            int changed = changedField.getInt(null);
-            Method post = ncClass.getDeclaredMethod("postNotificationName", int.class, Object[].class);
-            post.setAccessible(true);
-            post.invoke(globalNc, changed, new Object[0]);
+            ensureTgReflection();
+            if (tgNcGetGlobalInstance == null || tgNcProxyChangedId == null || tgNcPostNotificationName == null) return;
+            Object globalNc = tgNcGetGlobalInstance.invoke(null);
+            int changed = tgNcProxyChangedId.getInt(null);
+            tgNcPostNotificationName.invoke(globalNc, changed, new Object[0]);
         } catch (Throwable ignored) {}
     }
 

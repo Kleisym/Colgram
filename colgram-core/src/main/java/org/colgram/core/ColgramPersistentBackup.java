@@ -136,62 +136,132 @@ public final class ColgramPersistentBackup {
         return ColgramBackupCodec.decryptEnvelope(envelope, keyMaterial);
     }
 
+    private static final String PREFS_LOCAL_BACKUP = "colgram_local_backup_meta";
+    private static final String KEY_LOCAL_WRAPPED = "local_wrapped_key_b64";
+    private static final String KEY_LOCAL_IV = "local_wrapped_iv_b64";
+    private static final String KEYSTORE_LOCAL_ALIAS = "colgram_persistent_backup_v1";
+    private static final String PRIVATE_BACKUP_DIR = "colgram_private_backup";
+
     /**
-     * Reinstall-stable device key material: identical across updates, full uninstall+reinstall,
-     * Android OS patches, and Lite/Full package switches on the same device.
+     * Generates a random 256-bit local key wrapped inside AndroidKeyStore for app-private
+     * automatic snapshots. Never derives encryption keys from public Build.* fields.
      */
-    private static char[] deviceKeyMaterial() {
-        String s = safeBuild(Build.BRAND) + "|" + safeBuild(Build.MANUFACTURER) + "|"
-                + safeBuild(Build.DEVICE) + "|" + safeBuild(Build.MODEL) + "|"
-                + safeBuild(Build.HARDWARE) + "|" + safeBuild(Build.BOARD) + "|"
-                + safeBuild(Build.PRODUCT) + "|colgram_persistent_vault_v1";
-        return s.toCharArray();
+    private static byte[] getOrCreateLocalKeystoreSecret(Context context, boolean createIfMissing) {
+        if (context == null || Build.VERSION.SDK_INT < 23) {
+            return null;
+        }
+        try {
+            java.security.KeyStore ks = java.security.KeyStore.getInstance("AndroidKeyStore");
+            ks.load(null);
+            javax.crypto.SecretKey ksKey = null;
+            if (ks.containsAlias(KEYSTORE_LOCAL_ALIAS)) {
+                java.security.KeyStore.Entry entry = ks.getEntry(KEYSTORE_LOCAL_ALIAS, null);
+                if (entry instanceof java.security.KeyStore.SecretKeyEntry) {
+                    ksKey = ((java.security.KeyStore.SecretKeyEntry) entry).getSecretKey();
+                }
+            } else if (createIfMissing) {
+                javax.crypto.KeyGenerator kg = javax.crypto.KeyGenerator.getInstance("AES", "AndroidKeyStore");
+                kg.init(new android.security.keystore.KeyGenParameterSpec.Builder(
+                        KEYSTORE_LOCAL_ALIAS,
+                        android.security.keystore.KeyProperties.PURPOSE_ENCRYPT
+                                | android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
+                        .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
+                        .setKeySize(256)
+                        .build());
+                ksKey = kg.generateKey();
+            }
+            if (ksKey == null) {
+                return null;
+            }
+            android.content.SharedPreferences prefs = context.getSharedPreferences(PREFS_LOCAL_BACKUP, Context.MODE_PRIVATE);
+            String wrappedB64 = prefs.getString(KEY_LOCAL_WRAPPED, null);
+            String ivB64 = prefs.getString(KEY_LOCAL_IV, null);
+            if (wrappedB64 != null && ivB64 != null) {
+                byte[] iv = android.util.Base64.decode(ivB64, android.util.Base64.NO_WRAP);
+                byte[] wrapped = android.util.Base64.decode(wrappedB64, android.util.Base64.NO_WRAP);
+                javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+                c.init(javax.crypto.Cipher.DECRYPT_MODE, ksKey, new javax.crypto.spec.GCMParameterSpec(128, iv));
+                return c.doFinal(wrapped);
+            }
+            if (!createIfMissing) {
+                return null;
+            }
+            byte[] secret = new byte[32];
+            new java.security.SecureRandom().nextBytes(secret);
+            javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+            c.init(javax.crypto.Cipher.ENCRYPT_MODE, ksKey);
+            byte[] wrapped = c.doFinal(secret);
+            prefs.edit()
+                    .putString(KEY_LOCAL_WRAPPED, android.util.Base64.encodeToString(wrapped, android.util.Base64.NO_WRAP))
+                    .putString(KEY_LOCAL_IV, android.util.Base64.encodeToString(c.getIV(), android.util.Base64.NO_WRAP))
+                    .apply();
+            return secret;
+        } catch (Throwable t) {
+            Log.w(TAG, "Keystore local backup key unavailable: " + t.getMessage());
+            return null;
+        }
     }
 
-    private static String safeBuild(String val) {
-        return val != null ? val.trim() : "";
+    private static char[] bytesToHexChars(byte[] bytes) {
+        char[] hex = new char[bytes.length * 2];
+        final char[] digits = "0123456789abcdef".toCharArray();
+        for (int i = 0; i < bytes.length; i++) {
+            int v = bytes[i] & 0xFF;
+            hex[i * 2] = digits[v >>> 4];
+            hex[i * 2 + 1] = digits[v & 0x0F];
+        }
+        return hex;
     }
-
-    // =========================================================================================
-    // Android Lifecycle Entrypoints (Auto-Backup & Fresh-Install Auto-Restore)
-    // =========================================================================================
 
     /**
-     * Runs synchronously at the very start of ApplicationLoader.onCreate() BEFORE UserConfig or
-     * ConnectionsManager loads any accounts. Fast no-op (<1ms) whenever at least 1 local account
-     * already exists. On a fresh install / reinstall, automatically restores from Documents/ColgramBackup
-     * if readable without user interaction.
+     * Never blocks ApplicationLoader.onCreate() UI thread or trusts un-passphrased files on shared storage.
+     * On first launch when no local account exists, dispatches an app-private Keystore-protected check off UI thread.
      */
     public static boolean restoreIfFreshInstallSync(Context context) {
         if (context == null || startupRestoreAttempted) return false;
         startupRestoreAttempted = true;
-        Context app = context.getApplicationContext();
-        if (app == null) app = context;
+        final Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            EXECUTOR.execute(() -> restorePrivateBackupIfFreshInstall(app));
+            return false;
+        }
+        return restorePrivateBackupIfFreshInstall(app);
+    }
+
+    private static boolean restorePrivateBackupIfFreshInstall(Context app) {
         try {
             if (hasAnyLocalAccount(app)) {
                 return false;
             }
-            byte[] blob = readLocalExternalBackup(app);
-            if (blob == null || blob.length <= HEADER_LEN) {
+            File privFile = new File(new File(app.getFilesDir(), PRIVATE_BACKUP_DIR), BACKUP_FILENAME);
+            if (!privFile.isFile() || !privFile.canRead() || privFile.length() <= HEADER_LEN) {
                 return false;
             }
-            if (isPassphraseProtected(blob)) {
-                Log.i(TAG, "Found passphrase-protected backup; awaiting user restore on welcome screen");
+            byte[] secret = getOrCreateLocalKeystoreSecret(app, false);
+            if (secret == null || secret.length == 0) {
                 return false;
             }
-            RestoreResult res = restoreFromBytes(app, blob, null);
-            if (res.success) {
-                Log.i(TAG, "AUTO_RESTORE_OK files=" + res.restoredFiles
-                        + " vaultAccounts=" + res.restoredVaultAccounts);
-                return true;
+            char[] keyChars = bytesToHexChars(secret);
+            byte[] blob = readFileBytes(privFile);
+            try {
+                RestoreResult res = restoreFromBytesInternal(app, blob, keyChars, true);
+                if (res.success) {
+                    Log.i(TAG, "AUTO_RESTORE_PRIVATE_OK files=" + res.restoredFiles
+                            + " vaultAccounts=" + res.restoredVaultAccounts);
+                    return true;
+                }
+            } finally {
+                Arrays.fill(secret, (byte) 0);
+                Arrays.fill(keyChars, '\0');
             }
         } catch (Throwable t) {
-            Log.w(TAG, "restoreIfFreshInstallSync skipped: " + t.getMessage());
+            Log.w(TAG, "restorePrivateBackupIfFreshInstall skipped: " + t.getMessage());
         }
         return false;
     }
 
-    /** Debounced off-UI-thread backup triggered on account login/save, vault archive, and app pause. */
+    /** Debounced off-UI-thread backup to app-private Keystore-protected snapshot (never shared storage without passphrase). */
     public static void scheduleAutoBackup(Context context) {
         if (context == null) return;
         final Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
@@ -206,7 +276,7 @@ public final class ColgramPersistentBackup {
             }
             pendingAutoBackup = EXECUTOR.schedule(() -> {
                 try {
-                    BackupResult r = backupNow(app, null);
+                    BackupResult r = backupPrivateSnapshot(app);
                     if (r.success) {
                         lastAutoBackupAtMs = System.currentTimeMillis();
                     }
@@ -217,12 +287,57 @@ public final class ColgramPersistentBackup {
         }
     }
 
-    /** Creates an encrypted full snapshot immediately and writes it to Documents/ColgramBackup. */
+    private static BackupResult backupPrivateSnapshot(Context app) {
+        synchronized (BACKUP_LOCK) {
+            byte[] secret = getOrCreateLocalKeystoreSecret(app, true);
+            if (secret == null || secret.length == 0) {
+                return new BackupResult(false, 0, 0, "", "KeyStore unavailable for private backup");
+            }
+            char[] keyMat = bytesToHexChars(secret);
+            Arrays.fill(secret, (byte) 0);
+            try {
+                int activeAccounts = countLocalActiveAccounts(app);
+                Map<String, byte[]> decryptedVault = ColgramAccountManager.exportDecryptedVaultBundles(app);
+                int totalAccounts = activeAccounts + decryptedVault.size();
+                if (totalAccounts == 0) {
+                    return new BackupResult(false, 0, 0, "", "Нет активных аккаунтов для сохранения");
+                }
+                Map<String, byte[]> entries = collectSnapshotEntries(app, decryptedVault);
+                if (entries.isEmpty()) {
+                    return new BackupResult(false, 0, 0, "", "Нет данных для копирования");
+                }
+                byte[] plain = encodeSnapshot(entries, System.currentTimeMillis());
+                byte[] encrypted;
+                try {
+                    encrypted = encryptEnvelope(plain, keyMat, false);
+                } finally {
+                    ColgramCryptoVault.zeroize(plain);
+                }
+                File outDir = new File(app.getFilesDir(), PRIVATE_BACKUP_DIR);
+                File outFile = new File(outDir, BACKUP_FILENAME);
+                writeAtomic(outFile, encrypted);
+                notifySystemBackupAgent();
+                lastAutoBackupAtMs = System.currentTimeMillis();
+                return new BackupResult(true, entries.size(), totalAccounts, outFile.getAbsolutePath(), "");
+            } catch (Throwable t) {
+                Log.w(TAG, "backupPrivateSnapshot failed: " + t.getMessage());
+                return new BackupResult(false, 0, 0, "", t.getMessage());
+            } finally {
+                Arrays.fill(keyMat, '\0');
+            }
+        }
+    }
+
+    /** Creates an encrypted full snapshot with an explicit passphrase and writes it to Documents/ColgramBackup. */
     public static BackupResult backupNow(Context context, char[] optionalPassphrase) {
         if (context == null) {
             return new BackupResult(false, 0, 0, "", "No context");
         }
         Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        if (optionalPassphrase == null || optionalPassphrase.length == 0) {
+            return new BackupResult(false, 0, 0, "",
+                    "Для экспорта в Documents/" + BACKUP_SUBDIR + " требуется указать мастер-пароль");
+        }
         synchronized (BACKUP_LOCK) {
             try {
                 int activeAccounts = countLocalActiveAccounts(app);
@@ -238,11 +353,10 @@ public final class ColgramPersistentBackup {
                     return new BackupResult(false, 0, 0, "", "Нет данных для копирования");
                 }
                 byte[] plain = encodeSnapshot(entries, System.currentTimeMillis());
-                boolean usePass = optionalPassphrase != null && optionalPassphrase.length > 0;
-                char[] keyMat = usePass ? Arrays.copyOf(optionalPassphrase, optionalPassphrase.length) : deviceKeyMaterial();
+                char[] keyMat = Arrays.copyOf(optionalPassphrase, optionalPassphrase.length);
                 byte[] encrypted;
                 try {
-                    encrypted = encryptEnvelope(plain, keyMat, usePass);
+                    encrypted = encryptEnvelope(plain, keyMat, true);
                 } finally {
                     ColgramCryptoVault.zeroize(plain);
                     Arrays.fill(keyMat, '\0');
@@ -262,8 +376,11 @@ public final class ColgramPersistentBackup {
         }
     }
 
-    /** Builds encrypted backup bytes for manual SAF ACTION_CREATE_DOCUMENT export (optional passphrase). */
+    /** Builds encrypted backup bytes for manual SAF ACTION_CREATE_DOCUMENT export (requires passphrase). */
     public static byte[] buildEncryptedBackupBytes(Context context, char[] optionalPassphrase) throws Exception {
+        if (optionalPassphrase == null || optionalPassphrase.length == 0) {
+            throw new IllegalArgumentException("Для экспорта резервной копии требуется пароль");
+        }
         Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         synchronized (BACKUP_LOCK) {
             Map<String, byte[]> decryptedVault = ColgramAccountManager.exportDecryptedVaultBundles(app);
@@ -272,10 +389,9 @@ public final class ColgramPersistentBackup {
                 throw new IllegalStateException("Нет данных для резервной копии");
             }
             byte[] plain = encodeSnapshot(entries, System.currentTimeMillis());
-            boolean usePass = optionalPassphrase != null && optionalPassphrase.length > 0;
-            char[] keyMat = usePass ? Arrays.copyOf(optionalPassphrase, optionalPassphrase.length) : deviceKeyMaterial();
+            char[] keyMat = Arrays.copyOf(optionalPassphrase, optionalPassphrase.length);
             try {
-                return encryptEnvelope(plain, keyMat, usePass);
+                return encryptEnvelope(plain, keyMat, true);
             } finally {
                 ColgramCryptoVault.zeroize(plain);
                 Arrays.fill(keyMat, '\0');
@@ -313,17 +429,21 @@ public final class ColgramPersistentBackup {
     }
 
     public static RestoreResult restoreFromBytes(Context context, byte[] encryptedBlob, char[] optionalPassphrase) {
+        return restoreFromBytesInternal(context, encryptedBlob, optionalPassphrase, false);
+    }
+
+    private static RestoreResult restoreFromBytesInternal(Context context, byte[] encryptedBlob,
+                                                          char[] optionalPassphrase, boolean allowPrivateKey) {
         if (context == null || encryptedBlob == null || encryptedBlob.length <= HEADER_LEN) {
             return new RestoreResult(false, 0, 0, "Повреждённый или пустой файл копии");
         }
         Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         synchronized (BACKUP_LOCK) {
             boolean needsPass = isPassphraseProtected(encryptedBlob);
-            char[] keyMat = (needsPass && optionalPassphrase != null && optionalPassphrase.length > 0)
-                    ? Arrays.copyOf(optionalPassphrase, optionalPassphrase.length)
-                    : (optionalPassphrase != null && optionalPassphrase.length > 0
-                        ? Arrays.copyOf(optionalPassphrase, optionalPassphrase.length)
-                        : deviceKeyMaterial());
+            if ((optionalPassphrase == null || optionalPassphrase.length == 0) && !allowPrivateKey) {
+                return new RestoreResult(false, 0, 0, "Для расшифровки резервной копии требуется мастер-пароль");
+            }
+            char[] keyMat = Arrays.copyOf(optionalPassphrase, optionalPassphrase.length);
             byte[] plain = null;
             try {
                 plain = decryptEnvelope(encryptedBlob, keyMat);
@@ -338,6 +458,8 @@ public final class ColgramPersistentBackup {
                 if (!prefsDir.exists()) prefsDir.mkdirs();
                 if (!filesDir.exists()) filesDir.mkdirs();
                 if (!dbDir.exists()) dbDir.mkdirs();
+                String filesCanon = filesDir.getCanonicalPath();
+                String filesPrefix = filesCanon.endsWith(File.separator) ? filesCanon : filesCanon + File.separator;
 
                 int restoredFiles = 0;
                 Map<String, byte[]> rawVaultBundles = new LinkedHashMap<>();
@@ -356,14 +478,15 @@ public final class ColgramPersistentBackup {
                     File target;
                     if (rel.startsWith("shared_prefs/")) {
                         String name = rel.substring("shared_prefs/".length());
-                        if (name.contains("/")) continue;
+                        if (name.contains("/") || name.contains("\\") || "..".equals(name)) continue;
                         target = new File(prefsDir, name);
                     } else if (rel.startsWith("files/")) {
                         String sub = rel.substring("files/".length());
                         target = new File(filesDir, sub);
+                        if (!target.getCanonicalPath().startsWith(filesPrefix)) continue;
                     } else if (rel.startsWith("databases/")) {
                         String name = rel.substring("databases/".length());
-                        if (name.contains("/")) continue;
+                        if (name.contains("/") || name.contains("\\") || "..".equals(name)) continue;
                         target = new File(dbDir, name);
                         // Remove stale WAL/SHM journals before replacing SQLite database file.
                         new File(dbDir, name + "-wal").delete();
@@ -383,7 +506,7 @@ public final class ColgramPersistentBackup {
             } catch (GeneralSecurityException secErr) {
                 String msg = needsPass
                         ? "Неверный пароль или файл повреждён"
-                        : "Не удалось расшифровать копию (создана на другом устройстве или повреждена)";
+                        : "Не удалось расшифровать копию (требуется пароль или файл повреждён)";
                 return new RestoreResult(false, 0, 0, msg);
             } catch (Throwable t) {
                 Log.w(TAG, "restoreFromBytes failed", t);
@@ -581,18 +704,20 @@ public final class ColgramPersistentBackup {
             }
         }
 
-        // Legacy / direct Documents/ColgramBackup path (Android <=9 or legacy-enabled storage)
-        try {
-            File docs = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
-            if (docs != null) {
-                File dir = new File(docs, BACKUP_SUBDIR);
-                if (dir.exists() || dir.mkdirs()) {
-                    File out = new File(dir, BACKUP_FILENAME);
-                    writeAtomic(out, data);
-                    if (writtenPath.isEmpty()) writtenPath = out.getAbsolutePath();
+        // Legacy / direct Documents/ColgramBackup path only when MediaStore didn't already persist it
+        if (writtenPath.isEmpty()) {
+            try {
+                File docs = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+                if (docs != null) {
+                    File dir = new File(docs, BACKUP_SUBDIR);
+                    if (dir.exists() || dir.mkdirs()) {
+                        File out = new File(dir, BACKUP_FILENAME);
+                        writeAtomic(out, data);
+                        writtenPath = out.getAbsolutePath();
+                    }
                 }
-            }
-        } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+        }
 
         if (writtenPath.isEmpty()) {
             throw new IllegalStateException("Не удалось записать копию в Documents/" + BACKUP_SUBDIR);
@@ -648,11 +773,22 @@ public final class ColgramPersistentBackup {
     }
 
     private static byte[] readFileBytes(File f) throws Exception {
+        long declared = f.length();
+        if (declared > MAX_TOTAL_BYTES) {
+            throw new SecurityException("Файл копии слишком большой: " + declared);
+        }
         try (FileInputStream in = new FileInputStream(f);
-             ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.max(512, Math.min(f.length(), 1024 * 1024)))) {
+             ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.max(512, Math.min(declared, 1024 * 1024)))) {
             byte[] buf = new byte[16384];
+            long total = 0L;
             int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            while ((n = in.read(buf)) > 0) {
+                total += n;
+                if (total > MAX_TOTAL_BYTES) {
+                    throw new SecurityException("Файл копии превышает допустимый лимит");
+                }
+                out.write(buf, 0, n);
+            }
             return out.toByteArray();
         }
     }

@@ -34,9 +34,94 @@
  */
 
 #include <jni.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+
+static pthread_mutex_t g_exchange_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static jstring new_jstring_from_utf8_safe(JNIEnv *env, const char *utf8) {
+    if (!env) return NULL;
+    if (!utf8) return NULL;
+    size_t len = strlen(utf8);
+    if (len == 0) {
+        const jchar empty = 0;
+        return (*env)->NewString(env, &empty, 0);
+    }
+    jchar *utf16 = (jchar *)malloc((len * 2 + 1) * sizeof(jchar));
+    if (!utf16) {
+        return NULL;
+    }
+    const unsigned char *p = (const unsigned char *)utf8;
+    size_t i = 0;
+    jsize out = 0;
+    while (i < len) {
+        unsigned char c = p[i];
+        uint32_t cp = 0xFFFDu;
+        if (c < 0x80u) {
+            cp = c;
+            i += 1;
+        } else if ((c & 0xE0u) == 0xC0u) {
+            if (i + 1 < len && (p[i + 1] & 0xC0u) == 0x80u) {
+                uint32_t v = ((uint32_t)(c & 0x1Fu) << 6) | (uint32_t)(p[i + 1] & 0x3Fu);
+                if (v >= 0x80u) {
+                    cp = v;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else if ((c & 0xF0u) == 0xE0u) {
+            if (i + 2 < len && (p[i + 1] & 0xC0u) == 0x80u && (p[i + 2] & 0xC0u) == 0x80u) {
+                uint32_t v = ((uint32_t)(c & 0x0Fu) << 12)
+                           | ((uint32_t)(p[i + 1] & 0x3Fu) << 6)
+                           | (uint32_t)(p[i + 2] & 0x3Fu);
+                if (v >= 0x800u && !(v >= 0xD800u && v <= 0xDFFFu)) {
+                    cp = v;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else if ((c & 0xF8u) == 0xF0u) {
+            if (i + 3 < len && (p[i + 1] & 0xC0u) == 0x80u && (p[i + 2] & 0xC0u) == 0x80u && (p[i + 3] & 0xC0u) == 0x80u) {
+                uint32_t v = ((uint32_t)(c & 0x07u) << 18)
+                           | ((uint32_t)(p[i + 1] & 0x3Fu) << 12)
+                           | ((uint32_t)(p[i + 2] & 0x3Fu) << 6)
+                           | (uint32_t)(p[i + 3] & 0x3Fu);
+                if (v >= 0x10000u && v <= 0x10FFFFu) {
+                    cp = v;
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        if (cp <= 0xFFFFu) {
+            utf16[out++] = (jchar)cp;
+        } else {
+            cp -= 0x10000u;
+            utf16[out++] = (jchar)(0xD800u + (cp >> 10));
+            utf16[out++] = (jchar)(0xDC00u + (cp & 0x3FFu));
+        }
+    }
+    jstring result = (*env)->NewString(env, utf16, out);
+    free(utf16);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
+    return result;
+}
 
 /*
  * The Go client writes every transport decision to stderr, which nothing on Android reads. The
@@ -89,6 +174,10 @@ static char *jni_copy(JNIEnv *env, jstring s) {
         return NULL;
     }
     const char *chars = (*env)->GetStringUTFChars(env, s, NULL);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
     if (chars == NULL) {
         return NULL;
     }
@@ -106,7 +195,7 @@ static jstring jni_take(JNIEnv *env, char *s) {
     if (s == NULL) {
         return NULL;
     }
-    jstring out = (*env)->NewStringUTF(env, s);
+    jstring out = new_jstring_from_utf8_safe(env, s);
     free(s);
     return out;
 }
@@ -172,24 +261,29 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1exchange(JNIEnv *env,
         return NULL;
     }
     jsize len = (*env)->GetArrayLength(env, packet);
+    if ((*env)->ExceptionCheck(env) || len < 0) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        return NULL;
+    }
     jbyte *bytes = (*env)->GetByteArrayElements(env, packet, NULL);
-    if (bytes == NULL) {
+    if ((*env)->ExceptionCheck(env) || bytes == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         return NULL;
     }
     char *cb = jni_copy(env, bind);
     char *ce = jni_copy(env, edge);
-    /* C.CBytes on the Go side, so this buffer is freed here with free(), not on the Go heap. */
+    /* Serialize exchange + out-of-band reply length read so concurrent callers never cross-read lengths. */
+    pthread_mutex_lock(&g_exchange_lock);
     char *reply = colgram_masque_exchange_slice(bytes, (long)len, cb, ce);
-    (*env)->ReleaseByteArrayElements(env, packet, bytes, 0);
+    char *length_text = reply != NULL ? colgram_masque_last_reply_len() : NULL;
+    pthread_mutex_unlock(&g_exchange_lock);
+    (*env)->ReleaseByteArrayElements(env, packet, bytes, JNI_ABORT);
     free(cb);
     free(ce);
     if (reply == NULL) {
+        free(length_text);
         return NULL;
     }
-    /* The length comes back out of band: the buffer is owned by C, so C is what has to know how
-       much to release. A parsed integer rather than a second return value because the Go export
-       can only return one pointer through the cgo //export path. */
-    char *length_text = colgram_masque_last_reply_len();
     long reply_len = length_text == NULL ? 0 : strtol(length_text, NULL, 10);
     free(length_text);
     if (reply_len <= 0) {
@@ -197,12 +291,17 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1exchange(JNIEnv *env,
         return NULL;
     }
     jbyteArray out = (*env)->NewByteArray(env, (jsize)reply_len);
-    if (out == NULL) {
+    if ((*env)->ExceptionCheck(env) || out == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         free(reply);
         return NULL;
     }
     (*env)->SetByteArrayRegion(env, out, 0, (jsize)reply_len, (const jbyte *)reply);
     free(reply);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
     return out;
 }
 
@@ -233,8 +332,17 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1receive(JNIEnv *env, 
         | ((uint32_t)framed[2] << 16) | ((uint32_t)framed[3] << 24);
     if (length < 20 || length > 65535) { free(framed); return NULL; }
     jbyteArray out = (*env)->NewByteArray(env, (jsize)length);
-    if (out != NULL) (*env)->SetByteArrayRegion(env, out, 0, (jsize)length, (const jbyte *)(framed + 4));
+    if ((*env)->ExceptionCheck(env) || out == NULL) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        free(framed);
+        return NULL;
+    }
+    (*env)->SetByteArrayRegion(env, out, 0, (jsize)length, (const jbyte *)(framed + 4));
     free(framed);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
     return out;
 }
 
@@ -244,7 +352,6 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1tunnel_1address(JNIEn
     return jni_take(env, colgram_masque_tunnel_address());
 }
 
-#include <pthread.h>
 static JavaVM *vpn_vm;
 static jobject vpn_service;
 static jmethodID vpn_protect;
@@ -256,12 +363,26 @@ Java_org_colgram_core_ColgramMasqueNative_colgram_1masque_1set_1vpn(JNIEnv *env,
     pthread_mutex_lock(&vpn_lock);
     if (vpn_service != NULL) (*env)->DeleteGlobalRef(env, vpn_service);
     vpn_service = service == NULL ? NULL : (*env)->NewGlobalRef(env, service);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        vpn_service = NULL;
+    }
     (*env)->GetJavaVM(env, &vpn_vm);
     vpn_protect = NULL;
     if (service != NULL) {
         jclass type = (*env)->GetObjectClass(env, service);
-        vpn_protect = (*env)->GetMethodID(env, type, "protect", "(I)Z");
-        (*env)->DeleteLocalRef(env, type);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            type = NULL;
+        }
+        if (type != NULL) {
+            vpn_protect = (*env)->GetMethodID(env, type, "protect", "(I)Z");
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                vpn_protect = NULL;
+            }
+            (*env)->DeleteLocalRef(env, type);
+        }
     }
     pthread_mutex_unlock(&vpn_lock);
 }

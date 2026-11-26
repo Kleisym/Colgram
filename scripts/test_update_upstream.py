@@ -57,7 +57,8 @@ class UpdateUpstreamTest(unittest.TestCase):
         self.assertIn("APP_VERSION_NAME=", wf)
         self.assertIn("verify-privacy.py", wf)
         self.assertIn("host_verify.py --jvm-tests", wf)
-        self.assertEqual(wf.count("          body: |"), 1)
+        self.assertIn("--notes-file /tmp/release_notes.md", wf)
+        self.assertIn("SHA256SUMS.txt", wf)
 
 
 if __name__ == "__main__":
