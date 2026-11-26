@@ -9,6 +9,7 @@ import android.widget.Toast;
 
 import androidx.webkit.ProxyConfig;
 import androidx.webkit.ProxyController;
+import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
 import org.colgram.core.ColgramBrowserRoutePolicy;
@@ -170,13 +171,51 @@ public final class ColgramBrowserRoutes {
             if (org.colgram.core.ColgramConfig.isCloakEnabled()
                     || org.colgram.core.ColgramHookHandler.shouldHardenWebView()) {
                 String currentUa = settings.getUserAgentString();
-                if (currentUa != null && !currentUa.contains("Telegram-Android/")) {
+                if (currentUa != null) {
+                    boolean isBotUa = currentUa.contains("Telegram-Android/");
                     settings.setUserAgentString(org.colgram.core.ColgramHookHandler.cloakWebViewUserAgent(
-                            currentUa, false, org.telegram.messenger.BuildVars.BUILD_VERSION_STRING, "HIGH"));
+                            currentUa, isBotUa, org.telegram.messenger.BuildVars.BUILD_VERSION_STRING, "HIGH"));
+                }
+                String spoofJs = org.colgram.core.ColgramHookHandler.buildWebViewSpoofJs();
+                if (spoofJs != null && !spoofJs.isEmpty()
+                        && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    java.util.HashSet<String> allOrigins = new java.util.HashSet<>();
+                    allOrigins.add("*");
+                    WebViewCompat.addDocumentStartJavaScript(webView, spoofJs, allOrigins);
                 }
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    /** Injects anti-fingerprint JS into a WebView on page load when DOCUMENT_START_SCRIPT is unavailable. */
+    public static void injectSpoofScript(WebView webView) {
+        if (webView == null) return;
+        try {
+            if (!org.colgram.core.ColgramConfig.isCloakEnabled()
+                    && !org.colgram.core.ColgramHookHandler.shouldHardenWebView()) {
+                return;
+            }
+            String js = org.colgram.core.ColgramHookHandler.buildWebViewSpoofJs();
+            if (js != null && !js.isEmpty()) {
+                webView.evaluateJavascript(js, null);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** Replaces/strips Chromium hardware Client Hint headers when forwarding WebView HTTP requests. */
+    public static String filterRequestHeaderValue(String headerName, String headerValue) {
+        if (headerName == null || !org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            return headerValue;
+        }
+        String lower = headerName.toLowerCase(java.util.Locale.US);
+        if ("sec-ch-ua-model".equals(lower)) {
+            return "\"" + org.colgram.core.ColgramCloak.getEffectiveDeviceModel().replace("\"", "") + "\"";
+        }
+        if ("x-requested-with".equals(lower)) {
+            return null;
+        }
+        return headerValue;
     }
 
     /** Clears process-wide WebView proxy override safely when a proxied browser view closes. */

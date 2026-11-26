@@ -210,6 +210,8 @@ public final class ColgramSecurityPolicy {
             String appVersionName,
             String perfClass) {
         String base = originalUa == null ? "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36" : originalUa;
+        // Make idempotent when re-invoked cleanly by multiple WebView setup hooks.
+        base = base.replaceAll("\\s+Telegram-Android/[^)]*\\)", "");
         base = base.replace("; wv)", ")");
         base = base.replaceAll("Version/[\\d.]+\\s*", "");
 
@@ -218,7 +220,12 @@ public final class ColgramSecurityPolicy {
         String sdkNum = extractSdkInt(spoofSystemVersion);
 
         if (cloakEnabled) {
-            base = base.replaceAll("\\(Linux;\\s*Android[^)]*\\)", "(Linux; Android " + androidVer + "; K)");
+            if (modelToken.toLowerCase(Locale.US).contains("iphone")) {
+                String iosVer = extractIosRelease(spoofSystemVersion);
+                base = base.replaceAll("\\(Linux;\\s*Android[^)]*\\)", "(iPhone; CPU iPhone OS " + iosVer.replace('.', '_') + " like Mac OS X)");
+            } else {
+                base = base.replaceAll("\\(Linux;\\s*Android[^)]*\\)", "(Linux; Android " + androidVer + "; K)");
+            }
         }
 
         if (appendTelegramBotTag) {
@@ -229,6 +236,49 @@ public final class ColgramSecurityPolicy {
             base = base + " Telegram-Android/" + ver + " (" + modelToken + "; Android " + androidVer + "; SDK " + sdkNum + "; " + perf + ")";
         }
         return base;
+    }
+
+    /**
+     * Generates a safe JS shim executed at document start to cloak Chromium Client Hints
+     * (`navigator.userAgentData.getHighEntropyValues`), `navigator.platform`, CPU/RAM hints, and
+     * WebGL GPU renderer strings inside Mini Apps and in-app WebViews.
+     */
+    public static String buildWebViewSpoofJs(String spoofModel, String spoofSystemVersion, boolean cloakEnabled) {
+        if (!cloakEnabled) return "";
+        String model = (spoofModel == null || spoofModel.trim().isEmpty()) ? "Google Pixel 8 Pro" : spoofModel.trim();
+        String escModel = jsEscape(model);
+        boolean isIos = model.toLowerCase(Locale.US).contains("iphone");
+        String osVer = jsEscape(isIos ? extractIosRelease(spoofSystemVersion) : extractAndroidRelease(spoofSystemVersion));
+        String platform = isIos ? "iPhone" : "Android";
+        String navPlatform = isIos ? "iPhone" : "Linux armv8l";
+        return "(function(){try{"
+                + "if(window.__colgramCloakApplied)return;window.__colgramCloakApplied=true;"
+                + "var m='" + escModel + "',pv='" + osVer + "',pl='" + platform + "';"
+                + "try{Object.defineProperty(navigator,'platform',{get:function(){return '" + navPlatform + "';},configurable:true});}catch(e){}"
+                + "try{Object.defineProperty(navigator,'hardwareConcurrency',{get:function(){return 8;},configurable:true});}catch(e){}"
+                + "try{Object.defineProperty(navigator,'deviceMemory',{get:function(){return 8;},configurable:true});}catch(e){}"
+                + "try{var uad={brands:[{brand:'Chromium',version:'130'},{brand:'Not_A Brand',version:'24'}],mobile:true,platform:pl,"
+                + "getHighEntropyValues:function(h){return Promise.resolve({architecture:'arm',bitness:'64',brands:this.brands,mobile:true,model:m,platform:pl,platformVersion:pv,uaFullVersion:'130.0.0.0'});},"
+                + "toJSON:function(){return{brands:this.brands,mobile:true,platform:pl};}};"
+                + "Object.defineProperty(navigator,'userAgentData',{get:function(){return uad;},configurable:true});}catch(e){}"
+                + "var maskGl=function(p){if(!p||!p.prototype||!p.prototype.getParameter)return;"
+                + "var orig=p.prototype.getParameter;p.prototype.getParameter=function(k){"
+                + "if(k===37445)return 'Google Inc. (ARM)';"
+                + "if(k===37446)return 'ANGLE (ARM, Immortalis-G715, OpenGL ES 3.2)';"
+                + "return orig.apply(this,arguments);};};"
+                + "maskGl(window.WebGLRenderingContext);maskGl(window.WebGL2RenderingContext);"
+                + "}catch(e){}})();";
+    }
+
+    private static String jsEscape(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "").replace("\r", "");
+    }
+
+    private static String extractIosRelease(String spoofSys) {
+        if (spoofSys == null) return "17.6.1";
+        Matcher m = Pattern.compile("iOS\\s*(\\d+(?:\\.\\d+)*)", Pattern.CASE_INSENSITIVE).matcher(spoofSys);
+        return m.find() ? m.group(1) : "17.6.1";
     }
 
     private static String extractAndroidRelease(String spoofSys) {

@@ -2,11 +2,15 @@ package org.colgram.core;
 
 import android.app.Activity;
 import android.content.ClipData;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.res.AssetFileDescriptor;
 import android.net.Uri;
 import android.provider.OpenableColumns;
 import android.util.Log;
+import android.webkit.MimeTypeMap;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -128,25 +132,54 @@ public class ColgramFileImport {
         }
 
         final Context appContext = context == null ? null : context.getApplicationContext();
+        final Context deliveryContext = appContext != null ? appContext : context;
         new Thread(() -> {
             ArrayList<String> paths = new ArrayList<>();
+            int failed = 0;
             for (Uri u : uris) {
-                File f = copyToSandbox(appContext, u);
-                if (f != null) paths.add(f.getAbsolutePath());
+                File f = copyToSandbox(deliveryContext, u);
+                if (f != null && f.exists() && f.length() > 0L) {
+                    paths.add(f.getAbsolutePath());
+                } else {
+                    failed++;
+                }
             }
             Log.i(TAG, "imported " + paths.size() + "/" + uris.size() + " file(s) into the sandbox");
             final ArrayList<String> result = paths;
-            if (cb != null) {
-                // Deliver on the main thread: every caller here is UI code.
-                new android.os.Handler(android.os.Looper.getMainLooper()).post(
-                        () -> cb.onImported(result));
-            }
+            final int failedCount = failed;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                if (failedCount > 0 && result.isEmpty() && deliveryContext != null) {
+                    try {
+                        Toast.makeText(deliveryContext, "Не удалось прикрепить выбранный файл", Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {}
+                }
+                if (cb != null) {
+                    try {
+                        cb.onImported(result);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "onImported callback error: " + t);
+                    }
+                }
+            });
         }, "colgram-file-import").start();
         return true;
     }
 
-    /** The private inbox. Inside the app sandbox, so it needs no permission whatsoever. */
+    /**
+     * Private import staging directory. Prefers app-private external files dir (zero storage
+     * permission needed, never triggers AndroidUtilities.isInternalUri /data/data/ block, and still
+     * shielded from MediaStore with .nomedia), falling back to internal files/colgram_inbox.
+     */
     public static File getInboxDir(Context context) {
+        if (context != null) {
+            try {
+                File ext = context.getExternalFilesDir("colgram_inbox");
+                if (ext != null && (ext.exists() || ext.mkdirs()) && ext.canWrite()) {
+                    ColgramStorageSandbox.ensureDirWithNoMedia(ext);
+                    return ext;
+                }
+            } catch (Throwable ignored) {}
+        }
         File dir = new File(context.getFilesDir(), "colgram_inbox");
         ColgramStorageSandbox.ensureDirWithNoMedia(dir);
         return dir;
@@ -163,22 +196,53 @@ public class ColgramFileImport {
         if (context == null || uri == null) return null;
         InputStream in = null;
         OutputStream out = null;
+        AssetFileDescriptor afd = null;
         File tmp = null;
         try {
             File inboxDir = getInboxDir(context);
-            ColgramStorageOptimizer.pruneRegenerableWaste(
-                    null, inboxDir, ColgramStorageOptimizer.getActiveTelegramFilePaths(), System.currentTimeMillis());
+            try {
+                ColgramStorageOptimizer.pruneRegenerableWaste(
+                        null, inboxDir, ColgramStorageOptimizer.getActiveTelegramFilePaths(), System.currentTimeMillis());
+            } catch (Throwable ignored) {}
 
             String name = displayName(context, uri);
             if (name == null || name.isEmpty()) {
                 name = "import_" + System.currentTimeMillis();
             }
+            ContentResolver resolver = context.getContentResolver();
             // Sanitise: a display name can contain path separators, and it is attacker-controlled
             // as far as we are concerned (any app can publish a document provider).
-            name = name.replace('/', '_').replace('\\', '_');
+            name = name.replace('/', '_').replace('\\', '_').replace(":", "_").trim();
+            if (name.isEmpty()) {
+                name = "import_" + System.currentTimeMillis();
+            }
+            if (!name.contains(".") && resolver != null) {
+                try {
+                    String mime = resolver.getType(uri);
+                    String ext = mime != null ? MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) : null;
+                    if (ext != null && !ext.isEmpty()) {
+                        name = name + "." + ext;
+                    }
+                } catch (Throwable ignored) {}
+            }
             tmp = new File(inboxDir, ".import_" + System.currentTimeMillis() + "_" + Math.abs(name.hashCode()) + ".cgtmp");
 
-            in = context.getContentResolver().openInputStream(uri);
+            if (resolver == null) return null;
+            try {
+                in = resolver.openInputStream(uri);
+            } catch (Throwable openErr) {
+                in = null;
+            }
+            if (in == null) {
+                try {
+                    afd = resolver.openTypedAssetFileDescriptor(uri, "*/*", null);
+                    if (afd != null) {
+                        in = afd.createInputStream();
+                    }
+                } catch (Throwable afdErr) {
+                    in = null;
+                }
+            }
             if (in == null) return null;
             out = new FileOutputStream(tmp);
             byte[] buf = new byte[64 * 1024];
@@ -191,6 +255,9 @@ public class ColgramFileImport {
             out = null;
 
             long len = tmp.length();
+            if (len <= 0L) {
+                return null;
+            }
             String sha = ColgramStorageOptimizer.computeSha256(tmp);
             if (!sha.isEmpty() && len > 0L) {
                 File[] existing = inboxDir.listFiles();
@@ -226,6 +293,7 @@ public class ColgramFileImport {
             return null;
         } finally {
             try { if (in != null) in.close(); } catch (Throwable ignored) {}
+            try { if (afd != null) afd.close(); } catch (Throwable ignored) {}
             try { if (out != null) out.close(); } catch (Throwable ignored) {}
             try { if (tmp != null && tmp.exists()) tmp.delete(); } catch (Throwable ignored) {}
         }

@@ -15400,6 +15400,15 @@ def inject_turbo_messaging_patches(repo_path):
     """Apply and converge instant TX/RX, push keepalive, and turbo avatar/media hunks."""
     for rel_path, label, target, replacement in _TURBO_MESSAGING_PATCH_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
+        if label == "ConnectionsManager.java turbo #6" and os.path.exists(full_path):
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                cm_text = f.read()
+            if (
+                "native_setPushConnectionEnabled(currentAccount, true);" in cm_text
+                and "native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, logPath, regId, cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, effectivePush, ApplicationLoader.isNetworkOnline(), ApplicationLoader.getCurrentNetworkType(), perfClass);" in cm_text
+            ):
+                print(f" [=] Already patched (Cloak perfClass): {label}")
+                continue
         _patch_file_eol(full_path, target, replacement, label)
 
 
@@ -16065,6 +16074,1408 @@ def inject_chat_wallpaper_unlock_patches(repo_path):
         _patch_file_eol(full_path, target, replacement, label)
 
 
+_ATTACH_SPOOF_DELETE_PATCH_SPECS = [
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java',
+        'AndroidUtilities.java safe colgram_inbox/sharing/sandbox exemption in isInternalUri',
+        (
+            '                if (path != null) {\n'
+            '                    pathString = path;\n'
+            '                }\n'
+            '            } catch (Exception e) {\n'
+            '                pathString.replace("/./", "/");\n'
+            '                //igonre\n'
+            '            }\n'
+            '        }\n'
+            '        if (pathString.endsWith(".attheme")) {\n'
+            '            return false;\n'
+            '        }\n'
+            '        return pathString != null && pathString.toLowerCase().contains("/data/data/" + ApplicationLoader.applicationContext.getPackageName());\n'
+            '    }\n'
+        ),
+        (
+            '                if (path != null) {\n'
+            '                    pathString = path;\n'
+            '                }\n'
+            '            } catch (Exception e) {\n'
+            '                pathString = pathString.replace("/./", "/");\n'
+            '                //igonre\n'
+            '            }\n'
+            '        }\n'
+            '        if (pathString == null) {\n'
+            '            return false;\n'
+            '        }\n'
+            '        if (pathString.endsWith(".attheme")) {\n'
+            '            return false;\n'
+            '        }\n'
+            '        // Allow user-selected external attachments staged safely in Colgram\'s inbox or sharing dir\n'
+            '        // without opening access to Telegram databases, session keys, or SharedPreferences.\n'
+            '        try {\n'
+            '            File extInbox = ApplicationLoader.applicationContext.getExternalFilesDir("colgram_inbox");\n'
+            '            if (extInbox != null) {\n'
+            '                String canonicalExtInbox = extInbox.getCanonicalPath();\n'
+            '                if (pathString.startsWith(canonicalExtInbox + File.separator)) {\n'
+            '                    return false;\n'
+            '                }\n'
+            '            }\n'
+            '            File filesDir = ApplicationLoader.applicationContext.getFilesDir();\n'
+            '            if (filesDir != null) {\n'
+            '                String canonicalInbox = new File(filesDir, "colgram_inbox").getCanonicalPath();\n'
+            '                if (pathString.startsWith(canonicalInbox + File.separator)) {\n'
+            '                    return false;\n'
+            '                }\n'
+            '            }\n'
+            '            File sharingDir = getSharingDirectory();\n'
+            '            if (sharingDir != null) {\n'
+            '                String canonicalSharing = sharingDir.getCanonicalPath();\n'
+            '                if (pathString.startsWith(canonicalSharing + File.separator)) {\n'
+            '                    return false;\n'
+            '                }\n'
+            '            }\n'
+            '            if (filesDir != null) {\n'
+            '                String rawCustom = org.colgram.core.ColgramConfig.getCustomStorageDir();\n'
+            '                String safeCustom = (rawCustom == null || rawCustom.trim().isEmpty())\n'
+            '                        ? "Colgram"\n'
+            '                        : rawCustom.trim().replace(\'/\', \'_\').replace(\'\\\\\', \'_\').replace("..", "_");\n'
+            '                if (!safeCustom.isEmpty() && !".".equals(safeCustom)) {\n'
+            '                    String canonicalSandbox = new File(filesDir, safeCustom).getCanonicalPath();\n'
+            '                    if (!canonicalSandbox.equals(filesDir.getCanonicalPath())\n'
+            '                            && pathString.startsWith(canonicalSandbox + File.separator)) {\n'
+            '                        return false;\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '        } catch (Throwable ignored) {\n'
+            '        }\n'
+            '        return pathString.toLowerCase().contains("/data/data/" + ApplicationLoader.applicationContext.getPackageName());\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java',
+        'ChatAttachAlert.java SAF audio pick null fmessages crash & dismiss fix',
+        (
+            '                    if (org.colgram.core.ColgramConfig.isSandboxStorageEnabled()) {\n'
+            '                        // Colgram: no READ_MEDIA_AUDIO request. Pick through SAF instead.\n'
+            '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "audio/*", true, paths -> {\n'
+            '                            if (paths == null || paths.isEmpty()) {\n'
+            '                                return;\n'
+            '                            }\n'
+            '                            if (documentsDelegate != null) {\n'
+            '                                documentsDelegate.didSelectFiles(paths, "", null, null, true, 0, 0, 0, false, 0);\n'
+            '                            } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+            '                                ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
+            '                                        .didSelectFiles(paths, "", null, null, true, 0, 0, 0, false, 0);\n'
+            '                            }\n'
+            '                        });\n'
+            '                        return;\n'
+            '                    }\n'
+        ),
+        (
+            '                    if (org.colgram.core.ColgramConfig.isSandboxStorageEnabled()) {\n'
+            '                        // Colgram: no READ_MEDIA_AUDIO request. Pick through SAF instead.\n'
+            '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "audio/*", true, paths -> {\n'
+            '                            if (paths == null || paths.isEmpty()) {\n'
+            '                                return;\n'
+            '                            }\n'
+            '                            try {\n'
+            '                                if (documentsDelegate != null) {\n'
+            '                                    documentsDelegate.didSelectFiles(paths, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
+            '                                } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+            '                                    ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
+            '                                            .didSelectFiles(paths, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
+            '                                }\n'
+            '                            } catch (Throwable t) {\n'
+            '                                FileLog.e(t);\n'
+            '                            } finally {\n'
+            '                                try {\n'
+            '                                    dismiss(true);\n'
+            '                                } catch (Throwable ignored) {}\n'
+            '                            }\n'
+            '                        });\n'
+            '                        return;\n'
+            '                    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java',
+        'ChatAttachAlert.java SAF files pick null fmessages crash & dismiss fix',
+        (
+            '                    if (org.colgram.core.ColgramConfig.isSandboxStorageEnabled()) {\n'
+            '                        // Colgram: no READ_MEDIA_IMAGES / READ_MEDIA_VIDEO request. Pick through SAF.\n'
+            '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "*/*", true, paths -> {\n'
+            '                            if (paths == null || paths.isEmpty()) {\n'
+            '                                return;\n'
+            '                            }\n'
+            '                            if (documentsDelegate != null) {\n'
+            '                                documentsDelegate.didSelectFiles(paths, "", null, null, true, 0, 0, 0, false, 0);\n'
+            '                            } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+            '                                ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
+            '                                        .didSelectFiles(paths, "", null, null, true, 0, 0, 0, false, 0);\n'
+            '                            }\n'
+            '                        });\n'
+            '                        return;\n'
+            '                    }\n'
+        ),
+        (
+            '                    if (org.colgram.core.ColgramConfig.isSandboxStorageEnabled()) {\n'
+            '                        // Colgram: no READ_MEDIA_IMAGES / READ_MEDIA_VIDEO request. Pick through SAF.\n'
+            '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "*/*", true, paths -> {\n'
+            '                            if (paths == null || paths.isEmpty()) {\n'
+            '                                return;\n'
+            '                            }\n'
+            '                            try {\n'
+            '                                if (documentsDelegate != null) {\n'
+            '                                    documentsDelegate.didSelectFiles(paths, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
+            '                                } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+            '                                    ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
+            '                                            .didSelectFiles(paths, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
+            '                                }\n'
+            '                            } catch (Throwable t) {\n'
+            '                                FileLog.e(t);\n'
+            '                            } finally {\n'
+            '                                try {\n'
+            '                                    dismiss(true);\n'
+            '                                } catch (Throwable ignored) {}\n'
+            '                            }\n'
+            '                        });\n'
+            '                        return;\n'
+            '                    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java',
+        'ChatAttachAlert.java openDocumentsLayout null-safe fmessages & photos',
+        (
+            '                @Override\n'
+            '                public void didSelectFiles(ArrayList<String> files, String caption, ArrayList<TLRPC.MessageEntity> captionEntities, ArrayList<MessageObject> fmessages, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long effectId, boolean invertMedia, long payStars) {\n'
+            '                    if (documentsDelegate != null) {\n'
+            '                        documentsDelegate.didSelectFiles(files, caption, captionEntities, fmessages, notify, scheduleDate, scheduleRepeatPeriod, effectId, invertMedia, payStars);\n'
+            '                    } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+            '                        ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment).didSelectFiles(files, caption, captionEntities, fmessages, notify, scheduleDate, scheduleRepeatPeriod, effectId, invertMedia, payStars);\n'
+            '                    } else if (baseFragment instanceof PassportActivity) {\n'
+            '                        ((PassportActivity) baseFragment).didSelectFiles(files, caption, notify, scheduleDate, effectId, invertMedia);\n'
+            '                    }\n'
+            '                }\n'
+            '\n'
+            '                @Override\n'
+            '                public void didSelectPhotos(ArrayList<SendMessagesHelper.SendingMediaInfo> photos, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long payStars) {\n'
+            '                    if (documentsDelegate != null) {\n'
+        ),
+        (
+            '                @Override\n'
+            '                public void didSelectFiles(ArrayList<String> files, String caption, ArrayList<TLRPC.MessageEntity> captionEntities, ArrayList<MessageObject> fmessages, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long effectId, boolean invertMedia, long payStars) {\n'
+            '                    ArrayList<MessageObject> safeMessages = fmessages != null ? fmessages : new ArrayList<>();\n'
+            '                    if (documentsDelegate != null) {\n'
+            '                        documentsDelegate.didSelectFiles(files, caption, captionEntities, safeMessages, notify, scheduleDate, scheduleRepeatPeriod, effectId, invertMedia, payStars);\n'
+            '                    } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
+            '                        ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment).didSelectFiles(files, caption, captionEntities, safeMessages, notify, scheduleDate, scheduleRepeatPeriod, effectId, invertMedia, payStars);\n'
+            '                    } else if (baseFragment instanceof PassportActivity) {\n'
+            '                        ((PassportActivity) baseFragment).didSelectFiles(files, caption, notify, scheduleDate, effectId, invertMedia);\n'
+            '                    }\n'
+            '                }\n'
+            '\n'
+            '                @Override\n'
+            '                public void didSelectPhotos(ArrayList<SendMessagesHelper.SendingMediaInfo> photos, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long payStars) {\n'
+            '                    if (photos == null || photos.isEmpty()) {\n'
+            '                        return;\n'
+            '                    }\n'
+            '                    if (documentsDelegate != null) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java didSelectFiles null-safe fmessages & files',
+        (
+            '    @Override\n'
+            '    public void didSelectFiles(ArrayList<String> files, String caption, ArrayList<TLRPC.MessageEntity> captionEntities, ArrayList<MessageObject> fmessages, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long effectId, boolean invertMedia, long payStars) {\n'
+            '        fillEditingMediaWithCaption(caption, null);\n'
+            '        if (checkSlowModeAlert()) {\n'
+            '            if (!fmessages.isEmpty() && !TextUtils.isEmpty(caption)) {\n'
+            '                SendMessagesHelper.SendMessageParams params = SendMessagesHelper.SendMessageParams.of(caption, dialog_id, null, null, null, true, captionEntities, null, null, true, 0, 0, null, false);\n'
+            '                params.sendMessageChatArguments = getMessageChatSendParams();\n'
+            '                params.invert_media = invertMedia;\n'
+            '                params.payStars = payStars;\n'
+            '                params.monoForumPeer = getSendMonoForumPeerId();\n'
+            '                params.suggestionParams = messageSuggestionParams;\n'
+            '                SendMessagesHelper.getInstance(currentAccount).sendMessage(params);\n'
+            '                caption = null;\n'
+            '            }\n'
+            '            getSendMessagesHelper().sendMessage(fmessages, dialog_id, false, false, true, 0, 0, null, -1, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams());\n'
+            '            SendMessagesHelper.prepareSendingDocuments(getAccountInstance(), files, files, null, caption, captionEntities, null, dialog_id, replyingMessageObject, getThreadMessage(), null, replyingQuote, editingMessageObject, notify, scheduleDate, scheduleRepeatPeriod, null, getMessageChatSendParams(), effectId, invertMedia, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams());\n'
+            '            afterMessageSend();\n'
+            '        }\n'
+            '    }\n'
+        ),
+        (
+            '    @Override\n'
+            '    public void didSelectFiles(ArrayList<String> files, String caption, ArrayList<TLRPC.MessageEntity> captionEntities, ArrayList<MessageObject> fmessages, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long effectId, boolean invertMedia, long payStars) {\n'
+            '        final boolean hasFiles = files != null && !files.isEmpty();\n'
+            '        final boolean hasForwardMessages = fmessages != null && !fmessages.isEmpty();\n'
+            '        if (!hasFiles && !hasForwardMessages) {\n'
+            '            return;\n'
+            '        }\n'
+            '        fillEditingMediaWithCaption(caption, null);\n'
+            '        if (checkSlowModeAlert()) {\n'
+            '            if (hasForwardMessages && !TextUtils.isEmpty(caption)) {\n'
+            '                SendMessagesHelper.SendMessageParams params = SendMessagesHelper.SendMessageParams.of(caption, dialog_id, null, null, null, true, captionEntities, null, null, true, 0, 0, null, false);\n'
+            '                params.sendMessageChatArguments = getMessageChatSendParams();\n'
+            '                params.invert_media = invertMedia;\n'
+            '                params.payStars = payStars;\n'
+            '                params.monoForumPeer = getSendMonoForumPeerId();\n'
+            '                params.suggestionParams = messageSuggestionParams;\n'
+            '                SendMessagesHelper.getInstance(currentAccount).sendMessage(params);\n'
+            '                caption = null;\n'
+            '            }\n'
+            '            if (hasForwardMessages) {\n'
+            '                getSendMessagesHelper().sendMessage(fmessages, dialog_id, false, false, true, 0, 0, null, -1, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams());\n'
+            '            }\n'
+            '            if (hasFiles) {\n'
+            '                SendMessagesHelper.prepareSendingDocuments(getAccountInstance(), files, files, null, caption, captionEntities, null, dialog_id, replyingMessageObject, getThreadMessage(), null, replyingQuote, editingMessageObject, notify, scheduleDate, scheduleRepeatPeriod, null, getMessageChatSendParams(), effectId, invertMedia, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams());\n'
+            '            }\n'
+            '            afterMessageSend();\n'
+            '        }\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java sendUriAsDocument null/exception guard',
+        (
+            '        String tempPath = AndroidUtilities.getPath(uri);\n'
+            '        String originalPath = tempPath;\n'
+            '        boolean sendAsUri = false;\n'
+        ),
+        (
+            '        String tempPath = null;\n'
+            '        try {\n'
+            '            tempPath = AndroidUtilities.getPath(uri);\n'
+            '        } catch (Throwable e) {\n'
+            '            FileLog.e(e);\n'
+            '        }\n'
+            '        String originalPath = tempPath != null ? tempPath : uri.toString();\n'
+            '        boolean sendAsUri = false;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java videoPath null early return',
+        (
+            '                    if (videoPath == null) {\n'
+            '                        showAttachmentError();\n'
+            '                    }\n'
+            '                    if (paused) {\n'
+        ),
+        (
+            '                    if (videoPath == null) {\n'
+            '                        showAttachmentError();\n'
+            '                        return;\n'
+            '                    }\n'
+            '                    if (paused) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java requestCode 21 clipData null guard',
+        (
+            '                            ClipData clipData = data.getClipData();\n'
+            '                            for (int i = 0; i < clipData.getItemCount(); i++) {\n'
+            '                                sendUriAsDocument(clipData.getItemAt(i).getUri(), notify, scheduleDate);\n'
+            '                            }\n'
+            '                            afterMessageSend();\n'
+            '                        }, themeDelegate);\n'
+            '                        return;\n'
+            '                    } else {\n'
+            '                        showAttachmentError();\n'
+            '                    }\n'
+            '                } else {\n'
+            '                    fillEditingMediaWithCaption(null, null);\n'
+            '                    if (data.getData() != null) {\n'
+            '                        sendUriAsDocument(data.getData());\n'
+            '                    } else if (data.getClipData() != null) {\n'
+            '                        ClipData clipData = data.getClipData();\n'
+            '                        for (int i = 0; i < clipData.getItemCount(); i++) {\n'
+            '                            sendUriAsDocument(clipData.getItemAt(i).getUri());\n'
+            '                        }\n'
+            '                    } else {\n'
+        ),
+        (
+            '                            ClipData clipData = data.getClipData();\n'
+            '                            for (int i = 0; i < clipData.getItemCount(); i++) {\n'
+            '                                if (clipData.getItemAt(i) != null && clipData.getItemAt(i).getUri() != null) {\n'
+            '                                    sendUriAsDocument(clipData.getItemAt(i).getUri(), notify, scheduleDate);\n'
+            '                                }\n'
+            '                            }\n'
+            '                            afterMessageSend();\n'
+            '                        }, themeDelegate);\n'
+            '                        return;\n'
+            '                    } else {\n'
+            '                        showAttachmentError();\n'
+            '                    }\n'
+            '                } else {\n'
+            '                    fillEditingMediaWithCaption(null, null);\n'
+            '                    if (data.getData() != null) {\n'
+            '                        sendUriAsDocument(data.getData());\n'
+            '                    } else if (data.getClipData() != null) {\n'
+            '                        ClipData clipData = data.getClipData();\n'
+            '                        for (int i = 0; i < clipData.getItemCount(); i++) {\n'
+            '                            if (clipData.getItemAt(i) != null && clipData.getItemAt(i).getUri() != null) {\n'
+            '                                sendUriAsDocument(clipData.getItemAt(i).getUri());\n'
+            '                            }\n'
+            '                        }\n'
+            '                    } else {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java option 9990 complete purge',
+        (
+            '            if (selectedObjectGroup != null && selectedObjectGroup.messages != null && !selectedObjectGroup.messages.isEmpty()) {\n'
+            '                for (int i = 0; i < selectedObjectGroup.messages.size(); i++) {\n'
+            '                    MessageObject gm = selectedObjectGroup.messages.get(i);\n'
+            '                    gm.deleted = true;\n'
+            '                    org.colgram.core.ColgramHookHandler.unmarkMessageDeleted(gm.getDialogId(), gm.getId());\n'
+            '                    org.colgram.core.ColgramHookHandler.unmarkMessageDeleted(dialog_id, gm.getId());\n'
+            '                    org.colgram.core.ColgramHookHandler.markForcePurged(gm.getDialogId(), gm.getId());\n'
+            '                    org.colgram.core.ColgramHookHandler.markForcePurged(dialog_id, gm.getId());\n'
+            '                    localIds.add(gm.getId());\n'
+            '                }\n'
+            '            } else {\n'
+            '                selectedObject.deleted = true;\n'
+            '                org.colgram.core.ColgramHookHandler.unmarkMessageDeleted(did, selectedObject.getId());\n'
+            '                org.colgram.core.ColgramHookHandler.unmarkMessageDeleted(dialog_id, selectedObject.getId());\n'
+            '                org.colgram.core.ColgramHookHandler.markForcePurged(did, selectedObject.getId());\n'
+            '                org.colgram.core.ColgramHookHandler.markForcePurged(dialog_id, selectedObject.getId());\n'
+            '                localIds.add(selectedObject.getId());\n'
+            '            }\n'
+        ),
+        (
+            '            if (selectedObjectGroup != null && selectedObjectGroup.messages != null && !selectedObjectGroup.messages.isEmpty()) {\n'
+            '                for (int i = 0; i < selectedObjectGroup.messages.size(); i++) {\n'
+            '                    MessageObject gm = selectedObjectGroup.messages.get(i);\n'
+            '                    gm.deleted = true;\n'
+            '                    org.colgram.core.ColgramHookHandler.markForcePurged(gm.getDialogId(), gm.getId());\n'
+            '                    org.colgram.core.ColgramHookHandler.markForcePurged(dialog_id, gm.getId());\n'
+            '                    localIds.add(gm.getId());\n'
+            '                }\n'
+            '            } else {\n'
+            '                selectedObject.deleted = true;\n'
+            '                org.colgram.core.ColgramHookHandler.markForcePurged(did, selectedObject.getId());\n'
+            '                org.colgram.core.ColgramHookHandler.markForcePurged(dialog_id, selectedObject.getId());\n'
+            '                localIds.add(selectedObject.getId());\n'
+            '            }\n'
+            '            org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(did, localIds);\n'
+            '            if (did != dialog_id) {\n'
+            '                org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(dialog_id, localIds);\n'
+            '            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java checkFileSize safe cursor & AFD close',
+        (
+            '    private static boolean checkFileSize(AccountInstance accountInstance, Uri uri) {\n'
+            '        long len = 0;\n'
+            '        try {\n'
+            '            AssetFileDescriptor assetFileDescriptor = ApplicationLoader.applicationContext.getContentResolver().openAssetFileDescriptor(uri, "r", null);\n'
+            '            if (assetFileDescriptor != null) {\n'
+            '                len = assetFileDescriptor.getLength();\n'
+            '            }\n'
+            '            Cursor cursor = ApplicationLoader.applicationContext.getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null);\n'
+            '            int sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE);\n'
+            '            cursor.moveToFirst();\n'
+            '            len = cursor.getLong(sizeIndex);\n'
+            '            cursor.close();\n'
+            '        } catch (Exception e) {\n'
+            '            FileLog.e(e);\n'
+            '        }\n'
+            '        if (!FileLoader.checkUploadFileSize(accountInstance.getCurrentAccount(), len)) {\n'
+            '            return true;\n'
+            '        }\n'
+            '        return false;\n'
+            '    }\n'
+        ),
+        (
+            '    private static boolean checkFileSize(AccountInstance accountInstance, Uri uri) {\n'
+            '        long len = 0;\n'
+            '        AssetFileDescriptor assetFileDescriptor = null;\n'
+            '        Cursor cursor = null;\n'
+            '        try {\n'
+            '            assetFileDescriptor = ApplicationLoader.applicationContext.getContentResolver().openAssetFileDescriptor(uri, "r", null);\n'
+            '            if (assetFileDescriptor != null) {\n'
+            '                len = assetFileDescriptor.getLength();\n'
+            '            }\n'
+            '            cursor = ApplicationLoader.applicationContext.getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null);\n'
+            '            if (cursor != null && cursor.moveToFirst()) {\n'
+            '                int sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE);\n'
+            '                if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {\n'
+            '                    len = cursor.getLong(sizeIndex);\n'
+            '                }\n'
+            '            }\n'
+            '        } catch (Exception e) {\n'
+            '            FileLog.e(e);\n'
+            '        } finally {\n'
+            '            try {\n'
+            '                if (cursor != null) cursor.close();\n'
+            '            } catch (Throwable ignored) {}\n'
+            '            try {\n'
+            '                if (assetFileDescriptor != null) assetFileDescriptor.close();\n'
+            '            } catch (Throwable ignored) {}\n'
+            '        }\n'
+            '        if (len > 0 && !FileLoader.checkUploadFileSize(accountInstance.getCurrentAccount(), len)) {\n'
+            '            return true;\n'
+            '        }\n'
+            '        return false;\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java',
+        'SendMessagesHelper.java prepareSendingDocuments null-safe paths/uris',
+        (
+            '            if (paths != null) {\n'
+            '                int count = paths.size();\n'
+            '                for (int a = 0; a < count; a++) {\n'
+            '                    final String captionFinal = a == 0 ? caption : null;\n'
+            '                    if (!isEncrypted && count > 1 && mediaCount % 10 == 0 && pollSendParams == null) {\n'
+            '                        if (groupId[0] != 0) {\n'
+            '                            finishGroup(accountInstance, groupId[0], scheduleDate);\n'
+            '                        }\n'
+            '                        groupId[0] = Utilities.random.nextLong();\n'
+            '                        mediaCount = 0;\n'
+            '                    }\n'
+            '                    mediaCount++;\n'
+            '                    long prevGroupId = groupId[0];\n'
+            '                    error = prepareSendingDocumentInternal(accountInstance, paths.get(a), originalPaths.get(a), null, mime, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, a == 0 ? captionEntities : null, editingMessageObject, groupId, !forcedPollDoNotSendFinal && (pollSendParams == null && mediaCount == 10 || a == count - 1), captionFinal, notify, scheduleDate, scheduleRepeatPeriod, docType, inputContent == null, sendMessageChatArguments, first ? effectId : 0, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, pollSendIndexes!= null ? pollSendIndexes.get(a) : -1);\n'
+            '                    first = false;\n'
+            '                    if (prevGroupId != groupId[0] || groupId[0] == -1) {\n'
+            '                        mediaCount = 1;\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '            if (uris != null) {\n'
+            '                groupId[0] = 0;\n'
+            '                mediaCount = 0;\n'
+            '                int count = uris.size();\n'
+            '                for (int a = 0; a < uris.size(); a++) {\n'
+            '                    final String captionFinal = a == 0 && (paths == null || paths.size() == 0) ? caption : null;\n'
+            '                    final ArrayList<TLRPC.MessageEntity> captionEntitiesFinal = a == 0 && (paths == null || paths.size() == 0) ? captionEntities : null;\n'
+            '                    if (!isEncrypted && count > 1 && mediaCount % 10 == 0 && pollSendParams == null) {\n'
+            '                        if (groupId[0] != 0) {\n'
+            '                            finishGroup(accountInstance, groupId[0], scheduleDate);\n'
+            '                        }\n'
+            '                        groupId[0] = Utilities.random.nextLong();\n'
+            '                        mediaCount = 0;\n'
+            '                    }\n'
+            '                    mediaCount++;\n'
+            '                    long prevGroupId = groupId[0];\n'
+            '                    error = prepareSendingDocumentInternal(accountInstance, null, null, uris.get(a), mime, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, captionEntitiesFinal, editingMessageObject, groupId, !forcedPollDoNotSendFinal && (pollSendParams == null && mediaCount == 10 || a == count - 1), captionFinal, notify, scheduleDate, scheduleRepeatPeriod, docType, inputContent == null, sendMessageChatArguments, first ? effectId : 0, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, pollSendUriIndexes != null ? pollSendUriIndexes.get(a) : -1);\n'
+        ),
+        (
+            '            if (paths != null) {\n'
+            '                int count = paths.size();\n'
+            '                for (int a = 0; a < count; a++) {\n'
+            '                    String pathItem = paths.get(a);\n'
+            '                    if (pathItem == null || pathItem.isEmpty()) {\n'
+            '                        continue;\n'
+            '                    }\n'
+            '                    String origPathItem = (originalPaths != null && a < originalPaths.size()) ? originalPaths.get(a) : pathItem;\n'
+            '                    final String captionFinal = a == 0 ? caption : null;\n'
+            '                    if (!isEncrypted && count > 1 && mediaCount % 10 == 0 && pollSendParams == null) {\n'
+            '                        if (groupId[0] != 0) {\n'
+            '                            finishGroup(accountInstance, groupId[0], scheduleDate);\n'
+            '                        }\n'
+            '                        groupId[0] = Utilities.random.nextLong();\n'
+            '                        mediaCount = 0;\n'
+            '                    }\n'
+            '                    mediaCount++;\n'
+            '                    long prevGroupId = groupId[0];\n'
+            '                    error = prepareSendingDocumentInternal(accountInstance, pathItem, origPathItem, null, mime, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, a == 0 ? captionEntities : null, editingMessageObject, groupId, !forcedPollDoNotSendFinal && (pollSendParams == null && mediaCount == 10 || a == count - 1), captionFinal, notify, scheduleDate, scheduleRepeatPeriod, docType, inputContent == null, sendMessageChatArguments, first ? effectId : 0, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, pollSendIndexes!= null ? pollSendIndexes.get(a) : -1);\n'
+            '                    first = false;\n'
+            '                    if (prevGroupId != groupId[0] || groupId[0] == -1) {\n'
+            '                        mediaCount = 1;\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '            if (uris != null) {\n'
+            '                groupId[0] = 0;\n'
+            '                mediaCount = 0;\n'
+            '                int count = uris.size();\n'
+            '                for (int a = 0; a < uris.size(); a++) {\n'
+            '                    Uri uriItem = uris.get(a);\n'
+            '                    if (uriItem == null) {\n'
+            '                        continue;\n'
+            '                    }\n'
+            '                    final String captionFinal = a == 0 && (paths == null || paths.size() == 0) ? caption : null;\n'
+            '                    final ArrayList<TLRPC.MessageEntity> captionEntitiesFinal = a == 0 && (paths == null || paths.size() == 0) ? captionEntities : null;\n'
+            '                    if (!isEncrypted && count > 1 && mediaCount % 10 == 0 && pollSendParams == null) {\n'
+            '                        if (groupId[0] != 0) {\n'
+            '                            finishGroup(accountInstance, groupId[0], scheduleDate);\n'
+            '                        }\n'
+            '                        groupId[0] = Utilities.random.nextLong();\n'
+            '                        mediaCount = 0;\n'
+            '                    }\n'
+            '                    mediaCount++;\n'
+            '                    long prevGroupId = groupId[0];\n'
+            '                    error = prepareSendingDocumentInternal(accountInstance, null, null, uriItem, mime, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, captionEntitiesFinal, editingMessageObject, groupId, !forcedPollDoNotSendFinal && (pollSendParams == null && mediaCount == 10 || a == count - 1), captionFinal, notify, scheduleDate, scheduleRepeatPeriod, docType, inputContent == null, sendMessageChatArguments, first ? effectId : 0, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, pollSendUriIndexes != null ? pollSendUriIndexes.get(a) : -1);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java full cloak params, system_lang_code & initVersion bump',
+        (
+            '        try {\n'
+            '            try {\n'
+            '                org.colgram.core.ColgramConfig.init(ApplicationLoader.applicationContext);\n'
+            '            } catch (Throwable ignored) {}\n'
+            '            systemLangCode = LocaleController.getSystemLocaleStringIso639().toLowerCase();\n'
+            '            langCode = LocaleController.getLocaleStringIso639().toLowerCase();\n'
+            '            deviceModel = org.colgram.core.ColgramConfig.getSpoofDeviceModel();\n'
+            '            PackageInfo pInfo = ApplicationLoader.applicationContext.getPackageManager().getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0);\n'
+            '            appVersion = pInfo.versionName + " (" + pInfo.versionCode + ")";\n'
+            '            if (BuildVars.DEBUG_PRIVATE_VERSION) {\n'
+            '                appVersion += " pbeta";\n'
+            '            } else if (BuildVars.DEBUG_VERSION) {\n'
+            '                appVersion += " beta";\n'
+            '            }\n'
+            '            systemVersion = org.colgram.core.ColgramConfig.getSpoofSystemVersion();\n'
+            '        } catch (Exception e) {\n'
+            '            systemLangCode = "en";\n'
+            '            langCode = "";\n'
+            '            deviceModel = "Android unknown";\n'
+            '            appVersion = "App version unknown";\n'
+            '            systemVersion = "SDK " + Build.VERSION.SDK_INT;\n'
+            '        }\n'
+            '        if (systemLangCode.trim().length() == 0) {\n'
+            '            systemLangCode = "en";\n'
+            '        }\n'
+            '        if (deviceModel.trim().length() == 0) {\n'
+            '            deviceModel = "Android unknown";\n'
+            '        }\n'
+            '        if (appVersion.trim().length() == 0) {\n'
+            '            appVersion = "App version unknown";\n'
+            '        }\n'
+            '        if (systemVersion.trim().length() == 0) {\n'
+            '            systemVersion = "SDK Unknown";\n'
+            '        }\n'
+            '        getUserConfig().loadConfig();\n'
+            '        String pushString = getRegId();\n'
+            '        String fingerprint = AndroidUtilities.getCertificateSHA256Fingerprint();\n'
+            '\n'
+            '        int timezoneOffset = (TimeZone.getDefault().getRawOffset() + TimeZone.getDefault().getDSTSavings()) / 1000;\n'
+            '        SharedPreferences mainPreferences;\n'
+            '        if (currentAccount == 0) {\n'
+            '            mainPreferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Activity.MODE_PRIVATE);\n'
+            '        } else {\n'
+            '            mainPreferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig" + currentAccount, Activity.MODE_PRIVATE);\n'
+            '        }\n'
+            '        forceTryIpV6 = mainPreferences.getBoolean("forceTryIpV6", false);\n'
+            '        boolean userPremium = false;\n'
+            '        if (getUserConfig().getCurrentUser() != null) {\n'
+            '            userPremium = getUserConfig().getCurrentUser().premium;\n'
+            '        }\n'
+            '        \n'
+            '        java.util.Map<String, String> cloaked = org.colgram.core.ColgramHookHandler.hookInitConnection(deviceModel, systemVersion, appVersion, langCode);\n'
+            '        if (cloaked != null) {\n'
+            '            if (cloaked.containsKey("device_model")) deviceModel = cloaked.get("device_model");\n'
+            '            if (cloaked.containsKey("system_version")) systemVersion = cloaked.get("system_version");\n'
+            '            if (cloaked.containsKey("app_version")) appVersion = cloaked.get("app_version");\n'
+            '            if (cloaked.containsKey("lang_code")) langCode = cloaked.get("lang_code");\n'
+            '        }\n'
+            '        \n'
+            '        init(SharedConfig.buildVersion(), TLRPC.LAYER, BuildVars.APP_ID, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, FileLog.getNetworkLogPath(), pushString, fingerprint, timezoneOffset, getUserConfig().getClientUserId(), userPremium, enablePushConnection);\n'
+        ),
+        (
+            '        try {\n'
+            '            try {\n'
+            '                org.colgram.core.ColgramConfig.init(ApplicationLoader.applicationContext);\n'
+            '            } catch (Throwable ignored) {}\n'
+            '            if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                systemLangCode = org.colgram.core.ColgramConfig.getSpoofLang();\n'
+            '                langCode = org.colgram.core.ColgramConfig.getSpoofLang();\n'
+            '                deviceModel = org.colgram.core.ColgramCloak.getEffectiveDeviceModel();\n'
+            '                systemVersion = org.colgram.core.ColgramCloak.getEffectiveSystemVersion();\n'
+            '            } else {\n'
+            '                systemLangCode = LocaleController.getSystemLocaleStringIso639().toLowerCase();\n'
+            '                langCode = LocaleController.getLocaleStringIso639().toLowerCase();\n'
+            '                deviceModel = Build.MANUFACTURER + " " + Build.MODEL;\n'
+            '                systemVersion = "SDK " + Build.VERSION.SDK_INT;\n'
+            '            }\n'
+            '            PackageInfo pInfo = ApplicationLoader.applicationContext.getPackageManager().getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0);\n'
+            '            appVersion = pInfo.versionName + " (" + pInfo.versionCode + ")";\n'
+            '            if (BuildVars.DEBUG_PRIVATE_VERSION) {\n'
+            '                appVersion += " pbeta";\n'
+            '            } else if (BuildVars.DEBUG_VERSION) {\n'
+            '                appVersion += " beta";\n'
+            '            }\n'
+            '        } catch (Exception e) {\n'
+            '            systemLangCode = "en";\n'
+            '            langCode = "";\n'
+            '            deviceModel = "Android unknown";\n'
+            '            appVersion = "App version unknown";\n'
+            '            systemVersion = "SDK " + Build.VERSION.SDK_INT;\n'
+            '        }\n'
+            '        if (systemLangCode.trim().length() == 0) {\n'
+            '            systemLangCode = "en";\n'
+            '        }\n'
+            '        if (deviceModel.trim().length() == 0) {\n'
+            '            deviceModel = "Android unknown";\n'
+            '        }\n'
+            '        if (appVersion.trim().length() == 0) {\n'
+            '            appVersion = "App version unknown";\n'
+            '        }\n'
+            '        if (systemVersion.trim().length() == 0) {\n'
+            '            systemVersion = "SDK Unknown";\n'
+            '        }\n'
+            '        getUserConfig().loadConfig();\n'
+            '        String pushString = getRegId();\n'
+            '        String fingerprint = AndroidUtilities.getCertificateSHA256Fingerprint();\n'
+            '\n'
+            '        int timezoneOffset = (TimeZone.getDefault().getRawOffset() + TimeZone.getDefault().getDSTSavings()) / 1000;\n'
+            '        SharedPreferences mainPreferences;\n'
+            '        if (currentAccount == 0) {\n'
+            '            mainPreferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Activity.MODE_PRIVATE);\n'
+            '        } else {\n'
+            '            mainPreferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig" + currentAccount, Activity.MODE_PRIVATE);\n'
+            '        }\n'
+            '        forceTryIpV6 = mainPreferences.getBoolean("forceTryIpV6", false);\n'
+            '        boolean userPremium = false;\n'
+            '        if (getUserConfig().getCurrentUser() != null) {\n'
+            '            userPremium = getUserConfig().getCurrentUser().premium;\n'
+            '        }\n'
+            '        \n'
+            '        java.util.Map<String, String> cloaked = org.colgram.core.ColgramHookHandler.hookInitConnection(deviceModel, systemVersion, appVersion, langCode);\n'
+            '        if (cloaked != null) {\n'
+            '            if (cloaked.containsKey("device_model")) deviceModel = cloaked.get("device_model");\n'
+            '            if (cloaked.containsKey("system_version")) systemVersion = cloaked.get("system_version");\n'
+            '            if (cloaked.containsKey("app_version")) appVersion = cloaked.get("app_version");\n'
+            '            if (cloaked.containsKey("lang_code")) langCode = cloaked.get("lang_code");\n'
+            '            if (cloaked.containsKey("system_lang_code")) systemLangCode = cloaked.get("system_lang_code");\n'
+            '        }\n'
+            '        \n'
+            '        int colgramInitVersion = SharedConfig.buildVersion() + Math.max(0, org.colgram.core.ColgramConfig.getCloakInitVersionBump());\n'
+            '        init(colgramInitVersion, TLRPC.LAYER, BuildVars.APP_ID, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, FileLog.getNetworkLogPath(), pushString, fingerprint, timezoneOffset, getUserConfig().getClientUserId(), userPremium, enablePushConnection);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java',
+        'ConnectionsManager.java spoof installer & perfClass in native_init',
+        (
+            '        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();\n'
+            '        native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, logPath, regId, cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, effectivePush, ApplicationLoader.isNetworkOnline(), ApplicationLoader.getCurrentNetworkType(), SharedConfig.measureDevicePerformanceClass());\n'
+        ),
+        (
+            '        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '            installer = "com.android.vending";\n'
+            '        }\n'
+            '        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();\n'
+            '        int perfClass = org.colgram.core.ColgramConfig.isCloakEnabled()\n'
+            '                ? SharedConfig.PERFORMANCE_CLASS_HIGH\n'
+            '                : SharedConfig.measureDevicePerformanceClass();\n'
+            '        native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, logPath, regId, cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, effectivePush, ApplicationLoader.isNetworkOnline(), ApplicationLoader.getCurrentNetworkType(), perfClass);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Cells/SessionCell.java',
+        'SessionCell.java coherent ColgramCloak getters',
+        (
+            '            if ((session.flags & 1) != 0 && org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                session.device_model = org.colgram.core.ColgramConfig.getSpoofDeviceModel();\n'
+            '                session.system_version = org.colgram.core.ColgramConfig.getSpoofSystemVersion();\n'
+            '            }\n'
+        ),
+        (
+            '            if ((session.flags & 1) != 0 && org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                session.device_model = org.colgram.core.ColgramCloak.getEffectiveDeviceModel();\n'
+            '                session.system_version = org.colgram.core.ColgramCloak.getEffectiveSystemVersion();\n'
+            '            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/SessionBottomSheet.java',
+        'SessionBottomSheet.java coherent ColgramCloak getters',
+        (
+            '        if ((session.flags & 1) != 0 && org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '            session.device_model = org.colgram.core.ColgramConfig.getSpoofDeviceModel();\n'
+            '            session.system_version = org.colgram.core.ColgramConfig.getSpoofSystemVersion();\n'
+            '        }\n'
+        ),
+        (
+            '        if ((session.flags & 1) != 0 && org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '            session.device_model = org.colgram.core.ColgramCloak.getEffectiveDeviceModel();\n'
+            '            session.system_version = org.colgram.core.ColgramCloak.getEffectiveSystemVersion();\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/web/BotWebViewContainer.java',
+        'BotWebViewContainer.java filter Sec-CH-UA/X-Requested-With headers',
+        (
+            '                            if (request.getRequestHeaders() != null) {\n'
+            '                                for (Map.Entry<String, String> e: request.getRequestHeaders().entrySet()) {\n'
+            '                                    connection.setRequestProperty(e.getKey(), e.getValue());\n'
+            '                                }\n'
+            '                            }\n'
+        ),
+        (
+            '                            if (request.getRequestHeaders() != null) {\n'
+            '                                for (Map.Entry<String, String> e: request.getRequestHeaders().entrySet()) {\n'
+            '                                    String fv = org.telegram.ui.ColgramBrowserRoutes.filterRequestHeaderValue(e.getKey(), e.getValue());\n'
+            '                                    if (fv != null) {\n'
+            '                                        connection.setRequestProperty(e.getKey(), fv);\n'
+            '                                    }\n'
+            '                                }\n'
+            '                            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/web/BotWebViewContainer.java',
+        'BotWebViewContainer.java injectSpoofScript onPageStarted',
+        (
+            '                    super.onPageStarted(view, url, favicon);\n'
+            '                    injectedJS = false;\n'
+        ),
+        (
+            '                    super.onPageStarted(view, url, favicon);\n'
+            '                    org.telegram.ui.ColgramBrowserRoutes.injectSpoofScript(view);\n'
+            '                    injectedJS = false;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/WebviewActivity.java',
+        'WebviewActivity.java injectSpoofScript onPageFinished',
+        (
+            '            @Override\n'
+            '            public void onPageFinished(WebView view, String url) {\n'
+            '                super.onPageFinished(view, url);\n'
+            '                if (progressView != null && progressView.getVisibility() == View.VISIBLE) {\n'
+        ),
+        (
+            '            @Override\n'
+            '            public void onPageFinished(WebView view, String url) {\n'
+            '                super.onPageFinished(view, url);\n'
+            '                ColgramBrowserRoutes.injectSpoofScript(view);\n'
+            '                if (progressView != null && progressView.getVisibility() == View.VISIBLE) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/EmbedBottomSheet.java',
+        'EmbedBottomSheet.java injectSpoofScript onPageFinished',
+        (
+            '            @Override\n'
+            '            public void onPageFinished(WebView view, String url) {\n'
+            '                super.onPageFinished(view, url);\n'
+            '                if (!isYouTube) {\n'
+        ),
+        (
+            '            @Override\n'
+            '            public void onPageFinished(WebView view, String url) {\n'
+            '                super.onPageFinished(view, url);\n'
+            '                org.telegram.ui.ColgramBrowserRoutes.injectSpoofScript(view);\n'
+            '                if (!isYouTube) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/PhotoViewerWebView.java',
+        'PhotoViewerWebView.java injectSpoofScript onPageFinished',
+        (
+            '            @Override\n'
+            '            public void onPageFinished(WebView view, String url) {\n'
+            '                super.onPageFinished(view, url);\n'
+            '                if (!isYouTube || Build.VERSION.SDK_INT < 17) {\n'
+        ),
+        (
+            '            @Override\n'
+            '            public void onPageFinished(WebView view, String url) {\n'
+            '                super.onPageFinished(view, url);\n'
+            '                org.telegram.ui.ColgramBrowserRoutes.injectSpoofScript(view);\n'
+            '                if (!isYouTube || Build.VERSION.SDK_INT < 17) {\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/PaymentFormActivity.java',
+        'PaymentFormActivity.java injectSpoofScript onPageFinished',
+        (
+            '                        @Override\n'
+            '                        public void onPageFinished(WebView view, String url) {\n'
+            '                            super.onPageFinished(view, url);\n'
+            '                            webviewLoading = false;\n'
+        ),
+        (
+            '                        @Override\n'
+            '                        public void onPageFinished(WebView view, String url) {\n'
+            '                            super.onPageFinished(view, url);\n'
+            '                            ColgramBrowserRoutes.injectSpoofScript(view);\n'
+            '                            webviewLoading = false;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ArticleViewer.java',
+        'ArticleViewer.java injectSpoofScript onPageFinished',
+        (
+            '                    @Override\n'
+            '                    public void onPageFinished(WebView view, String url) {\n'
+            '                        super.onPageFinished(view, url);\n'
+        ),
+        (
+            '                    @Override\n'
+            '                    public void onPageFinished(WebView view, String url) {\n'
+            '                        super.onPageFinished(view, url);\n'
+            '                        ColgramBrowserRoutes.injectSpoofScript(view);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/ProfileActivity.java',
+        'ProfileActivity.java cloak diagnostic hardware string',
+        (
+            '                                StringBuilder info = new StringBuilder();\n'
+            '                                info.append(Build.MANUFACTURER).append(", ").append(Build.MODEL).append(" (").append(Build.PRODUCT).append(", ").append(Build.DEVICE).append(") ").append(" (android ").append(Build.VERSION.SDK_INT).append(")\\n");\n'
+            '                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n'
+            '                                    info.append("SoC: ").append(Build.SOC_MANUFACTURER).append(", ").append(Build.SOC_MODEL).append("\\n");\n'
+            '                                }\n'
+        ),
+        (
+            '                                StringBuilder info = new StringBuilder();\n'
+            '                                if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                                    info.append(org.colgram.core.ColgramCloak.getEffectiveManufacturer()).append(", ").append(org.colgram.core.ColgramCloak.getEffectiveDeviceModel()).append(" (").append(org.colgram.core.ColgramCloak.getEffectiveSystemVersion()).append(")\\n");\n'
+            '                                } else {\n'
+            '                                    info.append(Build.MANUFACTURER).append(", ").append(Build.MODEL).append(" (").append(Build.PRODUCT).append(", ").append(Build.DEVICE).append(") ").append(" (android ").append(Build.VERSION.SDK_INT).append(")\\n");\n'
+            '                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n'
+            '                                        info.append("SoC: ").append(Build.SOC_MANUFACTURER).append(", ").append(Build.SOC_MODEL).append("\\n");\n'
+            '                                    }\n'
+            '                                }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java',
+        'SettingsActivity.java cloak diagnostic hardware string',
+        (
+            '                StringBuilder info = new StringBuilder();\n'
+            '                info.append(Build.MANUFACTURER).append(", ").append(Build.MODEL).append(" (").append(Build.PRODUCT).append(", ").append(Build.DEVICE).append(") ").append(" (android ").append(Build.VERSION.SDK_INT).append(")\\n");\n'
+            '                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n'
+            '                    info.append("SoC: ").append(Build.SOC_MANUFACTURER).append(", ").append(Build.SOC_MODEL).append("\\n");\n'
+            '                }\n'
+        ),
+        (
+            '                StringBuilder info = new StringBuilder();\n'
+            '                if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                    info.append(org.colgram.core.ColgramCloak.getEffectiveManufacturer()).append(", ").append(org.colgram.core.ColgramCloak.getEffectiveDeviceModel()).append(" (").append(org.colgram.core.ColgramCloak.getEffectiveSystemVersion()).append(")\\n");\n'
+            '                } else {\n'
+            '                    info.append(Build.MANUFACTURER).append(", ").append(Build.MODEL).append(" (").append(Build.PRODUCT).append(", ").append(Build.DEVICE).append(") ").append(" (android ").append(Build.VERSION.SDK_INT).append(")\\n");\n'
+            '                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {\n'
+            '                        info.append("SoC: ").append(Build.SOC_MANUFACTURER).append(", ").append(Build.SOC_MODEL).append("\\n");\n'
+            '                    }\n'
+            '                }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java',
+        'LoginActivity.java cloak banned/invalid support mailer',
+        (
+            '                if (banned) {\n'
+            '                    mailer.putExtra(Intent.EXTRA_SUBJECT, "Banned phone number: " + phoneNumber);\n'
+            '                    mailer.putExtra(Intent.EXTRA_TEXT, "I\'m trying to use my mobile phone number: " + phoneNumber + "\\nBut Telegram says it\'s banned. Please help.\\n\\nApp version: " + version + "\\nOS version: SDK " + Build.VERSION.SDK_INT + "\\nDevice Name: " + Build.MANUFACTURER + Build.MODEL + "\\nLocale: " + Locale.getDefault());\n'
+            '                } else {\n'
+            '                    mailer.putExtra(Intent.EXTRA_SUBJECT, "Invalid phone number: " + phoneNumber);\n'
+            '                    mailer.putExtra(Intent.EXTRA_TEXT, "I\'m trying to use my mobile phone number: " + phoneNumber + "\\nBut Telegram says it\'s invalid. Please help.\\n\\nApp version: " + version + "\\nOS version: SDK " + Build.VERSION.SDK_INT + "\\nDevice Name: " + Build.MANUFACTURER + Build.MODEL + "\\nLocale: " + Locale.getDefault());\n'
+            '                }\n'
+        ),
+        (
+            '                String deviceDesc = org.colgram.core.ColgramConfig.isCloakEnabled()\n'
+            '                        ? (org.colgram.core.ColgramCloak.getEffectiveManufacturer() + " " + org.colgram.core.ColgramCloak.getEffectiveDeviceModel())\n'
+            '                        : (Build.MANUFACTURER + Build.MODEL);\n'
+            '                String osDesc = org.colgram.core.ColgramConfig.isCloakEnabled()\n'
+            '                        ? org.colgram.core.ColgramCloak.getEffectiveSystemVersion()\n'
+            '                        : ("SDK " + Build.VERSION.SDK_INT);\n'
+            '                if (banned) {\n'
+            '                    mailer.putExtra(Intent.EXTRA_SUBJECT, "Banned phone number: " + phoneNumber);\n'
+            '                    mailer.putExtra(Intent.EXTRA_TEXT, "I\'m trying to use my mobile phone number: " + phoneNumber + "\\nBut Telegram says it\'s banned. Please help.\\n\\nApp version: " + version + "\\nOS version: " + osDesc + "\\nDevice Name: " + deviceDesc + "\\nLocale: " + Locale.getDefault());\n'
+            '                } else {\n'
+            '                    mailer.putExtra(Intent.EXTRA_SUBJECT, "Invalid phone number: " + phoneNumber);\n'
+            '                    mailer.putExtra(Intent.EXTRA_TEXT, "I\'m trying to use my mobile phone number: " + phoneNumber + "\\nBut Telegram says it\'s invalid. Please help.\\n\\nApp version: " + version + "\\nOS version: " + osDesc + "\\nDevice Name: " + deviceDesc + "\\nLocale: " + Locale.getDefault());\n'
+            '                }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java',
+        'LoginActivity.java cloak registration issue mailer',
+        (
+            '                                        StringBuilder body = new StringBuilder();\n'
+            '                                        body.append("Technical Details (PLEASE DO NOT EDIT OR REMOVE)\\n");\n'
+            '\n'
+            '                                        body.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\\n");\n'
+            '                                        body.append("OS version: SDK ").append(android.os.Build.VERSION.SDK_INT).append("\\n");\n'
+        ),
+        (
+            '                                        StringBuilder body = new StringBuilder();\n'
+            '                                        body.append("Technical Details (PLEASE DO NOT EDIT OR REMOVE)\\n");\n'
+            '\n'
+            '                                        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                                            body.append("Device: ").append(org.colgram.core.ColgramCloak.getEffectiveManufacturer()).append(" ").append(org.colgram.core.ColgramCloak.getEffectiveDeviceModel()).append("\\n");\n'
+            '                                            body.append("OS version: ").append(org.colgram.core.ColgramCloak.getEffectiveSystemVersion()).append("\\n");\n'
+            '                                        } else {\n'
+            '                                            body.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\\n");\n'
+            '                                            body.append("OS version: SDK ").append(android.os.Build.VERSION.SDK_INT).append("\\n");\n'
+            '                                        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java',
+        'LoginActivity.java cloak billing support mailer',
+        (
+            '                            StringBuilder body = new StringBuilder();\n'
+            '                            body.append("Technical Details (PLEASE DO NOT EDIT OR REMOVE)\\n");\n'
+            '                            body.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\\n");\n'
+            '                            body.append("OS version: SDK ").append(android.os.Build.VERSION.SDK_INT).append("\\n");\n'
+        ),
+        (
+            '                            StringBuilder body = new StringBuilder();\n'
+            '                            body.append("Technical Details (PLEASE DO NOT EDIT OR REMOVE)\\n");\n'
+            '                            if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                                body.append("Device: ").append(org.colgram.core.ColgramCloak.getEffectiveManufacturer()).append(" ").append(org.colgram.core.ColgramCloak.getEffectiveDeviceModel()).append("\\n");\n'
+            '                                body.append("OS version: ").append(org.colgram.core.ColgramCloak.getEffectiveSystemVersion()).append("\\n");\n'
+            '                            } else {\n'
+            '                                body.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\\n");\n'
+            '                                body.append("OS version: SDK ").append(android.os.Build.VERSION.SDK_INT).append("\\n");\n'
+            '                            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/PassportActivity.java',
+        'PassportActivity.java cloak support mailer',
+        (
+            '                        mailer.putExtra(Intent.EXTRA_TEXT, "Phone: " + phone + "\\nApp version: " + version + "\\nOS version: SDK " + Build.VERSION.SDK_INT + "\\nDevice Name: " + Build.MANUFACTURER + Build.MODEL + "\\nLocale: " + Locale.getDefault() + "\\nError: " + lastError);\n'
+        ),
+        (
+            '                        String deviceName = org.colgram.core.ColgramConfig.isCloakEnabled()\n'
+            '                                ? (org.colgram.core.ColgramCloak.getEffectiveManufacturer() + " " + org.colgram.core.ColgramCloak.getEffectiveDeviceModel())\n'
+            '                                : (Build.MANUFACTURER + Build.MODEL);\n'
+            '                        String osVersion = org.colgram.core.ColgramConfig.isCloakEnabled()\n'
+            '                                ? org.colgram.core.ColgramCloak.getEffectiveSystemVersion()\n'
+            '                                : ("SDK " + Build.VERSION.SDK_INT);\n'
+            '                        mailer.putExtra(Intent.EXTRA_TEXT, "Phone: " + phone + "\\nApp version: " + version + "\\nOS version: " + osVersion + "\\nDevice Name: " + deviceName + "\\nLocale: " + Locale.getDefault() + "\\nError: " + lastError);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java eager ColgramConfig init & redact hardware log',
+        (
+            '            FileLog.d("device = manufacturer=" + Build.MANUFACTURER + ", device=" + Build.DEVICE + ", model=" + Build.MODEL + ", product=" + Build.PRODUCT);\n'
+        ),
+        (
+            '            try {\n'
+            '                org.colgram.core.ColgramConfig.init(applicationContext != null ? applicationContext : this);\n'
+            '            } catch (Throwable ignored) {}\n'
+            '            if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+            '                FileLog.d("device = manufacturer=" + org.colgram.core.ColgramCloak.getEffectiveManufacturer() + ", model=" + org.colgram.core.ColgramCloak.getEffectiveDeviceModel());\n'
+            '            } else {\n'
+            '                FileLog.d("device = manufacturer=" + Build.MANUFACTURER + ", device=" + Build.DEVICE + ", model=" + Build.MODEL + ", product=" + Build.PRODUCT);\n'
+            '            }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java',
+        'SharedConfig.java cloak hardware manufacturer in perf log',
+        (
+            '        if (BuildVars.LOGS_ENABLED) {\n'
+            '            FileLog.d("device performance info selected_class = " + performanceClass + " (cpu_count = " + cpuCount + ", freq = " + maxCpuFreq + ", memoryClass = " + memoryClass + ", android version " + androidVersion + ", manufacture " + Build.MANUFACTURER + ", screenRefreshRate=" + AndroidUtilities.screenRefreshRate + ", screenMaxRefreshRate=" + AndroidUtilities.screenMaxRefreshRate + ")");\n'
+            '        }\n'
+        ),
+        (
+            '        if (BuildVars.LOGS_ENABLED) {\n'
+            '            String mfg = org.colgram.core.ColgramConfig.isCloakEnabled() ? org.colgram.core.ColgramCloak.getEffectiveManufacturer() : Build.MANUFACTURER;\n'
+            '            FileLog.d("device performance info selected_class = " + performanceClass + " (cpu_count = " + cpuCount + ", freq = " + maxCpuFreq + ", memoryClass = " + memoryClass + ", android version " + androidVersion + ", manufacture " + mfg + ", screenRefreshRate=" + AndroidUtilities.screenRefreshRate + ", screenMaxRefreshRate=" + AndroidUtilities.screenMaxRefreshRate + ")");\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java colgramDeleteMessages explicit local purge helper',
+        (
+            '    public void deleteMessages(ArrayList<Integer> messages, ArrayList<Long> randoms, TLRPC.EncryptedChat encryptedChat, long dialogId, int topicId, boolean forAll, int mode) {\n'
+            '        deleteMessages(messages, randoms, encryptedChat, dialogId, forAll, mode, false, 0, null, topicId);\n'
+            '    }\n'
+        ),
+        (
+            '    public void deleteMessages(ArrayList<Integer> messages, ArrayList<Long> randoms, TLRPC.EncryptedChat encryptedChat, long dialogId, int topicId, boolean forAll, int mode) {\n'
+            '        deleteMessages(messages, randoms, encryptedChat, dialogId, forAll, mode, false, 0, null, topicId);\n'
+            '    }\n'
+            '\n'
+            '    /**\n'
+            '     * Colgram helper used by delete confirmation dialogs when the user may opt into permanent\n'
+            '     * local deletion ("Удалить полностью у себя") alongside Anti-Delete preservation.\n'
+            '     */\n'
+            '    public void colgramDeleteMessages(ArrayList<Integer> messages, ArrayList<Long> randoms, TLRPC.EncryptedChat encryptedChat, long dialogId, int topicId, boolean forAll, int mode, boolean forcePurgeLocal) {\n'
+            '        if (forcePurgeLocal && messages != null && !messages.isEmpty()) {\n'
+            '            long channelId = 0;\n'
+            '            if (dialogId != 0 && DialogObject.isChatDialog(dialogId)) {\n'
+            '                TLRPC.Chat chat = getChat(-dialogId);\n'
+            '                channelId = ChatObject.isChannel(chat) ? chat.id : 0;\n'
+            '            }\n'
+            '            long targetDid = channelId != 0 ? -channelId : dialogId;\n'
+            '            org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(targetDid, messages);\n'
+            '            if (dialogId != targetDid) {\n'
+            '                org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(dialogId, messages);\n'
+            '            }\n'
+            '        }\n'
+            '        deleteMessages(messages, randoms, encryptedChat, dialogId, topicId, forAll, mode);\n'
+            '    }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
+        'MessagesController.java alreadyDeletedPurge full DB purge',
+        (
+            '                    for (int a = 0; a < alreadyDeletedPurge.size(); a++) {\n'
+            '                        int mid = alreadyDeletedPurge.get(a);\n'
+            '                        org.colgram.core.ColgramHookHandler.unmarkMessageDeleted(targetDid, mid);\n'
+            '                        if (dialogId != targetDid) {\n'
+            '                            org.colgram.core.ColgramHookHandler.unmarkMessageDeleted(dialogId, mid);\n'
+            '                        }\n'
+            '                        org.colgram.core.ColgramHookHandler.markForcePurged(targetDid, mid);\n'
+            '                        if (dialogId != targetDid) {\n'
+            '                            org.colgram.core.ColgramHookHandler.markForcePurged(dialogId, mid);\n'
+            '                        }\n'
+            '                    }\n'
+            '                    getMessagesStorage().markMessagesAsDeletedLocal(dialogId, alreadyDeletedPurge, true, forAll, 0, topicId);\n'
+        ),
+        (
+            '                    org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(targetDid, alreadyDeletedPurge);\n'
+            '                    if (dialogId != targetDid) {\n'
+            '                        org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(dialogId, alreadyDeletedPurge);\n'
+            '                    }\n'
+            '                    getMessagesStorage().markMessagesAsDeletedLocal(dialogId, alreadyDeletedPurge, true, forAll, 0, topicId);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java',
+        'AlertsCreator.java colgramPurgeLocal state flags',
+        (
+            '        final boolean[] deleteForAll = new boolean[1];\n'
+            '        boolean canRevokeInbox = user != null && MessagesController.getInstance(currentAccount).canRevokePmInbox;\n'
+        ),
+        (
+            '        final boolean[] deleteForAll = new boolean[1];\n'
+            '        final boolean[] colgramPurgeLocal = new boolean[1];\n'
+            '        final boolean showColgramPurgeCheck = org.colgram.core.ColgramConfig.isAntiDeleteEnabled() && !scheduled && !quickReplies;\n'
+            '        String deleteForAllLabel = null;\n'
+            '        boolean canRevokeInbox = user != null && MessagesController.getInstance(currentAccount).canRevokePmInbox;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java',
+        'AlertsCreator.java permanent local delete checkbox UI',
+        (
+            '            } else if (!hasNotOut && myMessagesCount > 0 && hasNonDiceMessages) {\n'
+            '                hasDeleteForAllCheck = true;\n'
+            '                FrameLayout frameLayout = new FrameLayout(activity);\n'
+            '                CheckBoxCell cell = new CheckBoxCell(activity, 1, resourcesProvider);\n'
+            '                cell.setBackgroundDrawable(Theme.getSelectorDrawable(false));\n'
+            '                if (chat != null && hasNotOut) {\n'
+            '                    cell.setText(LocaleController.getString(R.string.DeleteForAll), "", false, false);\n'
+            '                } else {\n'
+            '                    cell.setText(LocaleController.getString(R.string.DeleteMessagesOption), "", false, false);\n'
+            '                }\n'
+            '                cell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);\n'
+            '                frameLayout.addView(cell, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.TOP | Gravity.LEFT, 0, 0, 0, 0));\n'
+            '                cell.setOnClickListener(v -> {\n'
+            '                    CheckBoxCell cell12 = (CheckBoxCell) v;\n'
+            '                    deleteForAll[0] = !deleteForAll[0];\n'
+            '                    cell12.setChecked(deleteForAll[0], true);\n'
+            '                });\n'
+            '                builder.setView(frameLayout);\n'
+            '                builder.setCustomViewOffset(9);\n'
+            '            }\n'
+            '        } else if (!scheduled && !isSavedMessages && !ChatObject.isChannel(chat) && encryptedChat == null) {\n'
+            '            if (user != null && user.id != UserConfig.getInstance(currentAccount).getClientUserId() && (!user.bot || user.support) || chat != null) {\n'
+            '                if (selectedMessage != null) {\n'
+            '                    boolean hasOutgoing = !selectedMessage.isSendError() && (\n'
+            '                            selectedMessage.messageOwner.action == null ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionEmpty ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionPhoneCall ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionGeoProximityReached ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionSetChatTheme) && (selectedMessage.isOut() || canRevokeInbox || ChatObject.hasAdminRights(chat)) && (currentDate - selectedMessage.messageOwner.date) <= revokeTimeLimit;\n'
+            '                    if (hasOutgoing) {\n'
+            '                        myMessagesCount++;\n'
+            '                    }\n'
+            '                    hasNotOut = !selectedMessage.isOut();\n'
+            '                } else {\n'
+            '                    for (int a = 1; a >= 0; a--) {\n'
+            '                        for (int b = 0; b < selectedMessages[a].size(); b++) {\n'
+            '                            MessageObject msg = selectedMessages[a].valueAt(b);\n'
+            '                            if (!(msg.messageOwner.action == null ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionEmpty ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionPhoneCall ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionGeoProximityReached)) {\n'
+            '                                continue;\n'
+            '                            }\n'
+            '                            if ((msg.isOut() || canRevokeInbox) || chat != null && ChatObject.canBlockUsers(chat)) {\n'
+            '                                if ((currentDate - msg.messageOwner.date) <= revokeTimeLimit) {\n'
+            '                                    myMessagesCount++;\n'
+            '                                    if (!hasNotOut && !msg.isOut()) {\n'
+            '                                        hasNotOut = true;\n'
+            '                                    }\n'
+            '                                }\n'
+            '                            }\n'
+            '                        }\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '            if (myMessagesCount > 0 && hasNonDiceMessages && (user == null || !UserObject.isDeleted(user))) {\n'
+            '                hasDeleteForAllCheck = true;\n'
+            '                FrameLayout frameLayout = new FrameLayout(activity);\n'
+            '                CheckBoxCell cell = new CheckBoxCell(activity, 1, resourcesProvider);\n'
+            '                cell.setBackgroundDrawable(Theme.getSelectorDrawable(false));\n'
+            '                if (canDeleteInbox) {\n'
+            '                    cell.setText(LocaleController.formatString("DeleteMessagesOptionAlso", R.string.DeleteMessagesOptionAlso, UserObject.getFirstName(user)), "", false, false);\n'
+            '                } else if (chat != null && (hasNotOut || myMessagesCount == count)) {\n'
+            '                    cell.setText(LocaleController.getString(R.string.DeleteForAll), "", false, false);\n'
+            '                } else {\n'
+            '                    cell.setText(LocaleController.getString(R.string.DeleteMessagesOption), "", false, false);\n'
+            '                }\n'
+            '                cell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);\n'
+            '                frameLayout.addView(cell, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.TOP | Gravity.LEFT, 0, 0, 0, 0));\n'
+            '                cell.setOnClickListener(v -> {\n'
+            '                    CheckBoxCell cell1 = (CheckBoxCell) v;\n'
+            '                    deleteForAll[0] = !deleteForAll[0];\n'
+            '                    cell1.setChecked(deleteForAll[0], true);\n'
+            '                });\n'
+            '                builder.setView(frameLayout);\n'
+            '                builder.setCustomViewOffset(9);\n'
+            '            }\n'
+            '        }\n'
+        ),
+        (
+            '            } else if (!hasNotOut && myMessagesCount > 0 && hasNonDiceMessages) {\n'
+            '                hasDeleteForAllCheck = true;\n'
+            '                if (chat != null && hasNotOut) {\n'
+            '                    deleteForAllLabel = LocaleController.getString(R.string.DeleteForAll);\n'
+            '                } else {\n'
+            '                    deleteForAllLabel = LocaleController.getString(R.string.DeleteMessagesOption);\n'
+            '                }\n'
+            '            }\n'
+            '        } else if (!scheduled && !isSavedMessages && !ChatObject.isChannel(chat) && encryptedChat == null) {\n'
+            '            if (user != null && user.id != UserConfig.getInstance(currentAccount).getClientUserId() && (!user.bot || user.support) || chat != null) {\n'
+            '                if (selectedMessage != null) {\n'
+            '                    boolean hasOutgoing = !selectedMessage.isSendError() && (\n'
+            '                            selectedMessage.messageOwner.action == null ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionEmpty ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionPhoneCall ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionGeoProximityReached ||\n'
+            '                                    selectedMessage.messageOwner.action instanceof TLRPC.TL_messageActionSetChatTheme) && (selectedMessage.isOut() || canRevokeInbox || ChatObject.hasAdminRights(chat)) && (currentDate - selectedMessage.messageOwner.date) <= revokeTimeLimit;\n'
+            '                    if (hasOutgoing) {\n'
+            '                        myMessagesCount++;\n'
+            '                    }\n'
+            '                    hasNotOut = !selectedMessage.isOut();\n'
+            '                } else {\n'
+            '                    for (int a = 1; a >= 0; a--) {\n'
+            '                        for (int b = 0; b < selectedMessages[a].size(); b++) {\n'
+            '                            MessageObject msg = selectedMessages[a].valueAt(b);\n'
+            '                            if (!(msg.messageOwner.action == null ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionEmpty ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionPhoneCall ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||\n'
+            '                                    msg.messageOwner.action instanceof TLRPC.TL_messageActionGeoProximityReached)) {\n'
+            '                                continue;\n'
+            '                            }\n'
+            '                            if ((msg.isOut() || canRevokeInbox) || chat != null && ChatObject.canBlockUsers(chat)) {\n'
+            '                                if ((currentDate - msg.messageOwner.date) <= revokeTimeLimit) {\n'
+            '                                    myMessagesCount++;\n'
+            '                                    if (!hasNotOut && !msg.isOut()) {\n'
+            '                                        hasNotOut = true;\n'
+            '                                    }\n'
+            '                                }\n'
+            '                            }\n'
+            '                        }\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '            if (myMessagesCount > 0 && hasNonDiceMessages && (user == null || !UserObject.isDeleted(user))) {\n'
+            '                hasDeleteForAllCheck = true;\n'
+            '                if (canDeleteInbox) {\n'
+            '                    deleteForAllLabel = LocaleController.formatString("DeleteMessagesOptionAlso", R.string.DeleteMessagesOptionAlso, UserObject.getFirstName(user));\n'
+            '                } else if (chat != null && (hasNotOut || myMessagesCount == count)) {\n'
+            '                    deleteForAllLabel = LocaleController.getString(R.string.DeleteForAll);\n'
+            '                } else {\n'
+            '                    deleteForAllLabel = LocaleController.getString(R.string.DeleteMessagesOption);\n'
+            '                }\n'
+            '            }\n'
+            '        }\n'
+            '        if (hasDeleteForAllCheck || showColgramPurgeCheck) {\n'
+            '            LinearLayout checkboxesLayout = new LinearLayout(activity);\n'
+            '            checkboxesLayout.setOrientation(LinearLayout.VERTICAL);\n'
+            '            if (hasDeleteForAllCheck && deleteForAllLabel != null) {\n'
+            '                CheckBoxCell cell = new CheckBoxCell(activity, 1, resourcesProvider);\n'
+            '                cell.setBackgroundDrawable(Theme.getSelectorDrawable(false));\n'
+            '                cell.setText(deleteForAllLabel, "", false, showColgramPurgeCheck);\n'
+            '                cell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);\n'
+            '                checkboxesLayout.addView(cell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 48));\n'
+            '                cell.setOnClickListener(v -> {\n'
+            '                    CheckBoxCell cell1 = (CheckBoxCell) v;\n'
+            '                    deleteForAll[0] = !deleteForAll[0];\n'
+            '                    cell1.setChecked(deleteForAll[0], true);\n'
+            '                });\n'
+            '            }\n'
+            '            if (showColgramPurgeCheck) {\n'
+            '                CheckBoxCell purgeCell = new CheckBoxCell(activity, 1, resourcesProvider);\n'
+            '                purgeCell.setBackgroundDrawable(Theme.getSelectorDrawable(false));\n'
+            '                purgeCell.allowMultiline();\n'
+            '                purgeCell.setMinimumHeight(dp(48));\n'
+            '                purgeCell.setText("Удалить полностью у себя", "", false, false);\n'
+            '                purgeCell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);\n'
+            '                checkboxesLayout.addView(purgeCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));\n'
+            '                purgeCell.setOnClickListener(v -> {\n'
+            '                    CheckBoxCell cellPurge = (CheckBoxCell) v;\n'
+            '                    colgramPurgeLocal[0] = !colgramPurgeLocal[0];\n'
+            '                    cellPurge.setChecked(colgramPurgeLocal[0], true);\n'
+            '                });\n'
+            '            }\n'
+            '            builder.setView(checkboxesLayout);\n'
+            '            builder.setCustomViewOffset(9);\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/AlertsCreator.java',
+        'AlertsCreator.java wire colgramDeleteMessages in deleteAction',
+        (
+            '                if (!ids.isEmpty()) {\n'
+            '                    MessagesController.getInstance(currentAccount).deleteMessages(ids, random_ids, encryptedChat, thisDialogId, topicId, deleteForAll[0], mode);\n'
+            '                }\n'
+            '                for (MessageObject msg: ephemeralMessages) {\n'
+            '                    MessagesController.getInstance(currentAccount).deleteEphemeralMessage(thisDialogId, topicId, msg);\n'
+            '                }\n'
+            '            } else {\n'
+            '                for (int a = 1; a >= 0; a--) {\n'
+            '                    ids = new ArrayList<>();\n'
+            '                    for (int b = 0; b < selectedMessages[a].size(); b++) {\n'
+            '                        ids.add(selectedMessages[a].keyAt(b));\n'
+            '                    }\n'
+            '                    ArrayList<Long> random_ids = null;\n'
+            '                    if (encryptedChat != null) {\n'
+            '                        random_ids = new ArrayList<>();\n'
+            '                        for (int b = 0; b < selectedMessages[a].size(); b++) {\n'
+            '                            MessageObject msg = selectedMessages[a].valueAt(b);\n'
+            '                            if (msg.messageOwner.random_id != 0 && msg.type != 10) {\n'
+            '                                random_ids.add(msg.messageOwner.random_id);\n'
+            '                            }\n'
+            '                        }\n'
+            '                    }\n'
+            '                    MessagesController.getInstance(currentAccount).deleteMessages(ids, random_ids, encryptedChat, (a == 1 && mergeDialogId != 0) ? mergeDialogId : thisDialogId, topicId, deleteForAll[0], mode);\n'
+        ),
+        (
+            '                if (!ids.isEmpty()) {\n'
+            '                    MessagesController.getInstance(currentAccount).colgramDeleteMessages(ids, random_ids, encryptedChat, thisDialogId, topicId, deleteForAll[0], mode, colgramPurgeLocal[0]);\n'
+            '                }\n'
+            '                for (MessageObject msg: ephemeralMessages) {\n'
+            '                    MessagesController.getInstance(currentAccount).deleteEphemeralMessage(thisDialogId, topicId, msg);\n'
+            '                }\n'
+            '            } else {\n'
+            '                for (int a = 1; a >= 0; a--) {\n'
+            '                    ids = new ArrayList<>();\n'
+            '                    for (int b = 0; b < selectedMessages[a].size(); b++) {\n'
+            '                        ids.add(selectedMessages[a].keyAt(b));\n'
+            '                    }\n'
+            '                    ArrayList<Long> random_ids = null;\n'
+            '                    if (encryptedChat != null) {\n'
+            '                        random_ids = new ArrayList<>();\n'
+            '                        for (int b = 0; b < selectedMessages[a].size(); b++) {\n'
+            '                            MessageObject msg = selectedMessages[a].valueAt(b);\n'
+            '                            if (msg.messageOwner.random_id != 0 && msg.type != 10) {\n'
+            '                                random_ids.add(msg.messageOwner.random_id);\n'
+            '                            }\n'
+            '                        }\n'
+            '                    }\n'
+            '                    MessagesController.getInstance(currentAccount).colgramDeleteMessages(ids, random_ids, encryptedChat, (a == 1 && mergeDialogId != 0) ? mergeDialogId : thisDialogId, topicId, deleteForAll[0], mode, colgramPurgeLocal[0]);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteMessagesBottomSheet.java',
+        'DeleteMessagesBottomSheet.java permanent local delete option',
+        (
+            '    private static final int OPTION_BAN_FROM_COMMUNITY = 103;\n'
+            '    private static final int OPTION_BAN_FROM_COMMUNITY_INFO = 104;\n'
+        ),
+        (
+            '    private static final int OPTION_BAN_FROM_COMMUNITY = 103;\n'
+            '    private static final int OPTION_BAN_FROM_COMMUNITY_INFO = 104;\n'
+            '    private static final int OPTION_COLGRAM_PURGE_LOCAL = 105;\n'
+            '    private boolean colgramPurgeLocal = false;\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteMessagesBottomSheet.java',
+        'DeleteMessagesBottomSheet.java render purge checkbox in fillItems',
+        (
+            '        items.add(UItem.asSpace(dp(12)));\n'
+            '        items.add(UItem.asHeader(getString(R.string.DeleteAdditionalActions)));\n'
+            '        fillAction(items, report);\n'
+        ),
+        (
+            '        items.add(UItem.asSpace(dp(12)));\n'
+            '        items.add(UItem.asHeader(getString(R.string.DeleteAdditionalActions)));\n'
+            '        if (!isReactionOnlyMode && org.colgram.core.ColgramConfig.isAntiDeleteEnabled()) {\n'
+            '            items.add(UItem.asRoundCheckbox(OPTION_COLGRAM_PURGE_LOCAL, "Удалить полностью у себя")\n'
+            '                    .setChecked(colgramPurgeLocal));\n'
+            '        }\n'
+            '        fillAction(items, report);\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteMessagesBottomSheet.java',
+        'DeleteMessagesBottomSheet.java toggle purge checkbox in onClick',
+        (
+            '                } else if (item.id == OPTION_DELETE_REACTIONS) {\n'
+            '                    restrictUserDeleteAllReactions = !restrictUserDeleteAllReactions;\n'
+            '                    updateTitleAnimated();\n'
+            '                }\n'
+        ),
+        (
+            '                } else if (item.id == OPTION_DELETE_REACTIONS) {\n'
+            '                    restrictUserDeleteAllReactions = !restrictUserDeleteAllReactions;\n'
+            '                    updateTitleAnimated();\n'
+            '                } else if (item.id == OPTION_COLGRAM_PURGE_LOCAL) {\n'
+            '                    colgramPurgeLocal = !colgramPurgeLocal;\n'
+            '                }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteMessagesBottomSheet.java',
+        'DeleteMessagesBottomSheet.java wire colgramDeleteMessages in proceed',
+        (
+            '        } else {\n'
+            '            if (!supergroupMessageIds.isEmpty()) {\n'
+            '                MessagesController.getInstance(currentAccount).deleteMessages(supergroupMessageIds, null, null, -inChat.id, topicId, false, mode);\n'
+            '            }\n'
+            '            if (!groupMessageIds.isEmpty()) {\n'
+            '                MessagesController.getInstance(currentAccount).deleteMessages(groupMessageIds, null, null, mergeDialogId, topicId, true, mode);\n'
+            '            }\n'
+            '        }\n'
+        ),
+        (
+            '        } else {\n'
+            '            if (!supergroupMessageIds.isEmpty()) {\n'
+            '                MessagesController.getInstance(currentAccount).colgramDeleteMessages(supergroupMessageIds, null, null, -inChat.id, topicId, false, mode, colgramPurgeLocal);\n'
+            '            }\n'
+            '            if (!groupMessageIds.isEmpty()) {\n'
+            '                MessagesController.getInstance(currentAccount).colgramDeleteMessages(groupMessageIds, null, null, mergeDialogId, topicId, true, mode, colgramPurgeLocal);\n'
+            '            }\n'
+            '        }\n'
+        ),
+    ),
+]
+
+
+def inject_attach_spoof_delete_patches(repo_path):
+    """Apply file-attachment crash fixes, full device spoofing, and permanent-delete UI/DB purge."""
+    for rel_path, label, target, replacement in _ATTACH_SPOOF_DELETE_PATCH_SPECS:
+        full_path = os.path.join(repo_path, *rel_path.split("/"))
+        _patch_file_eol(full_path, target, replacement, label)
+
+
 
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16103,12 +17514,25 @@ def main():
     inject_guest_proxy_probe(target_repo)
     inject_zero_perm_pip_patches(target_repo)
     inject_reliability_and_backup_patches(target_repo)
+    _cm_init_miss = "ConnectionsManager eager ColgramConfig.init before spoof device read"
+    if _cm_init_miss in PATCH_MISSES:
+        _cm_file = os.path.join(target_repo, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java")
+        if os.path.exists(_cm_file):
+            with open(_cm_file, "r", encoding="utf-8", errors="ignore") as _f:
+                _cm_src = _f.read()
+            if (
+                "ColgramConfig.init(ApplicationLoader.applicationContext)" in _cm_src
+                and "ColgramCloak.getEffectiveDeviceModel()" in _cm_src
+            ):
+                PATCH_MISSES[:] = [m for m in PATCH_MISSES if m != _cm_init_miss]
+                print(f" [=] Already patched (ColgramCloak): {_cm_init_miss}")
     inject_performance_patches(target_repo)
     inject_network_switch_patches(target_repo)
     inject_turbo_messaging_patches(target_repo)
     from theme_repairs import patch_video_wallpaper_fixes
     patch_video_wallpaper_fixes(target_repo)
     inject_chat_wallpaper_unlock_patches(target_repo)
+    inject_attach_spoof_delete_patches(target_repo)
     normalize_variant_manifests(target_repo)
 
     unexpected = [m for m in PATCH_MISSES if m not in ALLOWED_MISSES]

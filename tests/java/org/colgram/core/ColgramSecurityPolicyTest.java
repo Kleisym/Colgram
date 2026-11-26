@@ -145,10 +145,70 @@ public class ColgramSecurityPolicyTest {
         checkEq(75, ColgramSecurityPolicy.computeScorePercent(mix), "3 closed/fixed out of 4 = 75%");
     }
 
+    public static void testWebViewSpoofJs() {
+        checkEq("", ColgramSecurityPolicy.buildWebViewSpoofJs("Google Pixel 9 Pro", "SDK 35 (Android 15)", false),
+                "disabled cloak returns empty JS");
+
+        String androidJs = ColgramSecurityPolicy.buildWebViewSpoofJs("Samsung Galaxy S24 Ultra", "SDK 34 (Android 14)", true);
+        checkEq(true, androidJs.contains("Samsung Galaxy S24 Ultra"), "Android JS includes spoof model");
+        checkEq(true, androidJs.contains("getHighEntropyValues"), "Android JS hooks userAgentData high-entropy values");
+        checkEq(true, androidJs.contains("Linux armv8l"), "Android JS spoofs platform");
+        checkEq(true, androidJs.contains("WebGLRenderingContext") && androidJs.contains("WebGL2RenderingContext"),
+                "Android JS masks WebGL renderer");
+
+        String iosJs = ColgramSecurityPolicy.buildWebViewSpoofJs("iPhone 15 Pro Max", "iOS 17.6.1", true);
+        checkEq(true, iosJs.contains("iPhone 15 Pro Max"), "iOS JS includes iPhone model");
+        checkEq(true, iosJs.contains("'iPhone'") || iosJs.contains("\"iPhone\""), "iOS JS spoofs iPhone platform");
+        checkEq(true, iosJs.contains("17.6.1"), "iOS JS includes iOS release");
+        checkEq(true, iosJs.contains("37446") && iosJs.contains("ANGLE (ARM, Immortalis-G715, OpenGL ES 3.2)"),
+                "iOS JS masks WebGL unmasked renderer");
+    }
+
+    public static void testIdempotentUserAgent() {
+        String base = "Mozilla/5.0 (Linux; Android 13; RealDevice) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+        String onceBrowser = ColgramSecurityPolicy.buildCloakedWebViewUserAgent(
+                base, "Google Pixel 9 Pro", "SDK 35 (Android 15)", true, false, "12.10.6", "HIGH");
+        String twiceBrowser = ColgramSecurityPolicy.buildCloakedWebViewUserAgent(
+                onceBrowser, "Google Pixel 9 Pro", "SDK 35 (Android 15)", true, false, "12.10.6", "HIGH");
+        checkEq(true, !onceBrowser.contains("RealDevice"), "browser cloaked UA strips real model: " + onceBrowser);
+        checkEq(onceBrowser, twiceBrowser, "browser buildCloakedWebViewUserAgent must be idempotent");
+
+        String botBase = base + " Telegram-Android/12.10.6 (RealVendor RealDevice; Android 13; SDK 33; AVERAGE)";
+        String onceBot = ColgramSecurityPolicy.buildCloakedWebViewUserAgent(
+                botBase, "Google Pixel 9 Pro", "SDK 35 (Android 15)", true, true, "12.10.6", "HIGH");
+        String twiceBot = ColgramSecurityPolicy.buildCloakedWebViewUserAgent(
+                onceBot, "Google Pixel 9 Pro", "SDK 35 (Android 15)", true, true, "12.10.6", "HIGH");
+        checkEq(true, onceBot.contains("Google Pixel 9 Pro"), "bot cloaked UA contains spoof model: " + onceBot);
+        checkEq(true, !onceBot.contains("RealDevice"), "bot cloaked UA strips real model: " + onceBot);
+        checkEq(onceBot, twiceBot, "bot buildCloakedWebViewUserAgent must be idempotent");
+    }
+
+    public static void testColgramCloakProfiles() {
+        checkEq("iOS 17.6.1", ColgramCloak.getSystemVersionForModel("iPhone 15 Pro Max", "SDK 34 (Android 14)"),
+                "iPhone preset pairs coherent iOS version");
+        String pixelSys = ColgramCloak.getSystemVersionForModel("Google Pixel 9 Pro", "SDK 34 (Android 14)");
+        checkEq(true, pixelSys.contains("Android 15"), "Pixel 9 Pro pairs coherent Android 15 version");
+
+        ColgramCloak.DeviceProfile preset = ColgramCloak.findPresetForModel("Google Pixel 9 Pro");
+        checkEq(true, preset != null && "Google".equals(preset.manufacturer), "Pixel 9 Pro preset manufacturer");
+
+        java.util.Map<String, String> params = ColgramCloak.getCloakedConnectionParams(
+                "RealHardwareModel", "Android 13", "12.10.6", "ru");
+        checkEq(true, !"RealHardwareModel".equals(params.get("device_model")),
+                "default cloak masks real device model");
+        checkEq(true, params.get("manufacturer") != null && !params.get("manufacturer").isEmpty(),
+                "cloaked connection params include manufacturer");
+        checkEq(true, params.get("system_lang_code") != null && !params.get("system_lang_code").isEmpty(),
+                "cloaked connection params include system_lang_code");
+    }
+
     public static void main(String[] args) {
         testSanitizeTrackingUrl();
         testInspectUrlThreats();
         testCloakWebViewUserAgent();
+        testWebViewSpoofJs();
+        testIdempotentUserAgent();
+        testColgramCloakProfiles();
         testRedactSensitiveLogs();
         testScoreComputation();
         System.out.println("ColgramSecurityPolicyTest: PASS");

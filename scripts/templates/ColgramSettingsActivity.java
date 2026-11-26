@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -17,6 +18,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramBotSync;
+import org.colgram.core.ColgramCloak;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramOperationGate;
@@ -393,6 +395,12 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
+                if (listAdapter != null && cloakModelRow >= 0) {
+                    listAdapter.notifyItemChanged(cloakModelRow);
+                }
+                promptRestartForCloakChange(val
+                        ? "Маскировка включена. Перезапустите Colgram, чтобы Telegram-сессия сразу переподключилась с новым отпечатком устройства."
+                        : "Маскировка отключена. Перезапустите Colgram для применения изменений к MTProto-сессии.");
             } else if (position == cloakModelRow) {
                 showModelSelector();
             } else if (position == antiDeleteRow) {
@@ -1010,23 +1018,119 @@ public class ColgramSettingsActivity extends BaseFragment {
 
     private void showModelSelector() {
         if (getParentActivity() == null) return;
+        final String[] labels = {
+            "Google Pixel 8 Pro (Android 14)",
+            "Google Pixel 9 Pro (Android 15)",
+            "Samsung Galaxy S24 Ultra (Android 14)",
+            "Xiaomi 14 Ultra (Android 14)",
+            "Nothing Phone (2) (Android 14)",
+            "OnePlus 12 (Android 14)",
+            "iPhone 15 Pro Max (iOS 17.6.1)",
+            "Случайный профиль",
+            "Своя модель вручную..."
+        };
         final String[] models = {
             "Google Pixel 8 Pro",
+            "Google Pixel 9 Pro",
             "Samsung Galaxy S24 Ultra",
-            "iPhone 15 Pro Max",
             "Xiaomi 14 Ultra",
             "Nothing Phone (2)",
-            "OnePlus 12"
+            "OnePlus 12",
+            "iPhone 15 Pro Max"
         };
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
         builder.setTitle("Выберите профиль устройства");
-        builder.setItems(models, (dialog, which) -> {
-            ColgramConfig.setSpoofDeviceModel(models[which]);
-            listAdapter.notifyItemChanged(cloakModelRow);
-            Toast.makeText(getParentActivity(), "Профиль изменен: " + models[which], Toast.LENGTH_SHORT).show();
+        builder.setItems(labels, (dialog, which) -> {
+            String selectedModel;
+            String selectedSys;
+            if (which == 7) {
+                ColgramCloak.DeviceProfile rnd = ColgramCloak.getRandomProfile();
+                selectedModel = rnd.model;
+                selectedSys = rnd.systemVersion;
+            } else if (which == 8) {
+                showCustomModelInput();
+                return;
+            } else {
+                selectedModel = models[which];
+                selectedSys = ColgramCloak.getSystemVersionForModel(selectedModel, null);
+            }
+            ColgramConfig.setSpoofDeviceModel(selectedModel);
+            ColgramConfig.setSpoofSystemVersion(selectedSys);
+            if (!ColgramConfig.isCloakEnabled()) {
+                ColgramConfig.setCloakEnabled(true);
+                if (listAdapter != null && cloakEnabledRow >= 0) {
+                    listAdapter.notifyItemChanged(cloakEnabledRow);
+                }
+            }
+            if (listAdapter != null && cloakModelRow >= 0) {
+                listAdapter.notifyItemChanged(cloakModelRow);
+            }
+            promptRestartForCloakChange("Профиль устройства установлен: " + selectedModel + " (" + selectedSys
+                    + ").\n\nПерезапустите Colgram сейчас, чтобы Telegram-серверы немедленно обновили модель и ОС сессии.");
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
+    }
+
+    private void showCustomModelInput() {
+        Activity act = getParentActivity();
+        if (act == null) return;
+        final EditTextBoldCursor input = new EditTextBoldCursor(act);
+        input.setHint("Например: Google Pixel 9 Pro");
+        input.setText(ColgramCloak.getEffectiveDeviceModel());
+        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
+        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
+        input.setSingleLine(true);
+        input.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8),
+                AndroidUtilities.dp(16), AndroidUtilities.dp(8));
+        showDialog(new AlertDialog.Builder(act, resourceProvider)
+                .setTitle("Своя модель устройства")
+                .setView(input)
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    String model = input.getText() == null ? "" : input.getText().toString().trim();
+                    if (model.isEmpty()) return;
+                    ColgramConfig.setSpoofDeviceModel(model);
+                    if (!ColgramConfig.isCloakEnabled()) {
+                        ColgramConfig.setCloakEnabled(true);
+                    }
+                    if (listAdapter != null) {
+                        if (cloakEnabledRow >= 0) listAdapter.notifyItemChanged(cloakEnabledRow);
+                        if (cloakModelRow >= 0) listAdapter.notifyItemChanged(cloakModelRow);
+                    }
+                    promptRestartForCloakChange("Модель «" + model + "» сохранена. Перезапустите Colgram для обновления MTProto-сессии.");
+                })
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                .create());
+    }
+
+    private void promptRestartForCloakChange(String message) {
+        Activity act = getParentActivity();
+        if (act == null) return;
+        try {
+            showDialog(new AlertDialog.Builder(act, resourceProvider)
+                    .setTitle("Маскировка устройства")
+                    .setMessage(message)
+                    .setPositiveButton("Перезапустить сейчас", (d, w) -> restartApplicationCleanly(act))
+                    .setNegativeButton("Позже", null)
+                    .create());
+        } catch (Throwable ignored) {
+            Toast.makeText(act, message, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private static void restartApplicationCleanly(Activity activity) {
+        if (activity == null) return;
+        try {
+            Intent launch = activity.getPackageManager().getLaunchIntentForPackage(activity.getPackageName());
+            if (launch != null) {
+                Intent restart = Intent.makeRestartActivityTask(launch.getComponent());
+                activity.startActivity(restart);
+            }
+        } catch (Throwable ignored) {}
+        try {
+            activity.finishAffinity();
+        } catch (Throwable ignored) {}
+        android.os.Process.killProcess(android.os.Process.myPid());
     }
 
     /**
@@ -1565,7 +1669,8 @@ public class ColgramSettingsActivity extends BaseFragment {
                     TextSettingsCell settingsCell = (TextSettingsCell) holder.itemView;
                     if (position == cloakModelRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_devices, ColgramMenuChrome.COLOR_VIOLET);
-                        settingsCell.setTextAndValue("Модель устройства", ColgramConfig.getSpoofDeviceModel(), false);
+                        settingsCell.setTextAndValue("Профиль устройства",
+                                ColgramCloak.getEffectiveDeviceModel() + " · " + ColgramCloak.getEffectiveSystemVersion(), false);
                     } else if (position == currentProxyRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_speed, ColgramMenuChrome.COLOR_CYAN);
                         ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();

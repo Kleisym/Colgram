@@ -456,6 +456,12 @@ public class ColgramFilesActivity extends BaseFragment {
                     showPath(path);
                     return;
                 }
+                if (!file.exists() || !file.isFile()) {
+                    if (getParentActivity() != null) {
+                        Toast.makeText(getParentActivity(), "Файл не найден", Toast.LENGTH_SHORT).show();
+                    }
+                    return;
+                }
                 PickListener listener = pendingPickListener;
                 pendingPickListener = null;
                 pickMode = false;
@@ -463,7 +469,9 @@ public class ColgramFilesActivity extends BaseFragment {
                 paths.add(path);
                 finishFragment();
                 if (listener != null) {
-                    listener.onPicked(paths);
+                    try {
+                        listener.onPicked(paths);
+                    } catch (Throwable ignored) {}
                 }
             });
         } else {
@@ -661,11 +669,28 @@ public class ColgramFilesActivity extends BaseFragment {
     }
 
     private static boolean copyInto(Context context, Uri uri, File targetDir) {
+        if (context == null || uri == null || targetDir == null) return false;
         InputStream in = null;
+        android.content.res.AssetFileDescriptor afd = null;
         try {
-            in = context.getContentResolver().openInputStream(uri);
+            try {
+                in = context.getContentResolver().openInputStream(uri);
+            } catch (Throwable ignored) {
+                in = null;
+            }
+            if (in == null) {
+                try {
+                    afd = context.getContentResolver().openTypedAssetFileDescriptor(uri, "*/*", null);
+                    if (afd != null) {
+                        in = afd.createInputStream();
+                    }
+                } catch (Throwable ignored) {
+                    in = null;
+                }
+            }
             if (in == null) return false;
-            String name = displayName(context, uri);
+            String name = displayName(context, uri).replace('/', '_').replace('\\', '_').replace(':', '_');
+            if (name.isEmpty()) name = "file-" + System.currentTimeMillis();
             File out = new File(targetDir, name);
             int suffix = 1;
             while (out.exists()) {
@@ -685,6 +710,9 @@ public class ColgramFilesActivity extends BaseFragment {
         } finally {
             try {
                 if (in != null) in.close();
+            } catch (Throwable ignored) {}
+            try {
+                if (afd != null) afd.close();
             } catch (Throwable ignored) {}
         }
     }

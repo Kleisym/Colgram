@@ -1074,6 +1074,19 @@ public class ColgramHookHandler {
         }
     }
 
+    /** Completely removes deleted tombstones and saved edit/media revisions for a message batch. */
+    public static void purgeMessagesCompletely(long dialogId, java.util.Collection<Integer> messageIds) {
+        if (dialogId == 0 || messageIds == null || messageIds.isEmpty()) return;
+        for (Integer id : messageIds) {
+            if (id != null && id != 0) {
+                markForcePurged(dialogId, id);
+            }
+        }
+        if (appContext != null) {
+            ColgramDatabase.getInstance(appContext).purgeMessagesCompletely(dialogId, messageIds);
+        }
+    }
+
     public static boolean isForcePurged(long dialogId, int messageId) {
         if (messageId == 0) return false;
         long now = System.currentTimeMillis();
@@ -1469,11 +1482,22 @@ public class ColgramHookHandler {
                 || ColgramConfig.isMaxAnonymityEnabled();
         return ColgramSecurityPolicy.buildCloakedWebViewUserAgent(
                 originalUa,
-                ColgramConfig.getSpoofDeviceModel(),
-                ColgramConfig.getSpoofSystemVersion(),
+                ColgramCloak.getEffectiveDeviceModel(),
+                ColgramCloak.getEffectiveSystemVersion(),
                 cloak,
                 isBot,
                 appVersionName,
                 perfClass);
+    }
+
+    /** Returns JS shim spoofing Client Hints / navigator / WebGL renderer for WebViews when cloaking is active. */
+    public static String buildWebViewSpoofJs() {
+        boolean cloak = ColgramConfig.isCloakEnabled()
+                || ColgramConfig.isDefenderWebViewHardeningEnabled()
+                || ColgramConfig.isMaxAnonymityEnabled();
+        return ColgramSecurityPolicy.buildWebViewSpoofJs(
+                ColgramCloak.getEffectiveDeviceModel(),
+                ColgramCloak.getEffectiveSystemVersion(),
+                cloak);
     }
 }

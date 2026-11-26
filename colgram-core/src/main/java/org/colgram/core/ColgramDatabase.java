@@ -494,6 +494,65 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     }
 
     /**
+     * Permanently removes all local Colgram records (deleted tombstones, edit history, and media
+     * revisions) for a batch of messages in one transaction so a user-requested full local delete
+     * leaves zero preserved trace in ColgramDatabase.
+     */
+    public void purgeMessagesCompletely(long dialogId, Collection<Integer> messageIds) {
+        if (dialogId == 0L || messageIds == null || messageIds.isEmpty()) return;
+        Set<Integer> dialogSet = deletedMessagesByDialog.get(dialogId);
+        for (Integer id : messageIds) {
+            if (id == null || id == 0) continue;
+            if (!deletedCachesLoaded) {
+                pendingPurgesDuringLoad.add(deletedKey(dialogId, id));
+            }
+            if (dialogSet != null) {
+                dialogSet.remove(id);
+            }
+        }
+        SQLiteDatabase db = null;
+        SQLiteStatement delStmt = null;
+        SQLiteStatement editStmt = null;
+        SQLiteStatement mediaStmt = null;
+        boolean inTx = false;
+        try {
+            db = getWritableDatabase();
+            delStmt = db.compileStatement("DELETE FROM " + TABLE_DELETED + " WHERE "
+                    + COL_DEL_DIALOG_ID + "=? AND " + COL_DEL_MSG_ID + "=?");
+            editStmt = db.compileStatement("DELETE FROM " + TABLE_EDITS + " WHERE "
+                    + COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?");
+            mediaStmt = db.compileStatement("DELETE FROM " + TABLE_MEDIA + " WHERE "
+                    + COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?");
+            db.beginTransaction();
+            inTx = true;
+            for (Integer id : messageIds) {
+                if (id == null || id == 0) continue;
+                delStmt.clearBindings();
+                delStmt.bindLong(1, dialogId);
+                delStmt.bindLong(2, id);
+                delStmt.executeUpdateDelete();
+
+                editStmt.clearBindings();
+                editStmt.bindLong(1, dialogId);
+                editStmt.bindLong(2, id);
+                editStmt.executeUpdateDelete();
+
+                mediaStmt.clearBindings();
+                mediaStmt.bindLong(1, dialogId);
+                mediaStmt.bindLong(2, id);
+                mediaStmt.executeUpdateDelete();
+            }
+            db.setTransactionSuccessful();
+        } catch (Exception ignored) {
+        } finally {
+            if (delStmt != null) try { delStmt.close(); } catch (Throwable ignored) {}
+            if (editStmt != null) try { editStmt.close(); } catch (Throwable ignored) {}
+            if (mediaStmt != null) try { mediaStmt.close(); } catch (Throwable ignored) {}
+            if (db != null && inTx) try { db.endTransaction(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
      * Checks if a message was marked as deleted in O(1) memory without blocking the UI thread.
      * Strictly scoped to the exact (dialogId, messageId) pair — never wildcard-matches dialogId=0.
      */

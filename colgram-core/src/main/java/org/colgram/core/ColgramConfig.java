@@ -15,6 +15,8 @@ public class ColgramConfig {
     private static final String KEY_SPOOF_MODEL = "spoof_device_model";
     private static final String KEY_SPOOF_SYSTEM_VERSION = "spoof_system_version";
     private static final String KEY_SPOOF_LANG = "spoof_system_lang";
+    private static final String KEY_CLOAK_INIT_BUMP = "cloak_init_version_bump";
+    private static final String KEY_CLOAK_REINIT_MIGRATED = "colgram_cloak_reinit_v2";
 
     // Message Vault
     private static final String KEY_ANTI_DELETE_ENABLED = "anti_delete_enabled";
@@ -76,6 +78,7 @@ public class ColgramConfig {
     private static volatile String spoofDeviceModel = DEFAULT_MODEL;
     private static volatile String spoofSystemVersion = DEFAULT_SYSTEM_VERSION;
     private static volatile String spoofLang = DEFAULT_LANG;
+    private static volatile int cloakInitVersionBump = 0;
     private static volatile boolean antiDeleteEnabled = true;
     private static volatile boolean editHistoryEnabled = true;
     private static volatile boolean antiDeleteHighlightEnabled = true;
@@ -209,6 +212,14 @@ public class ColgramConfig {
                         .putBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, true)
                         .apply();
             }
+            if (!sp.getBoolean(KEY_CLOAK_REINIT_MIGRATED, false)) {
+                int nextBump = sp.getInt(KEY_CLOAK_INIT_BUMP, 0) + 1;
+                if (nextBump > 90000) nextBump = 1;
+                sp.edit()
+                        .putInt(KEY_CLOAK_INIT_BUMP, nextBump)
+                        .putBoolean(KEY_CLOAK_REINIT_MIGRATED, true)
+                        .apply();
+            }
             prefs = sp;
             loadAllCachedPrefs(sp);
             if (prefChangeListener == null) {
@@ -238,6 +249,7 @@ public class ColgramConfig {
         spoofDeviceModel = p.getString(KEY_SPOOF_MODEL, DEFAULT_MODEL);
         spoofSystemVersion = p.getString(KEY_SPOOF_SYSTEM_VERSION, DEFAULT_SYSTEM_VERSION);
         spoofLang = p.getString(KEY_SPOOF_LANG, DEFAULT_LANG);
+        cloakInitVersionBump = p.getInt(KEY_CLOAK_INIT_BUMP, 0);
         antiDeleteEnabled = p.getBoolean(KEY_ANTI_DELETE_ENABLED, true);
         editHistoryEnabled = p.getBoolean(KEY_EDIT_HISTORY_ENABLED, true);
         antiDeleteHighlightEnabled = p.getBoolean(KEY_ANTI_DELETE_HIGHLIGHT, true);
@@ -336,6 +348,7 @@ public class ColgramConfig {
             case KEY_SPOOF_MODEL: spoofDeviceModel = p.getString(KEY_SPOOF_MODEL, DEFAULT_MODEL); break;
             case KEY_SPOOF_SYSTEM_VERSION: spoofSystemVersion = p.getString(KEY_SPOOF_SYSTEM_VERSION, DEFAULT_SYSTEM_VERSION); break;
             case KEY_SPOOF_LANG: spoofLang = p.getString(KEY_SPOOF_LANG, DEFAULT_LANG); break;
+            case KEY_CLOAK_INIT_BUMP: cloakInitVersionBump = p.getInt(KEY_CLOAK_INIT_BUMP, 0); break;
             case KEY_ANTI_DELETE_ENABLED: antiDeleteEnabled = p.getBoolean(KEY_ANTI_DELETE_ENABLED, true); break;
             case KEY_EDIT_HISTORY_ENABLED: editHistoryEnabled = p.getBoolean(KEY_EDIT_HISTORY_ENABLED, true); break;
             case KEY_ANTI_DELETE_HIGHLIGHT: antiDeleteHighlightEnabled = p.getBoolean(KEY_ANTI_DELETE_HIGHLIGHT, true); break;
@@ -455,14 +468,31 @@ public class ColgramConfig {
     }
 
     // --- Cloaking ---
+    public static int getCloakInitVersionBump() {
+        return cloakInitVersionBump;
+    }
+
+    public static void bumpCloakInitVersion() {
+        int next = (cloakInitVersionBump + 1) % 90000;
+        if (next <= 0) next = 1;
+        cloakInitVersionBump = next;
+        if (prefs != null) {
+            prefs.edit().putInt(KEY_CLOAK_INIT_BUMP, next).apply();
+        }
+    }
+
     public static boolean isCloakEnabled() {
         return cloakEnabled;
     }
 
     public static void setCloakEnabled(boolean enabled) {
         if (prefs != null) {
+            boolean changed = cloakEnabled != enabled;
             cloakEnabled = enabled;
             prefs.edit().putBoolean(KEY_CLOAK_ENABLED, enabled).apply();
+            if (changed) {
+                bumpCloakInitVersion();
+            }
         }
     }
 
@@ -471,9 +501,23 @@ public class ColgramConfig {
     }
 
     public static void setSpoofDeviceModel(String model) {
+        if (model == null || model.trim().isEmpty()) return;
+        String trimmed = model.trim();
+        boolean changed = !trimmed.equals(spoofDeviceModel);
+        spoofDeviceModel = trimmed;
+        ColgramCloak.DeviceProfile preset = ColgramCloak.findPresetForModel(trimmed);
+        if (preset != null) {
+            spoofSystemVersion = preset.systemVersion;
+        }
         if (prefs != null) {
-            spoofDeviceModel = model;
-            prefs.edit().putString(KEY_SPOOF_MODEL, model).apply();
+            SharedPreferences.Editor ed = prefs.edit().putString(KEY_SPOOF_MODEL, trimmed);
+            if (preset != null) {
+                ed.putString(KEY_SPOOF_SYSTEM_VERSION, preset.systemVersion);
+            }
+            ed.apply();
+        }
+        if (changed) {
+            bumpCloakInitVersion();
         }
     }
 
@@ -482,9 +526,15 @@ public class ColgramConfig {
     }
 
     public static void setSpoofSystemVersion(String version) {
+        if (version == null || version.trim().isEmpty()) return;
+        String trimmed = version.trim();
+        boolean changed = !trimmed.equals(spoofSystemVersion);
+        spoofSystemVersion = trimmed;
         if (prefs != null) {
-            spoofSystemVersion = version;
-            prefs.edit().putString(KEY_SPOOF_SYSTEM_VERSION, version).apply();
+            prefs.edit().putString(KEY_SPOOF_SYSTEM_VERSION, trimmed).apply();
+        }
+        if (changed) {
+            bumpCloakInitVersion();
         }
     }
 
@@ -493,9 +543,15 @@ public class ColgramConfig {
     }
 
     public static void setSpoofLang(String lang) {
+        if (lang == null || lang.trim().isEmpty()) return;
+        String trimmed = lang.trim();
+        boolean changed = !trimmed.equals(spoofLang);
+        spoofLang = trimmed;
         if (prefs != null) {
-            spoofLang = lang;
-            prefs.edit().putString(KEY_SPOOF_LANG, lang).apply();
+            prefs.edit().putString(KEY_SPOOF_LANG, trimmed).apply();
+        }
+        if (changed) {
+            bumpCloakInitVersion();
         }
     }
 
