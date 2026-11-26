@@ -14008,7 +14008,13 @@ _PRE_BYPASS_BG_SPECS = [
 
 
 _SUPERSEDED_PERF_MARKERS = {
-    "MessagesStorage.java perf #1": "ColgramHookHandler.hookShouldPreventDialogDelete(did,",
+    "MessagesStorage.java perf #1": (
+        "                if (messagesOnly == 1 && org.colgram.core.ColgramConfig.isAntiDeleteEnabled()) {\n"
+        '                    org.colgram.core.ColgramHookHandler.hookShouldPreventDialogDelete(did, "");\n'
+        '                    database.executeFast("UPDATE dialogs SET unread_count = 0, unread_count_i = 0 WHERE did = " + did).stepThis().dispose();\n'
+        "                    return;\n"
+        "                }"
+    ),
     "MessagesStorage.java perf #3": "colgramPositive",
     "ChatMessageCell.java perf #1": "colgramConsumePendingDeleteAnim(",
     "ChatMessageCell.java perf #2": "colgramHasPendingDeleteAnim(",
@@ -14036,8 +14042,8 @@ def _has_superseded_marker(filepath, label, marker_map):
     marker = marker_map.get(label)
     if not marker or not os.path.exists(filepath):
         return False
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        return marker in f.read()
+    with open(filepath, "r", encoding="utf-8", errors="ignore", newline="") as f:
+        return marker.replace("\r\n", "\n") in f.read().replace("\r\n", "\n")
 
 
 def inject_performance_patches(repo_path):
