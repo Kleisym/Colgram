@@ -36,7 +36,7 @@ class RouteCancellationTest(unittest.TestCase):
 
     def test_unbounded_cache_with_auto_compress_enabled_by_default(self):
         s = (CORE / "ColgramConfig.java").read_text(encoding="utf-8")
-        self.assertTrue("getBoolean(KEY_UNLIMITED_MEMORY, true)" in s, "unlimited storage must be enabled by default")
+        self.assertTrue("getBoolean(KEY_UNLIMITED_MEMORY, false)" in s, "v4 defaults must cap physical disk storage at 1 GB by default")
         self.assertTrue('getBoolean("auto_compress_storage_enabled", true)' in s, "auto-compression must be enabled by default")
         s = (CORE / "ColgramUnlimitedMemory.java").read_text(encoding="utf-8")
         self.assertTrue("autoCompressOversizedCacheImagesAsync" in s, "auto-compression worker missing from ColgramUnlimitedMemory")

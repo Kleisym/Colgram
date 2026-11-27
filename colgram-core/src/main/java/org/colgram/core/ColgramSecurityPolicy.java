@@ -270,6 +270,15 @@ public final class ColgramSecurityPolicy {
                 + "if(k===37446)return 'ANGLE (ARM, Immortalis-G715, OpenGL ES 3.2)';"
                 + "return orig.apply(this,arguments);};};"
                 + "maskGl(window.WebGLRenderingContext);maskGl(window.WebGL2RenderingContext);"
+                + "try{Date.prototype.getTimezoneOffset=function(){return 0;};"
+                + "if(window.Intl&&Intl.DateTimeFormat&&Intl.DateTimeFormat.prototype&&Intl.DateTimeFormat.prototype.resolvedOptions){"
+                + "var _origResolved=Intl.DateTimeFormat.prototype.resolvedOptions;"
+                + "Intl.DateTimeFormat.prototype.resolvedOptions=function(){"
+                + "var r=_origResolved.apply(this,arguments);if(r&&typeof r==='object')r.timeZone='UTC';return r;};}}catch(e){}"
+                + "try{var blockRtc=function(name){if(!(name in window))return;"
+                + "var BlockedRtc=function(){throw new DOMException('WebRTC disabled by Colgram privacy policy','SecurityError');};"
+                + "Object.defineProperty(window,name,{value:BlockedRtc,configurable:true,writable:false});};"
+                + "blockRtc('RTCPeerConnection');blockRtc('webkitRTCPeerConnection');}catch(e){}"
                 + "}catch(e){}})();";
     }
 

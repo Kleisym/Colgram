@@ -762,7 +762,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
 #endif
 #ifdef TCP_USER_TIMEOUT
     {
-        int user_timeout = 12000;
+        int user_timeout = 45000;
         setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout));
     }
 #endif

@@ -1419,7 +1419,20 @@ public final class ColgramKolitiVoice {
             pruneOldFiles(outDir, 15);
 
             URL url = new URL(urlStr);
-            conn = (HttpURLConnection) url.openConnection();
+            java.net.Proxy preferredProxy = ColgramHttp.pickRelayProxy();
+            if (preferredProxy == null && ColgramDpiBypass.isBound()) {
+                preferredProxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                        new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort()));
+            }
+            if (preferredProxy != null) {
+                conn = (HttpURLConnection) url.openConnection(preferredProxy);
+            } else {
+                if (ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled()) {
+                    throw new java.io.IOException("Direct connection blocked by strict privacy policy");
+                }
+                conn = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
+            }
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setConnectTimeout(8000);
             conn.setReadTimeout(28000);
             conn.setDoOutput(true);

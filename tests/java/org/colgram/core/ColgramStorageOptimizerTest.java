@@ -282,12 +282,47 @@ public final class ColgramStorageOptimizerTest {
         ColgramStorageIndex.resetForTest();
     }
 
+    private static void testFuseCasOrphanCleanupDehydrationAndZlib() throws Exception {
+        File tmpDir = Files.createTempDirectory("colgram_cas_dehyd_test").toFile();
+        ColgramStorageIndex.resetForTest();
+        ColgramStorageIndex.init(tmpDir);
+
+        File casDir = new File(tmpDir, ".colgram_cas");
+        File orphanBlob = writeBytes(new File(casDir, "ff/ff00112233445566.jpg"), patternBytes(120_000, 9), System.currentTimeMillis());
+        long reclaimed = ColgramStorageOptimizer.pruneOrphanCasBlobs(casDir);
+        check(!orphanBlob.exists() && reclaimed == 120_000L,
+                "Orphan CAS blob cleanup must reclaim legacy duplicated FUSE CAS blob");
+
+        File sampleMedia = new File(tmpDir, "Images/sample.jpg");
+        ColgramStorageIndex.markDehydrated(sampleMedia, 5_242_880L, -1001L, 77, "/vault/preview.webp");
+        ColgramStorageIndex.flush();
+        check(ColgramStorageIndex.getTotalDehydratedBytes() == 5_242_880L
+                        && ColgramStorageIndex.getDehydratedCount() == 1
+                        && ColgramStorageIndex.getDehydratedEntry(sampleMedia.getAbsolutePath()) != null,
+                "Tier-0 dehydrated entry must persist virtual original size & preview metadata");
+
+        ColgramStorageIndex.resetForTest();
+        ColgramStorageIndex.init(tmpDir);
+        check(ColgramStorageIndex.getDehydratedCount() == 1
+                        && ColgramStorageIndex.getTotalCatalogVirtualBytes() >= 5_242_880L,
+                "Dehydrated catalog entry must reload cleanly from v1 TSV GZIP manifest");
+
+        byte[] rawMeta = "{\"sender\":12345,\"text\":\"Lazy shadow vault zlib test payload repeating repeated\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] compressed = ColgramDatabase.zlibCompressBytes(rawMeta);
+        byte[] restored = ColgramDatabase.zlibDecompressBytes(compressed);
+        check(compressed.length > 0 && Arrays.equals(rawMeta, restored),
+                "ColgramDatabase zlibCompressBytes/zlibDecompressBytes must round-trip losslessly");
+
+        ColgramStorageIndex.resetForTest();
+    }
+
     public static void main(String[] args) throws Exception {
         testStorageIndexAndManagedFileGuard();
         testStarvationFreePaginationAndSinglePassCompression();
         testSha256ContentDeduplication();
         testAiChatStoreGzipMigrationAndHighCaps();
         testRegenerableWasteAndEmergencyLowDiskCloudGuard();
+        testFuseCasOrphanCleanupDehydrationAndZlib();
         System.out.println("ColgramStorageOptimizerTest: PASS");
     }
 }

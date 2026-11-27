@@ -146,14 +146,33 @@ public class ColgramCloak {
             lang = ColgramConfig.DEFAULT_LANG;
         }
 
+        String cloakedAppVersion = stripColgramSuffix(originalAppVersion);
         params.put("device_model", model);
         params.put("system_version", sysVersion);
         params.put("manufacturer", getEffectiveManufacturer());
-        params.put("app_version", originalAppVersion);
+        params.put("app_version", cloakedAppVersion);
         params.put("lang_code", lang);
         params.put("system_lang_code", lang);
 
         return params;
+    }
+
+    /**
+     * Strips Colgram build suffix (e.g. "-colgram.2026...") so MTProto sees a vanilla app version.
+     */
+    public static String stripColgramSuffix(String version) {
+        if (version == null) {
+            return "";
+        }
+        int idx = version.indexOf("-colgram.");
+        if (idx > 0) {
+            return version.substring(0, idx);
+        }
+        idx = version.indexOf("-colgram");
+        if (idx > 0) {
+            return version.substring(0, idx);
+        }
+        return version;
     }
 
     /**

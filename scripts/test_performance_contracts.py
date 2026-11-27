@@ -167,7 +167,7 @@ class CoreCacheAndDbSyncContractsTest(unittest.TestCase):
 
     def test_colgram_database_blocked_cache_and_batched_mark_messages_deleted(self):
         db = read_text(CORE / "ColgramDatabase.java")
-        self.assertIn("DATABASE_VERSION = 6", db)
+        self.assertIn("DATABASE_VERSION = 7", db)
         self.assertIn("blockedUsersCache", db)
         blocked_fn = extract_method(db, "public boolean isNotificationsBlockedFrom(long userId)")
         self.assertIn("blockedUsersCache.contains(userId)", blocked_fn)
@@ -211,8 +211,8 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         self.assertIn("totalBytesCount < 256 * 1024", update_params)
         self.assertIn("downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 32 ? 1024 * 64 : 1024 * 32) : 1024 * 128;", update_params)
         self.assertIn("downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;", update_params)
-        self.assertIn("maxDownloadRequests = 4;", update_params)
-        self.assertIn("maxDownloadRequestsBig = 4;", update_params)
+        self.assertIn("maxDownloadRequests = 6;", update_params)
+        self.assertIn("maxDownloadRequestsBig = 6;", update_params)
         self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);", update_params)
         self.assertNotIn("maxDownloadRequests = boost ? 6 : 8;", update_params)
         # Prebuilt libtmessages.49.so uses DOWNLOAD_CONNECTIONS_COUNT == 2
@@ -245,7 +245,7 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         il = read_text(MSG / "ImageLoader.java")
         self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il)
         self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il)
-        self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 1)', il)
+        self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 2)', il)
         self.assertIn("colgramLottiePrecacheLock", il)
         self.assertIn("cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority)", il)
         self.assertIn("cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority)", il)

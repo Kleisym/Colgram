@@ -36,7 +36,11 @@ public final class ColgramSpamGuard {
     public static final String PING_STEALTH = "stealth";
     public static final String PING_UNKNOWN = "unknown";
 
-    private static final long WINDOW_MS = 10 * 60 * 1000L;
+    private static final Pattern MASS_MENTION_TAG_RE = p(
+            "(?<![\\p{L}0-9_])@(?:all|everyone|here|admins?|все|всем|админы?)(?![\\p{L}0-9_])");
+    private static final long INTERACTION_TTL_MS = 24L * 60L * 60L * 1000L;
+    private static final int MAX_INTERACTION_CACHE = 4096;
+    private static final ConcurrentHashMap<Long, Long> recentUserInteractedSenders = new ConcurrentHashMap<>();
 
     private static final int[][] FANCY_RANGES = {
             {0x1D400, 0x1D7FF}, {0xFF01, 0xFF5E}, {0x24B6, 0x24E9}, {0x1F130, 0x1F189}
@@ -44,6 +48,8 @@ public final class ColgramSpamGuard {
 
     private static final Pattern INVISIBLE_RE = Pattern.compile(
             "[\\u200b\\u200e\\u200f\\u2060-\\u2064\\u2066-\\u206f\\ufeff\\u180e\\u3164\\u115f\\u1160\\u2800]");
+
+    private static final long WINDOW_MS = 10 * 60 * 1000L;
 
     private static final Pattern AUTH_SAFE_RE = p("(?:my\\.telegram\\.org|login\\s*code|confirmation\\s*code|код\\s+(?:входа|подтверждения))");
     private static final Pattern AD_DISCLOSURE_RE = p("(?:\\berid\\s*[:=]\\s*[a-z0-9_-]{3,}|(?<![\\p{L}0-9_])#(?:реклама|рекламный|промо|promo|ad|sponsored)(?![\\p{L}0-9_])|реклама\\s*[.,;]\\s*(?:ооо|ип|ао|пао|инн|erid)|инн\\s*\\d{10,12}\\b[^\\n]{0,40}\\berid\\b|маркировк\\w*\\s+реклам\\w*)");
@@ -104,7 +110,8 @@ public final class ColgramSpamGuard {
             new LexiconRule("выиграл\\w*|выигрыш\\w*|\\bприз\\w*|розыгрыш\\w*|халяв\\w*|\\bраздач\\w*|\\bраздаю\\b|бесплатн\\w*|\\bgiveaway\\w*|\\bбонус\\w*|получи(?:ть|те)?\\s+(?:приз|бонус|подарок|деньги)", 25, "prize", false),
             new LexiconRule("пиар\\w*\\s+в\\s+\\d+|\\b\\d+\\s+чат(?:ах|ов|а)\\b|прода(?:м|ю)\\s+рекламу\\s+в\\s+(?:чат|канал|\\d)|взаимн\\w*\\s+пиар\\w*|\\bвп\\b|рассылк\\w*\\s+по\\s+(?:чатам|лс|базе)|\\bинвайт\\w*|\\bрепост(?:ы|ов)?\\s*:|\\bкуплю\\s+чат\\w*", 25, "ad_services", false),
             new LexiconRule("делаю\\s+(?:ботов|бота|сайт\\w*|дизайн\\w*|аватар\\w*|монтаж\\w*|рекламу)|на\\s+заказ\\b|\\bуслуг\\w*|разработ\\w*\\s+(?:бот|сайт)\\w*", 20, "services", false),
-            new LexiconRule("\\b(?:мой|мою|наш|нашу)\\s+(?:канал\\w*|чат\\w*|бот\\w*|магазин\\w*|проект\\w*|групп\\w*)|\\bподпис(?:ывайся|ывайтесь|ись|итесь)\\b|\\bжми\\s+(?:сюда|ниже|на\\s+кнопку|по\\s+кнопке)\\b|\\bпереходи\\s+(?:сюда|по\\s+ссылке|в\\s+канал|в\\s+бот)\\b|\\bуспей\\s+(?:забрать|подписаться|войти)\\b|\\bзаход(?:и|ите)\\b|\\bвступ(?:ай|айте)\\b|\\bзалета(?:й|йте)\\b|\\bjoin\\s+(?:my|our|us)\\b|\\bsubscribe\\b", 25, "self_promo", false)
+            new LexiconRule("\\b(?:мой|мою|наш|нашу)\\s+(?:канал\\w*|чат\\w*|бот\\w*|магазин\\w*|проект\\w*|групп\\w*)|\\bподпис(?:ывайся|ывайтесь|ись|итесь)\\b|\\bжми\\s+(?:сюда|ниже|на\\s+кнопку|по\\s+кнопке)\\b|\\bпереходи\\s+(?:сюда|по\\s+ссылке|в\\s+канал|в\\s+бот)\\b|\\bуспей\\s+(?:забрать|подписаться|войти)\\b|\\bзаход(?:и|ите)\\b|\\bвступ(?:ай|айте)\\b|\\bзалета(?:й|йте)\\b|\\bjoin\\s+(?:my|our|us)\\b|\\bsubscribe\\b", 25, "self_promo", false),
+            new LexiconRule("\\bsteam\\b|\\bстим\\w*|пополнени\\w*|\\bбаланс\\w*|\\bпродаж[уеа]\\b|\\bзаказам\\b|открыт\\s+к\\s+заказам|всегда\\s+на\\s+связи|\\bгаранти[яию]\\b|\\bгифт\\w*|\\bpsn\\b|\\bxbox\\b|\\bcs2\\b|\\bcs:?go\\b|\\bvalorant\\b|\\bвалорант\\w*|\\bпополн(?:ю|яю|ить)\\b", 25, "gaming_topup", false)
     };
 
     private static final Set<String> BUYER_BLOCKING_TOPICS = Set.of(
@@ -114,7 +121,7 @@ public final class ColgramSpamGuard {
 
     private static final Pattern CARRIER_RE = p("\\b(?:билайн\\w*|мтс|мегафон\\w*|теле2|tele2|йота|yota|сб[-\\s]*моб\\w*|сбермоб\\w*|т[-\\s]*мобайл\\w*|тинькофф\\s*моб\\w*|ростелеком\\w*)\\b");
     private static final Pattern PROMO_RE = p("\\b(?:бонус\\w*|промокод\\w*|купон\\w*|к[еэ]шб[еэ]к\\w*|акци[яи]|скидк\\w*|бесплатн\\w*|халяв\\w*|розыгрыш\\w*|раздач\\w*|выигр\\w*|вывод\\w*|оптом|опт\\b)");
-    private static final Pattern SALE_VERB_RE = p("\\b(?:продам|продаю|продается|продаем|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|отдаю|дарю|раздаю|раздача|делаю|помогу|ищу\\s+менеджер\\w*|ищ(?:у|ем)\\s+(?:партнер\\w*|админ\\w*|людей|сотрудник\\w*|работник\\w*)|требу(?:ю|е)тся|нужны\\s+люди|принима(?:ю|ем)|при[её]м\\s+(?:смс|номер\\w*|физ\\w*|акк\\w*)|возьму\\s+(?:под|на\\s+ворк|на\\s+рег\\w*|физ\\w*|сим\\w*|акк\\w*)|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:момент\\w*|сразу|от\\b)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|обращайтесь|дешевле|дешево|выгодно|недорого|по\\s+курсу|ниже\\s+рынка|купить\\s+можно|в\\s+наличии|цена\\s+за|прайс\\s*:|sell\\w*|buy\\w*|cheap\\w*)\\b");
+    private static final Pattern SALE_VERB_RE = p("\\b(?:продам|продаю|продается|продаем|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|отдаю|дарю|раздаю|раздача|делаю|помогу|ищу\\s+менеджер\\w*|ищ(?:у|ем)\\s+(?:партнер\\w*|админ\\w*|людей|сотрудник\\w*|работник\\w*)|требу(?:ю|е)тся|нужны\\s+люди|принима(?:ю|ем)|при[её]м\\s+(?:смс|номер\\w*|физ\\w*|акк\\w*)|возьму\\s+(?:под|на\\s+ворк|на\\s+рег\\w*|физ\\w*|сим\\w*|акк\\w*)|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:момент\\w*|сразу|от\\b)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|открыт\\s+к\\s+заказам|всегда\\s+на\\s+связи|пополн(?:ю|яю|ение)|обращайтесь|дешевле|дешево|выгодно|недорого|по\\s+курсу|ниже\\s+рынка|купить\\s+можно|в\\s+наличии|цена\\s+за|прайс\\s*:|sell\\w*|buy\\w*|cheap\\w*)\\b");
     private static final Pattern SELLER_ASK_RE = p("\\b(?:купишь|купите|покупайте|покупай|закажи|заказывай|нужн[ыао]\\s+(?:звезд|акк|подписчик|просмотр|клик|реклам|бусты|премиум)|хочешь\\s+(?:заработать|зарабатывать|звезд|бесплатн|подарок|подарки|премиум)|хотите\\s+(?:заработать|зарабатывать))");
     private static final Pattern ROUTING_RE = p("(?:пиш(?:и|ите)|писать|связь|обращаться|отпиш(?:и|ите)|стучи(?:те)?|жду|заказ|менеджер\\w*|contact|для\\s+заказа|купить)\\s*(?:в\\s+лс|в\\s+личку|в\\s+пм|сюда|тут|мне)?\\s*[:\\-—–]?\\s*@\\w+");
     private static final Pattern EMOJI_ROUTING_RE = p("(?:📩|👉|📲|💬|✍️|✍|✉️|☎️|📞|➡️|⬇️)\\s*(?:в\\s+лс|пишите|связь|обращаться)?\\s*@\\w+");
@@ -340,8 +347,13 @@ public final class ColgramSpamGuard {
         Set<String> cleanOwn = new HashSet<>();
         if (ownLabels != null) {
             for (String l : ownLabels) {
-                String norm = lettersOnly(l);
-                if (!norm.isEmpty()) cleanOwn.add(norm);
+                if (l == null) continue;
+                String normFull = lettersOnly(l);
+                if (!normFull.isEmpty()) cleanOwn.add(normFull);
+                for (String part : l.trim().split("\\s+")) {
+                    String np = lettersOnly(part);
+                    if (np.length() >= 2) cleanOwn.add(np);
+                }
             }
         }
         String kind = null;
@@ -355,42 +367,70 @@ public final class ColgramSpamGuard {
             }
             if (target != 0 && selfUserId != 0 && target == selfUserId) {
                 String rawSlice = utf16Slice(text, ent.offset, ent.length);
+                String trimmed = rawSlice.trim();
+                if (trimmed.length() <= 1 || hasInvisibleGhostChars(rawSlice)) {
+                    return PING_STEALTH;
+                }
                 String label = lettersOnly(rawSlice);
+                if (label.isEmpty() || label.length() < 2) {
+                    return PING_STEALTH;
+                }
                 boolean matchesSelf = false;
-                if (!label.isEmpty()) {
-                    for (String own : cleanOwn) {
-                        if (label.contains(own) || (label.length() >= 3 && own.contains(label))) {
+                String[] rawTokens = trimmed.split("\\s+");
+                for (String own : cleanOwn) {
+                    if (label.equals(own)) {
+                        matchesSelf = true;
+                        break;
+                    }
+                    if (own.length() >= 4 && label.equals("@" + own)) {
+                        matchesSelf = true;
+                        break;
+                    }
+                    for (String rt : rawTokens) {
+                        String tok = lettersOnly(rt);
+                        if (tok.isEmpty()) continue;
+                        if (tok.equals(own)) {
+                            matchesSelf = true;
+                            break;
+                        }
+                        if (own.length() >= 3 && (tok.startsWith(own) || (tok.length() >= 3 && own.startsWith(tok)))) {
                             matchesSelf = true;
                             break;
                         }
                     }
+                    if (matchesSelf) break;
                 }
                 if (!matchesSelf) return PING_STEALTH;
-                kind = rawSlice.trim().startsWith("@") ? PING_USERNAME : PING_NAME;
+                kind = trimmed.startsWith("@") ? PING_USERNAME : PING_NAME;
             }
         }
         return kind;
     }
 
     public static boolean hasHiddenOrMassMentionEntity(String text, List<MentionTarget> entities) {
+        if (text != null && MASS_MENTION_TAG_RE.matcher(text).find()) {
+            return true;
+        }
         if (entities == null || entities.isEmpty()) return false;
         int totalMentions = 0;
         int userMentions = 0;
         for (MentionTarget ent : entities) {
             boolean isUserRef = ent.targetUserId != 0
                     || ent.targetUrl.toLowerCase(Locale.ROOT).contains("tg://user?id=");
+            String slice = utf16Slice(text, ent.offset, ent.length);
             if (isUserRef) {
                 userMentions++;
                 totalMentions++;
-                String slice = utf16Slice(text, ent.offset, ent.length);
-                if (!HAS_LETTER_RE.matcher(slice).find() && !HAS_DIGIT_RE.matcher(slice).find()) {
+                String trimmed = slice.trim();
+                if (trimmed.length() <= 1 || hasInvisibleGhostChars(slice)
+                        || (!HAS_LETTER_RE.matcher(slice).find() && !HAS_DIGIT_RE.matcher(slice).find())) {
                     return true;
                 }
             } else {
                 totalMentions++;
             }
         }
-        return userMentions >= 2 || totalMentions >= 4;
+        return userMentions >= 2 || totalMentions >= 3;
     }
 
     public static boolean isGenuineBuyerQuestion(String text, Collection<String> ownUsernames) {
@@ -465,6 +505,15 @@ public final class ColgramSpamGuard {
                                       boolean viaBot, boolean visualMedia, boolean hiddenOrMassEntity,
                                       boolean isLeadCheckAllowed, Collection<String> ownUsernames,
                                       boolean hasInlineUrlButtons, boolean isForwardedFromChannel) {
+        return diagnose(rawText, metadata, pingKind, isPing, viaBot, visualMedia, hiddenOrMassEntity,
+                isLeadCheckAllowed, ownUsernames, hasInlineUrlButtons, isForwardedFromChannel, 0, false);
+    }
+
+    public static SpamReport diagnose(String rawText, String metadata, String pingKind, boolean isPing,
+                                      boolean viaBot, boolean visualMedia, boolean hiddenOrMassEntity,
+                                      boolean isLeadCheckAllowed, Collection<String> ownUsernames,
+                                      boolean hasInlineUrlButtons, boolean isForwardedFromChannel,
+                                      int customEmojiCount, boolean hasUrlEntity) {
         String text = rawText == null ? "" : rawText;
         String meta = metadata == null ? "" : metadata;
         NormalizedResult combined = normalizeText(meta.isEmpty() ? text : (text + "\n" + meta));
@@ -488,7 +537,7 @@ public final class ColgramSpamGuard {
             return new SpamReport(100, true, true, true, false, false, "invisible_ghost_ping",
                     Collections.singletonList("zero_width_ghost_chars"), combined.flags, combined.normalized);
         }
-        if (hiddenOrMassEntity) {
+        if (hiddenOrMassEntity || MASS_MENTION_TAG_RE.matcher(text).find()) {
             return new SpamReport(100, true, true, true, false, false, "hidden_or_mass_entity",
                     Collections.singletonList("entity_ghost_or_mass_mention"), combined.flags, combined.normalized);
         }
@@ -658,6 +707,19 @@ public final class ColgramSpamGuard {
             score += 15;
             factors.add("asset_specifiers(+15)");
         }
+        if (customEmojiCount >= 3) {
+            score += 20;
+            factors.add("custom_emoji_wall_" + customEmojiCount + "(+20)");
+        }
+        if (hasUrlEntity && (commercialCore || hasDmCta || customEmojiCount >= 2 || text.length() > 220)) {
+            score += 20;
+            factors.add("embedded_url_entity(+20)");
+        }
+        if (text.length() > 220 && (commercialCore || hasLinks || hasUrlEntity || !foreignHandles.isEmpty()
+                || customEmojiCount >= 3 || priceCount > 0 || catalogueRows >= 2 || bullets >= 2)) {
+            score += 40;
+            factors.add("long_ad_wall(+40)");
+        }
 
         boolean commercial = commercialCore || hasEmojiRouting || hasTextRouting;
         boolean combo = (topicPoints > 0 && (hasSaleVerb || hasSellerAsk || hasEmojiRouting || hasTextRouting
@@ -798,6 +860,51 @@ public final class ColgramSpamGuard {
         Matcher m = pat.matcher(text);
         while (m.find()) c++;
         return c;
+    }
+
+    public static void recordOutgoingInteraction(long userId) {
+        if (userId <= 0L) return;
+        long now = System.currentTimeMillis();
+        if (recentUserInteractedSenders.size() >= MAX_INTERACTION_CACHE) {
+            recentUserInteractedSenders.entrySet().removeIf(e -> (now - e.getValue()) > INTERACTION_TTL_MS);
+            if (recentUserInteractedSenders.size() >= MAX_INTERACTION_CACHE) {
+                recentUserInteractedSenders.clear();
+            }
+        }
+        recentUserInteractedSenders.put(userId, now);
+    }
+
+    public static boolean hasRecentInteraction(long userId, long nowMs) {
+        if (userId <= 0L) return false;
+        Long ts = recentUserInteractedSenders.get(userId);
+        if (ts == null) return false;
+        if ((nowMs - ts) > INTERACTION_TTL_MS) {
+            recentUserInteractedSenders.remove(userId, ts);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Layer (d): Big-group unsolicited stranger ping ("без моего база") protection.
+     * In groups with >= 50 participants, blocks pings from non-contacts that are neither
+     * whitelisted, recently interacted with in the last 24h, nor a genuine reply to self.
+     */
+    public static boolean isUnsolicitedStrangerBigGroupPing(long senderId,
+                                                            int participantsCount,
+                                                            boolean isContact,
+                                                            boolean isWhitelisted,
+                                                            boolean isGenuineReplyToSelf,
+                                                            boolean antiPingStrangersEnabled,
+                                                            long nowMs) {
+        if (!antiPingStrangersEnabled || senderId <= 0L) return false;
+        if (participantsCount < 50) return false;
+        if (isContact || isWhitelisted || isGenuineReplyToSelf) return false;
+        return !hasRecentInteraction(senderId, nowMs);
+    }
+
+    public static void resetInteractionsForTest() {
+        recentUserInteractedSenders.clear();
     }
 
     private static String lettersOnly(String raw) {

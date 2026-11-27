@@ -250,6 +250,28 @@ public final class ColgramMediaDcAndProxyTest {
         check(ColgramProxyPolicy.compare(unchecked, failed, 1_000) < 0, "unchecked (tier 3) < failed (tier 4)");
         check(ColgramProxyPolicy.compare(failed, quarantined, 1_000) < 0, "failed (tier 4) < quarantined (tier 5)");
 
+        // 7. Track 1 channel-loading & IPv6/escape-hatch contracts
+        check(ColgramTelegramWsBridge.PREWARM_MEDIA_MAX_PER_BUCKET == 4,
+                "PREWARM_MEDIA_MAX_PER_BUCKET must be 4 for media DCs");
+        check(ColgramTelegramWsBridge.prewarmMaxFor(2, true) == 4,
+                "prewarmMaxFor media session must be 4");
+        check(ColgramTelegramWsBridge.prewarmMaxFor(2, false) == 3,
+                "prewarmMaxFor control session must remain 3");
+        List<ColgramTelegramWsBridge.EdgeEndpoint> ipv4OnlyCandidates =
+                ColgramTelegramWsBridge.buildCandidateEndpoints(
+                        2, null, Collections.emptyMap(), Collections.emptySet(), true, false);
+        check(!ipv4OnlyCandidates.isEmpty(), "IPv4-only candidate list must not be empty");
+        for (ColgramTelegramWsBridge.EdgeEndpoint ep : ipv4OnlyCandidates) {
+            check(ep.ip.indexOf(':') < 0, "!includeIpv6 must filter all IPv6 endpoints: " + ep.ip);
+        }
+        List<ColgramTelegramWsBridge.EdgeEndpoint> escapeHatchCandidates =
+                ColgramTelegramWsBridge.buildCandidateEndpoints(
+                        2, null, Collections.emptyMap(),
+                        Collections.singleton("149.154.167.220|kws2.web.telegram.org"), false, false);
+        check(escapeHatchCandidates.stream().anyMatch(
+                ep -> "149.154.167.220".equals(ep.ip) && "kws2.web.telegram.org".equals(ep.sniHost)),
+                "fresh .220 tail escape hatch must stay appended even when deprioritized");
+
         System.out.println("ColgramMediaDcAndProxyTest: " + checks + " checks PASS");
     }
 }

@@ -59,31 +59,43 @@ public final class ColgramHttp {
         }
     }
 
+    private static boolean preferProxyFirst() {
+        String relayUrl = ColgramConfig.getRelayUrl();
+        return ColgramConfig.isStrictProxySecurityEnabled()
+                || ColgramConfig.isMaxAnonymityEnabled()
+                || ColgramDpiBypass.isBound()
+                || ColgramProxyManager.hasActiveRouteForUi()
+                || (relayUrl != null && !relayUrl.trim().isEmpty());
+    }
+
     /**
-     * GET a URL, falling back through relays. Throws IOException describing every attempt when
-     * nothing worked - an empty return would be the silent failure this class exists to remove.
+     * GET a URL, routing through active proxy/DPI tunnel first when configured or strict mode is
+     * active, falling back through relays or direct DoH-pinned route only when permitted.
      */
     public static Response get(String urlStr) throws IOException {
+        return executeWithRelays(urlStr, null, null);
+    }
+
+    private static Response executeWithRelays(String urlStr, String jsonBody, String bearer) throws IOException {
         List<String> attempts = new ArrayList<>();
-        try {
-            return open(urlStr, null);
-        } catch (Throwable t) {
-            attempts.add("напрямую: " + reason(t));
+        boolean proxyFirst = preferProxyFirst();
+        if (!proxyFirst && !ColgramConfig.isMaxAnonymityEnabled()) {
+            try {
+                return open(urlStr, null, jsonBody, bearer);
+            } catch (Throwable t) {
+                attempts.add("напрямую: " + reason(t));
+            }
         }
 
-        Response configured = viaConfiguredRelay(urlStr, null, null, attempts);
+        Response configured = viaConfiguredRelay(urlStr, jsonBody, bearer, attempts);
         if (configured != null) return configured;
 
         List<ColgramProxyManager.ProxyItem> relays = relayCandidates();
-        if (relays.isEmpty()) {
-            attempts.add("нет ни одного SOCKS-релея в пуле");
-            throw new IOException(join(attempts));
-        }
         int used = 0;
         for (ColgramProxyManager.ProxyItem relay : relays) {
             if (used++ >= MAX_RELAY_ATTEMPTS) break;
             try {
-                Response r = open(urlStr, relay);
+                Response r = open(urlStr, relay, jsonBody, bearer);
                 Log.i(TAG, "fetched " + hostOf(urlStr) + " through relay " + relay.address
                         + ":" + relay.port);
                 return r;
@@ -91,21 +103,35 @@ public final class ColgramHttp {
                 attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
             }
         }
-        Response tunneled = viaConnectRelays(urlStr, null, null, attempts);
+        Response tunneled = viaConnectRelays(urlStr, jsonBody, bearer, attempts);
         if (tunneled != null) return tunneled;
+
+        if (proxyFirst && !ColgramConfig.isMaxAnonymityEnabled()) {
+            try {
+                return open(urlStr, null, jsonBody, bearer);
+            } catch (Throwable t) {
+                attempts.add("напрямую: " + reason(t));
+            }
+        }
+        if (relays.isEmpty() && attempts.isEmpty()) {
+            attempts.add("нет доступного прокси/релея");
+        }
         throw new IOException(join(attempts));
     }
 
     /**
-     * Short-budget GET for public candidate feeds. A feed is retried on the next refresh, so it
-     * must not hold the whole 16-source batch behind four 20-second relay attempts.
+     * Short-budget GET for public candidate feeds. Routes via configured proxy/DPI tunnel first
+     * when active or in strict mode.
      */
     public static Response getFast(String urlStr) throws IOException {
         List<String> attempts = new ArrayList<>();
-        try {
-            return openFast(urlStr, null);
-        } catch (Throwable t) {
-            attempts.add("напрямую: " + reason(t));
+        boolean proxyFirst = preferProxyFirst();
+        if (!proxyFirst && !ColgramConfig.isMaxAnonymityEnabled()) {
+            try {
+                return openFast(urlStr, null);
+            } catch (Throwable t) {
+                attempts.add("напрямую: " + reason(t));
+            }
         }
 
         Response configured = viaConfiguredRelayFast(urlStr, attempts);
@@ -144,6 +170,13 @@ public final class ColgramHttp {
                 }
             }
         }
+        if (proxyFirst && !ColgramConfig.isMaxAnonymityEnabled()) {
+            try {
+                return openFast(urlStr, null);
+            } catch (Throwable t) {
+                attempts.add("напрямую: " + reason(t));
+            }
+        }
         throw new IOException(join(attempts));
     }
 
@@ -157,7 +190,7 @@ public final class ColgramHttp {
             conn = (HttpURLConnection) new URL(relay + sep + "url=" + target).openConnection(Proxy.NO_PROXY);
             conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setRequestProperty("Accept", "application/json");
             int code = conn.getResponseCode();
             InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
@@ -198,7 +231,7 @@ public final class ColgramHttp {
         try {
             conn.setConnectTimeout(FAST_CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(FAST_READ_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setRequestProperty("Accept", "application/json");
             int code = conn.getResponseCode();
             InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
@@ -213,54 +246,14 @@ public final class ColgramHttp {
         return ColgramProxyPolicy.readBounded(stream, MAX_FEED_BYTES);
     }
 
-    /** POST a JSON body, with the same relay fallback as GET. */
+    /** POST a JSON body, with the same proxy-first and relay fallback as GET. */
     public static Response post(String urlStr, String jsonBody, String bearer) throws IOException {
-        List<String> attempts = new ArrayList<>();
-        try {
-            return open(urlStr, null, jsonBody, bearer);
-        } catch (Throwable t) {
-            attempts.add("напрямую: " + reason(t));
-        }
-        Response configured = viaConfiguredRelay(urlStr, jsonBody, bearer, attempts);
-        if (configured != null) return configured;
-
-        int used = 0;
-        for (ColgramProxyManager.ProxyItem relay : relayCandidates()) {
-            if (used++ >= MAX_RELAY_ATTEMPTS) break;
-            try {
-                return open(urlStr, relay, jsonBody, bearer);
-            } catch (Throwable t) {
-                attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
-            }
-        }
-        Response tunneled = viaConnectRelays(urlStr, jsonBody, bearer, attempts);
-        if (tunneled != null) return tunneled;
-        throw new IOException(join(attempts));
+        return executeWithRelays(urlStr, jsonBody, bearer);
     }
 
     /** GET with an optional bearer token. */
     public static Response get(String urlStr, String bearer) throws IOException {
-        List<String> attempts = new ArrayList<>();
-        try {
-            return open(urlStr, null, null, bearer);
-        } catch (Throwable t) {
-            attempts.add("напрямую: " + reason(t));
-        }
-        Response configured = viaConfiguredRelay(urlStr, null, bearer, attempts);
-        if (configured != null) return configured;
-
-        int used = 0;
-        for (ColgramProxyManager.ProxyItem relay : relayCandidates()) {
-            if (used++ >= MAX_RELAY_ATTEMPTS) break;
-            try {
-                return open(urlStr, relay, null, bearer);
-            } catch (Throwable t) {
-                attempts.add(relay.address + ":" + relay.port + " -> " + reason(t));
-            }
-        }
-        Response tunneled = viaConnectRelays(urlStr, null, bearer, attempts);
-        if (tunneled != null) return tunneled;
-        throw new IOException(join(attempts));
+        return executeWithRelays(urlStr, null, bearer);
     }
 
     /**
@@ -285,7 +278,7 @@ public final class ColgramHttp {
             HttpURLConnection conn = (HttpURLConnection) new URL(via).openConnection(Proxy.NO_PROXY);
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(READ_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setRequestProperty("Accept", "application/json");
             if (bearer != null && !bearer.isEmpty()) {
                 conn.setRequestProperty("X-Colgram-Authorization", bearer);
@@ -462,7 +455,7 @@ public final class ColgramHttp {
         HttpURLConnection conn = openConfiguredConnection(urlStr, socksHost, socksPort);
         conn.setConnectTimeout(connectTimeoutMs);
         conn.setReadTimeout(readTimeoutMs);
-        conn.setRequestProperty("User-Agent", "Colgram/3.0");
+        conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
         conn.setRequestProperty("Accept", "application/octet-stream, */*");
         return conn;
     }
@@ -531,7 +524,7 @@ public final class ColgramHttp {
         try {
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(READ_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setRequestProperty("Accept", "application/json");
             if (bearer != null && !bearer.isEmpty()) {
                 conn.setRequestProperty("Authorization", "Bearer " + bearer);
@@ -599,7 +592,7 @@ public final class ColgramHttp {
             java.io.OutputStream rawOut = tunnel.getOutputStream();
             rawOut.write(("CONNECT " + host + ":" + port + " HTTP/1.1\r\n"
                     + "Host: " + host + ":" + port + "\r\n"
-                    + "User-Agent: Colgram/1.0\r\n\r\n").getBytes("UTF-8"));
+                    + "User-Agent: " + ColgramPolymorphicStealth.pickBrowserUserAgent() + "\r\n\r\n").getBytes("UTF-8"));
             rawOut.flush();
             String status = readLine(tunnel.getInputStream());
             if (status == null || !status.contains(" 200")) {
@@ -629,7 +622,7 @@ public final class ColgramHttp {
             StringBuilder req = new StringBuilder();
             req.append(jsonBody != null ? "POST " : "GET ").append(path).append(" HTTP/1.1\r\n");
             req.append("Host: ").append(host).append("\r\n");
-            req.append("User-Agent: Mozilla/5.0\r\n");
+            req.append("User-Agent: ").append(ColgramPolymorphicStealth.pickBrowserUserAgent()).append("\r\n");
             req.append("Accept: application/json\r\n");
             if (bearer != null && !bearer.isEmpty()) {
                 req.append("Authorization: Bearer ").append(bearer).append("\r\n");

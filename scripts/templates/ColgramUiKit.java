@@ -1,13 +1,24 @@
 package org.telegram.ui;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.graphics.Canvas;
+import android.graphics.LinearGradient;
+import android.graphics.Matrix;
+import android.graphics.Paint;
 import android.graphics.PorterDuff;
+import android.graphics.RectF;
+import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
@@ -15,9 +26,13 @@ import android.text.TextUtils;
 import android.text.method.PasswordTransformationMethod;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -29,12 +44,17 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramPolymorphicStealth;
+import org.colgram.core.ColgramSavedTagsStore;
 import org.colgram.core.ColgramTelegramWsBridge;
+import org.colgram.core.ColgramUiBridge;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.LocaleController;
@@ -42,7 +62,7 @@ import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
-import org.telegram.ui.Components.BulletinFactory;
+import org.telegram.ui.Components.CubicBezierInterpolator;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.LayoutHelper;
 
@@ -277,6 +297,7 @@ public final class ColgramUiKit {
         if (!TextUtils.isEmpty(badgeText)) {
             TextView pill = makePillChip(ctx, badgeText, withAlpha(tint, pal.dark ? 0x26 : 0x14),
                     tint, withAlpha(tint, 0x44));
+            pill.setMaxWidth(dp(128));
             row.addView(pill, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT,
                     Gravity.CENTER_VERTICAL, 8, 0, 0, 0));
         }
@@ -351,6 +372,27 @@ public final class ColgramUiKit {
             box.addView(eye, LayoutHelper.createLinear(34, 34, Gravity.CENTER_VERTICAL, 6, 0, 0, 0));
         }
         return box;
+    }
+
+    private static final class MaxHeightScrollView extends ScrollView {
+        MaxHeightScrollView(Context context) {
+            super(context);
+            setVerticalScrollBarEnabled(false);
+            setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int screenH = AndroidUtilities.displaySize != null && AndroidUtilities.displaySize.y > 0
+                    ? AndroidUtilities.displaySize.y : dp(720);
+            int maxH = Math.max(dp(180), (int) (screenH * 0.58f));
+            int mode = MeasureSpec.getMode(heightMeasureSpec);
+            int size = MeasureSpec.getSize(heightMeasureSpec);
+            if (mode == MeasureSpec.UNSPECIFIED || size > maxH) {
+                heightMeasureSpec = MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.AT_MOST);
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+        }
     }
 
     private static boolean isValidActivity(Activity act) {
@@ -473,15 +515,10 @@ public final class ColgramUiKit {
             ));
         }
 
-        if (items.size() > 5) {
-            ScrollView scroll = new ScrollView(act);
-            scroll.setVerticalScrollBarEnabled(false);
-            scroll.addView(listWrap);
-            LinearLayout.LayoutParams lp = LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12);
-            root.addView(scroll, lp);
-        } else {
-            root.addView(listWrap, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
-        }
+        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
+        scroll.addView(listWrap);
+        LinearLayout.LayoutParams lp = LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12);
+        root.addView(scroll, lp);
 
         TextView cancelBtn = makeCtaButton(act, LocaleController.getString(R.string.Cancel),
                 pal.cardSurface, pal.textSecondary, true, pal.borderSubtle);
@@ -520,8 +557,7 @@ public final class ColgramUiKit {
             msgView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
             msgView.setLineSpacing(dp(3), 1.0f);
             msgCard.addView(msgView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-            ScrollView scroll = new ScrollView(act);
-            scroll.setVerticalScrollBarEnabled(false);
+            MaxHeightScrollView scroll = new MaxHeightScrollView(act);
             scroll.addView(msgCard);
             root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
         }
@@ -581,10 +617,9 @@ public final class ColgramUiKit {
         msgView.setTextIsSelectable(selectableText);
         msgCard.addView(msgView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        ScrollView scroll = new ScrollView(act);
-        scroll.setVerticalScrollBarEnabled(false);
+        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
         scroll.addView(msgCard);
-        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0, 1f, 0, 0, 0, 14));
+        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
 
         final BottomSheet sheet = createFlagshipSheet(act, rp, false, false, root);
 
@@ -640,8 +675,7 @@ public final class ColgramUiKit {
         inner.setOrientation(LinearLayout.VERTICAL);
         inner.addView(inputBox, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
 
-        ScrollView scroll = new ScrollView(act);
-        scroll.setVerticalScrollBarEnabled(false);
+        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
         scroll.addView(inner);
         root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
@@ -712,15 +746,14 @@ public final class ColgramUiKit {
         root.addView(makeSheetHeader(act, pal, iconRes, pal.accentPrimary, title, subtitle, null),
                 LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        ScrollView scroll = new ScrollView(act);
-        scroll.setVerticalScrollBarEnabled(false);
+        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
         if (customContent != null) {
             if (customContent.getParent() instanceof ViewGroup) {
                 ((ViewGroup) customContent.getParent()).removeView(customContent);
             }
             scroll.addView(customContent);
         }
-        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 0, 1f, 0, 0, 0, 12));
+        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
 
         final BottomSheet sheet = createFlagshipSheet(act, rp, needFocus, secureWindow, root);
 
@@ -904,53 +937,1122 @@ public final class ColgramUiKit {
 
     private static void showNoticeInternal(BaseFragment fragment, Context context, int iconRes,
                                            CharSequence text, boolean isError) {
+        if (TextUtils.isEmpty(text)) return;
+        String raw = text.toString().trim();
+        String title = raw;
+        String subtitle = "";
+        int nl = raw.indexOf('\n');
+        if (nl > 0) {
+            title = raw.substring(0, nl).trim();
+            subtitle = raw.substring(nl + 1).trim();
+        } else {
+            int colon = raw.indexOf(": ");
+            if (colon > 0 && colon <= 36 && colon + 2 < raw.length()) {
+                title = raw.substring(0, colon).trim();
+                subtitle = raw.substring(colon + 2).trim();
+            }
+        }
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        int accent = isError ? pal.semanticCrimson : pal.accentPrimary;
+        int effIcon = iconRes != 0 ? iconRes : (isError ? R.drawable.msg_info : R.drawable.msg_check_s);
+        Context hostCtx = context != null ? context
+                : (fragment != null && fragment.getParentActivity() != null ? fragment.getParentActivity() : ColgramUiBridge.currentActivity());
+        showHudBanner(hostCtx, title, subtitle, effIcon, accent, null, null);
+    }
+
+    public static void showHudBanner(Context ctx, String title, String subtitle, int iconRes, int accentColor) {
+        showHudBanner(ctx, title, subtitle, iconRes, accentColor, null, null);
+    }
+
+    public static void showHudBanner(Context ctx, String title, String subtitle, int iconRes, int accentColor,
+                                     String actionLabel, Runnable onAction) {
+        final String safeTitle = title == null ? "" : title.trim();
+        final String safeSub = subtitle == null ? "" : subtitle.trim();
+        if (safeTitle.isEmpty() && safeSub.isEmpty()) return;
         Runnable task = () -> {
-            try {
-                BaseFragment target = fragment;
-                if (target == null) {
-                    target = LaunchActivity.getSafeLastFragment();
+            Activity act = resolveHudActivity(ctx);
+            if (!isValidActivity(act)) {
+                Context appCtx = ctx != null ? ctx.getApplicationContext() : ApplicationLoader.applicationContext;
+                if (appCtx != null) {
+                    String msg = safeSub.isEmpty() ? safeTitle : (safeTitle.isEmpty() ? safeSub : (safeTitle + " — " + safeSub));
+                    Toast.makeText(appCtx, msg, Toast.LENGTH_SHORT).show();
                 }
-                BulletinFactory bf = null;
-                Theme.ResourcesProvider rp = target != null ? target.getResourceProvider() : null;
-                if (target != null && target.getVisibleDialog() instanceof BottomSheet) {
-                    BottomSheet bs = (BottomSheet) target.getVisibleDialog();
-                    if (bs.container != null) {
-                        bf = BulletinFactory.of(bs.container, rp);
-                    }
-                } else if (BulletinFactory.canShowBulletin(target)) {
-                    bf = BulletinFactory.of(target);
-                }
-                if (bf != null) {
-                    Context resCtx = context != null ? context
-                            : (target != null ? target.getParentActivity() : ApplicationLoader.applicationContext);
-                    if (iconRes != 0 && resCtx != null) {
-                        Drawable d = ContextCompat.getDrawable(resCtx, iconRes);
-                        if (d != null) {
-                            Drawable mut = d.mutate();
-                            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
-                            mut.setColorFilter(isError ? pal.semanticCrimson : pal.accentPrimary, PorterDuff.Mode.SRC_IN);
-                            bf.createSimpleBulletin(mut, text).show();
-                            return;
-                        }
-                    }
-                    if (isError) {
-                        bf.createErrorBulletin(text, rp).show();
-                    } else {
-                        bf.createSuccessBulletin(text, rp).show();
-                    }
-                    return;
-                }
-            } catch (Throwable ignored) {
+                return;
             }
-            Context appCtx = context != null ? context.getApplicationContext() : ApplicationLoader.applicationContext;
-            if (appCtx != null) {
-                Toast.makeText(appCtx, text, isError ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
-            }
+            ColgramHudManager.getInstance().showBanner(act, safeTitle, safeSub, iconRes, accentColor, actionLabel, onAction);
         };
         if (Looper.myLooper() == Looper.getMainLooper()) {
             task.run();
         } else {
             UI_HANDLER.post(task);
+        }
+    }
+
+    public static ProgressHudHandle showProgressHud(Context ctx, int iconRes, CharSequence title,
+                                                    CharSequence initialMeta, Runnable onCancel) {
+        final ProgressHudHandle handle = new ProgressHudHandle(ctx, iconRes, title, initialMeta, onCancel);
+        Runnable startTask = handle::attachAndShowOnUi;
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            startTask.run();
+        } else {
+            UI_HANDLER.post(startTask);
+        }
+        return handle;
+    }
+
+    public static void showMalwareWarningSheet(
+            Activity act,
+            Theme.ResourcesProvider rp,
+            String fileName, String ext, long sizeBytes,
+            String threatReason, boolean isOpenAction,
+            Runnable onProceedConfirmed) {
+        if (!isValidActivity(act)) return;
+        final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        final LinearLayout root = makeSheetRoot(act, pal);
+        final String rawName = fileName == null ? "file" : fileName;
+        final boolean hasBidiSpoof = hasBidiOverrideChars(rawName);
+        final String displayName = sanitizeDisplayFilename(rawName);
+        final String extLabel = TextUtils.isEmpty(ext) ? "ФАЙЛ" : ext.trim().toUpperCase(Locale.ROOT);
+
+        root.addView(makeSheetHeader(
+                act, pal,
+                R.drawable.outline_shield_check, pal.semanticCrimson,
+                isOpenAction ? "Опасный файл перед запуском" : "Щит загрузок заблокировал файл",
+                isOpenAction ? "Проверьте тип файла перед открытием" : "Потенциально опасный или сверхбольшой файл",
+                extLabel
+        ), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+        LinearLayout infoCard = makeCard(act, pal, false);
+        TextView nameTv = new TextView(act);
+        nameTv.setText(displayName);
+        nameTv.setTextColor(pal.textPrimary);
+        nameTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.5f);
+        nameTv.setTypeface(AndroidUtilities.bold());
+        nameTv.setMaxLines(3);
+        nameTv.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        infoCard.addView(nameTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+
+        LinearLayout pillsRow = new LinearLayout(act);
+        pillsRow.setOrientation(LinearLayout.HORIZONTAL);
+        pillsRow.addView(makePillChip(act, formatBytesRu(sizeBytes),
+                withAlpha(pal.semanticCrimson, pal.dark ? 0x26 : 0x14),
+                pal.semanticCrimson, withAlpha(pal.semanticCrimson, 0x48)),
+                LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 0, 6, 0));
+        pillsRow.addView(makePillChip(act, "Тип: " + extLabel,
+                pal.chipSurface, pal.textSecondary, pal.borderSubtle),
+                LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 0, 0, 6, 0));
+        if (hasBidiSpoof) {
+            pillsRow.addView(makePillChip(act, "RLO-подмена!",
+                    withAlpha(pal.semanticAmber, 0x28), pal.semanticAmber, withAlpha(pal.semanticAmber, 0x55)),
+                    LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
+        }
+        infoCard.addView(pillsRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 10));
+
+        TextView reasonTv = new TextView(act);
+        String reason = TextUtils.isEmpty(threatReason)
+                ? "Файл содержит исполняемое расширение или превышает безопасный лимит автозагрузки."
+                : threatReason;
+        if (hasBidiSpoof) {
+            reason = reason + "\nОбнаружены скрытые символы направления текста (Unicode RLO), маскирующие расширение.";
+        }
+        reasonTv.setText(reason);
+        reasonTv.setTextColor(pal.textSecondary);
+        reasonTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f);
+        reasonTv.setLineSpacing(dp(2.5f), 1.0f);
+        infoCard.addView(reasonTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
+        scroll.addView(infoCard);
+        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
+
+        final BottomSheet sheet = createFlagshipSheet(act, rp, false, false, root);
+        LinearLayout btnRow = new LinearLayout(act);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView proceedBtn = makeCtaButton(
+                act,
+                isOpenAction ? "Всё равно открыть" : "Всё равно скачать",
+                pal.cardSurface,
+                pal.semanticCrimson,
+                true,
+                withAlpha(pal.semanticCrimson, 0x60)
+        );
+        proceedBtn.setOnClickListener(v -> {
+            sheet.dismiss();
+            if (onProceedConfirmed != null) onProceedConfirmed.run();
+        });
+
+        TextView cancelBtn = makeCtaButton(
+                act,
+                LocaleController.getString(R.string.Cancel),
+                pal.accentPrimary,
+                0xFFFFFFFF,
+                false,
+                0
+        );
+        cancelBtn.setOnClickListener(v -> sheet.dismiss());
+
+        btnRow.addView(proceedBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1.05f, 0, 0, 10, 0));
+        btnRow.addView(cancelBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f));
+        root.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+        sheet.show();
+    }
+
+    public static BottomSheet showEmojiTagPickerSheet(
+            Activity act,
+            Theme.ResourcesProvider rp,
+            int currentAccount,
+            int messageId,
+            Runnable onChanged) {
+        if (!isValidActivity(act) || messageId <= 0) return null;
+        final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        final LinearLayout root = makeSheetRoot(act, pal);
+        root.addView(makeSheetHeader(
+                act, pal,
+                R.drawable.msg_reactions, pal.accentPrimary,
+                "Теги в Избранном",
+                "Локальные теги хранятся в устройстве и фильтруют сообщения мгновенно",
+                null
+        ), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+        final LinearLayout grid = new LinearLayout(act);
+        grid.setOrientation(LinearLayout.VERTICAL);
+        final List<ColgramSavedTagsStore.TagPreset> presets = ColgramSavedTagsStore.DEFAULT_PRESETS;
+        final Runnable[] rebuildGrid = new Runnable[1];
+        rebuildGrid[0] = () -> {
+            grid.removeAllViews();
+            int cols = 3;
+            LinearLayout row = null;
+            for (int i = 0; i < presets.size(); i++) {
+                if (i % cols == 0) {
+                    row = new LinearLayout(act);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    grid.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+                }
+                final ColgramSavedTagsStore.TagPreset preset = presets.get(i);
+                boolean active = ColgramSavedTagsStore.hasTag(currentAccount, messageId, preset.emoji);
+                TextView chip = new TextView(act);
+                chip.setText(preset.emoji + " " + preset.label);
+                chip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
+                chip.setTypeface(active ? AndroidUtilities.bold() : Typeface.DEFAULT);
+                chip.setSingleLine(true);
+                chip.setEllipsize(TextUtils.TruncateAt.END);
+                chip.setGravity(Gravity.CENTER);
+                chip.setPadding(dp(8), dp(9), dp(8), dp(9));
+                int bg = active ? withAlpha(pal.accentPrimary, pal.dark ? 0x2E : 0x18) : pal.cardSurface;
+                int stroke = active ? pal.accentPrimary : pal.borderSubtle;
+                chip.setTextColor(active ? pal.accentPrimary : pal.textPrimary);
+                ColgramMenuChrome.attachTactileFeedback(chip, INNER_CARD_RADIUS_DP, bg, stroke,
+                        withAlpha(pal.accentPrimary, 0x24));
+                chip.setOnClickListener(v -> {
+                    ColgramSavedTagsStore.toggleTag(act, currentAccount, messageId, preset.emoji, preset.label);
+                    rebuildGrid[0].run();
+                    if (onChanged != null) onChanged.run();
+                });
+                row.addView(chip, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f,
+                        0, 0, (i % cols == cols - 1) ? 0 : 8, 0));
+            }
+            if (row != null && presets.size() % cols != 0) {
+                int missing = cols - (presets.size() % cols);
+                for (int m = 0; m < missing; m++) {
+                    View spacer = new View(act);
+                    row.addView(spacer, LayoutHelper.createLinear(0, 1, 1f, 0, 0, m == missing - 1 ? 0 : 8, 0));
+                }
+            }
+        };
+        rebuildGrid[0].run();
+
+        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
+        scroll.addView(grid);
+        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
+
+        final BottomSheet sheet = createFlagshipSheet(act, rp, false, false, root);
+        LinearLayout btnRow = new LinearLayout(act);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView customBtn = makeCtaButton(act, "Свой тег", pal.cardSurface, pal.textPrimary, true, pal.borderSubtle);
+        customBtn.setOnClickListener(v -> {
+            sheet.dismiss();
+            showInputSheet(act, rp, R.drawable.msg_reactions,
+                    "Свой эмодзи-тег", "Введите эмодзи (например 🚀 или 🔖)",
+                    "🚀", "", InputType.TYPE_CLASS_TEXT, false, false, true, "Добавить",
+                    val -> {
+                        String trimmed = val == null ? "" : val.trim();
+                        if (!trimmed.isEmpty()) {
+                            ColgramSavedTagsStore.addTag(act, currentAccount, messageId, trimmed, "");
+                            if (onChanged != null) onChanged.run();
+                        }
+                    }, null, null);
+        });
+
+        List<String> existing = ColgramSavedTagsStore.getTags(currentAccount, messageId);
+        if (!existing.isEmpty()) {
+            TextView clearBtn = makeCtaButton(act, "Сбросить", pal.cardSurface, pal.semanticCrimson, true,
+                    withAlpha(pal.semanticCrimson, 0x45));
+            clearBtn.setOnClickListener(v -> {
+                ColgramSavedTagsStore.clearMessageTags(act, currentAccount, messageId);
+                sheet.dismiss();
+                if (onChanged != null) onChanged.run();
+            });
+            btnRow.addView(clearBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 0.9f, 0, 0, 8, 0));
+        }
+        btnRow.addView(customBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f, 0, 0, 8, 0));
+
+        TextView doneBtn = makeCtaButton(act, LocaleController.getString(R.string.Done),
+                pal.accentPrimary, 0xFFFFFFFF, false, 0);
+        doneBtn.setOnClickListener(v -> sheet.dismiss());
+        btnRow.addView(doneBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f));
+        root.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+        sheet.show();
+        return sheet;
+    }
+
+    private static Activity resolveHudActivity(Context ctx) {
+        if (ctx instanceof Activity) {
+            Activity a = (Activity) ctx;
+            if (isValidActivity(a)) return a;
+        }
+        if (ctx != null) {
+            Activity found = AndroidUtilities.findActivity(ctx);
+            if (isValidActivity(found)) return found;
+        }
+        Activity cur = ColgramUiBridge.currentActivity();
+        if (isValidActivity(cur)) return cur;
+        return isValidActivity(LaunchActivity.instance) ? LaunchActivity.instance : null;
+    }
+
+    private static boolean hasBidiOverrideChars(String name) {
+        if (name == null) return false;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if ((c >= '\u202A' && c <= '\u202E') || (c >= '\u2066' && c <= '\u2069') || c == '\u200E' || c == '\u200F') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String sanitizeDisplayFilename(String name) {
+        if (name == null) return "";
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if ((c >= '\u202A' && c <= '\u202E') || (c >= '\u2066' && c <= '\u2069') || c == '\u200E' || c == '\u200F' || c < 0x20) {
+                continue;
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    private static String formatBytesRu(long bytes) {
+        if (bytes <= 0L) return "0 Б";
+        if (bytes >= 1024L * 1024L * 1024L) {
+            return String.format(Locale.US, "%.2f ГБ", bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        if (bytes >= 1024L * 1024L) {
+            return String.format(Locale.US, "%.1f МБ", bytes / (1024.0 * 1024.0));
+        }
+        if (bytes >= 1024L) {
+            return Math.max(1L, bytes / 1024L) + " КБ";
+        }
+        return bytes + " Б";
+    }
+
+    private static String formatProgressMetaRu(long copied, long total) {
+        if (total <= 0L) {
+            return copied <= 0L ? "Подготовка…" : formatBytesRu(copied);
+        }
+        if (total >= 1024L * 1024L * 1024L) {
+            return String.format(Locale.US, "%.2f / %.2f ГБ",
+                    Math.min(copied, total) / (1024.0 * 1024.0 * 1024.0),
+                    total / (1024.0 * 1024.0 * 1024.0));
+        }
+        if (total >= 1024L * 1024L) {
+            long cMb = Math.round(Math.min(copied, total) / (1024.0 * 1024.0));
+            long tMb = Math.max(1L, Math.round(total / (1024.0 * 1024.0)));
+            return cMb + " / " + tMb + " МБ";
+        }
+        long cKb = Math.round(Math.min(copied, total) / 1024.0);
+        long tKb = Math.max(1L, Math.round(total / 1024.0));
+        return cKb + " / " + tKb + " КБ";
+    }
+
+    public static final class ColgramProgressBarView extends View {
+        private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint shimmerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF trackRect = new RectF();
+        private final RectF fillRect = new RectF();
+        private final Matrix shimmerMatrix = new Matrix();
+        private LinearGradient fillShader;
+        private LinearGradient shimmerShader;
+        private int lastW;
+        private int accentColor;
+        private int trackColor;
+        private float animatedFraction = 0f;
+        private float targetFraction = 0f;
+        private boolean indeterminate = false;
+        private float shimmerOffset = 0f;
+        private ObjectAnimator fractionAnim;
+        private ValueAnimator shimmerAnim;
+
+        public ColgramProgressBarView(Context context) {
+            super(context);
+            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            this.accentColor = pal.accentPrimary;
+            this.trackColor = withAlpha(pal.textPrimary, pal.dark ? 0x1A : 0x12);
+        }
+
+        public void setAccentColor(int accent, int track) {
+            if (this.accentColor != accent || this.trackColor != track) {
+                this.accentColor = accent;
+                this.trackColor = track;
+                this.fillShader = null;
+                invalidate();
+            }
+        }
+
+        public float getAnimatedFraction() {
+            return animatedFraction;
+        }
+
+        public void setAnimatedFraction(float fraction) {
+            this.animatedFraction = Math.max(0f, Math.min(1f, fraction));
+            invalidate();
+        }
+
+        public void setProgressFraction(float fraction, boolean animate) {
+            float clamped = Math.max(0f, Math.min(1f, fraction));
+            if (indeterminate) {
+                indeterminate = false;
+                syncShimmerAnim();
+            }
+            targetFraction = clamped;
+            if (fractionAnim != null) {
+                fractionAnim.cancel();
+                fractionAnim = null;
+            }
+            if (animate && Math.abs(clamped - animatedFraction) > 0.002f) {
+                fractionAnim = ObjectAnimator.ofFloat(this, "animatedFraction", animatedFraction, clamped);
+                fractionAnim.setDuration(180L);
+                fractionAnim.setInterpolator(new DecelerateInterpolator());
+                fractionAnim.start();
+            } else {
+                setAnimatedFraction(clamped);
+            }
+        }
+
+        public void setIndeterminate(boolean ind) {
+            if (this.indeterminate != ind) {
+                this.indeterminate = ind;
+                if (ind && fractionAnim != null) {
+                    fractionAnim.cancel();
+                    fractionAnim = null;
+                }
+                syncShimmerAnim();
+                invalidate();
+            }
+        }
+
+        public void stopAnimations() {
+            if (fractionAnim != null) {
+                fractionAnim.cancel();
+                fractionAnim = null;
+            }
+            if (shimmerAnim != null) {
+                shimmerAnim.cancel();
+                shimmerAnim = null;
+            }
+        }
+
+        private void syncShimmerAnim() {
+            boolean shouldRun = indeterminate
+                    && isAttachedToWindow()
+                    && getVisibility() == VISIBLE
+                    && getWindowVisibility() == VISIBLE
+                    && !ApplicationLoader.mainInterfacePaused;
+            if (shouldRun && shimmerAnim == null) {
+                shimmerAnim = ValueAnimator.ofFloat(0f, 1f);
+                shimmerAnim.setDuration(1100L);
+                shimmerAnim.setRepeatCount(ValueAnimator.INFINITE);
+                shimmerAnim.setInterpolator(new LinearInterpolator());
+                shimmerAnim.addUpdateListener(a -> {
+                    shimmerOffset = (float) a.getAnimatedValue();
+                    invalidate();
+                });
+                shimmerAnim.start();
+            } else if (!shouldRun && shimmerAnim != null) {
+                shimmerAnim.cancel();
+                shimmerAnim = null;
+            }
+        }
+
+        @Override
+        protected void onAttachedToWindow() {
+            super.onAttachedToWindow();
+            syncShimmerAnim();
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            super.onDetachedFromWindow();
+            stopAnimations();
+        }
+
+        @Override
+        protected void onWindowVisibilityChanged(int visibility) {
+            super.onWindowVisibilityChanged(visibility);
+            syncShimmerAnim();
+        }
+
+        @Override
+        protected void onVisibilityChanged(@NonNull View changedView, int visibility) {
+            super.onVisibilityChanged(changedView, visibility);
+            syncShimmerAnim();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            int w = getWidth();
+            int h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float r = h * 0.5f;
+
+            trackPaint.setColor(trackColor);
+            trackRect.set(0f, 0f, w, h);
+            canvas.drawRoundRect(trackRect, r, r, trackPaint);
+
+            if (fillShader == null || lastW != w) {
+                lastW = w;
+                int c2 = ColgramAeroStyler.Palette.resolve().accentSecondary;
+                if (accentColor != ColgramAeroStyler.Palette.resolve().accentPrimary) {
+                    c2 = accentColor;
+                }
+                fillShader = new LinearGradient(0f, 0f, w, 0f, accentColor, c2, Shader.TileMode.CLAMP);
+                fillPaint.setShader(fillShader);
+                shimmerShader = new LinearGradient(-w * 0.35f, 0f, w * 0.35f, 0f,
+                        new int[]{withAlpha(accentColor, 0x33), accentColor, withAlpha(accentColor, 0x33)},
+                        new float[]{0f, 0.5f, 1f}, Shader.TileMode.CLAMP);
+                shimmerPaint.setShader(shimmerShader);
+            }
+
+            if (indeterminate) {
+                float barW = w * 0.42f;
+                float startX = (w + barW) * shimmerOffset - barW;
+                shimmerMatrix.setTranslate(startX, 0f);
+                shimmerShader.setLocalMatrix(shimmerMatrix);
+                fillRect.set(Math.max(0f, startX), 0f, Math.min(w, startX + barW), h);
+                if (fillRect.width() > 0f) {
+                    canvas.drawRoundRect(fillRect, r, r, shimmerPaint);
+                }
+            } else if (animatedFraction > 0f) {
+                float fillW = Math.max(h, w * animatedFraction);
+                fillRect.set(0f, 0f, Math.min(w, fillW), h);
+                canvas.drawRoundRect(fillRect, r, r, fillPaint);
+            }
+        }
+    }
+
+    public static final class ProgressHudHandle {
+        private final Context initCtx;
+        private final int iconRes;
+        private final CharSequence initTitle;
+        private final CharSequence initMeta;
+        private final Runnable onCancel;
+
+        private boolean attached;
+        private boolean finished;
+        private boolean dismissed;
+        private long lastBytes;
+        private long lastTotal;
+        private CharSequence latestTitle;
+        private CharSequence latestMeta;
+        private ColgramHudManager.HudCardView cardView;
+
+        ProgressHudHandle(Context ctx, int iconRes, CharSequence title, CharSequence initialMeta, Runnable onCancel) {
+            this.initCtx = ctx;
+            this.iconRes = iconRes;
+            this.initTitle = title == null ? "" : title;
+            this.initMeta = initialMeta == null ? "" : initialMeta;
+            this.onCancel = onCancel;
+            this.latestTitle = this.initTitle;
+            this.latestMeta = this.initMeta;
+        }
+
+        void attachAndShowOnUi() {
+            if (dismissed || finished) return;
+            Activity act = resolveHudActivity(initCtx);
+            if (!isValidActivity(act)) return;
+            cardView = ColgramHudManager.getInstance().showProgressCard(
+                    act, iconRes != 0 ? iconRes : R.drawable.msg_download,
+                    latestTitle, latestMeta, () -> {
+                        dismiss();
+                        if (onCancel != null) {
+                            onCancel.run();
+                        }
+                    });
+            attached = cardView != null;
+            if (attached && lastTotal > 0L) {
+                cardView.updateProgress(lastBytes, lastTotal, latestTitle);
+            }
+        }
+
+        public void update(long bytesCopied, long totalBytes, CharSequence titleOrNull) {
+            Runnable r = () -> {
+                if (dismissed || finished) return;
+                lastBytes = bytesCopied;
+                lastTotal = totalBytes;
+                if (titleOrNull != null) {
+                    latestTitle = titleOrNull;
+                }
+                latestMeta = formatProgressMetaRu(bytesCopied, totalBytes);
+                if (!attached) {
+                    attachAndShowOnUi();
+                }
+                if (cardView != null) {
+                    cardView.updateProgress(bytesCopied, totalBytes, latestTitle);
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+            else UI_HANDLER.post(r);
+        }
+
+        public void setIndeterminate(CharSequence meta) {
+            Runnable r = () -> {
+                if (dismissed || finished) return;
+                latestMeta = meta == null ? "" : meta;
+                if (!attached) {
+                    attachAndShowOnUi();
+                }
+                if (cardView != null) {
+                    cardView.setProgressIndeterminate(latestMeta);
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+            else UI_HANDLER.post(r);
+        }
+
+        public void complete(CharSequence doneTitle, CharSequence doneSub) {
+            Runnable r = () -> {
+                if (dismissed || finished) return;
+                finished = true;
+                if (!attached) {
+                    attachAndShowOnUi();
+                }
+                if (cardView != null) {
+                    ColgramHudManager.getInstance().completeProgressCard(cardView, doneTitle, doneSub);
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+            else UI_HANDLER.post(r);
+        }
+
+        public void fail(CharSequence errTitle, CharSequence errSub) {
+            Runnable r = () -> {
+                if (dismissed || finished) return;
+                finished = true;
+                if (!attached) {
+                    attachAndShowOnUi();
+                }
+                if (cardView != null) {
+                    ColgramHudManager.getInstance().failProgressCard(cardView, errTitle, errSub);
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+            else UI_HANDLER.post(r);
+        }
+
+        public void dismiss() {
+            Runnable r = () -> {
+                if (dismissed) return;
+                dismissed = true;
+                if (cardView != null) {
+                    ColgramHudManager.getInstance().dismissCard(cardView);
+                    cardView = null;
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+            else UI_HANDLER.post(r);
+        }
+    }
+
+    private static final class ColgramHudManager {
+        private static final ColgramHudManager INSTANCE = new ColgramHudManager();
+
+        static ColgramHudManager getInstance() {
+            return INSTANCE;
+        }
+
+        private HudCardView activeBanner;
+        private HudCardView activeProgress;
+        private final Runnable autoDismissBanner = () -> {
+            if (activeBanner != null) {
+                dismissCard(activeBanner);
+            }
+        };
+        private final Runnable autoDismissProgress = () -> {
+            if (activeProgress != null) {
+                dismissCard(activeProgress);
+            }
+        };
+
+        void showBanner(Activity act, String title, String subtitle, int iconRes, int accentColor,
+                        String actionLabel, Runnable onAction) {
+            UI_HANDLER.removeCallbacks(autoDismissBanner);
+            ViewGroup host = resolveOverlayHost(act);
+            if (host == null) return;
+
+            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            int effAccent = accentColor != 0 ? accentColor : pal.accentPrimary;
+            int effIcon = iconRes != 0 ? iconRes
+                    : (effAccent == pal.semanticCrimson ? R.drawable.msg_info : R.drawable.msg_check_s);
+
+            if (activeBanner != null && activeBanner.getParent() == host && !activeBanner.isDismissing) {
+                activeBanner.bindBanner(pal, effIcon, effAccent, title, subtitle, actionLabel, onAction);
+                applyHostMargins(host, activeBanner, false);
+                long delay = (effAccent == pal.semanticCrimson || safeLen(subtitle) > 48) ? 4000L : 2800L;
+                UI_HANDLER.postDelayed(autoDismissBanner, delay);
+                return;
+            }
+            if (activeBanner != null) {
+                removeImmediate(activeBanner);
+                activeBanner = null;
+            }
+
+            HudCardView card = new HudCardView(act, false, () -> dismissCard(activeBanner));
+            card.bindBanner(pal, effIcon, effAccent, title, subtitle, actionLabel, onAction);
+            activeBanner = card;
+            attachAndAnimateIn(host, card, false);
+
+            long delay = (effAccent == pal.semanticCrimson || safeLen(subtitle) > 48) ? 4000L : 2800L;
+            UI_HANDLER.postDelayed(autoDismissBanner, delay);
+        }
+
+        HudCardView showProgressCard(Activity act, int iconRes, CharSequence title, CharSequence meta, Runnable onCancel) {
+            UI_HANDLER.removeCallbacks(autoDismissProgress);
+            ViewGroup host = resolveOverlayHost(act);
+            if (host == null) return null;
+            if (activeProgress != null) {
+                removeImmediate(activeProgress);
+                activeProgress = null;
+            }
+            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            HudCardView card = new HudCardView(act, true, onCancel);
+            card.bindProgress(pal, iconRes, pal.accentPrimary, title, meta);
+            activeProgress = card;
+            attachAndAnimateIn(host, card, true);
+            return card;
+        }
+
+        void completeProgressCard(HudCardView card, CharSequence title, CharSequence sub) {
+            if (card == null || card.isDismissing) return;
+            UI_HANDLER.removeCallbacks(autoDismissProgress);
+            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            card.showCompleted(pal, title, sub);
+            UI_HANDLER.postDelayed(autoDismissProgress, 1200L);
+        }
+
+        void failProgressCard(HudCardView card, CharSequence title, CharSequence sub) {
+            if (card == null || card.isDismissing) return;
+            UI_HANDLER.removeCallbacks(autoDismissProgress);
+            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            card.showFailed(pal, title, sub);
+            UI_HANDLER.postDelayed(autoDismissProgress, 3200L);
+        }
+
+        void dismissCard(HudCardView card) {
+            if (card == null || card.isDismissing) return;
+            card.isDismissing = true;
+            if (card == activeBanner) {
+                UI_HANDLER.removeCallbacks(autoDismissBanner);
+            } else if (card == activeProgress) {
+                UI_HANDLER.removeCallbacks(autoDismissProgress);
+            }
+            if (card.progressBar != null) {
+                card.progressBar.stopAnimations();
+            }
+            float targetY = card.topOverlay ? -dp(24) : dp(24);
+            card.animate().cancel();
+            card.animate()
+                    .alpha(0f)
+                    .translationY(targetY)
+                    .scaleX(0.96f)
+                    .scaleY(0.96f)
+                    .setDuration(190L)
+                    .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
+                    .setListener(new AnimatorListenerAdapter() {
+                        @Override
+                        public void onAnimationEnd(Animator animation) {
+                            removeImmediate(card);
+                            if (card == activeBanner) activeBanner = null;
+                            if (card == activeProgress) activeProgress = null;
+                        }
+                    })
+                    .start();
+        }
+
+        private void removeImmediate(HudCardView card) {
+            if (card == null) return;
+            if (card.progressBar != null) {
+                card.progressBar.stopAnimations();
+            }
+            if (card.getParent() instanceof ViewGroup) {
+                ((ViewGroup) card.getParent()).removeView(card);
+            }
+        }
+
+        private ViewGroup resolveOverlayHost(Activity act) {
+            if (!isValidActivity(act)) return null;
+            try {
+                BaseFragment last = LaunchActivity.getSafeLastFragment();
+                if (last != null && last.getVisibleDialog() instanceof BottomSheet) {
+                    BottomSheet bs = (BottomSheet) last.getVisibleDialog();
+                    if (bs.isShowing() && bs.getWindow() != null && bs.getWindow().getDecorView() instanceof ViewGroup) {
+                        return (ViewGroup) bs.getWindow().getDecorView();
+                    }
+                }
+            } catch (Throwable ignored) {}
+            if (act.getWindow() != null && act.getWindow().getDecorView() instanceof ViewGroup) {
+                return (ViewGroup) act.getWindow().getDecorView();
+            }
+            return null;
+        }
+
+        private void attachAndAnimateIn(ViewGroup host, HudCardView card, boolean topOverlay) {
+            int screenW = AndroidUtilities.displaySize != null && AndroidUtilities.displaySize.x > 0
+                    ? AndroidUtilities.displaySize.x : dp(360);
+            int maxW = Math.min(screenW - dp(28), dp(420));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    maxW,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    (topOverlay ? Gravity.TOP : Gravity.BOTTOM) | Gravity.CENTER_HORIZONTAL
+            );
+            card.setLayoutParams(lp);
+            applyHostMargins(host, card, topOverlay);
+
+            ViewCompat.setOnApplyWindowInsetsListener(card, (v, insets) -> {
+                applyHostMargins(host, card, topOverlay, insets);
+                return insets;
+            });
+
+            host.addView(card);
+            card.setAlpha(0f);
+            card.setScaleX(0.96f);
+            card.setScaleY(0.96f);
+            card.setTranslationY(topOverlay ? -dp(20) : dp(20));
+            card.animate()
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .translationY(0f)
+                    .setDuration(240L)
+                    .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
+                    .start();
+        }
+
+        private void applyHostMargins(ViewGroup host, HudCardView card, boolean topOverlay) {
+            WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(host);
+            applyHostMargins(host, card, topOverlay, insets);
+        }
+
+        private void applyHostMargins(ViewGroup host, HudCardView card, boolean topOverlay, WindowInsetsCompat insets) {
+            if (!(card.getLayoutParams() instanceof FrameLayout.LayoutParams)) return;
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) card.getLayoutParams();
+            int topInset = AndroidUtilities.statusBarHeight;
+            int bottomInset = AndroidUtilities.navigationBarHeight;
+            if (insets != null) {
+                Insets sys = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+                Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+                topInset = Math.max(topInset, sys.top);
+                bottomInset = Math.max(bottomInset, Math.max(sys.bottom, ime.bottom));
+            }
+            if (topOverlay) {
+                lp.topMargin = topInset + dp(10);
+            } else {
+                lp.bottomMargin = bottomInset + dp(14);
+            }
+            card.setLayoutParams(lp);
+        }
+
+        private static int safeLen(String s) {
+            return s == null ? 0 : s.length();
+        }
+
+        static final class HudCardView extends LinearLayout {
+            final boolean topOverlay;
+            final FrameLayout iconBadge;
+            final ImageView iconView;
+            final TextView titleView;
+            final TextView subtitleView;
+            final TextView metaView;
+            final ColgramProgressBarView progressBar;
+            final TextView ctaBtn;
+            final ImageView closeBtn;
+            final Runnable onClose;
+            boolean isDismissing;
+            private float downX;
+            private float downY;
+            private boolean swiping;
+
+            HudCardView(Context ctx, boolean isProgress, Runnable onClose) {
+                super(ctx);
+                this.topOverlay = isProgress;
+                this.onClose = onClose;
+                setOrientation(HORIZONTAL);
+                setGravity(Gravity.CENTER_VERTICAL);
+                setPadding(dp(14), dp(11), dp(14), dp(11));
+                if (Build.VERSION.SDK_INT >= 21) {
+                    setElevation(dp(10));
+                }
+
+                iconBadge = new FrameLayout(ctx);
+                iconView = new ImageView(ctx);
+                iconView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                iconBadge.addView(iconView, LayoutHelper.createFrame(18, 18, Gravity.CENTER));
+                addView(iconBadge, LayoutHelper.createLinear(34, 34, Gravity.CENTER_VERTICAL, 0, 0, 12, 0));
+
+                LinearLayout centerCol = new LinearLayout(ctx);
+                centerCol.setOrientation(VERTICAL);
+                addView(centerCol, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
+
+                if (isProgress) {
+                    LinearLayout topLine = new LinearLayout(ctx);
+                    topLine.setOrientation(HORIZONTAL);
+                    topLine.setGravity(Gravity.CENTER_VERTICAL);
+
+                    titleView = new TextView(ctx);
+                    titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f);
+                    titleView.setTypeface(AndroidUtilities.bold());
+                    titleView.setMaxLines(1);
+                    titleView.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+                    topLine.addView(titleView, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, 0, 0, 8, 0));
+
+                    metaView = new TextView(ctx);
+                    metaView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
+                    metaView.setMaxLines(1);
+                    topLine.addView(metaView, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
+                    centerCol.addView(topLine, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+                    subtitleView = new TextView(ctx);
+                    subtitleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
+                    subtitleView.setMaxLines(1);
+                    subtitleView.setEllipsize(TextUtils.TruncateAt.END);
+                    subtitleView.setVisibility(GONE);
+                    centerCol.addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+
+                    progressBar = new ColgramProgressBarView(ctx);
+                    centerCol.addView(progressBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 6, 0, 6, 0, 0));
+                    ctaBtn = null;
+                } else {
+                    titleView = new TextView(ctx);
+                    titleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
+                    titleView.setTypeface(AndroidUtilities.bold());
+                    titleView.setMaxLines(2);
+                    titleView.setEllipsize(TextUtils.TruncateAt.END);
+                    centerCol.addView(titleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+                    subtitleView = new TextView(ctx);
+                    subtitleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
+                    subtitleView.setMaxLines(2);
+                    subtitleView.setEllipsize(TextUtils.TruncateAt.END);
+                    centerCol.addView(subtitleView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+
+                    metaView = null;
+                    progressBar = null;
+
+                    ctaBtn = new TextView(ctx);
+                    ctaBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
+                    ctaBtn.setTypeface(AndroidUtilities.bold());
+                    ctaBtn.setPadding(dp(10), dp(6), dp(10), dp(6));
+                    ctaBtn.setSingleLine(true);
+                    ctaBtn.setVisibility(GONE);
+                    addView(ctaBtn, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT,
+                            Gravity.CENTER_VERTICAL, 8, 0, 0, 0));
+                }
+
+                closeBtn = new ImageView(ctx);
+                closeBtn.setImageResource(R.drawable.msg_close);
+                closeBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                closeBtn.setPadding(dp(6), dp(6), dp(6), dp(6));
+                closeBtn.setOnClickListener(v -> {
+                    if (onClose != null) onClose.run();
+                });
+                addView(closeBtn, LayoutHelper.createLinear(28, 28, Gravity.CENTER_VERTICAL, 8, 0, 0, 0));
+            }
+
+            private void applySurface(ColgramAeroStyler.Palette pal, int accent, int iconRes) {
+                int surface = withAlpha(pal.cardElevated, 0xF2);
+                int border = withAlpha(accent, pal.dark ? 0x52 : 0x34);
+                setBackground(makeRoundedBg(surface, 18f, border, 1f));
+                iconBadge.setBackground(makeRoundedBg(withAlpha(accent, 0x22), 10f, withAlpha(accent, 0x44), 1f));
+                if (iconRes != 0) {
+                    iconView.setImageResource(iconRes);
+                }
+                iconView.setColorFilter(accent, PorterDuff.Mode.SRC_IN);
+                titleView.setTextColor(pal.textPrimary);
+                subtitleView.setTextColor(pal.textSecondary);
+                if (metaView != null) {
+                    metaView.setTextColor(pal.textSecondary);
+                }
+                closeBtn.setBackground(makeRoundedBg(withAlpha(pal.textPrimary, pal.dark ? 0x16 : 0x0E),
+                        PILL_RADIUS_DP, 0, 0f));
+                closeBtn.setColorFilter(pal.textSecondary, PorterDuff.Mode.SRC_IN);
+            }
+
+            void bindBanner(ColgramAeroStyler.Palette pal, int iconRes, int accent,
+                            String title, String subtitle, String actionLabel, Runnable onAction) {
+                applySurface(pal, accent, iconRes);
+                titleView.setText(title == null ? "" : title);
+                if (TextUtils.isEmpty(subtitle)) {
+                    subtitleView.setVisibility(GONE);
+                } else {
+                    subtitleView.setText(subtitle);
+                    subtitleView.setVisibility(VISIBLE);
+                }
+                if (ctaBtn != null) {
+                    if (!TextUtils.isEmpty(actionLabel) && onAction != null) {
+                        ctaBtn.setText(actionLabel);
+                        ctaBtn.setTextColor(accent);
+                        ColgramMenuChrome.attachTactileFeedback(ctaBtn, PILL_RADIUS_DP,
+                                withAlpha(accent, 0x1E), withAlpha(accent, 0x44), withAlpha(accent, 0x30));
+                        ctaBtn.setOnClickListener(v -> {
+                            onAction.run();
+                            if (onClose != null) onClose.run();
+                        });
+                        ctaBtn.setVisibility(VISIBLE);
+                        closeBtn.setVisibility(GONE);
+                    } else {
+                        ctaBtn.setVisibility(GONE);
+                        closeBtn.setVisibility(VISIBLE);
+                    }
+                }
+            }
+
+            void bindProgress(ColgramAeroStyler.Palette pal, int iconRes, int accent,
+                              CharSequence title, CharSequence meta) {
+                applySurface(pal, accent, iconRes);
+                titleView.setText(title == null ? "" : title);
+                if (metaView != null) {
+                    metaView.setText(meta == null ? "" : meta);
+                }
+                if (progressBar != null) {
+                    progressBar.setAccentColor(accent, withAlpha(pal.textPrimary, pal.dark ? 0x1A : 0x12));
+                    progressBar.setIndeterminate(true);
+                }
+            }
+
+            void updateProgress(long copied, long total, CharSequence titleOrNull) {
+                if (titleOrNull != null) {
+                    titleView.setText(titleOrNull);
+                }
+                if (metaView != null) {
+                    metaView.setText(formatProgressMetaRu(copied, total));
+                }
+                if (progressBar != null) {
+                    if (total > 0L) {
+                        float frac = Math.max(0f, Math.min(1f, (float) copied / (float) total));
+                        progressBar.setProgressFraction(frac, true);
+                    } else {
+                        progressBar.setIndeterminate(true);
+                    }
+                }
+            }
+
+            void setProgressIndeterminate(CharSequence meta) {
+                if (metaView != null && meta != null) {
+                    metaView.setText(meta);
+                }
+                if (progressBar != null) {
+                    progressBar.setIndeterminate(true);
+                }
+            }
+
+            void showCompleted(ColgramAeroStyler.Palette pal, CharSequence doneTitle, CharSequence doneSub) {
+                applySurface(pal, pal.semanticEmerald, R.drawable.msg_check_s);
+                titleView.setText(TextUtils.isEmpty(doneTitle) ? "Готово" : doneTitle);
+                if (!TextUtils.isEmpty(doneSub)) {
+                    subtitleView.setText(doneSub);
+                    subtitleView.setVisibility(VISIBLE);
+                }
+                if (metaView != null) {
+                    metaView.setText("Готово");
+                    metaView.setTextColor(pal.semanticEmerald);
+                }
+                if (progressBar != null) {
+                    progressBar.setAccentColor(pal.semanticEmerald, withAlpha(pal.semanticEmerald, 0x22));
+                    progressBar.setProgressFraction(1f, true);
+                }
+                closeBtn.setVisibility(GONE);
+            }
+
+            void showFailed(ColgramAeroStyler.Palette pal, CharSequence errTitle, CharSequence errSub) {
+                applySurface(pal, pal.semanticCrimson, R.drawable.msg_info);
+                titleView.setText(TextUtils.isEmpty(errTitle) ? "Ошибка" : errTitle);
+                if (!TextUtils.isEmpty(errSub)) {
+                    subtitleView.setText(errSub);
+                    subtitleView.setVisibility(VISIBLE);
+                }
+                if (metaView != null) {
+                    metaView.setText("");
+                }
+                if (progressBar != null) {
+                    progressBar.stopAnimations();
+                    progressBar.setVisibility(GONE);
+                }
+                closeBtn.setVisibility(VISIBLE);
+            }
+
+            @Override
+            public boolean onInterceptTouchEvent(MotionEvent ev) {
+                if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    downX = ev.getRawX();
+                    downY = ev.getRawY();
+                    swiping = false;
+                } else if (ev.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                    if (Math.abs(ev.getRawX() - downX) > dp(10) || Math.abs(ev.getRawY() - downY) > dp(12)) {
+                        swiping = true;
+                        return true;
+                    }
+                }
+                return super.onInterceptTouchEvent(ev);
+            }
+
+            @Override
+            public boolean onTouchEvent(MotionEvent ev) {
+                int action = ev.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    downX = ev.getRawX();
+                    downY = ev.getRawY();
+                    return true;
+                } else if (action == MotionEvent.ACTION_MOVE) {
+                    float dx = ev.getRawX() - downX;
+                    float dy = ev.getRawY() - downY;
+                    if (Math.abs(dx) > dp(8) || Math.abs(dy) > dp(10)) {
+                        swiping = true;
+                    }
+                    if (swiping) {
+                        setTranslationX(dx);
+                        setAlpha(Math.max(0.25f, 1f - Math.abs(dx) / (float) Math.max(1, getWidth())));
+                    }
+                    return true;
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    float dx = ev.getRawX() - downX;
+                    float dy = ev.getRawY() - downY;
+                    if (swiping && (Math.abs(dx) > dp(56) || (topOverlay && dy < -dp(32)) || (!topOverlay && dy > dp(32)))) {
+                        if (onClose != null) {
+                            onClose.run();
+                        }
+                    } else if (swiping) {
+                        animate().translationX(0f).alpha(1f).setDuration(160L).start();
+                    }
+                    swiping = false;
+                    return true;
+                }
+                return super.onTouchEvent(ev);
+            }
         }
     }
 

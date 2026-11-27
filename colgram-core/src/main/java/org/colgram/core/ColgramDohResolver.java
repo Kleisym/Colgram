@@ -140,34 +140,33 @@ public final class ColgramDohResolver {
      * Mullvad 194.242.2.2 timeout, Yandex 77.88.8.8:443 HTTP/2-only) are excluded.
      */
     private static final Endpoint[] ENDPOINTS = {
-            // Wave 1 triplet: Comss RU (DoH, spoofed SNI) + Yandex (DoT:853, spoofed SNI) + AdGuard (DoH)
-            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
-            new Endpoint("77.88.8.8", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
-            new Endpoint("94.140.14.14", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
-            // Wave 2 triplet: Cloudflare + Google + Comss backup
+            // Wave 1 triplet: Cloudflare + AdGuard + ControlD (non-RU encrypted HTTP/1.1 DoH)
             new Endpoint("1.1.1.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
-            new Endpoint("8.8.8.8", "dns.google", "dns.google", 443, false, true, "google"),
-            new Endpoint("141.133.183.77", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
-            // Wave 3 triplet: AliDNS (spoofed SNI) + ControlD + DNS.SB (spoofed SNI)
-            new Endpoint("223.5.5.5", "dns.alidns.com", "dns.alidns.com", 443, false, true, "alidns"),
+            new Endpoint("94.140.14.14", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
             new Endpoint("76.76.2.0", "freedns.controld.com", "freedns.controld.com", 443, false, false, "controld"),
+            // Wave 2 triplet: Google + DNS.SB + Cloudflare backup (non-RU encrypted DoH)
+            new Endpoint("8.8.8.8", "dns.google", "dns.google", 443, false, true, "google"),
             new Endpoint("45.11.45.11", "doh.dns.sb", "doh.dns.sb", 443, false, true, "dnssb"),
-            // Wave 4 triplet: Comss + Yandex DoT backup + AdGuard backup
+            new Endpoint("1.0.0.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
+            // Wave 3 triplet: AdGuard backup + Google backup + Comss RU (RU fallback only after non-RU)
+            new Endpoint("94.140.15.15", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
+            new Endpoint("8.8.4.4", "dns.google", "dns.google", 443, false, true, "google"),
+            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            // Wave 4+ RU-whitelisted DoH/DoT & AliDNS backups (only when non-RU DoH fails and max-anonymity is OFF)
+            new Endpoint("77.88.8.8", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
+            new Endpoint("141.133.183.77", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            new Endpoint("223.5.5.5", "dns.alidns.com", "dns.alidns.com", 443, false, true, "alidns"),
             new Endpoint("212.109.195.93", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
             new Endpoint("77.88.8.1", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
-            new Endpoint("94.140.15.15", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
-            // Wave 5 backups: Cloudflare + Google + Comss
-            new Endpoint("1.0.0.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
-            new Endpoint("8.8.4.4", "dns.google", "dns.google", 443, false, true, "google"),
             new Endpoint("155.212.172.101", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
             new Endpoint("212.109.221.20", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
     };
 
     /** Uncensored IPv6 DoH/DoT endpoints interleaved automatically on dual-stack 4G/LTE networks. */
     private static final Endpoint[] IPV6_ENDPOINTS = {
+            new Endpoint("2606:4700:4700::1111", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
             new Endpoint("2a10:50c0::ad1:ff", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
             new Endpoint("2001:4860:4860::8888", "dns.google", "dns.google", 443, false, true, "google"),
-            new Endpoint("2606:4700:4700::1111", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
             new Endpoint("2a02:6b8::feed:0ff", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
     };
 
@@ -313,23 +312,50 @@ public final class ColgramDohResolver {
         return activeEndpoints(hasRoutableIpv6ForCurrentSocket(false));
     }
 
+    private static boolean isRuOrCnEndpoint(Endpoint ep) {
+        if (ep == null || ep.providerGroup == null) return false;
+        return "comss".equals(ep.providerGroup)
+                || "yandex".equals(ep.providerGroup)
+                || "alidns".equals(ep.providerGroup);
+    }
+
     private static List<Endpoint> activeEndpoints(boolean allowIpv6) {
         boolean v6 = allowIpv6;
+        boolean skipRuCn = ColgramConfig.isMaxAnonymityEnabled();
         List<Endpoint> out = new ArrayList<>(ENDPOINTS.length + (v6 ? IPV6_ENDPOINTS.length : 0));
         if (!v6) {
-            for (Endpoint ep : ENDPOINTS) out.add(ep);
+            for (Endpoint ep : ENDPOINTS) {
+                if (!skipRuCn || !isRuOrCnEndpoint(ep)) out.add(ep);
+            }
+            if (out.isEmpty()) {
+                for (Endpoint ep : ENDPOINTS) out.add(ep);
+            }
             return out;
         }
         // Interleave IPv6 DoH early (every 2 IPv4 endpoints) so IPv4-blackholed dual-stack 4G wins on Wave 1!
         int v6Idx = 0;
         for (int i = 0; i < ENDPOINTS.length; i++) {
-            out.add(ENDPOINTS[i]);
-            if ((i == 1 || i == 3 || i == 5) && v6Idx < IPV6_ENDPOINTS.length) {
-                out.add(IPV6_ENDPOINTS[v6Idx++]);
+            Endpoint ep = ENDPOINTS[i];
+            if (!skipRuCn || !isRuOrCnEndpoint(ep)) {
+                out.add(ep);
+            }
+            if ((i == 1 || i == 3 || i == 5)) {
+                while (v6Idx < IPV6_ENDPOINTS.length && skipRuCn && isRuOrCnEndpoint(IPV6_ENDPOINTS[v6Idx])) {
+                    v6Idx++;
+                }
+                if (v6Idx < IPV6_ENDPOINTS.length) {
+                    out.add(IPV6_ENDPOINTS[v6Idx++]);
+                }
             }
         }
         while (v6Idx < IPV6_ENDPOINTS.length) {
-            out.add(IPV6_ENDPOINTS[v6Idx++]);
+            Endpoint v6Ep = IPV6_ENDPOINTS[v6Idx++];
+            if (!skipRuCn || !isRuOrCnEndpoint(v6Ep)) {
+                out.add(v6Ep);
+            }
+        }
+        if (out.isEmpty()) {
+            for (Endpoint ep : ENDPOINTS) out.add(ep);
         }
         return out;
     }
@@ -574,14 +600,25 @@ public final class ColgramDohResolver {
      * an explicit entry point rather than a global override. ColgramHttp calls it before every
      * request, and {@link #prefetch} warms the cache for names the app is about to need.
      */
+    private static boolean isStrictEncryptedDnsOnly() {
+        return ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled();
+    }
+
     /**
      * Resolve a name using DoH first when enabled so ISP/system DNS never sees queried domains,
      * falling back to system DNS only when DoH fails and strict proxy security allows it.
      */
     public static InetAddress[] resolveOrSystem(String hostname) {
-        InetAddress[] viaDoh = resolve(hostname);
+        if (hostname == null) return null;
+        String cleaned = hostname.trim();
+        if (cleaned.isEmpty()) return null;
+        if (isIpLiteral(cleaned)) return resolveSystem(cleaned);
+        InetAddress[] viaDoh = resolve(cleaned);
         if (viaDoh != null && viaDoh.length > 0) return viaDoh;
-        InetAddress[] system = resolveSystem(hostname);
+        if (isStrictEncryptedDnsOnly()) {
+            return new InetAddress[0];
+        }
+        InetAddress[] system = resolveSystem(cleaned);
         return system != null ? system : new InetAddress[0];
     }
 
@@ -589,13 +626,17 @@ public final class ColgramDohResolver {
      * One address for `hostname`, or null when no permitted resolver can answer.
      */
     public static InetAddress resolveOrNull(String hostname) {
-        InetAddress[] viaDoh = resolve(hostname);
+        if (hostname == null) return null;
+        String cleaned = hostname.trim();
+        if (cleaned.isEmpty()) return null;
+        if (isIpLiteral(cleaned)) return pickReachable(resolveSystem(cleaned));
+        InetAddress[] viaDoh = resolve(cleaned);
         InetAddress usable = pickReachable(viaDoh);
         if (usable != null) return usable;
-        if (ColgramConfig.isDohEnabled() && ColgramConfig.isStrictProxySecurityEnabled()) {
+        if (isStrictEncryptedDnsOnly()) {
             return null;
         }
-        InetAddress[] system = resolveSystem(hostname);
+        InetAddress[] system = resolveSystem(cleaned);
         return pickReachable(system);
     }
 
@@ -807,9 +848,12 @@ public final class ColgramDohResolver {
                 result = queryEndpoints(key, cleaned, System.currentTimeMillis(), true);
                 if (result != null) return result;
             }
-            if (ColgramConfig.isStrictProxySecurityEnabled()) {
+            if (isStrictEncryptedDnsOnly()) {
                 return null;
             }
+        }
+        if (isStrictEncryptedDnsOnly()) {
+            return null;
         }
         return resolveSystem(cleaned);
     }
@@ -864,7 +908,7 @@ public final class ColgramDohResolver {
                 }
             }
         }
-        if (merged.isEmpty()) {
+        if (merged.isEmpty() && !isStrictEncryptedDnsOnly()) {
             InetAddress[] sys = resolveSystem(cleaned);
             if (sys != null) {
                 for (InetAddress a : sys) {
@@ -1069,23 +1113,28 @@ public final class ColgramDohResolver {
             }
         }
 
-        // 3. Last-resort encrypted Russian-whitelisted RFC 7858 DoT:853 if not already tried
-        Endpoint[] ruFallbacks = {EMERGENCY_RU_DOT, EMERGENCY_RU_DOT_SECONDARY};
-        for (Endpoint ruDot : ruFallbacks) {
-            if (triedKeys.contains(ruDot.key())) continue;
-            try {
-                long dotDeadline = System.currentTimeMillis() + 2600L;
-                byte[] ruReply = queryWire(ruDot, wireQuery, sockProtector, fdProtector, dotDeadline, null);
-                if (ruReply != null && ruReply.length >= 12) {
-                    lastResolver = ruDot.key();
-                    lastWorkingEndpoint = ruDot;
-                    return ruReply;
+        // 3. Last-resort encrypted RFC 7858 DoT:853 (disabled in max-anonymity mode)
+        if (!ColgramConfig.isMaxAnonymityEnabled()) {
+            Endpoint[] ruFallbacks = {EMERGENCY_RU_DOT, EMERGENCY_RU_DOT_SECONDARY};
+            for (Endpoint ruDot : ruFallbacks) {
+                if (triedKeys.contains(ruDot.key())) continue;
+                try {
+                    long dotDeadline = System.currentTimeMillis() + 2600L;
+                    byte[] ruReply = queryWire(ruDot, wireQuery, sockProtector, fdProtector, dotDeadline, null);
+                    if (ruReply != null && ruReply.length >= 12) {
+                        lastResolver = ruDot.key();
+                        lastWorkingEndpoint = ruDot;
+                        return ruReply;
+                    }
+                } catch (Throwable ignored) {
                 }
-            } catch (Throwable ignored) {
             }
         }
 
-        // 4. Emergency fallback: protected plain UDP/53 so DNS never suffers total blackout
+        // 4. Emergency plaintext UDP/53 disabled in strict/max-anonymity mode
+        if (isStrictEncryptedDnsOnly()) {
+            return null;
+        }
         return queryEmergencyUdp(wireQuery, udpProtector);
     }
 
@@ -1252,7 +1301,7 @@ public final class ColgramDohResolver {
     }
 
     static byte[] queryFastDomesticUdp(byte[] wireQuery, DatagramProtector udpProtector) {
-        if (wireQuery == null || wireQuery.length < 12) return null;
+        if (wireQuery == null || wireQuery.length < 12 || isStrictEncryptedDnsOnly()) return null;
         String[] fastDomesticDns = {"77.88.8.8", "77.88.8.1"};
         for (String dnsIp : fastDomesticDns) {
             java.net.DatagramSocket sock = null;
@@ -1279,6 +1328,7 @@ public final class ColgramDohResolver {
     }
 
     private static byte[] queryEmergencyUdp(byte[] wireQuery, DatagramProtector udpProtector) {
+        if (wireQuery == null || wireQuery.length < 12 || isStrictEncryptedDnsOnly()) return null;
         for (String dnsIp : EMERGENCY_UDP_DNS) {
             java.net.DatagramSocket sock = null;
             try {

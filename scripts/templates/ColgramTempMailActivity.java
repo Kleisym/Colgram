@@ -8,12 +8,12 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.Toast;
 
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -36,6 +36,7 @@ import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Cells.HeaderCell;
 import org.telegram.ui.Cells.ShadowSectionCell;
 import org.telegram.ui.Cells.TextCheckCell;
+import org.telegram.ui.Cells.TextDetailSettingsCell;
 import org.telegram.ui.Cells.TextSettingsCell;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RecyclerListView;
@@ -1379,7 +1380,21 @@ public class ColgramTempMailActivity extends BaseFragment {
             messages.clear();
             cachedBodies.clear();
             if (listAdapter != null) listAdapter.notifyDataSetChanged();
-            showToast("Ящик создан (" + providerLabel + "): " + address);
+            Activity hudAct = getParentActivity();
+            if (hudAct != null) {
+                ColgramUiKit.showHudBanner(
+                        hudAct,
+                        "Ящик создан · " + providerLabel,
+                        address,
+                        R.drawable.msg_send,
+                        ColgramMenuChrome.COLOR_EMERALD,
+                        "Копировать",
+                        () -> {
+                            copyToClipboard(address);
+                            ColgramUiKit.showNotice(this, R.drawable.msg_copy, "Скопировано: " + address, false);
+                        }
+                );
+            }
             fetchMessages(false);
         });
     }
@@ -2085,11 +2100,8 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void showToast(String text) {
-        if (isDestroyed) return;
-        Context ctx = getParentActivity();
-        if (ctx != null) {
-            Toast.makeText(ctx.getApplicationContext(), text, Toast.LENGTH_SHORT).show();
-        }
+        if (isDestroyed || text == null || text.isEmpty()) return;
+        ColgramUiKit.showNotice(this, R.drawable.msg_send, text, false);
     }
 
     private static final class HttpException extends IOException {
@@ -2239,6 +2251,9 @@ public class ColgramTempMailActivity extends BaseFragment {
             if (position == shadowAfterActionsPos() || position == bottomShadowPos()) {
                 return 3;
             }
+            if (position == copyRowPos() || (position >= inboxStartPos() && !messages.isEmpty())) {
+                return 4;
+            }
             return 2;
         }
 
@@ -2259,6 +2274,10 @@ public class ColgramTempMailActivity extends BaseFragment {
                     break;
                 case 2:
                     view = new TextSettingsCell(mContext);
+                    view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+                    break;
+                case 4:
+                    view = new TextDetailSettingsCell(mContext);
                     view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
                     break;
                 case 3:
@@ -2301,58 +2320,61 @@ public class ColgramTempMailActivity extends BaseFragment {
                 }
                 case 1: {
                     TextCheckCell tc = (TextCheckCell) holder.itemView;
-                    tc.setTextAndCheck("Автообновление (5 сек)", autoRefreshEnabled, false);
                     ColgramMenuChrome.applyCheckIcon(tc, ColgramMenuChrome.COLOR_TEAL, R.drawable.msg_online);
+                    tc.setTextAndCheck("Автообновление (5 сек)", autoRefreshEnabled, false);
+                    break;
+                }
+                case 4: {
+                    TextDetailSettingsCell td = (TextDetailSettingsCell) holder.itemView;
+                    if (position == copyRowPos()) {
+                        ColgramMenuChrome.applyDetailIcon(td, "Скопировать адрес",
+                                currentEmail.isEmpty() ? "Создаётся…" : currentEmail,
+                                R.drawable.msg_copy, ColgramMenuChrome.COLOR_BLUE, true);
+                    } else if (!messages.isEmpty() && position >= inboxStartPos() && position < bottomShadowPos()) {
+                        int mIdx = position - inboxStartPos();
+                        TempMessage m = messages.get(mIdx);
+                        CachedEmailDetail cached = cachedBodies.get(m.tmId);
+                        String bodyPreview = cached != null ? cached.plainBody : "";
+                        String otp = ColgramTempMailDiscovery.extractOtp(m.subject, bodyPreview);
+                        String detail = !otp.isEmpty()
+                                ? ("Код: " + otp + (TextUtils.isEmpty(m.from) ? "" : (" · " + m.from)))
+                                : (TextUtils.isEmpty(m.from) ? "Входящее письмо" : m.from);
+                        ColgramMenuChrome.applyDetailIcon(td,
+                                m.subject.isEmpty() ? "(Без темы)" : m.subject,
+                                detail,
+                                !otp.isEmpty() ? R.drawable.msg_secret : R.drawable.msg_send,
+                                !otp.isEmpty() ? ColgramMenuChrome.COLOR_AMBER : ColgramMenuChrome.COLOR_INDIGO,
+                                mIdx < messages.size() - 1);
+                    }
                     break;
                 }
                 case 2: {
                     TextSettingsCell s = (TextSettingsCell) holder.itemView;
-                    if (position == copyRowPos()) {
-                        s.setTextAndValue("Скопировать адрес",
-                                currentEmail.isEmpty() ? "Создаётся…" : currentEmail, true);
-                        ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_copy, ColgramMenuChrome.COLOR_BLUE);
-                    } else if (position == gmailRowPos()) {
-                        s.setTextAndValue("Новый @gmail.com", "Нативно", true);
+                    if (position == gmailRowPos()) {
                         ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_send, ColgramMenuChrome.COLOR_CRIMSON);
+                        s.setTextAndValue("Новый @gmail.com", "Нативно", true);
                     } else if (position == googleMailRowPos()) {
-                        s.setTextAndValue("Новый @googlemail.com", "Нативно", true);
                         ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_send, ColgramMenuChrome.COLOR_ROSE);
+                        s.setTextAndValue("Новый @googlemail.com", "Нативно", true);
                     } else if (position == newRowPos()) {
-                        s.setTextAndValue("Случайный домен", "Новый ящик", true);
                         ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_retry, ColgramMenuChrome.COLOR_EMERALD);
+                        s.setTextAndValue("Случайный домен", "Новый ящик", true);
                     } else if (position == domainRowPos()) {
+                        ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_link, ColgramMenuChrome.COLOR_VIOLET);
                         String val = pendingDomain != null
                                 ? "@" + pendingDomain
                                 : (availableDomains.isEmpty()
                                         ? (discoveryRunning ? "Загрузка…" : "Авто")
                                         : availableDomains.size() + " доменов");
                         s.setTextAndValue("Выбрать домен", val, true);
-                        ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_link, ColgramMenuChrome.COLOR_VIOLET);
                     } else if (position == refreshRowPos()) {
-                        s.setTextAndValue("Проверить входящие", messages.size() + " писем", true);
                         ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_search, ColgramMenuChrome.COLOR_CYAN);
+                        s.setTextAndValue("Проверить входящие", messages.size() + " писем", true);
                     } else if (position >= inboxStartPos() && position < bottomShadowPos()) {
-                        if (messages.isEmpty()) {
-                            s.setText(autoRefreshEnabled
-                                    ? "Ожидание писем (проверка каждые 5 сек)…"
-                                    : "Писем пока нет", false);
-                            ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_info, ColgramMenuChrome.COLOR_SLATE);
-                        } else {
-                            int mIdx = position - inboxStartPos();
-                            TempMessage m = messages.get(mIdx);
-                            CachedEmailDetail cached = cachedBodies.get(m.tmId);
-                            String bodyPreview = cached != null ? cached.plainBody : "";
-                            String otp = ColgramTempMailDiscovery.extractOtp(m.subject, bodyPreview);
-                            String rightVal = !otp.isEmpty() ? ("Код: " + otp) : m.from;
-                            if (rightVal != null && rightVal.length() > 26) {
-                                rightVal = rightVal.substring(0, 25) + "…";
-                            }
-                            s.setTextAndValue(m.subject.isEmpty() ? "(Без темы)" : m.subject,
-                                    rightVal == null ? "" : rightVal, mIdx < messages.size() - 1);
-                            ColgramMenuChrome.applySettingIcon(s,
-                                    !otp.isEmpty() ? R.drawable.msg_secret : R.drawable.msg_send,
-                                    !otp.isEmpty() ? ColgramMenuChrome.COLOR_AMBER : ColgramMenuChrome.COLOR_INDIGO);
-                        }
+                        ColgramMenuChrome.applySettingIcon(s, R.drawable.msg_info, ColgramMenuChrome.COLOR_SLATE);
+                        s.setText(autoRefreshEnabled
+                                ? "Ожидание писем (проверка каждые 5 сек)…"
+                                : "Писем пока нет", false);
                     }
                     break;
                 }
@@ -2364,7 +2386,8 @@ public class ColgramTempMailActivity extends BaseFragment {
     public ArrayList<ThemeDescription> getThemeDescriptions() {
         ArrayList<ThemeDescription> list = new ArrayList<>();
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_CELLBACKGROUNDCOLOR,
-                new Class[]{HeaderCell.class, TextCheckCell.class, TextSettingsCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
+                new Class[]{HeaderCell.class, TextCheckCell.class, TextSettingsCell.class, TextDetailSettingsCell.class},
+                null, null, null, Theme.key_windowBackgroundWhite));
         list.add(new ThemeDescription(fragmentView, ThemeDescription.FLAG_BACKGROUND,
                 null, null, null, null, Theme.key_windowBackgroundGray));
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_BACKGROUND,

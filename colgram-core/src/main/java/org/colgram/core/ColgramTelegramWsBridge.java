@@ -186,6 +186,7 @@ public final class ColgramTelegramWsBridge {
     private static final long FAILURE_COOLDOWN_MS = 1800L;
     private static final long BURST_FAILURE_WINDOW_MS = 800L;
     private static final long DEPRIORITIZE_TTL_MS = 45_000L;
+    private static final long DEFAULT_EDGE_DEPRIORITIZE_TTL_MS = 8_000L;
     private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
 
     private static ExecutorService createWsDaemonPool(int maxThreads, final String prefix,
@@ -288,9 +289,13 @@ public final class ColgramTelegramWsBridge {
     private static final long DIAL_SLOT_ACQUIRE_WAIT_MS = 2200L;
     private static final SecureRandom SHARED_MASK_SEEDER = new SecureRandom();
     static final int PREWARM_MAX_PER_BUCKET = 3;
+    static final int PREWARM_MEDIA_MAX_PER_BUCKET = 4;
     static final long PREWARM_TTL_MS = 38_000L;
     static final long PREWARM_REFRESH_MS = 28_000L;
-    private static final long DC135_DEAD_COOLDOWN_MS = 120_000L;
+    private static final long DC135_DEAD_COOLDOWN_MS = 12_000L;
+    private static final long DC135_MAX_BACKOFF_MS = 30_000L;
+    private static final int DC135_WIFI_CONNECT_TIMEOUT_MS = 1200;
+    private static final int DC135_CELLULAR_CONNECT_TIMEOUT_MS = 1600;
     private static final byte[] EMPTY_BYTES = new byte[0];
     private static final int[] PREWARM_TARGET_DCS = {2, 4, -2, -4};
     private static final ExecutorService PREWARM_POOL = createWsDaemonPool(
@@ -317,7 +322,18 @@ public final class ColgramTelegramWsBridge {
     private static final java.util.concurrent.atomic.AtomicLongArray cooldownUntilByDc =
             new java.util.concurrent.atomic.AtomicLongArray(DC_BUCKET_COUNT);
     private static final AtomicLongArray dc135DeadUntil = new AtomicLongArray(DC_BUCKET_COUNT);
+    private static final java.util.concurrent.atomic.AtomicIntegerArray dc135DeadStreak =
+            new java.util.concurrent.atomic.AtomicIntegerArray(DC_BUCKET_COUNT);
+    private static final AtomicInteger consecutiveTransportFailures = new AtomicInteger(0);
     private static final AtomicLongArray lastBurstFailAtByDc = new AtomicLongArray(DC_BUCKET_COUNT);
+
+    static int prewarmMaxForBucket(int bucket) {
+        return (bucket >= 6 && bucket <= 10) ? PREWARM_MEDIA_MAX_PER_BUCKET : PREWARM_MAX_PER_BUCKET;
+    }
+
+    static int prewarmMaxFor(int normDc, boolean media) {
+        return media ? PREWARM_MEDIA_MAX_PER_BUCKET : PREWARM_MAX_PER_BUCKET;
+    }
     private static final AtomicLongArray lastSuccessAtByDc = new AtomicLongArray(DC_BUCKET_COUNT);
     private static final Semaphore[] dialSlotsByDc = createDcSemaphores();
     private static final AtomicInteger lastHandshakeRttMs = new AtomicInteger(-1);
@@ -617,7 +633,7 @@ public final class ColgramTelegramWsBridge {
             }
             if (newest == null) return true;
             if ((nowMs - newest.createdAtMs) >= PREWARM_REFRESH_MS) {
-                if (q.size() >= PREWARM_MAX_PER_BUCKET) {
+                if (q.size() >= prewarmMaxForBucket(bucket)) {
                     PrewarmedEntry evicted = q.pollLast();
                     if (evicted != null) evicted.session.close();
                 }
@@ -663,7 +679,7 @@ public final class ColgramTelegramWsBridge {
             java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q = buckets[entry.bucket];
             pruneExpired(q, nowMs);
             synchronized (q) {
-                if (entry.generation != generation.get() || q.size() >= PREWARM_MAX_PER_BUCKET) {
+                if (entry.generation != generation.get() || q.size() >= prewarmMaxForBucket(entry.bucket)) {
                     entry.session.close();
                     return false;
                 }
@@ -795,14 +811,17 @@ public final class ColgramTelegramWsBridge {
             consecutiveFailuresByDc.set(i, 0);
             cooldownUntilByDc.set(i, 0L);
             dc135DeadUntil.set(i, 0L);
+            dc135DeadStreak.set(i, 0);
             lastBurstFailAtByDc.set(i, 0L);
         }
+        consecutiveTransportFailures.set(0);
     }
 
     public static void deprioritizeEndpoint(WsSession session) {
         if (session == null || session.edgeIp == null || session.sniHost == null) return;
         EdgeEndpoint ep = new EdgeEndpoint(session.edgeIp, session.sniHost);
-        deprioritizedUntil.put(ep.key(), System.currentTimeMillis() + DEPRIORITIZE_TTL_MS);
+        long ttlMs = DEFAULT_EDGE_IP.equals(ep.ip) ? DEFAULT_EDGE_DEPRIORITIZE_TTL_MS : DEPRIORITIZE_TTL_MS;
+        deprioritizedUntil.put(ep.key(), System.currentTimeMillis() + ttlMs);
         int bucket = dcBucket(session.rawDcId != 0 ? session.rawDcId : session.dcId);
         if (ep.equals(lastWorkingByDc.get(bucket))) {
             lastWorkingByDc.compareAndSet(bucket, ep, null);
@@ -926,9 +945,10 @@ public final class ColgramTelegramWsBridge {
         final boolean wantProtected = sysVpn != null;
         final long now = System.currentTimeMillis();
         PREWARMED_POOL.evictExpired(now);
+        final int capForBucket = prewarmMaxFor(normDc, media);
         int current = PREWARMED_POOL.size(bucket);
         int pending = PREWARMED_POOL.inFlight.get(bucket);
-        int freeSlots = PREWARM_MAX_PER_BUCKET - (current + pending);
+        int freeSlots = capForBucket - (current + pending);
         int deficit = Math.min(Math.max(1, maxToSpawn), freeSlots);
         if (deficit <= 0) return;
 
@@ -936,7 +956,7 @@ public final class ColgramTelegramWsBridge {
         final ColgramDohResolver.SocketProtector protector = sysVpn != null ? sysVpn::protect : null;
         final ColgramNativeDesync.FdProtector fdProtector = sysVpn != null ? sysVpn::protect : null;
         for (int i = 0; i < deficit; i++) {
-            if (PREWARMED_POOL.inFlight.incrementAndGet(bucket) > PREWARM_MAX_PER_BUCKET) {
+            if (PREWARMED_POOL.inFlight.incrementAndGet(bucket) > capForBucket) {
                 PREWARMED_POOL.inFlight.decrementAndGet(bucket);
                 break;
             }
@@ -982,7 +1002,7 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static void replenishPrewarmedAsync(final int normDc, final boolean media) {
-        replenishPrewarmedAsync(normDc, media, PREWARM_MAX_PER_BUCKET);
+        replenishPrewarmedAsync(normDc, media, prewarmMaxFor(normDc, media));
     }
 
     static boolean offerPrewarmedForTest(WsSession session, long createdAtMs, boolean wantProtected) {
@@ -1120,6 +1140,12 @@ public final class ColgramTelegramWsBridge {
         long now = System.currentTimeMillis();
         if (now < cooldownUntilByDc.get(bucket)) return null;
 
+        if (isSecondaryDcFastFail(normDc) && now >= dc135DeadUntil.get(bucket)
+                && !ColgramDpiBypass.wasExplicitlyStopped()
+                && PREWARMED_POOL.size(bucket) == 0 && PREWARMED_POOL.inFlight.get(bucket) == 0) {
+            replenishPrewarmedAsync(normDc, media, 2);
+        }
+
         if (allowPrewarm) {
             boolean wantProtected = (protector != null || fdProtector != null
                     || ColgramDpiBypass.activeSystemDpiVpn() != null);
@@ -1181,8 +1207,8 @@ public final class ColgramTelegramWsBridge {
         boolean canNative = ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null);
         int bucket = bucketFor(normDc, media);
 
-        // Retire DC1/DC3/DC5 3-attempt fallback traps: 1 bounded attempt (350ms Wi-Fi / 420ms Cell),
-        // then 120s dead cooldown so blocked Russian DC1/3/5 edges never stall DC2/DC4.
+        // DC1/DC3/DC5 resilient connect (1200ms Wi-Fi / 1600ms cellular): race top-2 candidates,
+        // retry with fallbackFragModes on timeout/SSL/EOF, and bound dead backoff 12s..30s.
         if (isSecondaryDcFastFail(normDc)) {
             long now = System.currentTimeMillis();
             if (now < dc135DeadUntil.get(bucket)) {
@@ -1190,38 +1216,50 @@ public final class ColgramTelegramWsBridge {
             }
             List<EdgeEndpoint> fastCands = candidateEndpointsFor(normDc, media);
             if (fastCands.isEmpty()) {
-                dc135DeadUntil.set(bucket, now + DC135_DEAD_COOLDOWN_MS);
+                int streak = dc135DeadStreak.incrementAndGet(bucket);
+                long backoff = Math.min(DC135_MAX_BACKOFF_MS, DC135_DEAD_COOLDOWN_MS << Math.min(2, Math.max(0, streak - 1)));
+                dc135DeadUntil.set(bucket, now + backoff);
                 return null;
             }
-            int fastMode = isSpoofSniFragMode(preferredFragMode) ? preferredFragMode : FRAG_SPOOF_SNI_PLAIN;
-            int fastTimeout = cellularNetwork ? 420 : 350;
-            EdgeEndpoint ep = fastCands.get(0);
-            Socket sock = null;
-            try {
-                if (ColgramNativeDesync.isAvailable() && (protector == null || fdProtector != null)) {
-                    sock = ColgramNativeDesync.connect(ep.ip, 443, fastTimeout, 0, -1, fdProtector);
-                } else {
-                    sock = new Socket();
-                    sock.setTcpNoDelay(true);
-                    if (protector != null && !protector.protect(sock)) {
-                        closeQuietly(sock);
-                        sock = null;
-                    } else {
-                        ColgramDpiBypass.connectTracked(sock, new InetSocketAddress(ep.ip, 443), fastTimeout);
-                    }
-                }
-                if (sock != null) {
-                    HandshakeResult res = tryHandshake(new DialedTcp(ep, sock), normDc, media, fastMode, forPrewarm);
-                    if (res.session != null) {
-                        dc135DeadUntil.set(bucket, 0L);
-                        return res.session;
-                    }
-                    sock = null;
-                }
-            } catch (Throwable ignored) {
-                closeQuietly(sock);
+            int fastMode = preferredFragMode;
+            if (!canNative && isNativeFragMode(fastMode)) {
+                fastMode = FRAG_SPOOF_SNI_PLAIN;
             }
-            dc135DeadUntil.set(bucket, System.currentTimeMillis() + DC135_DEAD_COOLDOWN_MS);
+            int fastTimeout = cellularNetwork ? DC135_CELLULAR_CONNECT_TIMEOUT_MS : DC135_WIFI_CONNECT_TIMEOUT_MS;
+            List<EdgeEndpoint> top2 = fastCands.size() > 2 ? fastCands.subList(0, 2) : fastCands;
+            DialedTcp tcp = connectEdgeRace(top2, protector, fdProtector, fastMode, fastTimeout);
+            if (tcp != null) {
+                HandshakeResult res = tryHandshake(tcp, normDc, media, fastMode, forPrewarm);
+                if (res.session != null) {
+                    dc135DeadUntil.set(bucket, 0L);
+                    dc135DeadStreak.set(bucket, 0);
+                    setPreferredFragMode(fastMode);
+                    return res.session;
+                }
+                if (!res.hostnameMismatch && (res.wrapperRejected || res.transportFailure || !workedOnNetwork
+                        || consecutiveTransportFailures.get() >= 2)
+                        && System.currentTimeMillis() + 600L < deadlineMs) {
+                    int[] fallbacks = fallbackFragModes(fastMode, canNative);
+                    int tried = 0;
+                    for (int altMode : fallbacks) {
+                        if (tried >= 2 || System.currentTimeMillis() + 600L >= deadlineMs) break;
+                        tried++;
+                        DialedTcp altTcp = connectEdgeRace(top2, protector, fdProtector, altMode, fastTimeout);
+                        if (altTcp == null) break;
+                        HandshakeResult altRes = tryHandshake(altTcp, normDc, media, altMode, forPrewarm);
+                        if (altRes.session != null) {
+                            dc135DeadUntil.set(bucket, 0L);
+                            dc135DeadStreak.set(bucket, 0);
+                            setPreferredFragMode(altMode);
+                            return altRes.session;
+                        }
+                        if (altRes.hostnameMismatch) break;
+                    }
+                }
+            }
+            int streak = dc135DeadStreak.incrementAndGet(bucket);
+            long backoff = Math.min(DC135_MAX_BACKOFF_MS, DC135_DEAD_COOLDOWN_MS << Math.min(2, Math.max(0, streak - 1)));
+            dc135DeadUntil.set(bucket, System.currentTimeMillis() + backoff);
             return null;
         }
 
@@ -1276,12 +1314,15 @@ public final class ColgramTelegramWsBridge {
                 return res.session;
             }
 
-            if (!res.hostnameMismatch && (res.wrapperRejected || !workedOnNetwork)
+            if (!res.hostnameMismatch
+                    && (res.wrapperRejected || !workedOnNetwork
+                            || (res.transportFailure && consecutiveTransportFailures.get() >= 2))
                     && System.currentTimeMillis() + 700L < deadlineMs) {
                 int[] fallbacks = fallbackFragModes(primaryMode, canNative);
+                int maxFallbacks = consecutiveTransportFailures.get() >= 2 ? 2 : maxAltPerEndpoint;
                 int altTried = 0;
                 for (int altMode : fallbacks) {
-                    if (altTried >= maxAltPerEndpoint
+                    if (altTried >= maxFallbacks
                             || System.currentTimeMillis() + 800L >= deadlineMs) break;
                     altTried++;
                     DialedTcp altTcp = connectEdgeRace(
@@ -1295,7 +1336,9 @@ public final class ColgramTelegramWsBridge {
                     if (altRes.hostnameMismatch) break;
                 }
             }
-            deprioritizedUntil.put(tcp.endpoint.key(), System.currentTimeMillis() + DEPRIORITIZE_TTL_MS);
+            long ttlMs = DEFAULT_EDGE_IP.equals(tcp.endpoint.ip)
+                    ? DEFAULT_EDGE_DEPRIORITIZE_TTL_MS : DEPRIORITIZE_TTL_MS;
+            deprioritizedUntil.put(tcp.endpoint.key(), System.currentTimeMillis() + ttlMs);
         }
         if (!forPrewarm) {
             recordBurstFailure(normDc, media);
@@ -1441,11 +1484,13 @@ public final class ColgramTelegramWsBridge {
         final WsSession session;
         final boolean wrapperRejected;
         final boolean hostnameMismatch;
+        final boolean transportFailure;
 
-        HandshakeResult(WsSession session, boolean wrapperRejected, boolean hostnameMismatch) {
+        HandshakeResult(WsSession session, boolean wrapperRejected, boolean hostnameMismatch, boolean transportFailure) {
             this.session = session;
             this.wrapperRejected = wrapperRejected;
             this.hostnameMismatch = hostnameMismatch;
+            this.transportFailure = transportFailure;
         }
     }
 
@@ -1673,12 +1718,20 @@ public final class ColgramTelegramWsBridge {
                 workedOnNetwork = true;
                 ColgramDpiBypass.onDirectLayer1Success();
             }
+            consecutiveTransportFailures.set(0);
             consecutiveFailuresByDc.set(bucket, 0);
             cooldownUntilByDc.set(bucket, 0L);
             Log.i(TAG, "WSS upgraded ok: " + tcp.endpoint + " tlsSni=" + tlsSni
                     + " fragMode=" + fragMode + " dc=" + normDc + " wireDc=" + wireDcId);
-            return new HandshakeResult(new WsSession(normDc, wireDcId, ip, realHost, ssl, tcp.socket, in, out), false, false);
+            return new HandshakeResult(new WsSession(normDc, wireDcId, ip, realHost, ssl, tcp.socket, in, out), false, false, false);
         } catch (Throwable t) {
+            boolean timeoutSslOrEof = (t instanceof java.net.SocketTimeoutException)
+                    || (t instanceof javax.net.ssl.SSLException)
+                    || (t instanceof java.io.EOFException)
+                    || (t instanceof java.io.IOException);
+            if (!hostnameMismatch && timeoutSslOrEof && !forPrewarm) {
+                consecutiveTransportFailures.incrementAndGet();
+            }
             if (isSpoofSniFragMode(fragMode)) {
                 spoofSniCursor.incrementAndGet();
             }
@@ -1688,7 +1741,7 @@ public final class ColgramTelegramWsBridge {
                 tcp.socket.close();
             } catch (Throwable ignored) {
             }
-            return new HandshakeResult(null, wrapperRejected, hostnameMismatch);
+            return new HandshakeResult(null, wrapperRejected, hostnameMismatch, timeoutSslOrEof);
         }
     }
 
@@ -2439,6 +2492,12 @@ public final class ColgramTelegramWsBridge {
         return candidateEndpointsFor(dcId, Obfuscated2FrameSplitter.isMediaDcId(dcId));
     }
 
+    private static boolean isIncludeIpv6Current() {
+        boolean isProtected = ColgramDpiBypass.activeSystemDpiVpn() != null;
+        return ColgramDohResolver.hasRoutableIpv6ForCurrentSocket(isProtected)
+                || (isIpv6BypassEnabledSafe() && (isProtected || !ColgramDpiBypass.isOverlayVpnActive()));
+    }
+
     private static List<EdgeEndpoint> candidateEndpointsFor(int dcId, boolean media) {
         long now = System.currentTimeMillis();
         if (now - resolvedAt > DNS_CACHE_TTL_MS && refreshInFlight.compareAndSet(false, true)) {
@@ -2449,7 +2508,8 @@ public final class ColgramTelegramWsBridge {
             }
         }
         int bucket = bucketFor(dcId, media);
-        return buildCandidateEndpoints(dcId, lastWorkingByDc.get(bucket), perHostIps, activeDeprioritizedKeys(now), media);
+        return buildCandidateEndpoints(dcId, lastWorkingByDc.get(bucket), perHostIps,
+                activeDeprioritizedKeys(now), media, isIncludeIpv6Current());
     }
 
     /**
@@ -2467,7 +2527,7 @@ public final class ColgramTelegramWsBridge {
             Map<String, List<String>> hostIps,
             Set<String> deprioritizedKeys) {
         return buildCandidateEndpoints(dcId, lastWorking, hostIps, deprioritizedKeys,
-                Obfuscated2FrameSplitter.isMediaDcId(dcId));
+                Obfuscated2FrameSplitter.isMediaDcId(dcId), true);
     }
 
     static List<EdgeEndpoint> buildCandidateEndpoints(
@@ -2476,11 +2536,22 @@ public final class ColgramTelegramWsBridge {
             Map<String, List<String>> hostIps,
             Set<String> deprioritizedKeys,
             boolean media) {
+        return buildCandidateEndpoints(dcId, lastWorking, hostIps, deprioritizedKeys, media, true);
+    }
+
+    static List<EdgeEndpoint> buildCandidateEndpoints(
+            int dcId,
+            EdgeEndpoint lastWorking,
+            Map<String, List<String>> hostIps,
+            Set<String> deprioritizedKeys,
+            boolean media,
+            boolean includeIpv6) {
         LinkedHashMap<String, EdgeEndpoint> ordered = new LinkedHashMap<>();
         Set<String> skipped = deprioritizedKeys == null ? Collections.emptySet() : deprioritizedKeys;
         int normDc = Obfuscated2FrameSplitter.normalizeDcId(dcId);
 
         if (lastWorking != null
+                && (includeIpv6 || lastWorking.ip.indexOf(':') < 0)
                 && !"149.154.167.99".equals(lastWorking.ip)
                 && !skipped.contains(lastWorking.key())
                 && isDcHostMatch(lastWorking.sniHost, normDc)
@@ -2503,6 +2574,7 @@ public final class ColgramTelegramWsBridge {
                 if (ips == null) continue;
                 for (String ip : ips) {
                     if (ip == null || ip.isEmpty() || "149.154.167.99".equals(ip)) continue;
+                    if (!includeIpv6 && ip.indexOf(':') >= 0) continue;
                     if (DEFAULT_EDGE_IP.equals(ip) && !isSharedEdgeSniForDc(host, normDc)) continue;
                     EdgeEndpoint ep = new EdgeEndpoint(ip, host);
                     if (!skipped.contains(ep.key())) ordered.putIfAbsent(ep.key(), ep);
@@ -2510,10 +2582,10 @@ public final class ColgramTelegramWsBridge {
             }
         }
 
-        // Live-verified official Telegram WebSocket edge IPv4 + IPv6 addresses per DC
-        // (never raw non-TLS MTProto DC IPs).
+        // Live-verified official Telegram WebSocket edge IPv4 (+ IPv6 only when includeIpv6) per DC.
         for (String secIp : secondaryEdgeIpsForDc(normDc)) {
             if (secIp == null) continue;
+            if (!includeIpv6 && secIp.indexOf(':') >= 0) continue;
             for (String host : dcSnis) {
                 if (DEFAULT_EDGE_IP.equals(secIp) && !isSharedEdgeSniForDc(host, normDc)) continue;
                 EdgeEndpoint sec = new EdgeEndpoint(secIp, host);
@@ -2522,10 +2594,11 @@ public final class ColgramTelegramWsBridge {
         }
 
         if (ordered.isEmpty()) {
-            // Every candidate was temporarily deprioritized; re-seed strictly within dcId's own
-            // verified WSS edges so DC1/DC3/DC5 never cross-wire onto DC2's kws2 endpoint.
+            // Every candidate was temporarily deprioritized or filtered; re-seed strictly within dcId's
+            // own verified WSS edges so DC1/DC3/DC5 never cross-wire onto DC2's kws2 endpoint.
             for (String secIp : secondaryEdgeIpsForDc(normDc)) {
                 if (secIp == null) continue;
+                if (!includeIpv6 && secIp.indexOf(':') >= 0) continue;
                 for (String host : dcSnis) {
                     if (DEFAULT_EDGE_IP.equals(secIp) && !isSharedEdgeSniForDc(host, normDc)) continue;
                     EdgeEndpoint ep = new EdgeEndpoint(secIp, host);
@@ -2534,6 +2607,26 @@ public final class ColgramTelegramWsBridge {
             }
             if (ordered.isEmpty()) {
                 ordered.put(DEFAULT_ENDPOINT.key(), DEFAULT_ENDPOINT);
+            }
+        }
+
+        // Escape hatch at tail: always append fresh-dial shared primary IPv4 (.220) + DoH IPv4
+        // endpoints so temporary cooldowns never collapse all IPv4 routes.
+        for (String host : sharedEdgeHostsForDc(normDc, media)) {
+            EdgeEndpoint freshPrimary = new EdgeEndpoint(DEFAULT_EDGE_IP, host);
+            ordered.putIfAbsent(freshPrimary.key(), freshPrimary);
+        }
+        if (hostIps != null) {
+            for (String host : dcSnis) {
+                List<String> ips = hostIps.get(host);
+                if (ips == null) continue;
+                for (String ip : ips) {
+                    if (ip == null || ip.isEmpty() || "149.154.167.99".equals(ip)) continue;
+                    if (ip.indexOf(':') >= 0) continue;
+                    if (DEFAULT_EDGE_IP.equals(ip) && !isSharedEdgeSniForDc(host, normDc)) continue;
+                    EdgeEndpoint ep = new EdgeEndpoint(ip, host);
+                    ordered.putIfAbsent(ep.key(), ep);
+                }
             }
         }
         return new ArrayList<>(ordered.values());
@@ -2684,7 +2777,8 @@ public final class ColgramTelegramWsBridge {
     private static DialedTcp connectEdgeRace(List<EdgeEndpoint> candidates,
                                              final ColgramDohResolver.SocketProtector protector,
                                              final ColgramNativeDesync.FdProtector fdProtector,
-                                             final int fragMode) {
+                                             final int fragMode,
+                                             final int attemptTimeoutMs) {
         if (candidates.isEmpty()) return null;
         boolean isProtected = (protector != null || fdProtector != null
                 || ColgramDpiBypass.activeSystemDpiVpn() != null);
@@ -2735,14 +2829,14 @@ public final class ColgramTelegramWsBridge {
                         if (done.get()) return;
                         if (useNativeSocket) {
                             sock = ColgramNativeDesync.connect(
-                                    ep.ip, 443, connectAttemptTimeoutMs(), mssClamp, windowClamp, fdProtector);
+                                    ep.ip, 443, attemptTimeoutMs, mssClamp, windowClamp, fdProtector);
                         } else {
                             sock = new Socket();
                             sock.setTcpNoDelay(true);
                             if (protector != null && !protector.protect(sock)) {
                                 return;
                             }
-                            ColgramDpiBypass.connectTracked(sock, new InetSocketAddress(ep.ip, 443), connectAttemptTimeoutMs());
+                            ColgramDpiBypass.connectTracked(sock, new InetSocketAddress(ep.ip, 443), attemptTimeoutMs);
                         }
                         DialedTcp candidate = new DialedTcp(ep, sock);
                         synchronized (winnerLock) {
@@ -2789,6 +2883,13 @@ public final class ColgramTelegramWsBridge {
             Log.d(TAG, "WS TCP connect race timed out (" + ep0 + ", " + ep1 + ")");
         }
         return result;
+    }
+
+    private static DialedTcp connectEdgeRace(List<EdgeEndpoint> candidates,
+                                             final ColgramDohResolver.SocketProtector protector,
+                                             final ColgramNativeDesync.FdProtector fdProtector,
+                                             final int fragMode) {
+        return connectEdgeRace(candidates, protector, fdProtector, fragMode, connectAttemptTimeoutMs());
     }
 
     private static boolean upgradeWebSocket(InputStream in, OutputStream out, String host)

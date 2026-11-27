@@ -90,7 +90,7 @@ class TrackBContractsTest(unittest.TestCase):
         self.assertIn("hookIoExecutor.execute(() -> db.purgeMessagesFromDiskOnly(dialogId, toPurge));", hh)
 
         db = read_text("colgram-core/src/main/java/org/colgram/core/ColgramDatabase.java")
-        self.assertIn("DATABASE_VERSION = 6;", db)
+        self.assertIn("DATABASE_VERSION = 7;", db)
         self.assertIn("peekPoisonedNonPositiveEntries()", db)
         self.assertIn("purgePoisonedNonPositiveEntries()", db)
         self.assertIn("purgeMessagesMemoryOnly(", db)
@@ -310,7 +310,10 @@ class TrackBContractsTest(unittest.TestCase):
             put7 = ms_text.replace("\r\n", "\n").split("public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {", 1)[1].split("public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage", 1)[0]
             self.assertNotIn("colgramDispatchPlugins(", put7)
             put8 = ms_text.replace("\r\n", "\n").split("public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {", 1)[1].split("public void processEphemeralMessages(", 1)[0]
-            self.assertIn("storageQueue.postRunnable(() -> {\n                if (mode == ChatActivity.MODE_DEFAULT) {\n                    colgramDispatchPlugins(messages);\n                }", put8)
+            self.assertTrue(
+                "storageQueue.postRunnable(() -> {\n                if (mode == ChatActivity.MODE_DEFAULT) {\n                    colgramDispatchPlugins(messages);\n                }" in put8
+                or "storageQueue.postRunnable(() -> {\n                if (mode == ChatActivity.MODE_DEFAULT) {\n                    colgramPreFilterSpamMentions(messages);\n                    colgramDispatchPlugins(messages);\n                }" in put8
+            )
 
             nc_text = patched_text("TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java").replace("\r\n", "\n")
             post_int = nc_text.split("public void postNotificationNameInternal(", 1)[1].split("public void updateObserver(", 1)[0]

@@ -25,6 +25,8 @@ public final class ColgramBypassStabilityRegressionTest {
         testWsSessionCloseClosesRawSocketBeforeSlowSslSocket();
         testPipeOverWebSocketClientCancelDoesNotPoisonEdgeOrPool();
         testPipeStandardOrWsSessionClientCancelDoesNotPoisonRawDcOrStrategy();
+        testSilentEndpointTtlExpiry();
+        testDefaultEdgeDeprioritizeTtlCapped();
         System.out.println("ColgramBypassStabilityRegressionTest PASSED");
     }
 
@@ -588,6 +590,70 @@ public final class ColgramBypassStabilityRegressionTest {
             ColgramDpiBypass.skipListenerCheckForTest = false;
             ColgramDpiBypass.clearSilentEndpointsForTest();
             ColgramDpiBypass.closeAllActiveSessions();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void testSilentEndpointTtlExpiry() throws Exception {
+        ColgramDpiBypass.clearSilentEndpointsForTest();
+        try {
+            java.lang.reflect.Field ttlField = ColgramDpiBypass.class.getDeclaredField("SILENT_ENDPOINT_TTL_MS");
+            ttlField.setAccessible(true);
+            check(ttlField.getLong(null) == 30_000L, "SILENT_ENDPOINT_TTL_MS must be 30_000L");
+
+            java.lang.reflect.Field mapField = ColgramDpiBypass.class.getDeclaredField("silentEndpoints");
+            mapField.setAccessible(true);
+            java.util.Map<String, Long> silentMap = (java.util.Map<String, Long>) mapField.get(null);
+
+            silentMap.put("127.0.0.1:443", System.currentTimeMillis() - 10L);
+            check(!ColgramDpiBypass.isEndpointSilentForTest("127.0.0.1", 443),
+                    "expired silent endpoint must clear immediately on lookup");
+            check(!silentMap.containsKey("127.0.0.1:443"),
+                    "expired silent endpoint entry must be removed from map");
+
+            silentMap.put("127.0.0.1:443", System.currentTimeMillis() + 30_000L);
+            check(ColgramDpiBypass.isEndpointSilentForTest("127.0.0.1", 443),
+                    "unexpired silent endpoint must remain active");
+        } finally {
+            ColgramDpiBypass.clearSilentEndpointsForTest();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void testDefaultEdgeDeprioritizeTtlCapped() throws Exception {
+        ColgramTelegramWsBridge.clearCooldowns();
+        try {
+            java.lang.reflect.Field deprioField = ColgramTelegramWsBridge.class.getDeclaredField("deprioritizedUntil");
+            deprioField.setAccessible(true);
+            java.util.Map<String, Long> deprioMap = (java.util.Map<String, Long>) deprioField.get(null);
+
+            long beforePrimary = System.currentTimeMillis();
+            ColgramTelegramWsBridge.WsSession primary = new ColgramTelegramWsBridge.WsSession(
+                    2, "149.154.167.220", "kws2.web.telegram.org", null, null, null);
+            ColgramTelegramWsBridge.deprioritizeEndpoint(primary);
+            Long primaryUntil = deprioMap.get("149.154.167.220|kws2.web.telegram.org");
+            check(primaryUntil != null, "primary .220 endpoint should record deprioritize deadline");
+            long primaryTtl = primaryUntil - beforePrimary;
+            check(primaryTtl > 0L && primaryTtl <= 8_500L,
+                    "primary .220 deprioritize TTL must be capped <= 8s, got=" + primaryTtl);
+
+            long beforeSecondary = System.currentTimeMillis();
+            ColgramTelegramWsBridge.WsSession secondary = new ColgramTelegramWsBridge.WsSession(
+                    2, "149.154.167.221", "kws2.web.telegram.org", null, null, null);
+            ColgramTelegramWsBridge.deprioritizeEndpoint(secondary);
+            Long secondaryUntil = deprioMap.get("149.154.167.221|kws2.web.telegram.org");
+            check(secondaryUntil != null && (secondaryUntil - beforeSecondary) > 8_500L,
+                    "non-primary endpoint should retain longer deprioritize TTL");
+
+            java.lang.reflect.Field dc135CdField = ColgramTelegramWsBridge.class.getDeclaredField("DC135_DEAD_COOLDOWN_MS");
+            dc135CdField.setAccessible(true);
+            check(dc135CdField.getLong(null) == 12_000L, "DC135_DEAD_COOLDOWN_MS must be 12_000L");
+
+            java.lang.reflect.Field dc135MaxField = ColgramTelegramWsBridge.class.getDeclaredField("DC135_MAX_BACKOFF_MS");
+            dc135MaxField.setAccessible(true);
+            check(dc135MaxField.getLong(null) == 30_000L, "DC135_MAX_BACKOFF_MS must be 30_000L");
+        } finally {
+            ColgramTelegramWsBridge.clearCooldowns();
         }
     }
 

@@ -160,9 +160,10 @@ class AttachSpoofDeleteContractsTest(unittest.TestCase):
         alerts = read_text(UI / "Components/AlertsCreator.java")
         self.assertTrue(
             'purgeCell.setText("Удалить полностью у себя", "", false, false);' in alerts
-            or 'purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);' in alerts,
-            "AlertsCreator.java must render permanent local delete checkbox",
+            or 'purgeCell.setText(colgramPurgeSb, "", false, false);' in alerts,
+            "AlertsCreator.java must render permanent local delete checkbox without right-column overlap",
         )
+        self.assertIn("Стереть локальную копию из сейфа анти-удаления", alerts)
         self.assertIn("CheckBoxCell", alerts)
 
         sheet = read_text(UI / "Components/DeleteMessagesBottomSheet.java")

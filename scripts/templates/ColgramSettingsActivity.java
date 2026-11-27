@@ -12,7 +12,6 @@ import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
-import android.widget.Toast;
 
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -23,10 +22,12 @@ import org.colgram.core.ColgramCloak;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramOperationGate;
+import org.colgram.core.ColgramPremiumConfig;
 import org.colgram.core.ColgramRouteEpoch;
 import org.colgram.core.ColgramProxyDoctor;
 import org.colgram.core.ColgramProxyManager;
 import org.colgram.core.ColgramSettingsBackup;
+import org.colgram.core.ColgramShieldConfig;
 import org.colgram.core.ColgramStorageSandbox;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
@@ -39,6 +40,7 @@ import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Cells.HeaderCell;
 import org.telegram.ui.Cells.ShadowSectionCell;
 import org.telegram.ui.Cells.TextCheckCell;
+import org.telegram.ui.Cells.TextDetailSettingsCell;
 import org.telegram.ui.Cells.TextInfoPrivacyCell;
 import org.telegram.ui.Cells.TextSettingsCell;
 import org.telegram.ui.Components.EditTextBoldCursor;
@@ -61,6 +63,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int rowCount;
     private int heroBannerRow;
     private int liveTelemetryRow;
+    private int premiumRow;
     private int cloakingHeaderRow;
     private int cloakEnabledRow;
     private int cloakModelRow;
@@ -150,6 +153,11 @@ public class ColgramSettingsActivity extends BaseFragment {
     private int resourceHeaderRow;
     private int dataSettingsRow;
     private int cacheSettingsRow;
+    private int filesHubRow;
+    private int infiniteStorageRow;
+    private int storageCapRow;
+    private int lazyShadowVaultRow;
+    private int malwareShieldRow;
     private int resourceSectionRow;
     private int dpiBypassRow;
     private int dohRow;
@@ -183,6 +191,9 @@ public class ColgramSettingsActivity extends BaseFragment {
     private String lastBotTestReport;
     private int pluginsRow;
     private int antiSpamRow;
+    private int antiPingBigGroupsRow;
+    private int collapseSpamPingsRow;
+    private int autoClearMentionsRow;
     private int autoReplyRow;
     private int tempMailRow;
     private int versionsRow;
@@ -192,6 +203,8 @@ public class ColgramSettingsActivity extends BaseFragment {
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
         ColgramConfig.init(getParentActivity());
+        ColgramShieldConfig.init(getParentActivity());
+        ColgramPremiumConfig.init(getParentActivity());
         updateRows();
         return true;
     }
@@ -217,6 +230,7 @@ public class ColgramSettingsActivity extends BaseFragment {
         rowCount = 0;
         heroBannerRow = rowCount++;
         liveTelemetryRow = rowCount++;
+        premiumRow = rowCount++;
         cloakingHeaderRow = rowCount++;
         cloakEnabledRow = rowCount++;
         cloakModelRow = rowCount++;
@@ -274,6 +288,11 @@ public class ColgramSettingsActivity extends BaseFragment {
         resourceHeaderRow = rowCount++;
         dataSettingsRow = rowCount++;
         cacheSettingsRow = rowCount++;
+        filesHubRow = rowCount++;
+        infiniteStorageRow = rowCount++;
+        storageCapRow = rowCount++;
+        lazyShadowVaultRow = rowCount++;
+        malwareShieldRow = rowCount++;
         resourceSectionRow = rowCount++;
 
         sandboxHeaderRow = rowCount++;
@@ -294,6 +313,9 @@ public class ColgramSettingsActivity extends BaseFragment {
         botTestRow = rowCount++;
         pluginsRow = rowCount++;
         antiSpamRow = rowCount++;
+        antiPingBigGroupsRow = rowCount++;
+        collapseSpamPingsRow = rowCount++;
+        autoClearMentionsRow = rowCount++;
         autoReplyRow = rowCount++;
         tempMailRow = rowCount++;
         versionsRow = rowCount++;
@@ -338,12 +360,56 @@ public class ColgramSettingsActivity extends BaseFragment {
                     || position == tempMailRow || position == versionsRow
                     || position == dataSettingsRow || position == cacheSettingsRow
                     || position == ownProxyRow || position == sandboxFilesRow
-                    || position == pluginsRow || position == accountVaultRow) {
+                    || position == pluginsRow || position == accountVaultRow
+                    || position == premiumRow || position == filesHubRow) {
                 long now = android.os.SystemClock.uptimeMillis();
                 if (now - lastNavTapMs < 360L) return;
                 lastNavTapMs = now;
             }
-            if (position == defenderRow) {
+            if (position == premiumRow) {
+                presentFragment(new ColgramPremiumActivity());
+                return;
+            } else if (position == filesHubRow) {
+                presentFragment(new ColgramFilesActivity());
+                return;
+            } else if (position == storageCapRow) {
+                showStorageCapSelector();
+                return;
+            } else if (position == infiniteStorageRow) {
+                boolean val = !ColgramShieldConfig.isInfiniteVirtualStorageEnabled();
+                ColgramShieldConfig.setInfiniteVirtualStorageEnabled(val);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(val);
+                ColgramUiKit.showNotice(this, R.drawable.msg_folders,
+                        val ? "Бесконечное хранилище (≤ 1 ГБ на диске) включено"
+                                : "Виртуальное хранилище выключено",
+                        false);
+                return;
+            } else if (position == lazyShadowVaultRow) {
+                boolean val = !ColgramShieldConfig.isLazyShadowVaultEnabled();
+                ColgramShieldConfig.setLazyShadowVaultEnabled(val);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(val);
+                return;
+            } else if (position == malwareShieldRow) {
+                boolean val = !ColgramShieldConfig.isMalwareDownloadShieldEnabled();
+                ColgramShieldConfig.setMalwareDownloadShieldEnabled(val);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(val);
+                return;
+            } else if (position == antiPingBigGroupsRow) {
+                boolean val = !ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled();
+                ColgramShieldConfig.setAntiPingStrangersBigGroupsEnabled(val);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(val);
+                return;
+            } else if (position == collapseSpamPingsRow) {
+                boolean val = !ColgramShieldConfig.isCollapseSpamPingsEnabled();
+                ColgramShieldConfig.setCollapseSpamPingsEnabled(val);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(val);
+                return;
+            } else if (position == autoClearMentionsRow) {
+                boolean val = !ColgramShieldConfig.isAntiPingAutoClearServerMentionsEnabled();
+                ColgramShieldConfig.setAntiPingAutoClearServerMentionsEnabled(val);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(val);
+                return;
+            } else if (position == defenderRow) {
                 presentFragment(new ColgramDefenderActivity());
                 return;
             } else if (position == antiSpamRow) {
@@ -483,9 +549,9 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
-                Toast.makeText(getParentActivity(),
+                ColgramUiKit.showNotice(this, R.drawable.msg_list,
                         val ? "Панель быстрого доступа включена" : "Панель быстрого доступа скрыта",
-                        Toast.LENGTH_SHORT).show();
+                        false);
             } else if (position == maxAnonymityRow) {
                 boolean val = !ColgramConfig.isMaxAnonymityEnabled();
                 ColgramConfig.setMaxAnonymityEnabled(val);
@@ -591,10 +657,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(remap);
                 }
-                Toast.makeText(getParentActivity(), remap
+                ColgramUiKit.showNotice(this, R.drawable.msg_speed, remap
                         ? "Telegram будет звонить на тот свой адрес, который отвечает. Это не прокси: между тобой и Telegram остаётся только Telegram."
                         : "Прямой выбор адреса выключен.",
-                        Toast.LENGTH_LONG).show();
+                        false);
             } else if (position == ipv6BypassRow) {
                 boolean val = !ColgramConfig.isIpv6BypassEnabled();
                 ColgramConfig.setIpv6BypassEnabled(val);
@@ -604,17 +670,17 @@ public class ColgramSettingsActivity extends BaseFragment {
                 // The strategy is read when tgnet re-evaluates the network, so nudge it here -
                 // otherwise the switch only takes effect after the next connection change.
                 ColgramProxyManager.recheckConnectionNow();
-                Toast.makeText(getParentActivity(), val
+                ColgramUiKit.showNotice(this, R.drawable.msg_online, val
                         ? "Telegram будет дёргать только IPv6-адреса центров. Нужно, чтобы в сети был рабочий IPv6."
                         : "Вернулись к IPv4.",
-                        Toast.LENGTH_LONG).show();
+                        false);
             } else if (position == relayUrlRow) {
                 editRelayUrl();
             } else if (position == proxyStatusRow) {
                 ColgramProxyManager.checkPoolNow(true);
                 if (getParentActivity() != null) {
-                    Toast.makeText(getParentActivity().getApplicationContext(),
-                            "Проверяю прокси через нативный чекер Telegram…", Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(this, R.drawable.msg_info,
+                            "Проверяю прокси через нативный чекер Telegram…", false);
                 }
                 // A sweep is up to 8 handshakes, and an unreachable host only reports after the
                 // checker's own timeout, so refreshing at 4 s used to show the old numbers.
@@ -637,10 +703,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(val);
                 }
-                Toast.makeText(getParentActivity(),
+                ColgramUiKit.showNotice(this, R.drawable.msg_clearcache,
                         val ? "Безлимит хранилища и автосжатие включены"
                                 : "Восстановлен стандартный лимит кэша",
-                        Toast.LENGTH_SHORT).show();
+                        false);
             } else if (position == sandboxFilesRow) {
                 // The folder itself. Attaching a file should not require handing Telegram the
                 // whole media library, so this is where files live and where they get picked up.
@@ -1300,7 +1366,7 @@ public class ColgramSettingsActivity extends BaseFragment {
             return;
         }
         if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) {
-            Toast.makeText(context, "WARP-бэкенд отсутствует в этой сборке", Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(context, R.drawable.msg_info, "WARP-бэкенд отсутствует в этой сборке", true);
             return;
         }
         final long token = warpOperationsGate.begin();
@@ -1352,8 +1418,8 @@ public class ColgramSettingsActivity extends BaseFragment {
             if (error != null || !org.colgram.core.ColgramWarpTunnel.isUp()) {
                 ColgramConfig.setWarpEnabled(false);
                 if (getParentActivity() != null) {
-                    Toast.makeText(context, "WARP: " + (error == null ? "туннель не запущен" : error),
-                            Toast.LENGTH_LONG).show();
+                    ColgramUiKit.showNotice(context, R.drawable.msg_info,
+                            "WARP: " + (error == null ? "туннель не запущен" : error), true);
                 }
             }
             refreshSettings();
@@ -1525,6 +1591,41 @@ public class ColgramSettingsActivity extends BaseFragment {
         return input;
     }
 
+    private void showStorageCapSelector() {
+        Activity act = getParentActivity();
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
+        java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(5);
+        items.add(ColgramUiKit.ChoiceItem.of("512 МБ (жёсткий эконом-лимит)", "Автоочистка при > 512 МБ", R.drawable.msg_clearcache));
+        items.add(ColgramUiKit.ChoiceItem.of("1024 МБ / 1 ГБ (Рекомендуется)", "Жёсткий лимит кэша ≤ 1 ГБ на диске", R.drawable.outline_shield_check));
+        items.add(ColgramUiKit.ChoiceItem.of("2048 МБ (2 ГБ)", "Повышенный физический предел", R.drawable.msg_folders));
+        items.add(ColgramUiKit.ChoiceItem.of("Выключить лимит (∞)", "Отключает жёсткую квоту хранилища", R.drawable.msg_speed));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_clearcache,
+                "Жёсткий лимит кэша на диске",
+                "Бесконечное хранилище (≤ 1 ГБ на диске) держит индексы и стриминг-кэш в заданной квоте.",
+                items,
+                idx -> {
+                    if (idx == 0) {
+                        ColgramShieldConfig.setStorageCapEnabled(true);
+                        ColgramShieldConfig.setStorageHardCapMb(512);
+                    } else if (idx == 1) {
+                        ColgramShieldConfig.setStorageCapEnabled(true);
+                        ColgramShieldConfig.setStorageHardCapMb(1024);
+                    } else if (idx == 2) {
+                        ColgramShieldConfig.setStorageCapEnabled(true);
+                        ColgramShieldConfig.setStorageHardCapMb(2048);
+                    } else if (idx == 3) {
+                        ColgramShieldConfig.setStorageCapEnabled(false);
+                    }
+                    if (listAdapter != null && storageCapRow >= 0) {
+                        listAdapter.notifyItemChanged(storageCapRow);
+                    }
+                }
+        );
+    }
+
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
         private final Context mContext;
 
@@ -1550,7 +1651,12 @@ public class ColgramSettingsActivity extends BaseFragment {
                    position == antiSpamRow || position == autoReplyRow || position == tempMailRow || position == versionsRow ||
                    position == cloudflareWarpRow || position == subscriptionRow || position == directConnectionRow
                    || position == publicProxyRow || position == subscriptionNodeRow || position == callsRow || position == browserRow
-                   || position == dataSettingsRow || position == cacheSettingsRow;
+                   || position == dataSettingsRow || position == cacheSettingsRow
+                   || position == premiumRow || position == filesHubRow
+                   || position == infiniteStorageRow || position == storageCapRow
+                   || position == lazyShadowVaultRow || position == malwareShieldRow
+                   || position == antiPingBigGroupsRow || position == collapseSpamPingsRow
+                   || position == autoClearMentionsRow;
         }
 
         @Override
@@ -1564,11 +1670,17 @@ public class ColgramSettingsActivity extends BaseFragment {
                 return 0; // HeaderCell
             } else if (position == cloakModelRow || position == currentProxyRow
                     || position == ownProxyRow || position == proxyStatusRow || position == relayUrlRow
-                    || position == sandboxFilesRow || position == accountVaultRow || position == liveWallpaperRow || position == easterEggsRow || position == batteryAutostartRow || position == settingsBackupRow || position == defenderRow || position == pluginsRow || position == botTestRow
+                    || position == sandboxFilesRow || position == defenderRow || position == cacheSettingsRow
+                    || position == directConnectionRow || position == publicProxyRow || position == cloudflareWarpRow
+                    || position == subscriptionRow || position == subscriptionNodeRow
+                    || position == callsRow || position == browserRow
+                    || position == premiumRow || position == filesHubRow || position == storageCapRow) {
+                return 7; // TextDetailSettingsCell (two-line wrap-safe layout)
+            } else if (position == accountVaultRow || position == liveWallpaperRow || position == easterEggsRow
+                    || position == batteryAutostartRow || position == settingsBackupRow
+                    || position == pluginsRow || position == botTestRow
                     || position == antiSpamRow || position == autoReplyRow || position == tempMailRow || position == versionsRow
-                    || position == cloudflareWarpRow || position == subscriptionRow || position == directConnectionRow
-                    || position == publicProxyRow || position == subscriptionNodeRow || position == callsRow || position == browserRow
-                    || position == dataSettingsRow || position == cacheSettingsRow) {
+                    || position == dataSettingsRow) {
                 return 2; // TextSettingsCell
             } else if (position == cloakingSectionRow || position == vaultSectionRow || position == ghostSectionRow ||
                        position == networkSectionRow || position == resourceSectionRow || position == sandboxSectionRow ||
@@ -1592,6 +1704,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                     break;
                 case 2:
                     view = new TextSettingsCell(mContext);
+                    view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+                    break;
+                case 7:
+                    view = new TextDetailSettingsCell(mContext);
                     view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
                     break;
                 case 3:
@@ -1666,7 +1782,43 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }
                 case 1: {
                     TextCheckCell checkCell = (TextCheckCell) holder.itemView;
-                    if (position == cloakEnabledRow) {
+                    if (position == infiniteStorageRow) {
+                        ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_EMERALD, R.drawable.msg_folders);
+                        checkCell.setColgramWrapTitle(true);
+                        checkCell.setTextAndValueAndCheck("Бесконечное хранилище (≤ 1 ГБ на диске)",
+                                "Виртуальная память для фото, видео и голосовых без раздувания диска",
+                                ColgramShieldConfig.isInfiniteVirtualStorageEnabled(), true, true);
+                    } else if (position == lazyShadowVaultRow) {
+                        ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_INDIGO, R.drawable.msg_archive);
+                        checkCell.setColgramWrapTitle(true);
+                        checkCell.setTextAndValueAndCheck("Ленивый сейф анти-удаления (Shadow Vault)",
+                                "Не скачивает тяжелые медиа заранее при получении сообщений",
+                                ColgramShieldConfig.isLazyShadowVaultEnabled(), true, true);
+                    } else if (position == malwareShieldRow) {
+                        ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_CRIMSON, R.drawable.outline_shield_check);
+                        checkCell.setColgramWrapTitle(true);
+                        checkCell.setTextAndValueAndCheck("Щит от вредоносных и тяжёлых APK",
+                                "Предупреждает при загрузке APK / архивов и опасных вложений",
+                                ColgramShieldConfig.isMalwareDownloadShieldEnabled(), true, false);
+                    } else if (position == antiPingBigGroupsRow) {
+                        ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_VIOLET, R.drawable.msg_block);
+                        checkCell.setColgramWrapTitle(true);
+                        checkCell.setTextAndValueAndCheck("Анти-пинг незнакомцев в больших группах",
+                                "Отключает уведомления об @упоминаниях от незнакомцев",
+                                ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled(), true, true);
+                    } else if (position == collapseSpamPingsRow) {
+                        ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_AMBER, R.drawable.msg_clear);
+                        checkCell.setColgramWrapTitle(true);
+                        checkCell.setTextAndValueAndCheck("Сворачивать спам-пинги и простыни в чатах",
+                                "Авто-сворачивание длинных спам-сообщений с @упоминаниями",
+                                ColgramShieldConfig.isCollapseSpamPingsEnabled(), true, true);
+                    } else if (position == autoClearMentionsRow) {
+                        ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_BLUE, R.drawable.msg_check_s);
+                        checkCell.setColgramWrapTitle(true);
+                        checkCell.setTextAndValueAndCheck("Авто-сброс серверных @упоминаний от спамеров",
+                                "Молча снимает значок «@» после отфильтрованного пинга",
+                                ColgramShieldConfig.isAntiPingAutoClearServerMentionsEnabled(), true, true);
+                    } else if (position == cloakEnabledRow) {
                         ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_VIOLET, R.drawable.settings_devices);
                         checkCell.setTextAndCheck("Маскировка модели и системы", ColgramConfig.isCloakEnabled(), true);
                     } else if (position == antiDeleteRow) {
@@ -1783,34 +1935,7 @@ public class ColgramSettingsActivity extends BaseFragment {
                 }
                 case 2: {
                     TextSettingsCell settingsCell = (TextSettingsCell) holder.itemView;
-                    if (position == cloakModelRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_devices, ColgramMenuChrome.COLOR_VIOLET);
-                        settingsCell.setTextAndValue("Профиль устройства",
-                                ColgramCloak.getEffectiveDeviceModel() + " · " + ColgramCloak.getEffectiveSystemVersion(), false);
-                    } else if (position == currentProxyRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_speed, ColgramMenuChrome.COLOR_CYAN);
-                        ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
-                        // Automatic failover deliberately keeps Telegram's persisted proxy
-                        // preference off. The live route still needs to be shown as active.
-                        boolean proxyOn = ColgramProxyManager.isProxyEnabled(getContext())
-                                || active != null;
-                        String proxyStr = !proxyOn
-                                ? "прокси выключен"
-                                : (active != null ? active.toString() : "включено, узел не определён");
-                        settingsCell.setTextAndValue("Выбрать публичный прокси", proxyStr, true);
-                    } else if (position == ownProxyRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.outline_shield_check, ColgramMenuChrome.COLOR_BLUE);
-                        settingsCell.setTextAndValue("Свой прокси: MTProto / WebSocket / SOCKS5",
-                                (ColgramProxyManager.isProxyEnabled(getContext())
-                                        || ColgramProxyManager.getCurrentActiveProxy() != null)
-                                        ? "открыть экран Telegram" : "добавить и включить", true);
-                    } else if (position == sandboxFilesRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_folders, ColgramMenuChrome.COLOR_AMBER);
-                        // Show the path that is actually in effect: scoped storage decides it, so
-                        // "Documents/Colgram" is only true when the system let us write there.
-                        settingsCell.setTextAndValue("Папка Colgram",
-                                ColgramStorageSandbox.getRootPath(getContext()), true);
-                    } else if (position == accountVaultRow) {
+                    if (position == accountVaultRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_account, ColgramMenuChrome.COLOR_INDIGO);
                         settingsCell.setTextAndValue("Сейф аккаунтов (без лимита)",
                                 "управление и пины", true);
@@ -1832,14 +1957,6 @@ public class ColgramSettingsActivity extends BaseFragment {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_pin_code, ColgramMenuChrome.COLOR_TEAL);
                         settingsCell.setTextAndValue("Бэкап аккаунтов и настроек (AES-256)",
                                 "экспорт / импорт", false);
-                    } else if (position == defenderRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.outline_shield_check, ColgramMenuChrome.COLOR_EMERALD);
-                        org.colgram.core.ColgramSecurityDefender.AuditReport dr =
-                                org.colgram.core.ColgramSecurityDefender.getLatestReport();
-                        String dVal = dr != null
-                                ? dr.scorePercent + "% · закрыто " + dr.closedCount + "/" + dr.findings.size()
-                                : (ColgramConfig.isDefenderEnabled() ? "авто-защита активна" : "выключен");
-                        settingsCell.setTextAndValue("Бот-защитник Telegram (дыры и утечки)", dVal, true);
                     } else if (position == pluginsRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_customize, ColgramMenuChrome.COLOR_VIOLET);
                         settingsCell.setTextAndValue("Плагины: маркетплейс, exteraGram, Python",
@@ -1860,21 +1977,78 @@ public class ColgramSettingsActivity extends BaseFragment {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_download, ColgramMenuChrome.COLOR_EMERALD);
                         settingsCell.setTextAndValue("Версии и обновления Colgram",
                                 "открыть", false);
-                    } else if (position == relayUrlRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_link, ColgramMenuChrome.COLOR_TEAL);
-                        String relay = ColgramConfig.getRelayUrl();
-                        settingsCell.setTextAndValue("Реле-адрес для Bot API и почты",
-                                relay.isEmpty() ? "не задан" : relay, true);
                     } else if (position == botTestRow) {
                         ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_bots, ColgramMenuChrome.COLOR_INDIGO);
                         settingsCell.setTextAndValue("Проверка Bot API (имя и описание)",
                                 botTestSummary(), true);
+                    } else if (position == dataSettingsRow) {
+                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_data, ColgramMenuChrome.COLOR_BLUE);
+                        settingsCell.setTextAndValue("Экономия трафика и автозагрузка", "настроить", true);
+                    }
+                    break;
+                }
+                case 7: {
+                    TextDetailSettingsCell detailCell = (TextDetailSettingsCell) holder.itemView;
+                    detailCell.setMultilineDetail(true);
+                    if (position == premiumRow) {
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Colgram Premium+",
+                                "Теги в Избранном, 0 рекламы, локальный STT и переводчик",
+                                R.drawable.msg_reactions, ColgramMenuChrome.COLOR_VIOLET, false);
+                    } else if (position == filesHubRow) {
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Бесконечное хранилище (≤ 1 ГБ на диске)",
+                                "Открыть диспетчер файлов, виртуальный стриминг и очистку",
+                                R.drawable.msg_folders, ColgramMenuChrome.COLOR_EMERALD, true);
+                    } else if (position == storageCapRow) {
+                        String capText = ColgramShieldConfig.isStorageCapEnabled()
+                                ? (ColgramShieldConfig.getStorageHardCapMb() + " МБ · автоматическая обрезка тяжёлого кэша")
+                                : "Без жёсткой квоты · очистка только вручную";
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Жёсткий лимит кэша на диске",
+                                capText, R.drawable.msg_clearcache, ColgramMenuChrome.COLOR_AMBER, true);
+                    } else if (position == cloakModelRow) {
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Профиль устройства",
+                                ColgramCloak.getEffectiveDeviceModel() + " · " + ColgramCloak.getEffectiveSystemVersion(),
+                                R.drawable.settings_devices, ColgramMenuChrome.COLOR_VIOLET, false);
+                    } else if (position == currentProxyRow) {
+                        ColgramProxyManager.ProxyItem active = ColgramProxyManager.getCurrentActiveProxy();
+                        // Automatic failover deliberately keeps Telegram's persisted proxy
+                        // preference off. The live route still needs to be shown as active.
+                        boolean proxyOn = ColgramProxyManager.isProxyEnabled(getContext())
+                                || active != null;
+                        String proxyStr = !proxyOn
+                                ? "прокси выключен"
+                                : (active != null ? active.toString() : "включено, узел не определён");
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Выбрать публичный прокси",
+                                proxyStr, R.drawable.msg_speed, ColgramMenuChrome.COLOR_CYAN, true);
+                    } else if (position == ownProxyRow) {
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Свой прокси: MTProto / WebSocket / SOCKS5",
+                                (ColgramProxyManager.isProxyEnabled(getContext())
+                                        || ColgramProxyManager.getCurrentActiveProxy() != null)
+                                        ? "открыть экран Telegram" : "добавить и включить",
+                                R.drawable.outline_shield_check, ColgramMenuChrome.COLOR_BLUE, true);
+                    } else if (position == sandboxFilesRow) {
+                        // Show the path that is actually in effect: scoped storage decides it, so
+                        // "Documents/Colgram" is only true when the system let us write there.
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Папка Colgram",
+                                ColgramStorageSandbox.getRootPath(getContext()),
+                                R.drawable.settings_folders, ColgramMenuChrome.COLOR_AMBER, true);
+                    } else if (position == defenderRow) {
+                        org.colgram.core.ColgramSecurityDefender.AuditReport dr =
+                                org.colgram.core.ColgramSecurityDefender.getLatestReport();
+                        String dVal = dr != null
+                                ? dr.scorePercent + "% · закрыто " + dr.closedCount + "/" + dr.findings.size()
+                                : (ColgramConfig.isDefenderEnabled() ? "авто-защита активна" : "выключен");
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Бот-защитник Telegram (дыры и утечки)",
+                                dVal, R.drawable.outline_shield_check, ColgramMenuChrome.COLOR_EMERALD, true);
+                    } else if (position == relayUrlRow) {
+                        String relay = ColgramConfig.getRelayUrl();
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Реле-адрес для Bot API и почты",
+                                relay.isEmpty() ? "не задан" : relay,
+                                R.drawable.msg_link, ColgramMenuChrome.COLOR_TEAL, true);
                     } else if (position == proxyStatusRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_info, ColgramMenuChrome.COLOR_AMBER);
-                        settingsCell.setTextAndValue("Состояние прокси (нажмите для проверки)",
-                                ColgramProxyDoctor.getStatusSummary(), true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Состояние прокси (нажмите для проверки)",
+                                ColgramProxyDoctor.getStatusSummary(),
+                                R.drawable.msg_info, ColgramMenuChrome.COLOR_AMBER, true);
                     } else if (position == directConnectionRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.outline_shield_plain_24, ColgramMenuChrome.COLOR_EMERALD);
                         String subscriptionState = subscriptionTunnelStatus(getContext());
                         boolean vpnActive = isAndroidVpnActive();
                         ColgramProxyManager.ProxyItem route = ColgramProxyManager.getCurrentActiveProxy();
@@ -1884,42 +2058,42 @@ public class ColgramSettingsActivity extends BaseFragment {
                                 && !ColgramProxyManager.isProxySelectionPending() && !vpnActive
                                 && !"running".equals(subscriptionState) && !"starting".equals(subscriptionState)
                                 && !"stopping".equals(subscriptionState) && !"consent".equals(subscriptionState);
-                        settingsCell.setTextAndValue("Обычный интернет · локальный слой",
-                                direct ? "выбран · " + dpiStatusLine() : vpnActive ? "активен Android VPN" : "нажмите для переключения", true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Обычный интернет · локальный слой",
+                                direct ? "выбран · " + dpiStatusLine() : vpnActive ? "активен Android VPN" : "нажмите для переключения",
+                                R.drawable.outline_shield_plain_24, ColgramMenuChrome.COLOR_EMERALD, true);
                     } else if (position == publicProxyRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_search, ColgramMenuChrome.COLOR_BLUE);
                         String status = ColgramProxyManager.getProxySelectionStatus();
-                        settingsCell.setTextAndValue("Найти рабочий публичный прокси",
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Найти рабочий публичный прокси",
                                 ColgramProxyManager.isProxySelectionPending() ? "проверяется · нажмите для отмены"
-                                        : status == null || status.isEmpty() ? "проверить" : status, true);
+                                        : status == null || status.isEmpty() ? "проверить" : status,
+                                R.drawable.msg_search, ColgramMenuChrome.COLOR_BLUE, true);
                     } else if (position == subscriptionNodeRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_online, ColgramMenuChrome.COLOR_INDIGO);
-                        settingsCell.setTextAndValue("Узел / страна из подписки",
-                                subscription.nodeLabel(), true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Узел / страна из подписки",
+                                subscription.nodeLabel(),
+                                R.drawable.msg_online, ColgramMenuChrome.COLOR_INDIGO, true);
                     } else if (position == callsRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_calls, ColgramMenuChrome.COLOR_EMERALD);
-                        settingsCell.setTextAndValue("Использовать для звонков", ColgramCallRoutes.summary(), true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Использовать для звонков",
+                                ColgramCallRoutes.summary(),
+                                R.drawable.settings_calls, ColgramMenuChrome.COLOR_EMERALD, true);
                     } else if (position == browserRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_link2, ColgramMenuChrome.COLOR_CYAN);
-                        settingsCell.setTextAndValue("Использовать для браузера", ColgramBrowserRoutes.summary(), false);
-                    } else if (position == dataSettingsRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.settings_data, ColgramMenuChrome.COLOR_BLUE);
-                        settingsCell.setTextAndValue("Экономия трафика и автозагрузка", "настроить", true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Использовать для браузера",
+                                ColgramBrowserRoutes.summary(),
+                                R.drawable.msg_link2, ColgramMenuChrome.COLOR_CYAN, false);
                     } else if (position == cacheSettingsRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_clearcache, ColgramMenuChrome.COLOR_AMBER);
-                        settingsCell.setTextAndValue("Кэш: размер и срок хранения",
-                                org.colgram.core.ColgramUnlimitedMemory.buildStatusSummary(mContext), false);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Кэш: размер и срок хранения",
+                                org.colgram.core.ColgramUnlimitedMemory.buildStatusSummary(mContext),
+                                R.drawable.msg_clearcache, ColgramMenuChrome.COLOR_AMBER, true);
                     } else if (position == cloudflareWarpRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_speed, ColgramMenuChrome.COLOR_CRIMSON);
-                        settingsCell.setTextAndValue("Cloudflare WARP (встроенный обход)",
-                                warpStatusLine(), true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Cloudflare WARP (встроенный обход)",
+                                warpStatusLine(),
+                                R.drawable.msg_speed, ColgramMenuChrome.COLOR_CRIMSON, true);
                     } else if (position == subscriptionRow) {
-                        ColgramMenuChrome.applySettingIcon(settingsCell, R.drawable.msg_download, ColgramMenuChrome.COLOR_VIOLET);
                         // The row says what is actually stored, never what the user hopes for:
                         // a link that parsed to nothing shows as absent, not as a tunnel waiting
                         // to start.
-                        settingsCell.setTextAndValue("Подписка (VPN на весь телефон)",
-                                subscriptionStatusLine(), true);
+                        ColgramMenuChrome.applyDetailIcon(detailCell, "Подписка (VPN на весь телефон)",
+                                subscriptionStatusLine(),
+                                R.drawable.msg_download, ColgramMenuChrome.COLOR_VIOLET, true);
                     }
                     break;
                 }
@@ -1963,6 +2137,10 @@ public class ColgramSettingsActivity extends BaseFragment {
                 new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         list.add(new ThemeDescription(listView, 0,
                 new Class[]{TextSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteValueText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
                 new Class[]{TextInfoPrivacyCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
         list.add(new ThemeDescription(listView, 0,

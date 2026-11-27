@@ -19,6 +19,9 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.colgram.core.ColgramConfig;
+import org.colgram.core.ColgramFileSafetyPolicy;
+import org.colgram.core.ColgramShieldConfig;
+import org.colgram.core.ColgramStorageCapEnforcer;
 import org.colgram.core.ColgramStorageSandbox;
 import org.colgram.core.ColgramUnlimitedMemory;
 import org.telegram.messenger.AndroidUtilities;
@@ -34,6 +37,7 @@ import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Cells.HeaderCell;
 import org.telegram.ui.Cells.ShadowSectionCell;
+import org.telegram.ui.Cells.TextCheckCell;
 import org.telegram.ui.Cells.TextSettingsCell;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.LayoutHelper;
@@ -90,6 +94,8 @@ public class ColgramFilesActivity extends BaseFragment {
     private File sandboxRoot;
     private String searchQuery = "";
     private String dirStatsSummary = "подсчёт...";
+    private volatile ColgramStorageCapEnforcer.VirtualStorageStats virtualStats =
+            new ColgramStorageCapEnforcer.VirtualStorageStats();
 
     private static final ExecutorService IMPORT_EXECUTOR = Executors.newSingleThreadExecutor();
     private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
@@ -97,7 +103,11 @@ public class ColgramFilesActivity extends BaseFragment {
     private int heroRow = -1;
     private int controlsHeaderRow = -1;
     private int cloudDriveRow = -1;
+    private int storageCapRow = -1;
     private int unlimitedCacheRow = -1;
+    private int lazyShadowVaultRow = -1;
+    private int malwareShieldRow = -1;
+    private int compressCleanNowRow = -1;
     private int controlsShadowRow = -1;
     private int headerRow = -1;
     private int parentDirRow = -1;
@@ -114,7 +124,9 @@ public class ColgramFilesActivity extends BaseFragment {
         super.onFragmentCreate();
         destroyed = false;
         pickMode = pendingPickListener != null;
-        sandboxRoot = ColgramStorageSandbox.getSandboxRootDir(getParentActivity());
+        Activity act = getParentActivity();
+        if (act != null) ColgramShieldConfig.init(act);
+        sandboxRoot = ColgramStorageSandbox.getSandboxRootDir(act);
         currentDir = sandboxRoot;
         reload();
         return true;
@@ -195,12 +207,18 @@ public class ColgramFilesActivity extends BaseFragment {
                 String[] ch = sub.list();
                 folderChildCounts.put(sub.getAbsolutePath(), ch == null ? 0 : ch.length);
             }
+            Context appCtx = ApplicationLoader.applicationContext;
+            final ColgramStorageCapEnforcer.VirtualStorageStats vs = appCtx != null
+                    ? ColgramStorageCapEnforcer.getVirtualStorageStats(appCtx)
+                    : new ColgramStorageCapEnforcer.VirtualStorageStats();
             final String formatted = objects((int) st[0]) + " · " + AndroidUtilities.formatFileSize(st[1]);
             AndroidUtilities.runOnUIThread(() -> {
                 if (destroyed || !sameDir(dir, currentDir)) return;
+                virtualStats = vs;
                 dirStatsSummary = formatted;
                 if (listAdapter != null) {
                     if (heroRow >= 0) listAdapter.notifyItemChanged(heroRow);
+                    if (storageCapRow >= 0) listAdapter.notifyItemChanged(storageCapRow);
                     if (headerRow >= 0) listAdapter.notifyItemChanged(headerRow);
                     if (!dirSnapshot.isEmpty() && !visibleEntries.isEmpty()) {
                         listAdapter.notifyItemRangeChanged(entriesStartRow, visibleEntries.size());
@@ -230,13 +248,21 @@ public class ColgramFilesActivity extends BaseFragment {
             heroRow = rowCount++;
             controlsHeaderRow = rowCount++;
             cloudDriveRow = rowCount++;
+            storageCapRow = rowCount++;
             unlimitedCacheRow = rowCount++;
+            lazyShadowVaultRow = rowCount++;
+            malwareShieldRow = rowCount++;
+            compressCleanNowRow = rowCount++;
             controlsShadowRow = rowCount++;
         } else {
             heroRow = -1;
             controlsHeaderRow = -1;
             cloudDriveRow = -1;
+            storageCapRow = -1;
             unlimitedCacheRow = -1;
+            lazyShadowVaultRow = -1;
+            malwareShieldRow = -1;
+            compressCleanNowRow = -1;
             controlsShadowRow = -1;
         }
         headerRow = rowCount++;
@@ -337,18 +363,41 @@ public class ColgramFilesActivity extends BaseFragment {
                 openSavedMessagesCloud();
                 return;
             }
+            if (position == storageCapRow) {
+                showStorageCapSelector();
+                return;
+            }
             if (position == unlimitedCacheRow) {
                 boolean next = !ColgramConfig.isUnlimitedMemoryEnabled();
                 ColgramConfig.setUnlimitedMemoryEnabled(next);
                 ColgramUnlimitedMemory.apply(getParentActivity(), next);
                 if (listAdapter != null) {
                     if (heroRow >= 0) listAdapter.notifyItemChanged(heroRow);
+                    if (storageCapRow >= 0) listAdapter.notifyItemChanged(storageCapRow);
                     listAdapter.notifyItemChanged(unlimitedCacheRow);
                 }
-                Toast.makeText(getParentActivity(),
-                        next ? "Медиа и файлы хранятся вечно без автоочистки"
-                                : "Восстановлен стандартный лимит кэша",
-                        Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showHudBanner(
+                        getParentActivity(),
+                        next ? "Режим Безлимита включён" : "Лимит " + formatCapLabel(),
+                        next ? "Медиа хранятся без жёсткой квоты" : "Жёсткий потолок кэша активен",
+                        R.drawable.msg_clearcache,
+                        ColgramMenuChrome.COLOR_EMERALD);
+                return;
+            }
+            if (position == lazyShadowVaultRow) {
+                boolean next = !ColgramShieldConfig.isLazyShadowVaultEnabled();
+                ColgramShieldConfig.setLazyShadowVaultEnabled(next);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(next);
+                return;
+            }
+            if (position == malwareShieldRow) {
+                boolean next = !ColgramShieldConfig.isMalwareDownloadShieldEnabled();
+                ColgramShieldConfig.setMalwareDownloadShieldEnabled(next);
+                if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(next);
+                return;
+            }
+            if (position == compressCleanNowRow) {
+                runManualOptimizeWithBanner();
                 return;
             }
             if (position == parentDirRow) {
@@ -367,6 +416,92 @@ public class ColgramFilesActivity extends BaseFragment {
         });
 
         return fragmentView;
+    }
+
+    private void showStorageCapSelector() {
+        Activity act = getParentActivity();
+        if (act == null) return;
+        final String[] labels = new String[]{
+                "512 MB (Ультра-компакт)",
+                "1 GB (Рекомендуется)",
+                "2 GB",
+                "5 GB",
+                "Безлимит (выкл. квоту)"
+        };
+        final int[] capsMb = new int[]{512, 1024, 2048, 5120, 0};
+        int curCap = (!ColgramShieldConfig.isStorageCapEnabled() || ColgramConfig.isUnlimitedMemoryEnabled())
+                ? 0 : ColgramShieldConfig.getStorageHardCapMb();
+        int sel = 1;
+        for (int i = 0; i < capsMb.length; i++) {
+            if (capsMb[i] == curCap) {
+                sel = i;
+                break;
+            }
+        }
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_clearcache,
+                "Лимит физического кэша",
+                "3-уровневое виртуальное хранилище: сжатие + Shadow-каталог + LRU защита",
+                labels,
+                sel,
+                which -> {
+                    int chosen = capsMb[which];
+                    ColgramUnlimitedMemory.applyStorageCap(act, chosen);
+                    ColgramUiKit.showHudBanner(
+                            act,
+                            "Лимит: " + labels[which],
+                            chosen > 0 ? "Авто-сжатие и квота синхронизированы" : "Квота отключена",
+                            R.drawable.msg_clearcache,
+                            ColgramMenuChrome.COLOR_EMERALD);
+                    reload();
+                }
+        );
+    }
+
+    private void runManualOptimizeWithBanner() {
+        Activity act = getParentActivity();
+        if (act == null || destroyed) return;
+        final Context appCtx = act.getApplicationContext();
+        ColgramUiKit.showHudBanner(
+                appCtx,
+                "Сжатие и виртуализация...",
+                "Запущен 3-фазный оптимизатор хранилища",
+                R.drawable.msg_clearcache,
+                ColgramMenuChrome.COLOR_CYAN);
+        bgExecutor.execute(() -> {
+            ColgramStorageCapEnforcer.EnforcementReport rep =
+                    ColgramStorageCapEnforcer.runManualOptimizationNow(appCtx);
+            final long savedTotal = rep.phaseAReclaimedBytes
+                    + rep.phaseBCompressedSavedBytes
+                    + rep.phaseCEvictedBytes
+                    + rep.logRotatedSavedBytes
+                    + rep.shadowPreviewsEvictedBytes;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (destroyed) return;
+                ColgramUiKit.showHudBanner(
+                        appCtx,
+                        "Оптимизация завершена",
+                        "Освобождено: " + ColgramStorageCapEnforcer.formatSize(savedTotal)
+                                + " · Сжато файлов: " + rep.compressedFilesCount
+                                + " · Сейчас: " + ColgramStorageCapEnforcer.formatSize(rep.bytesAfter),
+                        R.drawable.msg_clearcache,
+                        ColgramMenuChrome.COLOR_EMERALD);
+                reload();
+            });
+        });
+    }
+
+    private String formatCapLabel() {
+        if (!ColgramShieldConfig.isStorageCapEnabled() || ColgramConfig.isUnlimitedMemoryEnabled()) {
+            return "Безлимит";
+        }
+        int mb = ColgramShieldConfig.getStorageHardCapMb();
+        if (mb >= 1024 && (mb % 1024) == 0) {
+            return (mb / 1024) + " GB";
+        }
+        return mb + " MB";
     }
 
     private void openSavedMessagesCloud() {
@@ -506,18 +641,32 @@ public class ColgramFilesActivity extends BaseFragment {
     }
 
     private void openFile(File file) {
-        if (getParentActivity() == null) return;
-        try {
-            Uri uri = androidx.core.content.FileProvider.getUriForFile(
-                    getParentActivity(), getParentActivity().getPackageName() + ".provider", file);
-            Intent intent = new Intent(Intent.ACTION_VIEW);
-            intent.setDataAndType(uri, mimeFor(file.getName()));
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            getParentActivity().startActivity(intent);
-        } catch (Throwable t) {
-            Toast.makeText(getParentActivity(), "Нет приложения, чем открыть этот файл",
-                    Toast.LENGTH_SHORT).show();
+        Activity act = getParentActivity();
+        if (act == null || file == null) return;
+        long capBytes = ColgramShieldConfig.isStorageCapEnabled()
+                ? ColgramShieldConfig.getStorageHardCapBytes() : 0L;
+        ColgramFileSafetyPolicy.SafetyAssessment safety = ColgramFileSafetyPolicy.assessForManualAction(
+                file.getName(), mimeFor(file.getName()), file.length(), capBytes);
+        Runnable doOpen = () -> {
+            try {
+                Uri uri = androidx.core.content.FileProvider.getUriForFile(
+                        act, act.getPackageName() + ".provider", file);
+                Intent intent = new Intent(Intent.ACTION_VIEW);
+                intent.setDataAndType(uri, mimeFor(file.getName()));
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                act.startActivity(intent);
+            } catch (Throwable t) {
+                Toast.makeText(act, "Нет приложения, чем открыть этот файл",
+                        Toast.LENGTH_SHORT).show();
+            }
+        };
+        if (safety.manualWarningRequired) {
+            ColgramUiKit.showMalwareWarningSheet(
+                    act, resourceProvider, file.getName(), safety.detectedExtension,
+                    file.length(), safety.threatReason, true, doOpen);
+            return;
         }
+        doOpen.run();
     }
 
     private void shareFile(File file) {
@@ -798,6 +947,7 @@ public class ColgramFilesActivity extends BaseFragment {
             if (position == heroRow) return 10;
             if (position == controlsShadowRow || position == bottomShadowRow) return 2;
             if (position == headerRow || position == controlsHeaderRow) return 0;
+            if (position == lazyShadowVaultRow || position == malwareShieldRow) return 3;
             return 1;
         }
 
@@ -811,6 +961,9 @@ public class ColgramFilesActivity extends BaseFragment {
             } else if (viewType == 0) {
                 view = new HeaderCell(mContext, resourceProvider);
                 view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite, resourceProvider));
+            } else if (viewType == 3) {
+                view = new TextCheckCell(mContext, resourceProvider);
+                view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite, resourceProvider));
             } else {
                 view = new TextSettingsCell(mContext, resourceProvider);
                 view.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite, resourceProvider));
@@ -822,21 +975,26 @@ public class ColgramFilesActivity extends BaseFragment {
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
             if (position == heroRow) {
                 ColgramMenuChrome.HeroBannerCell hero = (ColgramMenuChrome.HeroBannerCell) holder.itemView;
-                boolean unlim = ColgramConfig.isUnlimitedMemoryEnabled();
+                ColgramStorageCapEnforcer.VirtualStorageStats vs = virtualStats;
+                boolean unlim = ColgramConfig.isUnlimitedMemoryEnabled() && !ColgramShieldConfig.isStorageCapEnabled();
+                String phys = ColgramStorageCapEnforcer.formatSize(vs.physicalBytes);
+                String virt = ColgramStorageCapEnforcer.formatSize(vs.virtualCatalogBytes);
+                String capStr = vs.capBytes > 0L ? ColgramStorageCapEnforcer.formatSize(vs.capBytes) : "Безлимит";
                 hero.bind(R.drawable.settings_folders,
                         unlim ? ColgramMenuChrome.COLOR_EMERALD : ColgramMenuChrome.COLOR_AMBER,
-                        "Бесконечное хранилище",
-                        "Песочница файлов Colgram, безлимитный кэш медиа и быстрый доступ к облаку Избранного",
-                        unlim ? "БЕЗЛИМИТ" : "СТАНДАРТ",
-                        dirStatsSummary,
-                        "Sandbox изоляция",
-                        "Облако TG");
+                        "Виртуальное хранилище",
+                        "3-уровневое сжатие, Shadow Micro-Vault и жёсткий лимит диска · Сжато: "
+                                + ColgramStorageCapEnforcer.formatSize(vs.savedByCompressionBytes),
+                        unlim ? "БЕЗЛИМИТ" : formatCapLabel(),
+                        phys + " / " + capStr,
+                        "Каталог " + virt,
+                        "Превью " + vs.shadowVaultFilesCount);
                 return;
             }
             if (position == controlsShadowRow || position == bottomShadowRow) return;
             if (position == controlsHeaderRow) {
                 HeaderCell cell = (HeaderCell) holder.itemView;
-                cell.setText("Облако и безлимитный кэш");
+                cell.setText("3-уровневый контроль хранилища");
                 ColgramMenuChrome.styleHeader(cell, ColgramMenuChrome.COLOR_TEAL, 0xFF2DD4BF);
                 return;
             }
@@ -849,16 +1007,41 @@ public class ColgramFilesActivity extends BaseFragment {
                 ColgramMenuChrome.styleHeader(cell, ColgramMenuChrome.COLOR_AMBER, 0xFFFBBF24);
                 return;
             }
+            if (position == lazyShadowVaultRow || position == malwareShieldRow) {
+                TextCheckCell checkCell = (TextCheckCell) holder.itemView;
+                if (position == lazyShadowVaultRow) {
+                    ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_INDIGO, R.drawable.msg_photos);
+                    checkCell.setTextAndCheck("Lazy Shadow Vault (трафик-сейв WebP)",
+                            ColgramShieldConfig.isLazyShadowVaultEnabled(), true);
+                } else {
+                    ColgramMenuChrome.applyCheckIcon(checkCell, ColgramMenuChrome.COLOR_CRIMSON, R.drawable.outline_shield_check);
+                    checkCell.setTextAndCheck("Щит автозагрузки (>15/50 MB, APK/EXE)",
+                            ColgramShieldConfig.isMalwareDownloadShieldEnabled(), true);
+                }
+                return;
+            }
             TextSettingsCell cell = (TextSettingsCell) holder.itemView;
             if (position == cloudDriveRow) {
                 ColgramMenuChrome.applySettingIcon(cell, R.drawable.msg_archive, ColgramMenuChrome.COLOR_CYAN);
                 cell.setTextAndValue("Облачное хранилище (Избранное)", "Без лимита", true);
                 return;
             }
+            if (position == storageCapRow) {
+                ColgramMenuChrome.applySettingIcon(cell, R.drawable.msg_clearcache, ColgramMenuChrome.COLOR_AMBER);
+                ColgramStorageCapEnforcer.VirtualStorageStats vs = virtualStats;
+                cell.setTextAndValue("Жёсткий лимит кэша",
+                        ColgramStorageCapEnforcer.formatSize(vs.physicalBytes) + " / " + formatCapLabel(), true);
+                return;
+            }
             if (position == unlimitedCacheRow) {
-                ColgramMenuChrome.applySettingIcon(cell, R.drawable.msg_clearcache, ColgramMenuChrome.COLOR_EMERALD);
-                boolean on = ColgramConfig.isUnlimitedMemoryEnabled();
-                cell.setTextAndValue("Безлимитный кэш медиа", on ? "Вкл (вечно)" : "Стандарт", false);
+                ColgramMenuChrome.applySettingIcon(cell, R.drawable.msg_folders, ColgramMenuChrome.COLOR_EMERALD);
+                boolean on = ColgramConfig.isUnlimitedMemoryEnabled() && !ColgramShieldConfig.isStorageCapEnabled();
+                cell.setTextAndValue("Безлимитный кэш медиа", on ? "Вкл (без лимита)" : "Управляется квотой", true);
+                return;
+            }
+            if (position == compressCleanNowRow) {
+                ColgramMenuChrome.applySettingIcon(cell, R.drawable.msg_clearcache, ColgramMenuChrome.COLOR_BLUE);
+                cell.setTextAndValue("Сжать и виртуализировать сейчас", "Запуск", false);
                 return;
             }
             if (position == parentDirRow) {

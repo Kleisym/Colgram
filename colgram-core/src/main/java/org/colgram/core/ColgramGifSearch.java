@@ -419,7 +419,7 @@ public final class ColgramGifSearch {
             }
             HttpURLConnection conn = ColgramHttp.openBinaryStream(urlStr, 4000, 6000);
             conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             int code = conn.getResponseCode();
             if (code < 200 || code >= 300) {
                 conn.disconnect();
@@ -457,6 +457,13 @@ public final class ColgramGifSearch {
     private static HttpURLConnection openSmartConnection(String urlStr, int timeoutMs) throws Exception {
         URL url = new URL(urlStr);
         try {
+            java.net.Proxy relayProxy = ColgramHttp.pickRelayProxy();
+            if (relayProxy != null) {
+                HttpURLConnection c = (HttpURLConnection) url.openConnection(relayProxy);
+                c.setConnectTimeout(Math.min(timeoutMs, 6000));
+                c.setReadTimeout(timeoutMs);
+                return c;
+            }
             int dpiPort = ColgramDpiBypass.isBound() ? ColgramDpiBypass.activePort() : 0;
             if (dpiPort > 0) {
                 java.net.Proxy socks = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
@@ -467,21 +474,27 @@ public final class ColgramGifSearch {
                 return c;
             }
         } catch (Throwable ignored) {}
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        if (ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled()) {
+            throw new java.io.IOException("Direct GIF search blocked by strict privacy policy");
+        }
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
         conn.setConnectTimeout(timeoutMs);
         conn.setReadTimeout(timeoutMs);
         return conn;
     }
 
     private static String httpGetString(String urlStr, int timeoutMs) throws Exception {
-        for (int attempt = 0; attempt < 2; attempt++) {
+        boolean allowDirectFallback = !ColgramConfig.isStrictProxySecurityEnabled()
+                && !ColgramConfig.isMaxAnonymityEnabled();
+        int maxAttempts = allowDirectFallback ? 2 : 1;
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
             HttpURLConnection conn = (attempt == 0)
-                    ? (HttpURLConnection) new URL(urlStr).openConnection()
-                    : openSmartConnection(urlStr, timeoutMs);
-            conn.setConnectTimeout(attempt == 0 ? Math.min(timeoutMs, 7000) : timeoutMs);
+                    ? openSmartConnection(urlStr, timeoutMs)
+                    : (HttpURLConnection) new URL(urlStr).openConnection(java.net.Proxy.NO_PROXY);
+            conn.setConnectTimeout(attempt == 0 ? timeoutMs : Math.min(timeoutMs, 7000));
             conn.setReadTimeout(timeoutMs);
             conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setRequestProperty("Accept", "text/html,application/xhtml+xml");
             conn.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7");
             try {
@@ -504,7 +517,7 @@ public final class ColgramGifSearch {
                     }
                 }
             } catch (Throwable ignored) {
-                if (attempt == 1) {
+                if (attempt == maxAttempts - 1) {
                     return "";
                 }
             } finally {

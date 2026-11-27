@@ -17,7 +17,6 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -246,14 +245,14 @@ public class ColgramAiActivity extends BaseFragment {
             return;
         }
         if (position == voiceTestRow) {
-            Toast.makeText(ctx, "Тестирую озвучку Koliti…", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(ctx, R.drawable.msg_voicechat, "Тестирую озвучку Koliti…", false);
             org.colgram.core.ColgramKolitiVoice.speakReplyAsync(
                     ctx,
                     "Привет! Я Колити — твой друг-помощник в Колграме. Проверка озвучки и ударений прошла успешно!",
                     "ru",
                     R.raw.koliti_user_voice_ref,
                     (usedClone, file, note) -> AndroidUtilities.runOnUIThread(() ->
-                            Toast.makeText(ctx, "Режим: " + note, Toast.LENGTH_SHORT).show())
+                            ColgramUiKit.showNotice(ctx, R.drawable.msg_voice_speaker, "Режим: " + note, false))
             );
             return;
         }
@@ -467,7 +466,8 @@ public class ColgramAiActivity extends BaseFragment {
                 AndroidUtilities.runOnUIThread(() -> {
                     Activity act = getParentActivity();
                     if (act != null && !act.isFinishing() && !act.isDestroyed()) {
-                        Toast.makeText(act, success ? ("Готово: " + spec.title) : message, Toast.LENGTH_LONG).show();
+                        ColgramUiKit.showNotice(act, success ? R.drawable.msg_check_s : R.drawable.msg_info,
+                                success ? ("Готово: " + spec.title) : message, !success);
                         refreshUi();
                     }
                 });
@@ -516,7 +516,7 @@ public class ColgramAiActivity extends BaseFragment {
                 fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 startActivityForResult(Intent.createChooser(fallback, chooserTitle), reqCode);
             } catch (Throwable t2) {
-                Toast.makeText(getParentActivity(), "Не удалось открыть проводник", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(getParentActivity(), R.drawable.msg_info, "Не удалось открыть проводник", true);
             }
         }
     }
@@ -547,10 +547,10 @@ public class ColgramAiActivity extends BaseFragment {
             try {
                 stagedAfd = act.getContentResolver().openAssetFileDescriptor(uri, "r");
             } catch (Throwable err) {
-                Toast.makeText(act, "Не удалось прочитать аудиофайл", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(act, R.drawable.msg_info, "Не удалось прочитать аудиофайл", true);
                 return;
             }
-            Toast.makeText(act, "Сохраняю образец голоса…", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(act, R.drawable.msg_download, "Сохраняю образец голоса…", false);
             new Thread(() -> {
                 try (android.content.res.AssetFileDescriptor afd = stagedAfd) {
                     File dir = new File(act.getFilesDir(), "koliti_voice_ref");
@@ -565,13 +565,13 @@ public class ColgramAiActivity extends BaseFragment {
                     if (dst.length() > 256) {
                         ColgramAiConfig.setVoiceReferencePath(act, dst.getAbsolutePath());
                         AndroidUtilities.runOnUIThread(() -> {
-                            Toast.makeText(act, "Образец голоса подключён: " + dst.getName(), Toast.LENGTH_SHORT).show();
+                            ColgramUiKit.showNotice(act, R.drawable.msg_check_s, "Образец голоса подключён: " + dst.getName(), false);
                             refreshRow(voiceSampleRow);
                         });
                     }
                 } catch (Throwable err) {
                     AndroidUtilities.runOnUIThread(() ->
-                            Toast.makeText(act, "Ошибка импорта аудио: " + err.getMessage(), Toast.LENGTH_LONG).show());
+                            ColgramUiKit.showNotice(act, R.drawable.msg_info, "Ошибка импорта аудио: " + err.getMessage(), true));
                 }
             }, "colgram-voice-ref-import").start();
             return;
@@ -581,10 +581,10 @@ public class ColgramAiActivity extends BaseFragment {
             try {
                 stagedModelAfd = act.getContentResolver().openAssetFileDescriptor(uri, "r");
             } catch (Throwable err) {
-                Toast.makeText(act, "Не удалось прочитать файл модели", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(act, R.drawable.msg_info, "Не удалось прочитать файл модели", true);
                 return;
             }
-            Toast.makeText(act, "Импорт файла в хранилище Koliti…", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(act, R.drawable.msg_download, "Импорт файла в хранилище Koliti…", false);
             new Thread(() -> {
                 File dst = null;
                 try (android.content.res.AssetFileDescriptor afd = stagedModelAfd) {
@@ -615,7 +615,7 @@ public class ColgramAiActivity extends BaseFragment {
                     }
                     ColgramAiEngine.getInstance().unloadModelAsync();
                     AndroidUtilities.runOnUIThread(() -> {
-                        Toast.makeText(act, "Файл подключён: " + savedDst.getName(), Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(act, R.drawable.msg_check_s, "Файл подключён: " + savedDst.getName(), false);
                         refreshUi();
                     });
                 } catch (Throwable err) {
@@ -623,7 +623,7 @@ public class ColgramAiActivity extends BaseFragment {
                         try { dst.delete(); } catch (Throwable ignored) {}
                     }
                     AndroidUtilities.runOnUIThread(() ->
-                            Toast.makeText(act, "Ошибка импорта: " + err.getMessage(), Toast.LENGTH_LONG).show());
+                            ColgramUiKit.showNotice(act, R.drawable.msg_info, "Ошибка импорта: " + err.getMessage(), true));
                 }
             }, "colgram-gguf-import").start();
         }
@@ -976,7 +976,7 @@ public class ColgramAiActivity extends BaseFragment {
                 primaryBtn.setOnClickListener(v -> {
                     if (ColgramAiEngine.getInstance().isModelLoaded()) {
                         ColgramAiEngine.getInstance().unloadModelAsync();
-                        Toast.makeText(ctx, "Koliti переведена в сон — память освобождена", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(ctx, R.drawable.msg_bot, "Koliti переведена в сон — память освобождена", false);
                         refreshRow(coreCardRow);
                         AndroidUtilities.runOnUIThread(() -> refreshRow(coreCardRow), 180L);
                         AndroidUtilities.runOnUIThread(() -> refreshRow(coreCardRow), 450L);
@@ -997,7 +997,7 @@ public class ColgramAiActivity extends BaseFragment {
                                 AndroidUtilities.runOnUIThread(() -> {
                                     Activity cur = getParentActivity();
                                     if (cur != null && !cur.isFinishing() && !cur.isDestroyed()) {
-                                        Toast.makeText(cur, message, Toast.LENGTH_SHORT).show();
+                                        ColgramUiKit.showNotice(cur, success ? R.drawable.msg_check_s : R.drawable.msg_info, message, !success);
                                         refreshUi();
                                     }
                                 });
@@ -1240,23 +1240,23 @@ public class ColgramAiActivity extends BaseFragment {
             } else if (type == 2) {
                 TextCheckCell c = (TextCheckCell) holder.itemView;
                 if (position == voiceOverToggleRow) {
-                    c.setTextAndValueAndCheck("Режим озвучки ответов", "Автоматически озвучивать ответы Koliti в чате", ColgramAiConfig.isVoiceOverEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_CRIMSON, R.drawable.msg_voice_speaker);
+                    c.setTextAndValueAndCheck("Режим озвучки ответов", "Автоматически озвучивать ответы Koliti в чате", ColgramAiConfig.isVoiceOverEnabled(mContext), true, true);
                 } else if (position == orbToggleRow) {
-                    c.setTextAndValueAndCheck("Плавающий кружок Koliti", "Свободно перемещается по экранам и чатам", ColgramAiConfig.isOrbEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_CRIMSON, R.drawable.msg_bot);
+                    c.setTextAndValueAndCheck("Плавающий кружок Koliti", "Свободно перемещается по экранам и чатам", ColgramAiConfig.isOrbEnabled(mContext), true, true);
                 } else if (position == webSearchRow) {
-                    c.setTextAndValueAndCheck("Веб-синтез через Koliti", "Данные из сети очищаются и передаются в ИИ", ColgramAiConfig.isWebSearchEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_BLUE, R.drawable.msg_search);
+                    c.setTextAndValueAndCheck("Веб-синтез через Koliti", "Данные из сети очищаются и передаются в ИИ", ColgramAiConfig.isWebSearchEnabled(mContext), true, true);
                 } else if (position == crossChatRow) {
-                    c.setTextAndValueAndCheck("Контекст всех чатов (BM25)", "Поиск важных фактов по всей истории переписок", ColgramAiConfig.isCrossChatRagEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_TEAL, R.drawable.msg_folders);
+                    c.setTextAndValueAndCheck("Контекст всех чатов (BM25)", "Поиск важных фактов по всей истории переписок", ColgramAiConfig.isCrossChatRagEnabled(mContext), true, true);
                 } else if (position == thinkingRow) {
-                    c.setTextAndValueAndCheck("Глубокое мышление (CoT)", "Выкл = Турбо-режим (мгновенный ответ); вкл = пошаговые рассуждения", ColgramAiConfig.isThinkingEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_INDIGO, R.drawable.msg_info);
+                    c.setTextAndValueAndCheck("Глубокое мышление (CoT)", "Выкл = Турбо-режим (мгновенный ответ); вкл = пошаговые рассуждения", ColgramAiConfig.isThinkingEnabled(mContext), true, true);
                 } else if (position == flashAttnRow) {
-                    c.setTextAndValueAndCheck("FlashAttention + Zero-Copy mmap", "Ускоряет большой контекст и снижает нагрев", ColgramAiConfig.isFlashAttentionEnabled(mContext), true, true);
                     ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_AMBER, R.drawable.msg_speed);
+                    c.setTextAndValueAndCheck("FlashAttention + Zero-Copy mmap", "Ускоряет большой контекст и снижает нагрев", ColgramAiConfig.isFlashAttentionEnabled(mContext), true, true);
                 }
             } else if (type == 3) {
                 TextDetailSettingsCell d = (TextDetailSettingsCell) holder.itemView;

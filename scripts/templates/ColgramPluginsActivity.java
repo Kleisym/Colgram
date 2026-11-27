@@ -330,8 +330,8 @@ public class ColgramPluginsActivity extends BaseFragment {
             case "auto_reply":
                 boolean ar = !org.colgram.core.ColgramConfig.isAutoReplyEnabled();
                 org.colgram.core.ColgramConfig.setAutoReplyEnabled(ar);
-                Toast.makeText(getParentActivity(),
-                        ar ? "Автоответчик включён" : "Автоответчик выключен", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(this, R.drawable.msg_reply_small,
+                        ar ? "Автоответчик включён" : "Автоответчик выключен", false);
                 listAdapter.notifyDataSetChanged();
                 break;
             case "keywords":
@@ -340,24 +340,21 @@ public class ColgramPluginsActivity extends BaseFragment {
                 if (kw && org.colgram.core.ColgramConfig.getKeywordAlertsList().trim().isEmpty()) {
                     showKeywordsDialog();
                 } else {
-                    Toast.makeText(getParentActivity(),
-                            kw ? "Оповещения по ключевым словам включены" : "Ключевые слова выключены",
-                            Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(this, R.drawable.msg_search,
+                            kw ? "Оповещения по ключевым словам включены" : "Ключевые слова выключены", false);
                 }
                 listAdapter.notifyDataSetChanged();
                 break;
             case "logger":
                 boolean lg = !org.colgram.core.ColgramConfig.isMessageLoggerEnabled();
                 org.colgram.core.ColgramConfig.setMessageLoggerEnabled(lg);
-                Toast.makeText(getParentActivity(),
-                        lg ? "Журнал сообщений включён" : "Журнал сообщений выключен",
-                        Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(this, R.drawable.msg_archive,
+                        lg ? "Журнал сообщений включён" : "Журнал сообщений выключен", false);
                 listAdapter.notifyDataSetChanged();
                 break;
             case "export":
-                Toast.makeText(getParentActivity(),
-                        "Откройте чат и отправьте .export — файл появится в Colgram/exports",
-                        Toast.LENGTH_LONG).show();
+                ColgramUiKit.showNotice(this, R.drawable.msg_download,
+                        "Откройте чат и отправьте .export — файл появится в Colgram/exports", false);
                 break;
             default:
                 break;
@@ -430,10 +427,10 @@ public class ColgramPluginsActivity extends BaseFragment {
                 catalogLoading = false;
                 rebuildRows();
                 if (toast && getParentActivity() != null) {
-                    Toast.makeText(getParentActivity(),
+                    ColgramUiKit.showNotice(this, R.drawable.msg_customize,
                             isRemote ? "Каталог обновлён: " + result.size()
                                     : "Сеть недоступна — показан встроенный набор",
-                            Toast.LENGTH_SHORT).show();
+                            false);
                 }
             });
         });
@@ -566,8 +563,8 @@ public class ColgramPluginsActivity extends BaseFragment {
             // the attached file invisible in some document pickers.
             startActivityForResult(intent, REQ_PICK_PY);
         } catch (Throwable t) {
-            Toast.makeText(getParentActivity(),
-                    "Не удалось открыть файловый менеджер: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(this, R.drawable.msg_info,
+                    "Не удалось открыть файловый менеджер: " + t.getMessage(), true);
         }
     }
 
@@ -607,9 +604,8 @@ public class ColgramPluginsActivity extends BaseFragment {
                 rebuildRows();
                 Activity act = getParentActivity();
                 if (act == null || act.isFinishing() || act.isDestroyed()) return;
-                Toast.makeText(act.getApplicationContext(),
-                        success ? "Плагин установлен из файла" : "Ошибка: " + failure,
-                        success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+                ColgramUiKit.showNotice(this, success ? R.drawable.msg_customize : R.drawable.msg_info,
+                        success ? "Плагин установлен из файла" : "Ошибка: " + failure, !success);
             });
         });
     }

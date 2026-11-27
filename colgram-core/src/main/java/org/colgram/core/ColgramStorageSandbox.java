@@ -278,6 +278,28 @@ public class ColgramStorageSandbox {
         return cas;
     }
 
+    /** Dedicated preview store inside files/colgram_vault/shadow_previews protected from cache eviction. */
+    public static File getShadowPreviewsDir(Context context) {
+        if (context == null) return null;
+        File filesDir = context.getFilesDir();
+        if (filesDir == null) return null;
+        File vault = new File(filesDir, "colgram_vault");
+        ensureDirWithNoMedia(vault);
+        File previews = new File(vault, "shadow_previews");
+        ensureDirWithNoMedia(previews);
+        return previews;
+    }
+
+    /** Returns all active sandbox and cache roots for unified disk cap scanning. */
+    public static java.util.List<File> getAllSandboxDirectories(Context context) {
+        java.util.List<File> dirs = new java.util.ArrayList<>();
+        File root = getSandboxRootDir(context);
+        if (root != null) dirs.add(root);
+        File cache = getCacheRootDir(context);
+        if (cache != null && !dirs.contains(cache)) dirs.add(cache);
+        return dirs;
+    }
+
     /** Absolute path of the folder actually in effect, for display. */
     public static String getRootPath(Context context) {
         File root = getSandboxRootDir(context);

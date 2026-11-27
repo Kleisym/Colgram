@@ -240,10 +240,10 @@ public class ColgramDefenderActivity extends BaseFragment {
                 if (destroyed) return;
                 rebuildRows();
                 if (getParentActivity() != null && trigger != null && trigger.startsWith("manual")) {
-                    Toast.makeText(getParentActivity(),
-                            "Защита: " + report.scorePercent + "% • закрыто " + report.closedCount + "/" + report.findings.size()
+                    ColgramUiKit.showNotice(this, R.drawable.outline_shield_check,
+                            "Защита: " + report.scorePercent + "% · закрыто " + report.closedCount + "/" + report.findings.size()
                                     + (report.autoFixedNow > 0 ? " (исправлено: " + report.autoFixedNow + ")" : ""),
-                            Toast.LENGTH_SHORT).show();
+                            false);
                 }
             });
         });
@@ -258,8 +258,8 @@ public class ColgramDefenderActivity extends BaseFragment {
                 if (destroyed) return;
                 rebuildRows();
                 if (getParentActivity() != null) {
-                    Toast.makeText(getParentActivity(),
-                            "Следы WebView/куки/логов очищены (" + count + ")", Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(this, R.drawable.msg_clearcache,
+                            "Следы слежки очищены: " + count, false);
                 }
             });
         });

@@ -23,6 +23,7 @@ import org.colgram.core.ColgramAntiSpam;
 import org.colgram.core.ColgramColemailerEngine;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramHookHandler;
+import org.colgram.core.ColgramShieldConfig;
 import org.colgram.core.ColgramSpamGuard;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ColgramNativeColemailerBridge;
@@ -75,12 +76,16 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     private static final int ACT_CHEATSHEET = 11;
     private static final int ACT_LEGACY_USERBOT = 12;
     private static final int ACT_DM_AUTO_DELETE_MUTES = 13;
+    private static final int ACT_CLEAR_SPAM_PINGS_NOW = 14;
 
     private static final int CHK_SPAM_GUARD = 101;
     private static final int CHK_NOTIF_FILTER = 102;
     private static final int CHK_SAVE_LEADS = 103;
     private static final int CHK_BROADCASTER = 104;
     private static final int CHK_AUTO_SUB = 105;
+    private static final int CHK_STRANGER_BIG_GROUPS = 106;
+    private static final int CHK_COLLAPSE_SPAM_PINGS = 107;
+    private static final int CHK_AUTO_CLEAR_SERVER_MENTIONS = 108;
 
     private static final class RowItem {
         final int type;
@@ -170,12 +175,17 @@ public class ColgramAntiSpamActivity extends BaseFragment {
 
     private void rebuildRows(Context context) {
         rows.clear();
+        ColgramShieldConfig.init(context);
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         boolean notifGranted = ColgramNotificationListenerService.isPermissionGranted(context);
 
         rows.add(new RowItem(TYPE_HERO, 0, "Антиспам & Colemailer", null, false, null));
         rows.add(new RowItem(TYPE_HEADER, 0, "Антиспам-щит и фильтр пингов", null, false, null));
         rows.add(new RowItem(TYPE_CHECK, CHK_SPAM_GUARD, "3-уровневый детектор спам-пингов", null, ColgramConfig.isSpamGuardEnabled(), null));
+        rows.add(new RowItem(TYPE_CHECK, CHK_STRANGER_BIG_GROUPS, "Блок чужих пингов в больших группах (>=50)", null, ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled(), null));
+        rows.add(new RowItem(TYPE_CHECK, CHK_COLLAPSE_SPAM_PINGS, "Сворачивать заблокированные спам-пинги", null, ColgramShieldConfig.isCollapseSpamPingsEnabled(), null));
+        rows.add(new RowItem(TYPE_CHECK, CHK_AUTO_CLEAR_SERVER_MENTIONS, "Авто-сброс бейджа @ на сервере (даже в Ghost)", null, ColgramShieldConfig.isAntiPingAutoClearServerMentionsEnabled(), null));
+        rows.add(new RowItem(TYPE_SETTING, ACT_CLEAR_SPAM_PINGS_NOW, "Очистить спам-пинги сейчас", "В 1 нажатие", false, null));
         rows.add(new RowItem(TYPE_CHECK, CHK_NOTIF_FILTER, "Автоочистка спам-уведомлений (Android)", null, ColgramConfig.isNotificationAdFilterEnabled(), null));
         rows.add(new RowItem(TYPE_SETTING, ACT_NOTIF_PERMISSION, "Доступ к уведомлениям Android",
                 notifGranted ? "Выдан" : "Выдать (нажать)", false, null));
@@ -214,16 +224,21 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 modeDesc = formatInterval(c.intervalSec);
             }
             String val = status + " · " + modeDesc + " · " + c.targetChats.size() + " ч.";
+            if (c.sentCount > 0 || c.failedCount > 0) {
+                val += " · ✓" + c.sentCount + (c.failedCount > 0 ? "/✕" + c.failedCount : "");
+            }
             if (!c.buttons.isEmpty()) val += " · кнопки";
             rows.add(new RowItem(TYPE_SETTING, 0, "Кампания: " + c.name, val, false, c.name));
         }
 
+        int queuedNow = ColgramNativeColemailerBridge.getQueuedBroadcastCount();
         rows.add(new RowItem(TYPE_SETTING, ACT_ROTATIONS, "Ротации постов по чатам",
                 String.valueOf(engine.listRotations().size()), false, null));
         String tok = ColgramConfig.getHelperBotToken();
         rows.add(new RowItem(TYPE_SETTING, ACT_BOT_TOKEN, "Helper Bot Token (inline-кнопки Bot API)",
                 TextUtils.isEmpty(tok) ? "Не задан (текст+ссылки)" : maskToken(tok), false, null));
-        rows.add(new RowItem(TYPE_SETTING, ACT_SYNC_FOLDERS, "Синхронизировать папки Telegram сейчас", null, false, null));
+        rows.add(new RowItem(TYPE_SETTING, ACT_SYNC_FOLDERS, "Синхронизировать папки Telegram сейчас",
+                queuedNow > 0 ? "Очередь: " + queuedNow : null, false, null));
         rows.add(new RowItem(TYPE_INFO, 0,
                 "Режимы: интервал (15м), счётчик сообщений (20 сообщений) и гибрид (оба условия со сбросом застоя). Inline-кнопки в формате [Сайт](url) || [Клик](cb:data).",
                 null, false, null));
@@ -231,7 +246,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         rows.add(new RowItem(TYPE_HEADER, 0, "Auto-Sub Gatekeeper и команды", null, false, null));
         rows.add(new RowItem(TYPE_CHECK, CHK_AUTO_SUB, "Auto-Sub (проверка подписок ботов)", null, ColgramConfig.isAutoSubEnabled(), null));
         rows.add(new RowItem(TYPE_SETTING, ACT_CHEATSHEET, "Шпаргалка команд в чатах (.мутить, .пингдиаг…)", "Открыть", false, null));
-        int acct = UserConfig.selectedAccount;
+        int acct = currentAccount;
         boolean userbotConfigured = !ColgramAntiSpam.getApiId(context, acct).isEmpty()
                 && !ColgramAntiSpam.getApiHash(context, acct).isEmpty()
                 && !ColgramAntiSpam.getPhone(context, acct).isEmpty();
@@ -257,6 +272,27 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 updateCheckRow(ctx, view, position, next, true);
                 break;
             }
+            case CHK_STRANGER_BIG_GROUPS: {
+                boolean next = !ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled();
+                ColgramShieldConfig.setAntiPingStrangersBigGroupsEnabled(next);
+                updateCheckRow(ctx, view, position, next, false);
+                break;
+            }
+            case CHK_COLLAPSE_SPAM_PINGS: {
+                boolean next = !ColgramShieldConfig.isCollapseSpamPingsEnabled();
+                ColgramShieldConfig.setCollapseSpamPingsEnabled(next);
+                updateCheckRow(ctx, view, position, next, false);
+                break;
+            }
+            case CHK_AUTO_CLEAR_SERVER_MENTIONS: {
+                boolean next = !ColgramShieldConfig.isAntiPingAutoClearServerMentionsEnabled();
+                ColgramShieldConfig.setAntiPingAutoClearServerMentionsEnabled(next);
+                updateCheckRow(ctx, view, position, next, false);
+                break;
+            }
+            case ACT_CLEAR_SPAM_PINGS_NOW:
+                ColgramNativeColemailerBridge.clearAllUnreadSpamPings(currentAccount);
+                break;
             case CHK_NOTIF_FILTER: {
                 boolean next = !ColgramConfig.isNotificationAdFilterEnabled();
                 ColgramConfig.setNotificationAdFilterEnabled(next);
@@ -711,7 +747,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 items,
                 which -> {
                     long did = snaps.get(which).dialogId;
-                    ColgramNativeColemailerBridge.handleChatCommand(did, 0, ".тишина выкл", 0L);
+                    ColgramNativeColemailerBridge.handleChatCommand(currentAccount, did, 0, ".тишина выкл", 0L);
                     refreshList(ctx);
                 }
         );
@@ -1079,7 +1115,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
         List<String> out = new ArrayList<>();
         try {
             ArrayList<MessagesController.DialogFilter> filters =
-                    MessagesController.getInstance(UserConfig.selectedAccount).getDialogFilters();
+                    MessagesController.getInstance(currentAccount).getDialogFilters();
             if (filters != null) {
                 for (MessagesController.DialogFilter f : filters) {
                     if (f != null && !TextUtils.isEmpty(f.name) && f.id != 0) {
@@ -1236,6 +1272,10 @@ public class ColgramAntiSpamActivity extends BaseFragment {
             if (item.campaignName != null) return R.drawable.msg_send;
             switch (item.id) {
                 case CHK_SPAM_GUARD: return R.drawable.outline_shield_check;
+                case CHK_STRANGER_BIG_GROUPS: return R.drawable.msg_groups;
+                case CHK_COLLAPSE_SPAM_PINGS: return R.drawable.msg_archive;
+                case CHK_AUTO_CLEAR_SERVER_MENTIONS: return R.drawable.msg_markread;
+                case ACT_CLEAR_SPAM_PINGS_NOW: return R.drawable.msg_clearcache;
                 case CHK_NOTIF_FILTER: return R.drawable.msg_block;
                 case CHK_SAVE_LEADS: return R.drawable.msg_archive;
                 case CHK_BROADCASTER: return R.drawable.msg_send;
@@ -1261,6 +1301,10 @@ public class ColgramAntiSpamActivity extends BaseFragment {
             if (item.campaignName != null) return ColgramMenuChrome.COLOR_AMBER;
             switch (item.id) {
                 case CHK_SPAM_GUARD: return ColgramMenuChrome.COLOR_CRIMSON;
+                case CHK_STRANGER_BIG_GROUPS: return ColgramMenuChrome.COLOR_VIOLET;
+                case CHK_COLLAPSE_SPAM_PINGS: return ColgramMenuChrome.COLOR_INDIGO;
+                case CHK_AUTO_CLEAR_SERVER_MENTIONS: return ColgramMenuChrome.COLOR_CYAN;
+                case ACT_CLEAR_SPAM_PINGS_NOW: return ColgramMenuChrome.COLOR_EMERALD;
                 case CHK_NOTIF_FILTER: return ColgramMenuChrome.COLOR_ROSE;
                 case CHK_SAVE_LEADS: return ColgramMenuChrome.COLOR_AMBER;
                 case CHK_BROADCASTER: return ColgramMenuChrome.COLOR_EMERALD;

@@ -936,30 +936,55 @@ public class ColgramBotSync {
     static java.util.List<java.net.Proxy> transportLadder(String host, int port) {
         java.util.List<java.net.Proxy> rungs = new java.util.ArrayList<>();
         java.net.Proxy cached = lastWorkingBotRung;
+        boolean strictOrMaxAnon = ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled();
+        boolean preferProxyFirst = strictOrMaxAnon || ColgramDpiBypass.isBound()
+                || ColgramProxyManager.hasActiveRouteForUi();
         boolean cachedFresh = cached != null && (System.currentTimeMillis() - lastWorkingBotRungAtMs) < BOT_RUNG_CACHE_TTL_MS;
-        if (cachedFresh) {
+        if (cachedFresh && (!preferProxyFirst || !java.net.Proxy.NO_PROXY.equals(cached))) {
             addRung(rungs, cached);
         }
-        boolean tryDirect = colgramShouldTryDirect();
-        if (tryDirect) {
+        if (preferProxyFirst) {
+            if (ColgramDpiBypass.isBound()) {
+                addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                        new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort())));
+            }
+            addRung(rungs, ColgramHttp.pickRelayProxy());
             java.net.Proxy front = ColgramEndpoints.frontProxy();
             if (front != null && ColgramEndpoints.select(host, port) != null) {
                 addRung(rungs, front);
             }
-            int ipv4Port = colgramIpv4ProxyPort();
-            if (ipv4Port > 0) {
-                addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.HTTP,
-                        new java.net.InetSocketAddress("127.0.0.1", ipv4Port)));
+            if (!ColgramConfig.isMaxAnonymityEnabled() && colgramShouldTryDirect()) {
+                int ipv4Port = colgramIpv4ProxyPort();
+                if (ipv4Port > 0) {
+                    addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                            new java.net.InetSocketAddress("127.0.0.1", ipv4Port)));
+                }
+                if (!strictOrMaxAnon || rungs.isEmpty()) {
+                    addRung(rungs, java.net.Proxy.NO_PROXY);
+                }
             }
-            addRung(rungs, java.net.Proxy.NO_PROXY);
-        }
-        if (ColgramDpiBypass.isBound()) {
-            addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.SOCKS,
-                    new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort())));
-        }
-        addRung(rungs, ColgramHttp.pickRelayProxy());
-        if (!tryDirect) {
-            addRung(rungs, java.net.Proxy.NO_PROXY);
+        } else {
+            boolean tryDirect = colgramShouldTryDirect();
+            if (tryDirect) {
+                java.net.Proxy front = ColgramEndpoints.frontProxy();
+                if (front != null && ColgramEndpoints.select(host, port) != null) {
+                    addRung(rungs, front);
+                }
+                int ipv4Port = colgramIpv4ProxyPort();
+                if (ipv4Port > 0) {
+                    addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                            new java.net.InetSocketAddress("127.0.0.1", ipv4Port)));
+                }
+                addRung(rungs, java.net.Proxy.NO_PROXY);
+            }
+            if (ColgramDpiBypass.isBound()) {
+                addRung(rungs, new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                        new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort())));
+            }
+            addRung(rungs, ColgramHttp.pickRelayProxy());
+            if (!tryDirect) {
+                addRung(rungs, java.net.Proxy.NO_PROXY);
+            }
         }
         if (rungs.isEmpty()) addRung(rungs, java.net.Proxy.NO_PROXY);
         return rungs;

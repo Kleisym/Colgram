@@ -45,8 +45,9 @@ public final class ColgramFileImport {
     public static final long PREMIUM_MAX_FILE_BYTES = 4000L * 1024L * 1024L;
     public static final long LARGE_FILE_DEDUP_SKIP_BYTES = 32L * 1024L * 1024L;
     public static final long STATFS_HEADROOM_BYTES = 64L * 1024L * 1024L;
-    public static final long PROGRESS_THRESHOLD_BYTES = 25L * 1024L * 1024L;
+    public static final long PROGRESS_THRESHOLD_BYTES = 4L * 1024L * 1024L;
     private static final int COPY_BUFFER_BYTES = 512 * 1024;
+    private static final long PROGRESS_CADENCE_NS = 100_000_000L;
     private static final long STALE_TEMP_AGE_MS = 6L * 60L * 60L * 1000L;
 
     public interface Callback {
@@ -441,6 +442,11 @@ public final class ColgramFileImport {
                     byte[] buf = new byte[COPY_BUFFER_BYTES];
                     int read;
                     long lastProgressNs = 0L;
+                    if (session != null && session.progressListener != null
+                            && staged.knownSize >= PROGRESS_THRESHOLD_BYTES) {
+                        lastProgressNs = System.nanoTime();
+                        notifyProgress(session, itemIndex, totalItems, displayName, 0L, staged.knownSize);
+                    }
                     while ((read = in.read(buf)) != -1) {
                         if (session != null && session.cancelled.get()) {
                             return null;
@@ -454,7 +460,7 @@ public final class ColgramFileImport {
                         if (session != null && session.progressListener != null
                                 && (staged.knownSize >= PROGRESS_THRESHOLD_BYTES || totalCopied >= PROGRESS_THRESHOLD_BYTES)) {
                             long nowNs = System.nanoTime();
-                            if (nowNs - lastProgressNs >= 200_000_000L) {
+                            if (lastProgressNs == 0L || nowNs - lastProgressNs >= PROGRESS_CADENCE_NS) {
                                 lastProgressNs = nowNs;
                                 notifyProgress(session, itemIndex, totalItems, displayName, totalCopied, staged.knownSize);
                             }

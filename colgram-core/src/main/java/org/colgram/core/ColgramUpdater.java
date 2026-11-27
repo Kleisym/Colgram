@@ -1,11 +1,7 @@
 package org.colgram.core;
 
-import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
-import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -28,8 +24,8 @@ import java.util.concurrent.Executors;
 /**
  * ColgramUpdater — In-app OTA & upstream Telegram update checker.
  * Checks GitHub Releases via ColgramHttp (with proxy/relay support), verifies semantic versions,
- * ABI-matching APKs, and optional SHA-256 digests, downloads via active Colgram transport or
- * DownloadManager, and safely launches PackageInstaller.
+ * ABI-matching APKs, and optional SHA-256 digests, downloads strictly via active Colgram
+ * transport/proxy, and safely launches PackageInstaller.
  */
 public class ColgramUpdater {
 
@@ -277,9 +273,9 @@ public class ColgramUpdater {
     }
 
     /**
-     * Downloads the APK file, verifies expectedSha256 (when provided), and launches installer.
-     * Routes directly through ColgramHttp when DPI bypass, proxy, or relay is active so censored
-     * networks do not fail inside Android's system DownloadManager.
+     * Downloads the APK file through {@link ColgramHttp} (using active SOCKS5 proxy, local DPI
+     * tunnel, or DoH pinning) so OS download services never bypass Colgram's proxy route,
+     * verifies expectedSha256 (when provided), and launches installer.
      */
     public static void downloadAndInstall(final Context context, final String apkUrl,
                                           final String versionName, final String expectedSha256) {
@@ -295,81 +291,10 @@ public class ColgramUpdater {
             }
         }
 
-        boolean preferColgramTransport = ColgramDpiBypass.isBound()
-                || ColgramProxyManager.hasActiveRouteForUi()
-                || !ColgramConfig.getRelayUrl().isEmpty();
-        final DownloadManager manager = (preferColgramTransport || dlDir == null)
-                ? null : (DownloadManager) appCtx.getSystemService(Context.DOWNLOAD_SERVICE);
-        if (manager == null) {
-            mainHandler.post(() -> Toast.makeText(
-                    appCtx, "Загрузка Colgram " + versionName + " через защищённый канал...", Toast.LENGTH_SHORT).show());
-            downloadViaColgramHttpFallback(appCtx, apkUrl, expectedSha256);
-            return;
-        }
-
-        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(apkUrl));
-        request.setTitle("Colgram Update " + versionName);
-        request.setDescription("Downloading latest build...");
-        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-        request.setDestinationInExternalFilesDir(appCtx, Environment.DIRECTORY_DOWNLOADS, "Colgram-Update.apk");
-
-        final long downloadId = manager.enqueue(request);
-        final IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
-        final BroadcastReceiver receiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context ctx, Intent intent) {
-                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
-                if (id != downloadId) return;
-                try {
-                    ctx.unregisterReceiver(this);
-                } catch (Exception ignored) {}
-
-                boolean success = false;
-                try (Cursor cursor = manager.query(new DownloadManager.Query().setFilterById(downloadId))) {
-                    if (cursor != null && cursor.moveToFirst()) {
-                        int statusCol = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS);
-                        success = statusCol >= 0 && cursor.getInt(statusCol) == DownloadManager.STATUS_SUCCESSFUL;
-                    }
-                } catch (Exception ignored) {
-                    success = false;
-                }
-
-                final File dlDir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-                final File file = dlDir != null ? new File(dlDir, "Colgram-Update.apk") : null;
-                if (!success || file == null || !file.exists()) {
-                    downloadViaColgramHttpFallback(ctx, apkUrl, expectedSha256);
-                    return;
-                }
-
-                executor.execute(() -> {
-                    if (expectedSha256 != null && !expectedSha256.isEmpty()) {
-                        String actual = sha256Hex(file);
-                        if (actual == null || !actual.equalsIgnoreCase(expectedSha256)) {
-                            //noinspection ResultOfMethodCallIgnored
-                            file.delete();
-                            mainHandler.post(() -> Toast.makeText(
-                                    ctx, "Ошибка SHA-256: файл обновления повреждён", Toast.LENGTH_LONG).show());
-                            return;
-                        }
-                    }
-                    mainHandler.post(() -> installApk(ctx, file));
-                });
-            }
-        };
-
-        if (activeDownloadReceiver != null) {
-            try { appCtx.unregisterReceiver(activeDownloadReceiver); } catch (Exception ignored) {}
-            activeDownloadReceiver = null;
-        }
-        activeDownloadReceiver = receiver;
-        if (Build.VERSION.SDK_INT >= 33) {
-            appCtx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
-        } else {
-            appCtx.registerReceiver(receiver, filter);
-        }
+        mainHandler.post(() -> Toast.makeText(
+                appCtx, "Загрузка Colgram " + versionName + " через защищённый канал...", Toast.LENGTH_SHORT).show());
+        downloadViaColgramHttpFallback(appCtx, apkUrl, expectedSha256);
     }
-
-    private static BroadcastReceiver activeDownloadReceiver = null;
 
     private static void downloadViaColgramHttpFallback(final Context ctx, final String apkUrl, final String expectedSha256) {
         executor.execute(() -> {

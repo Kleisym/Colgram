@@ -38,8 +38,7 @@ class KolitiSplitContractsTest(unittest.TestCase):
 
         updater = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramUpdater.java").read_text(encoding="utf-8")
         self.assertIn("ColgramBuildFlags.KOLITI_ENABLED", updater)
-        self.assertNotIn("catch (Exception ignored) {\n                    success = true;", updater)
-        self.assertIn("success = false;", updater)
+        self.assertNotIn("DownloadManager", updater)
         self.assertIn("if (release == null)", updater)
 
         for name in ("ColgramEasterEggs.java", "ColgramQuickBarView.java"):
@@ -180,9 +179,11 @@ class KolitiSplitContractsTest(unittest.TestCase):
             self.assertIn('noCompress += ["pack", "gguf", "onnx"]', sa_once)
             self.assertIn("colgramAbis", sa_once)
             for pg_marker in (
-                "# COLGRAM_R8_KEEP_RULES = 2",
+                "# COLGRAM_R8_KEEP_RULES = 3",
                 "-dontobfuscate",
                 "-keep class org.colgram.**",
+                "-keep class org.colgram.core.ColgramKolitiVoice",
+                "-keep interface org.colgram.core.ColgramKolitiVoice$TranscriptionCallback",
                 "-keep class org.telegram.ui.Colgram*",
                 "-keep class org.telegram.ui.ActionBar.AlertDialog$*",
                 "-keep class org.telegram.ui.ActionBar.INavigationLayout",
@@ -196,12 +197,12 @@ class KolitiSplitContractsTest(unittest.TestCase):
             ):
                 self.assertIn(pg_marker, pg_once)
 
-            # Verify v1 -> v2 proguard-rules upgrade and 2-pass convergence
+            # Verify v1/v2 -> v3 proguard-rules upgrade and 2-pass convergence
             proguard.write_text("-keep class org.telegram.messenger.* { *; }\n\n# COLGRAM_R8_KEEP_RULES = 1\n-dontobfuscate\n", encoding="utf-8")
             ksp._configure_proguard_rules(str(repo))
             pg_upgraded = proguard.read_text(encoding="utf-8")
             self.assertNotIn("# COLGRAM_R8_KEEP_RULES = 1", pg_upgraded)
-            self.assertIn("# COLGRAM_R8_KEEP_RULES = 2", pg_upgraded)
+            self.assertIn("# COLGRAM_R8_KEEP_RULES = 3", pg_upgraded)
             self.assertIn("-keep class org.telegram.ui.ChatActivity", pg_upgraded)
             ksp._configure_proguard_rules(str(repo))
             self.assertEqual(proguard.read_text(encoding="utf-8"), pg_upgraded)

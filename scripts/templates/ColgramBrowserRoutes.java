@@ -127,9 +127,95 @@ public final class ColgramBrowserRoutes {
         );
     }
 
+    private static final class ProxyGateState {
+        boolean ready;
+        boolean failed;
+        final java.util.List<Runnable> pending = new java.util.ArrayList<>();
+    }
+
+    private static final Object PROXY_GATE_LOCK = new Object();
+    private static final java.util.WeakHashMap<WebView, ProxyGateState> PROXY_GATES = new java.util.WeakHashMap<>();
+
+    private static ProxyGateState gateFor(WebView webView) {
+        synchronized (PROXY_GATE_LOCK) {
+            ProxyGateState state = PROXY_GATES.get(webView);
+            if (state == null) {
+                state = new ProxyGateState();
+                PROXY_GATES.put(webView, state);
+            }
+            return state;
+        }
+    }
+
+    private static void completeProxyGate(WebView webView, boolean ok) {
+        if (webView == null) return;
+        java.util.List<Runnable> toRun;
+        synchronized (PROXY_GATE_LOCK) {
+            ProxyGateState state = PROXY_GATES.get(webView);
+            if (state == null) return;
+            state.ready = ok;
+            state.failed = !ok;
+            toRun = new java.util.ArrayList<>(state.pending);
+            state.pending.clear();
+        }
+        if (ok) {
+            for (Runnable action : toRun) {
+                if (action != null) {
+                    webView.post(action);
+                }
+            }
+        }
+    }
+
+    /** Executes {@code action} once {@link ProxyController#setProxyOverride} has finished configuring WebView. */
+    public static void whenProxyReady(WebView webView, Runnable action) {
+        if (webView == null || action == null) return;
+        boolean runNow = false;
+        synchronized (PROXY_GATE_LOCK) {
+            ProxyGateState state = PROXY_GATES.get(webView);
+            if (state == null || state.ready) {
+                runNow = true;
+            } else if (!state.failed) {
+                state.pending.add(action);
+            } else {
+                // Fail closed when strict proxy setup failed: never issue raw direct WebView navigation.
+                return;
+            }
+        }
+        if (runNow) {
+            action.run();
+        }
+    }
+
+    /** Safe replacement for {@code webView.loadUrl(url)} queued until proxy override activation completes. */
+    public static void loadUrl(WebView webView, String url) {
+        if (webView == null || TextUtils.isEmpty(url)) return;
+        whenProxyReady(webView, () -> webView.loadUrl(url));
+    }
+
+    /** Safe replacement for {@code webView.loadUrl(url, headers)} queued until proxy override activation completes. */
+    public static void loadUrl(WebView webView, String url, java.util.Map<String, String> additionalHttpHeaders) {
+        if (webView == null || TextUtils.isEmpty(url)) return;
+        whenProxyReady(webView, () -> {
+            if (additionalHttpHeaders != null) {
+                webView.loadUrl(url, additionalHttpHeaders);
+            } else {
+                webView.loadUrl(url);
+            }
+        });
+    }
+
     public static void applyToWebView(WebView webView) {
         if (webView == null) return;
         Decision decision = evaluate(true);
+        boolean strictOrAnon = ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled();
+        boolean needsProxyRule = decision.mode != Mode.CURRENT || ColgramConfig.isMaxAnonymityEnabled();
+        ProxyGateState gate = gateFor(webView);
+        synchronized (PROXY_GATE_LOCK) {
+            gate.ready = false;
+            gate.failed = false;
+        }
+        boolean asyncCallbackScheduled = false;
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
                 if (!TextUtils.isEmpty(decision.proxyRule)) {
@@ -138,14 +224,30 @@ public final class ColgramBrowserRoutes {
                             .addBypassRule("127.0.0.1")
                             .addBypassRule("localhost")
                             .build();
-                    ProxyController.getInstance().setProxyOverride(config, Runnable::run, () -> {
-                    });
+                    ProxyController.getInstance().setProxyOverride(config, Runnable::run,
+                            () -> completeProxyGate(webView, true));
+                    asyncCallbackScheduled = true;
+                } else if (needsProxyRule && strictOrAnon) {
+                    ProxyController.getInstance().clearProxyOverride(Runnable::run,
+                            () -> completeProxyGate(webView, false));
+                    asyncCallbackScheduled = true;
                 } else {
-                    ProxyController.getInstance().clearProxyOverride(Runnable::run, () -> {
-                    });
+                    ProxyController.getInstance().clearProxyOverride(Runnable::run,
+                            () -> completeProxyGate(webView, true));
+                    asyncCallbackScheduled = true;
                 }
+            } else if (needsProxyRule && strictOrAnon) {
+                completeProxyGate(webView, false);
+                asyncCallbackScheduled = true;
             }
         } catch (Throwable ignored) {
+            if (needsProxyRule && strictOrAnon) {
+                completeProxyGate(webView, false);
+                asyncCallbackScheduled = true;
+            }
+        }
+        if (!asyncCallbackScheduled) {
+            completeProxyGate(webView, !(needsProxyRule && strictOrAnon));
         }
         try {
             WebSettings settings = webView.getSettings();
@@ -269,6 +371,16 @@ public final class ColgramBrowserRoutes {
                     throw new IOException("Failed to open loopback proxy front for SOCKS5");
                 }
             }
+            if (ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled()) {
+                throw new IOException("Blocked direct WebView fallback under strict privacy policy for mode=" + decision.mode);
+            }
+        }
+        if (ColgramConfig.isMaxAnonymityEnabled()) {
+            java.net.Proxy relayProxy = org.colgram.core.ColgramHttp.pickRelayProxy();
+            if (relayProxy != null) {
+                return url.openConnection(relayProxy);
+            }
+            throw new IOException("Blocked direct WebView connection under max-anonymity policy");
         }
         return url.openConnection(Proxy.NO_PROXY);
     }

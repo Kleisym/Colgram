@@ -24,7 +24,6 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -403,7 +402,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
                 startActivityForResult(Intent.createChooser(intent, "Выберите аватар для Koliti"), REQ_PICK_KOLITI_AVATAR);
             } catch (Throwable t) {
-                Toast.makeText(appCtx, "Не удалось открыть галерею", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Не удалось открыть галерею", true);
             }
         } else if (ColgramBuildFlags.KOLITI_ENABLED && kolitiAvatarResetRow >= 0 && position == kolitiAvatarResetRow) {
             final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
@@ -415,7 +414,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             ColgramDesignConfig.setKolitiCustomAvatarPath("");
             ColgramAeroStyler.invalidateKolitiAvatarCache();
             applyLiveDesignEverywhere(false);
-            Toast.makeText(appCtx, "Возвращён стандартный аватар Koliti", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(appCtx, R.drawable.msg_theme, "Возвращён стандартный аватар Koliti", false);
         } else if (ColgramBuildFlags.KOLITI_ENABLED && position == kolitiNameRow) {
             showTextInputDialog(ctx, "Имя ассистента",
                     "Например: Koliti, Jarvis, Nova",
@@ -430,10 +429,10 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                 ClipboardManager cm = (ClipboardManager) appCtx.getSystemService(Context.CLIPBOARD_SERVICE);
                 if (cm != null) {
                     cm.setPrimaryClip(ClipData.newPlainText("Colgram Design", json));
-                    Toast.makeText(appCtx, "Конфиг дизайна (JSON) скопирован в буфер", Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(appCtx, R.drawable.msg_copy, "Конфиг дизайна (JSON) скопирован в буфер", false);
                 }
             } catch (Throwable t) {
-                Toast.makeText(appCtx, "Не удалось скопировать JSON", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Не удалось скопировать JSON", true);
             }
         } else if (position == importJsonRow) {
             showTextInputDialog(ctx, "Импорт дизайна (JSON)",
@@ -443,9 +442,9 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         if (isFinishing() || getParentLayout() == null) return;
                         if (ColgramDesignConfig.importJson(val)) {
                             applyLiveDesignEverywhere(true);
-                            Toast.makeText(appCtx, "Дизайн успешно применён!", Toast.LENGTH_SHORT).show();
+                            ColgramUiKit.showNotice(appCtx, R.drawable.msg_check_s, "Дизайн успешно применён!", false);
                         } else {
-                            Toast.makeText(appCtx, "Некорректный JSON-конфиг", Toast.LENGTH_SHORT).show();
+                            ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Некорректный JSON-конфиг", true);
                         }
                     });
         } else if (position == resetAllRow) {
@@ -552,7 +551,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     }
                     if (decoded == null || decoded.getWidth() <= 0 || decoded.getHeight() <= 0) {
                         AndroidUtilities.runOnUIThread(() ->
-                                Toast.makeText(appCtx, "Не удалось прочитать изображение", Toast.LENGTH_SHORT).show());
+                                ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Не удалось прочитать изображение", true));
                         return;
                     }
                     int rotationDeg = 0;
@@ -600,11 +599,11 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         if (!isFinishing() && fragmentView != null) {
                             applyLiveDesignEverywhere(false);
                         }
-                        Toast.makeText(appCtx, "Новый аватар Koliti установлен везде!", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(appCtx, R.drawable.msg_check_s, "Новый аватар Koliti установлен везде!", false);
                     });
                 } catch (Throwable t) {
                     AndroidUtilities.runOnUIThread(() ->
-                            Toast.makeText(appCtx, "Ошибка сохранения аватара: " + t.getMessage(), Toast.LENGTH_SHORT).show());
+                            ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Ошибка сохранения аватара: " + t.getMessage(), true));
                 }
             });
         }
@@ -699,7 +698,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             phoneFrame.addView(bottomRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
             orbHost = new FrameLayout(ctx);
-            bottomRow.addView(orbHost, LayoutHelper.createLinear(80, 68, Gravity.CENTER_VERTICAL));
+            bottomRow.addView(orbHost, LayoutHelper.createLinear(84, 84, Gravity.CENTER_VERTICAL));
 
             orbPreview = new ImageView(ctx);
             orbPreview.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -1153,13 +1152,13 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             } else if (type == 2) {
                 TextCheckCell c = (TextCheckCell) holder.itemView;
                 if (position == hideDividersRow) {
+                    ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_SLATE, R.drawable.msg_customize);
                     c.setTextAndValueAndCheck("Скрыть тонкие разделители", "Более чистый безрамочный список",
                             ColgramDesignConfig.isHideDividers(), true, false);
-                    ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_SLATE, R.drawable.msg_customize);
                 } else if (position == showHeaderShieldRow) {
+                    ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_EMERALD, R.drawable.outline_shield_check);
                     c.setTextAndValueAndCheck("Иконка Щита (обход РКН) в шапке", "Показывать быстрый вход в прокси рядом с заголовком",
                             ColgramDesignConfig.isShowHeaderShield(), true, true);
-                    ColgramMenuChrome.applyCheckIcon(c, ColgramMenuChrome.COLOR_EMERALD, R.drawable.outline_shield_check);
                 }
             } else if (type == 3) {
                 TextDetailSettingsCell d = (TextDetailSettingsCell) holder.itemView;

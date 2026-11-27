@@ -28,9 +28,9 @@ public final class ColgramNotificationFilter {
     private static final Pattern HOMOGLYPH_ONLY = Pattern.compile("^[aeopcxkymthbun]+$");
     private static final Pattern HOMOGLYPH_SPAM = p("^(?:ворк\\w*|курс\\w*|прайс\\w*|скуп\\w*|продам|продаю|продаем|куплю|мтс|крипт\\w*|звезд\\w*|акк\\w*|бонус\\w*|казик\\w*|казино|интим\\w*|дроп\\w*|обнал\\w*|выплат\\w*|гарант\\w*)$");
 
-    private static final Pattern SALE = p("\\b(?:продаю|продам|продаем|продажа|скупаю|скупка|скупаем|предлагаю|предлагаем|сдам|сдаю|принимаю|принимаем|при[её]м\\s+(?:смс|номер\\w*|физ\\w*|акк\\w*)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|в\\s+продаже|в\\s+наличии)\\b");
-    private static final Pattern CATALOG = p("\\b(?:прайс\\w*|каталог\\w*|отзывы|price\\s*list)\\b");
-    private static final Pattern CONTACT = p("\\b(?:писать|пишите|пиши|заказать|купить|обращайтесь|контакты|в\\s+лс|в\\s+личку|в\\s+био)\\b");
+    private static final Pattern SALE = p("\\b(?:продаю|продам|продаем|продажа|скупаю|скупка|скупаем|предлагаю|предлагаем|сдам|сдаю|принимаю|принимаем|при[её]м\\s+(?:смс|номер\\w*|физ\\w*|акк\\w*)|выгодн\\w*\\s+(?:тем\\w*|услови\\w*|курс\\w*)|открыт\\s+к\\s+заказам|всегда\\s+на\\s+связи|пополн(?:ю|яю|ени\\w*)|в\\s+продаже|в\\s+наличии)\\b");
+    private static final Pattern CATALOG = p("\\b(?:прайс\\w*|каталог\\w*|отзывы|баланс\\w*|гаранти[яию]|price\\s*list)\\b");
+    private static final Pattern CONTACT = p("\\b(?:писать|пишите|пиши|заказать|заказам|купить|обращайтесь|контакты|в\\s+лс|в\\s+личку|в\\s+био)\\b");
     private static final Pattern PRICE = p("\\d+(?:[.,]\\d+)?\\s*(?:\\$|₽|€|руб\\w*|usd|ton|тон|звезд\\w*)|\\$\\s*\\d+");
     private static final Pattern WATERMARK = p("(?:отправленн?о|передано|переслано|опубликовано|рассылка|разослано|доставлено|запощено|sent|posted)\\s+(?:через|с\\s+помощью|при\\s+помощи|via|through|by)\\s+@[a-z0-9_]{4,32}\\b");
     private static final Pattern TARIFF_HEADER = p("\\b(?:репост\\w*|размещени\\w*|рассылк\\w*|закреп\\w*|тариф\\w*)\\s*:");
@@ -38,7 +38,7 @@ public final class ColgramNotificationFilter {
     private static final Pattern AUTH = p("(?:my\\.telegram\\.org|login\\s*code|confirmation\\s*code|код\\s+(?:входа|подтверждения))");
     private static final Pattern RECRUIT = p("ищ[уе]\\w*\\s+(?:людей|сотрудник\\w*|работник\\w*)|набор\\s+в\\s+команду");
     private static final Pattern JOB_DETAIL = p("профит|график|обучение\\s*:\\s*бесплатно|трафик|под\\s+процент");
-    private static final Pattern WORK_SIM = p("(?:\\b(?:ворк\\w*|заработ\\w*|зарабат\\w*|физ(?:\\s*номер\\w*|\\s*сим\\w*|\\s*акк\\w*|ы|ов)?|е?-?сим\\w*|esim|симк\\w*|сим[-\\s]*карт\\w*|нерег\\w*|при[её]м\\s+смс|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:сразу|момент\\w*|от)|гарант\\w*|репутац\\w*\\s+в\\s+тим\\w*|тим[аеу]\\s+(?:в\\s+био|у\\s+\\w+\\s+в\\s+био))\\b|(?<![\\w])\\+rep\\b)");
+    private static final Pattern WORK_SIM = p("(?:\\b(?:ворк\\w*|заработ\\w*|зарабат\\w*|steam|стим\\w*|гифт\\w*|psn|xbox|cs2|cs:?go|valorant|валорант\\w*|физ(?:\\s*номер\\w*|\\s*сим\\w*|\\s*акк\\w*|ы|ов)?|е?-?сим\\w*|esim|симк\\w*|сим[-\\s]*карт\\w*|нерег\\w*|при[её]м\\s+смс|момент(?:альн\\w*)?\\s+оплат\\w*|выплат\\w*\\s+(?:сразу|момент\\w*|от)|гарант\\w*|репутац\\w*\\s+в\\s+тим\\w*|тим[аеу]\\s+(?:в\\s+био|у\\s+\\w+\\s+в\\s+био))\\b|(?<![\\w])\\+rep\\b)");
     private static final Pattern CARRIER = p("\\b(?:билайн\\w*|мтс|мегафон\\w*|теле2|tele2|йота|yota|сб[-\\s]*моб\\w*|сбермоб\\w*|т[-\\s]*мобайл\\w*|тинькофф\\s*моб\\w*)\\b");
     private static final Pattern SMM = p("\\b(?:клик(?:и|ов)|накрутк\\w*|залив|просмотр(?:ы|ов))\\b");
     private static final Pattern REFERRAL = p("(?:t\\.me|telegram\\.me)/[^\\s]+[?&]startapp=");
@@ -164,7 +164,12 @@ public final class ColgramNotificationFilter {
                 || (workSim >= 1 && price && routing))) {
             return true;
         }
-        return contact && ((sale && (routing || catalogue || price))
+        if (!contact && text.length() > 220) {
+            boolean strongWall = (sale && (price || catalogue || workSim >= 1 || routing))
+                    || (workSim >= 2 && (sale || price || catalogue || routing));
+            if (strongWall) return true;
+        }
+        return contact && ((sale && (routing || catalogue || price || workSim >= 1))
                 || (catalogue && routing && price)
                 || (watermark && (sale || (catalogue && price))));
     }

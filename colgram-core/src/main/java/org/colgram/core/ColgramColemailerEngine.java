@@ -134,6 +134,9 @@ public final class ColgramColemailerEngine {
         public volatile boolean enabled = true;
         /** Account slot that owns this campaign (-1 = legacy/unassigned, >=0 = pinned to that account). */
         public volatile int ownerAccount = -1;
+        public volatile int sentCount = 0;
+        public volatile int failedCount = 0;
+        public volatile String lastError = "";
         final Object counterLock = new Object();
         private volatile Set<Long> targetChatsSnapshot = Collections.emptySet();
 
@@ -489,8 +492,6 @@ public final class ColgramColemailerEngine {
                 if (c.mode != MODE_INTERVAL) {
                     activeCounters++;
                 }
-            } else if (c != null && c.enabled && c.mode != MODE_INTERVAL) {
-                activeCounters++;
             }
         }
         activeCampaignCount.set(active);
@@ -498,6 +499,19 @@ public final class ColgramColemailerEngine {
         campaignsSnapshot = campaigns.isEmpty()
                 ? Collections.emptyList()
                 : Collections.unmodifiableList(new ArrayList<>(campaigns.values()));
+    }
+
+    public void recordCampaignDispatchOutcome(String campaignName, boolean success, String error) {
+        if (campaignName == null || campaignName.isEmpty()) return;
+        BroadcastCampaign c = campaigns.get(campaignName);
+        if (c == null) return;
+        if (success) {
+            c.sentCount++;
+            c.lastError = "";
+        } else {
+            c.failedCount++;
+            c.lastError = error == null ? "" : error;
+        }
     }
 
     public Set<String> collectNeededFolderNames(int account) {
@@ -523,6 +537,10 @@ public final class ColgramColemailerEngine {
 
     public int getActiveCampaignCount() {
         return activeCampaignCount.get();
+    }
+
+    public int getActiveCounterCampaignCount() {
+        return activeCounterCampaignCount.get();
     }
 
     public boolean hasActiveCampaigns() {
@@ -880,6 +898,21 @@ public final class ColgramColemailerEngine {
         return campaigns.get(chosen);
     }
 
+    /** Resolves any active RotationRule containing {@code baseCampaign}; falls back to {@code baseCampaign}. */
+    public synchronized BroadcastCampaign resolveRotatedCampaign(BroadcastCampaign baseCampaign, long chatId) {
+        if (baseCampaign == null || rotations.isEmpty()) return baseCampaign;
+        for (RotationRule r : rotations.values()) {
+            if (r == null || r.campaignNames.isEmpty()) continue;
+            if (r.campaignNames.contains(baseCampaign.name)) {
+                BroadcastCampaign next = nextRotationCampaign(r.name, chatId);
+                if (next != null && !next.text.isEmpty() && next.enabled) {
+                    return next;
+                }
+            }
+        }
+        return baseCampaign;
+    }
+
     // --- Whitelist & Mute rules (lock-free O(1) hot-path reads) ---
 
     public synchronized void addWhitelist(long userId) {
@@ -1199,6 +1232,22 @@ public final class ColgramColemailerEngine {
                     .append('\t').append(joinLongs(c.targetChats))
                     .append('\t').append(esc(formatButtonsPreview(c.buttons)))
                     .append('\t').append(c.ownerAccount).append('\n');
+            for (Map.Entry<Long, Long> tsEntry : c.chatLastSentAt.entrySet()) {
+                Long cid = tsEntry.getKey();
+                Long ts = tsEntry.getValue();
+                if (cid != null && ts != null && ts > 0L) {
+                    sb.append("TS\t").append(esc(c.name)).append('\t').append(cid).append('\t').append(ts).append('\n');
+                }
+            }
+            for (Map.Entry<Long, Integer> cntEntry : c.chatCounters.entrySet()) {
+                Long cid = cntEntry.getKey();
+                Integer cnt = cntEntry.getValue();
+                if (cid != null && cnt != null && cnt > 0) {
+                    long updatedAt = c.chatCounterUpdatedAt.getOrDefault(cid, 0L);
+                    sb.append("CNT\t").append(esc(c.name)).append('\t').append(cid).append('\t')
+                            .append(cnt).append('\t').append(updatedAt).append('\n');
+                }
+            }
         }
         for (RotationRule rot : rotations.values()) {
             sb.append("ROT\t").append(esc(rot.name)).append('\t')
@@ -1219,6 +1268,7 @@ public final class ColgramColemailerEngine {
         floodWaitUntilMs.clear();
         quietSnapshots.clear();
         activeCampaignCount.set(0);
+        activeCounterCampaignCount.set(0);
         loadedFromConfig = true;
         deserializeIntoSelf(raw);
     }
@@ -1278,6 +1328,22 @@ public final class ColgramColemailerEngine {
                     }
                     c.refreshTargetSnapshot();
                     campaigns.put(c.name, c);
+                } else if ("TS".equals(p[0]) && p.length >= 4) {
+                    BroadcastCampaign c = campaigns.get(unesc(p[1]));
+                    if (c != null) {
+                        long cid = Long.parseLong(p[2]);
+                        long ts = Long.parseLong(p[3]);
+                        if (ts > 0L) c.chatLastSentAt.put(cid, ts);
+                    }
+                } else if ("CNT".equals(p[0]) && p.length >= 5) {
+                    BroadcastCampaign c = campaigns.get(unesc(p[1]));
+                    if (c != null) {
+                        long cid = Long.parseLong(p[2]);
+                        int cnt = Integer.parseInt(p[3]);
+                        long upd = Long.parseLong(p[4]);
+                        if (cnt > 0) c.chatCounters.put(cid, cnt);
+                        if (upd > 0L) c.chatCounterUpdatedAt.put(cid, upd);
+                    }
                 } else if ("ROT".equals(p[0]) && p.length >= 3) {
                     String name = unesc(p[1]);
                     String joined = unesc(p[2]);

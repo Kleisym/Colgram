@@ -8,20 +8,28 @@ import android.database.sqlite.SQLiteOpenHelper;
 import android.database.sqlite.SQLiteStatement;
 import android.os.Looper;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 /**
- * ColgramDatabase — Secure local SQLite storage for preserving deleted messages
- * and tracking edit history across all chats.
+ * ColgramDatabase — Secure local SQLite storage for preserving deleted messages,
+ * edit history, collapsed spam tombstones, and Lazy Shadow Vault metadata across all chats.
  */
 public class ColgramDatabase extends SQLiteOpenHelper {
     private static final String DATABASE_NAME = "colgram_vault.db";
-    private static final int DATABASE_VERSION = 6;
+    private static final int DATABASE_VERSION = 7;
+
+    public static final int MAX_COLLAPSED_SPAM_ROWS = 2000;
+    public static final int MAX_SHADOW_MESSAGES_ROWS = 15000;
 
     // Table: Deleted Messages
     public static final String TABLE_DELETED = "deleted_messages";
@@ -73,9 +81,62 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     public static final String COL_MEDIA_MIME = "mime_type";
     public static final String COL_MEDIA_REMOTE_ID = "remote_id";  // document/photo id, for the "original" hint
 
+    // Table: Collapsed Spam Pings (bounded 2,000 rows LRU)
+    public static final String TABLE_COLLAPSED_SPAM = "collapsed_spam_messages";
+    public static final String COL_SPAM_DIALOG_ID = "dialog_id";
+    public static final String COL_SPAM_MSG_ID = "message_id";
+    public static final String COL_SPAM_SENDER_ID = "sender_id";
+    public static final String COL_SPAM_REASON = "reason";
+    public static final String COL_SPAM_AT = "collapsed_at";
+
+    // Table: Traffic-Saving Lazy Shadow Vault (bounded 15,000 rows LRU + zlib metadata)
+    public static final String TABLE_SHADOW_MESSAGES = "shadow_messages";
+    public static final String COL_SHADOW_DIALOG_ID = "dialog_id";
+    public static final String COL_SHADOW_MSG_ID = "message_id";
+    public static final String COL_SHADOW_SENDER_ID = "sender_id";
+    public static final String COL_SHADOW_DATE_SEC = "date_sec";
+    public static final String COL_SHADOW_MEDIA_TYPE = "media_type";
+    public static final String COL_SHADOW_MEDIA_SIZE = "media_size";
+    public static final String COL_SHADOW_META_ZLIB = "compressed_meta";
+    public static final String COL_SHADOW_PREVIEW_PATH = "preview_path";
+    public static final String COL_SHADOW_DEHYDRATED = "dehydrated";
+    public static final String COL_SHADOW_CAPTURED_AT = "captured_at";
+
+    public static final class ShadowMessageRecord {
+        public final long dialogId;
+        public final int messageId;
+        public final long senderId;
+        public final int dateSec;
+        public final int mediaType;
+        public final long mediaSize;
+        public final String metaJson;
+        public final String previewPath;
+        public final boolean dehydrated;
+        public final long capturedAtMs;
+
+        public ShadowMessageRecord(long dialogId, int messageId, long senderId, int dateSec,
+                                   int mediaType, long mediaSize, String metaJson,
+                                   String previewPath, boolean dehydrated, long capturedAtMs) {
+            this.dialogId = dialogId;
+            this.messageId = messageId;
+            this.senderId = senderId;
+            this.dateSec = dateSec;
+            this.mediaType = mediaType;
+            this.mediaSize = mediaSize;
+            this.metaJson = metaJson == null ? "" : metaJson;
+            this.previewPath = previewPath == null ? "" : previewPath;
+            this.dehydrated = dehydrated;
+            this.capturedAtMs = capturedAtMs;
+        }
+    }
+
     private static ColgramDatabase instance;
 
     private final ConcurrentHashMap<Long, Set<Integer>> deletedMessagesByDialog = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, ConcurrentHashMap<Integer, String>> collapsedSpamByDialog = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> shadowPreviewCache = new ConcurrentHashMap<>();
+    private final AtomicInteger collapsedInsertTick = new AtomicInteger(0);
+    private final AtomicInteger shadowInsertTick = new AtomicInteger(0);
     private final Set<Long> deletedDialogsCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<Long> blockedUsersCache = ConcurrentHashMap.newKeySet();
     private final Set<String> pendingPurgesDuringLoad = ConcurrentHashMap.newKeySet();
@@ -325,6 +386,38 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                     }
                 }
                 deletedDialogsCache.addAll(tmpDialogs);
+
+                // Preload collapsed spam pings for O(1) UI bind check
+                try (Cursor spamCur = db.query(TABLE_COLLAPSED_SPAM,
+                        new String[]{COL_SPAM_DIALOG_ID, COL_SPAM_MSG_ID, COL_SPAM_REASON},
+                        null, null, null, null, null)) {
+                    while (spamCur != null && spamCur.moveToNext()) {
+                        long sd = spamCur.getLong(0);
+                        int sm = spamCur.getInt(1);
+                        String sr = spamCur.isNull(2) ? "spam" : spamCur.getString(2);
+                        if (sd != 0L && sm != 0) {
+                            collapsedSpamByDialog
+                                    .computeIfAbsent(sd, k -> new ConcurrentHashMap<>())
+                                    .put(sm, sr);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+
+                // Preload Shadow Micro-Vault preview paths for O(1) deleted photo display
+                try (Cursor shadowCur = db.query(TABLE_SHADOW_MESSAGES,
+                        new String[]{COL_SHADOW_DIALOG_ID, COL_SHADOW_MSG_ID, COL_SHADOW_PREVIEW_PATH},
+                        COL_SHADOW_PREVIEW_PATH + " IS NOT NULL AND " + COL_SHADOW_PREVIEW_PATH + " != ''",
+                        null, null, null, null)) {
+                    while (shadowCur != null && shadowCur.moveToNext()) {
+                        long xd = shadowCur.getLong(0);
+                        int xm = shadowCur.getInt(1);
+                        String xp = shadowCur.getString(2);
+                        if (xd != 0L && xm != 0 && xp != null && !xp.isEmpty()) {
+                            shadowPreviewCache.put(deletedKey(xd, xm), xp);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+
                 pendingPurgesDuringLoad.clear();
                 deletedCachesLoaded = true;
                 loadedOk = true;
@@ -406,6 +499,37 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                 + COL_DEL_DLG_TIMESTAMP + " INTEGER, "
                 + COL_DEL_DLG_TITLE + " TEXT"
                 + ");");
+
+        createV7Tables(db);
+    }
+
+    private static void createV7Tables(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_COLLAPSED_SPAM + " ("
+                + COL_SPAM_DIALOG_ID + " INTEGER, "
+                + COL_SPAM_MSG_ID + " INTEGER, "
+                + COL_SPAM_SENDER_ID + " INTEGER, "
+                + COL_SPAM_REASON + " TEXT, "
+                + COL_SPAM_AT + " INTEGER, "
+                + "PRIMARY KEY (" + COL_SPAM_DIALOG_ID + ", " + COL_SPAM_MSG_ID + ")"
+                + ");");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_collapsed_spam_at ON " + TABLE_COLLAPSED_SPAM
+                + " (" + COL_SPAM_AT + ");");
+
+        db.execSQL("CREATE TABLE IF NOT EXISTS " + TABLE_SHADOW_MESSAGES + " ("
+                + COL_SHADOW_DIALOG_ID + " INTEGER, "
+                + COL_SHADOW_MSG_ID + " INTEGER, "
+                + COL_SHADOW_SENDER_ID + " INTEGER, "
+                + COL_SHADOW_DATE_SEC + " INTEGER, "
+                + COL_SHADOW_MEDIA_TYPE + " INTEGER, "
+                + COL_SHADOW_MEDIA_SIZE + " INTEGER, "
+                + COL_SHADOW_META_ZLIB + " BLOB, "
+                + COL_SHADOW_PREVIEW_PATH + " TEXT, "
+                + COL_SHADOW_DEHYDRATED + " INTEGER DEFAULT 0, "
+                + COL_SHADOW_CAPTURED_AT + " INTEGER, "
+                + "PRIMARY KEY (" + COL_SHADOW_DIALOG_ID + ", " + COL_SHADOW_MSG_ID + ")"
+                + ");");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_shadow_captured_at ON " + TABLE_SHADOW_MESSAGES
+                + " (" + COL_SHADOW_CAPTURED_AT + ");");
     }
 
     @Override
@@ -457,6 +581,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                 db.execSQL("DROP INDEX IF EXISTS idx_media_lookup;");
                 db.execSQL("CREATE INDEX IF NOT EXISTS idx_media_lookup ON " + TABLE_MEDIA
                         + " (" + COL_MEDIA_DIALOG_ID + ", " + COL_MEDIA_MSG_ID + ", " + COL_MEDIA_ID + ");");
+            } catch (Exception ignored) {}
+        }
+        // v6 -> v7: collapsed_spam_messages + Lazy Shadow Vault shadow_messages
+        if (oldVersion < 7) {
+            try {
+                createV7Tables(db);
             } catch (Exception ignored) {}
         }
     }
@@ -993,5 +1123,177 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             // Silently handle
         }
         return history;
+    }
+
+    public void recordCollapsedSpam(long dialogId, int messageId, long senderId, String reason) {
+        if (dialogId == 0L || messageId == 0) return;
+        String safeReason = (reason == null || reason.isEmpty()) ? "spam" : reason;
+        collapsedSpamByDialog
+                .computeIfAbsent(dialogId, k -> new ConcurrentHashMap<>())
+                .put(messageId, safeReason);
+        try {
+            SQLiteDatabase db = getWritableDatabase();
+            ContentValues v = new ContentValues();
+            v.put(COL_SPAM_DIALOG_ID, dialogId);
+            v.put(COL_SPAM_MSG_ID, messageId);
+            v.put(COL_SPAM_SENDER_ID, senderId);
+            v.put(COL_SPAM_REASON, safeReason);
+            v.put(COL_SPAM_AT, System.currentTimeMillis());
+            db.insertWithOnConflict(TABLE_COLLAPSED_SPAM, null, v, SQLiteDatabase.CONFLICT_REPLACE);
+            if ((collapsedInsertTick.incrementAndGet() & 63) == 0) {
+                db.execSQL("DELETE FROM " + TABLE_COLLAPSED_SPAM + " WHERE rowid IN ("
+                        + "SELECT rowid FROM " + TABLE_COLLAPSED_SPAM
+                        + " ORDER BY " + COL_SPAM_AT + " DESC LIMIT -1 OFFSET " + MAX_COLLAPSED_SPAM_ROWS + ");");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    public boolean isCollapsedSpam(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId == 0) return false;
+        prepareCacheForLookup();
+        ConcurrentHashMap<Integer, String> m = collapsedSpamByDialog.get(dialogId);
+        return m != null && m.containsKey(messageId);
+    }
+
+    public String getCollapsedSpamReason(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId == 0) return null;
+        prepareCacheForLookup();
+        ConcurrentHashMap<Integer, String> m = collapsedSpamByDialog.get(dialogId);
+        return m != null ? m.get(messageId) : null;
+    }
+
+    public void removeCollapsedSpam(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId == 0) return;
+        ConcurrentHashMap<Integer, String> m = collapsedSpamByDialog.get(dialogId);
+        if (m != null) m.remove(messageId);
+        try {
+            getWritableDatabase().delete(TABLE_COLLAPSED_SPAM,
+                    COL_SPAM_DIALOG_ID + "=? AND " + COL_SPAM_MSG_ID + "=?",
+                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
+        } catch (Throwable ignored) {}
+    }
+
+    public void upsertShadowMessage(long dialogId, int messageId, long senderId, int dateSec,
+                                    int mediaType, long mediaSize, String metaJson,
+                                    String previewPath, boolean dehydrated) {
+        if (dialogId == 0L || messageId <= 0) return;
+        if (previewPath != null && !previewPath.isEmpty()) {
+            shadowPreviewCache.put(deletedKey(dialogId, messageId), previewPath);
+        }
+        try {
+            SQLiteDatabase db = getWritableDatabase();
+            ContentValues v = new ContentValues();
+            v.put(COL_SHADOW_DIALOG_ID, dialogId);
+            v.put(COL_SHADOW_MSG_ID, messageId);
+            v.put(COL_SHADOW_SENDER_ID, senderId);
+            v.put(COL_SHADOW_DATE_SEC, dateSec);
+            v.put(COL_SHADOW_MEDIA_TYPE, mediaType);
+            v.put(COL_SHADOW_MEDIA_SIZE, mediaSize);
+            if (metaJson != null && !metaJson.isEmpty()) {
+                v.put(COL_SHADOW_META_ZLIB, zlibCompressBytes(metaJson.getBytes(StandardCharsets.UTF_8)));
+            }
+            if (previewPath != null && !previewPath.isEmpty()) {
+                v.put(COL_SHADOW_PREVIEW_PATH, previewPath);
+            }
+            v.put(COL_SHADOW_DEHYDRATED, dehydrated ? 1 : 0);
+            v.put(COL_SHADOW_CAPTURED_AT, System.currentTimeMillis());
+            db.insertWithOnConflict(TABLE_SHADOW_MESSAGES, null, v, SQLiteDatabase.CONFLICT_REPLACE);
+            if ((shadowInsertTick.incrementAndGet() & 127) == 0) {
+                db.execSQL("DELETE FROM " + TABLE_SHADOW_MESSAGES + " WHERE rowid IN ("
+                        + "SELECT rowid FROM " + TABLE_SHADOW_MESSAGES
+                        + " ORDER BY " + COL_SHADOW_CAPTURED_AT + " DESC LIMIT -1 OFFSET " + MAX_SHADOW_MESSAGES_ROWS + ");");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    public void markShadowDehydrated(long dialogId, int messageId, boolean dehydrated) {
+        if (dialogId == 0L || messageId <= 0) return;
+        try {
+            ContentValues v = new ContentValues();
+            v.put(COL_SHADOW_DEHYDRATED, dehydrated ? 1 : 0);
+            getWritableDatabase().update(TABLE_SHADOW_MESSAGES, v,
+                    COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?",
+                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
+        } catch (Throwable ignored) {}
+    }
+
+    /** O(1) UI-safe lookup for Lazy Shadow Vault WebP micro-preview path. */
+    public String getShadowPreviewPath(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId <= 0) return null;
+        prepareCacheForLookup();
+        return shadowPreviewCache.get(deletedKey(dialogId, messageId));
+    }
+
+    public ShadowMessageRecord getShadowMessageRecord(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId <= 0) return null;
+        try (Cursor c = getReadableDatabase().query(TABLE_SHADOW_MESSAGES,
+                new String[]{COL_SHADOW_SENDER_ID, COL_SHADOW_DATE_SEC, COL_SHADOW_MEDIA_TYPE,
+                        COL_SHADOW_MEDIA_SIZE, COL_SHADOW_META_ZLIB, COL_SHADOW_PREVIEW_PATH,
+                        COL_SHADOW_DEHYDRATED, COL_SHADOW_CAPTURED_AT},
+                COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?",
+                new String[]{String.valueOf(dialogId), String.valueOf(messageId)},
+                null, null, null, "1")) {
+            if (c != null && c.moveToFirst()) {
+                byte[] blob = c.isNull(4) ? null : c.getBlob(4);
+                String meta = "";
+                if (blob != null && blob.length > 0) {
+                    byte[] raw = zlibDecompressBytes(blob);
+                    if (raw != null) {
+                        meta = new String(raw, StandardCharsets.UTF_8);
+                    }
+                }
+                return new ShadowMessageRecord(
+                        dialogId, messageId, c.getLong(0), c.getInt(1), c.getInt(2), c.getLong(3),
+                        meta, c.isNull(5) ? "" : c.getString(5), c.getInt(6) != 0,
+                        normalizeEpochMillis(c.getLong(7)));
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    public int getShadowMessageCount() {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM " + TABLE_SHADOW_MESSAGES, null)) {
+            if (c != null && c.moveToFirst()) return c.getInt(0);
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    public static byte[] zlibCompressBytes(byte[] raw) {
+        if (raw == null || raw.length == 0) return new byte[0];
+        Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION);
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(64, raw.length / 2))) {
+            deflater.setInput(raw);
+            deflater.finish();
+            byte[] buf = new byte[1024];
+            while (!deflater.finished()) {
+                int n = deflater.deflate(buf);
+                if (n <= 0) break;
+                bos.write(buf, 0, n);
+            }
+            return bos.toByteArray();
+        } catch (Throwable ignored) {
+            return raw;
+        } finally {
+            deflater.end();
+        }
+    }
+
+    public static byte[] zlibDecompressBytes(byte[] compressed) {
+        if (compressed == null || compressed.length == 0) return new byte[0];
+        Inflater inflater = new Inflater();
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream(compressed.length * 2)) {
+            inflater.setInput(compressed);
+            byte[] buf = new byte[1024];
+            while (!inflater.finished()) {
+                int n = inflater.inflate(buf);
+                if (n <= 0) break;
+                bos.write(buf, 0, n);
+            }
+            return bos.toByteArray();
+        } catch (Throwable ignored) {
+            return null;
+        } finally {
+            inflater.end();
+        }
     }
 }

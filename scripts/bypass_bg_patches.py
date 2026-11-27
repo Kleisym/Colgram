@@ -21,13 +21,104 @@ def _patch_eol_variants(eol_patch_fn, filepath: str, anchors: list[str], replace
 
 def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     """Apply all Track A patches cleanly and idempotently against Telegram-Src."""
-    # 1. AndroidManifest.xml: restore POST_NOTIFICATIONS so background sync & notifications work on Android 13+.
+    # 1. AndroidManifest.xml: restore POST_NOTIFICATIONS, harden backup & permissions,
+    #    and strip unused Play/Wear/Referral/Clipboard tracking surfaces.
     manifest = os.path.join(repo_path, "TMessagesProj", "src", "main", "AndroidManifest.xml")
     eol_patch_fn(
         manifest,
         "    <!-- stripped POST_NOTIFICATIONS for Colgram privacy -->",
         '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
         "AndroidManifest.xml restore POST_NOTIFICATIONS",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        ['    <uses-permission android:name="android.permission.READ_CLIPBOARD"/>'],
+        "    <!-- stripped clipboard permission for Colgram privacy -->",
+        "AndroidManifest.xml strip READ_CLIPBOARD",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        [
+            """        android:allowBackup="true"
+        android:hasFragileUserData="true"
+        android:restoreAnyVersion="true"
+        android:backupAgent=".BackupAgent\""""
+        ],
+        """        android:allowBackup="false"
+        android:hasFragileUserData="true"
+        android:restoreAnyVersion="false\"""",
+        "AndroidManifest.xml disable allowBackup and strip BackupAgent",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        [
+            """        <receiver
+            android:name=".SmsReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.auth.api.phone.SMS_RETRIEVED"/>
+            </intent-filter>
+        </receiver>"""
+        ],
+        "        <!-- stripped sms retriever for Colgram privacy -->",
+        "AndroidManifest.xml strip SmsReceiver",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        [
+            """        <receiver android:name=".RefererReceiver" android:exported="true" android:permission="android.permission.INSTALL_PACKAGES">
+            <intent-filter>
+                <action android:name="com.android.vending.INSTALL_REFERRER" />
+            </intent-filter>
+        </receiver>"""
+        ],
+        "        <!-- stripped install referrer for Colgram privacy -->",
+        "AndroidManifest.xml strip RefererReceiver",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        [
+            """        <service
+            android:name=".WearAuthListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/tg-wear-auth/" />
+            </intent-filter>
+        </service>"""
+        ],
+        "        <!-- stripped wear auth listener for Colgram privacy -->",
+        "AndroidManifest.xml strip WearAuthListenerService",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        ['        <meta-data android:name="com.google.android.gms.wallet.api.enabled" android:value="true" />'],
+        "        <!-- stripped GMS wallet metadata for Colgram privacy -->",
+        "AndroidManifest.xml strip GMS wallet metadata",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        ['        <meta-data android:name="com.google.android.gms.vision.DEPENDENCIES" android:value="face,barcode" />'],
+        "        <!-- stripped GMS vision metadata for Colgram privacy -->",
+        "AndroidManifest.xml strip GMS vision metadata",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        manifest,
+        [
+            """        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="org.telegram.messenger.chromecast.ChromecastOptionsProvider" />"""
+        ],
+        "        <!-- stripped GMS cast metadata for Colgram privacy -->",
+        "AndroidManifest.xml strip GMS cast metadata",
     )
 
     # 2. ApplicationLoader.java: start background services even when pushService pref is off,
@@ -234,8 +325,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         });
         return requestToken;
     }""",
-        ],
-        """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+            """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
         if (object instanceof TLRPC.TL_messages_sendMedia) {
             return !(((TLRPC.TL_messages_sendMedia) object).media instanceof TLRPC.TL_inputMediaGame);
         }
@@ -254,7 +344,223 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         });
         return requestToken;
     }""",
-        "ConnectionsManager.java bypass stageQueue on outbound instant send requests",
+        ],
+        """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+        if (object instanceof TLRPC.TL_messages_sendMedia) {
+            return !(((TLRPC.TL_messages_sendMedia) object).media instanceof TLRPC.TL_inputMediaGame);
+        }
+        return object instanceof TLRPC.TL_messages_sendMessage
+                || object instanceof TLRPC.TL_messages_sendMultiMedia;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            return requestToken;
+        }
+        final boolean colgramAllowSpamMentionClear = org.colgram.core.ColgramGhostMode.isAllowingSpamMentionClear();
+        Utilities.stageQueue.postRunnable(() -> {
+            if (colgramAllowSpamMentionClear) {
+                org.colgram.core.ColgramGhostMode.runAllowingSpamMentionClear(() ->
+                        sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken));
+            } else {
+                sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            }
+        });
+        return requestToken;
+    }""",
+        "ConnectionsManager.java bypass stageQueue on outbound instant send requests and propagate Contract A read exemption",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """    private void sendRequestInternal(TLObject object, RequestDelegate onComplete, RequestDelegateTimestamp onCompleteTimestamp, QuickAckDelegate onQuickAck, WriteToSocketDelegate onWriteToSocket, int flags, int datacenterId, int connectionType, boolean immediate, int requestToken) {
+        if (object instanceof org.telegram.tgnet.tl.TL_account.updateStatus"""
+        ],
+        """    private static boolean colgramShouldDropFirewallRequest(TLObject object) {
+        if (object == null) return false;
+        if (object instanceof TLRPC.TL_help_saveAppLog
+                || object instanceof TLRPC.TL_messages_viewSponsoredMessage) {
+            return true;
+        }
+        if (object instanceof org.telegram.tgnet.tl.TL_account.updateDeviceLocked
+                && (org.colgram.core.ColgramConfig.isCloakEnabled()
+                        || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled())) {
+            return true;
+        }
+        if ((object instanceof TLRPC.TL_messages_getSponsoredMessages
+                || object instanceof TLRPC.TL_contacts_getSponsoredPeers)
+                && org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled()) {
+            return true;
+        }
+        if (org.colgram.core.ColgramConfig.isGhostTypingEnabled()
+                && object instanceof TLRPC.TL_messages_setTyping) {
+            return true;
+        }
+        if (org.colgram.core.ColgramConfig.isStealthStoriesEnabled()
+                && object instanceof org.telegram.tgnet.tl.TL_stories.TL_stories_readStories) {
+            return true;
+        }
+        if (org.colgram.core.ColgramConfig.isHideScreenshotNotifyEnabled()
+                && object instanceof TLRPC.TL_messages_sendScreenshotNotification) {
+            return true;
+        }
+        if (org.colgram.core.ColgramConfig.isGhostReadEnabled()
+                && !org.colgram.core.ColgramGhostMode.isAllowingSpamMentionClear()) {
+            if (object instanceof TLRPC.TL_messages_readHistory
+                    || object instanceof TLRPC.TL_channels_readHistory
+                    || object instanceof TLRPC.TL_messages_readSavedHistory
+                    || object instanceof TLRPC.TL_messages_readMessageContents
+                    || object instanceof TLRPC.TL_channels_readMessageContents
+                    || object instanceof TLRPC.TL_messages_readMentions
+                    || object instanceof TLRPC.TL_messages_readReactions
+                    || object instanceof TLRPC.TL_messages_readPollVotes) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static TLObject colgramSyntheticFirewallResponse(TLObject object) {
+        if (object instanceof TLRPC.TL_messages_getSponsoredMessages) {
+            return new TLRPC.TL_messages_sponsoredMessages();
+        }
+        if (object instanceof TLRPC.TL_messages_readHistory
+                || object instanceof TLRPC.TL_messages_readMessageContents
+                || object instanceof TLRPC.TL_channels_readMessageContents) {
+            return new TLRPC.TL_messages_affectedMessages();
+        }
+        if (object instanceof TLRPC.TL_channels_readHistory
+                || object instanceof TLRPC.TL_messages_readSavedHistory
+                || object instanceof TLRPC.TL_messages_readMentions
+                || object instanceof TLRPC.TL_messages_readReactions) {
+            return new TLRPC.TL_messages_affectedHistory();
+        }
+        return new TLRPC.TL_boolTrue();
+    }
+
+    private void sendRequestInternal(TLObject object, RequestDelegate onComplete, RequestDelegateTimestamp onCompleteTimestamp, QuickAckDelegate onQuickAck, WriteToSocketDelegate onWriteToSocket, int flags, int datacenterId, int connectionType, boolean immediate, int requestToken) {
+        if (object instanceof TLRPC.TL_messages_getMessagesViews
+                && org.colgram.core.ColgramConfig.isGhostReadEnabled()) {
+            ((TLRPC.TL_messages_getMessagesViews) object).increment = false;
+        }
+        if (colgramShouldDropFirewallRequest(object)) {
+            final TLObject syntheticResp = colgramSyntheticFirewallResponse(object);
+            object.freeResources();
+            if (onComplete != null || onCompleteTimestamp != null) {
+                Utilities.stageQueue.postRunnable(() -> {
+                    if (onComplete != null) {
+                        onComplete.run(syntheticResp, null);
+                    } else if (onCompleteTimestamp != null) {
+                        onCompleteTimestamp.run(syntheticResp, null, 0L);
+                    }
+                });
+            }
+            return;
+        }
+        if (object instanceof org.telegram.tgnet.tl.TL_account.updateStatus""",
+        "ConnectionsManager.java centralized MTProto privacy and telemetry firewall",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+        }"""
+        ],
+        """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+            packageId = "org.telegram.messenger";
+            regId = "";
+            cFingerprint = "";
+            timezoneOffset = 0;
+        }""",
+        "ConnectionsManager.java full native_init parameter cloaking",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """    public static int getInitFlags() {
+        if (ColgramGuestProxyService.inProbeProcess()) return 0;
+        int flags = 0;
+        EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);"""
+        ],
+        """    public static int getInitFlags() {
+        if (ColgramGuestProxyService.inProbeProcess()) return 0;
+        if (org.colgram.core.ColgramConfig.isCloakEnabled()) return 0;
+        int flags = 0;
+        EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);""",
+        "ConnectionsManager.java skip EmuDetector when cloaked",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """            ByteArrayOutputStream outbuf = null;
+            InputStream httpConnectionStream = null;
+            boolean done = false;
+            try {
+                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");"""
+        ],
+        """            if (org.colgram.core.ColgramConfig.isDohEnabled()
+                    && (org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                            || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled())) {
+                try {
+                    InetAddress[] doh = org.colgram.core.ColgramDohResolver.resolve(currentHostName);
+                    if (doh != null && doh.length > 0) {
+                        ArrayList<String> addresses = new ArrayList<>(doh.length);
+                        for (InetAddress addr : doh) {
+                            if (addr != null) addresses.add(addr.getHostAddress());
+                        }
+                        if (!addresses.isEmpty()) {
+                            return new ResolvedDomain(addresses, SystemClock.elapsedRealtime());
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                return null;
+            }
+            ByteArrayOutputStream outbuf = null;
+            InputStream httpConnectionStream = null;
+            boolean done = false;
+            try {
+                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");""",
+        "ConnectionsManager.java block direct google.com/resolve and system DNS in ResolveHostByNameTask",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """            URLConnection conn = url.openConnection();
+            conn.addRequestProperty("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 10_0 like Mac OS X) AppleWebKit/602.1.38 (KHTML, like Gecko) Version/10.0 Mobile/14A5297c Safari/602.1");"""
+        ],
+        """            if (org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                    || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+                throw new java.io.IOException("Direct DNS endpoint blocked under strict privacy policy");
+            }
+            URLConnection conn = url.openConnection();
+            conn.addRequestProperty("User-Agent", org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent());""",
+        "ConnectionsManager.java block direct openColgramBypassDnsConnection fallback under strict privacy",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
+        if (ColgramGuestProxyService.inProbeProcess()) return;
+        AndroidUtilities.runOnUIThread(() -> {"""
+        ],
+        """    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
+        if (ColgramGuestProxyService.inProbeProcess()) return;
+        if (org.colgram.core.ColgramConfig.isCloakEnabled() || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+            native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, "PLAYINTEGRITY_FAILED_EXCEPTION_UNAVAILABLE");
+            return;
+        }
+        AndroidUtilities.runOnUIThread(() -> {""",
+        "ConnectionsManager.java stub Play Integrity when cloaked",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -795,8 +1101,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             maxDownloadRequests = 12;
             maxDownloadRequestsBig = 12;
             maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);""",
-        ],
-        """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+            """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
                 || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
                 || location instanceof TLRPC.TL_inputStickerSetThumb
                 || location instanceof TLRPC.TL_inputPhotoFileLocation
@@ -808,7 +1113,20 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             maxDownloadRequests = 4;
             maxDownloadRequestsBig = 4;
             maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);""",
-        "FileLoadOperation.java safe chunk sizes (64KB >=32KB) and request caps (4/4/6)",
+        ],
+        """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+                || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || location instanceof TLRPC.TL_inputStickerSetThumb
+                || location instanceof TLRPC.TL_inputPhotoFileLocation
+                || totalBytesCount <= 0
+                || totalBytesCount < 256 * 1024;
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 32 ? 1024 * 64 : 1024 * 32) : 1024 * 128;
+            downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;
+            maxDownloadRequests = 6;
+            maxDownloadRequestsBig = 6;
+            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);""",
+        "FileLoadOperation.java safe chunk sizes (64KB >=32KB) and upgraded request caps (6/6/6)",
     )
     eol_patch_fn(
         file_load_op,
@@ -865,9 +1183,12 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     file_loader = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java"
     )
-    eol_patch_fn(
-        file_loader,
-        """        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {
+    with open(file_loader, "r", encoding="utf-8", errors="replace") as _fl_f:
+        _fl_prio_src = _fl_f.read()
+    if "isAvatarOrSmallImage" in _fl_prio_src:
+        eol_patch_fn(
+            file_loader,
+            """        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {
             boolean isAvatarOrSmallImage = parentObject instanceof TLRPC.User
                     || parentObject instanceof TLRPC.UserFull
                     || parentObject instanceof TLRPC.Chat
@@ -879,23 +1200,25 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 priority = PRIORITY_HIGH;
             }
         }
-        priority = getPriorityValue(priority);
-
-        if (operation != null) {
+        priority = getPriorityValue(priority);""",
+            "        priority = getPriorityValue(priority);",
+            "FileLoader.java stop blanket PRIORITY_HIGH",
+        )
+    eol_patch_fn(
+        file_loader,
+        """        if (operation != null) {
             if (cacheType != 10 && operation.isPreloadVideoOperation()) {
                 operation.setIsPreloadVideoOperation(false);
             }
             operation.setForceRequest(priority > 0);""",
-        """        priority = getPriorityValue(priority);
-
-        if (operation != null) {
+        """        if (operation != null) {
             if (cacheType != 10 && operation.isPreloadVideoOperation()) {
                 operation.setIsPreloadVideoOperation(false);
             }
             if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX) {
                 operation.setForceRequest(true);
             }""",
-        "FileLoader.java stop blanket PRIORITY_HIGH & setForceRequest storm",
+        "FileLoader.java gate setForceRequest on PRIORITY_VALUE_MAX",
     )
     eol_patch_fn(
         file_loader,
@@ -973,8 +1296,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);""",
             """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 2);
     private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 1);""",
-        ],
-        """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 3);
+            """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 3);
     private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);
     private DispatchQueuePriority colgramLottieOutQueue = new DispatchQueuePriority("colgramLottieOutQueue", 1);
     private static final Object colgramLottiePrecacheLock = new Object();
@@ -991,7 +1313,40 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         }
         return new RLottieDrawable(file, json, w, h, null, limitFps, null, fitzModifier, isSingleChannel);
     }""",
-        "ImageLoader.java queue thread count (3/2), dedicated Lottie queue, and RLottieDrawable precache helper",
+        ],
+        """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 3);
+    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);
+    private DispatchQueuePriority colgramLottieOutQueue = new DispatchQueuePriority("colgramLottieOutQueue", 2);
+    private static final Object[] colgramLottiePrecacheLocks = colgramCreatePrecacheLocks(8);
+
+    private static Object[] colgramCreatePrecacheLocks(int count) {
+        Object[] locks = new Object[count];
+        for (int i = 0; i < count; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
+    }
+
+    private static Object colgramLottiePrecacheLockFor(File file) {
+        if (file == null) return colgramLottiePrecacheLocks[0];
+        int h = file.getAbsolutePath().hashCode();
+        return colgramLottiePrecacheLocks[(h & 0x7fffffff) % colgramLottiePrecacheLocks.length];
+    }
+
+    private static RLottieDrawable colgramCreateRLottieDrawable(
+            File file, boolean compressed, int w, int h,
+            BitmapsCache.CacheOptions cacheOptions, boolean limitFps,
+            int fitzModifier, boolean isSingleChannel) {
+        String json = compressed ? decompressGzip(file) : null;
+        if (cacheOptions != null) {
+            final Object colgramLottiePrecacheLock = colgramLottiePrecacheLockFor(file);
+            synchronized (colgramLottiePrecacheLock) {
+                return new RLottieDrawable(file, json, w, h, cacheOptions, limitFps, null, fitzModifier, isSingleChannel);
+            }
+        }
+        return new RLottieDrawable(file, json, w, h, null, limitFps, null, fitzModifier, isSingleChannel);
+    }""",
+        "ImageLoader.java queue thread count (3/2), 2-thread Lottie queue, and striped per-path precache locks",
     )
     eol_patch_fn(
         image_loader,
@@ -1064,4 +1419,728 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     }""",
         """                    lottieDrawable = colgramCreateRLottieDrawable(cacheImage.finalFilePath, compressed, w, h, cacheOptions, limitFps, fitzModifier, isSingleChannel);""",
         "ImageLoader.java synchronize Lottie .pcache2 construction",
+    )
+    if os.path.exists(image_loader):
+        with open(image_loader, "r", encoding="utf-8", errors="ignore") as _il_p_f:
+            _il_p_src = _il_p_f.read()
+        if "isAvatarRequest" in _il_p_src:
+            _patch_eol_variants(
+                eol_patch_fn,
+                image_loader,
+                [
+                    """                    int effectivePriority = imageReceiver.getFileLoadingPriority();
+                    if (effectivePriority == FileLoader.PRIORITY_LOW) {
+                        img.priority = 0;
+                    } else if (thumb != 0 || isAvatarRequest || effectivePriority >= FileLoader.PRIORITY_HIGH) {
+                        img.priority = 2;
+                    } else {
+                        img.priority = 1;
+                    }"""
+                ],
+                """                    boolean isCustomEmojiRequest = imageLocation.document != null
+                            && MessageObject.isAnimatedEmoji(imageLocation.document);
+                    int effectivePriority = imageReceiver.getFileLoadingPriority();
+                    if (effectivePriority == FileLoader.PRIORITY_LOW) {
+                        img.priority = 0;
+                    } else if (isAvatarRequest || isCustomEmojiRequest) {
+                        img.priority = 3;
+                    } else if (thumb != 0 || effectivePriority >= FileLoader.PRIORITY_HIGH) {
+                        img.priority = 2;
+                    } else {
+                        img.priority = 1;
+                    }""",
+                "ImageLoader.java elevate avatar/custom-emoji decode priority above generic thumbs/photos",
+            )
+            _patch_eol_variants(
+                eol_patch_fn,
+                image_loader,
+                [
+                    """                            int loadingPriority = (thumb != 0 || isAvatarRequest || (cacheType != 10 && size > 0 && size <= 256 * 1024) || (imageLocation.location != null && cacheType != 10 && size <= 256 * 1024))
+                                    ? Math.max(FileLoader.PRIORITY_HIGH, imageReceiver.getFileLoadingPriority())
+                                    : imageReceiver.getFileLoadingPriority();"""
+                ],
+                """                            boolean isCustomEmojiLoad = imageLocation.document != null
+                                    && MessageObject.isAnimatedEmoji(imageLocation.document);
+                            int loadingPriority = (thumb != 0 || isAvatarRequest || isCustomEmojiLoad)
+                                    ? Math.max(FileLoader.PRIORITY_HIGH, imageReceiver.getFileLoadingPriority())
+                                    : ((cacheType != 10 && size <= 256 * 1024)
+                                            ? Math.max(FileLoader.PRIORITY_NORMAL_UP, imageReceiver.getFileLoadingPriority())
+                                            : imageReceiver.getFileLoadingPriority());""",
+                "ImageLoader.java keep avatars/custom emojis strictly above generic <=256KB message photos",
+            )
+
+    # 11. AnimatedEmojiDrawable.java: remove doOnIdle on DB->server lookup and chunk <= 100 IDs.
+    anim_emoji = os.path.join(
+        repo_path,
+        "TMessagesProj",
+        "src",
+        "main",
+        "java",
+        "org",
+        "telegram",
+        "ui",
+        "Components",
+        "AnimatedEmojiDrawable.java",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        anim_emoji,
+        [
+            """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
+            if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
+                processDocumentsAndLoadMore(documents, loadFromServerIds);
+            } else {
+                NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> processDocumentsAndLoadMore(documents, loadFromServerIds)));
+            }
+        }
+
+        private void loadFromServer(ArrayList<Long> loadFromServerIds) {
+            if (loadFromServerIds.isEmpty()) {
+                return;
+            }"""
+        ],
+        """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
+            if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
+                processDocumentsAndLoadMore(documents, loadFromServerIds);
+            } else {
+                AndroidUtilities.runOnUIThread(() -> processDocumentsAndLoadMore(documents, loadFromServerIds));
+            }
+        }
+
+        private void loadFromServer(ArrayList<Long> loadFromServerIds) {
+            if (loadFromServerIds.isEmpty()) {
+                return;
+            }
+            if (loadFromServerIds.size() > 100) {
+                for (int start = 0; start < loadFromServerIds.size(); start += 100) {
+                    int end = Math.min(loadFromServerIds.size(), start + 100);
+                    loadFromServer(new ArrayList<>(loadFromServerIds.subList(start, end)));
+                }
+                return;
+            }""",
+        "AnimatedEmojiDrawable.java remove doOnIdle delay and chunk server requests <= 100 IDs",
+    )
+
+    # 12. ChatActivity.java: defer participants & scheduled checks by 350ms, block sponsored reads.
+    chat_act = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_act,
+        [
+            """            if ((chatMode == 0 || chatMode == MODE_SAVED && getSavedDialogId() == getUserConfig().getClientUserId()) && (!isThreadChat() || isTopic)) {
+                waitingForLoad.add(lastLoadIndex);
+                getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 1, 0, 0, true, 0, classGuid, 2, 0, MODE_SCHEDULED, chatMode == MODE_SAVED ? 0 : threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
+            }"""
+        ],
+        """            if ((chatMode == 0 || chatMode == MODE_SAVED && getSavedDialogId() == getUserConfig().getClientUserId()) && (!isThreadChat() || isTopic)) {
+                final int scheduledLoadIndex = lastLoadIndex++;
+                waitingForLoad.add(scheduledLoadIndex);
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (finishing) {
+                        waitingForLoad.remove(scheduledLoadIndex);
+                        return;
+                    }
+                    getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 1, 0, 0, true, 0, classGuid, 2, 0, MODE_SCHEDULED, chatMode == MODE_SAVED ? 0 : threadMessageId, replyMaxReadId, scheduledLoadIndex, isTopic);
+                }, 350);
+            }""",
+        "ChatActivity.java defer MODE_SCHEDULED probe by 350ms",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_act,
+        [
+            """                        if (lastDate == 0 || Math.abs(System.currentTimeMillis() / 1000 - lastDate) > 60 * 60) {
+                            getMessagesController().loadChannelParticipants(currentChat.id);
+                        }"""
+        ],
+        """                        if (lastDate == 0 || Math.abs(System.currentTimeMillis() / 1000 - lastDate) > 60 * 60) {
+                            final long colgramParticipantsChatId = currentChat.id;
+                            AndroidUtilities.runOnUIThread(() -> {
+                                if (!finishing && currentChat != null && currentChat.id == colgramParticipantsChatId) {
+                                    getMessagesController().loadChannelParticipants(colgramParticipantsChatId);
+                                }
+                            }, 350);
+                        }""",
+        "ChatActivity.java defer loadChannelParticipants by 350ms",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_act,
+        [
+            """    private void addSponsoredMessages(boolean animated) {
+        if (sponsoredMessagesAdded || chatMode != 0 || !ChatObject.isChannel(currentChat) && !UserObject.isBot(currentUser) || !forwardEndReached[0] || getUserConfig().isPremium() && getMessagesController().isSponsoredDisabled() || isReport()) {
+            return;
+        }"""
+        ],
+        """    private void addSponsoredMessages(boolean animated) {
+        if (sponsoredMessagesAdded || chatMode != 0 || !ChatObject.isChannel(currentChat) && !UserObject.isBot(currentUser) || !forwardEndReached[0] || org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled() || getUserConfig().isPremium() && getMessagesController().isSponsoredDisabled() || isReport()) {
+            return;
+        }""",
+        "ChatActivity.java short-circuit addSponsoredMessages via ColgramPremiumConfig",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_act,
+        [
+            """        object.viewsReloaded = true;
+        TLRPC.TL_messages_viewSponsoredMessage req = new TLRPC.TL_messages_viewSponsoredMessage();
+        req.random_id = object.sponsoredId;
+        getConnectionsManager().sendRequest(req, null);
+        getMessagesController().markSponsoredAsRead(dialog_id, object);"""
+        ],
+        """        object.viewsReloaded = true;
+        if (!org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled()) {
+            getMessagesController().markSponsoredAsRead(dialog_id, object);
+        }""",
+        "ChatActivity.java drop TL_messages_viewSponsoredMessage",
+    )
+
+    # 13. VideoAds.java: short-circuit sponsored video ads & viewSponsoredMessage.
+    video_ads = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "video", "VideoAds.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        video_ads,
+        [
+            """    private void load() {
+        if (loading || loaded) return;
+
+        if (UserConfig.getInstance(currentAccount).isPremium() && MessagesController.getInstance(currentAccount).isSponsoredDisabled()) {
+            return;
+        }"""
+        ],
+        """    private void load() {
+        if (loading || loaded) return;
+
+        if (org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled()
+                || (UserConfig.getInstance(currentAccount).isPremium() && MessagesController.getInstance(currentAccount).isSponsoredDisabled())) {
+            loaded = true;
+            return;
+        }""",
+        "VideoAds.java short-circuit sponsored ads load()",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        video_ads,
+        [
+            """    public void logSponsoredShown(TLRPC.TL_sponsoredMessage ad) {
+        if (ad == null) return;
+        final TLRPC.TL_messages_viewSponsoredMessage req = new TLRPC.TL_messages_viewSponsoredMessage();
+        req.random_id = ad.random_id;
+        if (!BuildVars.DEBUG_PRIVATE_VERSION) {
+            ConnectionsManager.getInstance(currentAccount).sendRequest(req, null);
+        }
+    }"""
+        ],
+        """    public void logSponsoredShown(TLRPC.TL_sponsoredMessage ad) {
+        if (ad == null || org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled()) return;
+        if (true) return;
+    }""",
+        "VideoAds.java drop logSponsoredShown TL_messages_viewSponsoredMessage",
+    )
+
+    # 14. Telemetry / Firebase / Play Integrity / SSID hardening across UI & system bridges.
+    dual_cam = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Stories", "recorder", "DualCameraView.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        dual_cam,
+        [
+            """    private void log(boolean success) {
+        final boolean vendor = DualCameraView.dualAvailableDefault(ApplicationLoader.applicationContext, false);
+        if (MessagesController.getInstance(UserConfig.selectedAccount).collectDeviceStats) {"""
+        ],
+        """    private void log(boolean success) {
+        final boolean vendor = DualCameraView.dualAvailableDefault(ApplicationLoader.applicationContext, false);
+        if (false && MessagesController.getInstance(UserConfig.selectedAccount).collectDeviceStats) {""",
+        "DualCameraView.java disable TL_help_saveAppLog telemetry",
+    )
+    push_ctrl = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "PushListenerController.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        push_ctrl,
+        [
+            """                    if (sendStat) {
+                        String tag = pushType == PUSH_TYPE_FIREBASE ? "fcm" : "hcm";"""
+        ],
+        """                    if (false && sendStat) {
+                        String tag = pushType == PUSH_TYPE_FIREBASE ? "fcm" : "hcm";""",
+        "PushListenerController.java disable TL_help_saveAppLog telemetry",
+    )
+    prem_prev = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "PremiumPreviewFragment.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        prem_prev,
+        [
+            """    public static void sentShowScreenStat(String source) {
+        ConnectionsManager connectionsManager = ConnectionsManager.getInstance(UserConfig.selectedAccount);"""
+        ],
+        """    public static void sentShowScreenStat(String source) {
+        if (true) return;
+        ConnectionsManager connectionsManager = ConnectionsManager.getInstance(UserConfig.selectedAccount);""",
+        "PremiumPreviewFragment.java disable sentShowScreenStat telemetry",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        prem_prev,
+        [
+            """    public static void sentPremiumButtonClick() {
+        TLRPC.TL_help_saveAppLog req = new TLRPC.TL_help_saveAppLog();"""
+        ],
+        """    public static void sentPremiumButtonClick() {
+        if (true) return;
+        TLRPC.TL_help_saveAppLog req = new TLRPC.TL_help_saveAppLog();""",
+        "PremiumPreviewFragment.java disable sentPremiumButtonClick telemetry",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        prem_prev,
+        [
+            """    public static void sentPremiumBuyCanceled() {
+        TLRPC.TL_help_saveAppLog req = new TLRPC.TL_help_saveAppLog();"""
+        ],
+        """    public static void sentPremiumBuyCanceled() {
+        if (true) return;
+        TLRPC.TL_help_saveAppLog req = new TLRPC.TL_help_saveAppLog();""",
+        "PremiumPreviewFragment.java disable sentPremiumBuyCanceled telemetry",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        prem_prev,
+        [
+            """    public static void sentShowFeaturePreview(int currentAccount, int type) {
+        TLRPC.TL_help_saveAppLog req = new TLRPC.TL_help_saveAppLog();"""
+        ],
+        """    public static void sentShowFeaturePreview(int currentAccount, int type) {
+        if (true) return;
+        TLRPC.TL_help_saveAppLog req = new TLRPC.TL_help_saveAppLog();""",
+        "PremiumPreviewFragment.java disable sentShowFeaturePreview telemetry",
+    )
+    msg_ctrl_privacy = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesController.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        msg_ctrl_privacy,
+        [
+            """    public void logDeviceStats() {
+        if (collectDeviceStats && !loggedDeviceStats) {"""
+        ],
+        """    public void logDeviceStats() {
+        if (false && collectDeviceStats && !loggedDeviceStats) {""",
+        "MessagesController.java disable TL_help_saveAppLog device stats telemetry",
+    )
+
+    launch_act = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LaunchActivity.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        launch_act,
+        [
+            """                        if (intent.hasExtra(EXTRA_ACTION_TOKEN)) {
+                            final boolean success = true;
+                            final Action assistAction = new AssistActionBuilder()
+                                .setActionToken(intent.getStringExtra(EXTRA_ACTION_TOKEN))
+                                .setActionStatus(success ? Action.Builder.STATUS_TYPE_COMPLETED : Action.Builder.STATUS_TYPE_FAILED)
+                                .build();
+                            FirebaseUserActions.getInstance(this).end(assistAction);
+                            intent.removeExtra(EXTRA_ACTION_TOKEN);
+                        }"""
+        ],
+        """                        if (intent.hasExtra(EXTRA_ACTION_TOKEN)) {
+                            intent.removeExtra(EXTRA_ACTION_TOKEN);
+                        }""",
+        "LaunchActivity.java strip FirebaseUserActions action end (view)",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        launch_act,
+        [
+            """                        if (intent.hasExtra(EXTRA_ACTION_TOKEN)) {
+                            final boolean success = UserConfig.getInstance(currentAccount).isClientActivated() && "tg".equals(scheme) && unsupportedUrl == null;
+                            final Action assistAction = new AssistActionBuilder()
+                                    .setActionToken(intent.getStringExtra(EXTRA_ACTION_TOKEN))
+                                    .setActionStatus(success ? Action.Builder.STATUS_TYPE_COMPLETED : Action.Builder.STATUS_TYPE_FAILED)
+                                    .build();
+                            FirebaseUserActions.getInstance(this).end(assistAction);
+                            intent.removeExtra(EXTRA_ACTION_TOKEN);
+                        }"""
+        ],
+        """                        if (intent.hasExtra(EXTRA_ACTION_TOKEN)) {
+                            intent.removeExtra(EXTRA_ACTION_TOKEN);
+                        }""",
+        "LaunchActivity.java strip FirebaseUserActions action end (scheme)",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        launch_act,
+        [
+            """                                req.settings.allow_app_hash = req.settings.allow_firebase = PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();"""
+        ],
+        """                                req.settings.allow_app_hash = req.settings.allow_firebase = !(org.colgram.core.ColgramConfig.isCloakEnabled() || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) && PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();""",
+        "LaunchActivity.java set allow_firebase = false when cloaked",
+    )
+
+    login_act = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LoginActivity.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        login_act,
+        [
+            """                if (r.play_integrity_nonce != null) {
+                    IntegrityManager integrityManager = IntegrityManagerFactory.create(getContext());"""
+        ],
+        """                if (r.play_integrity_nonce != null) {
+                    if (org.colgram.core.ColgramConfig.isCloakEnabled() || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+                        resendCodeFromSafetyNet(params, res, "PLAYINTEGRITY_UNAVAILABLE");
+                        return;
+                    }
+                    IntegrityManager integrityManager = IntegrityManagerFactory.create(getContext());""",
+        "LoginActivity.java stub Play Integrity when cloaked",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        login_act,
+        [
+            """            settings.allow_app_hash = settings.allow_firebase = PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();"""
+        ],
+        """            settings.allow_app_hash = settings.allow_firebase = !(org.colgram.core.ColgramConfig.isCloakEnabled() || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) && PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();""",
+        "LoginActivity.java disable allow_firebase when cloaked",
+    )
+
+    net_mon = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "webrtc", "NetworkMonitorAutoDetect.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        net_mon,
+        [
+            """        if (wifiInfo != null) {
+          final String ssid = wifiInfo.getSSID();"""
+        ],
+        """        if (wifiInfo != null) {
+          if (org.colgram.core.ColgramConfig.isCloakEnabled() || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+            return "";
+          }
+          final String ssid = wifiInfo.getSSID();""",
+        "NetworkMonitorAutoDetect.java scrub Wi-Fi SSID when cloaked",
+    )
+
+    # 15. ExoPlayer ExtendedDefaultDataSource* + BotWebViewContainer: proxy routing, UA cloak, and proxy queue.
+    ext_factory = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "secretmedia", "ExtendedDefaultDataSourceFactory.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        ext_factory,
+        [
+            """        this(context, listener, new DefaultHttpDataSource.Factory()
+                .setUserAgent(userAgent)
+                .setTransferListener(listener)
+                .setAllowCrossProtocolRedirects(true));"""
+        ],
+        """        this(context, listener, new DefaultHttpDataSource.Factory()
+                .setUserAgent(org.colgram.core.ColgramConfig.isCloakEnabled() ? org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent() : userAgent)
+                .setTransferListener(listener)
+                .setAllowCrossProtocolRedirects(true));""",
+        "ExtendedDefaultDataSourceFactory.java cloak ExoPlayer User-Agent",
+    )
+    ext_ds = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "secretmedia", "ExtendedDefaultDataSource.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        ext_ds,
+        [
+            """            new DefaultHttpDataSource.Factory()
+                .setUserAgent(userAgent)"""
+        ],
+        """            new DefaultHttpDataSource.Factory()
+                .setUserAgent(org.colgram.core.ColgramConfig.isCloakEnabled() ? org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent() : userAgent)""",
+        "ExtendedDefaultDataSource.java cloak ExoPlayer User-Agent",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        ext_ds,
+        [
+            """        } else if (SCHEME_RAW.equals(scheme)) {
+            dataSource = getRawResourceDataSource();
+        } else if (("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()
+                        || org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                        || org.telegram.ui.ColgramBrowserRoutes.mode() != org.telegram.ui.ColgramBrowserRoutes.Mode.DIRECT)) {
+            dataSource = getColgramHttpDataSource();
+        } else if (("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()
+                        || org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                        || org.telegram.ui.ColgramBrowserRoutes.mode() != org.colgram.core.ColgramBrowserRoutePolicy.Mode.CURRENT)) {
+            dataSource = getColgramHttpDataSource();
+        } else {
+            dataSource = baseDataSource;
+        }
+        // Open the source and return.
+        return dataSource.open(dataSpec);""",
+            """        } else if (SCHEME_RAW.equals(scheme)) {
+            dataSource = getRawResourceDataSource();
+        } else if (("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()
+                        || org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                        || org.telegram.ui.ColgramBrowserRoutes.mode() != org.telegram.ui.ColgramBrowserRoutes.Mode.DIRECT)) {
+            dataSource = getColgramHttpDataSource();
+        } else {
+            dataSource = baseDataSource;
+        }
+        // Open the source and return.
+        return dataSource.open(dataSpec);""",
+            """        } else if (SCHEME_RAW.equals(scheme)) {
+            dataSource = getRawResourceDataSource();
+        } else {
+            dataSource = baseDataSource;
+        }
+        // Open the source and return.
+        return dataSource.open(dataSpec);""",
+        ],
+        """        } else if (SCHEME_RAW.equals(scheme)) {
+            dataSource = getRawResourceDataSource();
+        } else if (("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()
+                        || org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                        || org.telegram.ui.ColgramBrowserRoutes.mode() != org.colgram.core.ColgramBrowserRoutePolicy.Mode.CURRENT)) {
+            dataSource = getColgramHttpDataSource();
+        } else {
+            dataSource = baseDataSource;
+        }
+        // Open the source and return.
+        return dataSource.open(dataSpec);""",
+        "ExtendedDefaultDataSource.java route ExoPlayer HTTP(S) through ColgramBrowserRoutes proxy",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        ext_ds,
+        [
+            """    private @Nullable DataSource rawResourceDataSource;"""
+        ],
+        """    private @Nullable DataSource rawResourceDataSource;
+    private @Nullable DataSource colgramHttpDataSource;
+
+    private DataSource getColgramHttpDataSource() {
+        if (colgramHttpDataSource == null) {
+            colgramHttpDataSource = new DataSource() {
+                private java.net.HttpURLConnection conn;
+                private java.io.InputStream in;
+                private Uri activeUri;
+                private DataSpec activeSpec;
+
+                @Override
+                public void addTransferListener(TransferListener transferListener) {
+                    // Tracked via outer ExtendedDefaultDataSource listeners
+                }
+
+                @Override
+                public long open(DataSpec spec) throws IOException {
+                    activeSpec = spec;
+                    String cur = spec.uri.toString();
+                    for (int redirects = 0; redirects < 6; redirects++) {
+                        java.net.URLConnection rawConn = org.telegram.ui.ColgramBrowserRoutes.openConnection(new java.net.URL(cur));
+                        if (!(rawConn instanceof java.net.HttpURLConnection)) {
+                            throw new IOException("Expected HttpURLConnection");
+                        }
+                        java.net.HttpURLConnection c = (java.net.HttpURLConnection) rawConn;
+                        c.setConnectTimeout(10000);
+                        c.setReadTimeout(15000);
+                        c.setInstanceFollowRedirects(false);
+                        c.setRequestProperty("User-Agent", org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent());
+                        for (Map.Entry<String, String> e : spec.httpRequestHeaders.entrySet()) {
+                            c.setRequestProperty(e.getKey(), e.getValue());
+                        }
+                        if (spec.position > 0 || spec.length != -1) {
+                            String range = "bytes=" + spec.position + "-";
+                            if (spec.length != -1) {
+                                range += (spec.position + spec.length - 1);
+                            }
+                            c.setRequestProperty("Range", range);
+                        }
+                        int code = c.getResponseCode();
+                        if (code >= 300 && code < 400) {
+                            String loc = c.getHeaderField("Location");
+                            c.disconnect();
+                            if (loc == null || loc.isEmpty()) throw new IOException("Redirect without Location");
+                            cur = new java.net.URL(new java.net.URL(cur), loc).toString();
+                            continue;
+                        }
+                        if (code < 200 || code >= 300) {
+                            c.disconnect();
+                            throw new IOException("HTTP response code " + code);
+                        }
+                        conn = c;
+                        activeUri = Uri.parse(cur);
+                        in = c.getInputStream();
+                        for (int i = 0; i < transferListeners.size(); i++) {
+                            transferListeners.get(i).onTransferInitializing(this, spec, true);
+                            transferListeners.get(i).onTransferStart(this, spec, true);
+                        }
+                        long len = c.getContentLengthLong();
+                        return spec.length != -1 ? spec.length : (len >= 0 ? len : -1L);
+                    }
+                    throw new IOException("Too many redirects");
+                }
+
+                @Override
+                public int read(byte[] buffer, int offset, int readLength) throws IOException {
+                    if (readLength == 0) return 0;
+                    if (in == null) return -1;
+                    int n = in.read(buffer, offset, readLength);
+                    if (n > 0 && activeSpec != null) {
+                        for (int i = 0; i < transferListeners.size(); i++) {
+                            transferListeners.get(i).onBytesTransferred(this, activeSpec, true, n);
+                        }
+                    }
+                    return n;
+                }
+
+                @Override
+                public @Nullable Uri getUri() {
+                    return activeUri;
+                }
+
+                @Override
+                public Map<String, List<String>> getResponseHeaders() {
+                    return conn != null ? conn.getHeaderFields() : Collections.emptyMap();
+                }
+
+                @Override
+                public void close() throws IOException {
+                    try {
+                        if (in != null) in.close();
+                    } finally {
+                        in = null;
+                        if (conn != null) {
+                            conn.disconnect();
+                            conn = null;
+                        }
+                        if (activeSpec != null) {
+                            for (int i = 0; i < transferListeners.size(); i++) {
+                                transferListeners.get(i).onTransferEnd(this, activeSpec, true);
+                            }
+                            activeSpec = null;
+                        }
+                        activeUri = null;
+                    }
+                }
+            };
+        }
+        return colgramHttpDataSource;
+    }""",
+        "ExtendedDefaultDataSource.java add ColgramBrowserRoutes proxy HTTP DataSource",
+    )
+
+    bot_web = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "web", "BotWebViewContainer.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        bot_web,
+        [
+            """            url = tonsite2magic(url);
+            currentUrl = url;
+            d("loadUrl " + url);
+            super.loadUrl(url);
+            if (botWebViewContainer != null) {
+                botWebViewContainer.onURLChanged(dangerousUrl ? urlFallback : url, !canGoBack(), !canGoForward());
+            }
+        }
+
+        @Override
+        public void loadUrl(@NonNull String url, @NonNull Map<String, String> additionalHttpHeaders) {
+            if (currentSheet != null) {
+                currentSheet.dismiss();
+                currentSheet = null;
+            }
+            final String ourl = url;
+            checkCachedMetaProperties(url);
+            openedByUrl = url;
+            url = tonsite2magic(url);
+            currentUrl = url;
+            d("loadUrl " + url + " " + additionalHttpHeaders);
+            super.loadUrl(url, additionalHttpHeaders);
+            if (botWebViewContainer != null) {
+                botWebViewContainer.onURLChanged(dangerousUrl ? urlFallback : url, !canGoBack(), !canGoForward());
+            }
+        }
+
+        public void loadUrl(String url, WebMetadataCache.WebMetadata meta) {
+            if (currentSheet != null) {
+                currentSheet.dismiss();
+                currentSheet = null;
+            }
+            final String ourl = url;
+            applyCachedMeta(meta);
+            openedByUrl = url;
+            url = tonsite2magic(url);
+            currentUrl = url;
+            d("loadUrl " + url + " with cached meta");
+            super.loadUrl(url);"""
+        ],
+        """            url = tonsite2magic(url);
+            currentUrl = url;
+            d("loadUrl " + url);
+            final String colgramUrl1 = url;
+            org.telegram.ui.ColgramBrowserRoutes.whenProxyReady(this, () -> colgramSuperLoadUrl(colgramUrl1, null));
+            if (botWebViewContainer != null) {
+                botWebViewContainer.onURLChanged(dangerousUrl ? urlFallback : url, !canGoBack(), !canGoForward());
+            }
+        }
+
+        private void colgramSuperLoadUrl(String url, Map<String, String> headers) {
+            if (headers != null) {
+                super.loadUrl(url, headers);
+            } else {
+                super.loadUrl(url);
+            }
+        }
+
+        @Override
+        public void loadUrl(@NonNull String url, @NonNull Map<String, String> additionalHttpHeaders) {
+            if (currentSheet != null) {
+                currentSheet.dismiss();
+                currentSheet = null;
+            }
+            final String ourl = url;
+            checkCachedMetaProperties(url);
+            openedByUrl = url;
+            url = tonsite2magic(url);
+            currentUrl = url;
+            d("loadUrl " + url + " " + additionalHttpHeaders);
+            final String colgramUrl2 = url;
+            final Map<String, String> colgramHdrs2 = new java.util.HashMap<>(additionalHttpHeaders);
+            org.telegram.ui.ColgramBrowserRoutes.whenProxyReady(this, () -> colgramSuperLoadUrl(colgramUrl2, colgramHdrs2));
+            if (botWebViewContainer != null) {
+                botWebViewContainer.onURLChanged(dangerousUrl ? urlFallback : url, !canGoBack(), !canGoForward());
+            }
+        }
+
+        public void loadUrl(String url, WebMetadataCache.WebMetadata meta) {
+            if (currentSheet != null) {
+                currentSheet.dismiss();
+                currentSheet = null;
+            }
+            final String ourl = url;
+            applyCachedMeta(meta);
+            openedByUrl = url;
+            url = tonsite2magic(url);
+            currentUrl = url;
+            d("loadUrl " + url + " with cached meta");
+            final String colgramUrl3 = url;
+            org.telegram.ui.ColgramBrowserRoutes.whenProxyReady(this, () -> colgramSuperLoadUrl(colgramUrl3, null));""",
+        "BotWebViewContainer.java gate loadUrl on ColgramBrowserRoutes proxy readiness",
     )

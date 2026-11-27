@@ -65,9 +65,37 @@ class PrivacyNetworkContractTests(unittest.TestCase):
         doh = (CORE / "ColgramDohResolver.java").read_text(encoding="utf-8")
         self.assertIn("matchesCertificateName", doh)
         self.assertIn("Proxy.NO_PROXY", doh)
+        self.assertIn("isStrictEncryptedDnsOnly()", doh)
         http = (CORE / "ColgramHttp.java").read_text(encoding="utf-8")
         self.assertIn("allowThirdPartyRelays()", http)
         self.assertIn("isStrictProxySecurityEnabled()", http)
+        self.assertIn("preferProxyFirst()", http)
+        self.assertNotIn('"Colgram/3.0"', http)
+        self.assertNotIn('"Colgram/1.0"', http)
+
+        ghost = (CORE / "ColgramGhostMode.java").read_text(encoding="utf-8")
+        self.assertIn("runAllowingSpamMentionClear(Runnable action)", ghost)
+        self.assertIn("isAllowingSpamMentionClear()", ghost)
+
+        cloak = (CORE / "ColgramCloak.java").read_text(encoding="utf-8")
+        self.assertIn("stripColgramSuffix(", cloak)
+
+        cfg = (CORE / "ColgramConfig.java").read_text(encoding="utf-8")
+        self.assertIn("ghostReadEnabled = true;", cfg)
+        self.assertIn("ghostTypingEnabled = true;", cfg)
+        self.assertIn("autoUpdateEnabled = false;", cfg)
+        self.assertIn("colgram_defaults_v4_cap_migrated", cfg)
+
+        routes = (ROOT / "scripts/templates/ColgramBrowserRoutes.java").read_text(encoding="utf-8")
+        self.assertIn("whenProxyReady(", routes)
+        self.assertIn("public static void loadUrl(", routes)
+        self.assertNotIn("AlertDialog.Builder", routes)
+
+        updater = (CORE / "ColgramUpdater.java").read_text(encoding="utf-8")
+        self.assertNotIn("DownloadManager", updater)
+
+        defender = (CORE / "ColgramSecurityDefender.java").read_text(encoding="utf-8")
+        self.assertNotIn("ColgramConfig.setAutoUpdateEnabled(true)", defender)
 
 
     def test_defender_webview_voip_browser_update_and_service_contracts(self):

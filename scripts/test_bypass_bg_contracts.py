@@ -26,6 +26,18 @@ TRACK_A_TELEGRAM_RELS = (
     "TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/Components/AnimatedEmojiDrawable.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java",
+    "TMessagesProj/src/main/java/org/telegram/messenger/video/VideoAds.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/Stories/recorder/DualCameraView.java",
+    "TMessagesProj/src/main/java/org/telegram/messenger/PushListenerController.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/PremiumPreviewFragment.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java",
+    "TMessagesProj/src/main/java/org/webrtc/NetworkMonitorAutoDetect.java",
+    "TMessagesProj/src/main/java/org/telegram/messenger/secretmedia/ExtendedDefaultDataSourceFactory.java",
+    "TMessagesProj/src/main/java/org/telegram/messenger/secretmedia/ExtendedDefaultDataSource.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/web/BotWebViewContainer.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java",
 )
 IMAGE_LOADER_REL = TRACK_A_TELEGRAM_RELS[-1]
@@ -111,6 +123,11 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         ws = read_text(CORE / "ColgramTelegramWsBridge.java")
         self.assertIn("volatile boolean fromPrewarm = false;", ws)
         self.assertIn("PREWARM_MAX_PER_BUCKET = 3;", ws)
+        self.assertIn("PREWARM_MEDIA_MAX_PER_BUCKET = 4;", ws)
+        self.assertIn("DEFAULT_EDGE_DEPRIORITIZE_TTL_MS = 8_000L;", ws)
+        self.assertIn("DC135_DEAD_COOLDOWN_MS = 12_000L;", ws)
+        self.assertIn("DC135_WIFI_CONNECT_TIMEOUT_MS = 1200;", ws)
+        self.assertIn("DC135_CELLULAR_CONNECT_TIMEOUT_MS = 1600;", ws)
         self.assertIn("PREWARM_TTL_MS = 38_000L;", ws)
         self.assertIn("PREWARM_REFRESH_MS = 28_000L;", ws)
         self.assertIn("maintainForegroundPrewarmIfNeeded(", ws)
@@ -136,6 +153,18 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("public static int drainPrewarmedPool()", ws)
         self.assertIn("public static void evictPrewarmedBucket(int dcId)", ws)
         self.assertIn("public static WsSession dialFreshForDc(", ws)
+        build_cands = extract_method(
+            ws,
+            "static List<EdgeEndpoint> buildCandidateEndpoints(\n"
+            "            int dcId,\n"
+            "            EdgeEndpoint lastWorking,\n"
+            "            Map<String, List<String>> hostIps,\n"
+            "            Set<String> deprioritizedKeys,\n"
+            "            boolean media,\n"
+            "            boolean includeIpv6)",
+        )
+        self.assertIn("if (!includeIpv6 && ip.indexOf(':') >= 0) continue;", build_cands)
+        self.assertIn("if (!includeIpv6 && secIp.indexOf(':') >= 0) continue;", build_cands)
 
         wrap = extract_method(ws, "private static Socket wrapSocketForMode(")
         self.assertIn("if (base instanceof ColgramNativeDesync.NativeSocket && isNativeFragMode(fragMode))", wrap)
@@ -164,6 +193,7 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
 
         inv = extract_method(pm, "private static void invalidateNetworkProbeState(String reason)")
         self.assertNotIn('"link properties changed".equals(reason)\n', inv)
+        self.assertNotIn('"network validated".equals(reason)', inv)
         self.assertIn("ColgramTelegramWsBridge.drainPrewarmedPool()", inv)
 
         vpn = extract_method(pm, "private static boolean hasSystemVpn(Context context)")
@@ -171,14 +201,22 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
 
         wd = extract_method(pm, "private static void connectionWatchdogTick()")
         self.assertIn("mainDcStallTimedOut", wd)
-        self.assertIn(">= 15_000L", wd)
+        self.assertIn(">= 40_000L", wd)
+        self.assertIn("hasRecentRxWithin(25_000L)", wd)
         self.assertIn("maintainForegroundPrewarmIfNeeded(", wd)
 
         screen_on = extract_method(pm, "public static void onScreenTurnedOn(")
-        self.assertIn("40_000L", screen_on)
+        self.assertIn("120_000L", screen_on)
+        self.assertNotIn("tgnetForceReconnect(", screen_on)
         fg = extract_method(pm, "public static void onAppForegrounded(")
         self.assertIn(">= 45_000L", fg)
-        self.assertIn("40_000L", fg)
+        self.assertIn("120_000L", fg)
+        self.assertIn("6_500L", fg)
+        self.assertNotIn("tgnetForceReconnect(", fg)
+        fr = extract_method(pm, "private static void tgnetForceReconnect(String reason)")
+        self.assertIn("currentForceReconnectBackoffMs()", fr)
+        self.assertIn("FORCE_RECONNECT_MAX_BACKOFF_MS = 120_000L;", pm)
+        self.assertIn("tgCmNativeResumeNetwork", pm)
 
         stop_bg = extract_method(pm, "private static void stopBackgroundFeedScraping()")
         self.assertIn("watchdogTask", stop_bg)
@@ -250,7 +288,7 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("int buf_sz = 131072;", c_src)
         self.assertIn("int keepidle = 180;", c_src)
         self.assertIn("int keepintvl = 30;", c_src)
-        self.assertIn("int user_timeout = 12000;", c_src)
+        self.assertIn("int user_timeout = 45000;", c_src)
         self.assertIn("wait_pollout_slices(", c_src)
         self.assertIn("TCP_QUICKACK", c_src)
         self.assertIn("nativeIsSocketIdleClean(", c_src)
@@ -292,6 +330,12 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             manifest_txt = read_text(manifest_path)
             self.assertIn('android.permission.POST_NOTIFICATIONS', manifest_txt)
             self.assertNotIn("stripped POST_NOTIFICATIONS", manifest_txt)
+            self.assertIn('android:allowBackup="false"', manifest_txt)
+            self.assertNotIn("READ_CLIPBOARD", manifest_txt)
+            self.assertNotIn(".BackupAgent", manifest_txt)
+            self.assertNotIn(".SmsReceiver", manifest_txt)
+            self.assertNotIn(".RefererReceiver", manifest_txt)
+            self.assertNotIn(".WearAuthListenerService", manifest_txt)
             ET.parse(manifest_path)
 
             al = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[1])
@@ -301,11 +345,15 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             cm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[2])
             self.assertIn("public static void colgramResetProxySignature()", cm)
             self.assertIn("TLRPC.TL_inputMediaGame", extract_method(cm, "private static boolean colgramIsDirectSendResponseSafe("))
+            self.assertIn("colgramShouldDropFirewallRequest", cm)
+            self.assertIn("isAllowingSpamMentionClear()", cm)
+            self.assertIn('packageId = "org.telegram.messenger";', cm)
 
             mc = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[3])
             self.assertIn("AndroidUtilities.runOnUIThread(() -> colgramDialogsRetryPending.put(folderId, false));", mc)
             self.assertIn("colgramDialogsRetryPending.put(folderId, true);", mc)
             self.assertIn("NotificationCenter.didUpdateConnectionState", mc)
+            self.assertIn("if (false && collectDeviceStats && !loggedDeviceStats)", mc)
 
             mdc = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[4])
             self.assertIn("reactionsFallbackActive", mdc)
@@ -337,10 +385,26 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             il = read_text(tmp_path / IMAGE_LOADER_REL)
             self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il)
             self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il)
-            self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 1)', il)
+            self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 2)', il)
             self.assertIn("synchronized (colgramLottiePrecacheLock)", il)
+            self.assertIn("colgramLottiePrecacheLockFor(", il)
             self.assertIn("int fitzModifier, boolean isSingleChannel", il)
             self.assertNotIn("int[] fitzModifier", il)
+
+            chat_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
+            self.assertIn("ColgramPremiumConfig.isBlockSponsoredAdsEnabled()", chat_src)
+            self.assertIn("350", chat_src)
+
+            va_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/video/VideoAds.java")
+            self.assertIn("ColgramPremiumConfig.isBlockSponsoredAdsEnabled()", va_src)
+
+            ae_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/Components/AnimatedEmojiDrawable.java")
+            self.assertIn("loadFromServerIds.size() > 100", ae_src)
+
+            ext_ds_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/secretmedia/ExtendedDefaultDataSource.java")
+            self.assertNotIn("Mode.DIRECT", ext_ds_src)
+            self.assertIn("org.colgram.core.ColgramBrowserRoutePolicy.Mode.CURRENT", ext_ds_src)
+            self.assertEqual(ext_ds_src.count("dataSource = getColgramHttpDataSource();"), 1)
 
     def test_image_loader_converges_on_fresh_upstream_clone(self):
         sys.path.insert(0, str(ROOT / "scripts"))
@@ -423,8 +487,9 @@ public class ImageLoader {
             il_pass1 = read_text(il_path)
             self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il_pass1)
             self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il_pass1)
-            self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 1)', il_pass1)
+            self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 2)', il_pass1)
             self.assertIn("synchronized (colgramLottiePrecacheLock)", il_pass1)
+            self.assertIn("colgramLottiePrecacheLockFor(", il_pass1)
             self.assertEqual(il_pass1.count("private static RLottieDrawable colgramCreateRLottieDrawable("), 1)
             self.assertGreaterEqual(il_pass1.count("colgramCreateRLottieDrawable("), 2)
             self.assertIn("int fitzModifier, boolean isSingleChannel", il_pass1)

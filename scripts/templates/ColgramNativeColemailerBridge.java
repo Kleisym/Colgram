@@ -11,19 +11,24 @@ import org.colgram.core.ColgramAutoReplyPolicy;
 import org.colgram.core.ColgramBotChatIdPolicy;
 import org.colgram.core.ColgramColemailerEngine;
 import org.colgram.core.ColgramConfig;
+import org.colgram.core.ColgramFileSafetyPolicy;
+import org.colgram.core.ColgramGhostMode;
 import org.colgram.core.ColgramHookHandler;
 import org.colgram.core.ColgramHttp;
+import org.colgram.core.ColgramShieldConfig;
 import org.colgram.core.ColgramSpamGuard;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.tgnet.tl.TL_keyboard;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
+import org.telegram.ui.ColgramMenuChrome;
 import org.telegram.ui.ColgramUiKit;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.LaunchActivity;
 
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,6 +42,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Native Java bridge connecting ColgramColemailerEngine & ColgramSpamGuard to
@@ -46,10 +58,25 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class ColgramNativeColemailerBridge {
 
     private static final String TAG = "ColgramColemailer";
-    private static final long FOLDER_SYNC_MIN_INTERVAL_MS = 60_000L;
+    private static final long FOLDER_SYNC_MIN_INTERVAL_MS = 30_000L;
     private static volatile long lastFolderSyncMs = 0L;
+    private static final long TOO_LONG_RECONCILE_DEBOUNCE_MS = 30_000L;
 
     private static final Runnable scheduledTickRunnable = ColgramNativeColemailerBridge::runDueBroadcastsOnUi;
+
+    private static final ScheduledExecutorService broadcastExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "colgram-broadcaster");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final AtomicLong broadcastEpoch = new AtomicLong(1L);
+    private static final AtomicInteger queuedBroadcastCount = new AtomicInteger(0);
+    private static final Set<String> inFlightBroadcastKeys = ConcurrentHashMap.newKeySet();
+    private static volatile long nextBroadcastReadyAtMs = 0L;
+    private static final ConcurrentHashMap<String, String> lastDispatchedCampaignByDialog = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> lastTooLongReconcileMs = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, List<Integer>> pendingMentionClearIds = new ConcurrentHashMap<>();
+    private static final Object mentionBatchLock = new Object();
 
     private static final Map<String, Long> recentIncomingDedupe = new LinkedHashMap<String, Long>(256, 0.75f, true) {
         @Override
@@ -97,6 +124,27 @@ public final class ColgramNativeColemailerBridge {
 
     public static void stopScheduler() {
         AndroidUtilities.cancelRunOnUIThread(scheduledTickRunnable);
+        broadcastEpoch.incrementAndGet();
+        inFlightBroadcastKeys.clear();
+        queuedBroadcastCount.set(0);
+    }
+
+    public static int getQueuedBroadcastCount() {
+        return Math.max(0, queuedBroadcastCount.get());
+    }
+
+    /** Debounced (>=30s) folder sync called from MessagesController on dialogsNeedReload / dialogFiltersUpdated. */
+    public static void scheduleDebouncedFolderSync(int account) {
+        if (!ColgramConfig.isBroadcasterEnabled()) return;
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        if (!anyActiveCampaignNeedsFolderSync(engine)) return;
+        long nowMs = System.currentTimeMillis();
+        if ((nowMs - lastFolderSyncMs) < FOLDER_SYNC_MIN_INTERVAL_MS) return;
+        AndroidUtilities.runOnUIThread(() -> {
+            if (System.currentTimeMillis() - lastFolderSyncMs >= FOLDER_SYNC_MIN_INTERVAL_MS) {
+                syncFoldersIntoEngine(account, true);
+            }
+        });
     }
 
     public static void rescheduleScheduler() {
@@ -225,7 +273,6 @@ public final class ColgramNativeColemailerBridge {
             int selectedAcc = UserConfig.selectedAccount;
             boolean needFolderSync = (nowMs - lastFolderSyncMs >= FOLDER_SYNC_MIN_INTERVAL_MS)
                     && anyActiveCampaignNeedsFolderSync(engine);
-            int dispatchSlot = 0;
             for (int acc = 0; acc < UserConfig.MAX_ACCOUNT_COUNT; acc++) {
                 if (!UserConfig.getInstance(acc).isClientActivated()) continue;
                 if (acc != selectedAcc && !engine.hasActiveCampaigns(acc)) continue;
@@ -239,14 +286,10 @@ public final class ColgramNativeColemailerBridge {
                     final ColgramColemailerEngine.BroadcastDueEvent ev = due.get(i);
                     if (isBlockedTargetDialog(targetAccount, ev.chatId)) continue;
                     if (engine.isFloodBackedOff(targetAccount, ev.chatId, nowMs)) continue;
-                    // Advance baseline immediately so overlapping ticks never double-send the same slot.
-                    engine.markBroadcastSent(ev.campaign, ev.chatId, nowSec);
-                    long delayMs = dispatchSlot++ * 900L;
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (!ColgramConfig.isBroadcasterEnabled()) return;
-                        if (engine.isFloodBackedOff(targetAccount, ev.chatId, System.currentTimeMillis())) return;
-                        dispatchCampaignToChat(targetAccount, ev.campaign, ev.chatId);
-                    }, delayMs);
+                    ColgramColemailerEngine.BroadcastCampaign activeCamp =
+                            engine.resolveRotatedCampaign(ev.campaign, ev.chatId);
+                    if (activeCamp == null || !activeCamp.enabled || TextUtils.isEmpty(activeCamp.text)) continue;
+                    enqueueBroadcastDispatch(targetAccount, activeCamp, ev.chatId, false);
                 }
             }
         } catch (Throwable tr) {
@@ -274,21 +317,61 @@ public final class ColgramNativeColemailerBridge {
                 showToast("Нет целевых чатов", "Укажите папку или откройте нужный чат и используйте .рассыл");
                 return;
             }
-            int idx = 0;
             int sentCount = 0;
             long nowMs = System.currentTimeMillis();
             for (Long chatId : new ArrayList<>(c.targetChats)) {
                 if (chatId == null || isBlockedTargetDialog(account, chatId)) continue;
                 if (engine.isFloodBackedOff(account, chatId, nowMs)) continue;
-                final long target = chatId;
-                sentCount++;
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (engine.isFloodBackedOff(account, target, System.currentTimeMillis())) return;
-                    dispatchCampaignToChat(account, c, target);
-                }, idx++ * 900L);
+                ColgramColemailerEngine.BroadcastCampaign activeCamp = engine.resolveRotatedCampaign(c, chatId);
+                if (activeCamp == null || TextUtils.isEmpty(activeCamp.text)) activeCamp = c;
+                if (enqueueBroadcastDispatch(account, activeCamp, chatId, true)) {
+                    sentCount++;
+                }
             }
-            showToast("Рассылка запущена", c.name + ": чатов " + sentCount);
+            showToast("Рассылка в очереди", c.name + ": чатов " + sentCount);
         });
+    }
+
+    private static boolean enqueueBroadcastDispatch(int account,
+                                                    ColgramColemailerEngine.BroadcastCampaign campaign,
+                                                    long dialogId,
+                                                    boolean manualTrigger) {
+        if (campaign == null || isBlockedTargetDialog(account, dialogId)) return false;
+        final String flightKey = account + ":" + campaign.name + ":" + dialogId;
+        if (!inFlightBroadcastKeys.add(flightKey)) {
+            return false;
+        }
+        final long epoch = broadcastEpoch.get();
+        long nowMs = System.currentTimeMillis();
+        long jitterMs = 1500L + ThreadLocalRandom.current().nextInt(1001);
+        long scheduleAt;
+        synchronized (broadcastExecutor) {
+            long earliest = Math.max(nowMs, nextBroadcastReadyAtMs);
+            nextBroadcastReadyAtMs = earliest + jitterMs;
+            scheduleAt = earliest;
+        }
+        long delayMs = Math.max(0L, scheduleAt - nowMs);
+        queuedBroadcastCount.incrementAndGet();
+        try {
+            broadcastExecutor.schedule(() -> {
+                try {
+                    if (epoch != broadcastEpoch.get()) return;
+                    if (!manualTrigger && !ColgramConfig.isBroadcasterEnabled()) return;
+                    if (!campaign.enabled) return;
+                    ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+                    if (engine.isFloodBackedOff(account, dialogId, System.currentTimeMillis())) return;
+                    dispatchCampaignToChat(account, campaign, dialogId);
+                } finally {
+                    inFlightBroadcastKeys.remove(flightKey);
+                    queuedBroadcastCount.updateAndGet(v -> Math.max(0, v - 1));
+                }
+            }, delayMs, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (Throwable t) {
+            inFlightBroadcastKeys.remove(flightKey);
+            queuedBroadcastCount.updateAndGet(v -> Math.max(0, v - 1));
+            return false;
+        }
     }
 
     private static void dispatchCampaignToChat(int account, ColgramColemailerEngine.BroadcastCampaign campaign, long dialogId) {
@@ -300,42 +383,48 @@ public final class ColgramNativeColemailerBridge {
         if (!campaign.buttons.isEmpty() && !TextUtils.isEmpty(botToken)) {
             final String markupJson = ColgramColemailerEngine.toBotApiReplyMarkupJson(campaign.buttons);
             final String botChatId = toBotApiChatId(account, dialogId);
-            new Thread(() -> {
-                try {
-                    String apiUrl = "https://api.telegram.org/bot" + botToken + "/sendMessage";
-                    String json = "{\"chat_id\":" + botChatId
-                            + ",\"text\":\"" + jsonEscape(campaign.text) + "\""
-                            + ",\"disable_web_page_preview\":" + campaign.disablePreview
-                            + ",\"reply_markup\":" + markupJson + "}";
-                    ColgramHttp.Response resp = ColgramHttp.post(apiUrl, json, null);
-                    if (resp != null && resp.code >= 200 && resp.code < 300) {
-                        engine.markBroadcastSent(campaign, dialogId, System.currentTimeMillis() / 1000L);
-                        engine.recordPingRpc(dialogId, "broadcast_bot_api", true, campaign.name);
-                        return;
-                    }
-                    if (resp != null && resp.code == 429) {
-                        long waitSec = ColgramColemailerEngine.parseFloodWaitSeconds(resp.body);
-                        if (waitSec <= 0L) waitSec = 60L;
-                        engine.recordFloodWait(account, dialogId, waitSec, System.currentTimeMillis());
-                        engine.recordPingRpc(dialogId, "broadcast_bot_api_429", false, "HTTP 429 wait=" + waitSec + "s");
-                        AndroidUtilities.runOnUIThread(ColgramNativeColemailerBridge::rescheduleScheduler);
-                        return;
-                    }
-                    engine.recordPingRpc(
-                            dialogId, "broadcast_bot_api_fallback", false, "HTTP " + (resp == null ? -1 : resp.code));
-                } catch (Throwable t) {
-                    engine.recordPingRpc(dialogId, "broadcast_bot_api_err", false, t.getMessage());
+            try {
+                String apiUrl = "https://api.telegram.org/bot" + botToken + "/sendMessage";
+                String json = "{\"chat_id\":" + botChatId
+                        + ",\"text\":\"" + jsonEscape(campaign.text) + "\""
+                        + ",\"disable_web_page_preview\":" + campaign.disablePreview
+                        + ",\"reply_markup\":" + markupJson + "}";
+                ColgramHttp.Response resp = ColgramHttp.post(apiUrl, json, null);
+                if (resp != null && resp.code >= 200 && resp.code < 300) {
+                    engine.markBroadcastSent(campaign, dialogId, System.currentTimeMillis() / 1000L);
+                    engine.recordCampaignDispatchOutcome(campaign.name, true, null);
+                    engine.recordPingRpc(dialogId, "broadcast_bot_api", true, campaign.name);
+                    return;
                 }
-                AndroidUtilities.runOnUIThread(() -> sendClientPost(account, campaign, dialogId));
-            }, "colgram-bot-broadcast").start();
-            return;
+                if (resp != null && resp.code == 429) {
+                    long waitSec = ColgramColemailerEngine.parseFloodWaitSeconds(resp.body);
+                    if (waitSec <= 0L) waitSec = 60L;
+                    engine.recordFloodWait(account, dialogId, waitSec, System.currentTimeMillis());
+                    engine.recordCampaignDispatchOutcome(campaign.name, false, "FLOOD_WAIT_" + waitSec);
+                    engine.recordPingRpc(dialogId, "broadcast_bot_api_429", false, "HTTP 429 wait=" + waitSec + "s");
+                    AndroidUtilities.runOnUIThread(ColgramNativeColemailerBridge::rescheduleScheduler);
+                    return;
+                }
+                if (resp != null && (resp.code == 400 || resp.code == 403)
+                        && resp.body != null && resp.body.toUpperCase(Locale.ROOT).contains("FORBIDDEN")) {
+                    engine.recordFloodWait(account, dialogId, 86400L, System.currentTimeMillis());
+                    engine.recordCampaignDispatchOutcome(campaign.name, false, "CHAT_WRITE_FORBIDDEN");
+                    engine.recordPingRpc(dialogId, "broadcast_bot_api_forbidden", false, resp.body);
+                    return;
+                }
+                engine.recordPingRpc(
+                        dialogId, "broadcast_bot_api_fallback", false, "HTTP " + (resp == null ? -1 : resp.code));
+            } catch (Throwable t) {
+                engine.recordPingRpc(dialogId, "broadcast_bot_api_err", false, t.getMessage());
+            }
         }
-        sendClientPost(account, campaign, dialogId);
+        AndroidUtilities.runOnUIThread(() -> sendClientPost(account, campaign, dialogId));
     }
 
     private static void sendClientPost(int account, ColgramColemailerEngine.BroadcastCampaign campaign, long dialogId) {
         if (campaign == null || isBlockedTargetDialog(account, dialogId)) return;
         if (campaign.ownerAccount >= 0 && campaign.ownerAccount != account) return;
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         try {
             StringBuilder payload = new StringBuilder(campaign.text);
             if (!campaign.buttons.isEmpty()) {
@@ -366,13 +455,60 @@ public final class ColgramNativeColemailerBridge {
                     entities,
                     null, null, true, 0, 0, null, false
             );
+            lastDispatchedCampaignByDialog.put(accountKey(account, dialogId), campaign.name);
             SendMessagesHelper.getInstance(account).sendMessage(params);
-            ColgramColemailerEngine.getInstance().markBroadcastSent(campaign, dialogId, System.currentTimeMillis() / 1000L);
-            ColgramColemailerEngine.getInstance().recordPingRpc(dialogId, "broadcast_client", true, campaign.name);
+            engine.markBroadcastSent(campaign, dialogId, System.currentTimeMillis() / 1000L);
+            engine.recordCampaignDispatchOutcome(campaign.name, true, null);
+            engine.recordPingRpc(dialogId, "broadcast_client", true, campaign.name);
         } catch (Throwable t) {
             FileLog.e(t);
-            ColgramColemailerEngine.getInstance().recordPingRpc(dialogId, "broadcast_client_err", false, t.getMessage());
+            engine.recordCampaignDispatchOutcome(campaign.name, false, t.getMessage());
+            engine.recordPingRpc(dialogId, "broadcast_client_err", false, t.getMessage());
         }
+    }
+
+    /** Hooked from SendMessagesHelper.performSendMessageRequest on server error (FLOOD_WAIT / SLOWMODE / FORBIDDEN). */
+    public static void onSendMessageError(int account, long dialogId, String errorText) {
+        if (TextUtils.isEmpty(errorText) || dialogId == 0L) return;
+        String upper = errorText.toUpperCase(Locale.ROOT);
+        ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+        String campName = lastDispatchedCampaignByDialog.get(accountKey(account, dialogId));
+        if (upper.contains("FLOOD_WAIT") || upper.contains("SLOWMODE_WAIT")) {
+            long waitSec = ColgramColemailerEngine.parseFloodWaitSeconds(errorText);
+            if (waitSec <= 0L) waitSec = 60L;
+            engine.recordFloodWait(account, dialogId, waitSec, System.currentTimeMillis());
+            if (campName != null) engine.recordCampaignDispatchOutcome(campName, false, errorText);
+            engine.recordPingRpc(dialogId, "send_wait", false, errorText);
+            AndroidUtilities.runOnUIThread(ColgramNativeColemailerBridge::rescheduleScheduler);
+        } else if (upper.contains("CHAT_WRITE_FORBIDDEN") || upper.contains("CHAT_SEND_") && upper.contains("_FORBIDDEN")) {
+            engine.recordFloodWait(account, dialogId, 86400L, System.currentTimeMillis());
+            if (campName != null) engine.recordCampaignDispatchOutcome(campName, false, errorText);
+            engine.recordPingRpc(dialogId, "send_forbidden", false, errorText);
+        }
+    }
+
+    /** Hooked from SendMessagesHelper on outgoing message dispatch/reply so group replies unblock legitimate interlocutors for 24h. */
+    public static void onOutgoingMessageSent(int account, TLRPC.Message msg) {
+        if (msg == null) return;
+        try {
+            long dialogId = MessageObject.getDialogId(msg);
+            if (dialogId > 0L) {
+                ColgramHookHandler.recordOutgoingUserInteraction(dialogId);
+            }
+            if (msg.replyMessage != null && msg.replyMessage.from_id != null) {
+                long uid = MessageObject.getPeerId(msg.replyMessage.from_id);
+                if (uid > 0L) ColgramHookHandler.recordOutgoingUserInteraction(uid);
+            }
+            if (msg.entities != null) {
+                for (int i = 0, n = msg.entities.size(); i < n; i++) {
+                    TLRPC.MessageEntity ent = msg.entities.get(i);
+                    if (ent instanceof TLRPC.TL_messageEntityMentionName) {
+                        long uid = ((TLRPC.TL_messageEntityMentionName) ent).user_id;
+                        if (uid > 0L) ColgramHookHandler.recordOutgoingUserInteraction(uid);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     public static boolean handleChatCommand(long dialogId, int replyToMsgId, String rawText, long replySenderId) {
@@ -649,9 +785,13 @@ public final class ColgramNativeColemailerBridge {
                 c.ownerAccount = account;
                 if (existing != null) {
                     c.targetChats.addAll(existing.targetChats);
+                    c.chatLastSentAt.putAll(existing.chatLastSentAt);
+                    c.chatCounters.putAll(existing.chatCounters);
+                    c.chatCounterUpdatedAt.putAll(existing.chatCounterUpdatedAt);
                     c.disablePreview = existing.disablePreview;
                 }
-                if (c.targetChats.isEmpty() && !isBlockedTargetDialog(account, dialogId)) {
+                if (c.targetChats.isEmpty() && TextUtils.isEmpty(c.folderName)
+                        && !isBlockedTargetDialog(account, dialogId)) {
                     c.targetChats.add(dialogId);
                 }
                 c.buttons.addAll(!parsed.buttons.isEmpty() ? parsed.buttons : draftButtons);
@@ -714,6 +854,256 @@ public final class ColgramNativeColemailerBridge {
      *   3. Ads, promos (`erid:`, `#реклама`, promo links, suspicious URL buttons / ad channel forwards) and spam pings
      *      from non-contacts — with 0% false positives on contacts, Saved Messages, Secret Chats, and normal conversations.
      */
+    private static int getGroupParticipantsCount(int account, long dialogId) {
+        if (dialogId >= 0L) return 0;
+        MessagesController mc = MessagesController.getInstance(account);
+        if (mc == null) return 0;
+        TLRPC.Chat chat = mc.getChat(-dialogId);
+        if (chat != null && chat.participants_count > 0) return chat.participants_count;
+        TLRPC.ChatFull full = mc.getChatFull(-dialogId);
+        return full != null ? Math.max(0, full.participants_count) : 0;
+    }
+
+    private static int countCustomEmojiEntities(TLRPC.Message msg) {
+        if (msg == null || msg.entities == null) return 0;
+        int count = 0;
+        for (int i = 0, n = msg.entities.size(); i < n; i++) {
+            if (msg.entities.get(i) instanceof TLRPC.TL_messageEntityCustomEmoji) count++;
+        }
+        return count;
+    }
+
+    private static boolean hasAnyUrlEntity(TLRPC.Message msg) {
+        if (msg == null || msg.entities == null) return false;
+        for (int i = 0, n = msg.entities.size(); i < n; i++) {
+            TLRPC.MessageEntity ent = msg.entities.get(i);
+            if (ent instanceof TLRPC.TL_messageEntityUrl || ent instanceof TLRPC.TL_messageEntityTextUrl) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Storage-layer pre-insertion gate called from MessagesStorage BEFORE putMessagesInternal():
+     * inspects incoming messages synchronously, strips msg.mentioned & media_unread before writing
+     * so 317 @ mention badge spikes NEVER happen even with Ghost Read active, records collapsed
+     * spam stub if enabled, and queues server mention clearing wrapped in Contract A.
+     */
+    public static boolean interceptIncomingSpamPing(int account, TLRPC.Message msg) {
+        if (msg == null || msg.out || msg.id <= 0 || msg instanceof TLRPC.TL_messageEmpty || msg.action != null) {
+            return false;
+        }
+        try {
+            long dialogId = MessageObject.getDialogId(msg);
+            if (dialogId == 0L || DialogObject.isEncryptedDialog(dialogId)
+                    || DialogObject.isFolderDialogId(dialogId)
+                    || ColgramAutoReplyPolicy.isProtectedSystemOrSpecialDialog(dialogId)) {
+                return false;
+            }
+            long selfId = UserConfig.getInstance(account).getClientUserId();
+            if (selfId == 0L || dialogId == selfId) return false;
+            long senderId = msg.from_id != null ? MessageObject.getPeerId(msg.from_id) : (dialogId > 0L ? dialogId : 0L);
+            if (senderId == selfId) return false;
+
+            ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+            ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+            engine.setSelfUserId(account, selfId);
+
+            if (ColgramShieldConfig.isLazyShadowVaultEnabled()) {
+                captureShadowMessageFromTL(dialogId, msg);
+            }
+
+            if (dialogId > 0L && engine.isDmAutoDeleteMuted(account, dialogId)) {
+                return true;
+            }
+            if (senderId != 0L && (isUserContact(account, senderId) || engine.isWhitelisted(senderId))) {
+                return false;
+            }
+            if (senderId != 0L && engine.getMuteActionFor(senderId, dialogId) != null) {
+                clearMentionFlagsAndEnqueueClear(account, dialogId, msg, senderId, "mute_rule");
+                return true;
+            }
+            if (!ColgramConfig.isSpamGuardEnabled()) return false;
+
+            boolean isGroup = dialogId < 0L;
+            if (!isGroup && !msg.mentioned) return false;
+
+            String text = msg.message == null ? "" : msg.message;
+            List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(msg);
+            String ownUname = ownUsername(account);
+            List<String> own = ownLabels(account);
+            String pingKind = classifyMessagePing(account, msg, selfId, ownUname, own, targets);
+            boolean isPing = msg.mentioned || pingKind != null;
+            boolean hiddenEntity = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
+            boolean viaBot = msg.via_bot_id != 0;
+            boolean visualMedia = isVisualMedia(msg);
+            boolean inlineUrlBtns = hasInlineUrlButtons(msg);
+            boolean fwdFromChannel = isForwardedFromChannel(msg);
+            int customEmojiCount = countCustomEmojiEntities(msg);
+            boolean hasUrlEnt = hasAnyUrlEntity(msg);
+
+            boolean allowLeads = isGroup && isPing && ColgramConfig.isSaveLeadsEnabled();
+            ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
+                    text, "", pingKind, isPing, viaBot, visualMedia, hiddenEntity,
+                    allowLeads, own, inlineUrlBtns, fwdFromChannel, customEmojiCount, hasUrlEnt);
+
+            int participants = getGroupParticipantsCount(account, dialogId);
+            boolean strangerPing = isGroup && isPing && ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                    senderId, participants, false, false,
+                    ColgramSpamGuard.PING_REPLY.equals(pingKind),
+                    ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled(),
+                    System.currentTimeMillis());
+
+            boolean blocked = (!report.isLead)
+                    && (strangerPing
+                        || ColgramSpamGuard.PING_STEALTH.equals(pingKind)
+                        || hiddenEntity
+                        || report.isSpam
+                        || report.shouldAutoRead);
+            if (!blocked) return false;
+
+            String reason = strangerPing ? "stranger_big_group_ping"
+                    : (!TextUtils.isEmpty(report.primaryTrigger) ? report.primaryTrigger : "spam_ping");
+            clearMentionFlagsAndEnqueueClear(account, dialogId, msg, senderId, reason);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void captureShadowMessageFromTL(long dialogId, TLRPC.Message msg) {
+        if (msg == null || msg.id <= 0) return;
+        try {
+            long senderId = msg.from_id != null ? MessageObject.getPeerId(msg.from_id) : 0L;
+            int mediaType = 0;
+            long mediaSize = 0L;
+            if (msg.media instanceof TLRPC.TL_messageMediaPhoto) {
+                mediaType = 1;
+            } else if (msg.media instanceof TLRPC.TL_messageMediaDocument && msg.media.document != null) {
+                mediaType = MessageObject.isVideoDocument(msg.media.document) ? 2 : 3;
+                mediaSize = msg.media.document.size;
+            }
+            String txt = msg.message == null ? "" : msg.message;
+            if (txt.length() > 512) txt = txt.substring(0, 512);
+            String meta = "{\"s\":" + senderId + ",\"t\":\"" + jsonEscape(txt) + "\"}";
+            ColgramHookHandler.captureShadowMessageMetadata(
+                    dialogId, msg.id, senderId, msg.date, mediaType, mediaSize, meta, null);
+        } catch (Throwable ignored) {}
+    }
+
+    private static void clearMentionFlagsAndEnqueueClear(int account, long dialogId,
+                                                         TLRPC.Message msg, long senderId, String reason) {
+        boolean hadMention = msg.mentioned || msg.media_unread;
+        msg.mentioned = false;
+        msg.media_unread = false;
+        msg.unread = false;
+        String cacheKey = msg.id > 0 ? (account + ":" + dialogId + ":" + msg.id) : null;
+        if (cacheKey != null) {
+            synchronized (recentSuppressVerdicts) {
+                recentSuppressVerdicts.put(cacheKey, Boolean.TRUE);
+            }
+        }
+        if (ColgramShieldConfig.isCollapseSpamPingsEnabled() && msg.id > 0) {
+            ColgramHookHandler.recordCollapsedSpam(dialogId, msg.id, senderId, reason);
+        }
+        if (hadMention && msg.id > 0 && ColgramShieldConfig.isAntiPingAutoClearServerMentionsEnabled()) {
+            enqueueServerSpamMentionClear(account, dialogId, msg.id);
+        }
+    }
+
+    private static void enqueueServerSpamMentionClear(int account, long dialogId, int msgId) {
+        final String key = account + ":" + dialogId;
+        boolean shouldSchedule;
+        synchronized (mentionBatchLock) {
+            List<Integer> list = pendingMentionClearIds.get(key);
+            if (list == null) {
+                list = new ArrayList<>();
+                pendingMentionClearIds.put(key, list);
+                shouldSchedule = true;
+            } else {
+                shouldSchedule = list.isEmpty();
+            }
+            if (!list.contains(msgId)) {
+                list.add(msgId);
+            }
+        }
+        if (shouldSchedule) {
+            broadcastExecutor.schedule(() -> {
+                List<Integer> batch;
+                synchronized (mentionBatchLock) {
+                    batch = pendingMentionClearIds.remove(key);
+                }
+                if (batch != null && !batch.isEmpty()) {
+                    AndroidUtilities.runOnUIThread(() -> markMessageIdsRead(account, dialogId, batch, true));
+                }
+            }, 150, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** Reconciles unread spam mentions when TL_updates_channelDifferenceTooLong resets a channel dialog. */
+    public static void reconcileChannelMentionsAfterTooLong(int account, long channelId, TLRPC.Dialog dialog) {
+        if (channelId <= 0L || dialog == null || dialog.unread_mentions_count <= 0) return;
+        if (!ColgramConfig.isSpamGuardEnabled()) return;
+        ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+        if (!ColgramShieldConfig.isAntiPingAutoClearServerMentionsEnabled()) return;
+        long now = System.currentTimeMillis();
+        String k = account + ":" + channelId;
+        Long prev = lastTooLongReconcileMs.get(k);
+        if (prev != null && (now - prev) < TOO_LONG_RECONCILE_DEBOUNCE_MS) return;
+        lastTooLongReconcileMs.put(k, now);
+        AndroidUtilities.runOnUIThread(() -> {
+            MessagesController mc = MessagesController.getInstance(account);
+            if (mc == null) return;
+            TLRPC.InputPeer peer = mc.getInputPeer(-channelId);
+            if (peer == null) return;
+            fetchMentionsPage(account, -channelId, peer, 0, 0, 0, 0, 0, true);
+        });
+    }
+
+    /** 1-tap cleanup of unread spam mentions across all active group/channel dialogs. */
+    public static void clearAllUnreadSpamPings(int account) {
+        MessagesController mc = MessagesController.getInstance(account);
+        if (mc == null) return;
+        ArrayList<TLRPC.Dialog> dialogs = mc.getAllDialogs();
+        List<Long> mentionDialogs = new ArrayList<>();
+        if (dialogs != null) {
+            for (int i = 0, n = dialogs.size(); i < n; i++) {
+                TLRPC.Dialog d = dialogs.get(i);
+                if (d != null && d.id < 0L && d.unread_mentions_count > 0) {
+                    mentionDialogs.add(d.id);
+                }
+            }
+        }
+        if (mentionDialogs.isEmpty()) {
+            ColgramUiKit.showHudBanner(
+                    ApplicationLoader.applicationContext,
+                    "Спам-пингов не найдено",
+                    "Непрочитанных @ упоминаний в группах сейчас 0",
+                    R.drawable.outline_shield_check,
+                    ColgramMenuChrome.COLOR_EMERALD);
+            return;
+        }
+        ColgramUiKit.showHudBanner(
+                ApplicationLoader.applicationContext,
+                "Очистка спам-пингов",
+                "Проверяем чатов с упоминаниями: " + mentionDialogs.size(),
+                R.drawable.outline_shield_check,
+                ColgramMenuChrome.COLOR_CYAN);
+        final int totalDialogs = mentionDialogs.size();
+        for (int i = 0; i < totalDialogs; i++) {
+            final long did = mentionDialogs.get(i);
+            final long delay = i * 300L;
+            final boolean silentDialog = totalDialogs > 1 && i < totalDialogs - 1;
+            AndroidUtilities.runOnUIThread(() -> {
+                TLRPC.InputPeer peer = mc.getInputPeer(did);
+                if (peer != null) {
+                    fetchMentionsPage(account, did, peer, 0, 0, 0, 0, 0, silentDialog);
+                }
+            }, delay);
+        }
+    }
+
     public static boolean shouldSuppressNotification(int account, MessageObject messageObject) {
         if (messageObject == null || messageObject.messageOwner == null) return false;
         return shouldSuppressNotification(account, messageObject.messageOwner);
@@ -786,7 +1176,7 @@ public final class ColgramNativeColemailerBridge {
             List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(msg);
             String ownUname = ownUsername(account);
             List<String> own = ownLabels(account);
-            String pingKind = classifyMessagePing(msg, selfId, ownUname, own, targets);
+            String pingKind = classifyMessagePing(account, msg, selfId, ownUname, own, targets);
             boolean isPing = msg.mentioned || pingKind != null;
             boolean hiddenEntity = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
             boolean visualMedia = isVisualMedia(msg);
@@ -794,7 +1184,15 @@ public final class ColgramNativeColemailerBridge {
 
             ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
                     text, "", pingKind, isPing, viaBot, visualMedia, hiddenEntity,
-                    isPing && !isBroadcastChannel, own, inlineUrlBtns, fwdFromChannel);
+                    isPing && !isBroadcastChannel, own, inlineUrlBtns, fwdFromChannel,
+                    countCustomEmojiEntities(msg), hasAnyUrlEntity(msg));
+
+            int participants = isGroup ? getGroupParticipantsCount(account, dialogId) : 0;
+            boolean strangerBigGroup = isGroup && isPing && ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                    senderId, participants, false, false,
+                    ColgramSpamGuard.PING_REPLY.equals(pingKind),
+                    ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled(),
+                    System.currentTimeMillis());
 
             boolean suppress;
             if (report.isLead) {
@@ -803,7 +1201,7 @@ public final class ColgramNativeColemailerBridge {
                 suppress = report.isExplicitAd
                         || (report.isSpam && report.score >= 85 && (inlineUrlBtns || report.isHardSpam || report.shouldAutoRead));
             } else if (isGroup) {
-                suppress = report.isSpam || report.shouldAutoRead;
+                suppress = strangerBigGroup || report.isSpam || report.shouldAutoRead;
             } else {
                 // Non-contact 1-on-1 DM: silence obvious cold spam/ad disclosures without touching ordinary first DMs.
                 suppress = report.isExplicitAd || report.isHardSpam || report.score >= 70;
@@ -947,7 +1345,7 @@ public final class ColgramNativeColemailerBridge {
         List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(msg);
         String ownUname = ownUsername(account);
         List<String> own = ownLabels(account);
-        String pingKind = classifyMessagePing(msg, selfId, ownUname, own, targets);
+        String pingKind = classifyMessagePing(account, msg, selfId, ownUname, own, targets);
         boolean isPing = msg.mentioned || pingKind != null;
         boolean hiddenEntity = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
         boolean visualMedia = isVisualMedia(msg);
@@ -958,21 +1356,33 @@ public final class ColgramNativeColemailerBridge {
         boolean allowLeadCheck = isPing && ColgramConfig.isSaveLeadsEnabled();
         ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
                 text, "", pingKind, isPing, viaBot, visualMedia, hiddenEntity,
-                allowLeadCheck, own, inlineUrlBtns, fwdFromChannel);
+                allowLeadCheck, own, inlineUrlBtns, fwdFromChannel,
+                countCustomEmojiEntities(msg), hasAnyUrlEntity(msg));
 
         if (report.isLead && allowLeadCheck) {
             saveLeadCopyToSavedMessages(account, dialogId, msg, report);
             return;
         }
 
-        if (report.isSpam || report.shouldAutoRead) {
+        int participants = getGroupParticipantsCount(account, dialogId);
+        boolean strangerBigGroup = isPing && ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                senderId, participants, false, false,
+                ColgramSpamGuard.PING_REPLY.equals(pingKind),
+                ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled(),
+                System.currentTimeMillis());
+
+        if (strangerBigGroup || report.isSpam || report.shouldAutoRead) {
             synchronized (recentSuppressVerdicts) {
                 recentSuppressVerdicts.put(dedupeKey, Boolean.TRUE);
             }
+            String trigger = strangerBigGroup ? "stranger_big_group_ping" : report.primaryTrigger;
             engine.recordPingRpc(dialogId, "incoming_spam", true,
-                    "score=" + report.score + " trigger=" + report.primaryTrigger);
+                    "score=" + report.score + " trigger=" + trigger);
+            if (ColgramShieldConfig.isCollapseSpamPingsEnabled()) {
+                ColgramHookHandler.recordCollapsedSpam(dialogId, msg.id, senderId, trigger);
+            }
             if (isPing) {
-                markMessageIdsRead(account, dialogId, Collections.singletonList(msg.id));
+                clearMentionFlagsAndEnqueueClear(account, dialogId, msg, senderId, trigger);
             }
             applyMuteAction(account, dialogId, senderId, msg.id, ColgramConfig.getDefaultMuteMode());
         }
@@ -986,14 +1396,20 @@ public final class ColgramNativeColemailerBridge {
             showToast("Чат недоступен", "Откройте чат перед очисткой пингов");
             return;
         }
-        showToast("Сканирую непрочитанные пинги…", "Ищу спам-упоминания без открытия переписки");
-        fetchMentionsPage(account, dialogId, inputPeer, 0, 0, 0, 0, 0);
+        ColgramUiKit.showHudBanner(
+                ApplicationLoader.applicationContext,
+                "Сканирую непрочитанные пинги…",
+                "Ищу спам-упоминания без открытия переписки",
+                R.drawable.outline_shield_check,
+                ColgramMenuChrome.COLOR_CYAN);
+        fetchMentionsPage(account, dialogId, inputPeer, 0, 0, 0, 0, 0, false);
     }
 
     private static void fetchMentionsPage(int account, long dialogId, TLRPC.InputPeer peer,
-                                          int offsetId, int page, int totalScanned, int totalCleared, int totalLeads) {
+                                          int offsetId, int page, int totalScanned, int totalCleared, int totalLeads,
+                                          boolean silent) {
         if (page >= 10) {
-            finishClearPings(account, dialogId, totalScanned, totalCleared, totalLeads);
+            finishClearPings(account, dialogId, totalScanned, totalCleared, totalLeads, silent);
             return;
         }
         TLRPC.TL_messages_getUnreadMentions req = new TLRPC.TL_messages_getUnreadMentions();
@@ -1007,8 +1423,10 @@ public final class ColgramNativeColemailerBridge {
                 }
                 ColgramColemailerEngine.getInstance().recordPingRpc(
                         dialogId, "unread_mentions", false, error != null ? error.text : "empty");
-                AndroidUtilities.runOnUIThread(() ->
-                        showToast("Ошибка RPC", error != null ? error.text : "Не удалось прочитать пинги"));
+                if (!silent) {
+                    AndroidUtilities.runOnUIThread(() ->
+                            showToast("Ошибка RPC", error != null ? error.text : "Не удалось прочитать пинги"));
+                }
                 return;
             }
             TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
@@ -1019,7 +1437,7 @@ public final class ColgramNativeColemailerBridge {
             if (res.messages.isEmpty()) {
                 ColgramColemailerEngine.getInstance().recordPingRpc(
                         dialogId, "unread_mentions_done", true, "cleared=" + totalCleared);
-                finishClearPings(account, dialogId, totalScanned, totalCleared, totalLeads);
+                finishClearPings(account, dialogId, totalScanned, totalCleared, totalLeads, silent);
                 return;
             }
 
@@ -1030,6 +1448,7 @@ public final class ColgramNativeColemailerBridge {
             int leadsInPage = 0;
             int minId = Integer.MAX_VALUE;
             ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+            int participants = getGroupParticipantsCount(account, dialogId);
 
             for (TLRPC.Message m : res.messages) {
                 if (m == null) continue;
@@ -1039,48 +1458,66 @@ public final class ColgramNativeColemailerBridge {
                     continue;
                 }
                 List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(m);
-                String pingKind = classifyMessagePing(m, selfId, ownUname, own, targets);
+                String pingKind = classifyMessagePing(account, m, selfId, ownUname, own, targets);
                 String txt = m.message == null ? "" : m.message;
                 boolean allowLeads = dialogId < 0 && ColgramConfig.isSaveLeadsEnabled();
                 ColgramSpamGuard.SpamReport report = ColgramSpamGuard.diagnose(
                         txt, "", pingKind, true, m.via_bot_id != 0, isVisualMedia(m),
                         ColgramSpamGuard.hasHiddenOrMassMentionEntity(txt, targets),
-                        allowLeads, own, hasInlineUrlButtons(m), isForwardedFromChannel(m));
+                        allowLeads, own, hasInlineUrlButtons(m), isForwardedFromChannel(m),
+                        countCustomEmojiEntities(m), hasAnyUrlEntity(m));
                 if (report.isLead && allowLeads) {
                     saveLeadCopyToSavedMessages(account, dialogId, m, report);
                     leadsInPage++;
                     continue;
                 }
                 String forced = sender != 0 ? engine.getMuteActionFor(sender, dialogId) : null;
-                if (forced != null || report.shouldAutoRead || report.isSpam) {
+                boolean strangerPing = ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                        sender, participants, false, false,
+                        ColgramSpamGuard.PING_REPLY.equals(pingKind),
+                        ColgramShieldConfig.isAntiPingStrangersBigGroupsEnabled(),
+                        System.currentTimeMillis());
+                if (forced != null || strangerPing || ColgramSpamGuard.PING_STEALTH.equals(pingKind)
+                        || report.shouldAutoRead || report.isSpam) {
                     spamIds.add(m.id);
+                    if (ColgramShieldConfig.isCollapseSpamPingsEnabled()) {
+                        ColgramHookHandler.recordCollapsedSpam(dialogId, m.id, sender,
+                                strangerPing ? "stranger_big_group_ping" : report.primaryTrigger);
+                    }
                 }
             }
 
             if (!spamIds.isEmpty()) {
-                markMessageIdsRead(account, dialogId, spamIds);
+                markMessageIdsRead(account, dialogId, spamIds, true);
             }
 
             final int nextScanned = totalScanned + res.messages.size();
             final int nextCleared = totalCleared + spamIds.size();
             final int nextLeads = totalLeads + leadsInPage;
             if (res.messages.size() < 100 || minId == Integer.MAX_VALUE) {
-                finishClearPings(account, dialogId, nextScanned, nextCleared, nextLeads);
+                finishClearPings(account, dialogId, nextScanned, nextCleared, nextLeads, silent);
             } else {
                 final int nextOffset = minId;
                 AndroidUtilities.runOnUIThread(() ->
-                        fetchMentionsPage(account, dialogId, peer, nextOffset, page + 1, nextScanned, nextCleared, nextLeads), 250L);
+                        fetchMentionsPage(account, dialogId, peer, nextOffset, page + 1, nextScanned, nextCleared, nextLeads, silent), 250L);
             }
         });
     }
 
-    private static void finishClearPings(int account, long dialogId, int scanned, int cleared, int leads) {
+    private static void finishClearPings(int account, long dialogId, int scanned, int cleared, int leads, boolean silent) {
         AndroidUtilities.runOnUIThread(() -> {
             if (cleared >= scanned && scanned > 0 && leads == 0) {
-                MessagesController.getInstance(account).markMentionsAsRead(dialogId, 0);
+                ColgramGhostMode.runAllowingSpamMentionClear(() ->
+                        MessagesController.getInstance(account).markMentionsAsRead(dialogId, 0));
             }
-            showToast("Пинги проверены: " + scanned,
-                    "Спам-пингов снято: " + cleared + (leads > 0 ? ", лидов сохранено: " + leads : ""));
+            if (!silent || cleared > 0) {
+                ColgramUiKit.showHudBanner(
+                        ApplicationLoader.applicationContext,
+                        "Пинги проверены: " + scanned,
+                        "Спам-пингов снято: " + cleared + (leads > 0 ? ", лидов сохранено: " + leads : ""),
+                        R.drawable.outline_shield_check,
+                        cleared > 0 ? ColgramMenuChrome.COLOR_EMERALD : ColgramMenuChrome.COLOR_CYAN);
+            }
         });
     }
 
@@ -1259,19 +1696,30 @@ public final class ColgramNativeColemailerBridge {
     }
 
     private static void markMessageIdsRead(int account, long dialogId, List<Integer> ids) {
+        markMessageIdsRead(account, dialogId, ids, false);
+    }
+
+    private static void markMessageIdsRead(int account, long dialogId, List<Integer> ids, boolean spamAutoClear) {
         if (ids == null || ids.isEmpty() || dialogId == 0L) return;
-        if (ColgramHookHandler.shouldPreventReadReceipt(dialogId)) return;
+        if (!spamAutoClear && ColgramHookHandler.shouldPreventReadReceipt(dialogId)) return;
         MessagesController mc = MessagesController.getInstance(account);
         if (mc == null) return;
-        if (dialogId < 0 && ChatObject.isChannel(mc.getChat(-dialogId))) {
-            TLRPC.TL_channels_readMessageContents req = new TLRPC.TL_channels_readMessageContents();
-            req.channel = mc.getInputChannel(-dialogId);
-            req.id.addAll(ids);
-            ConnectionsManager.getInstance(account).sendRequest(req, null);
+        Runnable send = () -> {
+            if (dialogId < 0 && ChatObject.isChannel(mc.getChat(-dialogId))) {
+                TLRPC.TL_channels_readMessageContents req = new TLRPC.TL_channels_readMessageContents();
+                req.channel = mc.getInputChannel(-dialogId);
+                req.id.addAll(ids);
+                ConnectionsManager.getInstance(account).sendRequest(req, null);
+            } else {
+                TLRPC.TL_messages_readMessageContents req = new TLRPC.TL_messages_readMessageContents();
+                req.id.addAll(ids);
+                ConnectionsManager.getInstance(account).sendRequest(req, null);
+            }
+        };
+        if (spamAutoClear) {
+            ColgramGhostMode.runAllowingSpamMentionClear(send);
         } else {
-            TLRPC.TL_messages_readMessageContents req = new TLRPC.TL_messages_readMessageContents();
-            req.id.addAll(ids);
-            ConnectionsManager.getInstance(account).sendRequest(req, null);
+            send.run();
         }
     }
 
@@ -1406,15 +1854,21 @@ public final class ColgramNativeColemailerBridge {
 
     private static String classifyMessagePing(TLRPC.Message msg, long selfId, String ownUsername,
                                               List<String> own, List<ColgramSpamGuard.MentionTarget> targets) {
+        return classifyMessagePing(UserConfig.selectedAccount, msg, selfId, ownUsername, own, targets);
+    }
+
+    private static String classifyMessagePing(int account, TLRPC.Message msg, long selfId, String ownUsername,
+                                              List<String> own, List<ColgramSpamGuard.MentionTarget> targets) {
         if (msg == null) return null;
-        // Telegram sets `msg.mentioned = true` ONLY when a reply actually targets OUR message
-        // (not when stranger A replies to stranger B, and not on ordinary forum topic messages).
-        if (msg.mentioned && msg.reply_to != null && msg.reply_to.reply_to_msg_id != 0) {
-            return ColgramSpamGuard.PING_REPLY;
-        }
         String txt = msg.message == null ? "" : msg.message;
+        // 1. Inspect explicit/stealth entities FIRST so a forum reply never masks a stealth user mention
         String entKind = ColgramSpamGuard.classifyEntityPing(txt, targets, selfId, own);
-        if (entKind != null) return entKind;
+        if (ColgramSpamGuard.PING_STEALTH.equals(entKind)) {
+            return ColgramSpamGuard.PING_STEALTH;
+        }
+        if (entKind != null) {
+            return entKind;
+        }
         if (!TextUtils.isEmpty(ownUsername)) {
             String needle = "@" + ownUsername.toLowerCase(Locale.ROOT);
             String low = txt.toLowerCase(Locale.ROOT);
@@ -1429,7 +1883,67 @@ public final class ColgramNativeColemailerBridge {
                 idx = low.indexOf(needle, idx + 1);
             }
         }
+        // 2. Genuine reply to self: verify non-forum-root and replied-to author == selfId when known
+        if (msg.mentioned && msg.reply_to != null && msg.reply_to.reply_to_msg_id != 0) {
+            boolean isTopicRootReply = msg.reply_to.forum_topic
+                    && msg.reply_to.reply_to_msg_id == msg.reply_to.reply_to_top_id
+                    && msg.reply_to.reply_to_top_id != 0;
+            if (!isTopicRootReply) {
+                if (msg.replyMessage != null && msg.replyMessage.from_id != null) {
+                    long replyAuthor = MessageObject.getPeerId(msg.replyMessage.from_id);
+                    if (selfId != 0L && replyAuthor == selfId) {
+                        return ColgramSpamGuard.PING_REPLY;
+                    }
+                    return ColgramSpamGuard.PING_STEALTH;
+                }
+                return ColgramSpamGuard.PING_REPLY;
+            }
+        }
         return msg.mentioned ? ColgramSpamGuard.PING_STEALTH : null;
+    }
+
+    /** Records finished download into storage cap accounting and Lazy Shadow Vault (zero network download). */
+    public static void onMediaDownloadedForShadowAndCap(int account, File file, Object parentObject) {
+        if (file == null || !file.isFile()) return;
+        ColgramHookHandler.notifyMediaFileLoaded(file);
+        if (!ColgramShieldConfig.isLazyShadowVaultEnabled()) return;
+        if (parentObject instanceof MessageObject) {
+            MessageObject mo = (MessageObject) parentObject;
+            if (mo.messageOwner != null && mo.getId() > 0 && mo.isPhoto()) {
+                long dialogId = mo.getDialogId();
+                long senderId = mo.getSenderId();
+                String txt = mo.messageOwner.message == null ? "" : mo.messageOwner.message;
+                if (txt.length() > 512) txt = txt.substring(0, 512);
+                String meta = "{\"s\":" + senderId + ",\"t\":\"" + jsonEscape(txt) + "\"}";
+                ColgramHookHandler.captureLazyShadowPhotoPreviewFromLoadedFile(
+                        dialogId, mo.getId(), senderId, mo.messageOwner.date, file.length(), meta, file);
+            }
+        }
+    }
+
+    /** Enforces malware/huge auto-download shield at MessagesStorage queue gate. */
+    public static boolean isStorageAutoDownloadBlocked(int account, TLRPC.Message msg) {
+        if (msg == null || msg.media == null) return false;
+        try {
+            ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+            if (!ColgramShieldConfig.isMalwareDownloadShieldEnabled()
+                    && !ColgramShieldConfig.isStorageCapEnabled()) {
+                return false;
+            }
+            if (msg.media instanceof TLRPC.TL_messageMediaStory) {
+                return ColgramShieldConfig.isMalwareDownloadShieldEnabled();
+            }
+            TLRPC.Document doc = MessageObject.getDocument(msg);
+            if (doc == null) return false;
+            String name = FileLoader.getDocumentFileName(doc);
+            boolean isWifi = ApplicationLoader.getAutodownloadNetworkType() == StatsController.TYPE_WIFI;
+            long capBytes = ColgramShieldConfig.isStorageCapEnabled()
+                    ? ColgramShieldConfig.getStorageHardCapBytes() : 0L;
+            return ColgramFileSafetyPolicy.shouldBlockAutoDownload(
+                    name, doc.mime_type, doc.size, isWifi, capBytes);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static boolean isUsernameChar(char c) {

@@ -35,6 +35,7 @@ public final class ColgramStorageIndex {
     public static final int STATE_COMPRESSED = 1;
     public static final int STATE_DEDUP_LINK = 2;
     public static final int STATE_DEDUP_CAS = 3;
+    public static final int STATE_DEHYDRATED = 4;
 
     private static final String INDEX_FILE_NAME = "colgram_storage_index_v1.tsv.gz";
 
@@ -46,9 +47,18 @@ public final class ColgramStorageIndex {
         public final String sha256;
         public final int state;
         public final long updatedAtMs;
+        public final long dialogId;
+        public final int msgId;
+        public final String previewPath;
 
         public Entry(String path, long origSize, long storedSize, long mtime,
                      String sha256, int state, long updatedAtMs) {
+            this(path, origSize, storedSize, mtime, sha256, state, updatedAtMs, 0L, 0, "");
+        }
+
+        public Entry(String path, long origSize, long storedSize, long mtime,
+                     String sha256, int state, long updatedAtMs,
+                     long dialogId, int msgId, String previewPath) {
             this.path = normalizePath(path);
             this.origSize = origSize;
             this.storedSize = storedSize;
@@ -56,13 +66,21 @@ public final class ColgramStorageIndex {
             this.sha256 = sha256 == null ? "" : sha256;
             this.state = state;
             this.updatedAtMs = updatedAtMs;
+            this.dialogId = dialogId;
+            this.msgId = msgId;
+            this.previewPath = previewPath == null ? "" : normalizePath(previewPath);
         }
 
         public long savedBytes() {
             return Math.max(0L, origSize - storedSize);
         }
 
+        public boolean isDehydrated() {
+            return state == STATE_DEHYDRATED;
+        }
+
         public boolean matchesFileOnDisk(File f) {
+            if (state == STATE_DEHYDRATED) return false;
             if (f == null || !f.isFile()) return false;
             long len = f.length();
             long mod = f.lastModified();
@@ -205,20 +223,120 @@ public final class ColgramStorageIndex {
     }
 
     public static void recordEntry(String path, long origSize, long storedSize, long mtime, String sha256, int state) {
+        recordEntry(path, origSize, storedSize, mtime, sha256, state, 0L, 0, "");
+    }
+
+    public static void recordEntry(String path, long origSize, long storedSize, long mtime,
+                                   String sha256, int state, long dialogId, int msgId, String previewPath) {
         String norm = normalizePath(path);
         if (norm.isEmpty()) return;
-        Entry entry = new Entry(norm, origSize, storedSize, mtime, sha256, state, System.currentTimeMillis());
+        Entry entry = new Entry(norm, origSize, storedSize, mtime, sha256, state,
+                System.currentTimeMillis(), dialogId, msgId, previewPath);
         entriesByPath.put(norm, entry);
         String name = fileNameOf(norm);
         if (!name.isEmpty()) {
             entriesByFileName.put(name, entry);
         }
-        if (sha256 != null && !sha256.isEmpty()) {
+        if (sha256 != null && !sha256.isEmpty() && state != STATE_DEHYDRATED) {
             canonicalPathBySha256.putIfAbsent(sha256, norm);
             refsBySha256.computeIfAbsent(sha256, k -> Collections.newSetFromMap(new ConcurrentHashMap<>()))
                     .add(norm);
         }
         dirty = true;
+    }
+
+    /** Records a Tier-0 dehydrated stub keeping virtual origSize/SHA/preview link while physical size is 0. */
+    public static void markDehydrated(File file, long origSize, long dialogId, int msgId, String previewPath) {
+        if (file == null) return;
+        markDehydrated(normalizePath(file), origSize, "", dialogId, msgId, previewPath);
+    }
+
+    public static void markDehydrated(String path, long origSize, String sha256,
+                                      long dialogId, int msgId, String previewPath) {
+        String norm = normalizePath(path);
+        if (norm.isEmpty()) return;
+        Entry prev = entriesByPath.get(norm);
+        long resolvedOrig = origSize > 0L ? origSize : (prev != null ? Math.max(prev.origSize, prev.storedSize) : 0L);
+        String resolvedSha = (sha256 != null && !sha256.isEmpty()) ? sha256 : (prev != null ? prev.sha256 : "");
+        long resolvedDialog = dialogId != 0L ? dialogId : (prev != null ? prev.dialogId : 0L);
+        int resolvedMsg = msgId != 0 ? msgId : (prev != null ? prev.msgId : 0);
+        String resolvedPreview = (previewPath != null && !previewPath.isEmpty())
+                ? previewPath : (prev != null ? prev.previewPath : "");
+        if (prev != null && !prev.sha256.isEmpty()) {
+            Set<String> refs = refsBySha256.get(prev.sha256);
+            if (refs != null) {
+                refs.remove(norm);
+            }
+        }
+        recordEntry(norm, resolvedOrig, 0L, 0L, resolvedSha, STATE_DEHYDRATED,
+                resolvedDialog, resolvedMsg, resolvedPreview);
+    }
+
+    /** Marks a previously dehydrated file as re-hydrated on disk. */
+    public static void markHydrated(File file) {
+        if (file == null) return;
+        String norm = normalizePath(file);
+        if (norm.isEmpty()) return;
+        Entry prev = entriesByPath.get(norm);
+        long len = file.isFile() ? Math.max(0L, file.length()) : 0L;
+        if (prev != null && prev.state == STATE_DEHYDRATED) {
+            recordEntry(norm, Math.max(prev.origSize, len), len, file.lastModified(),
+                    prev.sha256, STATE_SKIPPED_OPTIMAL, prev.dialogId, prev.msgId, prev.previewPath);
+        } else if (prev == null && len > 0L) {
+            recordEntry(file, len, len, "", STATE_SKIPPED_OPTIMAL);
+        }
+    }
+
+    public static Entry getDehydratedEntry(String path) {
+        if (path == null || path.isEmpty()) return null;
+        Entry e = entriesByPath.get(normalizePath(path));
+        if (e == null) {
+            String fn = fileNameOf(normalizePath(path));
+            if (!fn.isEmpty()) {
+                e = entriesByFileName.get(fn);
+            }
+        }
+        return (e != null && e.isDehydrated()) ? e : null;
+    }
+
+    public static long getTotalCompressionSavedBytes() {
+        long saved = 0L;
+        for (Entry e : entriesByPath.values()) {
+            if (e != null && (e.state == STATE_COMPRESSED || e.state == STATE_DEDUP_LINK || e.state == STATE_DEDUP_CAS)) {
+                saved += e.savedBytes();
+            }
+        }
+        return saved;
+    }
+
+    public static long getTotalDehydratedBytes() {
+        long total = 0L;
+        for (Entry e : entriesByPath.values()) {
+            if (e != null && e.state == STATE_DEHYDRATED) {
+                total += Math.max(0L, e.origSize);
+            }
+        }
+        return total;
+    }
+
+    public static int getDehydratedCount() {
+        int count = 0;
+        for (Entry e : entriesByPath.values()) {
+            if (e != null && e.state == STATE_DEHYDRATED) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public static long getTotalCatalogVirtualBytes() {
+        long total = 0L;
+        for (Entry e : entriesByPath.values()) {
+            if (e != null) {
+                total += Math.max(e.origSize, e.storedSize);
+            }
+        }
+        return total;
     }
 
     public static void registerCanonicalHash(String sha256, String canonicalPath) {
@@ -328,13 +446,31 @@ public final class ColgramStorageIndex {
                 String sha = line.substring(t4 + 1, t5);
                 int state = (int) parseLongSafe(line.substring(t5 + 1, t6), 0L);
                 long updated = parseLongSafe(t7 >= 0 ? line.substring(t6 + 1, t7) : line.substring(t6 + 1), 0L);
-                Entry e = new Entry(path, origSize, storedSize, mtime, sha, state, updated);
+                long dialogId = 0L;
+                int msgId = 0;
+                String previewPath = "";
+                if (t7 >= 0) {
+                    int t8 = line.indexOf('\t', t7 + 1);
+                    if (t8 >= 0) {
+                        dialogId = parseLongSafe(line.substring(t7 + 1, t8), 0L);
+                        int t9 = line.indexOf('\t', t8 + 1);
+                        if (t9 >= 0) {
+                            msgId = (int) parseLongSafe(line.substring(t8 + 1, t9), 0L);
+                            previewPath = line.substring(t9 + 1);
+                        } else {
+                            msgId = (int) parseLongSafe(line.substring(t8 + 1), 0L);
+                        }
+                    } else {
+                        dialogId = parseLongSafe(line.substring(t7 + 1), 0L);
+                    }
+                }
+                Entry e = new Entry(path, origSize, storedSize, mtime, sha, state, updated, dialogId, msgId, previewPath);
                 entriesByPath.put(e.path, e);
                 String fn = fileNameOf(e.path);
                 if (!fn.isEmpty()) {
                     entriesByFileName.put(fn, e);
                 }
-                if (!e.sha256.isEmpty()) {
+                if (!e.sha256.isEmpty() && e.state != STATE_DEHYDRATED) {
                     canonicalPathBySha256.putIfAbsent(e.sha256, e.path);
                     refsBySha256.computeIfAbsent(e.sha256, k -> Collections.newSetFromMap(new ConcurrentHashMap<>()))
                             .add(e.path);
@@ -372,6 +508,14 @@ public final class ColgramStorageIndex {
                     bw.write(Integer.toString(e.state));
                     bw.write('\t');
                     bw.write(Long.toString(e.updatedAtMs));
+                    if (e.dialogId != 0L || e.msgId != 0 || !e.previewPath.isEmpty()) {
+                        bw.write('\t');
+                        bw.write(Long.toString(e.dialogId));
+                        bw.write('\t');
+                        bw.write(Integer.toString(e.msgId));
+                        bw.write('\t');
+                        bw.write(e.previewPath.replace('\t', ' ').replace('\n', ' ').replace('\r', ' '));
+                    }
                     bw.write('\n');
                 }
                 bw.flush();

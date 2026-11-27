@@ -778,10 +778,10 @@ public final class ColgramPerformanceRegressionTest {
         setPrivateField(db, "deletedCacheLoadStarted", Boolean.TRUE);
         setPrivateField(db, "blockedUsersLoaded", Boolean.TRUE);
 
-        // Verify schema bumped to DATABASE_VERSION == 6
+        // Verify schema bumped to DATABASE_VERSION == 7
         java.lang.reflect.Field dbVerF = ColgramDatabase.class.getDeclaredField("DATABASE_VERSION");
         dbVerF.setAccessible(true);
-        check(dbVerF.getInt(null) == 6, "ColgramDatabase.DATABASE_VERSION must be 6");
+        check(dbVerF.getInt(null) == 7, "ColgramDatabase.DATABASE_VERSION must be 7");
 
         // 1. O(1) blocked-users cache semantics (0 SQLite calls when loaded; ignores uid=0)
         check(!db.isNotificationsBlockedFrom(0L), "uid=0 never blocked");

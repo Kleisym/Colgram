@@ -87,8 +87,8 @@ public class ColgramConfig {
     private static volatile boolean antiDeleteWipeEnabled = false;
     private static volatile boolean chatWallpaperEnabled = true;
     private static volatile boolean preserveMediaEnabled = true;
-    private static volatile boolean ghostReadEnabled = false;
-    private static volatile boolean ghostTypingEnabled = false;
+    private static volatile boolean ghostReadEnabled = true;
+    private static volatile boolean ghostTypingEnabled = true;
     private static volatile boolean ghostOnlineEnabled = false;
     private static volatile boolean bypassFlagSecureEnabled = true;
     private static volatile boolean autoHidePhoneEnabled = true;
@@ -98,7 +98,7 @@ public class ColgramConfig {
     private static volatile boolean dohEnabled = true;
     private static volatile boolean proxyBrowserEnabled = true;
     private static volatile String updateRepo = DEFAULT_UPDATE_REPO;
-    private static volatile boolean autoUpdateEnabled = true;
+    private static volatile boolean autoUpdateEnabled = false;
     private static volatile boolean cyberThemeEnabled = false;
     private static volatile String pendingUpstreamTag = null;
     private static volatile boolean miniAppPipEnabled = true;
@@ -149,7 +149,7 @@ public class ColgramConfig {
     private static volatile String helperBotToken = "";
     private static volatile String colemailerState = "";
     private static volatile boolean unlimitedMemoryConfigured = false;
-    private static volatile boolean unlimitedMemoryEnabled = true;
+    private static volatile boolean unlimitedMemoryEnabled = false;
     private static volatile boolean autoCompressStorageEnabled = true;
     private static volatile boolean alwaysBackgroundEnabled = true;
     private static volatile long lastAutoUpdateCheckMs = 0L;
@@ -184,16 +184,24 @@ public class ColgramConfig {
     public static void init(Context context) {
         if (prefs == null && context != null) {
             SharedPreferences sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            // Upgrade defaults once so anti-delete self-preserve & unlimited auto-compress storage are always ON by default.
+            // Upgrade defaults once so anti-delete self-preserve & auto-compress storage are ON by default.
             if (!sp.getBoolean("colgram_defaults_v3_migrated", false)) {
                 sp.edit()
                         .putBoolean(KEY_ANTI_DELETE_ENABLED, true)
                         .putBoolean(KEY_ANTI_DELETE_SELF, true)
                         .putBoolean(KEY_ANTI_DELETE_WIPE, false)
                         .putBoolean(KEY_ANTI_DELETE_HIGHLIGHT, true)
-                        .putBoolean(KEY_UNLIMITED_MEMORY, true)
+                        .putBoolean(KEY_UNLIMITED_MEMORY, false)
                         .putBoolean("auto_compress_storage_enabled", true)
                         .putBoolean("colgram_defaults_v3_migrated", true)
+                        .apply();
+            }
+            // Enforce capped cache default once so existing installs stop growing storage unboundedly.
+            if (!sp.getBoolean("colgram_defaults_v4_cap_migrated", false)) {
+                sp.edit()
+                        .putBoolean(KEY_UNLIMITED_MEMORY, false)
+                        .putBoolean("auto_compress_storage_enabled", true)
+                        .putBoolean("colgram_defaults_v4_cap_migrated", true)
                         .apply();
             }
             // One-time safety migration: lead auto-forwarding to Saved Messages must be strictly opt-in
@@ -269,7 +277,7 @@ public class ColgramConfig {
         dohEnabled = p.getBoolean(KEY_DOH_ENABLED, true);
         proxyBrowserEnabled = p.getBoolean(KEY_PROXY_BROWSER_ENABLED, true);
         updateRepo = p.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO);
-        autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, true);
+        autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, false);
         cyberThemeEnabled = p.getBoolean(KEY_CYBER_THEME_ENABLED, false);
         pendingUpstreamTag = p.getString(KEY_PENDING_UPSTREAM_TAG, null);
         miniAppPipEnabled = p.getBoolean(KEY_MINIAPP_PIP_ENABLED, true);
@@ -320,7 +328,7 @@ public class ColgramConfig {
         helperBotToken = p.getString(KEY_COLEMAILER_BOT_TOKEN, "");
         colemailerState = p.getString(KEY_COLEMAILER_STATE, "");
         unlimitedMemoryConfigured = p.contains(KEY_UNLIMITED_MEMORY);
-        unlimitedMemoryEnabled = p.getBoolean(KEY_UNLIMITED_MEMORY, true);
+        unlimitedMemoryEnabled = p.getBoolean(KEY_UNLIMITED_MEMORY, false);
         autoCompressStorageEnabled = p.getBoolean("auto_compress_storage_enabled", true);
         alwaysBackgroundEnabled = p.getBoolean(KEY_ALWAYS_BACKGROUND, true);
         lastAutoUpdateCheckMs = p.getLong(KEY_LAST_UPDATE_CHECK_MS, 0L);
@@ -368,7 +376,7 @@ public class ColgramConfig {
             case KEY_DOH_ENABLED: dohEnabled = p.getBoolean(KEY_DOH_ENABLED, true); break;
             case KEY_PROXY_BROWSER_ENABLED: proxyBrowserEnabled = p.getBoolean(KEY_PROXY_BROWSER_ENABLED, true); break;
             case KEY_UPDATE_REPO: updateRepo = p.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO); break;
-            case KEY_AUTO_UPDATE_ENABLED: autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, true); break;
+            case KEY_AUTO_UPDATE_ENABLED: autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, false); break;
             case KEY_CYBER_THEME_ENABLED: cyberThemeEnabled = p.getBoolean(KEY_CYBER_THEME_ENABLED, false); break;
             case KEY_PENDING_UPSTREAM_TAG: pendingUpstreamTag = p.getString(KEY_PENDING_UPSTREAM_TAG, null); break;
             case KEY_MINIAPP_PIP_ENABLED: miniAppPipEnabled = p.getBoolean(KEY_MINIAPP_PIP_ENABLED, true); break;
@@ -422,7 +430,7 @@ public class ColgramConfig {
             case KEY_COLEMAILER_STATE: colemailerState = p.getString(KEY_COLEMAILER_STATE, ""); break;
             case KEY_UNLIMITED_MEMORY:
                 unlimitedMemoryConfigured = p.contains(KEY_UNLIMITED_MEMORY);
-                unlimitedMemoryEnabled = p.getBoolean(KEY_UNLIMITED_MEMORY, true);
+                unlimitedMemoryEnabled = p.getBoolean(KEY_UNLIMITED_MEMORY, false);
                 break;
             case "auto_compress_storage_enabled":
                 autoCompressStorageEnabled = p.getBoolean("auto_compress_storage_enabled", true);

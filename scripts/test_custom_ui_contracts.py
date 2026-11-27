@@ -40,6 +40,8 @@ TRACK3_UI_TEMPLATES = (
     "ColgramNativeColemailerBridge.java",
     "ColgramCallRoutes.java",
     "ColgramBrowserRoutes.java",
+    "ColgramPremiumActivity.java",
+    "ColgramSavedTagsBarView.java",
     "ColgramSubscriptionControls.java",
     "ProxyListWarpControls.java.inc",
     "ColgramAeroStyler.java",
@@ -153,7 +155,8 @@ class CustomUiContractsTest(unittest.TestCase):
             "ColgramUiKit.java must be registered in BOTH inject_hooks and sync_colgram_extra_templates_and_assets",
         )
         self.assertIn("ColgramUiKit.showConfirmSheet(", ap)
-        self.assertIn('purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);', ap)
+        self.assertIn('purgeCell.setText(colgramPurgeSb, "", false, false);', ap)
+        self.assertIn("Стереть локальную копию из сейфа анти-удаления", ap)
         self.assertIn('"AlertsCreator.java permanent local delete checkbox UI"', ap)
 
     def test_koliti_split_patches_ui_upgrades_and_idempotency(self):
@@ -197,6 +200,8 @@ class CustomUiContractsTest(unittest.TestCase):
             alerts.write_text(
                 "public class AlertsCreator {\n"
                 "    void f() {\n"
+                "                purgeCell.allowMultiline();\n"
+                "                purgeCell.setMinimumHeight(dp(48));\n"
                 '                purgeCell.setText("Удалить полностью у себя", "", false, false);\n'
                 "    }\n"
                 "}\n",
@@ -297,10 +302,10 @@ class CustomUiContractsTest(unittest.TestCase):
             self.assertIn("SHA-256 ПРОВЕРЕН", launch_txt)
             self.assertIn("ColgramUiKit.showCustomViewSheet(", launch_txt)
 
-            self.assertIn(
-                'purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);',
-                alerts.read_text(encoding="utf-8"),
-            )
+            alerts_txt = alerts.read_text(encoding="utf-8")
+            self.assertIn('purgeCell.setText(colgramPurgeSb, "", false, false);', alerts_txt)
+            self.assertIn("Стереть локальную копию из сейфа анти-удаления", alerts_txt)
+            self.assertIn("purgeCell.setMultiline(true);", alerts_txt)
 
             data_txt = data_settings.read_text(encoding="utf-8")
             self.assertNotIn("AlertDialog.Builder", data_txt)

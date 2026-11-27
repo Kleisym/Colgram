@@ -383,6 +383,96 @@ public final class ColgramColemailerTest {
         check(!restored.isDmAutoDeleteMuted(0, peerA), "peerA must now be unmuted");
     }
 
+    private static void testTrack2AntiPingStrangersMassMentionsAndStateV2() {
+        // 1. Stealth entity ping detection: weak substring "own.contains(label)" MUST NOT bypass!
+        long selfId = 9001L;
+        List<String> own = java.util.Arrays.asList("Alexander", "alex_dev");
+        String msgStealthSubstr = "Перейдите сюда lex сегодня!";
+        List<ColgramSpamGuard.MentionTarget> stealthSubTargets = java.util.Collections.singletonList(
+                new ColgramSpamGuard.MentionTarget(selfId, "", msgStealthSubstr.indexOf("lex"), 3));
+        check(ColgramSpamGuard.PING_STEALTH.equals(
+                ColgramSpamGuard.classifyEntityPing(msgStealthSubstr, stealthSubTargets, selfId, own)),
+                "Weak substring inside Alexander must be caught as PING_STEALTH");
+
+        String msgPrefixOk = "Привет Алекс, зайдёшь на созвон?";
+        List<ColgramSpamGuard.MentionTarget> prefixTargets = java.util.Collections.singletonList(
+                new ColgramSpamGuard.MentionTarget(selfId, "", msgPrefixOk.indexOf("Алекс"), 5));
+        // Exact/prefix token against Cyrillic Alexander/Алекс
+        check(ColgramSpamGuard.PING_NAME.equals(
+                ColgramSpamGuard.classifyEntityPing(
+                        "Привет Алекс!",
+                        java.util.Collections.singletonList(new ColgramSpamGuard.MentionTarget(selfId, "", 7, 5)),
+                        selfId,
+                        java.util.Arrays.asList("Александр", "alex_dev"))),
+                "Token prefix Алекс -> Александр must remain legitimate PING_NAME");
+
+        // 2. Mass mentions: >=3 totalMentions OR @all/@everyone/@все
+        List<ColgramSpamGuard.MentionTarget> threeMentions = java.util.Arrays.asList(
+                new ColgramSpamGuard.MentionTarget(0L, "", 0, 4),
+                new ColgramSpamGuard.MentionTarget(0L, "", 5, 4),
+                new ColgramSpamGuard.MentionTarget(0L, "", 10, 4));
+        check(ColgramSpamGuard.hasHiddenOrMassMentionEntity("@aaa @bbb @ccc привет", threeMentions),
+                "totalMentions == 3 must trigger hasHiddenOrMassMentionEntity");
+        check(ColgramSpamGuard.hasHiddenOrMassMentionEntity("Внимание @all @everyone заходите", Collections.emptyList()),
+                "@all / @everyone tags must trigger hasHiddenOrMassMentionEntity");
+
+        // 3. Layer (c) commercial Steam/topup >220 char ad wall + NotificationFilter handleless ad wall
+        String longSteamAd = "Пополнение баланса Steam с минимальной комиссией! Всегда на связи, открыт к заказам "
+                + "24/7. Также в продаже гифты CS2, Valorant, PSN и Xbox подписки. Полная гарантия и быстрая выдача "
+                + "баланса на любой регион по самым выгодным ценам на рынке, обращайтесь для оформления заказа сейчас!";
+        ColgramSpamGuard.SpamReport wallRep = ColgramSpamGuard.diagnose(
+                longSteamAd, "", ColgramSpamGuard.PING_USERNAME, true, false, false, false,
+                false, own, false, false, 4, true);
+        check(wallRep.isSpam && wallRep.shouldAutoRead,
+                "Long >220 commercial Steam wall w/ custom emoji + URL entity must be blocked, score=" + wallRep.score);
+        check(ColgramNotificationFilter.isAd(longSteamAd),
+                "NotificationFilter.isAd must catch >220-char handleless commercial ad wall");
+
+        // 4. Layer (d) big-group unsolicited stranger ping + 24h outgoing interaction LRU
+        ColgramSpamGuard.resetInteractionsForTest();
+        long stranger = 888777L;
+        long now = System.currentTimeMillis();
+        check(ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                stranger, 150, false, false, false, true, now),
+                "Stranger ping in >=50 group must be blocked when no prior interaction or genuine reply");
+        check(!ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                stranger, 150, false, false, true, true, now),
+                "Genuine reply to self in big group must NOT be blocked as stranger ping");
+        check(!ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                stranger, 20, false, false, false, true, now),
+                "Small group <50 members must NOT trigger big-group stranger block");
+        ColgramSpamGuard.recordOutgoingInteraction(stranger);
+        check(!ColgramSpamGuard.isUnsolicitedStrangerBigGroupPing(
+                stranger, 150, false, false, false, true, now + 1000L),
+                "User interacted within 24h must be unblocked for pings");
+
+        // 5. Engine activeCounterCampaignCount reset + TS/CNT persistence v2 + rotations
+        ColgramColemailerEngine eng = ColgramColemailerEngine.newStandaloneForTest();
+        ColgramColemailerEngine.BroadcastCampaign emptyCounter = new ColgramColemailerEngine.BroadcastCampaign(
+                "empty_cnt", "", ColgramColemailerEngine.MODE_COUNTER, 0L, 5, "");
+        eng.addOrUpdateCampaign(emptyCounter);
+        check(eng.getActiveCounterCampaignCount() == 0, "Empty-text counter campaign must not inflate activeCounterCampaignCount");
+
+        ColgramColemailerEngine.BroadcastCampaign c1 = new ColgramColemailerEngine.BroadcastCampaign(
+                "promo_a", "Пост A", ColgramColemailerEngine.MODE_HYBRID, 600L, 3, "");
+        c1.targetChats.add(-10099L);
+        eng.addOrUpdateCampaign(c1);
+        eng.markBroadcastSent(c1, -10099L, 1_700_000_000L);
+        eng.onIncomingChatMessageAndCheckDue(-1, -10099L, 1_700_000_100L);
+        String v2State = eng.serializeState();
+
+        ColgramColemailerEngine restored = ColgramColemailerEngine.newStandaloneForTest();
+        restored.loadFromSerializedState(v2State);
+        ColgramColemailerEngine.BroadcastCampaign rc1 = restored.getCampaign("promo_a");
+        check(rc1 != null && rc1.chatLastSentAt.get(-10099L) == 1_700_000_000L,
+                "v2 serialization must persist chatLastSentAt TS");
+        check(rc1.chatCounters.get(-10099L) == 1,
+                "v2 serialization must persist chatCounters CNT");
+        restored.loadFromSerializedState("");
+        check(restored.getActiveCounterCampaignCount() == 0,
+                "loadFromSerializedState empty must reset activeCounterCampaignCount to 0");
+    }
+
     public static void main(String[] args) {
         testSpamGuardNormalizationAndPingDetection();
         testSpamGuardDiagnosisAndLeadVeto();
@@ -392,6 +482,7 @@ public final class ColgramColemailerTest {
         testEventDrivenSchedulerZeroIdleAndFloodWait();
         testUpgradedAdSpamHeuristicsAndZeroFalsePositives();
         testDmAutoDeleteMuteSafetyAndIsolation();
+        testTrack2AntiPingStrangersMassMentionsAndStateV2();
         System.out.println("ColgramColemailerTest: PASS");
     }
 }

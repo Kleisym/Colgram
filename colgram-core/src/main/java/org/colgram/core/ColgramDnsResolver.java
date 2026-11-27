@@ -43,7 +43,8 @@ public class ColgramDnsResolver {
                 }
             }
         }
-        if (addresses.isEmpty() && !ColgramConfig.isStrictProxySecurityEnabled()) {
+        if (addresses.isEmpty() && !ColgramConfig.isStrictProxySecurityEnabled()
+                && !ColgramConfig.isMaxAnonymityEnabled()) {
             addresses = queryDoh(CLOUDFLARE_DOH + hostname + "&type=A");
             if (addresses.isEmpty()) {
                 addresses = queryDoh(GOOGLE_DOH + hostname + "&type=A");
@@ -57,8 +58,21 @@ public class ColgramDnsResolver {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(requestUrl);
-            conn = (HttpURLConnection) url.openConnection();
+            java.net.Proxy proxy = ColgramHttp.pickRelayProxy();
+            if (proxy == null && ColgramDpiBypass.isBound()) {
+                proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                        new java.net.InetSocketAddress("127.0.0.1", ColgramDpiBypass.activePort()));
+            }
+            if (proxy != null) {
+                conn = (HttpURLConnection) url.openConnection(proxy);
+            } else {
+                if (ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled()) {
+                    return list;
+                }
+                conn = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
+            }
             conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.setRequestProperty("Accept", "application/dns-json");
             conn.setConnectTimeout(3000);
             conn.setReadTimeout(3000);

@@ -16,7 +16,6 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 
@@ -218,7 +217,7 @@ public final class ColgramAccountSwitcherHelper {
         int evictSlot = ColgramAccountVaultPolicy.pickEvictableSlotAllowPinnedFallback(
                 pinned, lastUsed, activeAccount);
         if (evictSlot < 0 || evictSlot == activeAccount || evictSlot == UserConfig.selectedAccount) {
-            Toast.makeText(ctx, "Нет доступного слота", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(ctx, R.drawable.msg_info, "Нет доступного слота", true);
             return;
         }
 
@@ -228,7 +227,7 @@ public final class ColgramAccountSwitcherHelper {
 
         boolean archived = archiveNativeSlot(ctx, evictSlot);
         if (!archived) {
-            Toast.makeText(ctx, "Не удалось зашифровать слот перед освобождением", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(ctx, R.drawable.msg_info, "Не удалось зашифровать слот перед освобождением", true);
             return;
         }
 
@@ -345,7 +344,8 @@ public final class ColgramAccountSwitcherHelper {
                     LaunchActivity.instance.switchToAccount(slot, true);
                 }
             });
-            root.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50, 0, 0, 0, 4));
+            row.setMinimumHeight(dp(50));
+            root.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 4));
         }
 
         TextView vaultHeader = new TextView(activity);
@@ -484,7 +484,7 @@ public final class ColgramAccountSwitcherHelper {
                 }
                 final int savedCount = saved;
                 AndroidUtilities.runOnUIThread(() -> {
-                    Toast.makeText(ctx, "Зашифровано аккаунтов: " + savedCount, Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(ctx, R.drawable.msg_secret, "Зашифровано аккаунтов: " + savedCount, false);
                     if (holder[0] != null && holder[0].isShowing()) {
                         holder[0].dismiss();
                         if (!fragment.isFinishing() && !activity.isFinishing() && !activity.isDestroyed()) {
@@ -653,13 +653,13 @@ public final class ColgramAccountSwitcherHelper {
 
         ColgramAccountManager.VaultBundle bundle = ColgramAccountManager.readVaultBundle(ctx, entry.vaultKey);
         if (bundle == null) {
-            Toast.makeText(ctx, "Ошибка расшифровки аккаунта", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(ctx, R.drawable.msg_info, "Ошибка расшифровки аккаунта", true);
             return;
         }
 
         if (UserConfig.getInstance(targetSlot).isClientActivated()) {
             if (!archiveNativeSlot(ctx, targetSlot)) {
-                Toast.makeText(ctx, "Не удалось сохранить текущий слот", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(ctx, R.drawable.msg_info, "Не удалось сохранить текущий слот", true);
                 return;
             }
             MessagesController.getInstance(targetSlot).performLogout(0);
@@ -667,11 +667,11 @@ public final class ColgramAccountSwitcherHelper {
         }
 
         if (!ColgramAccountManager.writeVaultBundleToSlot(ctx, bundle, targetSlot)) {
-            Toast.makeText(ctx, "Ошибка записи сессии в слот", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(ctx, R.drawable.msg_info, "Ошибка записи сессии в слот", true);
             return;
         }
 
-        Toast.makeText(ctx, "Переключение на " + entry.name + "...", Toast.LENGTH_SHORT).show();
+        ColgramUiKit.showNotice(ctx, R.drawable.msg_secret, "Переключение на " + entry.name + "...", false);
         Intent relaunch = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName());
         if (relaunch != null) {
             relaunch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
@@ -702,8 +702,8 @@ public final class ColgramAccountSwitcherHelper {
                     ColgramPersistentBackup.buildOpenBackupIntent(),
                     ColgramPersistentBackup.REQ_RESTORE_PERSISTENT_BACKUP);
         } catch (Throwable t) {
-            Toast.makeText(activity.getApplicationContext(),
-                    "Не удалось открыть выбор файла: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(activity.getApplicationContext(), R.drawable.msg_info,
+                    "Не удалось открыть выбор файла: " + t.getMessage(), true);
         }
     }
 
@@ -718,8 +718,8 @@ public final class ColgramAccountSwitcherHelper {
                     ColgramPersistentBackup.REQ_EXPORT_PERSISTENT_BACKUP);
         } catch (Throwable t) {
             pendingExportPassphrase = null;
-            Toast.makeText(activity.getApplicationContext(),
-                    "Не удалось открыть сохранение файла: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(activity.getApplicationContext(), R.drawable.msg_info,
+                    "Не удалось открыть сохранение файла: " + t.getMessage(), true);
         }
     }
 
@@ -753,10 +753,10 @@ public final class ColgramAccountSwitcherHelper {
                         os.flush();
                     }
                     AndroidUtilities.runOnUIThread(() ->
-                            Toast.makeText(appCtx, "Полная зашифрованная копия сохранена!", Toast.LENGTH_LONG).show());
+                            ColgramUiKit.showNotice(appCtx, R.drawable.msg_check_s, "Полная зашифрованная копия сохранена!", false));
                 } catch (Throwable t) {
                     AndroidUtilities.runOnUIThread(() ->
-                            Toast.makeText(appCtx, "Ошибка экспорта: " + t.getMessage(), Toast.LENGTH_LONG).show());
+                            ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Ошибка экспорта: " + t.getMessage(), true));
                 } finally {
                     if (pass != null) java.util.Arrays.fill(pass, '\0');
                 }
@@ -776,7 +776,7 @@ public final class ColgramAccountSwitcherHelper {
                 }
             } catch (Throwable t) {
                 AndroidUtilities.runOnUIThread(() ->
-                        Toast.makeText(appCtx, "Ошибка чтения копии: " + t.getMessage(), Toast.LENGTH_LONG).show());
+                        ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Ошибка чтения копии: " + t.getMessage(), true));
             }
         });
         return true;
@@ -819,12 +819,13 @@ public final class ColgramAccountSwitcherHelper {
     private static void finishPersistentRestoreUi(Activity activity, ColgramPersistentBackup.RestoreResult res) {
         Context appCtx = activity.getApplicationContext();
         if (!res.success) {
-            Toast.makeText(appCtx, res.error.isEmpty() ? "Не удалось восстановить копию" : res.error, Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(appCtx, R.drawable.msg_info,
+                    res.error.isEmpty() ? "Не удалось восстановить копию" : res.error, true);
             return;
         }
-        Toast.makeText(appCtx,
+        ColgramUiKit.showNotice(appCtx, R.drawable.msg_check_s,
                 "Восстановлено данных: " + res.restoredFiles + " (+сейф: " + res.restoredVaultAccounts + "). Перезапуск…",
-                Toast.LENGTH_LONG).show();
+                false);
         Intent relaunch = appCtx.getPackageManager().getLaunchIntentForPackage(appCtx.getPackageName());
         if (relaunch != null) {
             relaunch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);

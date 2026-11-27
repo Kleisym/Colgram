@@ -2,8 +2,12 @@ package org.colgram.core;
 
 import android.app.Activity;
 import android.app.Application;
+import android.content.Context;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.widget.Toast;
 
 import java.lang.ref.WeakReference;
 
@@ -35,8 +39,58 @@ public final class ColgramUiBridge {
     private static WeakReference<Activity> currentActivity = new WeakReference<>(null);
     private static volatile boolean registered = false;
     private static volatile boolean isForeground = false;
+    private static volatile NoticeDispatcher noticeDispatcher;
+
+    public interface NoticeDispatcher {
+        void showBanner(Context ctx, String title, String subtitle, int iconRes, int accentColor);
+    }
 
     private ColgramUiBridge() {}
+
+    public static void setNoticeDispatcher(NoticeDispatcher dispatcher) {
+        noticeDispatcher = dispatcher;
+    }
+
+    public static void postNotice(Context ctx, String title, String subtitle, boolean isError) {
+        postNotice(ctx, title, subtitle, 0, isError ? 0xFFE11D48 : 0xFF10B981);
+    }
+
+    public static void postNotice(Context ctx, String title, String subtitle, int iconRes, int accentColor) {
+        final String safeTitle = title == null ? "" : title;
+        final String safeSub = subtitle == null ? "" : subtitle;
+        if (safeTitle.isEmpty() && safeSub.isEmpty()) {
+            return;
+        }
+        final Context anchor = ctx != null ? ctx : currentActivity.get();
+        final NoticeDispatcher dispatcher = noticeDispatcher;
+        Runnable task = () -> {
+            if (dispatcher != null) {
+                try {
+                    dispatcher.showBanner(anchor, safeTitle, safeSub, iconRes, accentColor);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (anchor != null) {
+                try {
+                    String msg = safeSub.isEmpty() ? safeTitle : (safeTitle.isEmpty() ? safeSub : (safeTitle + " — " + safeSub));
+                    Toast.makeText(anchor.getApplicationContext() != null ? anchor.getApplicationContext() : anchor,
+                            msg, accentColor == 0xFFE11D48 ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try {
+            Looper main = Looper.getMainLooper();
+            if (main == null || Looper.myLooper() == main) {
+                task.run();
+            } else {
+                new Handler(main).post(task);
+            }
+        } catch (Throwable ignored) {
+            task.run();
+        }
+    }
 
     /**
      * Start tracking the top activity. Safe to call repeatedly.
@@ -45,6 +99,14 @@ public final class ColgramUiBridge {
      *            calling Telegram class, since this module has no context of its own)
      */
     public static void install(Application app) {
+        if (app != null) {
+            try {
+                ColgramPremiumConfig.init(app);
+            } catch (Throwable ignored) {}
+            try {
+                ColgramSavedTagsStore.init(app);
+            } catch (Throwable ignored) {}
+        }
         if (app == null || registered) return;
         try {
             app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {

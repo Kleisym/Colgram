@@ -78,7 +78,7 @@ final class ColgramSocks5Codec {
         StringBuilder req = new StringBuilder(160);
         req.append("CONNECT ").append(authority).append(" HTTP/1.1\r\n");
         req.append("Host: ").append(authority).append("\r\n");
-        req.append("User-Agent: Colgram/1.0\r\n");
+        req.append("User-Agent: ").append(ColgramPolymorphicStealth.pickBrowserUserAgent()).append("\r\n");
         req.append("Proxy-Connection: Keep-Alive\r\n");
         if (username != null && !username.isEmpty()) {
             String creds = username + ":" + (password == null ? "" : password);

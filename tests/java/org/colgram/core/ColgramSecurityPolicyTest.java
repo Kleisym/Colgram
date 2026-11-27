@@ -162,6 +162,10 @@ public class ColgramSecurityPolicyTest {
         checkEq(false, legacyIosJs.contains("iPhone"), "JS shim never mixes iPhone tokens on Android build");
         checkEq(true, legacyIosJs.contains("37446") && legacyIosJs.contains("ANGLE (ARM, Immortalis-G715, OpenGL ES 3.2)"),
                 "normalized JS masks WebGL unmasked renderer");
+        checkEq(true, androidJs.contains("getTimezoneOffset") && androidJs.contains("UTC"),
+                "WebView spoof JS normalizes timezone to UTC");
+        checkEq(true, androidJs.contains("RTCPeerConnection") && androidJs.contains("webkitRTCPeerConnection"),
+                "WebView spoof JS neutralizes WebRTC IP leak");
     }
 
     public static void testIdempotentUserAgent() {
@@ -205,6 +209,11 @@ public class ColgramSecurityPolicyTest {
                 "cloaked connection params include manufacturer");
         checkEq(true, params.get("system_lang_code") != null && !params.get("system_lang_code").isEmpty(),
                 "cloaked connection params include system_lang_code");
+
+        java.util.Map<String, String> strippedParams = ColgramCloak.getCloakedConnectionParams(
+                "RealHardwareModel", "Android 13", "12.10.6-colgram.20261114", "ru");
+        checkEq("12.10.6", strippedParams.get("app_version"),
+                "cloaked connection params strip -colgram suffix from app_version");
     }
 
     public static void main(String[] args) {

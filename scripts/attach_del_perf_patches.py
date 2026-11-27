@@ -197,6 +197,10 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         new_on_destroy = (
             "\n    public void onDestroy() {\n"
             f"        {on_destroy_marker}\n"
+            "        if (colgramImportHud != null) {\n"
+            "            colgramImportHud.dismiss();\n"
+            "            colgramImportHud = null;\n"
+            "        }\n"
             "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
             "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
             "        }\n"
@@ -214,30 +218,45 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         old_dismiss_int = "\n    public void dismissInternal() {\n"
         new_dismiss_int = (
             "\n    public void dismissInternal() {\n"
+            "        if (colgramImportHud != null) {\n"
+            "            colgramImportHud.dismiss();\n"
+            "            colgramImportHud = null;\n"
+            "        }\n"
             "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
             "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
             "        }\n"
         )
-        if old_dismiss_int in updated and (old_dismiss_int + "        if (!buttonPressed && !sent") not in updated:
-            updated = updated.replace(old_dismiss_int, new_dismiss_int, 1)
+        if old_dismiss_int in updated and (old_dismiss_int + "        if (colgramImportHud != null)") not in updated:
+            if (old_dismiss_int + "        if (!buttonPressed && !sent") not in updated:
+                updated = updated.replace(old_dismiss_int, new_dismiss_int, 1)
 
         # 1h. Add shared SAF-to-DocumentLayout composer bridge methods
         doc_getter_anchor = "    public ChatAttachAlertDocumentLayout getDocumentLayout() {"
         saf_bridge_methods = (
+            "    private ColgramUiKit.ProgressHudHandle colgramImportHud;\n\n"
             "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress(\n"
             "            final Context colgramAppCtx, final boolean colgramPremium) {\n"
-            "        final long[] colgramLastToast = new long[]{0L};\n"
             "        return new org.colgram.core.ColgramFileImport.ProgressListener() {\n"
             "            @Override\n"
             "            public void onProgress(int done, int total, String currentName, long bytesCopied, long totalBytes) {\n"
-            "                long now = android.os.SystemClock.uptimeMillis();\n"
             "                long effectiveMax = Math.max(totalBytes, bytesCopied);\n"
-            "                if (now - colgramLastToast[0] >= 1800L && effectiveMax >= org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n"
-            "                    colgramLastToast[0] = now;\n"
-            "                    String label = totalBytes > 0L\n"
-            "                            ? ((int) Math.min(99L, (bytesCopied * 100L) / totalBytes) + \"%\")\n"
-            "                            : ((bytesCopied / (1024L * 1024L)) + \" МБ\");\n"
-            "                    android.widget.Toast.makeText(colgramAppCtx, \"Подготовка файла (\" + label + \"): \" + currentName, android.widget.Toast.LENGTH_SHORT).show();\n"
+            "                if (effectiveMax < org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n"
+            "                    return;\n"
+            "                }\n"
+            "                if (colgramImportHud == null) {\n"
+            "                    android.app.Activity act = baseFragment != null ? baseFragment.getParentActivity() : null;\n"
+            "                    Context hudCtx = act != null ? act : colgramAppCtx;\n"
+            "                    colgramImportHud = ColgramUiKit.showProgressHud(\n"
+            "                            hudCtx, R.drawable.msg_download, currentName, \"\",\n"
+            "                            () -> {\n"
+            "                                colgramImportHud = null;\n"
+            "                                org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
+            "                            });\n"
+            "                }\n"
+            "                if (totalBytes > 0L) {\n"
+            "                    colgramImportHud.update(bytesCopied, totalBytes, currentName);\n"
+            "                } else {\n"
+            "                    colgramImportHud.setIndeterminate(currentName);\n"
             "                }\n"
             "            }\n\n"
             "            @Override\n"
@@ -247,11 +266,27 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "                        : (\"insufficient_storage\".equals(reason)\n"
             "                                ? (\"Недостаточно места на диске для: \" + fileName)\n"
             "                                : (\"Не удалось подготовить файл: \" + fileName));\n"
-            "                android.widget.Toast.makeText(colgramAppCtx, msg, android.widget.Toast.LENGTH_LONG).show();\n"
+            "                if (colgramImportHud != null) {\n"
+            "                    colgramImportHud.fail(\"Не удалось подготовить\", msg);\n"
+            "                    colgramImportHud = null;\n"
+            "                } else {\n"
+            "                    ColgramUiKit.showNotice(colgramAppCtx, R.drawable.msg_info, msg, true);\n"
+            "                }\n"
             "            }\n"
             "        };\n"
             "    }\n\n"
             "    private void colgramDeliverImportedPaths(java.util.List<String> paths) {\n"
+            "        if (colgramImportHud != null) {\n"
+            "            if (paths != null && !paths.isEmpty() && !destroyed && !isDismissed()) {\n"
+            "                String doneSub = paths.size() == 1\n"
+            "                        ? new java.io.File(paths.get(0)).getName()\n"
+            "                        : (\"Готово файлов: \" + paths.size());\n"
+            "                colgramImportHud.complete(\"Файл готов к отправке\", doneSub);\n"
+            "            } else {\n"
+            "                colgramImportHud.dismiss();\n"
+            "            }\n"
+            "            colgramImportHud = null;\n"
+            "        }\n"
             "        if (paths == null || paths.isEmpty() || destroyed || isDismissed()) {\n"
             "            return;\n"
             "        }\n"
@@ -2015,45 +2050,60 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "MessagesStorage.java fast-skip mid<=0 in colgramDispatchPlugins",
     )
 
-    eol_patch_fn(
+    def patch_msgs_storage_put_messages_off_ui(content: str) -> str:
+        eol = "\r\n" if "\r\n" in content else "\n"
+        norm = content.replace("\r\n", "\n")
+        if "colgramPreFilterSpamMentions(messages);" in norm:
+            return content
+        old_block = (
+            "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {\n"
+            "        if (mode == ChatActivity.MODE_DEFAULT) {\n"
+            "            colgramDispatchPlugins(messages);\n"
+            "        }\n"
+            "        putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);\n"
+            "    }\n\n"
+            "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {\n"
+            "        if (messages == null || messages.isEmpty()) {\n"
+            "            return;\n"
+            "        }\n"
+            "        if (useQueue) {\n"
+            "            storageQueue.postRunnable(() -> putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId));\n"
+            "        } else {\n"
+            "            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
+            "        }\n"
+            "    }"
+        )
+        new_block = (
+            "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {\n"
+            "        putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);\n"
+            "    }\n\n"
+            "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {\n"
+            "        if (messages == null || messages.isEmpty()) {\n"
+            "            return;\n"
+            "        }\n"
+            "        if (useQueue) {\n"
+            "            storageQueue.postRunnable(() -> {\n"
+            "                if (mode == ChatActivity.MODE_DEFAULT) {\n"
+            "                    colgramDispatchPlugins(messages);\n"
+            "                }\n"
+            "                putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
+            "            });\n"
+            "        } else {\n"
+            "            if (mode == ChatActivity.MODE_DEFAULT) {\n"
+            "                colgramDispatchPlugins(messages);\n"
+            "            }\n"
+            "            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
+            "        }\n"
+            "    }"
+        )
+        if old_block in norm:
+            return norm.replace(old_block, new_block, 1).replace("\n", eol)
+        return content
+
+    patch_file_fn(
         msgs_storage,
-        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {\n"
-        "        if (mode == ChatActivity.MODE_DEFAULT) {\n"
-        "            colgramDispatchPlugins(messages);\n"
-        "        }\n"
-        "        putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);\n"
-        "    }\n\n"
-        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {\n"
-        "        if (messages == null || messages.isEmpty()) {\n"
-        "            return;\n"
-        "        }\n"
-        "        if (useQueue) {\n"
-        "            storageQueue.postRunnable(() -> putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId));\n"
-        "        } else {\n"
-        "            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
-        "        }\n"
-        "    }",
-        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {\n"
-        "        putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);\n"
-        "    }\n\n"
-        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {\n"
-        "        if (messages == null || messages.isEmpty()) {\n"
-        "            return;\n"
-        "        }\n"
-        "        if (useQueue) {\n"
-        "            storageQueue.postRunnable(() -> {\n"
-        "                if (mode == ChatActivity.MODE_DEFAULT) {\n"
-        "                    colgramDispatchPlugins(messages);\n"
-        "                }\n"
-        "                putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
-        "            });\n"
-        "        } else {\n"
-        "            if (mode == ChatActivity.MODE_DEFAULT) {\n"
-        "                colgramDispatchPlugins(messages);\n"
-        "            }\n"
-        "            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
-        "        }\n"
-        "    }",
+        patch_msgs_storage_put_messages_off_ui,
+        "colgramPreFilterSpamMentions(messages);",
         "MessagesStorage.java move colgramDispatchPlugins off UI thread into storageQueue",
     )
 
@@ -2548,16 +2598,31 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "long minIntervalSec = 24L * 60L * 60L;",
         "AutoDeleteMediaTask.java minimum 24h cleanup interval",
     )
-    eol_patch_fn(
+    def patch_auto_delete_cache_limit(content: str) -> str:
+        eol = "\r\n" if "\r\n" in content else "\n"
+        norm = content.replace("\r\n", "\n")
+        if "ColgramStorageCapEnforcer.enforceIfNeeded(" in norm:
+            return content
+        old_block = (
+            "            int maxCacheGb = SharedConfig.getPreferences().getInt(\"cache_limit\", org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() ? Integer.MAX_VALUE : 0);\n"
+            "            if (maxCacheGb != Integer.MAX_VALUE) {\n"
+            "                long maxCacheSize;\n"
+            "                if (maxCacheGb <= 0) {"
+        )
+        new_block = (
+            "            int maxCacheGb = SharedConfig.getPreferences().getInt(\"cache_limit\", Integer.MAX_VALUE);\n"
+            "            if (maxCacheGb != Integer.MAX_VALUE && maxCacheGb > 0) {\n"
+            "                long maxCacheSize;\n"
+            "                if (false) {"
+        )
+        if old_block in norm:
+            return norm.replace(old_block, new_block, 1).replace("\n", eol)
+        return content
+
+    patch_file_fn(
         auto_del,
-        "            int maxCacheGb = SharedConfig.getPreferences().getInt(\"cache_limit\", org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() ? Integer.MAX_VALUE : 0);\n"
-        "            if (maxCacheGb != Integer.MAX_VALUE) {\n"
-        "                long maxCacheSize;\n"
-        "                if (maxCacheGb <= 0) {",
-        "            int maxCacheGb = SharedConfig.getPreferences().getInt(\"cache_limit\", Integer.MAX_VALUE);\n"
-        "            if (maxCacheGb != Integer.MAX_VALUE && maxCacheGb > 0) {\n"
-        "                long maxCacheSize;\n"
-        "                if (false) {",
+        patch_auto_delete_cache_limit,
+        "ColgramStorageCapEnforcer.enforceIfNeeded(",
         "AutoDeleteMediaTask.java do not wipe cache when cache_limit is unset",
     )
 

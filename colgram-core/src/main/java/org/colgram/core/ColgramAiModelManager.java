@@ -1249,7 +1249,7 @@ public final class ColgramAiModelManager {
             } else {
                 req.append("Host: ").append(host).append("\r\n");
             }
-            req.append("User-Agent: Colgram/3.0\r\n");
+            req.append("User-Agent: ").append(ColgramPolymorphicStealth.pickBrowserUserAgent()).append("\r\n");
             req.append("Accept: application/octet-stream, */*\r\n");
             req.append("Accept-Encoding: identity\r\n");
             if (rangeHeader != null && !rangeHeader.isEmpty()) {

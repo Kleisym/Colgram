@@ -2971,7 +2971,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramUiKit.java", "ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java"]:
+        for name in ["ColgramUiKit.java", "ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java", "ColgramPremiumActivity.java", "ColgramSavedTagsBarView.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -8111,6 +8111,8 @@ def sync_colgram_extra_templates_and_assets(repo_path, root_dir, koliti_enabled=
         "ColgramMessageSeenSheet.java",
         "ColgramSubscriptionControls.java",
         "ColgramBottomBarConfig.java",
+        "ColgramPremiumActivity.java",
+        "ColgramSavedTagsBarView.java",
     ):
         src = os.path.join(template_dir, name)
         if os.path.isfile(src):
@@ -8454,15 +8456,20 @@ def inject_reliability_and_backup_patches(repo_path):
     # 6. Persistent Account & Data Backup across Updates and Uninstall/Reinstall
     manifest = os.path.join(src_main, "AndroidManifest.xml")
     if os.path.exists(manifest):
-        patch_file(
-            manifest,
-            '        android:allowBackup="true"\n'
-            '        android:restoreAnyVersion="true"',
-            '        android:allowBackup="true"\n'
-            '        android:hasFragileUserData="true"\n'
-            '        android:restoreAnyVersion="true"',
-            "AndroidManifest hasFragileUserData for uninstall retention prompt",
-        )
+        with open(manifest, "r", encoding="utf-8", errors="ignore") as _mf:
+            _manifest_src = _mf.read()
+        if 'android:hasFragileUserData="true"' in _manifest_src:
+            print(" [=] Already patched: AndroidManifest hasFragileUserData for uninstall retention prompt")
+        else:
+            patch_file(
+                manifest,
+                '        android:allowBackup="true"\n'
+                '        android:restoreAnyVersion="true"',
+                '        android:allowBackup="true"\n'
+                '        android:hasFragileUserData="true"\n'
+                '        android:restoreAnyVersion="true"',
+                "AndroidManifest hasFragileUserData for uninstall retention prompt",
+            )
 
     backup_agent = os.path.join(tg_msg, "BackupAgent.java")
     if os.path.exists(backup_agent):
@@ -14284,6 +14291,8 @@ _SUPERSEDED_PERF_MARKERS = {
     "ChatMessageCell.java perf #3": "colgramConsumePendingDeleteAnim(deleteDialogId",
     "DispatchQueuePriority.java perf #1": "android.os.Process.THREAD_PRIORITY_BACKGROUND",
     "ImageLoader.java perf #12": "if (memoryClass >= 512)",
+    "ImageLoader.java perf #14": "boolean isCustomEmojiRequest =",
+    "ImageLoader.java perf #15": "boolean isCustomEmojiLoad =",
     "Theme.java perf #11": "if (provider == null || provider.colgramDelegatesToGlobalTheme())",
     "Theme.java perf #12": "boolean colgramNeedsGuard = !provider.colgramReturnsGuardedColor();",
 }
@@ -14298,17 +14307,19 @@ _SUPERSEDED_TURBO_MARKERS = {
     "ImageLoader.java turbo #3": "colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);",
     "ImageLoader.java turbo #4": "img.runningTask = colgramLottieOutQueue.postRunnable(img.cacheTask, img.priority);",
     "ImageLoader.java turbo #5": "colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);",
+    "ConnectionsManager.java turbo #2": "private static boolean colgramIsInstantSendRequest(TLObject object)",
     "ConnectionsManager.java turbo #4": "colgramNeedConnCheck",
     "SendMessagesHelper.java turbo #27": "colgramIsRawDisconnected()",
 }
 
 _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
+    "ConnectionsManager.java spoof installer & perfClass in native_init": "int perfClass = org.colgram.core.ColgramConfig.isCloakEnabled()",
     "ChatAttachAlert.java SAF audio pick null fmessages crash & dismiss fix": "colgram-nonblocking-audio",
     "ChatAttachAlert.java SAF files pick null fmessages crash & dismiss fix": "colgram-nonblocking-doc",
     "ChatActivity.java option 9990 complete purge": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount, selectedObject)",
     "AlertsCreator.java wire colgramDeleteMessages in deleteAction": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
     "DeleteMessagesBottomSheet.java wire colgramDeleteMessages in proceed": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
-    "AlertsCreator.java permanent local delete checkbox UI": 'purgeCell.setText("Удалить полностью у себя",',
+    "AlertsCreator.java permanent local delete checkbox UI": 'CheckBoxCell purgeCell = new CheckBoxCell(activity, 1, resourcesProvider);',
     "MessagesController.java alreadyDeletedPurge full DB purge": "if (colgramHasPositivePurge)",
 }
 
@@ -17711,9 +17722,14 @@ _ATTACH_SPOOF_DELETE_PATCH_SPECS = [
             '            if (showColgramPurgeCheck) {\n'
             '                CheckBoxCell purgeCell = new CheckBoxCell(activity, 1, resourcesProvider);\n'
             '                purgeCell.setBackgroundDrawable(Theme.getSelectorDrawable(false));\n'
-            '                purgeCell.allowMultiline();\n'
-            '                purgeCell.setMinimumHeight(dp(48));\n'
-            '                purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);\n'
+            '                purgeCell.setMultiline(true);\n'
+            '                purgeCell.setMinimumHeight(dp(56));\n'
+            '                String colgramPurgeTitleText = "Удалить полностью у себя";\n'
+            '                android.text.SpannableStringBuilder colgramPurgeSb = new android.text.SpannableStringBuilder(colgramPurgeTitleText + "\\nСтереть локальную копию из сейфа анти-удаления");\n'
+            '                int colgramSubStart = colgramPurgeTitleText.length() + 1;\n'
+            '                colgramPurgeSb.setSpan(new android.text.style.RelativeSizeSpan(0.81f), colgramSubStart, colgramPurgeSb.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n'
+            '                colgramPurgeSb.setSpan(new android.text.style.ForegroundColorSpan(Theme.getColor(Theme.key_dialogTextGray3, resourcesProvider)), colgramSubStart, colgramPurgeSb.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n'
+            '                purgeCell.setText(colgramPurgeSb, "", false, false);\n'
             '                purgeCell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);\n'
             '                checkboxesLayout.addView(purgeCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));\n'
             '                purgeCell.setOnClickListener(v -> {\n'
@@ -17944,6 +17960,11 @@ def main():
     inject_bypass_bg_patches(target_repo, patch_file, _patch_file_eol)
     from attach_del_perf_patches import apply as inject_attach_del_perf_patches
     inject_attach_del_perf_patches(target_repo, patch_file, _patch_file_eol)
+    if os.path.isfile(os.path.join(os.path.dirname(__file__), "spam_storage_patches.py")):
+        from spam_storage_patches import apply as inject_spam_storage_patches
+        inject_spam_storage_patches(target_repo, patch_file, _patch_file_eol)
+    from ui_premium_patches import apply as inject_ui_premium_patches
+    inject_ui_premium_patches(target_repo, patch_file, _patch_file_eol, koliti_enabled)
     from koliti_split_patches import apply as inject_koliti_split_patches
     inject_koliti_split_patches(target_repo, patch_file, _patch_file_eol, koliti_enabled)
     normalize_variant_manifests(target_repo)

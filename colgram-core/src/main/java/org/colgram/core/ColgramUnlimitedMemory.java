@@ -26,6 +26,7 @@ import java.util.Set;
 public final class ColgramUnlimitedMemory {
 
     private static final String TAG = "ColgramUnlimitedMemory";
+    private static final String TELEGRAM_MAINCONFIG = "mainconfig";
     private static final String KEY_CACHE_LIMIT = "cache_limit";
     private static final String KEY_KEEP_MEDIA = "keep_media";
     private static final String KEY_KEEP_MEDIA_TYPE_PREFIX = "keep_media_type_";
@@ -64,14 +65,56 @@ public final class ColgramUnlimitedMemory {
         return ColgramStorageIndex.isManagedModifiedFile(file);
     }
 
+    public static int toMainConfigCacheLimit(int capMb) {
+        if (capMb <= 0) return Integer.MAX_VALUE;
+        if (capMb == 512) return -512;
+        if (capMb == 1024) return -1024;
+        if (capMb == 2048) return 2;
+        if (capMb == 5120) return 5;
+        if (capMb % 1024 == 0 && (capMb / 1024) >= 2 && (capMb / 1024) <= 64) {
+            return capMb / 1024;
+        }
+        return -capMb;
+    }
+
+    /** Applies a finite hard storage cap (MB) in sync with Telegram's mainconfig & ColgramShieldConfig. */
+    public static void applyStorageCap(Context context, int capMb) {
+        if (context == null) return;
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        if (capMb <= 0) {
+            ColgramConfig.setUnlimitedMemoryEnabled(true);
+            apply(appCtx, true);
+            return;
+        }
+        ColgramShieldConfig.init(appCtx);
+        ColgramShieldConfig.setStorageCapEnabled(true);
+        ColgramShieldConfig.setStorageHardCapMb(capMb);
+        ColgramConfig.setUnlimitedMemoryEnabled(false);
+        try {
+            SharedPreferences prefs = appCtx.getSharedPreferences(TELEGRAM_MAINCONFIG, Context.MODE_PRIVATE);
+            prefs.edit()
+                    .putInt(KEY_CACHE_LIMIT, toMainConfigCacheLimit(capMb))
+                    .putInt(KEY_KEEP_MEDIA, KEEP_MEDIA_ONE_MONTH)
+                    .apply();
+        } catch (Throwable ignored) {}
+        apply(appCtx, false);
+        try {
+            ColgramBootJobService.scheduleStorageOptimize(appCtx);
+        } catch (Throwable ignored) {}
+        ColgramStorageCapEnforcer.enforceIfNeededAsync(appCtx, false);
+    }
+
+    /** Syncs cache limits and Shield hard cap across all accounts. */
     public static void apply(Context context, boolean enabled) {
         if (context == null) return;
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         try {
-            // Telegram's SharedConfig, CacheByChatsController, and AutoDeleteMediaTask read from "mainconfig"
-            SharedPreferences prefs = context.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+            ColgramShieldConfig.init(appCtx);
+            ColgramShieldConfig.setStorageCapEnabled(!enabled);
+            SharedPreferences prefs = appCtx.getSharedPreferences(TELEGRAM_MAINCONFIG, Context.MODE_PRIVATE);
             SharedPreferences.Editor editor = prefs.edit();
             int[] targetKeepTypes = new int[]{
-                    KEEP_MEDIA_FOREVER, KEEP_MEDIA_FOREVER, KEEP_MEDIA_FOREVER, KEEP_MEDIA_FOREVER
+                    KEEP_MEDIA_ONE_MONTH, KEEP_MEDIA_ONE_MONTH, KEEP_MEDIA_ONE_MONTH, KEEP_MEDIA_ONE_MONTH
             };
             int targetGlobalKeep = KEEP_MEDIA_FOREVER;
 
@@ -95,10 +138,12 @@ public final class ColgramUnlimitedMemory {
                     editor.putInt(KEY_KEEP_MEDIA_TYPE_PREFIX + t, KEEP_MEDIA_FOREVER);
                 }
             } else {
-                int restoredLimit = prefs.getInt("colgram_prev_cache_limit", 0);
+                int capMb = ColgramShieldConfig.getStorageHardCapMb();
+                if (capMb <= 0) capMb = ColgramShieldConfig.DEFAULT_STORAGE_HARD_CAP_MB;
+                int finiteLimit = toMainConfigCacheLimit(capMb);
                 int restoredKeep = prefs.getInt("colgram_prev_keep_media", KEEP_MEDIA_ONE_MONTH);
                 targetGlobalKeep = restoredKeep;
-                editor.putInt(KEY_CACHE_LIMIT, restoredLimit == Integer.MAX_VALUE ? 0 : restoredLimit);
+                editor.putInt(KEY_CACHE_LIMIT, finiteLimit);
                 editor.putInt(KEY_KEEP_MEDIA, restoredKeep);
                 for (int t = 0; t < 4; t++) {
                     String pk = "colgram_prev_" + KEY_KEEP_MEDIA_TYPE_PREFIX + t;
@@ -150,30 +195,38 @@ public final class ColgramUnlimitedMemory {
                     } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
-            Log.i(TAG, "cache limit " + (enabled ? "pinned to unlimited (keep forever)" : "restored finite limit"));
+            Log.i(TAG, "cache limit " + (enabled ? "pinned to unlimited (keep forever)" : "synced to hard cap " + ColgramShieldConfig.getStorageHardCapMb() + " MB"));
         } catch (Throwable t) {
             Log.w(TAG, "cannot write cache limit", t);
         }
     }
 
-    /** Applied once at startup off the critical UI path so a reboot cannot resurrect a pruning limit. */
+    /** Applied once at startup off the critical UI path so hard 1 GB cap or Unlimited stays consistent. */
     public static void restore(Context context) {
         if (context == null) return;
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         ColgramOptimizer.scheduleAfterStartup(() -> {
             try {
+                ColgramShieldConfig.init(appCtx);
                 ColgramStorageIndex.init(appCtx.getFilesDir());
             } catch (Throwable ignored) {}
-            if (ColgramConfig.isUnlimitedMemoryEnabled()) {
+            if (!ColgramShieldConfig.isStorageCapEnabled() && ColgramConfig.isUnlimitedMemoryEnabled()) {
                 apply(appCtx, true);
                 if (ColgramConfig.isAutoCompressStorageEnabled()) {
                     autoCompressOversizedCacheImagesAsync(appCtx);
                 }
-            } else if (!ColgramConfig.isUnlimitedMemoryConfigured()) {
-                apply(appCtx, true);
+            } else {
+                // Default 3-tier virtual storage hard cap (default 1024 MB)
+                apply(appCtx, false);
+                if (ColgramConfig.isUnlimitedMemoryEnabled()) {
+                    ColgramConfig.setUnlimitedMemoryEnabled(false);
+                }
             }
             try {
                 ColgramBootJobService.scheduleStorageOptimize(appCtx);
+            } catch (Throwable ignored) {}
+            try {
+                ColgramStorageCapEnforcer.scheduleInitialAccountingAndEnforce(appCtx);
             } catch (Throwable ignored) {}
         });
     }
@@ -493,6 +546,10 @@ public final class ColgramUnlimitedMemory {
 
     private static Collection<File> collectOptimizationRoots(Context appCtx) {
         LinkedHashSet<File> roots = new LinkedHashSet<>();
+        if (appCtx == null) return roots;
+        try {
+            roots.addAll(ColgramStorageCapEnforcer.collectAllManagedRoots(appCtx));
+        } catch (Throwable ignored) {}
         try {
             int[] sandboxTypes = new int[]{0, 1, 2, 3, 4, 5, 6, 100, 101};
             for (int type : sandboxTypes) {
@@ -501,27 +558,6 @@ public final class ColgramUnlimitedMemory {
                     roots.add(dir);
                 }
             }
-        } catch (Throwable ignored) {}
-        try {
-            File filesDir = appCtx.getFilesDir();
-            if (filesDir != null) {
-                File mediaHistory = new File(filesDir, "media_history");
-                if (mediaHistory.isDirectory()) roots.add(mediaHistory);
-                File inbox = new File(filesDir, "colgram_inbox");
-                if (inbox.isDirectory()) roots.add(inbox);
-            }
-        } catch (Throwable ignored) {}
-        try {
-            File extInbox = appCtx.getExternalFilesDir("colgram_inbox");
-            if (extInbox != null && extInbox.isDirectory()) roots.add(extInbox);
-        } catch (Throwable ignored) {}
-        try {
-            File extCache = appCtx.getExternalCacheDir();
-            if (extCache != null && extCache.isDirectory()) roots.add(extCache);
-        } catch (Throwable ignored) {}
-        try {
-            File intCache = appCtx.getCacheDir();
-            if (intCache != null && intCache.isDirectory()) roots.add(intCache);
         } catch (Throwable ignored) {}
         return roots;
     }
@@ -560,89 +596,97 @@ public final class ColgramUnlimitedMemory {
         } catch (Throwable ignored) {}
     }
 
-    /**
-     * EXIF-orientation-preserving, ARGB_8888 color-safe Android image transcoder.
-     */
-    private static final ColgramStorageOptimizer.ImageTranscoder ANDROID_BITMAP_TRANSCODER =
-            new ColgramStorageOptimizer.ImageTranscoder() {
-                @Override
-                public boolean transcode(File source, File tempDest, int preset) throws Exception {
-                    if (source == null || tempDest == null || !source.isFile()) return false;
-                    String lower = source.getName().toLowerCase(Locale.ROOT);
-                    boolean isPng = lower.endsWith(".png");
-                    boolean isJpg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
-                    if (!isPng && !isJpg) return false;
+    /** Creates an EXIF-safe ARGB_8888 WebP transcoder for Tier-1 cache & Shadow Micro-Vault compression. */
+    @SuppressWarnings("deprecation")
+    public static ColgramStorageOptimizer.ImageTranscoder createWebpTranscoder(final int defaultQuality, final int defaultMaxDim) {
+        return new ColgramStorageOptimizer.ImageTranscoder() {
+            @Override
+            public boolean transcode(File source, File tempDest, int preset) throws Exception {
+                if (source == null || tempDest == null || !source.isFile()) return false;
+                String lower = source.getName().toLowerCase(Locale.ROOT);
+                boolean isPng = lower.endsWith(".png");
+                boolean isJpg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+                boolean isWebp = lower.endsWith(".webp");
+                if (!isPng && !isJpg && !isWebp) return false;
 
-                    int targetMaxDim = (preset == ColgramStorageOptimizer.PRESET_MAX) ? 1920 : 2560;
-                    int jpegQuality = (preset == ColgramStorageOptimizer.PRESET_MAX) ? 74 : 82;
+                int targetMaxDim = defaultMaxDim > 0
+                        ? ((preset == ColgramStorageOptimizer.PRESET_MAX) ? Math.min(defaultMaxDim, 1600) : defaultMaxDim)
+                        : ((preset == ColgramStorageOptimizer.PRESET_MAX) ? 1600 : 1920);
+                int quality = defaultQuality > 0
+                        ? ((preset == ColgramStorageOptimizer.PRESET_MAX) ? Math.min(defaultQuality, 62) : defaultQuality)
+                        : ((preset == ColgramStorageOptimizer.PRESET_MAX) ? 62 : 78);
 
-                    BitmapFactory.Options bounds = new BitmapFactory.Options();
-                    bounds.inJustDecodeBounds = true;
-                    BitmapFactory.decodeFile(source.getAbsolutePath(), bounds);
-                    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false;
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeFile(source.getAbsolutePath(), bounds);
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false;
 
-                    int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
-                    int sampleSize = 1;
-                    while ((maxDim / (sampleSize * 2)) >= targetMaxDim) {
-                        sampleSize *= 2;
+                int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
+                int sampleSize = 1;
+                while ((maxDim / (sampleSize * 2)) >= targetMaxDim) {
+                    sampleSize *= 2;
+                }
+
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inSampleSize = sampleSize;
+                opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+
+                Bitmap bmp = BitmapFactory.decodeFile(source.getAbsolutePath(), opts);
+                if (bmp == null) return false;
+
+                try {
+                    if (isPng && bmp.hasAlpha()) {
+                        return false;
                     }
 
-                    BitmapFactory.Options opts = new BitmapFactory.Options();
-                    opts.inSampleSize = sampleSize;
-                    // Strictly use 32-bit ARGB_8888 (never destructive 16-bit RGB_565)
-                    opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                    int exifOrientation = ExifInterface.ORIENTATION_NORMAL;
+                    if (isJpg) {
+                        try {
+                            ExifInterface exif = new ExifInterface(source.getAbsolutePath());
+                            exifOrientation = exif.getAttributeInt(
+                                    ExifInterface.TAG_ORIENTATION,
+                                    ExifInterface.ORIENTATION_NORMAL);
+                        } catch (Throwable ignored) {}
+                    }
 
-                    Bitmap bmp = BitmapFactory.decodeFile(source.getAbsolutePath(), opts);
-                    if (bmp == null) return false;
+                    Matrix matrix = buildExifAndScaleMatrix(
+                            bmp.getWidth(), bmp.getHeight(), targetMaxDim, exifOrientation);
+                    if (matrix != null) {
+                        Bitmap transformed = Bitmap.createBitmap(
+                                bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), matrix, true);
+                        if (transformed != null && transformed != bmp) {
+                            bmp.recycle();
+                            bmp = transformed;
+                        }
+                    }
 
-                    try {
-                        if (isPng && bmp.hasAlpha()) {
-                            // Never strip transparency or change format of transparent PNGs
+                    try (FileOutputStream fos = new FileOutputStream(tempDest)) {
+                        Bitmap.CompressFormat fmt = android.os.Build.VERSION.SDK_INT >= 30
+                                ? Bitmap.CompressFormat.WEBP_LOSSY
+                                : Bitmap.CompressFormat.WEBP;
+                        if (!bmp.compress(fmt, quality, fos)) {
                             return false;
                         }
-
-                        int exifOrientation = ExifInterface.ORIENTATION_NORMAL;
-                        if (isJpg) {
-                            try {
-                                ExifInterface exif = new ExifInterface(source.getAbsolutePath());
-                                exifOrientation = exif.getAttributeInt(
-                                        ExifInterface.TAG_ORIENTATION,
-                                        ExifInterface.ORIENTATION_NORMAL);
-                            } catch (Throwable ignored) {}
-                        }
-
-                        Matrix matrix = buildExifAndScaleMatrix(
-                                bmp.getWidth(), bmp.getHeight(), targetMaxDim, exifOrientation);
-                        if (matrix != null) {
-                            Bitmap transformed = Bitmap.createBitmap(
-                                    bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), matrix, true);
-                            if (transformed != null && transformed != bmp) {
-                                bmp.recycle();
-                                bmp = transformed;
-                            }
-                        }
-
-                        try (FileOutputStream fos = new FileOutputStream(tempDest)) {
-                            Bitmap.CompressFormat fmt = isPng
-                                    ? Bitmap.CompressFormat.PNG
-                                    : Bitmap.CompressFormat.JPEG;
-                            int q = isPng ? 100 : jpegQuality;
-                            if (!bmp.compress(fmt, q, fos)) {
-                                return false;
-                            }
-                            fos.flush();
-                            try {
-                                fos.getFD().sync();
-                            } catch (Throwable ignored) {}
-                        }
-                        return tempDest.isFile() && tempDest.length() > 4096L;
-                    } finally {
-                        if (bmp != null && !bmp.isRecycled()) {
-                            bmp.recycle();
-                        }
+                        fos.flush();
+                        try {
+                            fos.getFD().sync();
+                        } catch (Throwable ignored) {}
+                    }
+                    return tempDest.isFile() && tempDest.length() > 512L;
+                } finally {
+                    if (bmp != null && !bmp.isRecycled()) {
+                        bmp.recycle();
                     }
                 }
-            };
+            }
+        };
+    }
+
+    /**
+     * EXIF-orientation-preserving, ARGB_8888 color-safe Android image transcoder (WebP lossy).
+     */
+    private static final ColgramStorageOptimizer.ImageTranscoder ANDROID_BITMAP_TRANSCODER =
+            createWebpTranscoder(78, 1920);
 
     private static Matrix buildExifAndScaleMatrix(int width, int height, int targetMaxDim, int exifOrientation) {
         if (width <= 0 || height <= 0) return null;

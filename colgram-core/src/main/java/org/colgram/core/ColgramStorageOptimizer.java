@@ -408,29 +408,20 @@ public final class ColgramStorageOptimizer {
                     continue;
                 }
 
-                // Attempt atomic POSIX/NIO hardlink replacement
+                // Attempt atomic POSIX/NIO hardlink replacement.
+                // On Android external FUSE/sdcardfs where hardlink() is unsupported, NEVER duplicate
+                // files into .colgram_cas (avoids 2x disk inflation bug on FUSE).
                 if (tryHardlinkReplace(canonical, f)) {
                     ColgramStorageIndex.recordEntry(f, len, f.length(), sha, ColgramStorageIndex.STATE_DEDUP_LINK);
                     result.dedupedFiles++;
                     result.dedupedSavedBytes += len;
-                } else if (casDir != null) {
-                    // On filesystems where hardlinks are unsupported (e.g. Android external FUSE),
-                    // stage canonical copy in .colgram_cas/<ab>/<sha256> and record CAS dedup reference
-                    File casBlob = ensureCasBlob(casDir, sha, canonical);
-                    if (casBlob != null && casBlob.isFile()) {
-                        ColgramStorageIndex.registerCanonicalHash(sha, casBlob.getAbsolutePath());
-                        ColgramStorageIndex.recordEntry(f, len, f.length(), sha, ColgramStorageIndex.STATE_DEDUP_CAS);
-                        result.dedupedFiles++;
-                        result.dedupedSavedBytes += len;
-                    }
                 }
             }
         }
         if (casDir != null) {
-            ColgramStorageIndex.flushToDirectory(casDir);
-        } else {
-            ColgramStorageIndex.flush();
+            result.wasteReclaimedBytes += pruneOrphanCasBlobs(casDir);
         }
+        ColgramStorageIndex.flush();
         return result;
     }
 
@@ -511,31 +502,6 @@ public final class ColgramStorageOptimizer {
                 tmpLink.delete();
             }
         }
-    }
-
-    private static File ensureCasBlob(File casDir, String sha256, File sourceFile) {
-        if (casDir == null || sha256 == null || sha256.length() < 4 || sourceFile == null || !sourceFile.isFile()) {
-            return null;
-        }
-        try {
-            File shard = new File(casDir, sha256.substring(0, 2));
-            if (!shard.exists()) shard.mkdirs();
-            String ext = "";
-            String name = sourceFile.getName();
-            int dot = name.lastIndexOf('.');
-            if (dot > 0 && dot >= name.length() - 6) {
-                ext = name.substring(dot).toLowerCase(Locale.ROOT);
-            }
-            File blob = new File(shard, sha256 + ext);
-            if (blob.isFile() && blob.length() == sourceFile.length()) {
-                return blob;
-            }
-            if (tryHardlinkOrCopy(sourceFile, blob)) {
-                return blob;
-            }
-        } catch (Throwable ignored) {
-        }
-        return null;
     }
 
     public static boolean tryHardlinkOrCopy(File src, File dst) {
@@ -650,6 +616,10 @@ public final class ColgramStorageOptimizer {
     }
 
     public static long pruneAcacheDirectory(File acacheDir, Set<String> activePaths, long nowMs) {
+        return pruneAcacheDirectory(acacheDir, activePaths, nowMs, ACACHE_MAX_BYTES);
+    }
+
+    public static long pruneAcacheDirectory(File acacheDir, Set<String> activePaths, long nowMs, long maxBytes) {
         if (acacheDir == null || !acacheDir.isDirectory()) return 0L;
         long reclaimed = 0L;
         List<File> surviving = new ArrayList<>();
@@ -659,7 +629,7 @@ public final class ColgramStorageOptimizer {
         for (File f : files) {
             if (f == null || ".nomedia".equals(f.getName())) continue;
             if (f.isDirectory()) {
-                reclaimed += pruneAcacheDirectory(f, activePaths, nowMs);
+                reclaimed += pruneAcacheDirectory(f, activePaths, nowMs, maxBytes);
                 continue;
             }
             if (isPathActive(f, activePaths)) continue;
@@ -674,7 +644,7 @@ public final class ColgramStorageOptimizer {
                 survivingBytes += len;
             }
         }
-        if (survivingBytes > ACACHE_MAX_BYTES) {
+        if (maxBytes > 0L && survivingBytes > maxBytes) {
             Collections.sort(surviving, new Comparator<File>() {
                 @Override
                 public int compare(File a, File b) {
@@ -682,12 +652,72 @@ public final class ColgramStorageOptimizer {
                 }
             });
             for (File f : surviving) {
-                if (survivingBytes <= ACACHE_MAX_BYTES) break;
+                if (survivingBytes <= maxBytes) break;
                 long len = f.length();
                 if (f.delete()) {
                     survivingBytes -= len;
                     reclaimed += len;
                 }
+            }
+        }
+        return reclaimed;
+    }
+
+    /**
+     * Cleans up orphan or duplicate .colgram_cas blobs created by older versions when FUSE hardlinks failed.
+     */
+    public static long pruneOrphanCasBlobs(File casDir) {
+        if (casDir == null || !casDir.isDirectory()) return 0L;
+        long reclaimed = 0L;
+        File[] children = sortedChildren(casDir);
+        if (children == null) return 0L;
+        String casNorm = ColgramStorageIndex.normalizePath(casDir);
+        for (File child : children) {
+            if (child == null) continue;
+            String name = child.getName();
+            if (".nomedia".equals(name) || "colgram_storage_index_v1.tsv.gz".equals(name)) continue;
+            if (child.isDirectory()) {
+                File[] blobs = sortedChildren(child);
+                if (blobs != null) {
+                    for (File blob : blobs) {
+                        if (blob == null || !blob.isFile()) continue;
+                        String bn = blob.getName();
+                        if (bn.endsWith(".cgtmp") || bn.endsWith(".tmp")) {
+                            long len = blob.length();
+                            if (blob.delete()) reclaimed += len;
+                            continue;
+                        }
+                        int dot = bn.indexOf('.');
+                        String sha = dot > 0 ? bn.substring(0, dot) : bn;
+                        // Only remove CAS blob when it is an unreferenced orphan or a duplicate copy
+                        // (never delete if an active entry shares its underlying inode as sole data).
+                        boolean linkedToNonCas = false;
+                        for (ColgramStorageIndex.Entry e : ColgramStorageIndex.allEntries()) {
+                            if (e == null || e.isDehydrated() || e.sha256.isEmpty() || !sha.equals(e.sha256)) continue;
+                            if (e.path.startsWith(casNorm + "/")) continue;
+                            File f = new File(e.path);
+                            if (f.isFile() && areSameUnderlyingFile(blob, f)) {
+                                linkedToNonCas = true;
+                                break;
+                            }
+                        }
+                        if (!linkedToNonCas) {
+                            long len = blob.length();
+                            if (blob.delete()) {
+                                reclaimed += len;
+                                ColgramStorageIndex.removeEntry(blob.getAbsolutePath());
+                            }
+                        }
+                    }
+                }
+                File[] rem = child.listFiles();
+                if (rem == null || rem.length == 0) {
+                    //noinspection ResultOfMethodCallIgnored
+                    child.delete();
+                }
+            } else if (name.endsWith(".cgtmp") || name.endsWith(".tmp")) {
+                long len = child.length();
+                if (child.delete()) reclaimed += len;
             }
         }
         return reclaimed;

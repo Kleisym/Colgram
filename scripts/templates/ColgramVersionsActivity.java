@@ -577,7 +577,7 @@ public class ColgramVersionsActivity extends BaseFragment {
             conn.setConnectTimeout(12000);
             conn.setReadTimeout(12000);
             conn.setRequestProperty("Accept", "application/vnd.github+json");
-            conn.setRequestProperty("User-Agent", "Colgram-Android");
+            conn.setRequestProperty("User-Agent", org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent());
             int code = conn.getResponseCode();
             InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
             if (is == null) {
@@ -853,7 +853,7 @@ public class ColgramVersionsActivity extends BaseFragment {
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(30000);
             conn.setInstanceFollowRedirects(false);
-            conn.setRequestProperty("User-Agent", "Colgram-Android");
+            conn.setRequestProperty("User-Agent", org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent());
             conn.connect();
             int code = conn.getResponseCode();
             if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
@@ -875,7 +875,8 @@ public class ColgramVersionsActivity extends BaseFragment {
         final Context appCtx = ctx.getApplicationContext();
         try {
             if (Build.VERSION.SDK_INT >= 26 && !appCtx.getPackageManager().canRequestPackageInstalls()) {
-                Toast.makeText(appCtx, "Разрешите установку обновлений Colgram из неизвестных источников", Toast.LENGTH_LONG).show();
+                ColgramUiKit.showNotice(this, R.drawable.msg_info,
+                        "Разрешите установку обновлений Colgram из неизвестных источников", true);
                 Intent perm = new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                         Uri.parse("package:" + appCtx.getPackageName()));
                 perm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -890,7 +891,8 @@ public class ColgramVersionsActivity extends BaseFragment {
             appCtx.startActivity(intent);
         } catch (Throwable t) {
             Log.w(TAG, "installer launch failed: " + t.getMessage());
-            Toast.makeText(appCtx, "Не удалось запустить установщик: " + t.getMessage(), Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(this, R.drawable.msg_info,
+                    "Не удалось запустить установщик: " + t.getMessage(), true);
         }
     }
 

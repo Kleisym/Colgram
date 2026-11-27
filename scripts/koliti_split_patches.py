@@ -449,18 +449,20 @@ def _configure_proguard_rules(repo_path: str) -> None:
         return
     with open(rules_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
         raw = fh.read()
-    if "# COLGRAM_R8_KEEP_RULES = 2" in raw:
+    if "# COLGRAM_R8_KEEP_RULES = 3" in raw:
         return
     eol = "\r\n" if "\r\n" in raw else "\n"
     text = raw.replace("\r\n", "\n")
-    text = re.sub(r"\n*# COLGRAM_R8_KEEP_RULES = 1[\s\S]*$", "", text).rstrip("\n")
+    text = re.sub(r"\n*# COLGRAM_R8_KEEP_RULES = (?:1|2)[\s\S]*$", "", text).rstrip("\n")
     block = (
-        "\n\n# COLGRAM_R8_KEEP_RULES = 2\n"
+        "\n\n# COLGRAM_R8_KEEP_RULES = 3\n"
         "-dontobfuscate\n"
         "-keepclasseswithmembernames,includedescriptorclasses class * {\n"
         "    native <methods>;\n"
         "}\n"
         "-keep class org.colgram.** { *; }\n"
+        "-keep class org.colgram.core.ColgramKolitiVoice { *; }\n"
+        "-keep interface org.colgram.core.ColgramKolitiVoice$TranscriptionCallback { *; }\n"
         "-keep class org.telegram.ui.Colgram* { *; }\n"
         "-keep class org.telegram.ui.Colgram*$* { *; }\n"
         "-keep class org.telegram.messenger.Colgram* { *; }\n"
@@ -737,8 +739,17 @@ def _upgrade_alerts_creator_subtitle(repo_path: str, eol_patch_fn) -> None:
     )
     _patch_text_replace_eol(
         alerts_path,
-        '                purgeCell.setText("Удалить полностью у себя", "", false, false);',
-        '                purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);',
+        '                purgeCell.allowMultiline();\n                purgeCell.setMinimumHeight(dp(48));\n                purgeCell.setText("Удалить полностью у себя", "", false, false);',
+        (
+            "                purgeCell.setMultiline(true);\n"
+            "                purgeCell.setMinimumHeight(dp(56));\n"
+            '                String colgramPurgeTitleText = "Удалить полностью у себя";\n'
+            '                android.text.SpannableStringBuilder colgramPurgeSb = new android.text.SpannableStringBuilder(colgramPurgeTitleText + "\\nСтереть локальную копию из сейфа анти-удаления");\n'
+            "                int colgramSubStart = colgramPurgeTitleText.length() + 1;\n"
+            "                colgramPurgeSb.setSpan(new android.text.style.RelativeSizeSpan(0.81f), colgramSubStart, colgramPurgeSb.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n"
+            "                colgramPurgeSb.setSpan(new android.text.style.ForegroundColorSpan(Theme.getColor(Theme.key_dialogTextGray3, resourcesProvider)), colgramSubStart, colgramPurgeSb.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);\n"
+            '                purgeCell.setText(colgramPurgeSb, "", false, false);'
+        ),
         "AlertsCreator.java permanent delete anti-delete subtitle",
         eol_patch_fn,
     )

@@ -338,22 +338,14 @@ public final class ColgramSecurityDefender {
                     ColgramSecurityPolicy.STATUS_SEALED));
         }
 
-        // 9. Update Signature / Hijack Guard
-        if (!ColgramConfig.isAutoUpdateEnabled() && autoClose) {
-            ColgramConfig.setAutoUpdateEnabled(true);
-            autoFixed++;
-            findings.add(new ColgramSecurityPolicy.AuditFinding(
-                    "update_integrity", "Целостность обновлений",
-                    "Восстановлено безопасное автообновление",
-                    "OTA использует проверку SHA-256 и блокирует чужие пакеты официального клиента.",
-                    ColgramSecurityPolicy.STATUS_AUTO_FIXED));
-        } else {
-            findings.add(new ColgramSecurityPolicy.AuditFinding(
-                    "update_integrity", "Целостность обновлений",
-                    "Защита от подмены APK и чужих подписей",
-                    "Обновления проверяются по SHA-256; несовместимые пакеты upstream заблокированы.",
-                    ColgramSecurityPolicy.STATUS_SEALED));
-        }
+        // 9. Update Signature / Hijack Guard (OTA stays strictly opt-in; SHA-256 verification stays active)
+        findings.add(new ColgramSecurityPolicy.AuditFinding(
+                "update_integrity", "Целостность обновлений",
+                ColgramConfig.isAutoUpdateEnabled()
+                        ? "Защита от подмены APK и чужих подписей"
+                        : "Автообновление отключено (ручная проверка с SHA-256)",
+                "Обновления проверяются по SHA-256; несовместимые пакеты upstream заблокированы.",
+                ColgramSecurityPolicy.STATUS_SEALED));
 
         // 10. Telemetry / Analytics Beacons Audit (Runtime check)
         boolean telemetryClean = isTelemetryStrippedRuntime(app);

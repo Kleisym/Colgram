@@ -24,6 +24,7 @@ public class ColgramHookHandler {
             ColgramCrashGuard.install(appContext);
             ColgramOptimizer.optimizeStartup(appContext);
             ColgramConfig.init(appContext);
+            ColgramShieldConfig.init(appContext);
             hookIoExecutor.execute(() -> {
                 try {
                     java.io.File cacheDir = appContext.getCacheDir();
@@ -585,6 +586,11 @@ public class ColgramHookHandler {
                         messageLogFile = new java.io.File(dir, "messages_log.jsonl");
                     } else if (messageLogWriter != null && (messageLogTotalWrites++ & 63) == 0 && !messageLogFile.exists()) {
                         closeMessageLogWriterLocked();
+                    }
+                    if (messageLogFile.isFile()
+                            && messageLogFile.length() >= ColgramStorageCapEnforcer.MESSAGES_LOG_ROTATE_BYTES) {
+                        closeMessageLogWriterLocked();
+                        ColgramStorageCapEnforcer.rotateMessagesLogIfNeeded(messageLogFile.getParentFile());
                     }
                     if (messageLogWriter == null) {
                         java.io.File parent = messageLogFile.getParentFile();
@@ -1566,5 +1572,124 @@ public class ColgramHookHandler {
                 ColgramCloak.getEffectiveDeviceModel(),
                 ColgramCloak.getEffectiveSystemVersion(),
                 cloak);
+    }
+
+    // --- Anti-Ping Collapsed Stubs, Interaction Cache, Shadow Vault & Hard Cap hooks ---
+
+    private static final java.util.Set<String> expandedSpamSessionKeys =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    public static void recordCollapsedSpam(long dialogId, int messageId, long senderId, String reason) {
+        if (appContext == null || dialogId == 0L || messageId == 0) return;
+        ColgramDatabase.getInstance(appContext).recordCollapsedSpam(dialogId, messageId, senderId, reason);
+    }
+
+    public static boolean isMessageCollapsedSpam(long dialogId, int messageId) {
+        if (appContext == null || dialogId == 0L || messageId == 0) return false;
+        if (!ColgramShieldConfig.isCollapseSpamPingsEnabled()) return false;
+        if (expandedSpamSessionKeys.contains(dialogId + ":" + messageId)) return false;
+        return ColgramDatabase.getInstance(appContext).isCollapsedSpam(dialogId, messageId);
+    }
+
+    public static String getCollapsedSpamReason(long dialogId, int messageId) {
+        if (appContext == null || dialogId == 0L || messageId == 0) return null;
+        return ColgramDatabase.getInstance(appContext).getCollapsedSpamReason(dialogId, messageId);
+    }
+
+    public static void toggleExpandCollapsedSpam(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId == 0) return;
+        String key = dialogId + ":" + messageId;
+        if (!expandedSpamSessionKeys.add(key)) {
+            expandedSpamSessionKeys.remove(key);
+        }
+    }
+
+    public static void recordOutgoingUserInteraction(long userId) {
+        ColgramSpamGuard.recordOutgoingInteraction(userId);
+    }
+
+    /** Captures zlib-compressed metadata into Lazy Shadow Vault without network traffic. */
+    public static void captureShadowMessageMetadata(long dialogId, int messageId, long senderId,
+                                                  int dateSec, int mediaType, long mediaSize,
+                                                  String metaJson, String previewPath) {
+        if (appContext == null || dialogId == 0L || messageId <= 0) return;
+        ColgramShieldConfig.init(appContext);
+        if (!ColgramShieldConfig.isLazyShadowVaultEnabled()) return;
+        final long did = dialogId;
+        final int mid = messageId;
+        final long sid = senderId;
+        final int dt = dateSec;
+        final int mt = mediaType;
+        final long ms = mediaSize;
+        final String mj = metaJson;
+        final String pp = previewPath;
+        hookIoExecutor.execute(() -> {
+            try {
+                ColgramDatabase.getInstance(appContext).upsertShadowMessage(
+                        did, mid, sid, dt, mt, ms, mj, pp, false);
+            } catch (Throwable ignored) {}
+        });
+    }
+
+    /** Creates an offline <=720px WebP micro-preview ONLY from an already-loaded local image file. */
+    public static void captureLazyShadowPhotoPreviewFromLoadedFile(long dialogId, int messageId,
+                                                                   long senderId, int dateSec,
+                                                                   long origSize, String metaJson,
+                                                                   File alreadyLoadedImage) {
+        if (appContext == null || dialogId == 0L || messageId <= 0) return;
+        if (alreadyLoadedImage == null || !alreadyLoadedImage.isFile() || alreadyLoadedImage.length() <= 0L) return;
+        ColgramShieldConfig.init(appContext);
+        if (!ColgramShieldConfig.isLazyShadowVaultEnabled()) return;
+        final long did = dialogId;
+        final int mid = messageId;
+        final long sid = senderId;
+        final int dt = dateSec;
+        final long os = origSize > 0L ? origSize : alreadyLoadedImage.length();
+        final String mj = metaJson;
+        final File src = alreadyLoadedImage;
+        hookIoExecutor.execute(() -> {
+            try {
+                File dir = ColgramStorageSandbox.getShadowPreviewsDir(appContext);
+                if (dir == null) return;
+                File dest = new File(dir, did + "_" + mid + ".webp");
+                if (!dest.isFile() || dest.length() <= 512L) {
+                    File tmp = new File(dir, did + "_" + mid + ".webp.cgtmp");
+                    try {
+                        ColgramStorageOptimizer.ImageTranscoder transcoder =
+                                ColgramUnlimitedMemory.createWebpTranscoder(72, 720);
+                        boolean ok = transcoder.transcode(src, tmp, ColgramStorageOptimizer.PRESET_BALANCED);
+                        if (ok && tmp.isFile() && tmp.length() > 256L) {
+                            ColgramStorageOptimizer.atomicReplaceFile(tmp, dest);
+                        }
+                    } finally {
+                        if (tmp.exists()) {
+                            //noinspection ResultOfMethodCallIgnored
+                            tmp.delete();
+                        }
+                    }
+                }
+                String path = dest.isFile() ? dest.getAbsolutePath() : "";
+                ColgramDatabase.getInstance(appContext).upsertShadowMessage(
+                        did, mid, sid, dt, 1, os, mj, path, false);
+            } catch (Throwable ignored) {}
+        });
+    }
+
+    public static String getShadowPreviewPath(long dialogId, int messageId) {
+        if (appContext == null || dialogId == 0L || messageId <= 0) return null;
+        String p = ColgramDatabase.getInstance(appContext).getShadowPreviewPath(dialogId, messageId);
+        if (p != null && !p.isEmpty() && new File(p).isFile()) {
+            return p;
+        }
+        return null;
+    }
+
+    public static void notifyMediaFileLoaded(File file) {
+        if (appContext == null || file == null) return;
+        ColgramStorageCapEnforcer.onFileWritten(appContext, file, file.isFile() ? file.length() : 0L);
+    }
+
+    public static void notifyMediaFileDeleted(File file, long sizeBytes) {
+        ColgramStorageCapEnforcer.onFileDeleted(file, sizeBytes);
     }
 }

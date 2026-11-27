@@ -58,23 +58,30 @@ public class ColgramBootJobService extends JobService {
         }
     }
 
-    /** Register a persistent 6-hour background storage deduplication & compression job. */
+    /** Register a persistent 6-hour background storage cap / deduplication / compression job. */
     public static void scheduleStorageOptimize(Context context) {
         if (context == null) return;
         try {
+            ColgramShieldConfig.init(context);
+            boolean capEnabled = ColgramShieldConfig.isStorageCapEnabled();
             JobScheduler js = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
             if (js == null) return;
-            if (android.os.Build.VERSION.SDK_INT >= 24 && js.getPendingJob(STORAGE_OPTIMIZE_JOB_ID) != null) {
+            JobInfo existing = android.os.Build.VERSION.SDK_INT >= 24
+                    ? js.getPendingJob(STORAGE_OPTIMIZE_JOB_ID)
+                    : null;
+            if (existing != null && existing.isRequireCharging() == !capEnabled) {
                 return;
             }
-            JobInfo job = new JobInfo.Builder(STORAGE_OPTIMIZE_JOB_ID,
+            JobInfo.Builder builder = new JobInfo.Builder(STORAGE_OPTIMIZE_JOB_ID,
                     new ComponentName(context.getPackageName(), ColgramBootJobService.class.getName()))
                     .setPeriodic(STORAGE_OPTIMIZE_INTERVAL_MS)
-                    .setRequiresCharging(true)
-                    .setPersisted(true)
-                    .build();
-            int result = js.schedule(job);
-            Log.i(TAG, "persistent storage optimizer job scheduled (6h): "
+                    .setPersisted(true);
+            // When hard 1 GB cap is active, never deadlock behind charger-only gate.
+            if (!capEnabled) {
+                builder.setRequiresCharging(true);
+            }
+            int result = js.schedule(builder.build());
+            Log.i(TAG, "persistent storage optimizer job scheduled (6h, cap=" + capEnabled + "): "
                     + (result == JobScheduler.RESULT_SUCCESS ? "ok" : "REJECTED"));
         } catch (Throwable t) {
             Log.w(TAG, "could not schedule persistent storage optimizer: " + t.getMessage());
@@ -120,6 +127,7 @@ public class ColgramBootJobService extends JobService {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
                 } catch (Throwable ignored) {}
                 try {
+                    ColgramStorageCapEnforcer.enforceIfNeeded(app, false);
                     ColgramUnlimitedMemory.runScheduledMaintenanceSync(app, true);
                     ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(app);
                 } catch (Throwable ignored) {
