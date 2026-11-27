@@ -568,6 +568,50 @@ class StartupSqliteAndPriorityOptimizationContractsTest(unittest.TestCase):
         self.assertIn("10x Optimization Pass", rp)
         self.assertIn("64 МБ `mmap`", rp)
 
+    def test_dialogs_blur_coalesce_upgrade_skips_clean_upstream_without_miss(self):
+        import importlib.util
+        import tempfile
+
+        ap = ROOT / "scripts/apply-patches.py"
+        spec = importlib.util.spec_from_file_location("apply_patches_dlg_mod", ap)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        upstream_dlg = (
+            "class DialogsActivity {\n"
+            "            blurScrimPaint.setAlpha(oldScrimAlpha);\n"
+            "        }\n\n"
+            "        @Override\n"
+            "        protected void dispatchDraw(Canvas canvas) {\n"
+            "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
+            "                blur3_InvalidateBlur();\n"
+            "            }\n\n"
+            "            if (invalidateScrollY && (rightSlidingDialogContainer == null || !rightSlidingDialogContainer.hasFragment()) && progressToActionMode == 0) {\n"
+            "        }\n"
+            "        @Override\n"
+            "        public void invalidateBlur() {\n"
+            "            super.invalidateBlur();\n"
+            "            blur3_InvalidateBlur();\n"
+            "        }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            dlg_dir = Path(tmp) / "TMessagesProj/src/main/java/org/telegram/ui"
+            dlg_dir.mkdir(parents=True, exist_ok=True)
+            dlg = dlg_dir / "DialogsActivity.java"
+            dlg.write_text(upstream_dlg, encoding="utf-8")
+            mod.PATCH_MISSES.clear()
+            # Only verify DialogsActivity perf #1 / #1b + pre-upgrade guard on clean upstream
+            ap_src = read_text(ap)
+            self.assertIn('if "private boolean colgramBlurredLastFrame;" in _dlg_src and "colgramLastBlurInvalidateMs" not in _dlg_src:', ap_src)
+            for rel, label, target, replacement in mod._PERFORMANCE_PATCH_SPECS:
+                if label in ("DialogsActivity.java perf #1", "DialogsActivity.java perf #1b"):
+                    mod._patch_file_eol(str(dlg), target, replacement, label)
+            self.assertEqual(mod.PATCH_MISSES, [])
+            out = dlg.read_text(encoding="utf-8")
+            self.assertIn("colgramLastBlurInvalidateMs = nowMs;", out)
+            self.assertIn("colgramLastBlurInvalidateMs = 0L;", out)
+
 
 if __name__ == "__main__":
     unittest.main()

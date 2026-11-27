@@ -14325,44 +14325,47 @@ def inject_performance_patches(repo_path):
     """Apply and converge performance, caching, and memory-safety hunks in Telegram-Src."""
     dialogs_path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
     if os.path.exists(dialogs_path):
-        _patch_file_eol(
-            dialogs_path,
-            (
-                "        private boolean colgramBlurredLastFrame;\n\n"
-                "        @Override\n"
-                "        protected void dispatchDraw(Canvas canvas) {\n"
-                "            Theme.colgramSyncDrawableTintsIfNeeded();\n"
-                "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
-                "                boolean blurActive = SharedConfig.chatBlurEnabled()\n"
-                "                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n"
-                "                if (blurActive || colgramBlurredLastFrame) {\n"
-                "                    colgramBlurredLastFrame = blurActive;\n"
-                "                    blur3_InvalidateBlur();\n"
-                "                }\n"
-                "            }\n"
-            ),
-            (
-                "        private boolean colgramBlurredLastFrame;\n"
-                "        private long colgramLastBlurInvalidateMs;\n\n"
-                "        @Override\n"
-                "        protected void dispatchDraw(Canvas canvas) {\n"
-                "            Theme.colgramSyncDrawableTintsIfNeeded();\n"
-                "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
-                "                boolean blurActive = SharedConfig.chatBlurEnabled()\n"
-                "                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n"
-                "                boolean stateChanged = blurActive != colgramBlurredLastFrame;\n"
-                "                if (stateChanged || blurActive) {\n"
-                "                    colgramBlurredLastFrame = blurActive;\n"
-                "                    long nowMs = android.os.SystemClock.uptimeMillis();\n"
-                "                    if (stateChanged || nowMs - colgramLastBlurInvalidateMs >= 16L) {\n"
-                "                        colgramLastBlurInvalidateMs = nowMs;\n"
-                "                        blur3_InvalidateBlur();\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-            ),
-            "DialogsActivity.java perf #1 (upgrade blur coalesce)",
-        )
+        with open(dialogs_path, "r", encoding="utf-8", errors="ignore") as _df:
+            _dlg_src = _df.read()
+        if "private boolean colgramBlurredLastFrame;" in _dlg_src and "colgramLastBlurInvalidateMs" not in _dlg_src:
+            _patch_file_eol(
+                dialogs_path,
+                (
+                    "        private boolean colgramBlurredLastFrame;\n\n"
+                    "        @Override\n"
+                    "        protected void dispatchDraw(Canvas canvas) {\n"
+                    "            Theme.colgramSyncDrawableTintsIfNeeded();\n"
+                    "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
+                    "                boolean blurActive = SharedConfig.chatBlurEnabled()\n"
+                    "                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n"
+                    "                if (blurActive || colgramBlurredLastFrame) {\n"
+                    "                    colgramBlurredLastFrame = blurActive;\n"
+                    "                    blur3_InvalidateBlur();\n"
+                    "                }\n"
+                    "            }\n"
+                ),
+                (
+                    "        private boolean colgramBlurredLastFrame;\n"
+                    "        private long colgramLastBlurInvalidateMs;\n\n"
+                    "        @Override\n"
+                    "        protected void dispatchDraw(Canvas canvas) {\n"
+                    "            Theme.colgramSyncDrawableTintsIfNeeded();\n"
+                    "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
+                    "                boolean blurActive = SharedConfig.chatBlurEnabled()\n"
+                    "                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n"
+                    "                boolean stateChanged = blurActive != colgramBlurredLastFrame;\n"
+                    "                if (stateChanged || blurActive) {\n"
+                    "                    colgramBlurredLastFrame = blurActive;\n"
+                    "                    long nowMs = android.os.SystemClock.uptimeMillis();\n"
+                    "                    if (stateChanged || nowMs - colgramLastBlurInvalidateMs >= 16L) {\n"
+                    "                        colgramLastBlurInvalidateMs = nowMs;\n"
+                    "                        blur3_InvalidateBlur();\n"
+                    "                    }\n"
+                    "                }\n"
+                    "            }\n"
+                ),
+                "DialogsActivity.java perf #1 (upgrade blur coalesce)",
+            )
     for rel_path, label, bypass_marker, target, replacement in _PRE_BYPASS_BG_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
         if os.path.exists(full_path):
