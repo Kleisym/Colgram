@@ -630,6 +630,26 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             boolean done = false;
             try {
                 URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");""",
+            """            if (org.colgram.core.ColgramConfig.isDohEnabled()) {
+                try {
+                    java.net.InetAddress[] doh = org.colgram.core.ColgramDohResolver.resolve(currentHostName);
+                    if (doh != null && doh.length > 0) {
+                        ArrayList<String> addresses = new ArrayList<>(doh.length);
+                        for (java.net.InetAddress addr : doh) {
+                            if (addr != null) addresses.add(addr.getHostAddress());
+                        }
+                        if (!addresses.isEmpty()) {
+                            return new ResolvedDomain(addresses, SystemClock.elapsedRealtime());
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            ByteArrayOutputStream outbuf = null;
+            InputStream httpConnectionStream = null;
+            boolean done = false;
+            try {
+                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");""",
             """            if (org.colgram.core.ColgramConfig.isDohEnabled()
                     && (org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
                             || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled())) {
