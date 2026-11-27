@@ -253,9 +253,15 @@ public final class ColgramPlatformInterface implements PlatformInterface {
         };
     }
 
+    private volatile String lastPublishedIface = null;
+    private volatile int lastPublishedIfIndex = Integer.MIN_VALUE;
+    private volatile boolean lastPublishedMetered = false;
+
     @Override
     public synchronized void startDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
         closeDefaultInterfaceMonitor(listener);
+        lastPublishedIface = null;
+        lastPublishedIfIndex = Integer.MIN_VALUE;
         ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
         if (manager == null || listener == null) return;
         networkCallback = new ConnectivityManager.NetworkCallback() {
@@ -277,6 +283,8 @@ public final class ColgramPlatformInterface implements PlatformInterface {
 
     @Override
     public synchronized void closeDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
+        lastPublishedIface = null;
+        lastPublishedIfIndex = Integer.MIN_VALUE;
         if (networkCallback == null) return;
         ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
         try {
@@ -285,7 +293,21 @@ public final class ColgramPlatformInterface implements PlatformInterface {
         networkCallback = null;
     }
 
-    private static void publishPhysicalNetwork(ConnectivityManager manager, InterfaceUpdateListener listener) {
+    private void emitDefaultInterfaceIfChanged(InterfaceUpdateListener listener,
+                                               String name, int ifIndex, boolean metered) {
+        String safeName = name == null ? "" : name;
+        if (safeName.equals(lastPublishedIface)
+                && ifIndex == lastPublishedIfIndex
+                && metered == lastPublishedMetered) {
+            return;
+        }
+        lastPublishedIface = safeName;
+        lastPublishedIfIndex = ifIndex;
+        lastPublishedMetered = metered;
+        listener.updateDefaultInterface(safeName, ifIndex, metered, false);
+    }
+
+    private void publishPhysicalNetwork(ConnectivityManager manager, InterfaceUpdateListener listener) {
         Network active = manager.getActiveNetwork();
         if (publishIfPhysical(manager, listener, active, false)) return;
         Network[] networks = manager.getAllNetworks();
@@ -294,11 +316,11 @@ public final class ColgramPlatformInterface implements PlatformInterface {
                 if (publishIfPhysical(manager, listener, candidate, validatedOnly)) return;
             }
         }
-        listener.updateDefaultInterface("", -1, false, false);
+        emitDefaultInterfaceIfChanged(listener, "", -1, false);
     }
 
-    private static boolean publishIfPhysical(ConnectivityManager manager, InterfaceUpdateListener listener,
-                                             Network network, boolean validatedOnly) {
+    private boolean publishIfPhysical(ConnectivityManager manager, InterfaceUpdateListener listener,
+                                      Network network, boolean validatedOnly) {
         if (network == null) return false;
         NetworkCapabilities caps = manager.getNetworkCapabilities(network);
         if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -311,8 +333,8 @@ public final class ColgramPlatformInterface implements PlatformInterface {
         try { device = java.net.NetworkInterface.getByName(name); }
         catch (java.net.SocketException ignored) { return false; }
         if (device == null || device.getIndex() <= 0) return false;
-        listener.updateDefaultInterface(name, device.getIndex(),
-                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED), false);
+        emitDefaultInterfaceIfChanged(listener, name, device.getIndex(),
+                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
         return true;
     }
 

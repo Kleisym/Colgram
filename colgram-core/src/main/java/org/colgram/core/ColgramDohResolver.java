@@ -74,7 +74,19 @@ public final class ColgramDohResolver {
     private static final int MAX_POOLED_PER_ENDPOINT = 4;
     private static final long POOL_IDLE_TTL_MS = 60_000L;
     private static final long POOL_MAX_AGE_MS = 180_000L;
-    private static final String[] SPOOFED_RU_SNIS = {"vk.com", "max.ru"};
+    private static final String[] SPOOFED_RU_SNIS = ColgramPolymorphicStealth.WHITELIST_BENIGN_SNIS;
+    private static final java.util.concurrent.atomic.AtomicInteger SPOOF_SNI_CURSOR =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    private static String pickRotatingSpoofSni(String avoid) {
+        int n = SPOOFED_RU_SNIS.length;
+        int start = Math.floorMod(SPOOF_SNI_CURSOR.getAndIncrement(), n);
+        String cand = SPOOFED_RU_SNIS[start];
+        if (avoid != null && cand.equalsIgnoreCase(avoid) && n > 1) {
+            cand = SPOOFED_RU_SNIS[(start + 1) % n];
+        }
+        return cand;
+    }
 
     /** Distinct exception thrown when TCP connect itself fails so we never retry TLS modes on a dead IP. */
     private static final class TcpConnectException extends java.io.IOException {
@@ -1677,7 +1689,7 @@ public final class ColgramDohResolver {
         // Spoofed RU-whitelist SNI (vk.com / max.ru) first on endpoints proven to accept it while
         // still verifying the real CA-signed certificate against endpoint.verifyName!
         if (endpoint.supportsSpoofedSni) {
-            String primarySni = SPOOFED_RU_SNIS[0];
+            String primarySni = pickRotatingSpoofSni(null);
             try {
                 byte[] res = querySingleAttempt(endpoint, request, protector, fdProtector,
                         primarySni, canNative, deadlineAt, activeSockets);
@@ -1692,7 +1704,9 @@ public final class ColgramDohResolver {
                             : new java.io.IOException(tlsOrHttpErr);
                 }
             }
-            String fallbackSni = "alidns".equals(endpoint.providerGroup) ? SPOOFED_RU_SNIS[1] : endpoint.sni;
+            String fallbackSni = "alidns".equals(endpoint.providerGroup)
+                    ? pickRotatingSpoofSni(primarySni)
+                    : endpoint.sni;
             return querySingleAttempt(endpoint, request, protector, fdProtector,
                     fallbackSni, false, deadlineAt, activeSockets);
         }
@@ -1786,6 +1800,7 @@ public final class ColgramDohResolver {
         }
         String hdr = "POST /dns-query HTTP/1.1\r\n"
                 + "Host: " + endpoint.sni + "\r\n"
+                + "User-Agent: " + ColgramPolymorphicStealth.pickBrowserUserAgent() + "\r\n"
                 + "Content-Type: application/dns-message\r\n"
                 + "Accept: application/dns-message\r\n"
                 + "Content-Length: " + request.length + "\r\n"

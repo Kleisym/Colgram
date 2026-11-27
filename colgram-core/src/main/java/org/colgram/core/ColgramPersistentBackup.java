@@ -62,7 +62,7 @@ public final class ColgramPersistentBackup {
     private static final int MAX_ACCOUNT_SLOTS = 5;
 
     private static final long AUTO_BACKUP_DEBOUNCE_MS = 6_000L;
-    private static final long AUTO_BACKUP_MIN_INTERVAL_MS = 45_000L;
+    private static final long AUTO_BACKUP_MIN_INTERVAL_MS = 15L * 60L * 1000L;
 
     private static final Object BACKUP_LOCK = new Object();
     private static final ScheduledExecutorService EXECUTOR = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -72,7 +72,21 @@ public final class ColgramPersistentBackup {
     });
     private static ScheduledFuture<?> pendingAutoBackup = null;
     private static volatile long lastAutoBackupAtMs = 0L;
+    private static volatile String lastAutoBackupFingerprint = "";
     private static volatile boolean startupRestoreAttempted = false;
+
+    private static final String[] SNAPSHOT_PREF_FILES = {
+            "userconfing.xml",
+            "userconfig1.xml", "userconfig2.xml", "userconfig3.xml", "userconfig4.xml",
+            "colgram_secure_config.xml",
+            "mainconfig.xml",
+            "colgram_proxies.xml",
+            "colgram_account_vault.xml",
+            "colgram_bot_tokens_global.xml",
+            "colgram_bot_account_0.xml", "colgram_bot_account_1.xml",
+            "colgram_bot_account_2.xml", "colgram_bot_account_3.xml",
+            "colgram_bot_account_4.xml"
+    };
 
     private ColgramPersistentBackup() {}
 
@@ -139,6 +153,7 @@ public final class ColgramPersistentBackup {
     private static final String PREFS_LOCAL_BACKUP = "colgram_local_backup_meta";
     private static final String KEY_LOCAL_WRAPPED = "local_wrapped_key_b64";
     private static final String KEY_LOCAL_IV = "local_wrapped_iv_b64";
+    private static final String KEY_LAST_AUTO_FP = "last_auto_backup_fp";
     private static final String KEYSTORE_LOCAL_ALIAS = "colgram_persistent_backup_v1";
     private static final String PRIVATE_BACKUP_DIR = "colgram_private_backup";
 
@@ -287,8 +302,90 @@ public final class ColgramPersistentBackup {
         }
     }
 
+    static String computeMetadataFingerprint(File prefsDir, File filesDir, File dbFile) {
+        StringBuilder sb = new StringBuilder(512);
+        if (prefsDir != null) {
+            for (String name : SNAPSHOT_PREF_FILES) {
+                appendFileStat(sb, "p/" + name, new File(prefsDir, name));
+            }
+        }
+        if (filesDir != null) {
+            appendDatDirStats(sb, filesDir, "f/");
+            for (int a = 1; a < MAX_ACCOUNT_SLOTS; a++) {
+                appendDatDirStats(sb, new File(filesDir, "account" + a), "f/a" + a + "/");
+            }
+        }
+        if (dbFile != null) {
+            appendFileStat(sb, "d/db", dbFile);
+            appendFileStat(sb, "d/wal", new File(dbFile.getAbsolutePath() + "-wal"));
+        }
+        String raw = sb.toString();
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            return new String(bytesToHexChars(md.digest(raw.getBytes(StandardCharsets.UTF_8))));
+        } catch (Throwable ignored) {
+            return raw;
+        }
+    }
+
+    private static void appendDatDirStats(StringBuilder sb, File dir, String prefix) {
+        if (dir == null || !dir.isDirectory()) return;
+        File[] files = dir.listFiles();
+        if (files == null || files.length == 0) return;
+        Arrays.sort(files, (a, b) -> {
+            String na = a != null ? a.getName() : "";
+            String nb = b != null ? b.getName() : "";
+            return na.compareTo(nb);
+        });
+        for (File f : files) {
+            if (f == null || !f.isFile()) continue;
+            String n = f.getName();
+            if ((n.startsWith("tgnet") || n.startsWith("dc")) && n.endsWith(".dat")) {
+                appendFileStat(sb, prefix + n, f);
+            }
+        }
+    }
+
+    private static void appendFileStat(StringBuilder sb, String tag, File f) {
+        if (f == null || !f.isFile()) return;
+        sb.append(tag).append(':').append(f.length()).append(':').append(f.lastModified()).append(';');
+    }
+
+    static boolean shouldSkipAutoBackup(String previousFingerprint, String currentFingerprint, File existingBackupFile) {
+        return existingBackupFile != null
+                && existingBackupFile.isFile()
+                && existingBackupFile.length() > HEADER_LEN
+                && previousFingerprint != null
+                && !previousFingerprint.isEmpty()
+                && previousFingerprint.equals(currentFingerprint);
+    }
+
     private static BackupResult backupPrivateSnapshot(Context app) {
         synchronized (BACKUP_LOCK) {
+            File dataDir = new File(app.getApplicationInfo().dataDir);
+            File prefsDir = new File(dataDir, "shared_prefs");
+            File filesDir = app.getFilesDir();
+            File dbFile = app.getDatabasePath("colgram_vault.db");
+            File outDir = new File(filesDir, PRIVATE_BACKUP_DIR);
+            File outFile = new File(outDir, BACKUP_FILENAME);
+
+            String currentFp = computeMetadataFingerprint(prefsDir, filesDir, dbFile);
+            String prevFp = lastAutoBackupFingerprint;
+            if (prevFp.isEmpty()) {
+                try {
+                    String stored = app.getSharedPreferences(PREFS_LOCAL_BACKUP, Context.MODE_PRIVATE)
+                            .getString(KEY_LAST_AUTO_FP, "");
+                    if (stored != null && !stored.isEmpty()) {
+                        prevFp = stored;
+                        lastAutoBackupFingerprint = stored;
+                    }
+                } catch (Throwable ignored) {}
+            }
+            if (shouldSkipAutoBackup(prevFp, currentFp, outFile)) {
+                lastAutoBackupAtMs = System.currentTimeMillis();
+                return new BackupResult(true, 0, 0, outFile.getAbsolutePath(), "");
+            }
+
             byte[] secret = getOrCreateLocalKeystoreSecret(app, true);
             if (secret == null || secret.length == 0) {
                 return new BackupResult(false, 0, 0, "", "KeyStore unavailable for private backup");
@@ -313,11 +410,15 @@ public final class ColgramPersistentBackup {
                 } finally {
                     ColgramCryptoVault.zeroize(plain);
                 }
-                File outDir = new File(app.getFilesDir(), PRIVATE_BACKUP_DIR);
-                File outFile = new File(outDir, BACKUP_FILENAME);
                 writeAtomic(outFile, encrypted);
                 notifySystemBackupAgent();
                 lastAutoBackupAtMs = System.currentTimeMillis();
+                String postFp = computeMetadataFingerprint(prefsDir, filesDir, dbFile);
+                lastAutoBackupFingerprint = postFp;
+                try {
+                    app.getSharedPreferences(PREFS_LOCAL_BACKUP, Context.MODE_PRIVATE)
+                            .edit().putString(KEY_LAST_AUTO_FP, postFp).apply();
+                } catch (Throwable ignored) {}
                 return new BackupResult(true, entries.size(), totalAccounts, outFile.getAbsolutePath(), "");
             } catch (Throwable t) {
                 Log.w(TAG, "backupPrivateSnapshot failed: " + t.getMessage());
@@ -591,19 +692,7 @@ public final class ColgramPersistentBackup {
         File filesDir = app.getFilesDir();
 
         // 1. Account configs, bot tokens, Colgram secure config, proxies, vault metadata
-        String[] prefFiles = {
-                "userconfing.xml",
-                "userconfig1.xml", "userconfig2.xml", "userconfig3.xml", "userconfig4.xml",
-                "colgram_secure_config.xml",
-                "mainconfig.xml",
-                "colgram_proxies.xml",
-                "colgram_account_vault.xml",
-                "colgram_bot_tokens_global.xml",
-                "colgram_bot_account_0.xml", "colgram_bot_account_1.xml",
-                "colgram_bot_account_2.xml", "colgram_bot_account_3.xml",
-                "colgram_bot_account_4.xml"
-        };
-        for (String name : prefFiles) {
+        for (String name : SNAPSHOT_PREF_FILES) {
             addFileIfPresent(entries, "shared_prefs/" + name, new File(prefsDir, name), MAX_ENTRY_BYTES);
         }
 

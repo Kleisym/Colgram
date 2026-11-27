@@ -188,6 +188,17 @@ public final class ColgramAttachDeleteSecurityTest {
     private static void testPersistentBackupRejectsNoPassphraseExport() {
         ColgramPersistentBackup.RestoreResult emptyRes = ColgramPersistentBackup.restoreFromBytes(null, null, null);
         check(!emptyRes.success, "Null context/blob rejected cleanly");
+
+        final boolean[] cbFired = new boolean[]{false};
+        final int[] cbCount = new int[]{-1};
+        boolean started = ColgramFileImport.importIntentResult(null, null,
+                ColgramFileImport.DEFAULT_MAX_FILE_BYTES,
+                paths -> {
+                    cbFired[0] = true;
+                    cbCount[0] = paths != null ? paths.size() : -1;
+                }, null);
+        check(!started && cbFired[0] && cbCount[0] == 0,
+                "importIntentResult(null, null) must return false and deliver empty list safely");
     }
 
     private static void setField(Object target, String name, Object val) throws Exception {

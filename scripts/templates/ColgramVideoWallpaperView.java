@@ -59,6 +59,7 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     private static final ConcurrentHashMap<String, Boolean> FILE_EXISTS_CACHE = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, String> VIDEO_POSTER_PATH_CACHE = new ConcurrentHashMap<>();
     private static final DispatchQueue RELEASE_QUEUE = new DispatchQueue("ColgramVideoReleaseQueue");
+    private static final long BACKGROUND_RELEASE_GRACE_MS = 1500L;
 
     private String videoPath;
     private String activePlayerPath;
@@ -78,6 +79,7 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
     private Runnable fallbackCheckRunnable;
     private Runnable watchdogCheckRunnable;
     private Runnable retryRunnable;
+    private Runnable delayedReleaseRunnable;
 
     public ColgramVideoWallpaperView(@NonNull Context context) {
         super(context);
@@ -168,8 +170,10 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
         pausedByHost = paused;
         if (paused) {
             pausePlaybackOnly();
+            scheduleDelayedRelease();
             return;
         }
+        cancelDelayedRelease();
         errorRetryCount = 0;
         stallRecoveryCount = 0;
         resumePlaybackIfReady();
@@ -191,7 +195,29 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
                 && !videoPath.isEmpty();
     }
 
+    private void cancelDelayedRelease() {
+        if (delayedReleaseRunnable != null) {
+            removeCallbacks(delayedReleaseRunnable);
+            delayedReleaseRunnable = null;
+        }
+    }
+
+    private void scheduleDelayedRelease() {
+        cancelDelayedRelease();
+        if (mediaPlayer == null && renderSurface == null) {
+            return;
+        }
+        delayedReleaseRunnable = () -> {
+            delayedReleaseRunnable = null;
+            if (!shouldBePlaying()) {
+                releasePlayer();
+            }
+        };
+        postDelayed(delayedReleaseRunnable, BACKGROUND_RELEASE_GRACE_MS);
+    }
+
     private void cancelScheduledChecks() {
+        cancelDelayedRelease();
         if (fallbackCheckRunnable != null) {
             removeCallbacks(fallbackCheckRunnable);
             fallbackCheckRunnable = null;
@@ -511,7 +537,9 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
         windowVisible = visibility == View.VISIBLE;
         if (!windowVisible) {
             pausePlaybackOnly();
+            scheduleDelayedRelease();
         } else {
+            cancelDelayedRelease();
             errorRetryCount = 0;
             stallRecoveryCount = 0;
             resumePlaybackIfReady();
@@ -524,7 +552,9 @@ public final class ColgramVideoWallpaperView extends TextureView implements Text
         super.setVisibility(visibility);
         if (visibility != View.VISIBLE) {
             pausePlaybackOnly();
+            scheduleDelayedRelease();
         } else if (prev != View.VISIBLE || !pausedByHost) {
+            cancelDelayedRelease();
             resumePlaybackIfReady();
         }
     }

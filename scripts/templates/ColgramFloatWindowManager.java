@@ -184,16 +184,17 @@ public class ColgramFloatWindowManager {
             }
 
             final String appKey = (title != null ? title.toString() : "miniapp");
-            final int bgColor = Theme.getColor(Theme.key_dialogBackground);
-            final int barColor = Theme.getColor(Theme.key_actionBarDefault);
-            final int borderColor = Theme.getColor(Theme.key_divider);
+            final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            final int bgColor = pal.cardElevated != 0 ? pal.cardElevated : Theme.getColor(Theme.key_dialogBackground);
+            final int barColor = pal.cardSurface != 0 ? pal.cardSurface : Theme.getColor(Theme.key_actionBarDefault);
+            final int borderColor = pal.borderSubtle != 0 ? pal.borderSubtle : Theme.getColor(Theme.key_divider);
             final int resolvedBar = barColor != 0 ? barColor : 0xff16181e;
             final int barInk = ColgramThemePolicy.contrastInkOn(resolvedBar);
 
             root = new FrameLayout(appContext);
             android.graphics.drawable.GradientDrawable cardBg = new android.graphics.drawable.GradientDrawable();
             cardBg.setColor(bgColor != 0 ? bgColor : 0xff16181e);
-            cardBg.setCornerRadius(AndroidUtilities.dp(14));
+            cardBg.setCornerRadius(AndroidUtilities.dp(16));
             cardBg.setStroke(AndroidUtilities.dp(1), borderColor != 0 ? borderColor : 0xff2f3644);
             root.setBackground(cardBg);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {

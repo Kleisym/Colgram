@@ -949,6 +949,8 @@ public final class ColgramDcRemap {
         if (s == null) return;
         try { s.setTcpNoDelay(true); } catch (Throwable ignored) {}
         try { s.setKeepAlive(true); } catch (Throwable ignored) {}
+        try { s.setSendBufferSize(131072); } catch (Throwable ignored) {}
+        try { s.setReceiveBufferSize(131072); } catch (Throwable ignored) {}
     }
 
     private static void flushIfDrained(InputStream in, OutputStream out) throws IOException {

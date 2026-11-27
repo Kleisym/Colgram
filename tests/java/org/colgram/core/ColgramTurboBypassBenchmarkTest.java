@@ -89,10 +89,10 @@ public final class ColgramTurboBypassBenchmarkTest {
                     4, -4, "127.0.0.1", "gosuslugi.ru",
                     cStale, cStale.getInputStream(), cStale.getOutputStream());
             long now = System.currentTimeMillis();
-            boolean acceptedExpired = ColgramTelegramWsBridge.offerPrewarmedForTest(staleSess, now - 25_000L, false);
+            boolean acceptedExpired = ColgramTelegramWsBridge.offerPrewarmedForTest(staleSess, now - 65_000L, false);
             check(!acceptedExpired || !ColgramTelegramWsBridge.hasPrewarmed(-4, true),
                     "expired entry must not be reported usable");
-            ColgramTelegramWsBridge.evictExpiredPrewarmedForTest(now + 30_000L);
+            ColgramTelegramWsBridge.evictExpiredPrewarmedForTest(now + 65_000L);
             check(cStale.isClosed(), "expired prewarmed socket must be closed");
             check(ColgramTelegramWsBridge.prewarmedPoolSizeForTest() == 0,
                     "pool must be empty after TTL eviction");

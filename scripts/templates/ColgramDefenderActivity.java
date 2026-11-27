@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,7 +20,6 @@ import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenu;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -266,64 +266,88 @@ public class ColgramDefenderActivity extends BaseFragment {
     }
 
     private void showCommandPrompt() {
-        Context ctx = getParentActivity();
+        Activity ctx = getParentActivity();
         if (ctx == null) return;
-        EditTextBoldCursor input = new EditTextBoldCursor(ctx);
-        input.setHint(".defender / .clean / /scan");
-        input.setText(".defender");
-        input.setSingleLine(true);
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
-        input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
-        FrameLayout wrap = new FrameLayout(ctx);
-        int pad = AndroidUtilities.dp(20);
-        wrap.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(4));
-        wrap.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(ctx, resourceProvider);
-        builder.setTitle("Команда Боту-защитнику");
-        builder.setMessage("Доступно также прямо в любом чате (сообщение не отправляется собеседнику): .defender, .защита, .clean");
-        builder.setView(wrap);
-        builder.setPositiveButton("Выполнить", (d, w) -> {
-            String cmd = input.getText() != null ? input.getText().toString() : ".defender";
-            executor.execute(() -> {
-                String reply = ColgramSecurityDefender.handleCommand(ctx.getApplicationContext(), cmd);
-                mainHandler.post(() -> {
-                    if (destroyed) return;
-                    rebuildRows();
-                    if (getParentActivity() != null) {
-                        new AlertDialog.Builder(getParentActivity(), resourceProvider)
-                                .setTitle("Ответ Бота-защитника")
-                                .setMessage(reply)
-                                .setPositiveButton("ОК", null)
-                                .show();
-                    }
-                });
-            });
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+        ColgramUiKit.showInputSheet(
+                ctx,
+                resourceProvider,
+                R.drawable.msg_bots,
+                "Команда Боту-защитнику",
+                "Доступно также прямо в любом чате (сообщение не отправляется собеседнику): .defender, .защита, .clean",
+                ".defender / .clean / /scan",
+                ".defender",
+                android.text.InputType.TYPE_CLASS_TEXT,
+                false,
+                false,
+                true,
+                "Выполнить",
+                rawCmd -> {
+                    String cmd = rawCmd != null ? rawCmd : ".defender";
+                    executor.execute(() -> {
+                        String reply = ColgramSecurityDefender.handleCommand(ctx.getApplicationContext(), cmd);
+                        mainHandler.post(() -> {
+                            if (destroyed) return;
+                            rebuildRows();
+                            Activity act = getParentActivity();
+                            if (act != null) {
+                                ColgramUiKit.showInfoSheet(
+                                        act,
+                                        resourceProvider,
+                                        R.drawable.msg_bots,
+                                        "Ответ Бота-защитника",
+                                        reply,
+                                        "ОК",
+                                        null,
+                                        null,
+                                        null,
+                                        true
+                                );
+                            }
+                        });
+                    });
+                },
+                null,
+                null
+        );
     }
 
     private void showFindingDialog(ColgramSecurityPolicy.AuditFinding finding) {
-        Context ctx = getParentActivity();
+        Activity ctx = getParentActivity();
         if (ctx == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(ctx, resourceProvider);
-        builder.setTitle(finding.title);
-        builder.setMessage("Категория: " + finding.category
+        String msg = "Категория: " + finding.category
                 + "\nСтатус: " + finding.statusBadge()
-                + "\n\n" + finding.detail);
+                + "\n\n" + finding.detail;
         if (finding.status == ColgramSecurityPolicy.STATUS_WARNING) {
-            builder.setPositiveButton("Закрыть автоматом", (d, w) -> {
-                ColgramConfig.setDefenderEnabled(true);
-                ColgramConfig.setDefenderAutoCloseEnabled(true);
-                runScanAsync("manual-heal-item");
-            });
+            ColgramUiKit.showConfirmSheet(
+                    ctx,
+                    resourceProvider,
+                    R.drawable.msg_secret,
+                    finding.title,
+                    msg,
+                    "Закрыть автоматом",
+                    false,
+                    () -> {
+                        ColgramConfig.setDefenderEnabled(true);
+                        ColgramConfig.setDefenderAutoCloseEnabled(true);
+                        runScanAsync("manual-heal-item");
+                    },
+                    LocaleController.getString(R.string.Cancel),
+                    null
+            );
         } else {
-            builder.setPositiveButton("ОК", null);
+            ColgramUiKit.showInfoSheet(
+                    ctx,
+                    resourceProvider,
+                    R.drawable.msg_secret,
+                    finding.title,
+                    msg,
+                    "ОК",
+                    null,
+                    null,
+                    null,
+                    false
+            );
         }
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
     }
 
     private void rebuildRows() {

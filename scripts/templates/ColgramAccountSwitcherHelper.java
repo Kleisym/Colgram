@@ -31,7 +31,6 @@ import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
 import org.telegram.tgnet.TLRPC;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.AvatarDrawable;
@@ -529,22 +528,23 @@ public final class ColgramAccountSwitcherHelper {
         ColgramMenuChrome.attachTactileFeedback(fullBackupBtn, 12, pal.chipSurface, pal.borderSubtle, pal.accentSoft);
         fullBackupBtn.setOnClickListener(v -> {
             if (activity.isFinishing() || activity.isDestroyed()) return;
-            final org.telegram.ui.Components.EditTextBoldCursor input = new org.telegram.ui.Components.EditTextBoldCursor(activity);
-            input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
-            input.setHint("Мастер-пароль (мин. 4 символа)");
-            input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-            input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
-            android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
-            int pad = dp(16);
-            container.setPadding(pad, pad / 2, pad, 0);
-            container.addView(input);
-            new AlertDialog.Builder(activity)
-                    .setTitle("Сохранить в Documents/ColgramBackup")
-                    .setView(container)
-                    .setPositiveButton("Сохранить", (d, w) -> {
-                        String pass = input.getText() != null ? input.getText().toString() : "";
+            ColgramUiKit.showInputSheet(
+                    activity,
+                    null,
+                    R.drawable.msg_archive,
+                    "Сохранить в Documents/ColgramBackup",
+                    "AES-256 резервная копия всех аккаунтов и настроек",
+                    "Мастер-пароль (мин. 4 символа)",
+                    null,
+                    android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                    true,
+                    !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure(),
+                    true,
+                    "Сохранить",
+                    rawPass -> {
+                        String pass = rawPass != null ? rawPass : "";
                         if (pass.length() < 4) {
-                            Toast.makeText(ctx, "Минимум 4 символа", Toast.LENGTH_SHORT).show();
+                            ColgramUiKit.showNotice(ctx, R.drawable.msg_info, "Минимум 4 символа", true);
                             return;
                         }
                         final char[] passChars = pass.toCharArray();
@@ -560,18 +560,21 @@ public final class ColgramAccountSwitcherHelper {
                                 AndroidUtilities.runOnUIThread(() -> {
                                     fullBackupBtn.setEnabled(true);
                                     if (res.success) {
-                                        Toast.makeText(ctx, "Сохранено (" + res.accountCount + " акк.) -> " + res.location, Toast.LENGTH_LONG).show();
+                                        ColgramUiKit.showNotice(ctx, R.drawable.msg_archive,
+                                                "Сохранено (" + res.accountCount + " акк.) -> " + res.location, false);
                                     } else {
-                                        Toast.makeText(ctx, "Ошибка бэкапа: " + res.error, Toast.LENGTH_LONG).show();
+                                        ColgramUiKit.showNotice(ctx, R.drawable.msg_info,
+                                                "Ошибка бэкапа: " + res.error, true);
                                     }
                                 });
                             } finally {
                                 java.util.Arrays.fill(passChars, '\0');
                             }
                         });
-                    })
-                    .setNegativeButton("Отмена", null)
-                    .show();
+                    },
+                    null,
+                    null
+            );
         });
         backupRow.addView(fullBackupBtn, LayoutHelper.createLinear(0, 40, 1f, Gravity.CENTER_VERTICAL, 0, 0, 6, 0));
 
@@ -782,23 +785,23 @@ public final class ColgramAccountSwitcherHelper {
     private static void promptRestorePassphraseAndApply(Activity activity, byte[] blob) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
         final Context appCtx = activity.getApplicationContext();
-        final org.telegram.ui.Components.EditTextBoldCursor input = new org.telegram.ui.Components.EditTextBoldCursor(activity);
-        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        input.setHint("Пароль от резервной копии");
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint));
-        FrameLayout box = new FrameLayout(activity);
-        int p = dp(16);
-        box.setPadding(p, p / 2, p, 0);
-        box.addView(input);
-
-        new AlertDialog.Builder(activity)
-                .setTitle("Расшифровка копии Colgram")
-                .setView(box)
-                .setPositiveButton("Восстановить", (d, w) -> {
-                    String passStr = input.getText() != null ? input.getText().toString() : "";
+        ColgramUiKit.showInputSheet(
+                activity,
+                null,
+                R.drawable.msg_secret,
+                "Расшифровка копии Colgram",
+                "Введите мастер-пароль для расшифровки резервной копии",
+                "Пароль от резервной копии",
+                null,
+                android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                true,
+                !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure(),
+                true,
+                "Восстановить",
+                rawPass -> {
+                    String passStr = rawPass != null ? rawPass : "";
                     if (passStr.isEmpty()) {
-                        Toast.makeText(appCtx, "Введите пароль", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(appCtx, R.drawable.msg_info, "Введите пароль", true);
                         return;
                     }
                     final char[] chars = passStr.toCharArray();
@@ -807,9 +810,10 @@ public final class ColgramAccountSwitcherHelper {
                         java.util.Arrays.fill(chars, '\0');
                         AndroidUtilities.runOnUIThread(() -> finishPersistentRestoreUi(activity, res));
                     });
-                })
-                .setNegativeButton("Отмена", null)
-                .show();
+                },
+                null,
+                null
+        );
     }
 
     private static void finishPersistentRestoreUi(Activity activity, ColgramPersistentBackup.RestoreResult res) {

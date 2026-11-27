@@ -31,7 +31,6 @@ import org.colgram.core.ColgramNativeLlama;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -204,19 +203,32 @@ public class ColgramAiActivity extends BaseFragment {
                     "3 минуты (баланс)",
                     "Не выгружать (держит в RAM пока открыт Colgram)"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Спящий режим Koliti")
-                    .setItems(labels, (d, which) -> {
+            int curIdle = ColgramAiConfig.getIdleUnloadSeconds(ctx);
+            int selIdle = -1;
+            for (int i = 0; i < vals.length; i++) {
+                if (vals[i] == curIdle) { selIdle = i; break; }
+            }
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(),
+                    getResourceProvider(),
+                    R.drawable.msg_speed,
+                    "Спящий режим Koliti",
+                    null,
+                    labels,
+                    selIdle,
+                    which -> {
                         ColgramAiConfig.setIdleUnloadSeconds(ctx, vals[which]);
                         refreshRow(idleSleepRow);
-                    }).create());
+                    }
+            );
             return;
         }
         if (position == voiceOverToggleRow) {
             boolean next = !ColgramAiConfig.isVoiceOverEnabled(ctx);
             ColgramAiConfig.setVoiceOverEnabled(ctx, next);
             if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(next);
-            Toast.makeText(ctx, next ? "Режим озвучки ответов Koliti включён" : "Озвучка ответов отключена", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(this, R.drawable.input_mic,
+                    next ? "Режим озвучки ответов Koliti включён" : "Озвучка ответов отключена", false);
             return;
         }
         if (position == voiceSampleRow) {
@@ -282,13 +294,25 @@ public class ColgramAiActivity extends BaseFragment {
                     "8K токенов (длинные чаты)",
                     "16K токенов (максимум)"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Размер контекста Koliti")
-                    .setItems(labels, (d, which) -> {
+            int curCtx = ColgramAiConfig.getContextSizeOverride(ctx);
+            int selCtx = -1;
+            for (int i = 0; i < vals.length; i++) {
+                if (vals[i] == curCtx) { selCtx = i; break; }
+            }
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(),
+                    getResourceProvider(),
+                    R.drawable.msg_settings,
+                    "Размер контекста Koliti",
+                    "Сбросит текущую загруженную сессию в RAM",
+                    labels,
+                    selCtx,
+                    which -> {
                         ColgramAiConfig.setContextSizeOverride(ctx, vals[which]);
                         ColgramAiEngine.getInstance().unloadModelAsync();
                         refreshRow(ctxSizeRow);
-                    }).create());
+                    }
+            );
             return;
         }
         if (position == kvQuantRow) {
@@ -298,12 +322,24 @@ public class ColgramAiActivity extends BaseFragment {
                     "Q4_0 (ультра-экономия памяти для 32K)",
                     "FP16 (без сжатия)"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Квантование KV-кэша")
-                    .setItems(labels, (d, which) -> {
+            int curKv = ColgramAiConfig.getKvQuantBits(ctx);
+            int selKv = -1;
+            for (int i = 0; i < vals.length; i++) {
+                if (vals[i] == curKv) { selKv = i; break; }
+            }
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(),
+                    getResourceProvider(),
+                    R.drawable.msg_speed,
+                    "Квантование KV-кэша",
+                    null,
+                    labels,
+                    selKv,
+                    which -> {
                         ColgramAiConfig.setKvQuantBits(ctx, vals[which]);
                         refreshRow(kvQuantRow);
-                    }).create());
+                    }
+            );
             return;
         }
         if (position == threadsRow) {
@@ -315,12 +351,24 @@ public class ColgramAiActivity extends BaseFragment {
                     "4 потока (для 4× big-ядер)",
                     "6 потоков (все ядра)"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Потоки CPU для Koliti")
-                    .setItems(labels, (d, which) -> {
+            int curTh = ColgramAiConfig.getThreadsOverride(ctx);
+            int selTh = -1;
+            for (int i = 0; i < vals.length; i++) {
+                if (vals[i] == curTh) { selTh = i; break; }
+            }
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(),
+                    getResourceProvider(),
+                    R.drawable.msg_speed_fast,
+                    "Потоки CPU для Koliti",
+                    null,
+                    labels,
+                    selTh,
+                    which -> {
                         ColgramAiConfig.setThreadsOverride(ctx, vals[which]);
                         refreshRow(threadsRow);
-                    }).create());
+                    }
+            );
             return;
         }
         if (position == importGgufRow) {
@@ -336,48 +384,58 @@ public class ColgramAiActivity extends BaseFragment {
             ColgramAiConfig.setCustomMmprojPath(ctx, "");
             ColgramAiConfig.setActiveModelId(ctx, ColgramAiModels.KOLITI_MODEL_ID);
             ColgramAiEngine.getInstance().unloadModelAsync();
-            Toast.makeText(ctx, "Возвращена модель " + ColgramAiModels.primary().title, Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(this, R.drawable.msg_bots, "Возвращена модель " + ColgramAiModels.primary().title, false);
             refreshUi();
         }
     }
 
     private void showModelTierPickerDialog(Context ctx) {
         if (ColgramAiModelManager.isDownloading()) {
-            Toast.makeText(ctx, "Сначала дождитесь завершения или остановите загрузку", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(this, R.drawable.msg_download, "Сначала дождитесь завершения или остановите загрузку", true);
             return;
         }
         final java.util.List<ColgramAiModels.ModelSpec> specs = ColgramAiModels.catalog();
         final String activeId = ColgramAiConfig.getActiveModelId(ctx);
         final boolean hasEmbedded = ColgramAiModelManager.hasEmbeddedAssets(ctx);
-        final String[] labels = new String[specs.size()];
+        final java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(specs.size());
         for (int i = 0; i < specs.size(); i++) {
             ColgramAiModels.ModelSpec s = specs.get(i);
             boolean installed = ColgramAiModelManager.isModelDownloaded(ctx, s);
             boolean embedded = s.hasBundledAssets() && hasEmbedded;
             String state = installed ? "установлена" : (embedded ? "встроена в APK" : "скачать с GitHub");
-            String mark = s.id.equals(activeId) ? "✓ " : "";
-            labels[i] = mark + s.title + "\n"
-                    + ColgramAiModelManager.formatSizeMb(s.approxModelBytes)
-                    + (s.supportsVision() ? " + Vision" : "")
-                    + " • " + state;
+            items.add(new ColgramUiKit.ChoiceItem(
+                    s.title,
+                    ColgramAiModelManager.formatSizeMb(s.approxModelBytes)
+                            + (s.supportsVision() ? " + Vision" : "")
+                            + " · " + state,
+                    R.drawable.msg_bots,
+                    0,
+                    s.id.equals(activeId),
+                    false,
+                    installed ? "Готова" : (embedded ? "В APK" : "GitHub")
+            ));
         }
-        showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                .setTitle("Выбор модели Колити")
-                .setItems(labels, (d, which) -> {
+        ColgramUiKit.showChoiceSheet(
+                getParentActivity(),
+                getResourceProvider(),
+                R.drawable.msg_bots,
+                "Выбор модели Колити",
+                "Локальные нейросети Koliti v3",
+                items,
+                which -> {
                     ColgramAiModels.ModelSpec chosen = specs.get(which);
                     ColgramAiConfig.setCustomModelPath(ctx, "");
                     ColgramAiConfig.setCustomMmprojPath(ctx, "");
                     ColgramAiConfig.setActiveModelId(ctx, chosen.id);
                     ColgramAiEngine.getInstance().unloadModelAsync();
                     if (ColgramAiModelManager.isModelDownloaded(ctx, chosen)) {
-                        Toast.makeText(ctx, "Активная модель: " + chosen.title, Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(this, R.drawable.msg_bots, "Активная модель: " + chosen.title, false);
                         refreshUi();
                     } else {
                         startDownloadForSpec(ctx, chosen);
                     }
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                }
+        );
     }
 
     private void startOrToggleCoreDownload(Context ctx) {
@@ -412,21 +470,29 @@ public class ColgramAiActivity extends BaseFragment {
     }
 
     private void confirmDeleteCore(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         final ColgramAiModels.ModelSpec spec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(ctx));
         long mb = Math.max(1L, (spec.approxModelBytes + spec.approxMmprojBytes) / (1024L * 1024L));
-        showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                .setTitle("Удалить веса " + spec.title + "?")
-                .setMessage("Освободится ~" + mb + " МБ памяти. Вы сможете загрузить модель повторно в любой момент или переключиться на " + ColgramAiModels.primary().title + ".")
-                .setPositiveButton("Удалить", (d, w) -> {
+        ColgramUiKit.showConfirmSheet(
+                act,
+                getResourceProvider(),
+                R.drawable.msg_delete,
+                "Удалить веса " + spec.title + "?",
+                "Освободится ~" + mb + " МБ памяти. Вы сможете загрузить модель повторно в любой момент или переключиться на " + ColgramAiModels.primary().title + ".",
+                "Удалить",
+                true,
+                () -> {
                     ColgramAiEngine.getInstance().unloadModelAsync();
                     ColgramAiModelManager.deleteModelFiles(ctx, spec);
                     if (!ColgramAiModels.KOLITI_MODEL_ID.equals(spec.id)) {
                         ColgramAiConfig.setActiveModelId(ctx, ColgramAiModels.KOLITI_MODEL_ID);
                     }
                     refreshUi();
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                },
+                "Отмена",
+                null
+        );
     }
 
     private void launchFilePicker(int reqCode, String chooserTitle) {
@@ -540,24 +606,32 @@ public class ColgramAiActivity extends BaseFragment {
     }
 
     private void showVoiceSamplePickerDialog(Context ctx) {
-        final String[] options = {
-                "Записать свой голос прямо сейчас (ГС)",
-                "Выбрать из моих голосовых (ГС) в Telegram",
-                "Выбрать аудиофайл (.ogg / .wav / .mp3)",
-                "Использовать встроенный голос Koliti"
-        };
-        showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                .setTitle("Образец голоса для клонирования")
-                .setItems(options, (d, which) -> {
+        Activity act = getParentActivity();
+        if (act == null) return;
+        java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(4);
+        items.add(ColgramUiKit.ChoiceItem.of("Записать свой голос прямо сейчас (ГС)", "10–15 секунд через микрофон", R.drawable.input_mic));
+        items.add(ColgramUiKit.ChoiceItem.of("Выбрать из моих голосовых (ГС) в Telegram", "Локальный кэш голосовых", R.drawable.msg_folders));
+        items.add(ColgramUiKit.ChoiceItem.of("Выбрать аудиофайл (.ogg / .wav / .mp3)", "Открыть системный проводник", R.drawable.msg_view_file));
+        items.add(ColgramUiKit.ChoiceItem.of("Использовать встроенный голос Koliti", "Сбросить образец клон-озвучки", R.drawable.msg_retry));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                getResourceProvider(),
+                R.drawable.input_mic,
+                "Образец голоса для клонирования",
+                "Выберите референс для персональной озвучки",
+                items,
+                which -> {
                     if (which == 0) {
                         showRecordVoiceSampleDialog(ctx);
                     } else if (which == 1) {
                         org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {
                             final java.util.List<File> notes = org.colgram.core.ColgramKolitiVoice.findRecentTelegramVoiceNotes(ctx, 12);
                             AndroidUtilities.runOnUIThread(() -> {
-                                if (getParentActivity() == null) return;
+                                Activity curAct = getParentActivity();
+                                if (curAct == null) return;
                                 if (notes.isEmpty()) {
-                                    Toast.makeText(ctx, "Локальные ГС не найдены — запишите образец или выберите файл", Toast.LENGTH_LONG).show();
+                                    ColgramUiKit.showNotice(this, R.drawable.msg_info,
+                                            "Локальные ГС не найдены — запишите образец или выберите файл", true);
                                     return;
                                 }
                                 String[] names = new String[notes.size()];
@@ -565,14 +639,22 @@ public class ColgramAiActivity extends BaseFragment {
                                     File f = notes.get(i);
                                     names[i] = f.getName() + " (" + Math.max(1L, f.length() / 1024L) + " КБ)";
                                 }
-                                showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                                        .setTitle("Выберите ваше голосовое (ГС)")
-                                        .setItems(names, (d2, idx) -> {
+                                ColgramUiKit.showChoiceSheet(
+                                        curAct,
+                                        getResourceProvider(),
+                                        R.drawable.input_mic,
+                                        "Выберите ваше голосовое (ГС)",
+                                        null,
+                                        names,
+                                        -1,
+                                        idx -> {
                                             File picked = notes.get(idx);
                                             ColgramAiConfig.setVoiceReferencePath(ctx, picked.getAbsolutePath());
-                                            Toast.makeText(ctx, "Образец голоса выбран: " + picked.getName(), Toast.LENGTH_SHORT).show();
+                                            ColgramUiKit.showNotice(this, R.drawable.input_mic,
+                                                    "Образец голоса выбран: " + picked.getName(), false);
                                             refreshRow(voiceSampleRow);
-                                        }).create());
+                                        }
+                                );
                             });
                         });
                     } else if (which == 2) {
@@ -586,10 +668,11 @@ public class ColgramAiActivity extends BaseFragment {
                         }
                     } else {
                         ColgramAiConfig.setVoiceReferencePath(ctx, "");
-                        Toast.makeText(ctx, "Используется стандартный образец Koliti", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(this, R.drawable.msg_retry, "Используется стандартный образец Koliti", false);
                         refreshRow(voiceSampleRow);
                     }
-                }).create());
+                }
+        );
     }
 
     private void showRecordVoiceSampleDialog(Context ctx) {
@@ -598,93 +681,110 @@ public class ColgramAiActivity extends BaseFragment {
         if (android.os.Build.VERSION.SDK_INT >= 23
                 && act.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             act.requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, 6411);
-            Toast.makeText(ctx, "Разрешите доступ к микрофону и нажмите снова", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(this, R.drawable.input_mic, "Разрешите доступ к микрофону и нажмите снова", true);
             return;
         }
         File outFile = new File(new File(act.getFilesDir(), "koliti_voice_ref"), "my_voice_" + System.currentTimeMillis() + ".m4a");
         if (!org.colgram.core.ColgramKolitiVoice.startRecording(outFile)) {
-            Toast.makeText(ctx, "Не удалось запустить запись с микрофона", Toast.LENGTH_SHORT).show();
+            ColgramUiKit.showNotice(this, R.drawable.msg_info, "Не удалось запустить запись с микрофона", true);
             return;
         }
-        AlertDialog dlg = new AlertDialog.Builder(ctx, getResourceProvider())
-                .setTitle("🎙 Запись образца голоса")
-                .setMessage("Прочитайте спокойно 10–15 секунд текста своим обычным голосом — так нейросеть точнее передаст тембр и ударения.\n\nНажмите «Сохранить», когда закончите.")
-                .setPositiveButton("Сохранить", (d, w) -> {
+        org.telegram.ui.ActionBar.BottomSheet sheet = ColgramUiKit.showConfirmSheet(
+                act,
+                getResourceProvider(),
+                R.drawable.input_mic,
+                "Запись образца голоса",
+                "Прочитайте спокойно 10–15 секунд текста своим обычным голосом — так нейросеть точнее передаст тембр и ударения.\n\nНажмите «Сохранить», когда закончите.",
+                "Сохранить",
+                false,
+                () -> {
                     File saved = org.colgram.core.ColgramKolitiVoice.stopRecording();
                     if (saved != null && saved.isFile()) {
                         ColgramAiConfig.setVoiceReferencePath(ctx, saved.getAbsolutePath());
-                        Toast.makeText(ctx, "Образец голоса сохранён (" + (saved.length() / 1024L) + " КБ)", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(this, R.drawable.input_mic,
+                                "Образец голоса сохранён (" + (saved.length() / 1024L) + " КБ)", false);
                         refreshRow(voiceSampleRow);
                     } else {
-                        Toast.makeText(ctx, "Запись слишком короткая", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "Запись слишком короткая", true);
                     }
-                })
-                .setNegativeButton("Отмена", (d, w) -> org.colgram.core.ColgramKolitiVoice.stopRecording())
-                .create();
-        android.app.Dialog shown = showDialog(dlg, d -> {
-            if (org.colgram.core.ColgramKolitiVoice.isRecording()) {
-                org.colgram.core.ColgramKolitiVoice.stopRecording();
-            }
-        });
-        if (shown == null && org.colgram.core.ColgramKolitiVoice.isRecording()) {
+                },
+                "Отмена",
+                () -> org.colgram.core.ColgramKolitiVoice.stopRecording()
+        );
+        if (sheet != null) {
+            sheet.setOnDismissListener(d -> {
+                if (org.colgram.core.ColgramKolitiVoice.isRecording()) {
+                    org.colgram.core.ColgramKolitiVoice.stopRecording();
+                }
+            });
+        } else if (org.colgram.core.ColgramKolitiVoice.isRecording()) {
             org.colgram.core.ColgramKolitiVoice.stopRecording();
         }
     }
 
     private void showVoiceCloneServerDialog(Context ctx) {
-        LinearLayout form = new LinearLayout(ctx);
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        LinearLayout form = new LinearLayout(act);
         form.setOrientation(LinearLayout.VERTICAL);
-        form.setPadding(dp(20), dp(10), dp(20), dp(4));
 
-        TextView hint = new TextView(ctx);
-        hint.setText("Для точного 1-в-1 клонирования вашего голоса с русскими ударениями укажите адрес вашего XTTS-v2 / F5-TTS / Fish-Speech сервера (например http://192.168.0.10:8020/tts_to_audio/) либо ключ Fish Audio / ElevenLabs.\n\nЕсли оставить пустым — работает встроенная офлайн-озвучка Android Neural TTS.");
-        hint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
-        hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
-        form.addView(hint, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
+        org.telegram.ui.Components.EditTextBoldCursor urlInput = ColgramUiKit.makeStyledEditText(
+                act, getResourceProvider(), pal,
+                "URL сервера (XTTS / F5-TTS / Fish / ElevenLabs)",
+                ColgramAiConfig.getVoiceCloneEndpoint(ctx),
+                android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI,
+                true);
+        form.addView(ColgramUiKit.makeInputContainer(act, pal, urlInput, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
 
-        android.widget.EditText urlInput = new android.widget.EditText(ctx);
-        urlInput.setHint("URL сервера (XTTS / F5-TTS / Fish / ElevenLabs)");
-        urlInput.setText(ColgramAiConfig.getVoiceCloneEndpoint(ctx));
-        urlInput.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
-        urlInput.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteHintText));
-        urlInput.setSingleLine(true);
-        form.addView(urlInput, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        org.telegram.ui.Components.EditTextBoldCursor keyInput = ColgramUiKit.makeStyledEditText(
+                act, getResourceProvider(), pal,
+                "API-ключ (опционально для Fish Audio / ElevenLabs)",
+                ColgramAiConfig.getVoiceCloneApiKey(ctx),
+                android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                true);
+        form.addView(ColgramUiKit.makeInputContainer(act, pal, keyInput, true),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
 
-        android.widget.EditText keyInput = new android.widget.EditText(ctx);
-        keyInput.setHint("API-ключ (опционально для Fish Audio / ElevenLabs)");
-        keyInput.setText(ColgramAiConfig.getVoiceCloneApiKey(ctx));
-        keyInput.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
-        keyInput.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteHintText));
-        keyInput.setSingleLine(true);
-        form.addView(keyInput, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        org.telegram.ui.Components.EditTextBoldCursor vidInput = ColgramUiKit.makeStyledEditText(
+                act, getResourceProvider(), pal,
+                "Voice ID / Reference ID (опционально)",
+                ColgramAiConfig.getVoiceCloneVoiceId(ctx),
+                android.text.InputType.TYPE_CLASS_TEXT,
+                true);
+        form.addView(ColgramUiKit.makeInputContainer(act, pal, vidInput, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        android.widget.EditText vidInput = new android.widget.EditText(ctx);
-        vidInput.setHint("Voice ID / Reference ID (опционально)");
-        vidInput.setText(ColgramAiConfig.getVoiceCloneVoiceId(ctx));
-        vidInput.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
-        vidInput.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteHintText));
-        vidInput.setSingleLine(true);
-        form.addView(vidInput, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                .setTitle("Клонирование голоса Koliti")
-                .setView(form)
-                .setPositiveButton("Сохранить", (d, w) -> {
+        ColgramUiKit.showCustomViewSheet(
+                act,
+                getResourceProvider(),
+                R.drawable.input_mic,
+                "Клонирование голоса Koliti",
+                "Для точного 1-в-1 клонирования вашего голоса с русскими ударениями укажите адрес вашего XTTS-v2 / F5-TTS / Fish-Speech сервера (например http://192.168.0.10:8020/tts_to_audio/) либо ключ Fish Audio / ElevenLabs. Если оставить пустым — работает встроенная офлайн-озвучка Android Neural TTS.",
+                form,
+                "Сохранить",
+                s -> {
                     ColgramAiConfig.setVoiceCloneEndpoint(ctx, urlInput.getText().toString().trim());
                     ColgramAiConfig.setVoiceCloneApiKey(ctx, keyInput.getText().toString().trim());
                     ColgramAiConfig.setVoiceCloneVoiceId(ctx, vidInput.getText().toString().trim());
-                    Toast.makeText(ctx, "Настройки озвучки сохранены", Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(this, R.drawable.input_mic, "Настройки озвучки сохранены", false);
                     refreshRow(voiceCloneEngineRow);
-                })
-                .setNeutralButton("Сбросить", (d, w) -> {
+                    return true;
+                },
+                "Сбросить",
+                s -> {
                     ColgramAiConfig.setVoiceCloneEndpoint(ctx, "");
                     ColgramAiConfig.setVoiceCloneApiKey(ctx, "");
                     ColgramAiConfig.setVoiceCloneVoiceId(ctx, "");
-                    Toast.makeText(ctx, "Переключено на встроенную офлайн-озвучку", Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(this, R.drawable.msg_retry, "Переключено на встроенную офлайн-озвучку", false);
                     refreshRow(voiceCloneEngineRow);
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                    return true;
+                },
+                "Отмена",
+                true,
+                false
+        );
     }
 
     private void refreshUi() {

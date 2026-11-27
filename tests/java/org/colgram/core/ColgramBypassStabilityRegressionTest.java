@@ -19,6 +19,8 @@ public final class ColgramBypassStabilityRegressionTest {
         testHasRecentRxWithinTracksAndResetsCleanly();
         testDialRacePoolIsolatedAndResponsive();
         testPrewarmPoolDrainAndBucketEvict();
+        testLoopbackGuardTelemetryAndStealthContracts();
+        testPipeOverWebSocketFailoverSynchronization();
         System.out.println("ColgramBypassStabilityRegressionTest PASSED");
     }
 
@@ -170,6 +172,180 @@ public final class ColgramBypassStabilityRegressionTest {
             check(drained >= 0, "drainPrewarmedPool must return non-negative count");
         } finally {
             ColgramTelegramWsBridge.setPrewarmEnabledForTest(true);
+        }
+    }
+
+    private static void testLoopbackGuardTelemetryAndStealthContracts() {
+        check(ColgramDpiBypass.isBlockedLoopbackTarget("127.0.0.1", 9876), "127.0.0.1:9876 blocked");
+        check(ColgramDpiBypass.isBlockedLoopbackTarget("::1", 443), "::1 blocked");
+        check(ColgramDpiBypass.isBlockedLoopbackTarget("localhost", 80), "localhost blocked");
+        check(ColgramDpiBypass.isBlockedLoopbackTarget("0.0.0.0", 443), "0.0.0.0 blocked");
+        check(!ColgramDpiBypass.isBlockedLoopbackTarget("149.154.167.220", 443), "public DC IP allowed");
+
+        check(ColgramNativeDesync.MODE_COMPACT_4_RECORD == 13, "MODE_COMPACT_4_RECORD must be 13");
+        check(ColgramNativeDesync.MODE_HDR2_SNI2_BULK == 14, "MODE_HDR2_SNI2_BULK must be 14");
+
+        String modeLabel = ColgramDpiBypass.getLiveModeLabel();
+        check(modeLabel != null && !modeLabel.isEmpty(), "getLiveModeLabel non-empty");
+        check(ColgramDpiBypass.getActiveSessionCount() >= 0, "getActiveSessionCount non-negative");
+
+        String wsSummary = ColgramTelegramWsBridge.getLiveTelemetrySummary();
+        check(wsSummary != null && !wsSummary.isEmpty(), "getLiveTelemetrySummary non-empty");
+        check(ColgramTelegramWsBridge.getPrewarmedTotalCount() >= 0, "getPrewarmedTotalCount non-negative");
+        ColgramTelegramWsBridge.getLastHandshakeRttMs();
+
+        List<ColgramTelegramWsBridge.EdgeEndpoint> eps = ColgramTelegramWsBridge.buildCandidateEndpoints(
+                2, null, java.util.Collections.emptyMap(), java.util.Collections.emptySet(), false);
+        for (ColgramTelegramWsBridge.EdgeEndpoint ep : eps) {
+            check(!"149.154.167.99".equals(ep.ip), "dead .99 edge IP must remain retired: " + ep);
+        }
+
+        check("googlevideo.com".equals(ColgramDpiBypass.baseDomainKey("rr3---sn-test.googlevideo.com")),
+                "baseDomainKey collapses YouTube subdomain");
+        check(ColgramPolymorphicStealth.isMultiTenantSharedDomain("d111111abcdef8.cloudfront.net"),
+                "cloudfront classified as multi-tenant CDN");
+        ColgramDpiBypass.reportHostStrategyResult("d111111abcdef8.cloudfront.net",
+                ColgramDpiBypass.STRATEGY_SPLIT_1, true, false);
+        check(!ColgramDpiBypass.isHostStrategyConfirmed("d111111abcdef8.cloudfront.net", false),
+                "multi-tenant CDN must not pollute hostStrategies");
+        check(ColgramDpiBypass.STRATEGY_NATIVE_COMPACT_4_RECORD == 14,
+                "STRATEGY_NATIVE_COMPACT_4_RECORD must be 14");
+        check(ColgramDpiBypass.STRATEGY_NATIVE_HDR2_SNI2_BULK == 15,
+                "STRATEGY_NATIVE_HDR2_SNI2_BULK must be 15");
+    }
+
+    private static byte[] buildTestObfuscated2Header() throws Exception {
+        byte[] sInit = new byte[64];
+        new java.util.Random(42).nextBytes(sInit);
+        byte[] sKey = java.util.Arrays.copyOfRange(sInit, 8, 40);
+        byte[] sIv = java.util.Arrays.copyOfRange(sInit, 40, 56);
+        byte[] rawSeed = sInit.clone();
+        rawSeed[56] = (byte) 0xef;
+        rawSeed[57] = (byte) 0xef;
+        rawSeed[58] = (byte) 0xef;
+        rawSeed[59] = (byte) 0xef;
+        rawSeed[60] = 2;
+        rawSeed[61] = 0;
+        javax.crypto.Cipher enc = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding");
+        enc.init(javax.crypto.Cipher.ENCRYPT_MODE,
+                new javax.crypto.spec.SecretKeySpec(sKey, "AES"),
+                new javax.crypto.spec.IvParameterSpec(sIv));
+        byte[] hdrCipher = enc.update(rawSeed);
+        System.arraycopy(hdrCipher, 56, sInit, 56, 8);
+        return sInit;
+    }
+
+    private static byte[] buildUnmaskedWsBinaryFrame(byte[] payload) {
+        byte[] frame = new byte[2 + payload.length];
+        frame[0] = (byte) 0x82;
+        frame[1] = (byte) payload.length;
+        System.arraycopy(payload, 0, frame, 2, payload.length);
+        return frame;
+    }
+
+    private static void testPipeOverWebSocketFailoverSynchronization() throws Exception {
+        java.lang.reflect.Method pipeWs = ColgramDpiBypass.class.getDeclaredMethod(
+                "pipeOverWebSocket",
+                Socket.class,
+                ColgramTelegramWsBridge.WsSession.class,
+                ColgramDpiBypass.CallListener.class,
+                long.class,
+                boolean.class);
+        pipeWs.setAccessible(true);
+
+        byte[] initHdr = buildTestObfuscated2Header();
+        byte[] expectedReply = new byte[]{
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, (byte) 0x88,
+                (byte) 0x99, (byte) 0xaa, (byte) 0xbb, (byte) 0xcc, 0x01, 0x02, 0x03, 0x04
+        };
+        byte[] wsReplyFrame = buildUnmaskedWsBinaryFrame(expectedReply);
+
+        try {
+            ColgramDpiBypass.skipListenerCheckForTest = true;
+
+            // Case 1: Dead initial prewarm fails on C2S write while S2C immediately sees EOF;
+            // S2C must wait for the 120ms redial instead of closing client prematurely.
+            runPipeFailoverScenario(pipeWs, initHdr, expectedReply, wsReplyFrame, true, false);
+
+            // Case 2: Dead initial prewarm sends EOF on S2C 50ms BEFORE client finishes sending 64B init;
+            // S2C must wait on initPhasePending and fail over cleanly once init arrives.
+            runPipeFailoverScenario(pipeWs, initHdr, expectedReply, wsReplyFrame, false, true);
+        } finally {
+            ColgramDpiBypass.skipListenerCheckForTest = false;
+            ColgramTelegramWsBridge.dialFreshOverrideForTest = null;
+        }
+    }
+
+    private static void runPipeFailoverScenario(java.lang.reflect.Method pipeWs,
+                                                byte[] initHdr,
+                                                byte[] expectedReply,
+                                                byte[] wsReplyFrame,
+                                                boolean failC2sWrite,
+                                                boolean delayClientInit) throws Exception {
+        java.util.concurrent.atomic.AtomicInteger dialCalls = new java.util.concurrent.atomic.AtomicInteger(0);
+        java.util.concurrent.atomic.AtomicInteger freshOutWrites = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        ColgramTelegramWsBridge.dialFreshOverrideForTest = (signedDc, prot, fdProt) -> {
+            dialCalls.incrementAndGet();
+            try {
+                Thread.sleep(120L);
+            } catch (InterruptedException ignored) {}
+            java.io.OutputStream freshOut = new java.io.OutputStream() {
+                @Override
+                public void write(int b) {}
+
+                @Override
+                public void write(byte[] b, int off, int len) {
+                    freshOutWrites.incrementAndGet();
+                }
+            };
+            return new ColgramTelegramWsBridge.WsSession(
+                    Math.abs(signedDc), signedDc, "149.154.167.220", "kws2.web.telegram.org",
+                    new Socket(), new java.io.ByteArrayInputStream(wsReplyFrame), freshOut);
+        };
+
+        java.io.OutputStream deadOut = new java.io.OutputStream() {
+            @Override
+            public void write(int b) throws java.io.IOException {
+                if (failC2sWrite) throw new java.io.IOException("simulated dead prewarm socket");
+            }
+
+            @Override
+            public void write(byte[] b, int off, int len) throws java.io.IOException {
+                if (failC2sWrite) throw new java.io.IOException("simulated dead prewarm socket");
+            }
+        };
+        ColgramTelegramWsBridge.WsSession staleSession = new ColgramTelegramWsBridge.WsSession(
+                2, 2, "149.154.167.220", "kws2.web.telegram.org",
+                new Socket(), new java.io.ByteArrayInputStream(new byte[0]), deadOut);
+        staleSession.fromPrewarm = true;
+
+        try (java.net.ServerSocket listener = new java.net.ServerSocket(0, 4, java.net.InetAddress.getLoopbackAddress());
+             Socket clientEnd = new Socket("127.0.0.1", listener.getLocalPort());
+             Socket proxySide = listener.accept()) {
+            clientEnd.setSoTimeout(5000);
+            pipeWs.invoke(null, proxySide, staleSession, null, 1L, false);
+
+            if (delayClientInit) {
+                Thread.sleep(50L);
+            }
+            java.io.OutputStream cOut = clientEnd.getOutputStream();
+            cOut.write(initHdr);
+            cOut.flush();
+
+            java.io.InputStream cIn = clientEnd.getInputStream();
+            byte[] got = new byte[expectedReply.length];
+            int total = 0;
+            while (total < got.length) {
+                int r = cIn.read(got, total, got.length - total);
+                if (r < 0) break;
+                total += r;
+            }
+            check(total == expectedReply.length && java.util.Arrays.equals(got, expectedReply),
+                    "client must survive concurrent C2S/S2C failover and receive fresh WSS reply (got="
+                            + total + ", failC2s=" + failC2sWrite + ", delayInit=" + delayClientInit + ")");
+            check(dialCalls.get() == 1, "exactly one fresh redial expected, got " + dialCalls.get());
+            check(freshOutWrites.get() >= 1, "fresh WSS session must receive replayed init packet");
         }
     }
 

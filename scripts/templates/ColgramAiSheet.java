@@ -64,9 +64,9 @@ import org.colgram.core.ColgramAiModels;
 import org.colgram.core.ColgramAiWebSearch;
 import org.colgram.core.ColgramKolitiVoice;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
@@ -253,6 +253,12 @@ public final class ColgramAiSheet {
                 int preferredH = Math.max(dp(320), (int) (screenH * 0.84f));
                 int targetH = availH > 0 ? Math.min(availH, preferredH) : preferredH;
                 super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(Math.max(dp(120), targetH), MeasureSpec.EXACTLY));
+            }
+
+            @Override
+            protected void onWindowVisibilityChanged(int visibility) {
+                super.onWindowVisibilityChanged(visibility);
+                syncPulseAnimators(visibility == VISIBLE);
             }
         };
         final boolean compactPortrait = AndroidUtilities.displaySize.x > 0 && AndroidUtilities.displaySize.x <= dp(395);
@@ -1639,11 +1645,37 @@ public final class ColgramAiSheet {
         });
     }
 
+    private void syncPulseAnimators(boolean windowVisible) {
+        Context ctx = liveDot != null ? liveDot.getContext() : null;
+        boolean allow = windowVisible
+                && !cleanedUp.get()
+                && !ApplicationLoader.mainInterfacePaused
+                && !org.colgram.core.ColgramPowerGuard.isPowerSaveMode(ctx)
+                && !org.colgram.core.ColgramPowerGuard.isThermalThrottled(ctx);
+        if (dotPulseAnimator != null) {
+            if (allow) {
+                if (dotPulseAnimator.isPaused()) dotPulseAnimator.resume();
+                else if (!dotPulseAnimator.isStarted()) dotPulseAnimator.start();
+            } else if (dotPulseAnimator.isRunning()) {
+                dotPulseAnimator.pause();
+            }
+        }
+        if (thinkingPulseAnimator != null) {
+            if (allow) {
+                if (thinkingPulseAnimator.isPaused()) thinkingPulseAnimator.resume();
+                else if (!thinkingPulseAnimator.isStarted()) thinkingPulseAnimator.start();
+            } else if (thinkingPulseAnimator.isRunning()) {
+                thinkingPulseAnimator.pause();
+            }
+        }
+    }
+
     private void startDotPulse() {
         stopDotPulse();
         Context ctx = liveDot != null ? liveDot.getContext() : null;
         if (org.colgram.core.ColgramPowerGuard.isPowerSaveMode(ctx)
-                || org.colgram.core.ColgramPowerGuard.isThermalThrottled(ctx)) {
+                || org.colgram.core.ColgramPowerGuard.isThermalThrottled(ctx)
+                || ApplicationLoader.mainInterfacePaused) {
             if (liveDot != null) liveDot.setAlpha(1.0f);
             return;
         }
@@ -1654,6 +1686,9 @@ public final class ColgramAiSheet {
         dotPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
         dotPulseAnimator.setInterpolator(new LinearInterpolator());
         dotPulseAnimator.addUpdateListener(a -> {
+            if (liveDot == null || liveDot.getWindowVisibility() != View.VISIBLE || ApplicationLoader.mainInterfacePaused) {
+                return;
+            }
             long now = android.os.SystemClock.uptimeMillis();
             if (now - lastDotFrameMs[0] < 50L) return;
             lastDotFrameMs[0] = now;
@@ -1672,11 +1707,28 @@ public final class ColgramAiSheet {
 
     private void startThinkingPulse(View target) {
         stopThinkingPulse();
+        Context ctx = target != null ? target.getContext() : null;
+        if (target == null
+                || org.colgram.core.ColgramPowerGuard.isPowerSaveMode(ctx)
+                || org.colgram.core.ColgramPowerGuard.isThermalThrottled(ctx)
+                || ApplicationLoader.mainInterfacePaused) {
+            if (target != null) target.setAlpha(1.0f);
+            return;
+        }
+        final long[] lastFrameMs = new long[]{0L};
         thinkingPulseAnimator = ValueAnimator.ofFloat(0.45f, 1.0f);
         thinkingPulseAnimator.setDuration(680L);
         thinkingPulseAnimator.setRepeatMode(ValueAnimator.REVERSE);
         thinkingPulseAnimator.setRepeatCount(ValueAnimator.INFINITE);
-        thinkingPulseAnimator.addUpdateListener(a -> target.setAlpha((float) a.getAnimatedValue()));
+        thinkingPulseAnimator.addUpdateListener(a -> {
+            if (target.getWindowVisibility() != View.VISIBLE || ApplicationLoader.mainInterfacePaused) {
+                return;
+            }
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - lastFrameMs[0] < 50L) return;
+            lastFrameMs[0] = now;
+            target.setAlpha((float) a.getAnimatedValue());
+        });
         thinkingPulseAnimator.start();
     }
 
@@ -1762,21 +1814,26 @@ public final class ColgramAiSheet {
         List<String> recent = ColgramAiChatBridge.collectRecentChatMediaPaths(chatActivity, 1);
         if (!recent.isEmpty() && !attachedPaths.contains(recent.get(0))) {
             final String recentPath = recent.get(0);
-            AlertDialog.Builder builder = new AlertDialog.Builder(act);
-            builder.setTitle("Прикрепить к Koliti");
-            builder.setItems(new CharSequence[]{
-                    "Выбрать фото или видео из галереи",
-                    "Взять последнее медиа из этого чата"
-            }, (dialog, which) -> {
-                if (which == 0) {
-                    launchMediaPicker(act);
-                } else {
-                    if (attachedPaths.size() >= 4) attachedPaths.remove(0);
-                    attachedPaths.add(recentPath);
-                    refreshAttachmentStrip();
-                }
-            });
-            builder.show();
+            java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(2);
+            items.add(ColgramUiKit.ChoiceItem.of("Выбрать фото или видео из галереи", "Системная медиатека", R.drawable.msg_photos));
+            items.add(ColgramUiKit.ChoiceItem.of("Взять последнее медиа из этого чата", "Быстрое прикрепление", R.drawable.msg_media));
+            ColgramUiKit.showChoiceSheet(
+                    act,
+                    parentFragment != null ? parentFragment.getResourceProvider() : null,
+                    R.drawable.msg_media,
+                    "Прикрепить к Koliti",
+                    "Выберите источник медиа",
+                    items,
+                    which -> {
+                        if (which == 0) {
+                            launchMediaPicker(act);
+                        } else {
+                            if (attachedPaths.size() >= 4) attachedPaths.remove(0);
+                            attachedPaths.add(recentPath);
+                            refreshAttachmentStrip();
+                        }
+                    }
+            );
             return;
         }
         launchMediaPicker(act);

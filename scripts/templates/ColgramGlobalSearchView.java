@@ -179,6 +179,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
         listView = new RecyclerListView(context);
         listView.setClipToPadding(false);
         listView.setLayoutManager(new LinearLayoutManager(context, LinearLayoutManager.VERTICAL, false));
+        ColgramMenuChrome.attachDynamicListAnimations(listView);
         adapter = new GlobalAdapter(context);
         listView.setAdapter(adapter);
         listView.setOnItemClickListener((view, position) -> {
@@ -963,7 +964,7 @@ public class ColgramGlobalSearchView extends FrameLayout {
                 pill.setTypeface(AndroidUtilities.bold());
                 pill.setPadding(dp(12), dp(6), dp(12), dp(6));
                 GradientDrawable bg = new GradientDrawable();
-                bg.setCornerRadius(dp(16));
+                bg.setCornerRadius(dp(999));
                 pill.setBackground(bg);
                 pill.setOnClickListener(v -> {
                     if (activeFilter != idx) {

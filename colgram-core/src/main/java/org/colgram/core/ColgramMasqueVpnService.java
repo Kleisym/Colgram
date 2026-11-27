@@ -45,7 +45,7 @@ public final class ColgramMasqueVpnService extends VpnService {
                 return;
             }
             report(ColgramWarpState.UP, null);
-            handler.postDelayed(this, 10_000L);
+            handler.postDelayed(this, ColgramUiBridge.isAppInForeground() ? 30_000L : 60_000L);
         }
     };
 
@@ -170,7 +170,8 @@ public final class ColgramMasqueVpnService extends VpnService {
             handler.post(() -> {
                 if (generation == attempt && running) {
                     foreground("WARP: защищённый канал подключён");
-                    handler.removeCallbacks(heartbeat); handler.postDelayed(heartbeat, 10_000L);
+                    handler.removeCallbacks(heartbeat);
+                    handler.postDelayed(heartbeat, ColgramUiBridge.isAppInForeground() ? 30_000L : 60_000L);
                 }
             });
             pump(attempt, descriptor);
@@ -224,10 +225,16 @@ public final class ColgramMasqueVpnService extends VpnService {
     private void pump(long attempt, ParcelFileDescriptor descriptor) throws Exception {
         try (FileInputStream in = new FileInputStream(descriptor.getFileDescriptor())) {
             byte[] buffer = new byte[32767];
+            int idleReads = 0;
             while (running && current(attempt)) {
                 int read = in.read(buffer);
                 if (read < 0) break;
-                if (read == 0) { Thread.sleep(10L); continue; }
+                if (read == 0) {
+                    idleReads = Math.min(8, idleReads + 1);
+                    Thread.sleep(Math.min(50L, 10L + (idleReads * 5L)));
+                    continue;
+                }
+                idleReads = 0;
                 byte[] packet = java.util.Arrays.copyOf(buffer, read);
                 ColgramMasqueNative.exchangeIpPacket(packet, null, null);
                 packetsHandled++;

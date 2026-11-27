@@ -130,12 +130,13 @@ public final class ColgramMessageSeenSheet {
         if (act == null || act.isFinishing() || act.isDestroyed() || message == null || !canCheckSeen(currentAccount, message, chat, user)) {
             return;
         }
-        final boolean isDark = Theme.isCurrentThemeDark();
-        final int cTextPrimary = isDark ? 0xFFF1F5F9 : 0xFF0F172A;
-        final int cTextSecondary = isDark ? 0xFF94A3B8 : 0xFF64748B;
-        final int cCard = isDark ? 0xFF141822 : 0xFFFFFFFF;
-        final int cBorder = isDark ? 0x22FFFFFF : 0x1A0F172A;
-        final int cAccent = 0xFFE11D48;
+        final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        final boolean isDark = pal.dark;
+        final int cTextPrimary = pal.textPrimary;
+        final int cTextSecondary = pal.textSecondary;
+        final int cCard = pal.cardSurface;
+        final int cBorder = pal.borderSubtle;
+        final int cAccent = pal.accentPrimary;
 
         final boolean isRound = message.isRoundVideo();
         final boolean isVoice = message.isVoice();
@@ -144,21 +145,8 @@ public final class ColgramMessageSeenSheet {
         final BottomSheet sheet = new BottomSheet(act, false, resourcesProvider);
         sheet.setApplyBottomPadding(false);
 
-        LinearLayout root = new LinearLayout(act);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(12), dp(18), dp(22) + AndroidUtilities.navigationBarHeight);
-        GradientDrawable sheetBg = new GradientDrawable();
-        sheetBg.setColor(isDark ? 0xFF0D1018 : 0xFFF8FAFC);
-        sheetBg.setCornerRadii(new float[]{dp(22), dp(22), dp(22), dp(22), 0, 0, 0, 0});
-        root.setBackground(sheetBg);
-
-        // Drag pill
-        View handle = new View(act);
-        GradientDrawable handleBg = new GradientDrawable();
-        handleBg.setColor(isDark ? 0x44FFFFFF : 0x330F172A);
-        handleBg.setCornerRadius(dp(3));
-        handle.setBackground(handleBg);
-        root.addView(handle, LayoutHelper.createLinear(38, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14));
+        LinearLayout root = ColgramUiKit.makeSheetRoot(act, pal);
+        ColgramAeroStyler.applyFlagshipSheetChrome(sheet, root, pal);
 
         // Header row
         LinearLayout header = new LinearLayout(act);

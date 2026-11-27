@@ -46,6 +46,8 @@
 #define MODE_SPLIT_BYTE1        10  /* Exact ByeDPI -s1 -r1+s: 1B kernel TCP split + 2-rec SNI+1 split, NO TTL=1, NO OOB */
 #define MODE_MULTI_SPLIT_SNI    11  /* Carrier-safe multi-split across SNI (-s1 -s3+s -s6+s + SLD-1 + SLD-mid + rec3): NO OOB, NO TTL=1 */
 #define MODE_HYBRID_MULTI_RECORD 12 /* Hybrid 3-record SNI+1 + SLD-1 + SLD-mid + Rec3 split: zero OOB, zero TTL=1 */
+#define MODE_COMPACT_4_RECORD    13 /* Compact 4-send SNI record split: zero OOB, zero TTL=1, jittered micro-flush */
+#define MODE_HDR2_SNI2_BULK      14 /* 2-byte TLS header + SNI prefix + SNI+2 + bulk tail: zero OOB, zero TTL=1 */
 
 typedef struct {
     atomic_int refcount;
@@ -248,6 +250,27 @@ static void wait_tx_pushed(DesyncConn *conn, uint32_t min_unacked, int cellular)
     usleep(cellular ? 2500 : 500);
 }
 
+static uint8_t pick_non_zero_oob_byte(void) {
+    return (uint8_t)(1u + arc4random_uniform(0x7Eu));
+}
+
+static int jitter_delay_us(int cellular) {
+    if (cellular) {
+        return 320 + (int)arc4random_uniform(531u);
+    }
+    return 180 + (int)arc4random_uniform(301u);
+}
+
+static size_t jitter_split_offset(size_t base_cut, size_t min_cut, size_t max_cut) {
+    if (min_cut >= max_cut) return min_cut;
+    if (base_cut < min_cut) base_cut = min_cut;
+    if (base_cut > max_cut) base_cut = max_cut;
+    size_t lo = (base_cut > min_cut + 2) ? (base_cut - 2) : min_cut;
+    size_t hi = (base_cut + 2 < max_cut) ? (base_cut + 2) : max_cut;
+    if (lo >= hi) return lo;
+    return lo + (size_t)arc4random_uniform((uint32_t)(hi - lo + 1u));
+}
+
 static int send_all(DesyncConn *conn, const uint8_t *buf, size_t len, int flags) {
     size_t sent = 0;
     while (sent < len) {
@@ -271,11 +294,11 @@ static int send_all(DesyncConn *conn, const uint8_t *buf, size_t len, int flags)
 }
 
 static int send_tail_split(DesyncConn *conn, const uint8_t *buf, size_t start,
-                           size_t cut2, size_t total, int delay_us) {
+                           size_t cut2, size_t total, int cellular) {
     if (cut2 > start && cut2 < total) {
         int rc = send_all(conn, buf + start, cut2 - start, 0);
         if (rc == 0) {
-            usleep((useconds_t)delay_us);
+            usleep((useconds_t)jitter_delay_us(cellular));
             rc = send_all(conn, buf + cut2, total - cut2, 0);
         }
         return rc;
@@ -284,22 +307,22 @@ static int send_tail_split(DesyncConn *conn, const uint8_t *buf, size_t start,
 }
 
 static int send_segmented_step(DesyncConn *conn, const uint8_t *buf, size_t *pos,
-                               size_t target, size_t limit, int delay_us) {
+                               size_t target, size_t limit, int cellular) {
     if (target <= *pos || target >= limit) return 0;
-    if (delay_us > 0) usleep((useconds_t)delay_us);
+    usleep((useconds_t)jitter_delay_us(cellular));
     int rc = send_all(conn, buf + *pos, target - *pos, 0);
     if (rc == 0) *pos = target;
     return rc;
 }
 
 static int send_multi_record_sni(DesyncConn *conn, const uint8_t *buf, size_t total,
-                                 size_t cut, size_t cut2, int delay_us, int hybrid) {
+                                 size_t cut, size_t cut2, int cellular, int hybrid) {
     /* Zero MSG_OOB, zero IP_TTL=1, zero tiny MSS — safe across LTE CGNAT/PGWs.
      * Splits byte 1, SNI+1 (cut), SNI+3, SNI+6, SLD-1, SLD-mid (cut2), and Record 3 SNI+1. */
     int rc = send_all(conn, buf, 1, 0);
     if (rc != 0) return rc;
     if (cut > 1) {
-        if (delay_us > 0) usleep((useconds_t)delay_us);
+        usleep((useconds_t)jitter_delay_us(cellular));
         rc = send_all(conn, buf + 1, cut - 1, 0);
         if (rc != 0) return rc;
     }
@@ -309,32 +332,84 @@ static int send_multi_record_sni(DesyncConn *conn, const uint8_t *buf, size_t to
     int has_rec2 = (pos + 6 < total && buf[pos] == 0x16 && buf[pos + 1] == 0x03);
     size_t hdr_skip = has_rec2 ? 5 : 0;
 
-    rc = send_segmented_step(conn, buf, &pos, pos + hdr_skip + (hybrid ? 1 : 2), rec2_end, delay_us);
-    if (rc == 0) rc = send_segmented_step(conn, buf, &pos, cut + hdr_skip + (hybrid ? 3 : 5), rec2_end, delay_us);
+    rc = send_segmented_step(conn, buf, &pos, pos + hdr_skip + (hybrid ? 1 : 2), rec2_end, cellular);
+    if (rc == 0) rc = send_segmented_step(conn, buf, &pos, cut + hdr_skip + (hybrid ? 3 : 5), rec2_end, cellular);
     if (rc == 0 && hybrid) {
-        rc = send_segmented_step(conn, buf, &pos, cut + hdr_skip + 6, rec2_end, delay_us);
+        rc = send_segmented_step(conn, buf, &pos, cut + hdr_skip + 6, rec2_end, cellular);
     }
     if (rc == 0 && cut2 > cut && rec2_end > pos + 1) {
         /* Cut at SLD-1 right before the SLD-mid record boundary (cut2). */
-        rc = send_segmented_step(conn, buf, &pos, rec2_end - 1, rec2_end, delay_us);
+        rc = send_segmented_step(conn, buf, &pos, rec2_end - 1, rec2_end, cellular);
     }
     if (rc == 0 && pos < rec2_end) {
-        if (delay_us > 0) usleep((useconds_t)delay_us);
+        usleep((useconds_t)jitter_delay_us(cellular));
         rc = send_all(conn, buf + pos, rec2_end - pos, 0);
         if (rc == 0) pos = rec2_end;
     }
     if (rc == 0 && pos < total) {
         int has_rec3 = (pos + 6 < total && buf[pos] == 0x16 && buf[pos + 1] == 0x03);
         if (has_rec3) {
-            rc = send_segmented_step(conn, buf, &pos, pos + 5 + 1, total, delay_us);
+            rc = send_segmented_step(conn, buf, &pos, pos + 5 + 1, total, cellular);
             if (rc == 0 && hybrid) {
-                rc = send_segmented_step(conn, buf, &pos, pos + 2, total, delay_us);
+                rc = send_segmented_step(conn, buf, &pos, pos + 2, total, cellular);
             }
         }
         if (rc == 0 && pos < total) {
-            if (delay_us > 0) usleep((useconds_t)delay_us);
+            usleep((useconds_t)jitter_delay_us(cellular));
             rc = send_all(conn, buf + pos, total - pos, 0);
         }
+    }
+    return rc;
+}
+
+static int send_compact_4_record(DesyncConn *conn, const uint8_t *buf, size_t total,
+                                 size_t cut, size_t cut2, int cellular) {
+    size_t c1 = (total > 2 && cut > 1) ? 1 : cut;
+    int rc = send_all(conn, buf, c1, 0);
+    if (rc != 0) return rc;
+    size_t pos = c1;
+    if (cut > pos) {
+        usleep((useconds_t)jitter_delay_us(cellular));
+        rc = send_all(conn, buf + pos, cut - pos, 0);
+        if (rc != 0) return rc;
+        pos = cut;
+    }
+    if (cut2 > pos && cut2 < total) {
+        usleep((useconds_t)jitter_delay_us(cellular));
+        rc = send_all(conn, buf + pos, cut2 - pos, 0);
+        if (rc != 0) return rc;
+        pos = cut2;
+    }
+    if (pos < total) {
+        usleep((useconds_t)jitter_delay_us(cellular));
+        rc = send_all(conn, buf + pos, total - pos, 0);
+    }
+    return rc;
+}
+
+static int send_hdr2_sni2_bulk(DesyncConn *conn, const uint8_t *buf, size_t total,
+                               size_t cut, int cellular) {
+    size_t hdr2 = (cut > 2) ? 2 : 1;
+    int rc = send_all(conn, buf, hdr2, 0);
+    if (rc != 0) return rc;
+    size_t pos = hdr2;
+    if (cut > pos) {
+        usleep((useconds_t)jitter_delay_us(cellular));
+        rc = send_all(conn, buf + pos, cut - pos, 0);
+        if (rc != 0) return rc;
+        pos = cut;
+    }
+    int has_rec2 = (pos + 6 < total && buf[pos] == 0x16 && buf[pos + 1] == 0x03);
+    size_t step = pos + (has_rec2 ? 7 : 2);
+    if (step > pos && step < total) {
+        usleep((useconds_t)jitter_delay_us(cellular));
+        rc = send_all(conn, buf + pos, step - pos, 0);
+        if (rc != 0) return rc;
+        pos = step;
+    }
+    if (pos < total) {
+        usleep((useconds_t)jitter_delay_us(cellular));
+        rc = send_all(conn, buf + pos, total - pos, 0);
     }
     return rc;
 }
@@ -643,18 +718,23 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
         LOGD("setsockopt(TCP_NODELAY) failed: errno=%d", errno);
     }
+    {
+        int buf_sz = 131072;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_sz, sizeof(buf_sz));
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
+    }
     if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) {
         LOGD("setsockopt(SO_KEEPALIVE) failed: errno=%d", errno);
     }
 #ifdef TCP_KEEPIDLE
     {
-        int keepidle = 25;
+        int keepidle = 180;
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
     }
 #endif
 #ifdef TCP_KEEPINTVL
     {
-        int keepintvl = 8;
+        int keepintvl = 30;
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     }
 #endif
@@ -666,7 +746,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
 #endif
 #ifdef TCP_USER_TIMEOUT
     {
-        int user_timeout = 25000;
+        int user_timeout = 60000;
         setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout));
     }
 #endif
@@ -774,6 +854,92 @@ Java_org_colgram_core_ColgramNativeDesync_nativeUnclampWindow(JNIEnv *env, jclas
     conn_release(conn);
 }
 
+JNIEXPORT jboolean JNICALL
+Java_org_colgram_core_ColgramNativeDesync_nativeIsSocketIdleClean(JNIEnv *env, jclass clazz, jlong handle) {
+    (void)env;
+    (void)clazz;
+    DesyncConn *conn = conn_acquire(handle);
+    if (conn == NULL) return JNI_FALSE;
+    if (atomic_load_explicit(&conn->closed, memory_order_acquire) || conn->fd < 0) {
+        conn_release(conn);
+        return JNI_FALSE;
+    }
+    int so_err = 0;
+    socklen_t err_len = sizeof(so_err);
+    if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &so_err, &err_len) != 0 || so_err != 0) {
+        conn_release(conn);
+        return JNI_FALSE;
+    }
+    struct pollfd pfd;
+    pfd.fd = conn->fd;
+#ifdef POLLRDHUP
+    short watch = (short)(POLLIN | POLLERR | POLLHUP | POLLRDHUP);
+#else
+    short watch = (short)(POLLIN | POLLERR | POLLHUP);
+#endif
+    pfd.events = watch;
+    pfd.revents = 0;
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    conn_release(conn);
+    return (rc == 0 && (pfd.revents & watch) == 0) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_org_colgram_core_ColgramNativeDesync_nativeSetKeepalive(JNIEnv *env, jclass clazz,
+                                                             jlong handle, jint idleSec,
+                                                             jint intvlSec, jint cnt,
+                                                             jint userTimeoutMs) {
+    (void)env;
+    (void)clazz;
+    DesyncConn *conn = conn_acquire(handle);
+    if (conn == NULL) return;
+    if (!atomic_load_explicit(&conn->closed, memory_order_acquire) && conn->fd >= 0) {
+        int ka = (idleSec > 0) ? 1 : 0;
+        setsockopt(conn->fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        if (ka) {
+#ifdef TCP_KEEPIDLE
+            {
+                int v = (int)idleSec;
+                setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, sizeof(v));
+            }
+#else
+            (void)idleSec;
+#endif
+#ifdef TCP_KEEPINTVL
+            if (intvlSec > 0) {
+                int v = (int)intvlSec;
+                setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
+            }
+#else
+            (void)intvlSec;
+#endif
+#ifdef TCP_KEEPCNT
+            if (cnt > 0) {
+                int v = (int)cnt;
+                setsockopt(conn->fd, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof(v));
+            }
+#else
+            (void)cnt;
+#endif
+        } else {
+            (void)intvlSec;
+            (void)cnt;
+        }
+#ifdef TCP_USER_TIMEOUT
+        if (userTimeoutMs >= 0) {
+            int ut = (int)userTimeoutMs;
+            setsockopt(conn->fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, sizeof(ut));
+        }
+#else
+        (void)userTimeoutMs;
+#endif
+    }
+    conn_release(conn);
+}
+
 JNIEXPORT jint JNICALL
 Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass clazz,
                                                            jlong handle,
@@ -832,7 +998,8 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
     size_t total = (size_t)len;
     size_t cut = (split1 > 0 && (size_t)split1 < total) ? (size_t)split1 : (total > 2 ? total / 2 : 1);
     size_t cut2 = 0;
-    if (total - cut > 5 && buf[cut] == 0x16 && buf[cut + 1] == 0x03) {
+    int tls_rec_boundary = (total - cut > 5 && buf[cut] == 0x16 && buf[cut + 1] == 0x03);
+    if (tls_rec_boundary) {
         size_t rec2_len = (((size_t)(buf[cut + 3] & 0xFF)) << 8) | (size_t)(buf[cut + 4] & 0xFF);
         if (rec2_len > 0 && rec2_len <= total - cut - 5) {
             size_t candidate_cut2 = cut + 5 + rec2_len;
@@ -841,9 +1008,11 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
                 cut2 = candidate_cut2;
             }
         }
+    } else if (total > 6 && !(buf[0] == 0x16 && buf[1] == 0x03)) {
+        cut = jitter_split_offset(cut, 1, total - 1);
     }
     int is_cell = cellular ? 1 : 0;
-    int delay_us = is_cell ? 350 : 120;
+    uint8_t oob_byte = pick_non_zero_oob_byte();
     int rc = 0;
 
     if (total <= 2 || mode == MODE_PLAIN) {
@@ -866,12 +1035,12 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
                 rc = send_all(conn, buf, cut, 0);
                 if (rc == 0) wait_tx_pushed(conn, 1, is_cell);
                 set_ttl(conn->fd, conn->family, conn->default_ttl);
-                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             } else {
                 rc = send_all(conn, buf, cut, 0);
                 if (rc == 0) {
-                    usleep(is_cell ? 2500 : 600);
-                    rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                    usleep((useconds_t)jitter_delay_us(is_cell));
+                    rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
                 }
             }
         } else if (mode == MODE_DISORDER_BYTE1) {
@@ -882,97 +1051,101 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendDesync(JNIEnv *env, jclass c
                 set_ttl(conn->fd, conn->family, conn->default_ttl);
                 if (rc == 0 && cut > 1) {
                     rc = send_all(conn, buf + 1, cut - 1, 0);
-                    if (rc == 0) usleep(is_cell ? 2000 : 500);
+                    if (rc == 0) usleep((useconds_t)jitter_delay_us(is_cell));
                 }
-                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             } else {
                 rc = send_all(conn, buf, 1, 0);
                 if (rc == 0 && cut > 1) {
-                    usleep(is_cell ? 2500 : 600);
+                    usleep((useconds_t)jitter_delay_us(is_cell));
                     rc = send_all(conn, buf + 1, cut - 1, 0);
                 }
                 if (rc == 0) {
-                    usleep(is_cell ? 2500 : 600);
-                    rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                    usleep((useconds_t)jitter_delay_us(is_cell));
+                    rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
                 }
             }
         } else if (mode == MODE_OOB_BYTE1_DISORDER) {
             /* Exact #1 Russian mobile ByeDPI: -o1 -d1 -r1+s (OOB + IP_TTL=1 at byte 1, then Rec1 & Rec2/Rec3) */
             if (set_ttl(conn->fd, conn->family, 1) == 0) {
-                rc = send_oob_chunk(conn, buf, 1, (uint8_t)'a');
+                rc = send_oob_chunk(conn, buf, 1, oob_byte);
                 if (rc == 0) wait_tx_pushed(conn, 1, is_cell);
                 set_ttl(conn->fd, conn->family, conn->default_ttl);
                 if (rc == 0 && cut > 1) {
                     rc = send_all(conn, buf + 1, cut - 1, 0);
-                    if (rc == 0) usleep(is_cell ? 2000 : 500);
+                    if (rc == 0) usleep((useconds_t)jitter_delay_us(is_cell));
                 }
-                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             } else {
-                rc = send_oob_chunk(conn, buf, 1, (uint8_t)'a');
+                rc = send_oob_chunk(conn, buf, 1, oob_byte);
                 if (rc == 0 && cut > 1) {
-                    usleep(is_cell ? 2500 : 600);
+                    usleep((useconds_t)jitter_delay_us(is_cell));
                     rc = send_all(conn, buf + 1, cut - 1, 0);
                 }
                 if (rc == 0) {
-                    usleep(is_cell ? 2500 : 600);
-                    rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                    usleep((useconds_t)jitter_delay_us(is_cell));
+                    rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
                 }
             }
         } else if (mode == MODE_OOB_DISORDER) {
             if (set_ttl(conn->fd, conn->family, 1) == 0) {
-                rc = send_oob_chunk(conn, buf, cut, (uint8_t)'a');
+                rc = send_oob_chunk(conn, buf, cut, oob_byte);
                 if (rc == 0) wait_tx_pushed(conn, 1, is_cell);
                 set_ttl(conn->fd, conn->family, conn->default_ttl);
-                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                if (rc == 0) rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             } else {
-                rc = send_oob_chunk(conn, buf, cut, (uint8_t)'a');
+                rc = send_oob_chunk(conn, buf, cut, oob_byte);
                 if (rc == 0) {
-                    usleep(is_cell ? 2500 : 600);
-                    rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                    usleep((useconds_t)jitter_delay_us(is_cell));
+                    rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
                 }
             }
         } else if (mode == MODE_MSS_OOB_BYTE1) {
-            rc = send_oob_chunk(conn, buf, 1, (uint8_t)'a');
+            rc = send_oob_chunk(conn, buf, 1, oob_byte);
             if (rc == 0 && cut > 1) {
-                usleep((useconds_t)delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
                 rc = send_all(conn, buf + 1, cut - 1, 0);
             }
             if (rc == 0) {
-                usleep((useconds_t)delay_us);
-                rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
+                rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             }
         } else if (mode == MODE_MSS_SPLIT) {
             rc = send_all(conn, buf, cut, 0);
             if (rc == 0) {
-                usleep(is_cell ? 1500 : 400);
-                rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
+                rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             }
         } else if (mode == MODE_OOB_BYTE1_ONLY) {
             /* Exact mobile ByeDPI -o1 -r1+s without IP_TTL=1: 0ms RTO, LTE-modem safe, normal SYN */
-            rc = send_oob_chunk(conn, buf, 1, (uint8_t)'a');
+            rc = send_oob_chunk(conn, buf, 1, oob_byte);
             if (rc == 0 && cut > 1) {
-                usleep((useconds_t)delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
                 rc = send_all(conn, buf + 1, cut - 1, 0);
             }
             if (rc == 0) {
-                usleep((useconds_t)delay_us);
-                rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
+                rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             }
         } else if (mode == MODE_SPLIT_BYTE1) {
             /* Exact ByeDPI -s1 -r1+s without IP_TTL=1 or MSG_OOB: pure kernel TCP 1B + SNI+1/SLD split */
             rc = send_all(conn, buf, 1, 0);
             if (rc == 0 && cut > 1) {
-                usleep((useconds_t)delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
                 rc = send_all(conn, buf + 1, cut - 1, 0);
             }
             if (rc == 0) {
-                usleep((useconds_t)delay_us);
-                rc = send_tail_split(conn, buf, cut, cut2, total, delay_us);
+                usleep((useconds_t)jitter_delay_us(is_cell));
+                rc = send_tail_split(conn, buf, cut, cut2, total, is_cell);
             }
         } else if (mode == MODE_MULTI_SPLIT_SNI) {
-            rc = send_multi_record_sni(conn, buf, total, cut, cut2, delay_us, 0);
+            rc = send_multi_record_sni(conn, buf, total, cut, cut2, is_cell, 0);
         } else if (mode == MODE_HYBRID_MULTI_RECORD) {
-            rc = send_multi_record_sni(conn, buf, total, cut, cut2, delay_us, 1);
+            rc = send_multi_record_sni(conn, buf, total, cut, cut2, is_cell, 1);
+        } else if (mode == MODE_COMPACT_4_RECORD) {
+            rc = send_compact_4_record(conn, buf, total, cut, cut2, is_cell);
+        } else if (mode == MODE_HDR2_SNI2_BULK) {
+            rc = send_hdr2_sni2_bulk(conn, buf, total, cut, is_cell);
         } else {
             rc = send_all(conn, buf, total, 0);
         }
@@ -1012,15 +1185,76 @@ Java_org_colgram_core_ColgramNativeDesync_nativeSendUdpFakeBurst(JNIEnv *env, jc
         return -1;
     }
     set_ttl(fd, family, (int)ttl);
-    uint8_t decoy[40];
-    for (int i = 0; i < (int)sizeof(decoy); i++) decoy[i] = (uint8_t)(0xA5 ^ (i * 17));
+    uint8_t decoy[72];
     int sent_ok = 0;
     for (int i = 0; i < (int)count; i++) {
-        decoy[0] = (uint8_t)(0x40 + i);
-        if (sendto(fd, decoy, sizeof(decoy), MSG_NOSIGNAL, (const struct sockaddr *)&sa, sa_len) > 0) {
+        size_t dlen = 36u + (size_t)arc4random_uniform(37u);
+        arc4random_buf(decoy, dlen);
+        decoy[0] = (uint8_t)(0x80u | (decoy[0] & 0x3Fu));
+        if (decoy[4] == 0x21u && decoy[5] == 0x12u && decoy[6] == 0xA4u && decoy[7] == 0x42u) {
+            decoy[4] ^= 0x37u;
+        }
+        if (sendto(fd, decoy, dlen, MSG_NOSIGNAL, (const struct sockaddr *)&sa, sa_len) > 0) {
             sent_ok++;
         }
-        if (i + 1 < (int)count) usleep(1500);
+        if (i + 1 < (int)count) usleep((useconds_t)(1100u + arc4random_uniform(900u)));
+    }
+    close(fd);
+    return sent_ok;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_colgram_core_ColgramNativeDesync_nativeSendUdpFakeBurstPayload(JNIEnv *env, jclass clazz,
+                                                                         jstring jIp, jint port,
+                                                                         jint ttl, jint count,
+                                                                         jbyteArray jPayload,
+                                                                         jobject protector) {
+    (void)clazz;
+    if (jIp == NULL || port <= 0 || port > 65535 || count <= 0) return -1;
+    if (jPayload == NULL) {
+        return Java_org_colgram_core_ColgramNativeDesync_nativeSendUdpFakeBurst(
+                env, clazz, jIp, port, ttl, count, protector);
+    }
+    if (count > 6) count = 6;
+    if (ttl < 1 || ttl > 12) ttl = 3;
+
+    jsize plen = (*env)->GetArrayLength(env, jPayload);
+    if (plen <= 0 || plen > 1400) {
+        return Java_org_colgram_core_ColgramNativeDesync_nativeSendUdpFakeBurst(
+                env, clazz, jIp, port, ttl, count, protector);
+    }
+    uint8_t pbuf[1400];
+    (*env)->GetByteArrayRegion(env, jPayload, 0, plen, (jbyte *)pbuf);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
+
+    const char *ip_str = (*env)->GetStringUTFChars(env, jIp, NULL);
+    if (ip_str == NULL) return -1;
+    struct sockaddr_storage sa;
+    socklen_t sa_len = 0;
+    int family = AF_INET;
+    int parse_rc = parse_ip_sockaddr(ip_str, (int)port, &sa, &sa_len, &family);
+    (*env)->ReleaseStringUTFChars(env, jIp, ip_str);
+    if (parse_rc != 0) return -1;
+
+    int fd = socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (!invoke_fd_protector(env, protector, fd)) {
+        close(fd);
+        return -1;
+    }
+    set_ttl(fd, family, (int)ttl);
+    int sent_ok = 0;
+    for (int i = 0; i < (int)count; i++) {
+        if (i > 0) {
+            pbuf[0] = (uint8_t)(0x80u | ((pbuf[0] + (uint8_t)arc4random_uniform(17u)) & 0x3Fu));
+        }
+        if (sendto(fd, pbuf, (size_t)plen, MSG_NOSIGNAL, (const struct sockaddr *)&sa, sa_len) > 0) {
+            sent_ok++;
+        }
+        if (i + 1 < (int)count) usleep((useconds_t)(1100u + arc4random_uniform(900u)));
     }
     close(fd);
     return sent_ok;

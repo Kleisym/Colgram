@@ -1390,7 +1390,8 @@ def inject_hooks(repo_path):
                     ("⚙️ Настройки Colgram", "Настройки Colgram"),
                     ("✉️ Временная почта (Temp Mail)", "Временная почта"),
                     ("📥 Версии Telegram", "Версии Telegram"),
-                    ("🛡 Анти-спам (юзербот)", "Анти-спам"),
+                    ("🛡 Анти-спам (юзербот)", "Антиспам"),
+                    ("Анти-спам", "Антиспам"),
                     ("🔄 Синхронизировать чаты бота", "Синхронизировать чаты бота"),
                     ("✉️ Написать от имени бота", "Написать от имени бота"),
             ):
@@ -1407,10 +1408,18 @@ def inject_hooks(repo_path):
             presentFragment(new ColgramPluginsActivity());
         });
         if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFA855F7);
+        io.add(R.drawable.msg_theme, "Конструктор дизайна", () -> {
+            presentFragment(new ColgramDesignStudioActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF7C3AED);
         io.add(R.drawable.msg_settings, "Настройки Colgram", () -> {
             presentFragment(new ColgramSettingsActivity());
         });
         if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFEF4444);
+        io.add(R.drawable.msg_secret, "Бот-защитник", () -> {
+            presentFragment(new ColgramDefenderActivity());
+        });
+        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF00C853);
         io.add(R.drawable.msg_send, "Временная почта", () -> {
             presentFragment(new ColgramTempMailActivity());
         });
@@ -1419,7 +1428,7 @@ def inject_hooks(repo_path):
             presentFragment(new ColgramVersionsActivity());
         });
         if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF10B981);
-        io.add(R.drawable.msg_policy, "Анти-спам", () -> {
+        io.add(R.drawable.msg_policy, "Антиспам", () -> {
             presentFragment(new ColgramAntiSpamActivity());
         });
         if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFF97316);
@@ -2962,7 +2971,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java"]:
+        for name in ["ColgramUiKit.java", "ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -5933,20 +5942,26 @@ def inject_hooks(repo_path):
             method_anchor,
             ("    private void colgramShowMemoryDialog() {\n"
              "        final boolean enabled = org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
-             "        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());\n"
-             "        builder.setTitle(\"Безлимитная память\");\n"
-             "        builder.setMessage(\"Включено: кэш медиа не ограничивается 300 МБ, просмотренные \"\n"
-             "                + \"фото, видео и тексты остаются доступными всегда и хранятся внутри \"\n"
-             "                + \"приложения, а не в галерее.\\n\\nВыключено: возвращается стандартное \"\n"
-             "                + \"поведение Telegram с очисткой кэша.\");\n"
-             "        builder.setPositiveButton(enabled ? \"Выключить\" : \"Включить\", (dialog, which) -> {\n"
-             "            boolean next = !org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
-             "            org.colgram.core.ColgramConfig.setUnlimitedMemoryEnabled(next);\n"
-             "            org.colgram.core.ColgramUnlimitedMemory.apply(getContext(), next);\n"
-             "            updateRows(true);\n"
-             "        });\n"
-             "        builder.setNegativeButton(\"Отмена\", null);\n"
-             "        showDialog(builder.create());\n"
+             "        ColgramUiKit.showConfirmSheet(\n"
+             "                getParentActivity(),\n"
+             "                getResourceProvider(),\n"
+             "                R.drawable.msg_archive,\n"
+             "                \"Безлимитная память\",\n"
+             "                \"Включено: кэш медиа не ограничивается 300 МБ, просмотренные \"\n"
+             "                        + \"фото, видео и тексты остаются доступными всегда и хранятся внутри \"\n"
+             "                        + \"приложения, а не в галерее.\\n\\nВыключено: возвращается стандартное \"\n"
+             "                        + \"поведение Telegram с очисткой кэша.\",\n"
+             "                enabled ? \"Выключить\" : \"Включить\",\n"
+             "                false,\n"
+             "                () -> {\n"
+             "                    boolean next = !org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+             "                    org.colgram.core.ColgramConfig.setUnlimitedMemoryEnabled(next);\n"
+             "                    org.colgram.core.ColgramUnlimitedMemory.apply(getContext(), next);\n"
+             "                    updateRows(true);\n"
+             "                },\n"
+             "                \"Отмена\",\n"
+             "                null\n"
+             "        );\n"
              "    }\n"
              "\n"
              + method_anchor), 1)
@@ -8065,6 +8080,7 @@ def sync_colgram_extra_templates_and_assets(repo_path, root_dir, koliti_enabled=
         "ColgramBotLoginBottomSheet.java",
         "ColgramQRLoginBottomSheet.java",
         "ColgramIntroArtView.java",
+        "ColgramUiKit.java",
         "ColgramMenuChrome.java",
         "ColgramConfettiView.java",
         "ColgramColaSlideView.java",
@@ -13903,7 +13919,7 @@ _PRE_BYPASS_BG_SPECS = [
     (
         'TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java',
         'FileLoaderPriorityQueue.java perf #2',
-        'type == TYPE_LARGE ? 3 : 6',
+        ('type == TYPE_LARGE ? 3 : 6', 'type == TYPE_LARGE ? 3 : 12'),
         (
             '        boolean pauseAllNextOperations = false;\n'
             '        int max = type == TYPE_LARGE ? MessagesController.getInstance(currentAccount).largeQueueMaxActiveOperations : MessagesController.getInstance(currentAccount).smallQueueMaxActiveOperations;\n'
@@ -13984,7 +14000,7 @@ _PRE_BYPASS_BG_SPECS = [
     (
         'TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java',
         'ImageLoader.java perf #1',
-        'new DispatchQueuePriority("cacheOutQueue", 2)',
+        ('new DispatchQueuePriority("cacheOutQueue", 2)', 'new DispatchQueuePriority("cacheOutQueue", 3)'),
         (
             '    private SparseArray<String> waitingForQualityThumbByTag = new SparseArray<>();\n'
             '    private LinkedList<HttpImageTask> httpTasks = new LinkedList<>();\n'
@@ -14026,7 +14042,11 @@ _SUPERSEDED_NETWORK_MARKERS = {
 }
 
 _SUPERSEDED_TURBO_MARKERS = {
+    "ApplicationLoader.java turbo #2": "&& (!mainInterfacePaused || org.colgram.core.ColgramUiBridge.isAppInForeground())) {",
     "ApplicationLoader.java turbo #4": "ColgramBootJobService.scheduleProxyRefresh(applicationContext);",
+    "ImageLoader.java turbo #3": "colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);",
+    "ImageLoader.java turbo #4": "img.runningTask = colgramLottieOutQueue.postRunnable(img.cacheTask, img.priority);",
+    "ImageLoader.java turbo #5": "colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);",
 }
 
 _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
@@ -14035,6 +14055,7 @@ _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
     "ChatActivity.java option 9990 complete purge": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount, selectedObject)",
     "AlertsCreator.java wire colgramDeleteMessages in deleteAction": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
     "DeleteMessagesBottomSheet.java wire colgramDeleteMessages in proceed": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
+    "AlertsCreator.java permanent local delete checkbox UI": 'purgeCell.setText("Удалить полностью у себя",',
 }
 
 
@@ -14052,7 +14073,9 @@ def inject_performance_patches(repo_path):
         full_path = os.path.join(repo_path, *rel_path.split("/"))
         if os.path.exists(full_path):
             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                if bypass_marker in f.read():
+                _pre_src = f.read()
+                _markers = (bypass_marker,) if isinstance(bypass_marker, str) else bypass_marker
+                if any(m in _pre_src for m in _markers):
                     continue
         _patch_file_eol(full_path, target, replacement, label)
     for rel_path, label, target, replacement in _PERFORMANCE_PATCH_SPECS:
@@ -17393,7 +17416,7 @@ _ATTACH_SPOOF_DELETE_PATCH_SPECS = [
             '                purgeCell.setBackgroundDrawable(Theme.getSelectorDrawable(false));\n'
             '                purgeCell.allowMultiline();\n'
             '                purgeCell.setMinimumHeight(dp(48));\n'
-            '                purgeCell.setText("Удалить полностью у себя", "", false, false);\n'
+            '                purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);\n'
             '                purgeCell.setPadding(LocaleController.isRTL ? dp(16) : dp(8), 0, LocaleController.isRTL ? dp(8) : dp(16), 0);\n'
             '                checkboxesLayout.addView(purgeCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));\n'
             '                purgeCell.setOnClickListener(v -> {\n'

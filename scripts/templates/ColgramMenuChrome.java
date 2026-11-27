@@ -380,10 +380,15 @@ public final class ColgramMenuChrome {
         private final Paint sheenPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint bubblePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ripplePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final android.graphics.Path clipPath = new android.graphics.Path();
-        private final android.graphics.Path wavePath = new android.graphics.Path();
-        private final android.graphics.Path crestPath = new android.graphics.Path();
-        private final RectF glowRect = new RectF();
+        private final android.graphics.Path[] cachedWavePaths = new android.graphics.Path[]{
+                new android.graphics.Path(), new android.graphics.Path()
+        };
+        private final android.graphics.Path[] cachedCrestPaths = new android.graphics.Path[]{
+                new android.graphics.Path(), new android.graphics.Path()
+        };
+        private int cachedWaveW;
+        private int cachedWaveH;
+        private float cachedWavePhase = -1f;
         private final Matrix sheenMatrix = new Matrix();
         private android.graphics.RadialGradient cachedGlow;
         private LinearGradient cachedSheen;
@@ -451,63 +456,73 @@ public final class ColgramMenuChrome {
                                 Shader.TileMode.CLAMP
                         );
                         sheenPaint.setShader(cachedSheen);
+                        float sheenFrac = (wavePhase * 1.6f) % 1.6f;
+                        if (sheenFrac < 1.0f) {
+                            sheenMatrix.setTranslate((sheenFrac * 1.8f - 0.4f) * w, 0f);
+                            cachedSheen.setLocalMatrix(sheenMatrix);
+                        }
                     }
 
-                    glowRect.set(0, 0, w, h);
-                    float corner = dp(16);
-                    clipPath.rewind();
-                    clipPath.addRoundRect(glowRect, corner, corner, android.graphics.Path.Direction.CW);
-
-                    canvas.save();
-                    canvas.clipPath(clipPath);
-
-                    // 1. Soft radial emblem ambient glow
+                    // 1. Soft radial emblem ambient glow (card uses ViewOutlineProvider dp(16) HW clip)
                     canvas.drawRect(0, 0, w, h, glowPaint);
 
-                    // 2. Calm dual-layer monochromatic sine waves gliding smoothly in one direction
-                    float t = wavePhase * (float) (Math.PI * 2.0);
-                    int steps = 28;
-                    for (int layer = 0; layer < 2; layer++) {
-                        float baseY = h - dp(layer == 0 ? 13f : 8f);
-                        float amp = dp(layer == 0 ? 3.8f : 2.6f);
-                        float phase = t + layer * 1.85f;
-                        wavePath.rewind();
-                        crestPath.rewind();
-                        wavePath.moveTo(0, h);
-                        float y0 = baseY + (float) Math.sin(-phase) * amp;
-                        wavePath.lineTo(0, y0);
-                        crestPath.moveTo(0, y0);
-                        float px = 0f;
-                        float py = y0;
-                        for (int i = 1; i <= steps; i++) {
-                            float f = (float) i / steps;
-                            float x = f * w;
-                            float y = baseY + (float) Math.sin(f * Math.PI * (1.45 + layer * 0.35) - phase) * amp;
-                            float mx = (px + x) * 0.5f;
-                            float my = (py + y) * 0.5f;
-                            wavePath.quadTo(px, py, mx, my);
-                            crestPath.quadTo(px, py, mx, my);
-                            px = x;
-                            py = y;
+                    // 2. Calm cached dual-layer monochromatic sine waves
+                    if (cachedWaveW != w || cachedWaveH != h || cachedWavePhase != wavePhase) {
+                        cachedWaveW = w;
+                        cachedWaveH = h;
+                        cachedWavePhase = wavePhase;
+                        float t = wavePhase * (float) (Math.PI * 2.0);
+                        int steps = 28;
+                        for (int layer = 0; layer < 2; layer++) {
+                            float baseY = h - dp(layer == 0 ? 13f : 8f);
+                            float amp = dp(layer == 0 ? 3.8f : 2.6f);
+                            float phase = t + layer * 1.85f;
+                            android.graphics.Path wp = cachedWavePaths[layer];
+                            android.graphics.Path cp = cachedCrestPaths[layer];
+                            wp.rewind();
+                            cp.rewind();
+                            wp.moveTo(0, h);
+                            float y0 = baseY + (float) Math.sin(-phase) * amp;
+                            wp.lineTo(0, y0);
+                            cp.moveTo(0, y0);
+                            float px = 0f;
+                            float py = y0;
+                            for (int i = 1; i <= steps; i++) {
+                                float f = (float) i / steps;
+                                float x = f * w;
+                                float y = baseY + (float) Math.sin(f * Math.PI * (1.45 + layer * 0.35) - phase) * amp;
+                                float mx = (px + x) * 0.5f;
+                                float my = (py + y) * 0.5f;
+                                wp.quadTo(px, py, mx, my);
+                                cp.quadTo(px, py, mx, my);
+                                px = x;
+                                py = y;
+                            }
+                            wp.lineTo(w, py);
+                            cp.lineTo(w, py);
+                            wp.lineTo(w, h);
+                            wp.close();
                         }
-                        wavePath.lineTo(w, py);
-                        crestPath.lineTo(w, py);
-                        wavePath.lineTo(w, h);
-                        wavePath.close();
+                        if (cachedSheen != null) {
+                            float sheenFrac = (wavePhase * 1.6f) % 1.6f;
+                            if (sheenFrac < 1.0f) {
+                                sheenMatrix.setTranslate((sheenFrac * 1.8f - 0.4f) * w, 0f);
+                                cachedSheen.setLocalMatrix(sheenMatrix);
+                            }
+                        }
+                    }
 
+                    for (int layer = 0; layer < 2; layer++) {
                         int wAlpha = dark ? (layer == 0 ? 0x18 : 0x22) : (layer == 0 ? 0x10 : 0x16);
                         wavePaint.setColor(withAlpha(layer == 0 ? effAccent : lighten(effAccent, 0.20f), wAlpha));
-                        canvas.drawPath(wavePath, wavePaint);
+                        canvas.drawPath(cachedWavePaths[layer], wavePaint);
 
                         waveCrestPaint.setColor(withAlpha(lighten(effAccent, 0.30f), dark ? 0x3C : 0x28));
-                        canvas.drawPath(crestPath, waveCrestPaint);
+                        canvas.drawPath(cachedCrestPaths[layer], waveCrestPaint);
                     }
 
                     // 3. Gentle diagonal glass sheen glide
-                    float sheenFrac = (wavePhase * 1.6f) % 1.6f;
-                    if (sheenFrac < 1.0f) {
-                        sheenMatrix.setTranslate((sheenFrac * 1.8f - 0.4f) * w, 0f);
-                        cachedSheen.setLocalMatrix(sheenMatrix);
+                    if (((wavePhase * 1.6f) % 1.6f) < 1.0f) {
                         canvas.drawRect(0, 0, w, h, sheenPaint);
                     }
 
@@ -519,10 +534,15 @@ public final class ColgramMenuChrome {
                         ripplePaint.setColor(withAlpha(lighten(effAccent, 0.3f), ra));
                         canvas.drawCircle(rippleX, rippleY, curR, ripplePaint);
                     }
-
-                    canvas.restore();
                 }
             };
+            card.setOutlineProvider(new android.view.ViewOutlineProvider() {
+                @Override
+                public void getOutline(View view, android.graphics.Outline outline) {
+                    outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(16));
+                }
+            });
+            card.setClipToOutline(true);
             card.setWillNotDraw(false);
             card.setOrientation(LinearLayout.VERTICAL);
             card.setPadding(dp(16), dp(14), dp(16), dp(15));

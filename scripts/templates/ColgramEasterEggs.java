@@ -25,8 +25,11 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.colgram.core.ColgramBuildFlags;
+import org.colgram.core.ColgramPowerGuard;
 import org.colgram.core.ColgramProxyDoctor;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.Components.LayoutHelper;
@@ -327,34 +330,27 @@ public final class ColgramEasterEggs {
         if (act == null) return;
 
         BottomSheet sheet = new BottomSheet(act, false);
-        LinearLayout container = new LinearLayout(act);
-        container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(dp(16), dp(12), dp(16), dp(20));
-
-        GradientDrawable sheetBg = new GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xFF0A0F1A, 0xFF0E1726}
-        );
-        sheetBg.setCornerRadius(dp(18));
-        sheetBg.setStroke(dp(1), 0x6610B981);
-        container.setBackground(sheetBg);
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        LinearLayout container = ColgramUiKit.makeSheetRoot(act, pal);
+        ColgramAeroStyler.applyFlagshipSheetChrome(sheet, container, pal);
 
         MatrixRainView rainView = new MatrixRainView(act);
         GradientDrawable rainFrame = new GradientDrawable();
         rainFrame.setColor(0xFF050A0E);
-        rainFrame.setCornerRadius(dp(14));
+        rainFrame.setCornerRadius(dp(16));
         rainFrame.setStroke(dp(1), 0x8010B981);
         rainView.setBackground(rainFrame);
         rainView.setClipToOutline(true);
-        container.addView(rainView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 130, 0, 0, 0, 14));
+        container.addView(rainView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 132, 0, 0, 0, 14));
 
         TextView title = new TextView(act);
         title.setText("COLGRAM // SECRET ARCADE");
-        title.setTextColor(0xFF34D399);
+        title.setTextColor(pal.dark ? 0xFF34D399 : pal.semanticEmerald);
         title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15.5f);
         title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         container.addView(title, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
 
+        LinearLayout telemetryCard = ColgramUiKit.makeCard(act, pal, false);
         TextView telemetry = new TextView(act);
         Runtime rt = Runtime.getRuntime();
         long heapUsed = (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
@@ -374,10 +370,11 @@ public final class ColgramEasterEggs {
                             + "• Память JVM: " + heapUsed + " МБ"
             );
         }
-        telemetry.setTextColor(0xFFD1FAE5);
+        telemetry.setTextColor(pal.textPrimary);
         telemetry.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
         telemetry.setTypeface(Typeface.MONOSPACE);
-        container.addView(telemetry, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
+        telemetryCard.addView(telemetry, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        container.addView(telemetryCard, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
 
         LinearLayout btnRow = new LinearLayout(act);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -515,11 +512,15 @@ public final class ColgramEasterEggs {
         protected void onAttachedToWindow() {
             super.onAttachedToWindow();
             lastMs = SystemClock.uptimeMillis();
+            if (anim != null) anim.cancel();
             anim = ValueAnimator.ofFloat(0f, 1f);
             anim.setDuration(1000L);
             anim.setRepeatCount(ValueAnimator.INFINITE);
             anim.setInterpolator(new LinearInterpolator());
             anim.addUpdateListener(a -> {
+                if (getWindowVisibility() != VISIBLE || ApplicationLoader.mainInterfacePaused) {
+                    return;
+                }
                 long now = SystemClock.uptimeMillis();
                 float dt = Math.min(0.05f, Math.max(0.008f, (now - lastMs) / 1000f));
                 lastMs = now;
@@ -548,7 +549,22 @@ public final class ColgramEasterEggs {
                     }
                 }
             });
-            anim.start();
+            if (getWindowVisibility() == VISIBLE) {
+                anim.start();
+            }
+        }
+
+        @Override
+        protected void onWindowVisibilityChanged(int visibility) {
+            super.onWindowVisibilityChanged(visibility);
+            if (anim == null) return;
+            if (visibility == VISIBLE) {
+                lastMs = SystemClock.uptimeMillis();
+                if (!anim.isStarted()) anim.start();
+                else if (anim.isPaused()) anim.resume();
+            } else if (anim.isRunning()) {
+                anim.pause();
+            }
         }
 
         @Override
@@ -587,12 +603,24 @@ public final class ColgramEasterEggs {
         private static final String GLYPHS = ColgramBuildFlags.KOLITI_ENABLED
                 ? "01COLGRAMKOLITIQWEN35ZX#@$%&*"
                 : "01COLGRAMCYBERAEROZX#@$%&*";
+        private static final String[] GLYPH_STRS;
+        static {
+            GLYPH_STRS = new String[GLYPHS.length()];
+            for (int i = 0; i < GLYPHS.length(); i++) {
+                GLYPH_STRS[i] = String.valueOf(GLYPHS.charAt(i));
+            }
+        }
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint headerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint headerGlowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Random rnd = new Random();
         private ValueAnimator anim;
         private int[] drops;
         private float scanY = 0f;
+        private LinearGradient cachedGrad;
+        private int cachedW = -1;
+        private int cachedH = -1;
+        private long lastStepMs = 0L;
 
         MatrixRainView(Context context) {
             super(context);
@@ -602,27 +630,62 @@ public final class ColgramEasterEggs {
             headerPaint.setTextSize(dp(15));
             headerPaint.setTypeface(Typeface.MONOSPACE);
             headerPaint.setTextAlign(Paint.Align.CENTER);
+            headerGlowPaint.setColor(0x5510B981);
+            headerGlowPaint.setTextSize(dp(15));
+            headerGlowPaint.setTypeface(Typeface.MONOSPACE);
+            headerGlowPaint.setTextAlign(Paint.Align.CENTER);
+        }
+
+        private void syncRainAnim() {
+            boolean shouldRun = isAttachedToWindow()
+                    && getWindowVisibility() == VISIBLE
+                    && getVisibility() == VISIBLE
+                    && !ApplicationLoader.mainInterfacePaused
+                    && !ColgramPowerGuard.isPowerSaveMode(getContext());
+            if (shouldRun) {
+                if (anim == null) {
+                    anim = ValueAnimator.ofFloat(0f, 1f);
+                    anim.setDuration(1000L);
+                    anim.setRepeatCount(ValueAnimator.INFINITE);
+                    anim.setInterpolator(new LinearInterpolator());
+                    anim.addUpdateListener(a -> {
+                        if (getWindowVisibility() != VISIBLE || ApplicationLoader.mainInterfacePaused) {
+                            return;
+                        }
+                        long now = SystemClock.uptimeMillis();
+                        if (now - lastStepMs < 32L) return;
+                        lastStepMs = now;
+                        if (drops != null) {
+                            for (int i = 0; i < drops.length; i++) {
+                                if (rnd.nextFloat() < 0.32f) {
+                                    drops[i] = (drops[i] + 1) % 14;
+                                }
+                            }
+                        }
+                        scanY = (scanY + dp(2.2f)) % Math.max(1f, getHeight());
+                        invalidate();
+                    });
+                    anim.start();
+                } else if (anim.isPaused()) {
+                    anim.resume();
+                } else if (!anim.isStarted()) {
+                    anim.start();
+                }
+            } else if (anim != null && anim.isRunning()) {
+                anim.pause();
+            }
         }
 
         @Override
         protected void onAttachedToWindow() {
             super.onAttachedToWindow();
-            anim = ValueAnimator.ofFloat(0f, 1f);
-            anim.setDuration(1000L);
-            anim.setRepeatCount(ValueAnimator.INFINITE);
-            anim.setInterpolator(new LinearInterpolator());
-            anim.addUpdateListener(a -> {
-                if (drops != null) {
-                    for (int i = 0; i < drops.length; i++) {
-                        if (rnd.nextFloat() < 0.32f) {
-                            drops[i] = (drops[i] + 1) % 14;
-                        }
-                    }
-                }
-                scanY = (scanY + dp(2.2f)) % Math.max(1f, getHeight());
-                invalidate();
-            });
-            anim.start();
+            syncRainAnim();
+        }
+
+        @Override
+        protected void onWindowVisibilityChanged(int visibility) {
+            super.onWindowVisibilityChanged(visibility);
+            syncRainAnim();
         }
 
         @Override
@@ -645,21 +708,26 @@ public final class ColgramEasterEggs {
                 drops = new int[cols];
                 for (int i = 0; i < cols; i++) drops[i] = rnd.nextInt(14);
             }
-            textPaint.setShader(new LinearGradient(0, 0, w, h,
-                    new int[]{0xFF10B981, 0xFF06B6D4, 0xFF34D399}, null, Shader.TileMode.CLAMP));
+            if (cachedGrad == null || cachedW != w || cachedH != h) {
+                cachedW = w;
+                cachedH = h;
+                cachedGrad = new LinearGradient(0, 0, w, h,
+                        new int[]{0xFF10B981, 0xFF06B6D4, 0xFF34D399}, null, Shader.TileMode.CLAMP);
+                textPaint.setShader(cachedGrad);
+            }
             for (int c = 0; c < cols; c++) {
                 int headRow = drops[c];
                 for (int r = 0; r < 8; r++) {
                     int yRow = (headRow - r + 14) % 14;
                     int alpha = Math.max(25, 240 - r * 32);
                     textPaint.setAlpha(alpha);
-                    char ch = GLYPHS.charAt((c * 7 + yRow * 3 + (int) scanY) % GLYPHS.length());
-                    canvas.drawText(String.valueOf(ch), c * step + dp(4), yRow * dp(11) + dp(12), textPaint);
+                    String chStr = GLYPH_STRS[(c * 7 + yRow * 3 + (int) scanY) % GLYPH_STRS.length];
+                    canvas.drawText(chStr, c * step + dp(4), yRow * dp(11) + dp(12), textPaint);
                 }
             }
-            headerPaint.setShadowLayer(dp(6), 0, 0, 0xFF10B981);
-            canvas.drawText(ColgramBuildFlags.KOLITI_ENABLED ? "COLGRAM // KOLITI CORE" : "COLGRAM // PRIVACY CORE",
-                    w * 0.5f, h * 0.54f, headerPaint);
+            String title = ColgramBuildFlags.KOLITI_ENABLED ? "COLGRAM // KOLITI CORE" : "COLGRAM // PRIVACY CORE";
+            canvas.drawText(title, w * 0.5f + dp(1), h * 0.54f + dp(1), headerGlowPaint);
+            canvas.drawText(title, w * 0.5f, h * 0.54f, headerPaint);
         }
     }
 

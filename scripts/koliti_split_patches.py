@@ -512,6 +512,281 @@ def _sync_koliti_assets_and_native(repo_path: str, koliti_enabled: bool) -> None
                 print(f" [+] Restored cached assets/{key} into Telegram-Src")
 
 
+def _patch_text_replace_eol(full_path: str, target: str, replacement: str, label: str, eol_patch_fn) -> None:
+    if not os.path.isfile(full_path):
+        return
+    with open(full_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        norm = fh.read().replace("\r\n", "\n")
+    if replacement.replace("\r\n", "\n") in norm:
+        return
+    if target.replace("\r\n", "\n") in norm:
+        eol_patch_fn(full_path, target, replacement, label)
+
+
+def _upgrade_launch_ota_sheet(repo_path: str, eol_patch_fn) -> None:
+    launch_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LaunchActivity.java"
+    )
+    if not os.path.isfile(launch_path):
+        return
+    with open(launch_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        norm = fh.read().replace("\r\n", "\n")
+    if "ColgramUiKit.showCustomViewSheet(" in norm and "showColgramPendingUpdateDialog" in norm:
+        return
+    old_body = (
+        "            AlertDialog.Builder builder = new AlertDialog.Builder(this);\n"
+        '            builder.setTitle("Доступно обновление Colgram " + pending.version);\n'
+        '            builder.setMessage((notes.isEmpty() ? "Новая сборка готова к установке." : notes)\n'
+        '                    + (pending.expectedSha256 != null ? "\\n\\nSHA-256 проверен." : ""));\n'
+        '            builder.setPositiveButton("Скачать и установить", (d, w) -> {\n'
+        "                if (isFinishing() || isDestroyed()) return;\n"
+        "                org.colgram.core.ColgramUpdater.downloadAndInstall(\n"
+        "                        this, pending.downloadUrl, pending.version, pending.expectedSha256);\n"
+        "            });\n"
+        '            builder.setNeutralButton("Версии", (d, w) -> {\n'
+        "                if (!isFinishing() && !isDestroyed() && actionBarLayout != null) {\n"
+        "                    presentFragment(new ColgramVersionsActivity());\n"
+        "                }\n"
+        "            });\n"
+        "            builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);\n"
+        "            showAlertDialog(builder);"
+    )
+    new_body = (
+        "            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();\n"
+        "            android.widget.LinearLayout bodyCard = ColgramUiKit.makeCard(this, pal, false);\n"
+        "            android.widget.LinearLayout badgeRow = new android.widget.LinearLayout(this);\n"
+        "            badgeRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);\n"
+        '            badgeRow.addView(ColgramUiKit.makePillChip(this, "v" + pending.version,\n'
+        "                    ColgramUiKit.withAlpha(pal.accentPrimary, 0x26), pal.accentPrimary,\n"
+        "                    ColgramUiKit.withAlpha(pal.accentPrimary, 0x60)),\n"
+        "                    org.telegram.ui.Components.LayoutHelper.createLinear(\n"
+        "                            org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT,\n"
+        "                            org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT, 0, 0, 8, 0));\n"
+        "            if (pending.expectedSha256 != null) {\n"
+        '                badgeRow.addView(ColgramUiKit.makePillChip(this, "SHA-256 ПРОВЕРЕН",\n'
+        "                        ColgramUiKit.withAlpha(pal.semanticEmerald, 0x26), pal.semanticEmerald,\n"
+        "                        ColgramUiKit.withAlpha(pal.semanticEmerald, 0x60)),\n"
+        "                        org.telegram.ui.Components.LayoutHelper.createLinear(\n"
+        "                                org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT,\n"
+        "                                org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT));\n"
+        "            }\n"
+        "            bodyCard.addView(badgeRow, org.telegram.ui.Components.LayoutHelper.createLinear(\n"
+        "                    org.telegram.ui.Components.LayoutHelper.MATCH_PARENT,\n"
+        "                    org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT, 0, 0, 0, 10));\n"
+        "            android.widget.TextView notesView = new android.widget.TextView(this);\n"
+        '            notesView.setText(notes.isEmpty() ? "Новая сборка готова к установке." : notes);\n'
+        "            notesView.setTextColor(pal.textPrimary);\n"
+        "            notesView.setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 13.5f);\n"
+        "            notesView.setLineSpacing(AndroidUtilities.dp(3), 1.0f);\n"
+        "            bodyCard.addView(notesView, org.telegram.ui.Components.LayoutHelper.createLinear(\n"
+        "                    org.telegram.ui.Components.LayoutHelper.MATCH_PARENT,\n"
+        "                    org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT));\n"
+        "            org.telegram.ui.ActionBar.BaseFragment topFrag = actionBarLayout != null ? actionBarLayout.getLastFragment() : null;\n"
+        "            org.telegram.ui.ActionBar.Theme.ResourcesProvider rp = topFrag != null ? topFrag.getResourceProvider() : null;\n"
+        "            ColgramUiKit.showCustomViewSheet(\n"
+        "                    this,\n"
+        "                    rp,\n"
+        "                    R.drawable.msg_download,\n"
+        '                    "Доступно обновление Colgram " + pending.version,\n'
+        '                    pending.expectedSha256 != null ? "Подписанный релиз · SHA-256 проверен" : "Официальный релиз Colgram",\n'
+        "                    bodyCard,\n"
+        '                    "Скачать и установить",\n'
+        "                    sheet -> {\n"
+        "                        if (isFinishing() || isDestroyed()) return true;\n"
+        "                        org.colgram.core.ColgramUpdater.downloadAndInstall(\n"
+        "                                this, pending.downloadUrl, pending.version, pending.expectedSha256);\n"
+        "                        return true;\n"
+        "                    },\n"
+        '                    "Версии",\n'
+        "                    sheet -> {\n"
+        "                        if (!isFinishing() && !isDestroyed() && actionBarLayout != null) {\n"
+        "                            presentFragment(new ColgramVersionsActivity());\n"
+        "                        }\n"
+        "                        return true;\n"
+        "                    },\n"
+        "                    LocaleController.getString(R.string.Cancel),\n"
+        "                    false,\n"
+        "                    false\n"
+        "            );"
+    )
+    _patch_text_replace_eol(launch_path, old_body, new_body, "LaunchActivity ColgramUiKit OTA update sheet", eol_patch_fn)
+
+
+def _upgrade_alerts_creator_subtitle(repo_path: str, eol_patch_fn) -> None:
+    alerts_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Components", "AlertsCreator.java"
+    )
+    _patch_text_replace_eol(
+        alerts_path,
+        '                purgeCell.setText("Удалить полностью у себя", "", false, false);',
+        '                purgeCell.setText("Удалить полностью у себя", "Стереть локальную копию из сейфа анти-удаления", false, false);',
+        "AlertsCreator.java permanent delete anti-delete subtitle",
+        eol_patch_fn,
+    )
+
+
+def _upgrade_data_settings_memory_sheet(repo_path: str, eol_patch_fn) -> None:
+    data_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DataSettingsActivity.java"
+    )
+    if not os.path.isfile(data_path):
+        return
+    with open(data_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        norm = fh.read().replace("\r\n", "\n")
+    if "colgramShowMemoryDialog" not in norm or "ColgramUiKit.showConfirmSheet(" in norm:
+        return
+    old_block = (
+        "        final boolean enabled = org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+        "        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());\n"
+        '        builder.setTitle("Безлимитная память");\n'
+        '        builder.setMessage("Включено: кэш медиа не ограничивается 300 МБ, просмотренные "\n'
+        '                + "фото, видео и тексты остаются доступными всегда и хранятся внутри "\n'
+        '                + "приложения, а не в галерее.\\n\\nВыключено: возвращается стандартное "\n'
+        '                + "поведение Telegram с очисткой кэша.");\n'
+        '        builder.setPositiveButton(enabled ? "Выключить" : "Включить", (dialog, which) -> {\n'
+        "            boolean next = !org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+        "            org.colgram.core.ColgramConfig.setUnlimitedMemoryEnabled(next);\n"
+        "            org.colgram.core.ColgramUnlimitedMemory.apply(getContext(), next);\n"
+        "            updateRows(true);\n"
+        "        });\n"
+        '        builder.setNegativeButton("Отмена", null);\n'
+        "        showDialog(builder.create());"
+    )
+    new_block = (
+        "        final boolean enabled = org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+        "        ColgramUiKit.showConfirmSheet(\n"
+        "                getParentActivity(),\n"
+        "                getResourceProvider(),\n"
+        "                R.drawable.msg_archive,\n"
+        '                "Безлимитная память",\n'
+        '                "Включено: кэш медиа не ограничивается 300 МБ, просмотренные "\n'
+        '                        + "фото, видео и тексты остаются доступными всегда и хранятся внутри "\n'
+        '                        + "приложения, а не в галерее.\\n\\nВыключено: возвращается стандартное "\n'
+        '                        + "поведение Telegram с очисткой кэша.",\n'
+        '                enabled ? "Выключить" : "Включить",\n'
+        "                false,\n"
+        "                () -> {\n"
+        "                    boolean next = !org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();\n"
+        "                    org.colgram.core.ColgramConfig.setUnlimitedMemoryEnabled(next);\n"
+        "                    org.colgram.core.ColgramUnlimitedMemory.apply(getContext(), next);\n"
+        "                    updateRows(true);\n"
+        "                },\n"
+        '                "Отмена",\n'
+        "                null\n"
+        "        );"
+    )
+    _patch_text_replace_eol(data_path, old_block, new_block, "DataSettingsActivity ColgramUiKit memory sheet", eol_patch_fn)
+
+
+def _harmonize_dialogs_overflow_menu(repo_path: str, eol_patch_fn) -> None:
+    dialogs_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java"
+    )
+    if not os.path.isfile(dialogs_path):
+        return
+    with open(dialogs_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        norm = fh.read().replace("\r\n", "\n")
+    if "ColgramDesignStudioActivity" not in norm:
+        old_settings_anchor = (
+            '        io.add(R.drawable.msg_settings, "Настройки Colgram", () -> {\n'
+            "            presentFragment(new ColgramSettingsActivity());\n"
+            "        });\n"
+            "        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFFEF4444);"
+        )
+        new_settings_block = (
+            '        io.add(R.drawable.msg_theme, "Конструктор дизайна", () -> {\n'
+            "            presentFragment(new ColgramDesignStudioActivity());\n"
+            "        });\n"
+            "        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF7C3AED);\n"
+            + old_settings_anchor
+            + "\n"
+            '        io.add(R.drawable.msg_secret, "Бот-защитник", () -> {\n'
+            "            presentFragment(new ColgramDefenderActivity());\n"
+            "        });\n"
+            "        if ((colgramSub = io.getLast()) != null) colgramSub.setIconColor(0xFF00C853);"
+        )
+        _patch_text_replace_eol(
+            dialogs_path,
+            old_settings_anchor,
+            new_settings_block,
+            "DialogsActivity overflow menu DesignStudio & Defender entries",
+            eol_patch_fn,
+        )
+    _patch_text_replace_eol(
+        dialogs_path,
+        '        io.add(R.drawable.msg_policy, "Анти-спам", () -> {',
+        '        io.add(R.drawable.msg_policy, "Антиспам", () -> {',
+        "DialogsActivity overflow menu Antispam label alignment",
+        eol_patch_fn,
+    )
+
+
+def _configure_proxy_list_telemetry(repo_path: str, eol_patch_fn) -> None:
+    proxy_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProxyListActivity.java"
+    )
+    if not os.path.isfile(proxy_path):
+        return
+    with open(proxy_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        norm = fh.read().replace("\r\n", "\n")
+    if "colgramHeroRow" not in norm or "VIEW_TYPE_COLGRAM_TELEMETRY" in norm:
+        return
+    specs = (
+        (
+            "ProxyListActivity colgramTelemetryRow field",
+            "    private int colgramHeroRow = -1;",
+            "    private int colgramHeroRow = -1;\n    private int colgramTelemetryRow = -1;",
+        ),
+        (
+            "ProxyListActivity colgramTelemetryRow live refresh",
+            "                if (heroChanged) {\n                    colgramRefreshBoundRow(colgramHeroRow);\n                }",
+            "                if (heroChanged) {\n                    colgramRefreshBoundRow(colgramHeroRow);\n                    colgramRefreshBoundRow(colgramTelemetryRow);\n                }",
+        ),
+        (
+            "ProxyListActivity colgramTelemetryRow row index",
+            "        colgramHeroRow = rowCount++;\n        useProxyRow = rowCount++;",
+            "        colgramHeroRow = rowCount++;\n        colgramTelemetryRow = rowCount++;\n        useProxyRow = rowCount++;",
+        ),
+        (
+            "ProxyListActivity VIEW_TYPE_COLGRAM_TELEMETRY constant",
+            "            VIEW_TYPE_COLGRAM_HERO = 7;",
+            "            VIEW_TYPE_COLGRAM_HERO = 7,\n            VIEW_TYPE_COLGRAM_TELEMETRY = 8;",
+        ),
+        (
+            "ProxyListActivity VIEW_TYPE_COLGRAM_TELEMETRY bind",
+            "                    hero.bind(badgeIcon, accent, \"Colgram • Сеть и обход\", subtitle, pill, portChip, dohChip, secChip);\n                    break;\n                }",
+            (
+                "                    hero.bind(badgeIcon, accent, \"Colgram • Сеть и обход\", subtitle, pill, portChip, dohChip, secChip);\n"
+                "                    break;\n"
+                "                }\n"
+                "                case VIEW_TYPE_COLGRAM_TELEMETRY: {\n"
+                "                    ColgramUiKit.LiveTelemetryCardView telemetry = (ColgramUiKit.LiveTelemetryCardView) holder.itemView;\n"
+                "                    telemetry.bindTheme();\n"
+                "                    telemetry.refreshTelemetry();\n"
+                "                    break;\n"
+                "                }"
+            ),
+        ),
+        (
+            "ProxyListActivity VIEW_TYPE_COLGRAM_TELEMETRY create",
+            "                case VIEW_TYPE_COLGRAM_HERO:\n                    view = new ColgramMenuChrome.HeroBannerCell(mContext);\n                    break;",
+            "                case VIEW_TYPE_COLGRAM_HERO:\n                    view = new ColgramMenuChrome.HeroBannerCell(mContext);\n                    break;\n                case VIEW_TYPE_COLGRAM_TELEMETRY:\n                    view = new ColgramUiKit.LiveTelemetryCardView(mContext);\n                    break;",
+        ),
+        (
+            "ProxyListActivity colgramTelemetryRow itemId",
+            "            if (position == colgramHeroRow) {\n                return -24;",
+            "            if (position == colgramHeroRow) {\n                return -24;\n            } else if (position == colgramTelemetryRow) {\n                return -25;",
+        ),
+        (
+            "ProxyListActivity colgramTelemetryRow itemViewType",
+            "            if (position == colgramHeroRow) {\n                return VIEW_TYPE_COLGRAM_HERO;",
+            "            if (position == colgramHeroRow) {\n                return VIEW_TYPE_COLGRAM_HERO;\n            } else if (position == colgramTelemetryRow) {\n                return VIEW_TYPE_COLGRAM_TELEMETRY;",
+        ),
+    )
+    for label, target, replacement in specs:
+        _patch_text_replace_eol(proxy_path, target, replacement, label, eol_patch_fn)
+
+
 def apply(repo_path: str, patch_file_fn, eol_patch_fn, koliti_enabled: bool = True) -> None:
     """Apply compile-time Koliti split gates, Gradle ABI/module wiring, and asset pruning."""
     _write_build_flags(repo_path, koliti_enabled)
@@ -545,6 +820,11 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn, koliti_enabled: bool = Tr
     for rel_path, label, target, replacement in _GATE_PATCH_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
         eol_patch_fn(full_path, target, replacement, label)
+    _upgrade_launch_ota_sheet(repo_path, eol_patch_fn)
+    _upgrade_alerts_creator_subtitle(repo_path, eol_patch_fn)
+    _upgrade_data_settings_memory_sheet(repo_path, eol_patch_fn)
+    _harmonize_dialogs_overflow_menu(repo_path, eol_patch_fn)
+    _configure_proxy_list_telemetry(repo_path, eol_patch_fn)
     _configure_standalone_gradle(repo_path)
     _configure_llama_gradle(repo_path, koliti_enabled)
     _sync_koliti_assets_and_native(repo_path, koliti_enabled)

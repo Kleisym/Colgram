@@ -25,7 +25,6 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.voip.VoIPService;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.utils.proxy.ProxySettings;
 
 import java.lang.ref.WeakReference;
@@ -69,16 +68,31 @@ public final class ColgramCallRoutes {
     public static void showPicker(Activity activity, Runnable onChange) {
         if (activity == null) return;
         Mode[] modes = Mode.values();
-        CharSequence[] labels = new CharSequence[modes.length];
-        for (int i = 0; i < modes.length; i++) {
-            labels[i] = (modes[i] == mode() ? "✓  " : "") + modes[i].labelRu;
+        java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(modes.length);
+        for (Mode m : modes) {
+            items.add(new ColgramUiKit.ChoiceItem(
+                    m.labelRu,
+                    m == Mode.SOCKS5 ? "Маршрутизация VoIP через выбранный SOCKS5" : null,
+                    org.telegram.messenger.R.drawable.msg_calls,
+                    0,
+                    m == mode(),
+                    false,
+                    null
+            ));
         }
-        new AlertDialog.Builder(activity).setTitle("Использовать для звонков")
-                .setItems(labels, (dialog, index) -> {
+        ColgramUiKit.showChoiceSheet(
+                activity,
+                null,
+                org.telegram.messenger.R.drawable.msg_calls,
+                "Использовать для звонков",
+                "Выберите транспорт для голосовых и видеозвонков",
+                items,
+                index -> {
                     Mode selected = modes[index];
                     if (selected == Mode.SOCKS5) chooseSocks(activity, onChange);
                     else save(selected, onChange);
-                }).setNegativeButton("Отмена", null).show();
+                }
+        );
     }
 
     private static void save(Mode mode, Runnable onChange) {
@@ -106,16 +120,46 @@ public final class ColgramCallRoutes {
             labels.add(identity(settings));
         }
         if (choices.isEmpty()) {
-            new AlertDialog.Builder(activity).setTitle("Прокси для звонков")
-                    .setMessage("Нет сохранённого SOCKS5. Добавьте свой прокси в меню щита. MTProto не передаёт голосовой трафик.")
-                    .setPositiveButton("ОК", null).show();
+            ColgramUiKit.showInfoSheet(
+                    activity,
+                    null,
+                    org.telegram.messenger.R.drawable.msg_calls,
+                    "Прокси для звонков",
+                    "Нет сохранённого SOCKS5. Добавьте свой прокси в меню щита. MTProto не передаёт голосовой трафик.",
+                    "Понятно",
+                    null,
+                    null,
+                    null,
+                    false
+            );
             return;
         }
-        new AlertDialog.Builder(activity).setTitle("Выберите SOCKS5 для звонков")
-                .setItems(labels.toArray(new String[0]), (dialog, index) -> {
+        String savedId = prefs().getString(SOCKS_KEY, "");
+        java.util.List<ColgramUiKit.ChoiceItem> choiceItems = new java.util.ArrayList<>(labels.size());
+        for (int i = 0; i < labels.size(); i++) {
+            String lbl = labels.get(i);
+            choiceItems.add(new ColgramUiKit.ChoiceItem(
+                    lbl,
+                    "SOCKS5 UDP Relay",
+                    org.telegram.messenger.R.drawable.msg_online,
+                    0,
+                    lbl.equals(savedId),
+                    false,
+                    null
+            ));
+        }
+        ColgramUiKit.showChoiceSheet(
+                activity,
+                null,
+                org.telegram.messenger.R.drawable.msg_calls,
+                "Выберите SOCKS5 для звонков",
+                null,
+                choiceItems,
+                index -> {
                     prefs().edit().putString(SOCKS_KEY, identity(choices.get(index))).apply();
                     save(Mode.SOCKS5, onChange);
-                }).setNegativeButton("Отмена", null).show();
+                }
+        );
     }
 
     private static boolean isSocks(ProxySettings settings) {
@@ -389,11 +433,21 @@ public final class ColgramCallRoutes {
     }
 
     public static void reportFailure(Context context, String reason) {
-        AndroidUtilities.runOnUIThread(() -> Toast.makeText(context, reason, Toast.LENGTH_LONG).show());
+        ColgramUiKit.showNotice(context, org.telegram.messenger.R.drawable.msg_calls, reason, true);
     }
 
     private static void showError(Activity activity, String reason) {
-        new AlertDialog.Builder(activity).setTitle("Маршрут звонка").setMessage(reason)
-                .setPositiveButton("ОК", null).show();
+        ColgramUiKit.showInfoSheet(
+                activity,
+                null,
+                org.telegram.messenger.R.drawable.msg_calls,
+                "Маршрут звонка",
+                reason,
+                "ОК",
+                null,
+                null,
+                null,
+                false
+        );
     }
 }

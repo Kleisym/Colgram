@@ -53,10 +53,10 @@ public class ColgramForegroundService extends Service {
     private static final int NOTIFICATION_ID = 771001;
     public static final String ACTION_DOZE_KEEPALIVE = "org.colgram.action.DOZE_KEEPALIVE";
     private static final int DOZE_KEEPALIVE_REQUEST_CODE = 771009;
-    /** Quiet Doze-proof alarm keepalive every 5 minutes for reliable screen-off delivery & Anti-Delete without heating. */
-    private static final long DOZE_KEEPALIVE_INTERVAL_MS = 300_000L;
-    private static final long DOZE_WAKELOCK_MS = 12_000L;
-    private static final long DOZE_PULSE_HOLD_MS = 9_000L;
+    /** Eco-cold Doze keepalive (15m interval, bounded <=1.5s wake only when bots/recovery truly need it). */
+    private static final long DOZE_KEEPALIVE_INTERVAL_MS = 900_000L;
+    private static final long DOZE_WAKELOCK_MS = 1_500L;
+    private static final long DOZE_PULSE_HOLD_MS = 250L;
 
     /** Lightweight passive 30-second bypass/poller check interval. */
     private static final long HEARTBEAT_MS = 30_000L;
@@ -133,11 +133,13 @@ public class ColgramForegroundService extends Service {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        // DO NOT unload Koliti weights on normal background switch (TRIM_MEMORY_UI_HIDDEN=20):
-        // only release GGUF weights under genuine critical OS memory pressure so reopening Koliti
-        // stays instant instead of triggering a 10-15s cold disk reload.
+        // Unload Koliti GGUF weights under genuine OS memory pressure OR when backgrounded while
+        // the screen is off, while keeping instant re-entry during active screen-on switching.
+        boolean screenOffBg = level >= TRIM_MEMORY_UI_HIDDEN && !ColgramPowerGuard.isScreenInteractive(this);
         if (ColgramBuildFlags.KOLITI_ENABLED
-                && (level == TRIM_MEMORY_RUNNING_CRITICAL || level >= TRIM_MEMORY_COMPLETE)) {
+                && (level >= TRIM_MEMORY_BACKGROUND
+                    || level == TRIM_MEMORY_RUNNING_CRITICAL
+                    || screenOffBg)) {
             try {
                 Class<?> aiCls = Class.forName("org.colgram.core.ColgramAiEngine");
                 Object aiInst = aiCls.getMethod("getInstance").invoke(null);
@@ -167,7 +169,11 @@ public class ColgramForegroundService extends Service {
         }
         serviceRunning = true;
         ensurePollers();
-        startHeartbeat();
+        if (ColgramUiBridge.isAppInForeground() || hasAnyBotTokens()) {
+            startHeartbeat();
+        } else {
+            stopHeartbeat();
+        }
         if (ColgramConfig.isAlwaysBackgroundEnabled()) {
             scheduleDozeKeepalive(getApplicationContext());
         }
@@ -396,8 +402,10 @@ public class ColgramForegroundService extends Service {
                     Log.w(TAG, "poller ensure failed for account " + account + ": " + t.getMessage());
                 }
             }
-            if (anyBotToken || ColgramConfig.isAlwaysBackgroundEnabled()) {
+            if (anyBotToken) {
                 ensureHumanAccountBackgroundSync();
+            } else if (!ColgramUiBridge.isAppInForeground()) {
+                return;
             }
             ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(this);
             if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
@@ -538,6 +546,7 @@ public class ColgramForegroundService extends Service {
     private void ensureHumanAccountBackgroundSync() {
         if (ColgramUiBridge.isAppInForeground()
                 || !ColgramConfig.isAlwaysBackgroundEnabled()
+                || !hasAnyBotTokens()
                 || ColgramPowerGuard.shouldThrottle(this)) {
             return;
         }
@@ -550,13 +559,13 @@ public class ColgramForegroundService extends Service {
         } else {
             screenOffSinceMs = 0L;
         }
-        // Zero-drain eco cadence: 5 min when screen is ON, 3 min Doze-aware tick when screen is OFF.
+        // Eco cadence: 5m interactive background, 15m screen-off Doze.
         long minIntervalMs = screenOn ? 300_000L : DOZE_KEEPALIVE_INTERVAL_MS;
         if (lastHumanSyncAtMs != 0L && now - lastHumanSyncAtMs < minIntervalMs) {
             return;
         }
         lastHumanSyncAtMs = now;
-        kickActiveHumanAccounts(true, false);
+        kickActiveHumanAccounts(false, false);
     }
 
     @Override
@@ -601,17 +610,12 @@ public class ColgramForegroundService extends Service {
             @Override
             public void run() {
                 final boolean fg = ColgramUiBridge.isAppInForeground();
-                if (!fg && !ColgramConfig.isAlwaysBackgroundEnabled() && !hasAnyBotTokens()) {
-                    if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
-                        ColgramOptimizer.scheduleAfterStartup(() -> {
-                            if (ColgramDpiBypass.restartIfDeadAndWait(2000L)) {
-                                kickHumanConnectionsNow();
-                            }
-                        });
-                    }
-                } else {
-                    ensurePollers();
+                if (!fg && !hasAnyBotTokens()) {
+                    // Zero-drain background policy: stop periodic wake timer once backgrounded with no bots.
+                    stopHeartbeat();
+                    return;
                 }
+                ensurePollers();
                 if (handler != null && heartbeat == this) {
                     long baseMs;
                     if (fg) {
@@ -645,18 +649,20 @@ public class ColgramForegroundService extends Service {
         ColgramForegroundService inst = activeInstance;
         if (inst == null || inst.handler == null) return;
         inst.handler.post(() -> {
-            // Keep START_STICKY service, passive 30s bypass watchdog, 3m Doze keepalive, and
-            // 127.0.0.1:9876 ALWAYS alive in background so chats, notifications, and Anti-Delete continue 24/7.
-            // Do NOT unload Koliti weights on normal background switch (only on critical memory trim).
-            inst.startHeartbeat();
-            if (ColgramConfig.isAlwaysBackgroundEnabled()) {
-                scheduleDozeKeepalive(inst.getApplicationContext());
+            if (ColgramUiBridge.isAppInForeground()) return;
+            ColgramTelegramWsBridge.onBackgroundPause();
+            if (inst.hasAnyBotTokens()) {
+                inst.startHeartbeat();
+                if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+                    scheduleDozeKeepalive(inst.getApplicationContext());
+                }
+            } else {
+                // Zero-drain sleep when there are no active bot pollers: stop periodic wake loops.
+                inst.stopHeartbeat();
             }
-            if (!ColgramUiBridge.isAppInForeground()) {
-                try {
-                    ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(inst);
-                } catch (Throwable ignored) {}
-            }
+            try {
+                ColgramUnlimitedMemory.trimTransientMemoryIfNeeded(inst);
+            } catch (Throwable ignored) {}
         });
     }
 
@@ -704,17 +710,26 @@ public class ColgramForegroundService extends Service {
         final Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         ColgramConfig.init(app);
         if (!ColgramConfig.isAlwaysBackgroundEnabled()) return;
-        scheduleDozeKeepalive(app);
+        final boolean hasBots = hasConfiguredBotTokens();
+        if (hasBots) {
+            scheduleDozeKeepalive(app);
+        }
+        if (!hasBots && ColgramProxyManager.isTelegramConnected() && ColgramDpiBypass.isBound()) {
+            ColgramDpiBypass.reapStaleSessions(10_000L, 0L);
+            return;
+        }
         if (!dozePulseInFlight.compareAndSet(false, true)) return;
         PowerManager.WakeLock wl = null;
-        try {
-            PowerManager pm = (PowerManager) app.getSystemService(Context.POWER_SERVICE);
-            if (pm != null) {
-                wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "colgram:doze_keepalive");
-                wl.setReferenceCounted(false);
-                wl.acquire(DOZE_WAKELOCK_MS);
-            }
-        } catch (Throwable ignored) {}
+        if (hasBots && !ColgramPowerGuard.shouldThrottle(app)) {
+            try {
+                PowerManager pm = (PowerManager) app.getSystemService(Context.POWER_SERVICE);
+                if (pm != null) {
+                    wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "colgram:doze_keepalive");
+                    wl.setReferenceCounted(false);
+                    wl.acquire(DOZE_WAKELOCK_MS);
+                }
+            } catch (Throwable ignored) {}
+        }
         final PowerManager.WakeLock wakeLock = wl;
         Thread t = new Thread(() -> {
             boolean scheduledAsyncRelease = false;
@@ -723,28 +738,32 @@ public class ColgramForegroundService extends Service {
                 if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                     ColgramDpiBypass.restartIfDeadAndWait(2000L);
                 }
-                kickActiveHumanAccounts(true, true);
-                try {
-                    Looper mainLooper = Looper.getMainLooper();
-                    if (mainLooper != null) {
-                        new Handler(mainLooper).postDelayed(
-                                () -> finishDozeKeepalivePulse(wakeLock), DOZE_PULSE_HOLD_MS);
+                if (hasBots) {
+                    kickActiveHumanAccounts(false, false);
+                }
+                if (wakeLock != null) {
+                    try {
+                        Looper mainLooper = Looper.getMainLooper();
+                        if (mainLooper != null) {
+                            new Handler(mainLooper).postDelayed(
+                                    () -> finishDozeKeepalivePulse(wakeLock), DOZE_PULSE_HOLD_MS);
+                            scheduledAsyncRelease = true;
+                        }
+                    } catch (Throwable ignored) {}
+                    if (!scheduledAsyncRelease) {
+                        Thread releaser = new Thread(() -> {
+                            try {
+                                Thread.sleep(DOZE_PULSE_HOLD_MS);
+                            } catch (InterruptedException ignored) {
+                                Thread.currentThread().interrupt();
+                            } finally {
+                                finishDozeKeepalivePulse(wakeLock);
+                            }
+                        }, "colgram-doze-release");
+                        releaser.setDaemon(true);
+                        releaser.start();
                         scheduledAsyncRelease = true;
                     }
-                } catch (Throwable ignored) {}
-                if (!scheduledAsyncRelease) {
-                    Thread releaser = new Thread(() -> {
-                        try {
-                            Thread.sleep(DOZE_PULSE_HOLD_MS);
-                        } catch (InterruptedException ignored) {
-                            Thread.currentThread().interrupt();
-                        } finally {
-                            finishDozeKeepalivePulse(wakeLock);
-                        }
-                    }, "colgram-doze-release");
-                    releaser.setDaemon(true);
-                    releaser.start();
-                    scheduledAsyncRelease = true;
                 }
             } catch (Throwable err) {
                 Log.w(TAG, "doze keepalive tick failed: " + err.getMessage());
@@ -770,6 +789,7 @@ public class ColgramForegroundService extends Service {
         inst.handler.post(() -> {
             if (ColgramUiBridge.isAppInForeground()) {
                 inst.screenOffSinceMs = 0L;
+                ColgramTelegramWsBridge.onForegroundResume();
                 inst.ensurePollers();
                 inst.startHeartbeat();
                 if (!ColgramProxyManager.isTelegramConnected()) {

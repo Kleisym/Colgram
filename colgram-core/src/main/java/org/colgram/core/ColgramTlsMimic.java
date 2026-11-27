@@ -483,6 +483,15 @@ public final class ColgramTlsMimic {
      * for all standards-compliant HTTP servers. Never mutates the caller's array.
      */
     public static byte[] mangleHttpHostHeader(byte[] buf, int len) {
+        return mangleHttpHostHeaderInternal(buf, len, false);
+    }
+
+    /** Polymorphic HTTP/1.x Host header case-randomization across 14 non-canonical casings. */
+    public static byte[] mangleHttpHostHeaderPolymorphic(byte[] buf, int len) {
+        return mangleHttpHostHeaderInternal(buf, len, true);
+    }
+
+    private static byte[] mangleHttpHostHeaderInternal(byte[] buf, int len, boolean polymorphic) {
         if (buf == null || len < 16 || len > buf.length) return buf;
         byte b0 = buf[0];
         if (b0 != 'G' && b0 != 'P' && b0 != 'H' && b0 != 'C' && b0 != 'O' && b0 != 'D') return buf;
@@ -501,10 +510,14 @@ public final class ColgramTlsMimic {
                     && (buf[i + 4] == 't' || buf[i + 4] == 'T')
                     && buf[i + 5] == ':') {
                 byte[] copy = Arrays.copyOf(buf, len);
-                copy[i + 1] = 'h';
-                copy[i + 2] = 'o';
-                copy[i + 3] = 'S';
-                copy[i + 4] = 't';
+                if (polymorphic) {
+                    ColgramPolymorphicStealth.randomizeHttpHostHeaderCase(copy, i);
+                } else {
+                    copy[i + 1] = 'h';
+                    copy[i + 2] = 'o';
+                    copy[i + 3] = 'S';
+                    copy[i + 4] = 't';
+                }
                 return copy;
             }
         }
@@ -539,6 +552,11 @@ public final class ColgramTlsMimic {
         int[] sni = findTlsSniSpan(data, data.length);
         if (sni != null) {
             int sldMid = findSldMidpoint(data, sni[0], sni[1]);
+            int minCut = Math.max(2, sni[0] + 1);
+            int maxCut = Math.min(data.length - 1, sni[1] - 1);
+            if (minCut < maxCut) {
+                sldMid = ColgramPolymorphicStealth.jitterSplitOffset(sldMid, minCut, maxCut);
+            }
             if (sldMid > 1 && sldMid < data.length) {
                 return new byte[][]{
                         Arrays.copyOfRange(data, 0, 1),
@@ -577,24 +595,26 @@ public final class ColgramTlsMimic {
      * ByeDPI {@code sendfile()+mmap()} desync.
      */
     public static byte[] buildFakeWhitelistedClientHello(int targetLen, int variant) {
-        String sni = DECOY_WHITELIST_SNI[Math.abs(variant) % DECOY_WHITELIST_SNI.length];
-        Random rnd = new Random();
+        String sni = ColgramPolymorphicStealth.pickBenignSni();
+        if (targetLen >= 512) {
+            return ColgramPolymorphicStealth.buildPolymorphicTlsClientHello(sni);
+        }
         byte[] random = new byte[32];
-        rnd.nextBytes(random);
+        ColgramPolymorphicStealth.fillRandomBytes(random, 0, 32);
 
         ByteArray hs = new ByteArray(Math.max(256, targetLen));
         hs.u8(0x01);                                    // HandshakeType: client_hello
         int hsLenAt = hs.length();
         hs.u8(0x00); hs.u8(0x00); hs.u8(0x00);          // handshake length placeholder
         hs.u8(0x03); hs.u8(0x03);                       // legacy_version TLS 1.2
-        hs.bytes(random);                               // 32B client_random
-        hs.u8(0x00);                                    // compact 0-byte session_id so SNI sits very early
-        // Compact modern TLS 1.3 + ECDHE cipher suite list (4 suites = 8B)
-        hs.u16(8);
-        hs.u16(0x1301);
-        hs.u16(0x1302);
-        hs.u16(0x1303);
-        hs.u16(0xc02f);
+        hs.bytes(random);                               // 32B polymorphic client_random
+        hs.u8(0x00);                                    // compact 0-byte session_id so SNI sits early inside split1
+        // Randomized TLS 1.3 + ECDHE suite list
+        int[] suites = (variant & 1) == 0
+                ? new int[]{0x1301, 0x1302, 0x1303, 0xc02f}
+                : new int[]{0x1301, 0x1303, 0x1302, 0xcca9};
+        hs.u16(suites.length * 2);
+        for (int cs : suites) hs.u16(cs);
         hs.u8(0x01); hs.u8(0x00);                       // compression: null
 
         int extLenAt = hs.length();
@@ -621,7 +641,7 @@ public final class ColgramTlsMimic {
         byte[] record = new byte[5 + hello.length];
         record[0] = 0x16;
         record[1] = 0x03;
-        record[2] = 0x01;
+        record[2] = (byte) ((ColgramPolymorphicStealth.nextUInt16() & 3) == 0 ? 0x03 : 0x01);
         record[3] = (byte) ((hello.length >>> 8) & 0xFF);
         record[4] = (byte) (hello.length & 0xFF);
         System.arraycopy(hello, 0, record, 5, hello.length);

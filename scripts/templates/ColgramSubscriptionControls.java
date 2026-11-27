@@ -23,8 +23,8 @@ import org.colgram.core.ColgramWarpTunnel;
 import org.colgram.singbox.ColgramVpnService;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
+import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
 
 import java.util.List;
@@ -112,48 +112,71 @@ final class ColgramSubscriptionControls {
         Context context = context();
         if (activity == null || context == null) return;
         if (!ColgramSubscriptionStore.hasSubscription(context)) { importLink(); return; }
-        screen.showDialog(new AlertDialog.Builder(activity).setTitle(label("VPN-подписка", "VPN subscription"))
-                .setItems(new String[]{toggleLabel(), label("Выбрать узел", "Choose node"),
-                        label("Импорт VPN-подписки или ключа", "Import VPN subscription or key"),
-                        label("Удалить подписку", "Remove subscription")}, (dialog, which) -> {
+        java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(4);
+        items.add(ColgramUiKit.ChoiceItem.of(toggleLabel(), null, org.telegram.messenger.R.drawable.msg_online));
+        items.add(ColgramUiKit.ChoiceItem.of(label("Выбрать узел", "Choose node"), null, org.telegram.messenger.R.drawable.msg_folders));
+        items.add(ColgramUiKit.ChoiceItem.of(label("Импорт VPN-подписки или ключа", "Import VPN subscription or key"), null, org.telegram.messenger.R.drawable.msg_download));
+        items.add(ColgramUiKit.ChoiceItem.destructive(label("Удалить подписку", "Remove subscription"), null, org.telegram.messenger.R.drawable.msg_delete));
+        ColgramUiKit.showChoiceSheet(
+                activity,
+                screen.getResourceProvider(),
+                org.telegram.messenger.R.drawable.msg_online,
+                label("VPN-подписка", "VPN subscription"),
+                null,
+                items,
+                which -> {
                     if (which == 0) toggle();
                     else if (which == 1) showNodes();
                     else if (which == 2) importLink();
                     else confirmRemove();
-                }).setNegativeButton(label("Отмена", "Cancel"), null).create());
+                }
+        );
     }
 
     void importLink() {
         Activity activity = screen.getParentActivity();
         if (activity == null) return;
-        org.telegram.ui.Components.EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
-                activity, screen.getResourceProvider(), "https://…   vless://…   vmess://…   trojan://…", true);
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        org.telegram.ui.Components.EditTextBoldCursor input = ColgramUiKit.makeStyledEditText(
+                activity,
+                screen.getResourceProvider(),
+                pal,
+                "https://…   vless://…   vmess://…   trojan://…",
+                null,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI
+                        | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+                false
+        );
         input.setContentDescription(label("Ссылка подписки или ключ VPN", "VPN subscription link or key"));
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI
-                | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setMinLines(2);
         input.setMaxLines(4);
         input.setHorizontallyScrolling(false);
         input.setSaveEnabled(false);
         input.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         if (Build.VERSION.SDK_INT >= 26) input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
-        android.widget.FrameLayout wrap = new android.widget.FrameLayout(activity);
-        int pad = AndroidUtilities.dp(20);
-        wrap.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(4));
-        wrap.addView(input, org.telegram.ui.Components.LayoutHelper.createFrame(
-                org.telegram.ui.Components.LayoutHelper.MATCH_PARENT,
-                org.telegram.ui.Components.LayoutHelper.WRAP_CONTENT));
-        AlertDialog dialog = new AlertDialog.Builder(activity, screen.getResourceProvider()).setTitle(label("Импорт VPN", "Import VPN"))
-                .setMessage(label("Вставьте URL подписки или ключ: VLESS TCP/WS, VMess, Trojan, Shadowsocks. Сохранение не включает VPN. Если VPN подписки уже запущен, он остановится после успешного импорта.",
-                        "Paste a subscription URL or key: VLESS over TCP/WS, VMess, Trojan, or Shadowsocks. Saving does not connect the VPN. An existing subscription VPN stops after a successful import."))
-                .setView(wrap)
-                .setPositiveButton(label("Сохранить", "Save"), (d, w) -> saveSubscription(input.getText().toString().trim()))
-                .setNegativeButton(label("Отмена", "Cancel"), null).create();
-        if (dialog.getWindow() != null && !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()) {
-            dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        android.widget.LinearLayout wrap = ColgramUiKit.makeInputContainer(activity, pal, input, false);
+        BottomSheet sheet = ColgramUiKit.showCustomViewSheet(
+                activity,
+                screen.getResourceProvider(),
+                org.telegram.messenger.R.drawable.msg_download,
+                label("Импорт VPN", "Import VPN"),
+                label("Вставьте URL подписки или ключ: VLESS TCP/WS, VMess, Trojan, Shadowsocks. Сохранение не включает VPN. Если VPN подписки уже запущен, он остановится после успешного импорта.",
+                        "Paste a subscription URL or key: VLESS over TCP/WS, VMess, Trojan, or Shadowsocks. Saving does not connect the VPN. An existing subscription VPN stops after a successful import."),
+                wrap,
+                label("Сохранить", "Save"),
+                s -> {
+                    saveSubscription(input.getText().toString().trim());
+                    return true;
+                },
+                null,
+                null,
+                label("Отмена", "Cancel"),
+                true,
+                !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()
+        );
+        if (sheet != null) {
+            sheet.setOnDismissListener(d -> input.setText(""));
         }
-        dialog.setOnDismissListener(d -> input.setText(""));
-        screen.showDialog(dialog, d -> input.setText(""));
     }
 
     private boolean beginEdit() {
@@ -200,16 +223,29 @@ final class ColgramSubscriptionControls {
                 if (activity == null) return;
                 if (nodes.isEmpty()) { say(label("В подписке нет узлов", "No nodes in the subscription")); return; }
                 ColgramSubscriptionStore.State state = ColgramSubscriptionStore.current(context);
-                String[] labels = new String[nodes.size()];
-                for (int i = 0; i < labels.length; i++) {
+                java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(nodes.size());
+                for (int i = 0; i < nodes.size(); i++) {
                     ColgramSubscription.Node node = nodes.get(i);
-                    labels[i] = (state != null && state.selected == i ? "✓  " : "") + safeLabel(node.name, i, node.protocol);
+                    items.add(new ColgramUiKit.ChoiceItem(
+                            safeLabel(node.name, i, node.protocol),
+                            node.protocol,
+                            org.telegram.messenger.R.drawable.msg_online,
+                            0,
+                            state != null && state.selected == i,
+                            false,
+                            null
+                    ));
                 }
-                screen.showDialog(new AlertDialog.Builder(activity).setTitle(label("Узел VPN / страна", "VPN node / country"))
-                        .setMessage(label("Названия указаны провайдером. Смена узла останавливает текущий VPN подписки.",
-                                "Names are provided by the service. Changing the node stops the current subscription VPN."))
-                        .setItems(labels, (d, index) -> selectNode(index))
-                        .setNegativeButton(label("Отмена", "Cancel"), null).create());
+                ColgramUiKit.showChoiceSheet(
+                        activity,
+                        screen.getResourceProvider(),
+                        org.telegram.messenger.R.drawable.msg_online,
+                        label("Узел VPN / страна", "VPN node / country"),
+                        label("Названия указаны провайдером. Смена узла останавливает текущий VPN подписки.",
+                                "Names are provided by the service. Changing the node stops the current subscription VPN."),
+                        items,
+                        this::selectNode
+                );
             });
         });
     }
@@ -244,10 +280,15 @@ final class ColgramSubscriptionControls {
         Context context = context();
         if (activity == null || context == null) return;
         if (!ColgramSubscriptionStore.hasSubscription(context)) { say(label("Подписка не сохранена", "No subscription saved")); return; }
-        screen.showDialog(new AlertDialog.Builder(activity)
-                .setTitle(label("Удалить подписку?", "Remove subscription?"))
-                .setMessage(label("Сохранённые ключи и выбор узла будут удалены.", "The saved keys and node selection will be removed."))
-                .setPositiveButton(label("Удалить", "Remove"), (d, w) -> {
+        ColgramUiKit.showConfirmSheet(
+                activity,
+                screen.getResourceProvider(),
+                org.telegram.messenger.R.drawable.msg_delete,
+                label("Удалить подписку?", "Remove subscription?"),
+                label("Сохранённые ключи и выбор узла будут удалены.", "The saved keys and node selection will be removed."),
+                label("Удалить", "Remove"),
+                true,
+                () -> {
                     if (!beginEdit()) return;
                     stopForAlternativeRoute(context);
                     PROFILE_WORK.execute(() -> {
@@ -258,7 +299,10 @@ final class ColgramSubscriptionControls {
                             finishEdit(null, label("Не удалось удалить подписку", "Could not remove the subscription"), true);
                         }
                     });
-                }).setNegativeButton(label("Отмена", "Cancel"), null).create());
+                },
+                label("Отмена", "Cancel"),
+                null
+        );
     }
 
     String toggleLabel() {
@@ -373,7 +417,6 @@ final class ColgramSubscriptionControls {
     }
 
     private void say(String message) {
-        Activity activity = screen.getParentActivity();
-        if (activity != null) Toast.makeText(activity, message, Toast.LENGTH_SHORT).show();
+        ColgramUiKit.showNotice(screen, org.telegram.messenger.R.drawable.msg_info, message, false);
     }
 }

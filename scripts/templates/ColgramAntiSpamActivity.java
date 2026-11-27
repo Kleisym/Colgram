@@ -32,9 +32,9 @@ import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.ActionBar;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
+import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Cells.HeaderCell;
 import org.telegram.ui.Cells.ShadowSectionCell;
@@ -345,15 +345,25 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     }
 
     private void promptNotificationListenerPermission(Context ctx) {
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Доступ к уведомлениям");
-        b.setMessage("Чтобы автоматически смахивать рекламные уведомления из групп на Android 9+, разрешите сервис «Colgram Антиспам» в системных настройках.");
-        b.setPositiveButton("Открыть настройки", (d, w) -> ColgramNotificationListenerService.openNotificationListenerSettings(ctx));
-        b.setNegativeButton("Позже", null);
-        showDialog(b.create());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramUiKit.showConfirmSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_bots,
+                "Доступ к уведомлениям",
+                "Чтобы автоматически смахивать рекламные уведомления из групп на Android 9+, разрешите сервис «Colgram Антиспам» в системных настройках.",
+                "Открыть настройки",
+                false,
+                () -> ColgramNotificationListenerService.openNotificationListenerSettings(ctx),
+                "Позже",
+                null
+        );
     }
 
     private void showMuteModePicker(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         final String[] labels = {
                 "Тихо (отключить уведомления)",
                 "Удалить спам-сообщение",
@@ -366,262 +376,398 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 ColgramColemailerEngine.MUTE_WARN,
                 ColgramColemailerEngine.MUTE_BAN
         };
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Действие при срабатывании .мутить / спам-гарда");
-        b.setItems(labels, (d, which) -> {
-            ColgramConfig.setDefaultMuteMode(modes[which]);
-            refreshList(ctx);
-        });
-        b.setNegativeButton("Отмена", null);
-        showDialog(b.create());
+        String curMode = ColgramConfig.getDefaultMuteMode();
+        int sel = -1;
+        for (int i = 0; i < modes.length; i++) {
+            if (modes[i].equals(curMode)) { sel = i; break; }
+        }
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_block,
+                "Действие при срабатывании .мутить / спам-гарда",
+                null,
+                labels,
+                sel,
+                which -> {
+                    ColgramConfig.setDefaultMuteMode(modes[which]);
+                    refreshList(ctx);
+                }
+        );
     }
 
     private void showDetectorSandboxDialog(Context ctx) {
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Проверка детектора антиспама");
-
-        LinearLayout box = makeDialogContainer(ctx);
-        EditText input = makeStyledEdit(ctx, "Вставьте подозрительное сообщение…", true);
-        box.addView(input);
-
-        b.setView(box);
-        b.setPositiveButton("Проверить", (d, w) -> {
-            String sample = input.getText().toString();
-            ColgramSpamGuard.SpamReport r = ColgramSpamGuard.diagnose(
-                    sample, "", ColgramSpamGuard.PING_USERNAME, true, false, false, false, true, Collections.emptyList());
-            String msg = "Скор: " + r.score + " / " + ColgramSpamGuard.SPAM_THRESHOLD
-                    + (r.isSpam ? " [СПАМ]" : (r.isLead ? " [ЛИД — сохранён]" : " [ЧИСТО]"))
-                    + "\nАвтопрочтение: " + (r.shouldAutoRead ? "да" : "нет")
-                    + "\nОбфускация: " + r.obfuscationFlags
-                    + "\n\nФакторы:\n" + (r.factors.isEmpty() ? "• нет" : "• " + TextUtils.join("\n• ", r.factors));
-            ColgramNativeColemailerBridge.showAlert("Результат скоринга", msg);
-        });
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_search,
+                "Проверка детектора антиспама",
+                "Локальная проверка скоринга и факторов на тестовом тексте",
+                "Вставьте подозрительное сообщение…",
+                null,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE,
+                false,
+                false,
+                false,
+                "Проверить",
+                sample -> {
+                    ColgramSpamGuard.SpamReport r = ColgramSpamGuard.diagnose(
+                            sample, "", ColgramSpamGuard.PING_USERNAME, true, false, false, false, true, Collections.emptyList());
+                    String msg = "Скор: " + r.score + " / " + ColgramSpamGuard.SPAM_THRESHOLD
+                            + (r.isSpam ? " [СПАМ]" : (r.isLead ? " [ЛИД — сохранён]" : " [ЧИСТО]"))
+                            + "\nАвтопрочтение: " + (r.shouldAutoRead ? "да" : "нет")
+                            + "\nОбфускация: " + r.obfuscationFlags
+                            + "\n\nФакторы:\n" + (r.factors.isEmpty() ? "• нет" : "• " + TextUtils.join("\n• ", r.factors));
+                    ColgramNativeColemailerBridge.showAlert("Результат скоринга", msg);
+                },
+                null,
+                null
+        );
     }
 
     private void showDmAutoDeleteMutesDialog(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         Set<Long> mutedSet = engine.getDmAutoDeleteMutedDialogs(currentAccount);
         List<Long> mutedIds = new ArrayList<>(mutedSet);
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Мут ЛС с автоудалением (" + mutedIds.size() + ")");
-        if (mutedIds.isEmpty()) {
-            b.setMessage("Список пуст.\nОткройте любой личный чат 1-на-1 -> меню ⋮ -> «Мут ЛС (автоудаление)», или отправьте `.dmmute` / `.mute` в чате.");
-        } else {
-            MessagesController mc = MessagesController.getInstance(currentAccount);
-            String[] items = new String[mutedIds.size()];
-            for (int i = 0; i < mutedIds.size(); i++) {
-                long uid = mutedIds.get(i);
-                String label = "ID " + uid;
-                TLRPC.User u = mc != null ? mc.getUser(uid) : null;
-                if (u != null) {
-                    String name = (u.first_name != null ? u.first_name : "")
-                            + (u.last_name != null && !u.last_name.isEmpty() ? (" " + u.last_name) : "");
-                    name = name.trim();
-                    if (!name.isEmpty()) {
-                        label = name + " (" + uid + ")";
+        Runnable openAddById = () -> ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_block,
+                "Включить мут ЛС по ID",
+                "Мгновенное автоудаление входящих в личном чате",
+                "Telegram User ID (личный чат)",
+                null,
+                InputType.TYPE_CLASS_NUMBER,
+                false,
+                false,
+                true,
+                "Включить",
+                raw -> {
+                    try {
+                        long uid = Long.parseLong(raw == null ? "" : raw.trim());
+                        long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
+                        boolean ok = engine.setDmAutoDeleteMuted(currentAccount, uid, selfId, true);
+                        ColgramUiKit.showNotice(this, ok ? R.drawable.msg_block : R.drawable.msg_info,
+                                ok ? ("Мут ЛС включён для " + uid)
+                                        : "Недопустимый ID (нельзя мутить Избранное или сервисные чаты)", !ok);
+                        refreshList(ctx);
+                    } catch (NumberFormatException ignored) {
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "Введите корректный числовой User ID", true);
                     }
-                }
-                items[i] = label + " — выключить мут ЛС";
-            }
-            b.setItems(items, (d, which) -> {
-                long uid = mutedIds.get(which);
-                long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
-                engine.setDmAutoDeleteMuted(currentAccount, uid, selfId, false);
-                Toast.makeText(ctx, "Мут ЛС выключен для " + uid, Toast.LENGTH_SHORT).show();
-                refreshList(ctx);
-            });
+                },
+                null,
+                null
+        );
+        if (mutedIds.isEmpty()) {
+            ColgramUiKit.showConfirmSheet(
+                    act,
+                    resourceProvider,
+                    R.drawable.msg_block,
+                    "Мут ЛС с автоудалением (0)",
+                    "Список пуст.\nОткройте любой личный чат 1-на-1 -> меню ⋮ -> «Мут ЛС (автоудаление)», или отправьте `.dmmute` / `.mute` в чате.",
+                    "+ По User ID",
+                    false,
+                    openAddById,
+                    "Закрыть",
+                    null
+            );
+            return;
         }
-        b.setPositiveButton("+ По User ID", (d, w) -> {
-            LinearLayout box = makeDialogContainer(ctx);
-            EditText ed = makeStyledEdit(ctx, "Telegram User ID (личный чат)", false);
-            ed.setInputType(InputType.TYPE_CLASS_NUMBER);
-            box.addView(ed);
-            showDialog(new AlertDialog.Builder(ctx).setTitle("Включить мут ЛС по ID").setView(box)
-                    .setPositiveButton("Включить", (d2, w2) -> {
-                        try {
-                            long uid = Long.parseLong(ed.getText().toString().trim());
-                            long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
-                            boolean ok = engine.setDmAutoDeleteMuted(currentAccount, uid, selfId, true);
-                            Toast.makeText(ctx, ok ? ("Мут ЛС включён для " + uid)
-                                    : "Недопустимый ID (нельзя мутить Избранное или сервисные чаты)", Toast.LENGTH_SHORT).show();
-                            refreshList(ctx);
-                        } catch (NumberFormatException ignored) {
-                            Toast.makeText(ctx, "Введите корректный числовой User ID", Toast.LENGTH_SHORT).show();
-                        }
-                    }).setNegativeButton("Отмена", null).create());
-        });
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+        MessagesController mc = MessagesController.getInstance(currentAccount);
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(mutedIds.size() + 1);
+        for (int i = 0; i < mutedIds.size(); i++) {
+            long uid = mutedIds.get(i);
+            String label = "ID " + uid;
+            TLRPC.User u = mc != null ? mc.getUser(uid) : null;
+            if (u != null) {
+                String name = (u.first_name != null ? u.first_name : "")
+                        + (u.last_name != null && !u.last_name.isEmpty() ? (" " + u.last_name) : "");
+                name = name.trim();
+                if (!name.isEmpty()) {
+                    label = name + " (" + uid + ")";
+                }
+            }
+            items.add(ColgramUiKit.ChoiceItem.of(label, "Нажмите чтобы выключить мут ЛС", R.drawable.msg_block));
+        }
+        items.add(ColgramUiKit.ChoiceItem.of("+ По User ID", "Добавить новый Telegram User ID", R.drawable.msg_edit));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_block,
+                "Мут ЛС с автоудалением (" + mutedIds.size() + ")",
+                null,
+                items,
+                which -> {
+                    if (which == mutedIds.size()) {
+                        openAddById.run();
+                        return;
+                    }
+                    long uid = mutedIds.get(which);
+                    long selfId = UserConfig.getInstance(currentAccount).getClientUserId();
+                    engine.setDmAutoDeleteMuted(currentAccount, uid, selfId, false);
+                    ColgramUiKit.showNotice(this, R.drawable.msg_block, "Мут ЛС выключен для " + uid, false);
+                    refreshList(ctx);
+                }
+        );
     }
 
     private void showMuteRulesDialog(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         List<ColgramColemailerEngine.MuteRule> rules = engine.listMuteRules();
         if (rules.isEmpty()) {
-            AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-            b.setTitle("Правила .мутить");
-            b.setMessage("Список пуст. Ответьте на сообщение в чате командой:\n.мутить [тихо|удалить|варн|бан] [чат]");
-            b.setPositiveButton("Добавить по ID", (d, w) -> showAddMuteRuleDialog(ctx));
-            b.setNegativeButton("OK", null);
-            showDialog(b.create());
+            ColgramUiKit.showConfirmSheet(
+                    act,
+                    resourceProvider,
+                    R.drawable.msg_block,
+                    "Правила .мутить",
+                    "Список пуст. Ответьте на сообщение в чате командой:\n.мутить [тихо|удалить|варн|бан] [чат]",
+                    "Добавить по ID",
+                    false,
+                    () -> showAddMuteRuleDialog(ctx),
+                    "OK",
+                    null
+            );
             return;
         }
-        String[] items = new String[rules.size()];
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(rules.size() + 1);
         for (int i = 0; i < rules.size(); i++) {
             ColgramColemailerEngine.MuteRule r = rules.get(i);
-            items[i] = (r.wholeChat ? ("Весь чат " + r.scopeChatId) : ("ID " + r.senderId + (r.scopeChatId == 0 ? " (везде)" : " в " + r.scopeChatId)))
-                    + " -> " + formatMuteMode(r.mode) + " (удалить)";
+            String title = r.wholeChat
+                    ? ("Весь чат " + r.scopeChatId)
+                    : ("ID " + r.senderId + (r.scopeChatId == 0 ? " (везде)" : " в " + r.scopeChatId));
+            items.add(ColgramUiKit.ChoiceItem.destructive(title, "Режим: " + formatMuteMode(r.mode) + " · удалить", R.drawable.msg_delete));
         }
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Активные правила мута (" + rules.size() + ")");
-        b.setItems(items, (d, which) -> {
-            ColgramColemailerEngine.MuteRule r = rules.get(which);
-            engine.removeMuteRule(r.senderId, r.scopeChatId, r.wholeChat);
-            if (!r.wholeChat && r.senderId != 0) ColgramHookHandler.setNotificationsBlocked(r.senderId, false);
-            refreshList(ctx);
-        });
-        b.setNeutralButton("+ По ID", (d, w) -> showAddMuteRuleDialog(ctx));
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+        items.add(ColgramUiKit.ChoiceItem.of("+ По ID", "Добавить новое правило", R.drawable.msg_edit));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_block,
+                "Активные правила мута (" + rules.size() + ")",
+                null,
+                items,
+                which -> {
+                    if (which == rules.size()) {
+                        showAddMuteRuleDialog(ctx);
+                        return;
+                    }
+                    ColgramColemailerEngine.MuteRule r = rules.get(which);
+                    engine.removeMuteRule(r.senderId, r.scopeChatId, r.wholeChat);
+                    if (!r.wholeChat && r.senderId != 0) ColgramHookHandler.setNotificationsBlocked(r.senderId, false);
+                    refreshList(ctx);
+                }
+        );
     }
 
     private void showAddMuteRuleDialog(Context ctx) {
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Замутить по Telegram ID");
-        LinearLayout box = makeDialogContainer(ctx);
-        EditText idEdit = makeStyledEdit(ctx, "User ID (или -100... для чата)", false);
-        idEdit.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED);
-        EditText modeEdit = makeStyledEdit(ctx, "Режим: silent / delete / warn / ban", false);
-        modeEdit.setText(ColgramConfig.getDefaultMuteMode());
-        box.addView(idEdit);
-        box.addView(modeEdit);
-        b.setView(box);
-        b.setPositiveButton("Добавить", (d, w) -> {
-            try {
-                long id = Long.parseLong(idEdit.getText().toString().trim());
-                String mode = ColgramColemailerEngine.normalizeMuteMode(modeEdit.getText().toString());
-                boolean whole = id < 0;
-                ColgramColemailerEngine.getInstance().setMuteRule(whole ? 0L : id, whole ? id : 0L, whole, mode);
-                if (!whole) ColgramHookHandler.setNotificationsBlocked(id, true);
-                refreshList(ctx);
-            } catch (NumberFormatException ignored) {
-                Toast.makeText(ctx, "Введите корректный числовой ID", Toast.LENGTH_SHORT).show();
-            }
-        });
-        b.setNegativeButton("Отмена", null);
-        showDialog(b.create());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        LinearLayout box = new LinearLayout(act);
+        box.setOrientation(LinearLayout.VERTICAL);
+        EditTextBoldCursor idEdit = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal, "User ID (или -100... для чата)", null,
+                InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED, true);
+        EditTextBoldCursor modeEdit = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal, "Режим: silent / delete / warn / ban",
+                ColgramConfig.getDefaultMuteMode(), InputType.TYPE_CLASS_TEXT, true);
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, idEdit, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, modeEdit, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        ColgramUiKit.showCustomViewSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_block,
+                "Замутить по Telegram ID",
+                null,
+                box,
+                "Добавить",
+                s -> {
+                    try {
+                        long id = Long.parseLong(idEdit.getText().toString().trim());
+                        String mode = ColgramColemailerEngine.normalizeMuteMode(modeEdit.getText().toString());
+                        boolean whole = id < 0;
+                        ColgramColemailerEngine.getInstance().setMuteRule(whole ? 0L : id, whole ? id : 0L, whole, mode);
+                        if (!whole) ColgramHookHandler.setNotificationsBlocked(id, true);
+                        refreshList(ctx);
+                        return true;
+                    } catch (NumberFormatException ignored) {
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "Введите корректный числовой ID", true);
+                        return false;
+                    }
+                },
+                null,
+                null,
+                "Отмена",
+                true,
+                false
+        );
     }
 
     private void showWhitelistDialog(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         List<Long> wl = engine.listWhitelist();
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Белый список (" + wl.size() + ")");
-        if (!wl.isEmpty()) {
-            String[] items = new String[wl.size()];
-            for (int i = 0; i < wl.size(); i++) items[i] = "ID " + wl.get(i) + " (нажмите чтобы убрать)";
-            b.setItems(items, (d, which) -> {
-                engine.removeWhitelist(wl.get(which));
-                refreshList(ctx);
-            });
-        } else {
-            b.setMessage("Пока никого нет. Можно добавить в чате командой `.вайтлист` ответом или по ID ниже.");
+        Runnable addWlById = () -> ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_openprofile,
+                "Добавить в белый список",
+                "Неприкосновенные пользователи (антиспам не трогает)",
+                "Telegram User ID",
+                null,
+                InputType.TYPE_CLASS_NUMBER,
+                false,
+                false,
+                true,
+                "OK",
+                raw -> {
+                    try {
+                        long uid = Long.parseLong(raw == null ? "" : raw.trim());
+                        engine.addWhitelist(uid);
+                        refreshList(ctx);
+                    } catch (NumberFormatException ignored) {
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "Введите числовой Telegram User ID", true);
+                    }
+                },
+                null,
+                null
+        );
+        if (wl.isEmpty()) {
+            ColgramUiKit.showConfirmSheet(
+                    act,
+                    resourceProvider,
+                    R.drawable.msg_openprofile,
+                    "Белый список (0)",
+                    "Пока никого нет. Можно добавить в чате командой `.вайтлист` ответом или по ID ниже.",
+                    "+ Добавить ID",
+                    false,
+                    addWlById,
+                    "Закрыть",
+                    null
+            );
+            return;
         }
-        b.setPositiveButton("+ Добавить ID", (d, w) -> {
-            LinearLayout box = makeDialogContainer(ctx);
-            EditText ed = makeStyledEdit(ctx, "Telegram User ID", false);
-            ed.setInputType(InputType.TYPE_CLASS_NUMBER);
-            box.addView(ed);
-            showDialog(new AlertDialog.Builder(ctx).setTitle("Добавить в белый список").setView(box)
-                    .setPositiveButton("OK", (d2, w2) -> {
-                        try {
-                            long uid = Long.parseLong(ed.getText().toString().trim());
-                            engine.addWhitelist(uid);
-                            refreshList(ctx);
-                        } catch (NumberFormatException ignored) {
-                            Toast.makeText(ctx.getApplicationContext(), "Введите числовой Telegram User ID", Toast.LENGTH_SHORT).show();
-                        }
-                    }).setNegativeButton("Отмена", null).create());
-        });
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(wl.size() + 1);
+        for (int i = 0; i < wl.size(); i++) {
+            items.add(ColgramUiKit.ChoiceItem.destructive("ID " + wl.get(i), "Нажмите чтобы убрать", R.drawable.msg_delete));
+        }
+        items.add(ColgramUiKit.ChoiceItem.of("+ Добавить ID", "Добавить пользователя по User ID", R.drawable.msg_edit));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_openprofile,
+                "Белый список (" + wl.size() + ")",
+                null,
+                items,
+                which -> {
+                    if (which == wl.size()) {
+                        addWlById.run();
+                        return;
+                    }
+                    engine.removeWhitelist(wl.get(which));
+                    refreshList(ctx);
+                }
+        );
     }
 
     private void showQuietChatsDialog(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         List<ColgramColemailerEngine.QuietSnapshot> snaps = engine.listQuietSnapshots();
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Снимки .тишина (" + snaps.size() + ")");
         if (snaps.isEmpty()) {
-            b.setMessage("Нет активных тихих чатов.\nОтправьте `.тишина` в любом чате — прежние настройки звука будут сохранены.");
-            b.setPositiveButton("OK", null);
-            showDialog(b.create());
+            ColgramUiKit.showInfoSheet(
+                    act,
+                    resourceProvider,
+                    R.drawable.msg_info,
+                    "Снимки .тишина (0)",
+                    "Нет активных тихих чатов.\nОтправьте `.тишина` в любом чате — прежние настройки звука будут сохранены.",
+                    "OK",
+                    null,
+                    null,
+                    null,
+                    false
+            );
             return;
         }
-        String[] items = new String[snaps.size()];
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(snaps.size());
         for (int i = 0; i < snaps.size(); i++) {
-            items[i] = "Чат " + snaps.get(i).dialogId + " — восстановить звук (.тишина выкл)";
+            items.add(ColgramUiKit.ChoiceItem.of("Чат " + snaps.get(i).dialogId, "Восстановить звук (.тишина выкл)", R.drawable.msg_retry));
         }
-        b.setItems(items, (d, which) -> {
-            long did = snaps.get(which).dialogId;
-            ColgramNativeColemailerBridge.handleChatCommand(did, 0, ".тишина выкл", 0L);
-            refreshList(ctx);
-        });
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_settings,
+                "Снимки .тишина (" + snaps.size() + ")",
+                null,
+                items,
+                which -> {
+                    long did = snaps.get(which).dialogId;
+                    ColgramNativeColemailerBridge.handleChatCommand(did, 0, ".тишина выкл", 0L);
+                    refreshList(ctx);
+                }
+        );
     }
 
     private void showCampaignEditorDialog(Context ctx, ColgramColemailerEngine.BroadcastCampaign existing) {
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle(existing == null ? "Новая кампания рассылки" : "Кампания: " + existing.name);
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        LinearLayout box = new LinearLayout(act);
+        box.setOrientation(LinearLayout.VERTICAL);
 
-        ScrollView scroll = new ScrollView(ctx);
-        LinearLayout box = makeDialogContainer(ctx);
-
-        EditText nameEt = makeStyledEdit(ctx, "Имя (например: promo_1)", false);
+        EditTextBoldCursor nameEt = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal, "Имя (например: promo_1)",
+                existing != null ? existing.name : null, InputType.TYPE_CLASS_TEXT, true);
         if (existing != null) {
-            nameEt.setText(existing.name);
             nameEt.setEnabled(false);
         }
 
-        // Collect live Telegram folders to help autocomplete/select
         List<String> folderNames = getTelegramFolderNames();
-        EditText folderEt = makeStyledEdit(ctx, "Папка Telegram (пусто = из .рассыл)"
-                + (folderNames.isEmpty() ? "" : ", напр.: " + folderNames.get(0)), false);
-        if (existing != null) folderEt.setText(existing.folderName);
+        EditTextBoldCursor folderEt = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal,
+                "Папка Telegram (пусто = из .рассыл)" + (folderNames.isEmpty() ? "" : ", напр.: " + folderNames.get(0)),
+                existing != null ? existing.folderName : null, InputType.TYPE_CLASS_TEXT, true);
 
-        TextView folderHint = new TextView(ctx);
+        TextView folderHint = new TextView(act);
         folderHint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
-        folderHint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+        folderHint.setTextColor(pal.accentPrimary);
         folderHint.setText(folderNames.isEmpty()
                 ? "Папки Telegram не найдены (используйте команду `.рассыл` прямо в нужном чате)"
                 : "Доступные папки (нажмите для подстановки): " + TextUtils.join(", ", folderNames));
-        folderHint.setPadding(0, AndroidUtilities.dp(4), 0, AndroidUtilities.dp(8));
+        folderHint.setPadding(AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(8));
         if (!folderNames.isEmpty()) {
             folderHint.setOnClickListener(v -> {
                 Activity curAct = getParentActivity();
                 if (destroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
-                try {
-                    new AlertDialog.Builder(curAct, resourceProvider)
-                            .setTitle("Выберите папку Telegram")
-                            .setItems(folderNames.toArray(new String[0]), (d, which) -> folderEt.setText(folderNames.get(which)))
-                            .show();
-                } catch (Throwable ignored) {}
+                ColgramUiKit.showChoiceSheet(
+                        curAct, resourceProvider, R.drawable.msg_folders,
+                        "Выберите папку Telegram", null,
+                        folderNames.toArray(new String[0]), -1,
+                        which -> folderEt.setText(folderNames.get(which))
+                );
             });
         }
 
-        EditText schedEt = makeStyledEdit(ctx, "Расписание: 15м | 20 сообщений | 1ч 15 сообщений", false);
+        String schedInit = "15м";
         if (existing != null) {
-            if (existing.mode == ColgramColemailerEngine.MODE_COUNTER) schedEt.setText(existing.counterThreshold + " сообщений");
-            else if (existing.mode == ColgramColemailerEngine.MODE_HYBRID) schedEt.setText(formatInterval(existing.intervalSec) + " " + existing.counterThreshold + " сообщений");
-            else schedEt.setText(formatInterval(existing.intervalSec));
-        } else {
-            schedEt.setText("15м");
+            if (existing.mode == ColgramColemailerEngine.MODE_COUNTER) schedInit = existing.counterThreshold + " сообщений";
+            else if (existing.mode == ColgramColemailerEngine.MODE_HYBRID) schedInit = formatInterval(existing.intervalSec) + " " + existing.counterThreshold + " сообщений";
+            else schedInit = formatInterval(existing.intervalSec);
         }
+        EditTextBoldCursor schedEt = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal, "Расписание: 15м | 20 сообщений | 1ч 15 сообщений",
+                schedInit, InputType.TYPE_CLASS_TEXT, true);
 
-        EditText bodyEt = makeStyledEdit(ctx, "Текст поста (опционально внизу кнопки:\n[Сайт](https://example.com) || [Клик](cb:buy))", true);
+        String bodyInit = "";
         if (existing != null) {
             String full = existing.text;
             if (!existing.buttons.isEmpty()) {
@@ -637,109 +783,129 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 }
                 full = full + "\n\n" + btns.toString().trim();
             }
-            bodyEt.setText(full);
+            bodyInit = full;
         }
+        EditTextBoldCursor bodyEt = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal,
+                "Текст поста (опционально внизу кнопки:\n[Сайт](https://example.com) || [Клик](cb:buy))",
+                bodyInit, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE, false);
 
-        CheckBox noPreviewCb = new CheckBox(ctx);
+        CheckBox noPreviewCb = new CheckBox(act);
         noPreviewCb.setText("Отключить предпросмотр ссылок");
-        noPreviewCb.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
+        noPreviewCb.setTextColor(pal.textPrimary);
         noPreviewCb.setChecked(existing != null && existing.disablePreview);
 
-        box.addView(nameEt);
-        box.addView(folderEt);
-        box.addView(folderHint);
-        box.addView(schedEt);
-        box.addView(bodyEt);
-        box.addView(noPreviewCb);
-        scroll.addView(box);
-        b.setView(scroll);
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, nameEt, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, folderEt, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        box.addView(folderHint, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, schedEt, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, bodyEt, false),
+                LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(noPreviewCb, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        b.setPositiveButton("Сохранить", (d, w) -> {
-            String name = nameEt.getText().toString().trim();
-            String rawPayload = bodyEt.getText().toString().trim();
-            if (name.isEmpty() || rawPayload.isEmpty()) {
-                Toast.makeText(ctx, "Укажите имя и текст поста", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            ColgramColemailerEngine.ScheduleSpec spec = ColgramColemailerEngine.parseSchedule(schedEt.getText().toString());
-            ColgramColemailerEngine.ParsedPost parsed = ColgramColemailerEngine.extractButtonsFromPost(rawPayload);
-            ColgramColemailerEngine.BroadcastCampaign camp = new ColgramColemailerEngine.BroadcastCampaign(
-                    name, parsed.body, spec.mode, spec.intervalSec, spec.counterThreshold, folderEt.getText().toString().trim());
-            camp.ownerAccount = currentAccount;
-            camp.disablePreview = noPreviewCb.isChecked();
-            camp.buttons.addAll(parsed.buttons);
-            if (existing != null) {
-                camp.enabled = existing.enabled;
-                camp.targetChats.addAll(existing.targetChats);
-            }
-            ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
-            engine.addOrUpdateCampaign(camp);
-            ColgramNativeColemailerBridge.syncFoldersIntoEngine(currentAccount);
-            engine.armMissingBaselines(currentAccount, System.currentTimeMillis() / 1000L);
-            ColgramNativeColemailerBridge.rescheduleScheduler();
-            refreshList(ctx);
-        });
-        b.setNegativeButton("Отмена", null);
-        showDialog(b.create());
+        ColgramUiKit.showCustomViewSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_send,
+                existing == null ? "Новая кампания рассылки" : "Кампания: " + existing.name,
+                "Событийный планировщик · 0% нагрузки в простое",
+                box,
+                "Сохранить",
+                s -> {
+                    String name = nameEt.getText().toString().trim();
+                    String rawPayload = bodyEt.getText().toString().trim();
+                    if (name.isEmpty() || rawPayload.isEmpty()) {
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "Укажите имя и текст поста", true);
+                        return false;
+                    }
+                    ColgramColemailerEngine.ScheduleSpec spec = ColgramColemailerEngine.parseSchedule(schedEt.getText().toString());
+                    ColgramColemailerEngine.ParsedPost parsed = ColgramColemailerEngine.extractButtonsFromPost(rawPayload);
+                    ColgramColemailerEngine.BroadcastCampaign camp = new ColgramColemailerEngine.BroadcastCampaign(
+                            name, parsed.body, spec.mode, spec.intervalSec, spec.counterThreshold, folderEt.getText().toString().trim());
+                    camp.ownerAccount = currentAccount;
+                    camp.disablePreview = noPreviewCb.isChecked();
+                    camp.buttons.addAll(parsed.buttons);
+                    if (existing != null) {
+                        camp.enabled = existing.enabled;
+                        camp.targetChats.addAll(existing.targetChats);
+                    }
+                    ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
+                    engine.addOrUpdateCampaign(camp);
+                    ColgramNativeColemailerBridge.syncFoldersIntoEngine(currentAccount);
+                    engine.armMissingBaselines(currentAccount, System.currentTimeMillis() / 1000L);
+                    ColgramNativeColemailerBridge.rescheduleScheduler();
+                    refreshList(ctx);
+                    return true;
+                },
+                null,
+                null,
+                "Отмена",
+                true,
+                false
+        );
     }
 
     private void showCampaignControlDialog(Context ctx, String campaignName) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         ColgramColemailerEngine.BroadcastCampaign c = engine.getCampaign(campaignName);
         if (c == null) return;
-        String[] actions = {
-                c.enabled ? "Поставить на паузу" : "Включить кампанию",
-                "Отправить сейчас (тест во все чаты)",
-                "Редактировать текст / кнопки / папку",
-                "Удалить кампанию"
-        };
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Кампания «" + c.name + "» (" + c.targetChats.size() + " чатов)");
-        b.setItems(actions, (d, which) -> {
-            if (which == 0) {
-                engine.setCampaignEnabled(c.name, !c.enabled);
-                ColgramNativeColemailerBridge.rescheduleScheduler();
-                refreshList(ctx);
-            } else if (which == 1) {
-                ColgramNativeColemailerBridge.triggerCampaignNow(c.name);
-            } else if (which == 2) {
-                showCampaignEditorDialog(ctx, c);
-            } else if (which == 3) {
-                engine.removeCampaign(c.name);
-                ColgramNativeColemailerBridge.rescheduleScheduler();
-                refreshList(ctx);
-            }
-        });
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(4);
+        items.add(ColgramUiKit.ChoiceItem.of(c.enabled ? "Поставить на паузу" : "Включить кампанию", null,
+                c.enabled ? R.drawable.msg_block : R.drawable.msg_online));
+        items.add(ColgramUiKit.ChoiceItem.of("Отправить сейчас (тест во все чаты)", null, R.drawable.msg_send));
+        items.add(ColgramUiKit.ChoiceItem.of("Редактировать текст / кнопки / папку", null, R.drawable.msg_edit));
+        items.add(ColgramUiKit.ChoiceItem.destructive("Удалить кампанию", "Безвозвратно удалить рассылку", R.drawable.msg_delete));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_send,
+                "Кампания «" + c.name + "» (" + c.targetChats.size() + " чатов)",
+                null,
+                items,
+                which -> {
+                    if (which == 0) {
+                        engine.setCampaignEnabled(c.name, !c.enabled);
+                        ColgramNativeColemailerBridge.rescheduleScheduler();
+                        refreshList(ctx);
+                    } else if (which == 1) {
+                        ColgramNativeColemailerBridge.triggerCampaignNow(c.name);
+                    } else if (which == 2) {
+                        showCampaignEditorDialog(ctx, c);
+                    } else if (which == 3) {
+                        engine.removeCampaign(c.name);
+                        ColgramNativeColemailerBridge.rescheduleScheduler();
+                        refreshList(ctx);
+                    }
+                }
+        );
     }
 
     private void showRotationsDialog(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         ColgramColemailerEngine engine = ColgramColemailerEngine.getInstance();
         List<ColgramColemailerEngine.RotationRule> list = engine.listRotations();
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Ротации кампаний (" + list.size() + ")");
-        if (!list.isEmpty()) {
-            String[] items = new String[list.size()];
-            for (int i = 0; i < list.size(); i++) {
-                ColgramColemailerEngine.RotationRule r = list.get(i);
-                items[i] = r.name + ": " + TextUtils.join(" -> ", r.campaignNames) + " (удалить)";
-            }
-            b.setItems(items, (d, which) -> {
-                engine.removeRotation(list.get(which).name);
-                refreshList(ctx);
-            });
-        } else {
-            b.setMessage("Ротация позволяет чередовать разные посты по кругу внутри чатов.");
-        }
-        b.setPositiveButton("+ Создать", (d, w) -> {
-            LinearLayout box = makeDialogContainer(ctx);
-            EditText nameEt = makeStyledEdit(ctx, "Имя ротации (например: main)", false);
-            EditText campsEt = makeStyledEdit(ctx, "Кампании через запятую (camp_1, camp_2)", false);
-            box.addView(nameEt);
-            box.addView(campsEt);
-            showDialog(new AlertDialog.Builder(ctx).setTitle("Новая ротация").setView(box)
-                    .setPositiveButton("Сохранить", (d2, w2) -> {
+        Runnable openCreateRotation = () -> {
+            ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+            LinearLayout box = new LinearLayout(act);
+            box.setOrientation(LinearLayout.VERTICAL);
+            EditTextBoldCursor nameEt = ColgramUiKit.makeStyledEditText(
+                    act, resourceProvider, pal, "Имя ротации (например: main)", null, InputType.TYPE_CLASS_TEXT, true);
+            EditTextBoldCursor campsEt = ColgramUiKit.makeStyledEditText(
+                    act, resourceProvider, pal, "Кампании через запятую (camp_1, camp_2)", null, InputType.TYPE_CLASS_TEXT, true);
+            box.addView(ColgramUiKit.makeInputContainer(act, pal, nameEt, false),
+                    LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+            box.addView(ColgramUiKit.makeInputContainer(act, pal, campsEt, false),
+                    LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            ColgramUiKit.showCustomViewSheet(
+                    act, resourceProvider, R.drawable.msg_retry, "Новая ротация", null, box,
+                    "Сохранить",
+                    s -> {
                         String rn = nameEt.getText().toString().trim();
                         String[] parts = campsEt.getText().toString().split(",");
                         List<String> clean = new ArrayList<>();
@@ -751,26 +917,73 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                             engine.setRotation(rn, clean);
                             refreshList(ctx);
                         }
-                    }).setNegativeButton("Отмена", null).create());
-        });
-        b.setNegativeButton("Закрыть", null);
-        showDialog(b.create());
+                        return true;
+                    },
+                    null, null, "Отмена", true, false
+            );
+        };
+        if (list.isEmpty()) {
+            ColgramUiKit.showConfirmSheet(
+                    act,
+                    resourceProvider,
+                    R.drawable.msg_retry,
+                    "Ротации кампаний (0)",
+                    "Ротация позволяет чередовать разные посты по кругу внутри чатов.",
+                    "+ Создать",
+                    false,
+                    openCreateRotation,
+                    "Закрыть",
+                    null
+            );
+            return;
+        }
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(list.size() + 1);
+        for (int i = 0; i < list.size(); i++) {
+            ColgramColemailerEngine.RotationRule r = list.get(i);
+            items.add(ColgramUiKit.ChoiceItem.destructive(r.name, TextUtils.join(" -> ", r.campaignNames) + " · удалить", R.drawable.msg_delete));
+        }
+        items.add(ColgramUiKit.ChoiceItem.of("+ Создать", "Новая ротация кампаний", R.drawable.msg_edit));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_retry,
+                "Ротации кампаний (" + list.size() + ")",
+                null,
+                items,
+                which -> {
+                    if (which == list.size()) {
+                        openCreateRotation.run();
+                        return;
+                    }
+                    engine.removeRotation(list.get(which).name);
+                    refreshList(ctx);
+                }
+        );
     }
 
     private void showBotTokenDialog(Context ctx) {
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx);
-        b.setTitle("Helper Bot Token (опционально)");
-        LinearLayout box = makeDialogContainer(ctx);
-        EditText ed = makeStyledEdit(ctx, "123456:ABC-DEF... (пусто = без бота)", false);
-        ed.setText(ColgramConfig.getHelperBotToken());
-        box.addView(ed);
-        b.setView(box);
-        b.setPositiveButton("Сохранить", (d, w) -> {
-            ColgramConfig.setHelperBotToken(ed.getText().toString());
-            refreshList(ctx);
-        });
-        b.setNegativeButton("Отмена", null);
-        showDialog(b.create());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_bots,
+                "Helper Bot Token (опционально)",
+                "Опциональный бот-токен для вспомогательных отправок",
+                "123456:ABC-DEF... (пусто = без бота)",
+                ColgramConfig.getHelperBotToken(),
+                InputType.TYPE_CLASS_TEXT,
+                true,
+                !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure(),
+                true,
+                "Сохранить",
+                raw -> {
+                    ColgramConfig.setHelperBotToken(raw != null ? raw : "");
+                    refreshList(ctx);
+                },
+                null,
+                null
+        );
     }
 
     private void showCheatsheetDialog() {
@@ -788,68 +1001,78 @@ public class ColgramAntiSpamActivity extends BaseFragment {
     }
 
     private void showLegacyUserbotDialog(Context ctx) {
+        Activity act = getParentActivity();
+        if (act == null) return;
         final int acct = UserConfig.selectedAccount;
-        AlertDialog.Builder b = new AlertDialog.Builder(ctx, resourceProvider);
-        b.setTitle("Внешний Telethon Userbot (опционально)");
-        LinearLayout box = makeDialogContainer(ctx);
-        EditText apiId = makeStyledEdit(ctx, "API ID", false);
-        apiId.setText(ColgramAntiSpam.getApiId(ctx, acct));
-        EditText apiHash = makeStyledEdit(ctx, "API Hash", false);
-        apiHash.setText(ColgramAntiSpam.getApiHash(ctx, acct));
-        EditText phone = makeStyledEdit(ctx, "Телефон (+7...)", false);
-        phone.setText(ColgramAntiSpam.getPhone(ctx, acct));
-        EditText password = makeStyledEdit(ctx, "2FA пароль (если есть)", false);
-        password.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        password.setText(ColgramAntiSpam.getPassword(ctx, acct));
-        EditText codeEt = makeStyledEdit(ctx, "Код входа из Telegram/SMS (после запуска)", false);
-        box.addView(apiId);
-        box.addView(apiHash);
-        box.addView(phone);
-        box.addView(password);
-        box.addView(codeEt);
-        b.setView(ColgramMenuChrome.wrapDialogScroll(ctx, box));
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        LinearLayout box = new LinearLayout(act);
+        box.setOrientation(LinearLayout.VERTICAL);
+        EditTextBoldCursor apiId = ColgramUiKit.makeStyledEditText(act, resourceProvider, pal, "API ID", ColgramAntiSpam.getApiId(ctx, acct), InputType.TYPE_CLASS_TEXT, true);
+        EditTextBoldCursor apiHash = ColgramUiKit.makeStyledEditText(act, resourceProvider, pal, "API Hash", ColgramAntiSpam.getApiHash(ctx, acct), InputType.TYPE_CLASS_TEXT, true);
+        EditTextBoldCursor phone = ColgramUiKit.makeStyledEditText(act, resourceProvider, pal, "Телефон (+7...)", ColgramAntiSpam.getPhone(ctx, acct), InputType.TYPE_CLASS_TEXT, true);
+        EditTextBoldCursor password = ColgramUiKit.makeStyledEditText(act, resourceProvider, pal, "2FA пароль (если есть)", ColgramAntiSpam.getPassword(ctx, acct), InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD, true);
+        EditTextBoldCursor codeEt = ColgramUiKit.makeStyledEditText(act, resourceProvider, pal, "Код входа из Telegram/SMS (после запуска)", null, InputType.TYPE_CLASS_TEXT, true);
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, apiId, false), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, apiHash, true), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, phone, false), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, password, true), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        box.addView(ColgramUiKit.makeInputContainer(act, pal, codeEt, false), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         final Context appCtx = ctx.getApplicationContext();
-        b.setPositiveButton("Сохранить / Код", (d, w) -> {
-            String enteredCode = codeEt.getText().toString().trim();
-            String pass = password.getText().toString();
-            ColgramAntiSpam.saveCredentials(appCtx, acct,
-                    apiId.getText().toString().trim(),
-                    apiHash.getText().toString().trim(),
-                    phone.getText().toString().trim(),
-                    pass);
-            if (!enteredCode.isEmpty()) {
-                workerExecutor.execute(() -> {
-                    boolean ok = ColgramAntiSpam.submitCredentials(enteredCode, pass);
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (destroyed) return;
-                        Toast.makeText(appCtx,
-                                ok ? "Код отправлен userbot" : "Не удалось отправить код userbot", Toast.LENGTH_SHORT).show();
-                    });
-                });
-            }
-            refreshList(ctx);
-        });
         boolean running = ColgramAntiSpam.isEnabled(ctx, acct);
-        b.setNeutralButton(running ? "Остановить" : "Запустить", (d, w) -> {
-            ColgramAntiSpam.saveCredentials(appCtx, acct,
-                    apiId.getText().toString().trim(),
-                    apiHash.getText().toString().trim(),
-                    phone.getText().toString().trim(),
-                    password.getText().toString());
-            Toast.makeText(appCtx, running ? "Останавливаю userbot..." : "Запускаю userbot...", Toast.LENGTH_SHORT).show();
-            workerExecutor.execute(() -> {
-                String err = running ? ColgramAntiSpam.stop(appCtx, acct) : ColgramAntiSpam.start(appCtx, acct);
-                AndroidUtilities.runOnUIThread(() -> {
-                    Toast.makeText(appCtx, err != null ? err : (running ? "Userbot остановлен" : "Запуск запрошен"),
-                            Toast.LENGTH_SHORT).show();
-                    if (!destroyed && getParentActivity() != null) {
-                        refreshList(getParentActivity());
+        ColgramUiKit.showCustomViewSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_bots,
+                "Внешний Telethon Userbot (опционально)",
+                "Учётные данные и вход внешнего userbot-клиента",
+                box,
+                "Сохранить / Код",
+                s -> {
+                    String enteredCode = codeEt.getText().toString().trim();
+                    String pass = password.getText().toString();
+                    ColgramAntiSpam.saveCredentials(appCtx, acct,
+                            apiId.getText().toString().trim(),
+                            apiHash.getText().toString().trim(),
+                            phone.getText().toString().trim(),
+                            pass);
+                    if (!enteredCode.isEmpty()) {
+                        workerExecutor.execute(() -> {
+                            boolean ok = ColgramAntiSpam.submitCredentials(enteredCode, pass);
+                            AndroidUtilities.runOnUIThread(() -> {
+                                if (destroyed) return;
+                                ColgramUiKit.showNotice(this, ok ? R.drawable.msg_bots : R.drawable.msg_info,
+                                        ok ? "Код отправлен userbot" : "Не удалось отправить код userbot", !ok);
+                            });
+                        });
                     }
-                });
-            });
-        });
-        b.setNegativeButton("Отмена", null);
-        showDialog(b.create());
+                    refreshList(ctx);
+                    return true;
+                },
+                running ? "Остановить" : "Запустить",
+                s -> {
+                    ColgramAntiSpam.saveCredentials(appCtx, acct,
+                            apiId.getText().toString().trim(),
+                            apiHash.getText().toString().trim(),
+                            phone.getText().toString().trim(),
+                            password.getText().toString());
+                    ColgramUiKit.showNotice(this, R.drawable.msg_bots,
+                            running ? "Останавливаю userbot..." : "Запускаю userbot...", false);
+                    workerExecutor.execute(() -> {
+                        String err = running ? ColgramAntiSpam.stop(appCtx, acct) : ColgramAntiSpam.start(appCtx, acct);
+                        AndroidUtilities.runOnUIThread(() -> {
+                            ColgramUiKit.showNotice(this, err != null ? R.drawable.msg_info : R.drawable.msg_bots,
+                                    err != null ? err : (running ? "Userbot остановлен" : "Запуск запрошен"), err != null);
+                            if (!destroyed && getParentActivity() != null) {
+                                refreshList(getParentActivity());
+                            }
+                        });
+                    });
+                    return true;
+                },
+                "Отмена",
+                true,
+                !org.colgram.core.ColgramHookHandler.shouldBypassFlagSecure()
+        );
     }
 
     private List<String> getTelegramFolderNames() {

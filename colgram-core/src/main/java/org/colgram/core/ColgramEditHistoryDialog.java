@@ -90,7 +90,7 @@ public class ColgramEditHistoryDialog {
                 row.setPadding(dp12, dp12, dp12, dp12);
                 GradientDrawable bg = new GradientDrawable();
                 bg.setColor(cardColor);
-                bg.setCornerRadius(dp12);
+                bg.setCornerRadius(dp16);
                 row.setBackground(bg);
 
                 TextView meta = new TextView(context);
@@ -128,8 +128,10 @@ public class ColgramEditHistoryDialog {
         closeBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.5f);
         closeBtn.setTypeface(Typeface.DEFAULT_BOLD);
         closeBtn.setGravity(Gravity.CENTER);
+        int dp14 = Math.round(14f * density);
+        int dp24 = Math.round(24f * density);
         GradientDrawable btnBg = new GradientDrawable();
-        btnBg.setCornerRadius(dp20);
+        btnBg.setCornerRadius(dp14);
         btnBg.setColor(accentColor);
         closeBtn.setBackground(btnBg);
         closeBtn.setOnClickListener(v -> {
@@ -141,26 +143,17 @@ public class ColgramEditHistoryDialog {
         });
         root.addView(closeBtn, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp44));
 
-        try {
-            Class<?> alertBuilderClass = Class.forName("org.telegram.ui.ActionBar.AlertDialog$Builder");
-            Object builder = alertBuilderClass.getConstructor(Context.class).newInstance(context);
-            alertBuilderClass.getMethod("setView", View.class).invoke(builder, root);
-            Object shown = alertBuilderClass.getMethod("show").invoke(builder);
-            if (shown instanceof Dialog) {
-                dialogRef[0] = (Dialog) shown;
-            }
-            return;
-        } catch (Throwable ignored) {}
-
         Dialog d = new Dialog(context);
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);
         GradientDrawable surf = new GradientDrawable();
         surf.setColor(surfaceColor);
-        surf.setCornerRadius(dp20);
+        surf.setCornerRadius(dp24);
         root.setBackground(surf);
         d.setContentView(root);
         if (d.getWindow() != null) {
             d.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+            d.getWindow().setLayout((int) (context.getResources().getDisplayMetrics().widthPixels * 0.92f),
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
         }
         dialogRef[0] = d;
         d.show();

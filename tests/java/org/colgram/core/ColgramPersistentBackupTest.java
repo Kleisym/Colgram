@@ -1,6 +1,9 @@
 package org.colgram.core;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -20,7 +23,66 @@ public final class ColgramPersistentBackupTest {
         testPassphraseProtectionAndWrongPasswordRejected();
         testEnvelopeTamperRejected();
         testPathTraversalWhitelistRejected();
+        testAutoBackupDirtyFingerprintSkip();
         System.out.println("ColgramPersistentBackupTest PASSED");
+    }
+
+    private static void testAutoBackupDirtyFingerprintSkip() throws Exception {
+        File tmpRoot = Files.createTempDirectory("cg_backup_fp_test_").toFile();
+        try {
+            File prefsDir = new File(tmpRoot, "shared_prefs");
+            File filesDir = new File(tmpRoot, "files");
+            File dbFile = new File(tmpRoot, "databases/colgram_vault.db");
+            File walFile = new File(tmpRoot, "databases/colgram_vault.db-wal");
+            prefsDir.mkdirs();
+            filesDir.mkdirs();
+            dbFile.getParentFile().mkdirs();
+
+            File secPrefs = new File(prefsDir, "colgram_secure_config.xml");
+            try (FileOutputStream fos = new FileOutputStream(secPrefs)) {
+                fos.write("<map><boolean name=\"a\" value=\"true\"/></map>".getBytes(StandardCharsets.UTF_8));
+            }
+            File tgnet = new File(filesDir, "tgnet.dat");
+            try (FileOutputStream fos = new FileOutputStream(tgnet)) {
+                fos.write(new byte[]{1, 2, 3, 4});
+            }
+            try (FileOutputStream fos = new FileOutputStream(dbFile)) {
+                fos.write(new byte[]{5, 6, 7, 8});
+            }
+            File backupFile = new File(tmpRoot, "colgram_full_vault.cgb");
+
+            String fp1 = ColgramPersistentBackup.computeMetadataFingerprint(prefsDir, filesDir, dbFile);
+            assertTrue(fp1 != null && !fp1.isEmpty(), "fingerprint must be non-empty");
+            assertTrue(!ColgramPersistentBackup.shouldSkipAutoBackup(fp1, fp1, backupFile),
+                    "missing backup file must not skip auto-backup");
+
+            try (FileOutputStream fos = new FileOutputStream(backupFile)) {
+                fos.write(new byte[ColgramBackupCodec.HEADER_LEN + 16]);
+            }
+            assertTrue(ColgramPersistentBackup.shouldSkipAutoBackup(fp1, fp1, backupFile),
+                    "unchanged fingerprint with existing backup file must skip redundant GZIP+AES write");
+
+            // Mutate WAL journal -> fingerprint must change so auto-backup runs
+            try (FileOutputStream fos = new FileOutputStream(walFile)) {
+                fos.write(new byte[]{9, 10, 11, 12, 13});
+            }
+            String fp2 = ColgramPersistentBackup.computeMetadataFingerprint(prefsDir, filesDir, dbFile);
+            assertTrue(!fp1.equals(fp2), "WAL mutation must dirty fingerprint");
+            assertTrue(!ColgramPersistentBackup.shouldSkipAutoBackup(fp1, fp2, backupFile),
+                    "dirty fingerprint must trigger auto-backup");
+        } finally {
+            deleteRec(tmpRoot);
+        }
+    }
+
+    private static void deleteRec(File f) {
+        if (f == null || !f.exists()) return;
+        File[] ch = f.listFiles();
+        if (ch != null) {
+            for (File c : ch) deleteRec(c);
+        }
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
     }
 
     private static void testSnapshotAndEnvelopeRoundTrip() throws Exception {

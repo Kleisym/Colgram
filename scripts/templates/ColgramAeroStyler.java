@@ -641,6 +641,8 @@ public final class ColgramAeroStyler {
         }
 
         private int cachedAccent;
+        private int cachedWaveW;
+        private int cachedWaveH;
 
         @Override
         protected void onDraw(Canvas canvas) {
@@ -674,28 +676,32 @@ public final class ColgramAeroStyler {
                         new float[]{0f, 0.28f, 0.52f, 0.76f, 1f},
                         Shader.TileMode.CLAMP
                 );
+                float shift = (phase * 1.85f - 0.42f) * w;
+                shaderMatrix.setTranslate(shift, 0f);
+                cachedGradient.setLocalMatrix(shaderMatrix);
                 paint.setShader(cachedGradient);
                 wavePaint.setShader(cachedGradient);
             }
-            float shift = (phase * 1.85f - 0.42f) * w;
-            shaderMatrix.setTranslate(shift, 0f);
-            cachedGradient.setLocalMatrix(shaderMatrix);
 
             // Soft bottom glow bed
             canvas.drawRect(0, h - dp(1.2f), w, h, paint);
 
-            // Flowing liquid sine wave ribbon across the header seam
-            float t = phase * (float) (Math.PI * 2.0);
-            float midY = h * 0.56f;
-            float amp = Math.max(1f, h * 0.34f);
-            wavePath.rewind();
-            int steps = 20;
-            for (int i = 0; i <= steps; i++) {
-                float f = (float) i / steps;
-                float x = f * w;
-                float y = midY + (float) Math.sin(f * Math.PI * 3.0 - t) * amp;
-                if (i == 0) wavePath.moveTo(x, y);
-                else wavePath.lineTo(x, y);
+            // Cached liquid sine wave ribbon across the header seam
+            if (cachedWaveW != w || cachedWaveH != h) {
+                cachedWaveW = w;
+                cachedWaveH = h;
+                float t = phase * (float) (Math.PI * 2.0);
+                float midY = h * 0.56f;
+                float amp = Math.max(1f, h * 0.34f);
+                wavePath.rewind();
+                int steps = 20;
+                for (int i = 0; i <= steps; i++) {
+                    float f = (float) i / steps;
+                    float x = f * w;
+                    float y = midY + (float) Math.sin(f * Math.PI * 3.0 - t) * amp;
+                    if (i == 0) wavePath.moveTo(x, y);
+                    else wavePath.lineTo(x, y);
+                }
             }
             canvas.drawPath(wavePath, wavePaint);
         }

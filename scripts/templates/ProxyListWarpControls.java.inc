@@ -116,19 +116,26 @@
 
     private void colgramShowSourceDiagnostics() {
         if (getParentActivity() == null) return;
-        AlertDialog.Builder details = new AlertDialog.Builder(getParentActivity(), getResourceProvider());
-        details.setTitle(ColgramSubscriptionControls.label("Источники прокси", "Proxy Sources"));
-        details.setMessage(org.colgram.core.ColgramProxyManager.getSourceDiagnostics());
-        details.setNeutralButton(ColgramSubscriptionControls.label("Найти ещё прокси", "Find more proxies"), (d, w) -> {
-            org.colgram.core.ColgramProxyManager.checkPoolNow();
-            if (getParentActivity() != null) {
-                android.widget.Toast.makeText(getParentActivity(),
-                        ColgramSubscriptionControls.label("Ищем и проверяем рабочие прокси...", "Scanning for working proxies..."),
-                        android.widget.Toast.LENGTH_SHORT).show();
-            }
-        });
-        details.setPositiveButton(ColgramSubscriptionControls.label("Закрыть", "Close"), null);
-        showDialog(details.create());
+        ColgramUiKit.showInfoSheet(
+                getParentActivity(),
+                getResourceProvider(),
+                org.telegram.messenger.R.drawable.msg_online,
+                ColgramSubscriptionControls.label("Источники прокси", "Proxy Sources"),
+                org.colgram.core.ColgramProxyManager.getSourceDiagnostics(),
+                ColgramSubscriptionControls.label("Найти ещё прокси", "Find more proxies"),
+                () -> {
+                    org.colgram.core.ColgramProxyManager.checkPoolNow();
+                    ColgramUiKit.showNotice(
+                            this,
+                            org.telegram.messenger.R.drawable.msg_search,
+                            ColgramSubscriptionControls.label("Ищем и проверяем рабочие прокси...", "Scanning for working proxies..."),
+                            false
+                    );
+                },
+                ColgramSubscriptionControls.label("Закрыть", "Close"),
+                null,
+                true
+        );
     }
 
     private boolean warpRequested(long token) {
@@ -142,7 +149,7 @@
         if (source == null || getParentActivity() == null) return;
         final android.content.Context context = source.getApplicationContext();
         if (!org.colgram.core.ColgramWarpTunnel.isBackendAvailable()) {
-            android.widget.Toast.makeText(source, "WARP-бэкенд отсутствует в этой сборке", android.widget.Toast.LENGTH_LONG).show();
+            ColgramUiKit.showNotice(this, org.telegram.messenger.R.drawable.msg_info, "WARP-бэкенд отсутствует в этой сборке", true);
             return;
         }
         colgramSubscription.stopForAlternativeRoute(context);
@@ -242,8 +249,9 @@
             if (error != null || !org.colgram.core.ColgramWarpTunnel.isUp()) {
                 org.colgram.core.ColgramConfig.setWarpEnabled(false);
                 warpUiFailure = error == null ? "туннель не запущен" : error;
-                if (getParentActivity() != null && context != null)
-                    android.widget.Toast.makeText(context, "WARP: " + warpUiFailure, android.widget.Toast.LENGTH_LONG).show();
+                if (getParentActivity() != null && context != null) {
+                    ColgramUiKit.showNotice(this, org.telegram.messenger.R.drawable.msg_info, "WARP: " + warpUiFailure, true);
+                }
             }
             refreshWarpState();
         });

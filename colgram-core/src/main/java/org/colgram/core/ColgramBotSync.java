@@ -1614,6 +1614,7 @@ public class ColgramBotSync {
                         }
 
                         int currentOffset = lastUpdateIds.getOrDefault(account, 0);
+                        int pollTimeoutSec = ColgramUiBridge.isAppInForeground() ? 35 : 50;
                         String urlStr;
                         if (currentOffset == 0) {
                             // First run.
@@ -1630,11 +1631,11 @@ public class ColgramBotSync {
                             // acknowledging anything we have not actually processed.
                             urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&timeout=0&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22channel_post%22%2C%22edited_channel_post%22%2C%22message_reaction%22%2C%22callback_query%22%5D";
                         } else {
-                            // Long-poll: wait up to 20 seconds on server
-                            urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=" + currentOffset + "&timeout=20";
+                            // Adaptive long-poll: 35s interactive, 50s screen-off to cut radio wakeups.
+                            urlStr = "https://api.telegram.org/bot" + token + "/getUpdates?limit=100&offset=" + currentOffset + "&timeout=" + pollTimeoutSec;
                         }
 
-                        HttpURLConnection conn = openConnection(urlStr, currentOffset == 0 ? 10000 : 28000);
+                        HttpURLConnection conn = openConnection(urlStr, currentOffset == 0 ? 10000 : ((pollTimeoutSec + 8) * 1000));
                         conn.setRequestMethod("GET");
 
                         int responseCode = conn.getResponseCode();
@@ -1693,7 +1694,7 @@ public class ColgramBotSync {
                             }
                         }
 
-                        Thread.sleep(300);
+                        Thread.sleep(ColgramUiBridge.isAppInForeground() ? 300L : 1500L);
 
                     } catch (InterruptedException e) {
                         break;

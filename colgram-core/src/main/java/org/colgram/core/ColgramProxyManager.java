@@ -990,10 +990,15 @@ public class ColgramProxyManager {
                 localRouteWatchTask.cancel(false);
             }
             localWatchScheduledForForeground = foreground;
-            long periodSec = foreground ? 30L : 300L;
+            long periodSec = foreground ? 30L : 900L;
             localRouteWatchTask = scheduler.scheduleWithFixedDelay(() -> {
                 // Event-driven 127.0.0.1:9876 bypass stays alive 24/7 (even in background);
-                // passively reap half-open carrier sockets (pending reply >=15s) at ~0% CPU.
+                // in deep background skip unnecessary work when listener is healthy & device idle.
+                if (!ColgramUiBridge.isAppInForeground()
+                        && ColgramDpiBypass.isBound()
+                        && ColgramPowerGuard.shouldThrottle(appContext)) {
+                    return;
+                }
                 try {
                     ColgramDpiBypass.reapStaleSessions(15_000L, 0L);
                 } catch (Throwable ignored) {}
@@ -4819,6 +4824,12 @@ public static void reportProxyFailure() {
     }
 
     private static boolean catalogChecksAllowed() {
+        if (!ColgramUiBridge.isAppInForeground() && !manualCatalogScanRequested) {
+            if (scheduledCatalogCheck == null) return false;
+            if (ColgramDpiBypass.isBound() && !ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+                return false;
+            }
+        }
         if (scheduledCatalogCheck != null || manualCatalogScanRequested) return true;
         if (!ColgramUiBridge.isAppInForeground()) return false;
         if (isInAutoCatalogCooldown()) return false;
@@ -4877,6 +4888,7 @@ public static void reportProxyFailure() {
     /** Pauses heavy background feed scraping while keeping 127.0.0.1:9876 bypass & passive watchdog alive 24/7. */
     public static void onAppBackgrounded() {
         lastBackgroundedAtMs = safeClockMs();
+        ColgramTelegramWsBridge.onBackgroundPause();
         stopBackgroundFeedScraping();
         if (mainHandler == null) return;
         mainHandler.post(() -> {
@@ -4899,6 +4911,10 @@ public static void reportProxyFailure() {
     public static void onScreenTurnedOn() {
         if (mainHandler == null || appContext == null) return;
         executor.execute(() -> {
+            if (!ColgramUiBridge.isAppInForeground() && isTelegramConnected()) {
+                ColgramDpiBypass.reapStaleSessions(10_000L, 0L);
+                return;
+            }
             ColgramDpiBypass.resetL3WhitelistCache();
             ColgramDpiBypass.clearTransientCooldowns();
             ColgramTelegramWsBridge.clearCooldowns();
@@ -4913,7 +4929,7 @@ public static void reportProxyFailure() {
         });
     }
 
-    /** Resumes foreground discovery and kicks an immediate <1s reconnect when returning to foreground. */
+    /** Resumes foreground discovery and kicks an immediate <1s reconnect only when disconnected/reaped. */
     public static void onAppForegrounded() {
         if (mainHandler == null || appContext == null) return;
         final long bgAt = lastBackgroundedAtMs;
@@ -4926,6 +4942,7 @@ public static void reportProxyFailure() {
             localRouteUnavailableUntil = 0L;
             mainHandler.removeCallbacks(postWakeVerifyRunner);
             executor.execute(() -> {
+                ColgramTelegramWsBridge.onForegroundResume();
                 ColgramDpiBypass.resetL3WhitelistCache();
                 ColgramDpiBypass.clearTransientCooldowns();
                 ColgramTelegramWsBridge.clearCooldowns();
@@ -4936,7 +4953,7 @@ public static void reportProxyFailure() {
                     ColgramDpiBypass.startImmediately();
                     mainHandler.post(() -> ensureLocalBaseRoute(appContext));
                 }
-                if (!isTelegramConnected() || reaped > 0 || awayMs >= 20_000L) {
+                if (!isTelegramConnected() || reaped > 0) {
                     tgnetForceReconnect("app foregrounded awayMs=" + awayMs + " reaped=" + reaped);
                 }
             });
@@ -5056,7 +5073,10 @@ public static void reportProxyFailure() {
         if (context == null || !ColgramConfig.isBuiltinProxyEnabled() || !catalogChecksAllowed()
                 || ColgramPowerGuard.shouldThrottle(context) || !hasCatalogNetwork(context)) {
             finishScheduledCatalogCheck(true);
-            scheduleBackgroundProxyCheck(Math.max(BACKGROUND_PROXY_IDLE_MS, 5L * 60_000L));
+            long idleDelay = ColgramUiBridge.isAppInForeground()
+                    ? Math.max(BACKGROUND_PROXY_IDLE_MS, 5L * 60_000L)
+                    : 30L * 60_000L;
+            scheduleBackgroundProxyCheck(idleDelay);
             return;
         }
         if (isProxySelectionPending()) {

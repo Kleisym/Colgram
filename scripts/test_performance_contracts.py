@@ -204,10 +204,10 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         self.assertIn("TLRPC.TL_inputPhotoFileLocation", update_params)
         self.assertIn("!allowDisordererFileSave", update_params)
         self.assertIn("totalBytesCount < 256 * 1024", update_params)
-        self.assertIn("downloadChunkSize = isSmallOrThumbOrAvatar ? 1024 * 32 : 1024 * 128;", update_params)
+        self.assertIn("downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 32 ? 1024 * 64 : 1024 * 32) : 1024 * 128;", update_params)
         self.assertIn("downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;", update_params)
         self.assertIn("maxDownloadRequests = 4;", update_params)
-        self.assertIn("maxDownloadRequestsBig = 6;", update_params)
+        self.assertIn("maxDownloadRequestsBig = 4;", update_params)
         self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);", update_params)
         self.assertNotIn("maxDownloadRequests = boost ? 6 : 8;", update_params)
         # Prebuilt libtmessages.49.so uses DOWNLOAD_CONNECTIONS_COUNT == 2
@@ -233,13 +233,14 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         self.assertIn("return FileLoader.PRIORITY_HIGH;", get_prio)
 
         fpq = read_text(MSG / "FileLoaderPriorityQueue.java")
-        self.assertIn("type == TYPE_LARGE ? 3 : 6", fpq)
+        self.assertIn("type == TYPE_LARGE ? 3 : 12", fpq)
         self.assertIn("isDownloadSpeedBoostEnabled() ? 1 : 20", fpq)
 
     def test_image_loader_parallel_decode_and_http_concurrency(self):
         il = read_text(MSG / "ImageLoader.java")
-        self.assertIn('new DispatchQueuePriority("cacheOutQueue", 2)', il)
-        self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 1)', il)
+        self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il)
+        self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il)
+        self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 1)', il)
         self.assertIn("colgramLottiePrecacheLock", il)
         self.assertIn("cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority)", il)
         self.assertIn("cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority)", il)
@@ -489,6 +490,20 @@ class TurboMessagingAndPushContractsTest(unittest.TestCase):
             mod.inject_network_switch_patches(str(tmp_tg))
             mod.inject_turbo_messaging_patches(str(tmp_tg))
             self.assertEqual(mod.PATCH_MISSES, [])
+
+    def test_foreground_service_stops_heartbeat_in_background_without_bots(self):
+        src = read_text(ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramForegroundService.java")
+        on_start = extract_method(src, "public int onStartCommand(Intent intent, int flags, int startId)")
+        self.assertIn("if (ColgramUiBridge.isAppInForeground() || hasAnyBotTokens())", on_start)
+        self.assertIn("stopHeartbeat();", on_start)
+
+        start_hb = extract_method(src, "private void startHeartbeat()")
+        self.assertIn("if (!fg && !hasAnyBotTokens())", start_hb)
+        self.assertIn("stopHeartbeat();", start_hb)
+        idx_stop = start_hb.index("stopHeartbeat();")
+        idx_post = start_hb.index("handler.postDelayed(this, delay);")
+        self.assertLess(idx_stop, idx_post)
+        self.assertIn("return;", start_hb[idx_stop:idx_post])
 
 
 if __name__ == "__main__":

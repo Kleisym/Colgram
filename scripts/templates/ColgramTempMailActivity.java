@@ -30,7 +30,6 @@ import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenu;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -528,15 +527,23 @@ public class ColgramTempMailActivity extends BaseFragment {
         String title = availableDomains.isEmpty()
                 ? "Выбор сервиса и домена"
                 : "Домены (" + Math.max(2, availableDomains.size()) + " доступно)";
-        showDialog(new AlertDialog.Builder(ctx, resourceProvider)
-                .setTitle(title)
-                .setItems(labels.toArray(new String[0]), (d, which) -> {
+        java.util.List<ColgramUiKit.ChoiceItem> choiceItems = new java.util.ArrayList<>(labels.size());
+        for (int i = 0; i < labels.size(); i++) {
+            choiceItems.add(ColgramUiKit.ChoiceItem.of(labels.get(i), null, R.drawable.msg_mention));
+        }
+        ColgramUiKit.showChoiceSheet(
+                ctx,
+                resourceProvider,
+                R.drawable.msg_mention,
+                title,
+                "Нажмите для смены домена или провайдера",
+                choiceItems,
+                which -> {
                     if (which >= 0 && which < actions.size()) {
                         actions.get(which).run();
                     }
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                }
+        );
     }
 
     /** Creates a native @gmail.com or @googlemail.com mailbox directly inside Colgram (zero browser/WebView). */
@@ -618,69 +625,96 @@ public class ColgramTempMailActivity extends BaseFragment {
         final Activity ctx = getParentActivity();
         if (isDestroyed || isFinishing() || ctx == null || ctx.isFinishing() || ctx.isDestroyed() || res == null) return;
         if (res.workingProviders.isEmpty()) {
-            showDialog(new AlertDialog.Builder(ctx, resourceProvider)
-                    .setTitle("Автопоиск источников")
-                    .setMessage("Проверено кандидатов: " + res.probedCandidates
+            ColgramUiKit.showInfoSheet(
+                    ctx,
+                    resourceProvider,
+                    R.drawable.msg_search,
+                    "Автопоиск источников",
+                    "Проверено кандидатов: " + res.probedCandidates
                             + "\nРабочие бесплатные API не ответили с текущей сети.\n\n"
-                            + res.reportSummary)
-                    .setPositiveButton("Добавить свой URL", (d, w) -> showAddCustomProviderDialog())
-                    .setNegativeButton("Закрыть", null)
-                    .create());
+                            + res.reportSummary,
+                    "Добавить свой URL",
+                    this::showAddCustomProviderDialog,
+                    "Закрыть",
+                    null,
+                    true
+            );
             return;
         }
 
-        final String[] items = new String[res.workingProviders.size()];
+        final java.util.List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(res.workingProviders.size() + 1);
         for (int i = 0; i < res.workingProviders.size(); i++) {
             ProviderSpec p = res.workingProviders.get(i);
-            items[i] = p.name + " [" + p.protocol + "] — " + p.latencyMs + " мс";
+            items.add(new ColgramUiKit.ChoiceItem(
+                    p.name,
+                    "Протокол " + p.protocol + " · " + p.latencyMs + " мс",
+                    R.drawable.msg_online,
+                    0,
+                    false,
+                    false,
+                    p.latencyMs + "мс"
+            ));
         }
-        showDialog(new AlertDialog.Builder(ctx, resourceProvider)
-                .setTitle("Найдено рабочих API: " + res.workingProviders.size())
-                .setItems(items, (d, which) -> {
-                    pendingProvider = res.workingProviders.get(which);
-                    pendingDomain = null;
-                    generateNewMailbox();
-                })
-                .setNeutralButton("Подробный отчёт", (d, w) -> {
-                    Activity curAct = getParentActivity();
-                    if (isDestroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
-                    showDialog(new AlertDialog.Builder(curAct, resourceProvider)
-                            .setTitle("Отчёт проверки (" + res.probedCandidates + " проверено)")
-                            .setMessage(res.reportSummary)
-                            .setPositiveButton("OK", null)
-                            .create());
-                })
-                .setNegativeButton("Закрыть", null)
-                .create());
+        items.add(ColgramUiKit.ChoiceItem.of("Подробный отчёт", "Проверено источников: " + res.probedCandidates, R.drawable.msg_info));
+        ColgramUiKit.showChoiceSheet(
+                ctx,
+                resourceProvider,
+                R.drawable.msg_search,
+                "Найдено рабочих API: " + res.workingProviders.size(),
+                "Выберите рабочий источник или посмотрите отчёт",
+                items,
+                which -> {
+                    if (which == res.workingProviders.size()) {
+                        Activity curAct = getParentActivity();
+                        if (isDestroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
+                        ColgramUiKit.showInfoSheet(
+                                curAct,
+                                resourceProvider,
+                                R.drawable.msg_info,
+                                "Отчёт проверки (" + res.probedCandidates + " проверено)",
+                                res.reportSummary,
+                                "OK",
+                                null,
+                                null,
+                                null,
+                                true
+                        );
+                    } else if (which >= 0 && which < res.workingProviders.size()) {
+                        pendingProvider = res.workingProviders.get(which);
+                        pendingDomain = null;
+                        generateNewMailbox();
+                    }
+                }
+        );
     }
 
     private void showAddCustomProviderDialog() {
-        final Context ctx = getParentActivity();
+        final Activity ctx = getParentActivity();
         if (ctx == null) return;
-
-        FrameLayout container = new FrameLayout(ctx);
-        int pad = AndroidUtilities.dp(20);
-        container.setPadding(pad, AndroidUtilities.dp(8), pad, 0);
-
-        EditText input = ColgramMenuChrome.makeDialogEditText(ctx, resourceProvider,
-                "https://api.mail.gw или URL списка источников", false);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        container.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        showDialog(new AlertDialog.Builder(ctx, resourceProvider)
-                .setTitle("Добавить свой API / URL")
-                .setMessage("Укажите базовый URL Hydra/TempMail API или страницу со списком сервисов. Colgram проверит протокол автоматически.")
-                .setView(container)
-                .setPositiveButton("Проверить и добавить", (d, w) -> {
-                    String raw = input.getText().toString().trim();
+        ColgramUiKit.showInputSheet(
+                ctx,
+                resourceProvider,
+                R.drawable.msg_link2,
+                "Добавить свой API / URL",
+                "Укажите базовый URL Hydra/TempMail API или страницу со списком сервисов. Colgram проверит протокол автоматически.",
+                "https://api.mail.gw или URL списка источников",
+                null,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI,
+                false,
+                false,
+                true,
+                "Проверить и добавить",
+                inputRaw -> {
+                    String raw = inputRaw == null ? "" : inputRaw.trim();
                     if (raw.isEmpty()) return;
                     if (!raw.startsWith("https://") && !raw.startsWith("http://")) {
                         raw = "https://" + raw;
                     }
                     probeAndSaveCustomUrl(raw);
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                },
+                null,
+                null
+        );
     }
 
     private void probeAndSaveCustomUrl(String rawUrl) {
@@ -1826,25 +1860,45 @@ public class ColgramTempMailActivity extends BaseFragment {
     private void showMessageDialog(String from, String subject, String body, String otp) {
         Activity ctx = getParentActivity();
         if (isDestroyed || isFinishing() || ctx == null || ctx.isFinishing() || ctx.isDestroyed()) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(ctx, resourceProvider);
-        builder.setTitle(subject.isEmpty() ? "Письмо" : subject);
-
         String message = "От: " + from + "\n\n" + body;
         if (!otp.isEmpty()) {
-            message = "Найден код подтверждения: " + otp + "\n\n" + message;
             final String finalOtp = otp;
-            builder.setNeutralButton("Скопировать код (" + otp + ")", (d, w) -> {
-                copyToClipboard(finalOtp);
-                showToast("Код " + finalOtp + " скопирован!");
-            });
+            message = "Найден код подтверждения: " + otp + "\n\n" + message;
+            ColgramUiKit.showInfoSheet(
+                    ctx,
+                    resourceProvider,
+                    R.drawable.msg_secret,
+                    subject.isEmpty() ? "Письмо" : subject,
+                    message,
+                    "Скопировать код (" + otp + ")",
+                    () -> {
+                        copyToClipboard(finalOtp);
+                        ColgramUiKit.showNotice(this, R.drawable.msg_copy, "Код " + finalOtp + " скопирован!", false);
+                    },
+                    "Скопировать текст",
+                    () -> {
+                        copyToClipboard(body);
+                        ColgramUiKit.showNotice(this, R.drawable.msg_copy, "Текст письма скопирован", false);
+                    },
+                    true
+            );
+        } else {
+            ColgramUiKit.showInfoSheet(
+                    ctx,
+                    resourceProvider,
+                    R.drawable.msg_info,
+                    subject.isEmpty() ? "Письмо" : subject,
+                    message,
+                    "Скопировать текст",
+                    () -> {
+                        copyToClipboard(body);
+                        ColgramUiKit.showNotice(this, R.drawable.msg_copy, "Текст письма скопирован", false);
+                    },
+                    "Закрыть",
+                    null,
+                    true
+            );
         }
-        builder.setMessage(message);
-        builder.setPositiveButton("Скопировать текст", (d, w) -> {
-            copyToClipboard(body);
-            showToast("Текст письма скопирован");
-        });
-        builder.setNegativeButton("Закрыть", null);
-        showDialog(builder.create());
     }
 
     private void copyToClipboard(String text) {

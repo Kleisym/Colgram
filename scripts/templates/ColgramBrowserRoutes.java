@@ -23,7 +23,6 @@ import org.colgram.core.ColgramProxyChain.Relay;
 import org.colgram.core.ColgramProxyManager;
 import org.colgram.core.ColgramWarpTunnel;
 import org.telegram.messenger.SharedConfig;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.utils.proxy.ProxySettings;
 
 import java.io.IOException;
@@ -278,15 +277,27 @@ public final class ColgramBrowserRoutes {
         if (activity == null) return;
         Mode current = mode();
         Mode[] modes = Mode.values();
-        CharSequence[] items = new CharSequence[modes.length];
+        java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(modes.length);
         for (int i = 0; i < modes.length; i++) {
             String suffix = statusSuffix(modes[i]);
-            String mark = modes[i] == current ? "● " : "";
-            items[i] = suffix.isEmpty() ? mark + modes[i].label : mark + modes[i].label + " (" + suffix + ")";
+            items.add(new ColgramUiKit.ChoiceItem(
+                    modes[i].label,
+                    suffix.isEmpty() ? null : suffix,
+                    org.telegram.messenger.R.drawable.msg_link2,
+                    0,
+                    modes[i] == current,
+                    false,
+                    null
+            ));
         }
-        new AlertDialog.Builder(activity)
-                .setTitle("Использовать для браузера")
-                .setItems(items, (dialog, which) -> {
+        ColgramUiKit.showChoiceSheet(
+                activity,
+                null,
+                org.telegram.messenger.R.drawable.msg_link2,
+                "Использовать для браузера",
+                "Транспорт для встроенного WebView",
+                items,
+                which -> {
                     Mode chosen = modes[which];
                     if (chosen == Mode.SOCKS5) {
                         pickSocksEndpoint(activity, onChanged);
@@ -295,12 +306,11 @@ public final class ColgramBrowserRoutes {
                     ColgramConfig.setBrowserRouteMode(chosen.name());
                     Decision decision = evaluate(chosen == Mode.LOCAL_DPI);
                     if (decision.hint != null) {
-                        Toast.makeText(activity, decision.hint, Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(activity, org.telegram.messenger.R.drawable.msg_link2, decision.hint, false);
                     }
                     if (onChanged != null) onChanged.run();
-                })
-                .setNegativeButton("Отмена", null)
-                .show();
+                }
+        );
     }
 
     private static void pickSocksEndpoint(Activity activity, Runnable onChanged) {
@@ -315,21 +325,33 @@ public final class ColgramBrowserRoutes {
             if (onChanged != null) onChanged.run();
             return;
         }
-        CharSequence[] labels = new CharSequence[options.size()];
         String saved = ColgramConfig.getBrowserRouteSocks();
+        java.util.List<ColgramUiKit.ChoiceItem> choiceItems = new java.util.ArrayList<>(options.size());
         for (int i = 0; i < options.size(); i++) {
             SocksEndpoint ep = options.get(i);
-            labels[i] = (ep.identity().equals(saved) ? "● " : "") + ep.identity();
+            choiceItems.add(new ColgramUiKit.ChoiceItem(
+                    ep.identity(),
+                    "SOCKS5 узел",
+                    org.telegram.messenger.R.drawable.msg_online,
+                    0,
+                    ep.identity().equals(saved),
+                    false,
+                    null
+            ));
         }
-        new AlertDialog.Builder(activity)
-                .setTitle("Выберите SOCKS5 для браузера")
-                .setItems(labels, (dialog, which) -> {
+        ColgramUiKit.showChoiceSheet(
+                activity,
+                null,
+                org.telegram.messenger.R.drawable.msg_link2,
+                "Выберите SOCKS5 для браузера",
+                null,
+                choiceItems,
+                which -> {
                     ColgramConfig.setBrowserRouteSocks(options.get(which).identity());
                     ColgramConfig.setBrowserRouteMode(Mode.SOCKS5.name());
                     if (onChanged != null) onChanged.run();
-                })
-                .setNegativeButton("Отмена", null)
-                .show();
+                }
+        );
     }
 
     private static String statusSuffix(Mode mode) {

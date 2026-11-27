@@ -25,7 +25,6 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.LayoutHelper;
@@ -210,14 +209,14 @@ public class ColgramQuickBarView extends FrameLayout {
             inkCol = pal.dark ? 0xFFF8FAFC : darken(def.accentColor);
             iconTint = pal.dark ? lighten(def.accentColor) : def.accentColor;
         } else {
-            bgCol = pal.dark ? 0xCC161922 : 0xEBFFFFFF;
-            strokeCol = pal.dark ? 0x24FFFFFF : 0x1E0F172A;
+            bgCol = pal.cardSurface;
+            strokeCol = pal.borderSubtle;
             inkCol = pal.textPrimary;
             iconTint = pal.dark ? lighten(def.accentColor) : def.accentColor;
         }
 
         GradientDrawable gd = new GradientDrawable();
-        gd.setCornerRadius(dp(16));
+        gd.setCornerRadius(dp(999));
         gd.setColor(bgCol);
         gd.setStroke(Math.max(1, dp(0.9f)), strokeCol);
         pill.setBackground(gd);

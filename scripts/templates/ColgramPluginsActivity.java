@@ -36,7 +36,6 @@ import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenuItem;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -367,30 +366,38 @@ public class ColgramPluginsActivity extends BaseFragment {
 
     /** One-line editor for the keyword list; enabling without words opens it automatically. */
     private void showKeywordsDialog() {
-        if (getParentActivity() == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
-        builder.setTitle("Ключевые слова");
-        EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
-                getParentActivity(), resourceProvider, "через запятую: работа, счёт, дедлайн", false);
-        input.setText(org.colgram.core.ColgramConfig.getKeywordAlertsList());
-        input.setSelection(input.getText().length());
-        LinearLayout wrap = new LinearLayout(getParentActivity());
-        wrap.setOrientation(LinearLayout.VERTICAL);
-        wrap.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12), AndroidUtilities.dp(20), AndroidUtilities.dp(4));
-        wrap.addView(input, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-        builder.setView(wrap);
-        builder.setPositiveButton("Сохранить", (d, w) -> {
-            org.colgram.core.ColgramConfig.setKeywordAlertsList(input.getText().toString());
-            listAdapter.notifyDataSetChanged();
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), (d, w) -> {
-            // Leaving the list empty leaves the toggle meaningless; switch it back off.
-            if (org.colgram.core.ColgramConfig.getKeywordAlertsList().trim().isEmpty()) {
-                org.colgram.core.ColgramConfig.setKeywordAlertsEnabled(false);
-            }
-            listAdapter.notifyDataSetChanged();
-        });
-        showDialog(builder.create());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        final boolean[] saved = new boolean[]{false};
+        org.telegram.ui.ActionBar.BottomSheet sheet = ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_edit,
+                "Ключевые слова",
+                "Список слов для локальных уведомлений о совпадениях",
+                "через запятую: работа, счёт, дедлайн",
+                org.colgram.core.ColgramConfig.getKeywordAlertsList(),
+                InputType.TYPE_CLASS_TEXT,
+                false,
+                false,
+                true,
+                "Сохранить",
+                raw -> {
+                    saved[0] = true;
+                    org.colgram.core.ColgramConfig.setKeywordAlertsList(raw == null ? "" : raw);
+                    listAdapter.notifyDataSetChanged();
+                },
+                null,
+                null
+        );
+        if (sheet != null) {
+            sheet.setOnDismissListener(d -> {
+                if (!saved[0] && org.colgram.core.ColgramConfig.getKeywordAlertsList().trim().isEmpty()) {
+                    org.colgram.core.ColgramConfig.setKeywordAlertsEnabled(false);
+                    listAdapter.notifyDataSetChanged();
+                }
+            });
+        }
     }
 
     // ------------------------------------------------------------ catalog
@@ -433,102 +440,113 @@ public class ColgramPluginsActivity extends BaseFragment {
     }
 
     private void installCatalogEntry(ColgramPluginManager.CatalogEntry e) {
-        if (getParentActivity() == null) return;
+        Activity act = getParentActivity();
+        if (act == null) return;
         final String fileName = ColgramPluginManager.fileNameFor(e);
         boolean already = ColgramPluginManager.isPluginInstalled(fileName);
 
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
-        builder.setTitle(e.name == null ? "Плагин" : e.name);
         StringBuilder msg = new StringBuilder();
         if (e.description != null && !e.description.isEmpty()) msg.append(e.description).append("\n\n");
         if (e.author != null && !e.author.isEmpty()) msg.append("Автор: ").append(e.author).append("\n");
         if (e.version != null && !e.version.isEmpty()) msg.append("Версия: ").append(e.version).append("\n");
         msg.append("Файл: ").append(fileName).append("\n");
         if (already) msg.append("\nУже установлен — будет перезаписан.");
-        builder.setMessage(msg.toString().trim());
 
-        builder.setPositiveButton(already ? "Переустановить" : "Установить", (d, w) -> {
-            executor.execute(() -> {
-                boolean ok = false;
-                String err = null;
-                try {
-                    if (e.downloadUrl != null && !e.downloadUrl.trim().isEmpty()) {
-                        ok = ColgramPluginManager.installPluginFromUrl(e.downloadUrl);
-                        if (!ok) err = "не удалось скачать " + e.downloadUrl;
-                    } else {
-                        // Bundled entries carry no URL: they are installed from the copy
-                        // already inside the APK, which is why the fallback catalog always
-                        // has a working install path.
-                        ok = ColgramPluginManager.installBundledPlugin(fileName);
-                        if (!ok) err = "встроенный плагин " + fileName + " не найден";
+        ColgramUiKit.showConfirmSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_customize,
+                e.name == null ? "Плагин" : e.name,
+                msg.toString().trim(),
+                already ? "Переустановить" : "Установить",
+                false,
+                () -> executor.execute(() -> {
+                    boolean ok = false;
+                    String err = null;
+                    try {
+                        if (e.downloadUrl != null && !e.downloadUrl.trim().isEmpty()) {
+                            ok = ColgramPluginManager.installPluginFromUrl(e.downloadUrl);
+                            if (!ok) err = "не удалось скачать " + e.downloadUrl;
+                        } else {
+                            ok = ColgramPluginManager.installBundledPlugin(fileName);
+                            if (!ok) err = "встроенный плагин " + fileName + " не найден";
+                        }
+                    } catch (Throwable t) {
+                        err = t.getMessage() == null ? t.toString() : t.getMessage();
                     }
-                } catch (Throwable t) {
-                    err = t.getMessage() == null ? t.toString() : t.getMessage();
-                }
-                final boolean success = ok;
-                final String failure = err;
-                mainHandler.post(() -> {
-                    if (destroyed) return;
-                    rebuildRows();
-                    if (getParentActivity() == null) return;
-                    Toast.makeText(getParentActivity(),
-                            success ? "Установлено: " + e.name : "Ошибка: " + failure,
-                            success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
-                });
-            });
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+                    final boolean success = ok;
+                    final String failure = err;
+                    mainHandler.post(() -> {
+                        if (destroyed) return;
+                        rebuildRows();
+                        if (getParentActivity() == null) return;
+                        ColgramUiKit.showNotice(
+                                this,
+                                success ? R.drawable.msg_customize : R.drawable.msg_info,
+                                success ? "Установлено: " + e.name : "Ошибка: " + failure,
+                                !success
+                        );
+                    });
+                }),
+                LocaleController.getString(R.string.Cancel),
+                null
+        );
     }
 
     // ------------------------------------------------------------ install paths
 
     /** Install from a raw .py URL typed by the user. */
     private void showInstallFromUrlDialog() {
-        if (getParentActivity() == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
-        builder.setTitle("Установить по ссылке");
-
-        LinearLayout layout = new LinearLayout(getParentActivity());
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12), AndroidUtilities.dp(20), AndroidUtilities.dp(4));
-
-        final EditTextBoldCursor urlInput = ColgramMenuChrome.makeDialogEditText(
-                getParentActivity(), resourceProvider, "https://example.com/my_plugin.py", false);
-        urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        layout.addView(urlInput, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-        builder.setView(layout);
-
-        builder.setPositiveButton("Установить", (d, w) -> {
-            String url = urlInput.getText().toString().trim();
-            if (url.isEmpty()) return;
-            if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                Toast.makeText(getParentActivity(), "Ссылка должна начинаться с http:// или https://", Toast.LENGTH_LONG).show();
-                return;
-            }
-            executor.execute(() -> {
-                boolean ok = false;
-                String err = null;
-                try {
-                    ok = ColgramPluginManager.installPluginFromUrl(url);
-                    if (!ok) err = "не удалось загрузить или установить";
-                } catch (Throwable t) {
-                    err = t.getMessage() == null ? t.toString() : t.getMessage();
-                }
-                final boolean success = ok;
-                final String failure = err;
-                mainHandler.post(() -> {
-                    if (destroyed) return;
-                    rebuildRows();
-                    if (getParentActivity() == null) return;
-                    Toast.makeText(getParentActivity(),
-                            success ? "Плагин установлен" : "Ошибка: " + failure,
-                            success ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
-                });
-            });
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_link2,
+                "Установить по ссылке",
+                "Прямая ссылка на .py или .plugin файл",
+                "https://example.com/my_plugin.py",
+                null,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI,
+                false,
+                false,
+                true,
+                "Установить",
+                rawUrl -> {
+                    String url = rawUrl == null ? "" : rawUrl.trim();
+                    if (url.isEmpty()) return;
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info,
+                                "Ссылка должна начинаться с http:// или https://", true);
+                        return;
+                    }
+                    executor.execute(() -> {
+                        boolean ok = false;
+                        String err = null;
+                        try {
+                            ok = ColgramPluginManager.installPluginFromUrl(url);
+                            if (!ok) err = "не удалось загрузить или установить";
+                        } catch (Throwable t) {
+                            err = t.getMessage() == null ? t.toString() : t.getMessage();
+                        }
+                        final boolean success = ok;
+                        final String failure = err;
+                        mainHandler.post(() -> {
+                            if (destroyed) return;
+                            rebuildRows();
+                            if (getParentActivity() == null) return;
+                            ColgramUiKit.showNotice(
+                                    this,
+                                    success ? R.drawable.msg_customize : R.drawable.msg_info,
+                                    success ? "Плагин установлен" : "Ошибка: " + failure,
+                                    !success
+                            );
+                        });
+                    });
+                },
+                null,
+                null
+        );
     }
 
     /**
@@ -641,56 +659,60 @@ public class ColgramPluginsActivity extends BaseFragment {
     private void showInstalledPluginActions(ColgramPluginManager.PluginInfo p) {
         Activity act = getParentActivity();
         if (destroyed || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
-        final Context appCtx = act.getApplicationContext();
-        String[] options = {"Настройки плагина", "Редактировать код", "Удалить плагин", "Отмена"};
-        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
-        builder.setTitle(p.name);
-        builder.setItems(options, (d, w) -> {
-            if (w == 0) {
-                openExteraPluginSettings(p);
-            } else if (w == 1) {
-                executor.execute(() -> {
-                    final String code = ColgramPluginManager.getPluginCode(p.fileName);
-                    mainHandler.post(() -> {
-                        if (!destroyed && getParentActivity() != null && !getParentActivity().isFinishing()) {
-                            showPluginEditorDialog(p.fileName, code);
-                        }
-                    });
-                });
-            } else if (w == 2) {
-                executor.execute(() -> {
-                    ColgramPluginManager.deletePlugin(p.fileName);
-                    mainHandler.post(() -> {
-                        if (destroyed) return;
-                        rebuildRows();
-                        Toast.makeText(appCtx, "Плагин удалён", Toast.LENGTH_SHORT).show();
-                    });
-                });
-            }
-        });
-        showDialog(builder.create());
+        java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(3);
+        items.add(ColgramUiKit.ChoiceItem.of("Настройки плагина", null, R.drawable.msg_settings));
+        items.add(ColgramUiKit.ChoiceItem.of("Редактировать код", p.fileName, R.drawable.msg_edit));
+        items.add(ColgramUiKit.ChoiceItem.destructive("Удалить плагин", "Удалить файл с устройства", R.drawable.msg_delete));
+        ColgramUiKit.showChoiceSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_customize,
+                p.name,
+                p.fileName,
+                items,
+                w -> {
+                    if (w == 0) {
+                        openExteraPluginSettings(p);
+                    } else if (w == 1) {
+                        executor.execute(() -> {
+                            final String code = ColgramPluginManager.getPluginCode(p.fileName);
+                            mainHandler.post(() -> {
+                                if (!destroyed && getParentActivity() != null && !getParentActivity().isFinishing()) {
+                                    showPluginEditorDialog(p.fileName, code);
+                                }
+                            });
+                        });
+                    } else if (w == 2) {
+                        executor.execute(() -> {
+                            ColgramPluginManager.deletePlugin(p.fileName);
+                            mainHandler.post(() -> {
+                                if (destroyed) return;
+                                rebuildRows();
+                                ColgramUiKit.showNotice(this, R.drawable.msg_delete, "Плагин удалён", false);
+                            });
+                        });
+                    }
+                }
+        );
     }
 
     private void openExteraPluginSettings(ColgramPluginManager.PluginInfo p) {
-        Context ctx = getParentActivity();
+        Activity ctx = getParentActivity();
         if (ctx == null) return;
-        Toast.makeText(ctx, "Загрузка настроек...", Toast.LENGTH_SHORT).show();
+        ColgramUiKit.showNotice(this, R.drawable.msg_settings, "Загрузка настроек...", false);
         executor.execute(() -> {
             String rawJson = ColgramPluginManager.getPluginSettingsSchemaJson(p.fileName);
             mainHandler.post(() -> {
-                if (destroyed || getParentActivity() == null) return;
+                Activity curActivity = getParentActivity();
+                if (destroyed || curActivity == null) return;
                 try {
                     JSONArray arr = new JSONArray(rawJson != null ? rawJson : "[]");
                     if (arr.length() == 0) {
-                        Toast.makeText(ctx, "У плагина нет встроенных настроек UI", Toast.LENGTH_SHORT).show();
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "У плагина нет встроенных настроек UI", false);
                         return;
                     }
-                    ScrollView scroll = new ScrollView(ctx);
-                    LinearLayout layout = new LinearLayout(ctx);
+                    LinearLayout layout = new LinearLayout(curActivity);
                     layout.setOrientation(LinearLayout.VERTICAL);
-                    int pad = AndroidUtilities.dp(18);
-                    layout.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(8));
-                    scroll.addView(layout);
 
                     final java.util.Map<String, Integer> selectorValues = new java.util.HashMap<>();
                     for (int i = 0; i < arr.length(); i++) {
@@ -700,25 +722,25 @@ public class ColgramPluginsActivity extends BaseFragment {
                         final String key = item.optString("key", "");
                         String text = item.optString("text", "");
                         if ("header".equals(type)) {
-                            TextView tv = new TextView(ctx);
+                            TextView tv = new TextView(curActivity);
                             tv.setText(text);
                             tv.setTypeface(AndroidUtilities.bold());
                             tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueHeader, resourceProvider));
                             tv.setPadding(0, AndroidUtilities.dp(10), 0, AndroidUtilities.dp(4));
                             layout.addView(tv);
                         } else if ("switch".equals(type) && !key.isEmpty()) {
-                            final TextCheckCell tc = new TextCheckCell(ctx, resourceProvider);
+                            final TextCheckCell tc = new TextCheckCell(curActivity, resourceProvider);
                             tc.setTextAndCheck(text, item.optBoolean("value", false), false);
                             tc.setTag(key);
                             tc.setOnClickListener(v -> tc.setChecked(!tc.isChecked()));
                             layout.addView(tc, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
                         } else if ("input".equals(type) && !key.isEmpty()) {
-                            TextView lbl = new TextView(ctx);
+                            TextView lbl = new TextView(curActivity);
                             lbl.setText(text);
                             lbl.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourceProvider));
                             lbl.setPadding(0, AndroidUtilities.dp(8), 0, AndroidUtilities.dp(2));
                             layout.addView(lbl);
-                            EditTextBoldCursor ed = ColgramMenuChrome.makeDialogEditText(ctx, resourceProvider, "", false);
+                            EditTextBoldCursor ed = ColgramMenuChrome.makeDialogEditText(curActivity, resourceProvider, "", false);
                             ed.setTag(key);
                             ed.setText(item.optString("value", ""));
                             layout.addView(ed, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
@@ -733,25 +755,32 @@ public class ColgramPluginsActivity extends BaseFragment {
                             if (!labels.isEmpty()) {
                                 int initIdx = Math.max(0, Math.min(item.optInt("value", 0), labels.size() - 1));
                                 selectorValues.put(key, initIdx);
-                                final TextDetailSettingsCell selCell = new TextDetailSettingsCell(ctx);
+                                final TextDetailSettingsCell selCell = new TextDetailSettingsCell(curActivity);
                                 selCell.setTextAndValue(text, labels.get(initIdx), false);
                                 selCell.setTag("selector:" + key);
                                 selCell.setOnClickListener(v -> {
                                     Activity curAct = getParentActivity();
                                     if (destroyed || curAct == null || curAct.isFinishing() || curAct.isDestroyed()) return;
-                                    AlertDialog.Builder pick = new AlertDialog.Builder(curAct, resourceProvider);
-                                    pick.setTitle(text);
-                                    pick.setItems(labels.toArray(new String[0]), (d2, whichIdx) -> {
-                                        selectorValues.put(key, whichIdx);
-                                        selCell.setTextAndValue(text, labels.get(whichIdx), false);
-                                    });
-                                    try { pick.show(); } catch (Throwable ignored) {}
+                                    Integer curVal = selectorValues.get(key);
+                                    ColgramUiKit.showChoiceSheet(
+                                            curAct,
+                                            resourceProvider,
+                                            R.drawable.msg_settings,
+                                            text,
+                                            null,
+                                            labels.toArray(new String[0]),
+                                            curVal != null ? curVal : 0,
+                                            whichIdx -> {
+                                                selectorValues.put(key, whichIdx);
+                                                selCell.setTextAndValue(text, labels.get(whichIdx), false);
+                                            }
+                                    );
                                 });
                                 layout.addView(selCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
                             }
                         } else if ("text".equals(type) || "divider".equals(type)) {
                             if (!text.isEmpty()) {
-                                TextView tv = new TextView(ctx);
+                                TextView tv = new TextView(curActivity);
                                 tv.setText(text);
                                 tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourceProvider));
                                 tv.setPadding(0, AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4));
@@ -760,98 +789,121 @@ public class ColgramPluginsActivity extends BaseFragment {
                         }
                     }
 
-                    AlertDialog.Builder b = new AlertDialog.Builder(ctx, resourceProvider);
-                    b.setTitle("Настройки: " + p.name);
-                    b.setView(scroll);
-                    b.setPositiveButton("Сохранить", (dlg, which) -> {
-                        final List<String[]> pending = new ArrayList<>();
-                        for (int idxItem = 0; idxItem < layout.getChildCount(); idxItem++) {
-                            View v = layout.getChildAt(idxItem);
-                            Object tag = v.getTag();
-                            if (!(tag instanceof String)) continue;
-                            String k = (String) tag;
-                            if (v instanceof TextCheckCell) {
-                                pending.add(new String[]{k, ((TextCheckCell) v).isChecked() ? "true" : "false"});
-                            } else if (v instanceof EditText) {
-                                pending.add(new String[]{k, JSONObject.quote(((EditText) v).getText().toString())});
-                            } else if (k.startsWith("selector:")) {
-                                String realKey = k.substring("selector:".length());
-                                Integer idxVal = selectorValues.get(realKey);
-                                if (idxVal != null) {
-                                    pending.add(new String[]{realKey, Integer.toString(idxVal)});
+                    ColgramUiKit.showCustomViewSheet(
+                            curActivity,
+                            resourceProvider,
+                            R.drawable.msg_settings,
+                            "Настройки: " + p.name,
+                            null,
+                            layout,
+                            "Сохранить",
+                            sheet -> {
+                                final List<String[]> pending = new ArrayList<>();
+                                for (int idxItem = 0; idxItem < layout.getChildCount(); idxItem++) {
+                                    View v = layout.getChildAt(idxItem);
+                                    Object tag = v.getTag();
+                                    if (!(tag instanceof String)) continue;
+                                    String k = (String) tag;
+                                    if (v instanceof TextCheckCell) {
+                                        pending.add(new String[]{k, ((TextCheckCell) v).isChecked() ? "true" : "false"});
+                                    } else if (v instanceof EditText) {
+                                        pending.add(new String[]{k, JSONObject.quote(((EditText) v).getText().toString())});
+                                    } else if (k.startsWith("selector:")) {
+                                        String realKey = k.substring("selector:".length());
+                                        Integer idxVal = selectorValues.get(realKey);
+                                        if (idxVal != null) {
+                                            pending.add(new String[]{realKey, Integer.toString(idxVal)});
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                        if (pending.isEmpty()) return;
-                        executor.execute(() -> {
-                            for (String[] kv : pending) {
-                                ColgramPluginManager.updatePluginSetting(p.fileName, kv[0], kv[1]);
-                            }
-                            mainHandler.post(() -> {
-                                if (!destroyed && getParentActivity() != null) {
-                                    Toast.makeText(getParentActivity(), "Настройки плагина сохранены", Toast.LENGTH_SHORT).show();
-                                }
-                            });
-                        });
-                    });
-                    b.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-                    showDialog(b.create());
+                                if (pending.isEmpty()) return true;
+                                executor.execute(() -> {
+                                    for (String[] kv : pending) {
+                                        ColgramPluginManager.updatePluginSetting(p.fileName, kv[0], kv[1]);
+                                    }
+                                    mainHandler.post(() -> {
+                                        if (!destroyed && getParentActivity() != null) {
+                                            ColgramUiKit.showNotice(this, R.drawable.msg_settings, "Настройки плагина сохранены", false);
+                                        }
+                                    });
+                                });
+                                return true;
+                            },
+                            null,
+                            null,
+                            LocaleController.getString(R.string.Cancel),
+                            true,
+                            false
+                    );
                 } catch (Throwable t) {
-                    Toast.makeText(ctx, "Ошибка настроек: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(this, R.drawable.msg_info, "Ошибка настроек: " + t.getMessage(), true);
                 }
             });
         });
     }
 
     private void showPluginEditorDialog(String initialName, String initialCode) {
-        if (getParentActivity() == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
-        builder.setTitle("Python плагин");
-
-        LinearLayout layout = new LinearLayout(getParentActivity());
+        Activity act = getParentActivity();
+        if (act == null) return;
+        ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
+        LinearLayout layout = new LinearLayout(act);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12), AndroidUtilities.dp(20), AndroidUtilities.dp(12));
 
-        final EditTextBoldCursor nameInput = ColgramMenuChrome.makeDialogEditText(
-                getParentActivity(), resourceProvider, "my_plugin.py", false);
-        if (initialName != null) nameInput.setText(initialName);
-        layout.addView(nameInput, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+        final EditTextBoldCursor nameInput = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal, "my_plugin.py", initialName, InputType.TYPE_CLASS_TEXT, true);
+        LinearLayout nameBox = ColgramUiKit.makeInputContainer(act, pal, nameInput, false);
+        layout.addView(nameBox, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 10));
 
-        final EditTextBoldCursor codeInput = ColgramMenuChrome.makeDialogEditText(
-                getParentActivity(), resourceProvider, "def on_command(cmd, args): ...", true);
+        String seedCode = (initialCode != null && !initialCode.isEmpty())
+                ? initialCode
+                : b64("IyBuYW1lOiDQnNC+0Lkg0L/Qu9Cw0LPQuNC9CiMgY29tbWFuZDogbXljbWQKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ9Ce0YLQstC10YI6ICcgKyBhcmdzCg==");
+        final EditTextBoldCursor codeInput = ColgramUiKit.makeStyledEditText(
+                act, resourceProvider, pal, "def on_command(cmd, args): ...", seedCode,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE, false);
         codeInput.setTypeface(Typeface.MONOSPACE);
         codeInput.setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 13);
         codeInput.setMinLines(6);
         codeInput.setMaxLines(14);
-        if (initialCode != null && !initialCode.isEmpty()) {
-            codeInput.setText(initialCode);
-        } else {
-            codeInput.setText(b64("IyBuYW1lOiDQnNC+0Lkg0L/Qu9Cw0LPQuNC9CiMgY29tbWFuZDogbXljbWQKCmRlZiBvbl9jb21tYW5kKGNtZCwgYXJncyk6CiAgICByZXR1cm4gJ9Ce0YLQstC10YI6ICcgKyBhcmdzCg=="));
-        }
-        layout.addView(codeInput, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        LinearLayout codeBox = ColgramUiKit.makeInputContainer(act, pal, codeInput, false);
+        layout.addView(codeBox, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        builder.setView(ColgramMenuChrome.wrapDialogScroll(getParentActivity(), layout));
-        builder.setPositiveButton("Сохранить", (dialog, which) -> {
-            String rawName = nameInput.getText().toString().trim();
-            if (rawName.isEmpty()) {
-                Toast.makeText(getParentActivity(), "Укажите имя файла", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            final String fileName = (!rawName.endsWith(".py") && !rawName.endsWith(".plugin")) ? (rawName + ".py") : rawName;
-            final String code = codeInput.getText().toString();
-            executor.execute(() -> {
-                final boolean ok = ColgramPluginManager.installPlugin(fileName, code);
-                mainHandler.post(() -> {
-                    if (destroyed || getParentActivity() == null) return;
-                    rebuildRows();
-                    Toast.makeText(getParentActivity(),
-                            ok ? "Плагин сохранён" : "Не удалось сохранить плагин",
-                            ok ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
-                });
-            });
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+        ColgramUiKit.showCustomViewSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_customize,
+                "Python плагин",
+                "Локальный скрипт расширения для Colgram",
+                layout,
+                "Сохранить",
+                s -> {
+                    String rawName = nameInput.getText().toString().trim();
+                    if (rawName.isEmpty()) {
+                        ColgramUiKit.showNotice(this, R.drawable.msg_info, "Укажите имя файла", true);
+                        return false;
+                    }
+                    final String fileName = (!rawName.endsWith(".py") && !rawName.endsWith(".plugin")) ? (rawName + ".py") : rawName;
+                    final String code = codeInput.getText().toString();
+                    executor.execute(() -> {
+                        final boolean ok = ColgramPluginManager.installPlugin(fileName, code);
+                        mainHandler.post(() -> {
+                            if (destroyed || getParentActivity() == null) return;
+                            rebuildRows();
+                            ColgramUiKit.showNotice(
+                                    this,
+                                    ok ? R.drawable.msg_customize : R.drawable.msg_info,
+                                    ok ? "Плагин сохранён" : "Не удалось сохранить плагин",
+                                    !ok
+                            );
+                        });
+                    });
+                    return true;
+                },
+                null,
+                null,
+                LocaleController.getString(R.string.Cancel),
+                true,
+                false
+        );
     }
 
     // ------------------------------------------------------------ adapter

@@ -71,8 +71,7 @@ final class ColgramCallUdpRelay {
             guard.start();
 
             byte[] bytes = new byte[MAX_PACKET];
-            byte[] decoyBuf = new byte[64];
-            DatagramPacket decoyPkt = new DatagramPacket(decoyBuf, decoyBuf.length);
+            DatagramPacket decoyPkt = new DatagramPacket(new byte[1], 1);
             DatagramPacket upstreamSendPkt = new DatagramPacket(bytes, 0, 0);
             DatagramPacket request = new DatagramPacket(bytes, bytes.length);
             InetSocketAddress client = null;
@@ -120,6 +119,8 @@ final class ColgramCallUdpRelay {
                             if (decoyCooldown.size() > MAX_PEERS * 2) decoyCooldown.clear();
                             decoyCooldown.put(target, nowMs);
                             for (int d = 0; d < 3; d++) {
+                                byte[] decoy = ColgramPolymorphicStealth.buildPolymorphicVoiceUdpDecoy();
+                                decoyPkt.setData(decoy, 0, decoy.length);
                                 upstream.send(decoyPkt);
                             }
                         }

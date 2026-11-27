@@ -28,7 +28,6 @@ import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.messenger.browser.Browser;
 import org.telegram.ui.ActionBar.ActionBar;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -399,41 +398,39 @@ public class ColgramVersionsActivity extends BaseFragment {
     }
 
     private void showEditRepoDialog() {
-        Context ctx = getParentActivity();
+        Activity ctx = getParentActivity();
         if (ctx == null) return;
-        EditTextBoldCursor input = new EditTextBoldCursor(ctx);
-        input.setText(getColgramRepo());
-        input.setHint("owner/repo (по умолчанию Kleisym/Colgram)");
-        input.setSingleLine(true);
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
-        input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
-        FrameLayout wrap = new FrameLayout(ctx);
-        int pad = AndroidUtilities.dp(20);
-        wrap.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(4));
-        wrap.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(ctx, resourceProvider);
-        builder.setTitle("GitHub-репозиторий обновлений");
-        builder.setView(wrap);
-        builder.setPositiveButton("Сохранить", (d, w) -> {
-            ColgramConfig.setUpdateRepo(input.getText() != null ? input.getText().toString() : "");
-            quickCheckStatus = null;
-            releasesLoading = true;
-            releasesFailed = false;
-            rebuildRows();
-            fetchReleases();
-        });
-        builder.setNeutralButton("Сбросить", (d, w) -> {
-            ColgramConfig.setUpdateRepo(ColgramConfig.DEFAULT_UPDATE_REPO);
-            quickCheckStatus = null;
-            releasesLoading = true;
-            releasesFailed = false;
-            rebuildRows();
-            fetchReleases();
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+        ColgramUiKit.showInputSheet(
+                ctx,
+                resourceProvider,
+                R.drawable.msg_link2,
+                "GitHub-репозиторий обновлений",
+                "Формат: owner/repo (по умолчанию " + ColgramConfig.DEFAULT_UPDATE_REPO + ")",
+                "owner/repo (по умолчанию Kleisym/Colgram)",
+                getColgramRepo(),
+                android.text.InputType.TYPE_CLASS_TEXT,
+                false,
+                false,
+                true,
+                "Сохранить",
+                raw -> {
+                    ColgramConfig.setUpdateRepo(raw != null ? raw : "");
+                    quickCheckStatus = null;
+                    releasesLoading = true;
+                    releasesFailed = false;
+                    rebuildRows();
+                    fetchReleases();
+                },
+                "Сбросить",
+                ignored -> {
+                    ColgramConfig.setUpdateRepo(ColgramConfig.DEFAULT_UPDATE_REPO);
+                    quickCheckStatus = null;
+                    releasesLoading = true;
+                    releasesFailed = false;
+                    rebuildRows();
+                    fetchReleases();
+                }
+        );
     }
 
     private void fetchReleases() {
@@ -683,17 +680,22 @@ public class ColgramVersionsActivity extends BaseFragment {
     private void confirmInstall(Row row) {
         Activity act = getParentActivity();
         if (destroyed || isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
-        builder.setTitle("Установить сборку");
-        builder.setMessage(row.title + "\n\n" + row.subtitle
-                + "\n\nAPK будет скачан и установлен поверх текущего Colgram. "
-                + "Данные аккаунтов сохранятся.");
-        builder.setPositiveButton("Скачать и установить", (d, w) -> downloadAndInstall(row));
+        String msg = row.title + "\n\n" + row.subtitle
+                + "\n\nAPK будет скачан и установлен поверх текущего Colgram. Данные аккаунтов сохранятся.";
         if (row.url != null && !row.url.isEmpty()) {
-            builder.setNeutralButton("Открыть страницу", (d, w) -> Browser.openUrl(getParentActivity(), row.url));
+            ColgramUiKit.showConfirmSheet(
+                    act, resourceProvider, R.drawable.msg_download, "Установить сборку", msg,
+                    "Скачать и установить", false, () -> downloadAndInstall(row),
+                    "Открыть страницу", () -> Browser.openUrl(getParentActivity(), row.url),
+                    LocaleController.getString(R.string.Cancel), null
+            );
+        } else {
+            ColgramUiKit.showConfirmSheet(
+                    act, resourceProvider, R.drawable.msg_download, "Установить сборку", msg,
+                    "Скачать и установить", false, () -> downloadAndInstall(row),
+                    LocaleController.getString(R.string.Cancel), null
+            );
         }
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
     }
 
     /**
@@ -706,15 +708,13 @@ public class ColgramVersionsActivity extends BaseFragment {
      * keeps working if the applicationId ever changes.
      */
     private void downloadAndInstall(Row row) {
-        final Context ctx = getParentActivity();
+        final Activity ctx = getParentActivity();
         if (ctx == null) return;
 
         final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean(false);
-        final AlertDialog progress = new AlertDialog(ctx, AlertDialog.ALERT_TYPE_SPINNER);
-        progress.setMessage("Загрузка сборки...\n" + row.title);
-        progress.setCancelable(true);
-        progress.setOnCancelListener(d -> cancelled.set(true));
-        showDialog(progress);
+        final ColgramUiKit.ProgressSheetHandle progress = ColgramUiKit.showProgressSheet(
+                ctx, resourceProvider, R.drawable.msg_download,
+                "Загрузка сборки", row.title, true, () -> cancelled.set(true));
 
         executor.execute(() -> {
             File target = null;
@@ -793,10 +793,9 @@ public class ColgramVersionsActivity extends BaseFragment {
                                     final long doneMb = done / (1024L * 1024L);
                                     final long totalMb = total / (1024L * 1024L);
                                     mainHandler.post(() -> {
-                                        if (!destroyed && !cancelled.get() && progress.isShowing()) {
-                                            progress.setMessage(
-                                                    "Загрузка сборки... " + pct + "%\n"
-                                                            + doneMb + " / " + totalMb + " МБ\n" + row.title);
+                                        if (!destroyed && !cancelled.get() && progress != null && progress.isShowing()) {
+                                            progress.setProgress(pct,
+                                                    "Загружено " + doneMb + " / " + totalMb + " МБ · " + row.title);
                                         }
                                     });
                                 }
@@ -826,7 +825,7 @@ public class ColgramVersionsActivity extends BaseFragment {
                 final Context appCtx = ctx.getApplicationContext();
                 mainHandler.post(() -> {
                     try {
-                        progress.dismiss();
+                        if (progress != null) progress.dismiss();
                     } catch (Throwable ignore) {}
                     if (destroyed || cancelled.get()) return;
                     Activity curAct = getParentActivity();
@@ -835,13 +834,12 @@ public class ColgramVersionsActivity extends BaseFragment {
             } catch (Throwable t) {
                 final String msg = t.getMessage() == null ? t.toString() : t.getMessage();
                 Log.w(TAG, "download failed: " + msg);
-                final Context appCtx = ctx.getApplicationContext();
                 mainHandler.post(() -> {
                     try {
-                        progress.dismiss();
+                        if (progress != null) progress.dismiss();
                     } catch (Throwable ignore) {}
                     if (destroyed) return;
-                    Toast.makeText(appCtx, "Не удалось скачать: " + msg, Toast.LENGTH_LONG).show();
+                    ColgramUiKit.showNotice(this, R.drawable.msg_info, "Не удалось скачать: " + msg, true);
                 });
             }
         });
@@ -903,29 +901,33 @@ public class ColgramVersionsActivity extends BaseFragment {
     private void confirmTagBuild(Row row) {
         Activity act = getParentActivity();
         if (destroyed || isFinishing() || act == null || act.isFinishing() || act.isDestroyed() || getVisibleDialog() != null) return;
-        final Context appCtx = act.getApplicationContext();
-        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
-        builder.setTitle(row.title);
-        builder.setMessage("Upstream-тег " + row.tag + " будет использован как база для сборки Colgram.\n\n"
+        String msg = "Upstream-тег " + row.tag + " будет использован как база для сборки Colgram.\n\n"
                 + "Установить эту версию сразу нельзя: это исходный код Telegram без патчей Colgram. "
                 + "Тег будет сохранён, а CI пересоберёт Colgram на нём — готовый APK появится "
-                + "в разделе «Сборки Colgram» выше.");
-        builder.setPositiveButton("Сохранить тег и открыть CI", (d, w) -> {
-            try {
-                org.colgram.core.ColgramConfig.setPendingUpstreamTag(row.tag);
-                Toast.makeText(appCtx,
-                        "Тег " + row.tag + " сохранён", Toast.LENGTH_LONG).show();
-            } catch (Throwable ignore) {
-                // best-effort; the browser fallback still works
-            }
-            Activity curAct = getParentActivity();
-            if (curAct != null) {
-                Browser.openUrl(curAct,
-                        "https://github.com/" + getColgramRepo() + "/actions/workflows/build-colgram.yml");
-            }
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+                + "в разделе «Сборки Colgram» выше.";
+        ColgramUiKit.showConfirmSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_download,
+                row.title,
+                msg,
+                "Сохранить тег и открыть CI",
+                false,
+                () -> {
+                    try {
+                        org.colgram.core.ColgramConfig.setPendingUpstreamTag(row.tag);
+                        ColgramUiKit.showNotice(this, R.drawable.msg_download, "Тег " + row.tag + " сохранён", false);
+                    } catch (Throwable ignore) {
+                    }
+                    Activity curAct = getParentActivity();
+                    if (curAct != null) {
+                        Browser.openUrl(curAct,
+                                "https://github.com/" + getColgramRepo() + "/actions/workflows/build-colgram.yml");
+                    }
+                },
+                LocaleController.getString(R.string.Cancel),
+                null
+        );
     }
 
     // ---------------------------------------------------------------- adapter

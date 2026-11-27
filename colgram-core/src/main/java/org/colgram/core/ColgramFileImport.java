@@ -217,7 +217,29 @@ public final class ColgramFileImport {
             deliverResult(session.callback, new ArrayList<String>());
             return true;
         }
+        importUrisAsync(context, data, session);
+        return true;
+    }
 
+    /**
+     * Imports all URIs from an arbitrary Intent result (e.g. ChatActivity requestCode == 21)
+     * through the exact same synchronous-AFD, OpenableColumns.SIZE, StatFs headroom,
+     * >32 MiB SHA-256 skip, and .nomedia-protected colgram_inbox staging pipeline.
+     */
+    public static boolean importIntentResult(final Context context, Intent data,
+                                           long maxFileSizeBytes, Callback callback,
+                                           ProgressListener progressListener) {
+        if (callback == null) {
+            return false;
+        }
+        if (context == null || data == null) {
+            deliverResult(callback, new ArrayList<String>());
+            return false;
+        }
+        return importUrisAsync(context, data, new PickSession(callback, maxFileSizeBytes, progressListener));
+    }
+
+    private static boolean importUrisAsync(final Context context, final Intent data, final PickSession session) {
         final List<Uri> uris = new ArrayList<>();
         ClipData clip = data.getClipData();
         if (clip != null) {
@@ -234,10 +256,10 @@ public final class ColgramFileImport {
 
         if (uris.isEmpty()) {
             deliverResult(session.callback, new ArrayList<String>());
-            return true;
+            return false;
         }
 
-        final Context appCtx = context.getApplicationContext();
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         final ContentResolver cr = appCtx.getContentResolver();
         final int dataFlags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
         final List<StagedUri> stagedUris = new ArrayList<>(uris.size());

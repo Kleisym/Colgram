@@ -134,11 +134,13 @@ public class ColgramBootJobService extends JobService {
         if (params != null && params.getJobId() == PROXY_REFRESH_JOB_ID) {
             final android.content.Context app = getApplicationContext();
             ColgramConfig.init(app);
+            boolean localHealthy = ColgramDpiBypass.isBound()
+                    && !ColgramDpiBypass.isStrictL3WhitelistDetected();
             boolean canSkipInBackground = !ColgramUiBridge.isAppInForeground()
                     && !ColgramForegroundService.hasConfiguredBotTokens()
-                    && ColgramDpiBypass.isBound()
-                    && ColgramProxyManager.isTelegramConnected()
-                    && ColgramDpiBypass.hasRecentRxWithin(180_000L);
+                    && (ColgramDpiBypass.hasRecentRxWithin(180_000L)
+                        || ColgramProxyManager.isTelegramConnected()
+                        || localHealthy);
             if (canSkipInBackground) {
                 jobFinished(params, false);
                 return false;
@@ -146,7 +148,8 @@ public class ColgramBootJobService extends JobService {
             Log.i(TAG, "persistent proxy refresh job running");
             ColgramProxyManager.refreshProxySourcesInBackground(app, () -> {
                 try {
-                    if (ColgramConfig.isAlwaysBackgroundEnabled()) {
+                    if (ColgramConfig.isAlwaysBackgroundEnabled()
+                            && ColgramForegroundService.hasConfiguredBotTokens()) {
                         if (!ColgramForegroundService.isServiceRunning()
                                 && canStartForegroundServiceFromJob(app)) {
                             ColgramForegroundService.start(app);

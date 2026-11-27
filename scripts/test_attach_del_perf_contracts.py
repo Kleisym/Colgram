@@ -20,6 +20,7 @@ TELEGRAM_SRC = os.path.join(ROOT, "Telegram-Src")
 TARGET_FILES = [
     "TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java",
     "TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertDocumentLayout.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertAudioLayout.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/MediaController.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/FileUploadOperation.java",
@@ -57,12 +58,15 @@ class TrackBContractsTest(unittest.TestCase):
             "shouldSkipDedupHash(",
             "hasSufficientSpace(",
             "ColgramStorageSandbox.ensureDirWithNoMedia(dir);",
+            "importIntentResult(",
         ):
             self.assertIn(token, fi)
         self.assertIn('getFilesDir(), "colgram_inbox"', fi.split("cleanupRejectedStagedFile(", 1)[1].split("openStagedUriSync", 1)[0])
 
         um = read_text("colgram-core/src/main/java/org/colgram/core/ColgramUnlimitedMemory.java")
         self.assertIn('appCtx.getExternalFilesDir("colgram_inbox")', um)
+        self.assertIn("isPowerSaveMode(appCtx)", um)
+        self.assertIn("AUTO_SWEEP_MIN_INTERVAL_MS", um)
 
         fa = read_text("scripts/templates/ColgramFilesActivity.java")
         self.assertIn("IMPORT_EXECUTOR", fa)
@@ -94,6 +98,9 @@ class TrackBContractsTest(unittest.TestCase):
         self.assertIn("KEYSTORE_LOCAL_ALIAS", pb)
         self.assertIn("PRIVATE_BACKUP_DIR", pb)
         self.assertIn("filesCanon", pb)
+        self.assertIn("AUTO_BACKUP_MIN_INTERVAL_MS = 15L * 60L * 1000L;", pb)
+        self.assertIn("computeMetadataFingerprint(", pb)
+        self.assertIn("shouldSkipAutoBackup(", pb)
         self.assertNotIn("private static char[] deviceKeyMaterial()", pb)
 
         am = read_text("colgram-core/src/main/java/org/colgram/core/ColgramAccountManager.java")
@@ -117,6 +124,9 @@ class TrackBContractsTest(unittest.TestCase):
         vw = read_text("scripts/templates/ColgramVideoWallpaperView.java")
         self.assertIn("Utilities.globalQueue.postRunnable(() -> {", vw)
         self.assertIn("releasePlayerAsync(preparedMp)", vw)
+        self.assertIn("BACKGROUND_RELEASE_GRACE_MS", vw)
+        self.assertIn("scheduleDelayedRelease()", vw)
+        self.assertNotIn("ColgramPowerGuard", vw)
 
     def test_native_jni_hardening_contracts(self):
         jb = read_text("tools/warpgo/native/jni_bridge.c")
@@ -199,7 +209,36 @@ class TrackBContractsTest(unittest.TestCase):
                 with open(os.path.join(tmp, *rel.split("/")), "r", encoding="utf-8", errors="ignore") as f:
                     return f.read()
 
-            self.assertIn("didSelectFiles(colgramPathsList,", patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java"))
+            ca_text = patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java")
+            ca_norm = ca_text.replace("\r\n", "\n")
+            self.assertIn("// colgram-attach-composer-v2", ca_norm)
+            self.assertIn("\n    public void onDestroy() {\n        // colgram-attach-composer-v2\n        if (!buttonPressed && !sent", ca_norm)
+            self.assertNotIn("        public void onDestroy() {\n        if (!buttonPressed", ca_norm)
+            self.assertIn("colgramLaunchSafIntoDocumentComposer", ca_text)
+            self.assertIn("colgramStageIntentResultToDocumentComposer", ca_text)
+            self.assertIn("documentLayout.colgramOpenDirectory(", ca_text)
+            self.assertIn("documentLayout.colgramAddImportedFiles(paths)", ca_text)
+            self.assertIn("Math.max(totalBytes, bytesCopied)", ca_text)
+            self.assertIn("colgramAppCtx", ca_text)
+            self.assertNotIn("didSelectFiles(colgramPathsList,", ca_text)
+            self.assertNotIn("ColgramFilesActivity.beginPick(", ca_text)
+            self.assertIn("// colgram-nonblocking-audio (native audio composer)", ca_text)
+            self.assertIn("// colgram-nonblocking-doc (native document composer)", ca_text)
+
+            dl_text = patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertDocumentLayout.java")
+            self.assertIn("colgramAddImportedFiles(", dl_text)
+            self.assertIn("colgramOpenDirectory(", dl_text)
+            self.assertIn("parentAlert.updateCountButton(1)", dl_text)
+            self.assertIn("MediaStore.Downloads.EXTERNAL_CONTENT_URI", dl_text)
+            self.assertIn("delegate.didSelectFiles(files, caption, captionEntities, fmessages, notify, scheduleDate, scheduleRepeatPeriod,", dl_text)
+
+            al_text = patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertAudioLayout.java")
+            self.assertIn("COLGRAM_PICK_AUDIO_SAF", al_text)
+            self.assertIn('colgramLaunchSafIntoDocumentComposer("audio/*")', al_text)
+
+            chat_text = patched_text("TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
+            self.assertIn("chatAttachAlert.colgramStageIntentResultToDocumentComposer(data);", chat_text)
+
             self.assertIn("java.util.Locale.US", patched_text("TMessagesProj/src/main/java/org/telegram/messenger/SavedMessagesController.java"))
             self.assertIn("org.telegram.messenger.SendMessagesHelper.colgramCancelMessageTransfers(", patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/DeleteMessagesBottomSheet.java"))
             self.assertIn("org.telegram.messenger.Utilities.globalQueue.postRunnable(", patched_text("TMessagesProj/src/main/java/org/telegram/ui/SecretMediaViewer.java"))
@@ -207,9 +246,6 @@ class TrackBContractsTest(unittest.TestCase):
             fl_text = patched_text("TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java")
             self.assertIn('tmpFile = File.createTempFile("colgram_dec_", ".tmp", outDir);', fl_text)
             self.assertIn("final File tmpFile;", fl_text)
-            ca_text = patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java")
-            self.assertIn("Math.max(totalBytes, bytesCopied)", ca_text)
-            self.assertIn("colgramAppCtx", ca_text)
             mc_text = patched_text("TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java")
             self.assertIn("(channelId == 0) ? dialogMessagesByIds.get(id) : null;", mc_text)
             self.assertIn("delObj.getDialogId() != targetDid", mc_text)

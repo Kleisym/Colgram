@@ -37,7 +37,6 @@ import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.INavigationLayout;
 import org.telegram.ui.ActionBar.Theme;
@@ -322,13 +321,15 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     "Классический плоский список",
                     "Мягкие скруглённые капсулы"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Стиль карточек чатов")
-                    .setItems(items, (d, which) -> {
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(), getResourceProvider(), R.drawable.msg_customize,
+                    "Стиль карточек чатов", null, items, ColgramDesignConfig.getCardStyle(),
+                    which -> {
                         if (isFinishing() || which < 0) return;
                         ColgramDesignConfig.setCardStyle(which);
                         applyLiveDesignEverywhere(false);
-                    }).create());
+                    }
+            );
         } else if (position == neonIntensityRow) {
             final String[] items = {
                     "Выключено (строгий минимализм)",
@@ -336,13 +337,15 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     "Стандарт (100%)",
                     "Максимум (140%)"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Интенсивность неоновых акцентов")
-                    .setItems(items, (d, which) -> {
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(), getResourceProvider(), R.drawable.msg_theme,
+                    "Интенсивность неоновых акцентов", null, items, ColgramDesignConfig.getNeonIntensity(),
+                    which -> {
                         if (isFinishing() || which < 0) return;
                         ColgramDesignConfig.setNeonIntensity(which);
                         applyLiveDesignEverywhere(false);
-                    }).create());
+                    }
+            );
         } else if (position == hideDividersRow) {
             boolean next = !ColgramDesignConfig.isHideDividers();
             ColgramDesignConfig.setHideDividers(next);
@@ -354,13 +357,15 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     "Всегда свёрнута в кнопку ⚡ в шапке",
                     "Полностью скрыть панель"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Расположение панели быстрого доступа")
-                    .setItems(items, (d, which) -> {
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(), getResourceProvider(), R.drawable.msg_customize,
+                    "Расположение панели быстрого доступа", null, items, ColgramDesignConfig.getQuickBarPlacement(),
+                    which -> {
                         if (isFinishing() || which < 0) return;
                         ColgramDesignConfig.setQuickBarPlacement(which);
                         applyLiveDesignEverywhere(false);
-                    }).create());
+                    }
+            );
         } else if (position == bottomBarButtonsRow) {
             ColgramBottomBarConfig.showEditorSheet(this, () -> applyLiveDesignEverywhere(false));
         } else if (position == showHeaderShieldRow) {
@@ -382,13 +387,15 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                     "Справа",
                     "Помнить последнее перетаскивание"
             };
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Позиция кружка Koliti")
-                    .setItems(items, (d, which) -> {
+            ColgramUiKit.showChoiceSheet(
+                    getParentActivity(), getResourceProvider(), R.drawable.msg_bots,
+                    "Позиция кружка Koliti", null, items, ColgramDesignConfig.getKolitiOrbDock(),
+                    which -> {
                         if (isFinishing() || which < 0) return;
                         ColgramDesignConfig.setKolitiOrbDock(which);
                         applyLiveDesignEverywhere(false);
-                    }).create());
+                    }
+            );
         } else if (ColgramBuildFlags.KOLITI_ENABLED && position == kolitiAvatarPickRow) {
             try {
                 Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
@@ -442,12 +449,17 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         }
                     });
         } else if (position == resetAllRow) {
-            showDialog(new AlertDialog.Builder(ctx, getResourceProvider())
-                    .setTitle("Сбросить дизайн?")
-                    .setMessage(ColgramBuildFlags.KOLITI_ENABLED
+            ColgramUiKit.showConfirmSheet(
+                    getParentActivity(),
+                    getResourceProvider(),
+                    R.drawable.msg_delete,
+                    "Сбросить дизайн?",
+                    ColgramBuildFlags.KOLITI_ENABLED
                             ? "Все цвета, геометрия карточек, раскладка шапки, размер и аватар Koliti вернутся к заводским."
-                            : "Все цвета, геометрия карточек и раскладка шапки вернутся к заводским.")
-                    .setPositiveButton("Сбросить", (d, w) -> {
+                            : "Все цвета, геометрия карточек и раскладка шапки вернутся к заводским.",
+                    "Сбросить",
+                    true,
+                    () -> {
                         if (isFinishing() || getParentLayout() == null) return;
                         if (ColgramBuildFlags.KOLITI_ENABLED) {
                             final String old = ColgramDesignConfig.getKolitiCustomAvatarPath();
@@ -460,10 +472,11 @@ public class ColgramDesignStudioActivity extends BaseFragment {
                         ColgramDesignConfig.resetAll();
                         ColgramAeroStyler.invalidateKolitiAvatarCache();
                         applyLiveDesignEverywhere(true);
-                        Toast.makeText(appCtx, "Дизайн сброшен к стандарту Colgram", Toast.LENGTH_SHORT).show();
-                    })
-                    .setNegativeButton("Отмена", null)
-                    .create());
+                        ColgramUiKit.showNotice(this, R.drawable.msg_theme, "Дизайн сброшен к стандарту Colgram", false);
+                    },
+                    "Отмена",
+                    null
+            );
         }
     }
 
@@ -473,10 +486,7 @@ public class ColgramDesignStudioActivity extends BaseFragment {
             if (isFinishing() || onPick == null) return;
             int parsed = ColgramDesignConfig.parseHexColor(val);
             if (parsed == 0) {
-                Context toastCtx = getParentActivity() != null ? getParentActivity() : ctx;
-                if (toastCtx != null) {
-                    Toast.makeText(toastCtx, "Введите цвет в формате #RRGGBB", Toast.LENGTH_SHORT).show();
-                }
+                ColgramUiKit.showNotice(this, R.drawable.msg_info, "Введите цвет в формате #RRGGBB", true);
             } else {
                 onPick.accept(parsed);
             }
@@ -489,28 +499,26 @@ public class ColgramDesignStudioActivity extends BaseFragment {
     private void showTextInputDialog(Context ctx, String title, String hint, String initial, StrConsumer onOk) {
         Activity act = (ctx instanceof Activity) ? (Activity) ctx : getParentActivity();
         if (isFinishing() || getParentLayout() == null || act == null || act.isFinishing() || act.isDestroyed()) return;
-        LinearLayout box = new LinearLayout(act);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(8), dp(20), dp(4));
-        EditText et = new EditText(act);
-        et.setHint(hint);
-        et.setText(initial == null ? "" : initial);
-        et.setSelection(Math.max(0, et.getText().length()));
-        et.setSingleLine(false);
-        et.setMaxLines(4);
-        et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        et.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, getResourceProvider()));
-        et.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, getResourceProvider()));
-        box.addView(et, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-        showDialog(new AlertDialog.Builder(act, getResourceProvider())
-                .setTitle(title)
-                .setView(box)
-                .setPositiveButton("Применить", (d, w) -> {
+        ColgramUiKit.showInputSheet(
+                act,
+                getResourceProvider(),
+                R.drawable.msg_edit,
+                title,
+                null,
+                hint,
+                initial,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE,
+                false,
+                false,
+                false,
+                "Применить",
+                val -> {
                     if (isFinishing() || onOk == null) return;
-                    onOk.accept(et.getText() == null ? "" : et.getText().toString());
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                    onOk.accept(val == null ? "" : val);
+                },
+                null,
+                null
+        );
     }
 
     @Override

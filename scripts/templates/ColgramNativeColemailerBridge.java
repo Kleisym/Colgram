@@ -17,9 +17,9 @@ import org.colgram.core.ColgramSpamGuard;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.tgnet.tl.TL_keyboard;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
+import org.telegram.ui.ColgramUiKit;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.LaunchActivity;
@@ -1544,29 +1544,21 @@ public final class ColgramNativeColemailerBridge {
                     showToast(title, body);
                     return;
                 }
-                AlertDialog.Builder builder = new AlertDialog.Builder(frag.getParentActivity());
-                builder.setTitle(title);
-
-                ScrollView scroll = new ScrollView(frag.getParentActivity());
-                LinearLayout box = new LinearLayout(frag.getParentActivity());
-                box.setOrientation(LinearLayout.VERTICAL);
-                int pad = AndroidUtilities.dp(20);
-                box.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(8));
-                TextView tv = new TextView(frag.getParentActivity());
-                tv.setText(body);
-                tv.setTextSize(14);
-                tv.setGravity(Gravity.START);
-                tv.setTextIsSelectable(true);
-                tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));
-                box.addView(tv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-                scroll.addView(box);
-                builder.setView(scroll);
-                builder.setNeutralButton("Копировать", (d, w) -> {
-                    AndroidUtilities.addToClipboard(body);
-                    showToast("Скопировано", title);
-                });
-                builder.setPositiveButton("OK", null);
-                frag.showDialog(builder.create());
+                ColgramUiKit.showInfoSheet(
+                        frag.getParentActivity(),
+                        frag.getResourceProvider(),
+                        R.drawable.msg_info,
+                        title,
+                        body,
+                        "Копировать",
+                        () -> {
+                            AndroidUtilities.addToClipboard(body);
+                            ColgramUiKit.showNotice(frag, R.drawable.msg_copy, "Скопировано", false);
+                        },
+                        "OK",
+                        null,
+                        true
+                );
             } catch (Throwable ignored) {}
         });
     }

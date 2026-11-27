@@ -43,6 +43,8 @@ public final class ColgramUnlimitedMemory {
     private static final String KEY_CLOUD_OFFLOADED_BYTES = "cloud_offloaded_bytes";
     private static final String KEY_COMPRESSION_PRESET = "compression_preset";
     private static final String KEY_SMART_CLOUD_OFFLOAD = "smart_cloud_offload_enabled";
+    private static final String KEY_LAST_AUTO_SWEEP_MS = "last_auto_sweep_ms";
+    private static final long AUTO_SWEEP_MIN_INTERVAL_MS = 4L * 60L * 60L * 1000L;
 
     private static final int DEFAULT_FILES_PER_SWEEP = 32;
     private static final int CHARGING_FILES_PER_SWEEP = 150;
@@ -363,6 +365,11 @@ public final class ColgramUnlimitedMemory {
     public static void autoCompressOversizedCacheImagesAsync(Context context) {
         if (context == null || compressionRunning) return;
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        if (!ColgramPowerGuard.isCharging(appCtx)
+                || ColgramPowerGuard.isThermalThrottled(appCtx)
+                || ColgramPowerGuard.isPowerSaveMode(appCtx)) {
+            return;
+        }
         Thread worker = new Thread(() -> {
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
@@ -381,8 +388,20 @@ public final class ColgramUnlimitedMemory {
     public static ColgramStorageOptimizer.SweepResult runScheduledMaintenanceSync(Context context, boolean fromIdleJob) {
         if (context == null) return new ColgramStorageOptimizer.SweepResult();
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
-        if (!ColgramPowerGuard.isCharging(appCtx) || ColgramPowerGuard.isThermalThrottled(appCtx)) {
+        if (!ColgramPowerGuard.isCharging(appCtx)
+                || ColgramPowerGuard.isThermalThrottled(appCtx)
+                || ColgramPowerGuard.isPowerSaveMode(appCtx)) {
             return new ColgramStorageOptimizer.SweepResult();
+        }
+        if (!fromIdleJob) {
+            try {
+                long lastSweep = appCtx.getSharedPreferences(PREF_COMPRESS_STATS, Context.MODE_PRIVATE)
+                        .getLong(KEY_LAST_AUTO_SWEEP_MS, 0L);
+                long now = System.currentTimeMillis();
+                if (lastSweep > 0L && now >= lastSweep && (now - lastSweep) < AUTO_SWEEP_MIN_INTERVAL_MS) {
+                    return new ColgramStorageOptimizer.SweepResult();
+                }
+            } catch (Throwable ignored) {}
         }
         boolean screenOff = !ColgramPowerGuard.isScreenInteractive(appCtx);
         int batchLimit = (fromIdleJob && screenOff) ? CHARGING_FILES_PER_SWEEP : DEFAULT_FILES_PER_SWEEP;
@@ -456,6 +475,12 @@ public final class ColgramUnlimitedMemory {
                 ColgramStorageIndex.flushToDirectory(casDir);
             } else {
                 ColgramStorageIndex.flush();
+            }
+            if (!manualForce) {
+                try {
+                    appCtx.getSharedPreferences(PREF_COMPRESS_STATS, Context.MODE_PRIVATE)
+                            .edit().putLong(KEY_LAST_AUTO_SWEEP_MS, nowMs).apply();
+                } catch (Throwable ignored) {}
             }
             persistSweepStats(appCtx, total);
         } catch (Throwable t) {

@@ -314,10 +314,10 @@ public final class ColgramBottomBarConfig {
 
         final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
         final boolean dark = pal.dark;
-        final int cTextPrimary = dark ? 0xFFF8FAFC : 0xFF0F172A;
-        final int cTextSecondary = dark ? 0xFF94A3B8 : 0xFF64748B;
-        final int cCard = dark ? 0x16FFFFFF : 0x0A0F172A;
-        final int cBorder = dark ? 0x22FFFFFF : 0x160F172A;
+        final int cTextPrimary = pal.textPrimary;
+        final int cTextSecondary = pal.textSecondary;
+        final int cCard = pal.cardSurface;
+        final int cBorder = pal.borderSubtle;
 
         final BottomSheet sheet = new BottomSheet(act, false, hostFragment.getResourceProvider());
         LinearLayout root = new LinearLayout(act);

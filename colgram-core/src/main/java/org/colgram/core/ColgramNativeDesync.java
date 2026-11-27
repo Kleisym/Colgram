@@ -45,6 +45,8 @@ public final class ColgramNativeDesync {
     public static final int MODE_SPLIT_BYTE1        = 10;
     public static final int MODE_MULTI_SPLIT_SNI    = 11;
     public static final int MODE_HYBRID_MULTI_RECORD = 12;
+    public static final int MODE_COMPACT_4_RECORD    = 13;
+    public static final int MODE_HDR2_SNI2_BULK      = 14;
     public static final int MAX_SAFE_FAKE_TTL       = 12;
 
     private static volatile SSLSocketFactory cachedEngineSslFactory;
@@ -227,11 +229,19 @@ public final class ColgramNativeDesync {
      */
     public static int sendUdpFakeBurst(String ipLiteral, int port, int ttl, int count,
                                        FdProtector protector) {
+        return sendUdpFakeBurst(ipLiteral, port, ttl, count,
+                ColgramPolymorphicStealth.buildPolymorphicVoiceUdpDecoy(), protector);
+    }
+
+    public static int sendUdpFakeBurst(String ipLiteral, int port, int ttl, int count,
+                                       byte[] decoyPayload, FdProtector protector) {
         if (!LOADED || ipLiteral == null || ipLiteral.isEmpty() || port <= 0 || port > 65535 || count <= 0) {
             return 0;
         }
         try {
-            int sent = nativeSendUdpFakeBurst(ipLiteral, port, ttl, count, protector);
+            int sent = decoyPayload != null && decoyPayload.length > 0
+                    ? nativeSendUdpFakeBurstPayload(ipLiteral, port, ttl, count, decoyPayload, protector)
+                    : nativeSendUdpFakeBurst(ipLiteral, port, ttl, count, protector);
             return Math.max(0, sent);
         } catch (Throwable ignored) {
             return 0;
@@ -315,11 +325,11 @@ public final class ColgramNativeDesync {
         } else {
             int httpCut = findHttpHostOffset(work);
             if (httpCut > 1 && httpCut < work.length) {
-                work = ColgramTlsMimic.mangleHttpHostHeader(work, work.length);
-                split1 = httpCut;
+                work = ColgramTlsMimic.mangleHttpHostHeaderPolymorphic(work, work.length);
+                split1 = ColgramPolymorphicStealth.jitterSplitOffset(httpCut, 1, work.length - 1);
             } else if (work.length >= 64) {
                 // MTProto obfuscated2 or binary handshake: cut early so first 64B header is split/disordered
-                split1 = 16;
+                split1 = ColgramPolymorphicStealth.jitterSplitOffset(16, 4, work.length - 1);
             }
         }
 
@@ -408,6 +418,19 @@ public final class ColgramNativeDesync {
             }
         }
 
+        /** Non-blocking poll check verifying no EOF, error, or unexpected queued RX bytes exist. */
+        public boolean isIdleClean() {
+            if (closed.get() || !LOADED) return false;
+            return nativeIsSocketIdleClean(handle);
+        }
+
+        /** Updates TCP keepalive and TCP_USER_TIMEOUT parameters cleanly on an open socket. */
+        public void setKeepalive(int idleSec, int intvlSec, int cnt, int userTimeoutMs) {
+            if (!closed.get() && LOADED) {
+                nativeSetKeepalive(handle, idleSec, intvlSec, cnt, userTimeoutMs);
+            }
+        }
+
         /** Sends the initial packet using native kernel desync (disorder / fake TTL / OOB / MSS). */
         public void sendDesynced(byte[] payload, int off, int len,
                                  int nativeMode, int fakeTtl, boolean tlsRecordSplit,
@@ -457,9 +480,9 @@ public final class ColgramNativeDesync {
         @Override public void setTcpNoDelay(boolean on) { /* Always enabled in nativeConnect */ }
         @Override public boolean getTcpNoDelay() { return true; }
         @Override public void setSendBufferSize(int size) { /* Managed by native kernel socket */ }
-        @Override public int getSendBufferSize() { return 65536; }
+        @Override public int getSendBufferSize() { return 131072; }
         @Override public void setReceiveBufferSize(int size) { /* Managed by native kernel socket */ }
-        @Override public int getReceiveBufferSize() { return 65536; }
+        @Override public int getReceiveBufferSize() { return 131072; }
         @Override public void setKeepAlive(boolean on) { /* Always enabled in nativeConnect */ }
         @Override public boolean getKeepAlive() { return true; }
         @Override public void setOOBInline(boolean on) { this.oobInline = on; }
@@ -686,11 +709,16 @@ public final class ColgramNativeDesync {
     private static native long nativeConnect(String ipLiteral, int port, int timeoutMs,
                                              int mssClamp, int windowClamp, FdProtector protector);
     private static native void nativeUnclampWindow(long handle);
+    private static native boolean nativeIsSocketIdleClean(long handle);
+    private static native void nativeSetKeepalive(long handle, int idleSec, int intvlSec,
+                                                  int cnt, int userTimeoutMs);
     private static native int nativeSendDesync(long handle, byte[] payload, int off, int len,
                                                int split1, int mode, int fakeTtl, boolean cellular,
                                                byte[] fakePayload, String tmpDir);
     private static native int nativeSendUdpFakeBurst(String ipLiteral, int port, int ttl,
                                                      int count, FdProtector protector);
+    private static native int nativeSendUdpFakeBurstPayload(String ipLiteral, int port, int ttl,
+                                                            int count, byte[] payload, FdProtector protector);
     private static native int nativeRead(long handle, byte[] buf, int off, int len, int timeoutMs);
     private static native int nativeWrite(long handle, byte[] buf, int off, int len);
     private static native void nativeShutdownOutput(long handle);

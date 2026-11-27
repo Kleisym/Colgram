@@ -29,7 +29,6 @@ import org.telegram.messenger.UserConfig;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenu;
 import org.telegram.ui.ActionBar.ActionBarMenuItem;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -387,118 +386,123 @@ public class ColgramFilesActivity extends BaseFragment {
     private void promptNewFolder() {
         Activity act = getParentActivity();
         if (act == null || currentDir == null) return;
-        EditTextBoldCursor input = new EditTextBoldCursor(act);
-        input.setHint("Название папки");
-        input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
-        input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
-        input.setSingleLine(true);
-
-        FrameLayout container = new FrameLayout(act);
-        container.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(8), AndroidUtilities.dp(20), 0);
-        container.addView(input);
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
-        builder.setTitle("Новая папка");
-        builder.setView(container);
-        builder.setPositiveButton("Создать", (d, w) -> {
-            String raw = input.getText() == null ? "" : input.getText().toString().trim();
-            final String name = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
-            final File dir = currentDir;
-            if (name.isEmpty() || dir == null) return;
-            final Context appCtx = act.getApplicationContext();
-            IMPORT_EXECUTOR.execute(() -> {
-                File sub = new File(dir, name);
-                final boolean ok = sub.exists() || sub.mkdirs();
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (destroyed) return;
-                    if (ok) {
-                        reload();
-                    } else {
-                        Toast.makeText(appCtx, "Не удалось создать папку", Toast.LENGTH_SHORT).show();
-                    }
-                });
-            });
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+        ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_folders,
+                "Новая папка",
+                "Создать директорию в текущем каталоге",
+                "Название папки",
+                null,
+                android.text.InputType.TYPE_CLASS_TEXT,
+                false,
+                false,
+                true,
+                "Создать",
+                rawInput -> {
+                    String raw = rawInput == null ? "" : rawInput.trim();
+                    final String name = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
+                    final File dir = currentDir;
+                    if (name.isEmpty() || dir == null) return;
+                    IMPORT_EXECUTOR.execute(() -> {
+                        File sub = new File(dir, name);
+                        final boolean ok = sub.exists() || sub.mkdirs();
+                        AndroidUtilities.runOnUIThread(() -> {
+                            if (destroyed) return;
+                            if (ok) {
+                                reload();
+                            } else {
+                                ColgramUiKit.showNotice(this, R.drawable.msg_info, "Не удалось создать папку", true);
+                            }
+                        });
+                    });
+                },
+                null,
+                null
+        );
     }
 
     private void showPath(String path) {
         if (getParentActivity() == null) return;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
-        builder.setTitle("Путь хранилища Colgram");
-        builder.setMessage(path);
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        builder.setPositiveButton("Скопировать", (dialog, which) -> {
-            try {
-                ClipboardManager cm = (ClipboardManager) getParentActivity()
-                        .getSystemService(Context.CLIPBOARD_SERVICE);
-                if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("path", path));
-            } catch (Throwable ignored) {}
-        });
-        showDialog(builder.create());
+        ColgramUiKit.showInfoSheet(
+                getParentActivity(),
+                resourceProvider,
+                R.drawable.msg_folders,
+                "Путь хранилища Colgram",
+                path,
+                "Скопировать",
+                () -> {
+                    try {
+                        Activity act = getParentActivity();
+                        if (act != null) {
+                            ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+                            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("path", path));
+                            ColgramUiKit.showNotice(this, R.drawable.msg_copy, "Путь скопирован", false);
+                        }
+                    } catch (Throwable ignored) {}
+                },
+                LocaleController.getString(R.string.Cancel),
+                null,
+                true
+        );
     }
 
     private void showFileActions(final File file, final int entryIndex, final int adapterPos) {
-        if (getParentActivity() == null) return;
-        final String[] items;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);
-        builder.setTitle(file.getName());
+        Activity act = getParentActivity();
+        if (act == null) return;
         if (pickMode) {
             final String path = file.getAbsolutePath();
-            items = new String[]{
-                    "Отправить в чат",
-                    "Скопировать путь",
-            };
-            builder.setItems(items, (dialog, which) -> {
-                if (which == 1) {
-                    showPath(path);
-                    return;
-                }
-                if (!file.exists() || !file.isFile()) {
-                    if (getParentActivity() != null) {
-                        Toast.makeText(getParentActivity(), "Файл не найден", Toast.LENGTH_SHORT).show();
+            ArrayList<ColgramUiKit.ChoiceItem> items = new ArrayList<>(2);
+            items.add(ColgramUiKit.ChoiceItem.of("Отправить в чат", "Передать через FileProvider", R.drawable.msg_send));
+            items.add(ColgramUiKit.ChoiceItem.of("Скопировать путь", path, R.drawable.msg_copy));
+            ColgramUiKit.showChoiceSheet(
+                    act, resourceProvider, R.drawable.msg_view_file, file.getName(), null, items,
+                    which -> {
+                        if (which == 1) {
+                            showPath(path);
+                            return;
+                        }
+                        if (!file.exists() || !file.isFile()) {
+                            ColgramUiKit.showNotice(this, R.drawable.msg_info, "Файл не найден", true);
+                            return;
+                        }
+                        PickListener listener = pendingPickListener;
+                        pendingPickListener = null;
+                        pickMode = false;
+                        ArrayList<String> paths = new ArrayList<>();
+                        paths.add(path);
+                        finishFragment();
+                        if (listener != null) {
+                            try {
+                                listener.onPicked(paths);
+                            } catch (Throwable ignored) {}
+                        }
                     }
-                    return;
-                }
-                PickListener listener = pendingPickListener;
-                pendingPickListener = null;
-                pickMode = false;
-                ArrayList<String> paths = new ArrayList<>();
-                paths.add(path);
-                finishFragment();
-                if (listener != null) {
-                    try {
-                        listener.onPicked(paths);
-                    } catch (Throwable ignored) {}
-                }
-            });
+            );
         } else {
-            items = new String[]{
-                    "Открыть",
-                    "Поделиться / В Избранное",
-                    "Переименовать",
-                    "Удалить",
-                    "Скопировать путь",
-            };
-            builder.setItems(items, (dialog, which) -> {
-                if (which == 0) {
-                    openFile(file);
-                } else if (which == 1) {
-                    shareFile(file);
-                } else if (which == 2) {
-                    renameFile(file);
-                } else if (which == 3) {
-                    deleteFile(file, entryIndex, adapterPos);
-                } else {
-                    showPath(file.getAbsolutePath());
-                }
-            });
+            ArrayList<ColgramUiKit.ChoiceItem> items = new ArrayList<>(5);
+            items.add(ColgramUiKit.ChoiceItem.of("Открыть", null, R.drawable.msg_view_file));
+            items.add(ColgramUiKit.ChoiceItem.of("Поделиться / В Избранное", null, R.drawable.msg_forward));
+            items.add(ColgramUiKit.ChoiceItem.of("Переименовать", null, R.drawable.msg_edit));
+            items.add(ColgramUiKit.ChoiceItem.destructive("Удалить", "Удалить безвозвратно", R.drawable.msg_delete));
+            items.add(ColgramUiKit.ChoiceItem.of("Скопировать путь", null, R.drawable.msg_copy));
+            ColgramUiKit.showChoiceSheet(
+                    act, resourceProvider, R.drawable.msg_view_file, file.getName(), null, items,
+                    which -> {
+                        if (which == 0) {
+                            openFile(file);
+                        } else if (which == 1) {
+                            shareFile(file);
+                        } else if (which == 2) {
+                            renameFile(file);
+                        } else if (which == 3) {
+                            deleteFile(file, entryIndex, adapterPos);
+                        } else {
+                            showPath(file.getAbsolutePath());
+                        }
+                    }
+            );
         }
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
     }
 
     private void openFile(File file) {
@@ -534,42 +538,39 @@ public class ColgramFilesActivity extends BaseFragment {
     private void renameFile(File file) {
         Activity act = getParentActivity();
         if (act == null || file == null) return;
-        EditTextBoldCursor input = new EditTextBoldCursor(act);
-        input.setText(file.getName());
-        input.setSelection(file.getName().length());
-        input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
-        input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack, resourceProvider));
-        input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint, resourceProvider));
-        input.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated, resourceProvider));
-        input.setSingleLine(true);
-
-        FrameLayout container = new FrameLayout(act);
-        container.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(8), AndroidUtilities.dp(20), 0);
-        container.addView(input);
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(act, resourceProvider);
-        builder.setTitle("Переименовать");
-        builder.setView(container);
-        builder.setPositiveButton("Сохранить", (d, w) -> {
-            String raw = input.getText() == null ? "" : input.getText().toString().trim();
-            final String next = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
-            if (next.isEmpty()) return;
-            final Context appCtx = act.getApplicationContext();
-            IMPORT_EXECUTOR.execute(() -> {
-                File dest = new File(file.getParentFile(), next);
-                final boolean ok = !dest.exists() && file.renameTo(dest);
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (destroyed) return;
-                    if (ok) {
-                        reload();
-                    } else {
-                        Toast.makeText(appCtx, "Не удалось переименовать", Toast.LENGTH_SHORT).show();
-                    }
-                });
-            });
-        });
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        showDialog(builder.create());
+        ColgramUiKit.showInputSheet(
+                act,
+                resourceProvider,
+                R.drawable.msg_edit,
+                "Переименовать",
+                null,
+                "Новое имя файла",
+                file.getName(),
+                android.text.InputType.TYPE_CLASS_TEXT,
+                false,
+                false,
+                true,
+                "Сохранить",
+                inputRaw -> {
+                    String raw = inputRaw == null ? "" : inputRaw.trim();
+                    final String next = raw.replaceAll("[\\\\/:*?\"<>|]", "_");
+                    if (next.isEmpty()) return;
+                    IMPORT_EXECUTOR.execute(() -> {
+                        File dest = new File(file.getParentFile(), next);
+                        final boolean ok = !dest.exists() && file.renameTo(dest);
+                        AndroidUtilities.runOnUIThread(() -> {
+                            if (destroyed) return;
+                            if (ok) {
+                                reload();
+                            } else {
+                                ColgramUiKit.showNotice(this, R.drawable.msg_info, "Не удалось переименовать", true);
+                            }
+                        });
+                    });
+                },
+                null,
+                null
+        );
     }
 
     private void deleteFile(File file, int entryIndex, int adapterPos) {

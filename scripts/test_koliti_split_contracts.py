@@ -188,7 +188,8 @@ class KolitiSplitContractsTest(unittest.TestCase):
         )
         self.assertIn("Colgram-12.10.6.apk", body)
         self.assertIn("Colgram-12.10.6-Koliti.apk", body)
-        self.assertIn("NetBypass v5.0", body)
+        self.assertIn("Next-Gen", body)
+        self.assertIn("NetBypass v6.0", body)
 
         legacy = rp.legacy_tags_to_delete(
             [

@@ -4,6 +4,21 @@ from __future__ import annotations
 import os
 
 
+def _patch_eol_variants(eol_patch_fn, filepath: str, anchors: list[str], replacement: str, desc: str) -> None:
+    """Apply an idempotent EOL-normalized patch matching whichever anchor state the target file holds."""
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            norm = f.read().replace("\r\n", "\n")
+        if replacement.replace("\r\n", "\n").strip() in norm:
+            eol_patch_fn(filepath, replacement, replacement, desc)
+            return
+        for anchor in anchors:
+            if anchor.replace("\r\n", "\n") in norm:
+                eol_patch_fn(filepath, anchor, replacement, desc)
+                return
+    eol_patch_fn(filepath, anchors[-1], replacement, desc)
+
+
 def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     """Apply all Track A patches cleanly and idempotently against Telegram-Src."""
     # 1. AndroidManifest.xml: restore POST_NOTIFICATIONS so background sync & notifications work on Android 13+.
@@ -145,6 +160,23 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                             }
                         };""",
         "ApplicationLoader.java diff network capabilities to filter LTE RSSI jitter",
+    )
+    eol_patch_fn(
+        app_loader,
+        """            NotificationCenter.getGlobalInstance().addObserver((id, account, args) -> {
+                if (id == NotificationCenter.screenStateChanged && isScreenOn) {
+                    ensureCurrentNetworkGet(true);
+                    refreshNetworkAndNotify();
+                }
+            }, NotificationCenter.screenStateChanged);""",
+        """            NotificationCenter.getGlobalInstance().addObserver((id, account, args) -> {
+                if (id == NotificationCenter.screenStateChanged && isScreenOn
+                        && (!mainInterfacePaused || org.colgram.core.ColgramUiBridge.isAppInForeground())) {
+                    ensureCurrentNetworkGet(true);
+                    refreshNetworkAndNotify();
+                }
+            }, NotificationCenter.screenStateChanged);""",
+        "ApplicationLoader.java gate screenStateChanged network refresh on foreground",
     )
 
     # 3. ConnectionsManager.java: expose colgramResetProxySignature() so bypass restart/fallback clears cached signature.
@@ -498,18 +530,11 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     file_load_op = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoadOperation.java"
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         file_load_op,
-        """        boolean isAvatarOrSmall = location instanceof TLRPC.TL_inputPeerPhotoFileLocation
-                || (totalBytesCount > 0 && totalBytesCount <= 256 * 1024);
-        if (boost && !forceSmallChunk) {
-            downloadChunkSize = (isAvatarOrSmall && (totalBytesCount <= 0 || totalBytesCount > 64 * 1024))
-                    || totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;
-            downloadChunkSizeBig = 1024 * 512;
-            maxDownloadRequests = 12;
-            maxDownloadRequestsBig = 12;
-            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);""",
-        """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+        [
+            """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
                 || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
                 || location instanceof TLRPC.TL_inputStickerSetThumb
                 || location instanceof TLRPC.TL_inputPhotoFileLocation
@@ -521,7 +546,29 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             maxDownloadRequests = 4;
             maxDownloadRequestsBig = 6;
             maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);""",
-        "FileLoadOperation.java safe chunk sizes and request caps",
+            """        boolean isAvatarOrSmall = location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || (totalBytesCount > 0 && totalBytesCount <= 256 * 1024);
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = (isAvatarOrSmall && (totalBytesCount <= 0 || totalBytesCount > 64 * 1024))
+                    || totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;
+            downloadChunkSizeBig = 1024 * 512;
+            maxDownloadRequests = 12;
+            maxDownloadRequestsBig = 12;
+            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);""",
+        ],
+        """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+                || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || location instanceof TLRPC.TL_inputStickerSetThumb
+                || location instanceof TLRPC.TL_inputPhotoFileLocation
+                || totalBytesCount <= 0
+                || totalBytesCount < 256 * 1024;
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 32 ? 1024 * 64 : 1024 * 32) : 1024 * 128;
+            downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;
+            maxDownloadRequests = 4;
+            maxDownloadRequestsBig = 4;
+            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);""",
+        "FileLoadOperation.java safe chunk sizes (64KB >=32KB) and request caps (4/4/6)",
     )
     eol_patch_fn(
         file_load_op,
@@ -542,12 +589,16 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 if (downloadedBytes > 0 && downloadedBytes % currentDownloadChunkSize == 0) {""",
         "FileLoadOperation.java OFFSET_INVALID 0-byte download guard",
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         file_load_op,
-        """                    req.cdn_supported = true;""",
-        """                    req.cdn_supported = !(org.colgram.core.ColgramDpiBypass.isBound()
+        [
+            """                    req.cdn_supported = !(org.colgram.core.ColgramDpiBypass.isBound()
                             && org.colgram.core.ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork());""",
-        "FileLoadOperation.java bypass CDN DC 203 when WSS bridge active",
+            """                    req.cdn_supported = true;""",
+        ],
+        """                    req.cdn_supported = !org.colgram.core.ColgramDpiBypass.isBound();""",
+        "FileLoadOperation.java bypass CDN DC 203 when local DPI bypass bound",
     )
     eol_patch_fn(
         file_load_op,
@@ -606,19 +657,29 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             }""",
         "FileLoader.java stop blanket PRIORITY_HIGH & setForceRequest storm",
     )
+    eol_patch_fn(
+        file_loader,
+        "        if (operation.totalBytesCount > 20 * 1024 * 1024 || isStory) {",
+        "        if (operation.totalBytesCount > 2 * 1024 * 1024 || isStory) {",
+        "FileLoader.java split smallFilesQueue vs largeFilesQueue at 2MB for instant avatars",
+    )
 
-    # 9. FileLoaderPriorityQueue.java: safe concurrent operation caps (large=3, small=6).
+    # 9. FileLoaderPriorityQueue.java: instant avatar/sticker concurrent ops (large=3, small=12).
     prio_queue = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoaderPriorityQueue.java"
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         prio_queue,
-        "            max = Math.max(max, type == TYPE_LARGE ? 8 : 24);",
-        "            max = Math.max(max, type == TYPE_LARGE ? 3 : 6);",
-        "FileLoaderPriorityQueue.java cap concurrent operations (3/6)",
+        [
+            "            max = Math.max(max, type == TYPE_LARGE ? 3 : 6);",
+            "            max = Math.max(max, type == TYPE_LARGE ? 8 : 24);",
+        ],
+        "            max = Math.max(max, type == TYPE_LARGE ? 3 : 12);",
+        "FileLoaderPriorityQueue.java boost small queue concurrent operations (3/12)",
     )
 
-    # 10. ImageLoader.java: tame cacheOutQueue/cacheThumbOutQueue threads (2/1) and serialize Lottie .pcache2 precache.
+    # 10. ImageLoader.java: cacheOutQueue/cacheThumbOutQueue threads (3/2) + dedicated Lottie queue.
     image_loader = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ImageLoader.java"
     )
@@ -632,11 +693,11 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 "            int fitzModifier, boolean isSingleChannel) {",
                 "ImageLoader.java upgrade fitzModifier parameter type",
             )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         image_loader,
-        """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 4);
-    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);""",
-        """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 2);
+        [
+            """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 2);
     private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 1);
     private static final Object colgramLottiePrecacheLock = new Object();
 
@@ -652,7 +713,107 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         }
         return new RLottieDrawable(file, json, w, h, null, limitFps, null, fitzModifier, isSingleChannel);
     }""",
-        "ImageLoader.java queue thread count (2/1) and Lottie precache lock",
+            """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 4);
+    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);
+    private static final Object colgramLottiePrecacheLock = new Object();
+
+    private static RLottieDrawable colgramCreateRLottieDrawable(
+            File file, boolean compressed, int w, int h,
+            BitmapsCache.CacheOptions cacheOptions, boolean limitFps,
+            int fitzModifier, boolean isSingleChannel) {
+        String json = compressed ? decompressGzip(file) : null;
+        if (cacheOptions != null) {
+            synchronized (colgramLottiePrecacheLock) {
+                return new RLottieDrawable(file, json, w, h, cacheOptions, limitFps, null, fitzModifier, isSingleChannel);
+            }
+        }
+        return new RLottieDrawable(file, json, w, h, null, limitFps, null, fitzModifier, isSingleChannel);
+    }""",
+            """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 4);
+    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);""",
+            """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 2);
+    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 1);""",
+        ],
+        """    private DispatchQueuePriority cacheOutQueue = new DispatchQueuePriority("cacheOutQueue", 3);
+    private DispatchQueuePriority cacheThumbOutQueue = new DispatchQueuePriority("cacheThumbOutQueue", 2);
+    private DispatchQueuePriority colgramLottieOutQueue = new DispatchQueuePriority("colgramLottieOutQueue", 1);
+    private static final Object colgramLottiePrecacheLock = new Object();
+
+    private static RLottieDrawable colgramCreateRLottieDrawable(
+            File file, boolean compressed, int w, int h,
+            BitmapsCache.CacheOptions cacheOptions, boolean limitFps,
+            int fitzModifier, boolean isSingleChannel) {
+        String json = compressed ? decompressGzip(file) : null;
+        if (cacheOptions != null) {
+            synchronized (colgramLottiePrecacheLock) {
+                return new RLottieDrawable(file, json, w, h, cacheOptions, limitFps, null, fitzModifier, isSingleChannel);
+            }
+        }
+        return new RLottieDrawable(file, json, w, h, null, limitFps, null, fitzModifier, isSingleChannel);
+    }""",
+        "ImageLoader.java queue thread count (3/2), dedicated Lottie queue, and RLottieDrawable precache helper",
+    )
+    eol_patch_fn(
+        image_loader,
+        """                                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {
+                                    cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority);
+                                } else {
+                                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);
+                                }
+                            }
+                        });
+                    }
+                    long currentTime = SystemClock.elapsedRealtime();""",
+        """                                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {
+                                    cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority);
+                                } else if (task.cacheImage.imageType == FileLoader.IMAGE_TYPE_LOTTIE) {
+                                    colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);
+                                } else {
+                                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);
+                                }
+                            }
+                        });
+                    }
+                    long currentTime = SystemClock.elapsedRealtime();""",
+        "ImageLoader.java route Lottie load tasks onto dedicated colgramLottieOutQueue",
+    )
+    eol_patch_fn(
+        image_loader,
+        """                        if (thumb != 0) {
+                            cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority);
+                        } else {
+                            img.runningTask = cacheOutQueue.postRunnable(img.cacheTask, img.priority);
+                        }""",
+        """                        if (thumb != 0) {
+                            cacheThumbOutQueue.postRunnable(img.cacheTask, img.priority);
+                        } else if (img.imageType == FileLoader.IMAGE_TYPE_LOTTIE) {
+                            img.runningTask = colgramLottieOutQueue.postRunnable(img.cacheTask, img.priority);
+                        } else {
+                            img.runningTask = cacheOutQueue.postRunnable(img.cacheTask, img.priority);
+                        }""",
+        "ImageLoader.java route cached Lottie decodes onto dedicated colgramLottieOutQueue",
+    )
+    eol_patch_fn(
+        image_loader,
+        """                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {
+                    cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority);
+                } else {
+                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);
+                }
+            }
+        });
+    }""",
+        """                if (task.cacheImage.type == ImageReceiver.TYPE_THUMB) {
+                    cacheThumbOutQueue.postRunnable(task, task.cacheImage.priority);
+                } else if (task.cacheImage.imageType == FileLoader.IMAGE_TYPE_LOTTIE) {
+                    colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);
+                } else {
+                    cacheOutQueue.postRunnable(task, task.cacheImage.priority);
+                }
+            }
+        });
+    }""",
+        "ImageLoader.java route post-download Lottie decodes onto dedicated colgramLottieOutQueue",
     )
     eol_patch_fn(
         image_loader,

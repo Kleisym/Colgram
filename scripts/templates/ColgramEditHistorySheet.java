@@ -38,7 +38,6 @@ import org.telegram.messenger.FileLog;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.tgnet.TLRPC;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.AnimatedEmojiDrawable;
@@ -816,7 +815,7 @@ public class ColgramEditHistorySheet {
             Bitmap bmp = decodeSafePreview(path, 1800);
             AndroidUtilities.runOnUIThread(() -> {
                 if (bmp == null) {
-                    Toast.makeText(appCtx, "Не удалось загрузить изображение", Toast.LENGTH_SHORT).show();
+                    ColgramUiKit.showNotice(appCtx, "Не удалось загрузить изображение", true);
                     return;
                 }
                 if (act.isFinishing() || act.isDestroyed()) {
@@ -827,13 +826,23 @@ public class ColgramEditHistorySheet {
                 iv.setImageBitmap(bmp);
                 iv.setAdjustViewBounds(true);
                 iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                iv.setPadding(dp(8), dp(8), dp(8), dp(8));
+                iv.setPadding(dp(4), dp(4), dp(4), dp(4));
+                iv.setClipToOutline(true);
+                iv.setBackground(ColgramUiKit.makeRoundedBg(0, 14f, 0, 0f));
                 try {
-                    new AlertDialog.Builder(act)
-                            .setTitle(TextUtils.isEmpty(title) ? "Сохранённое фото" : title)
-                            .setView(iv)
-                            .setPositiveButton("Закрыть", null)
-                            .show();
+                    BottomSheet previewSheet = ColgramUiKit.showCustomViewSheet(
+                            act, null, org.telegram.messenger.R.drawable.msg_photos,
+                            TextUtils.isEmpty(title) ? "Сохранённое фото" : title,
+                            null, iv, null, null, null, null, "Закрыть", false, false
+                    );
+                    if (previewSheet != null) {
+                        previewSheet.setOnDismissListener(d -> {
+                            iv.setImageDrawable(null);
+                            if (!bmp.isRecycled()) bmp.recycle();
+                        });
+                    } else if (!bmp.isRecycled()) {
+                        bmp.recycle();
+                    }
                 } catch (Throwable ignored) {
                     if (!bmp.isRecycled()) bmp.recycle();
                 }

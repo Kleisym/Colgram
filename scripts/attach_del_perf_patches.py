@@ -18,178 +18,308 @@ def _join(repo_path: str, rel: str) -> str:
 
 def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     # =========================================================================
-    # 1. ChatAttachAlert.java: 2GB/4GB limit, immediate non-blocking dismiss,
-    #    staged progress toast, and cleanup if rejected.
+    # 1. ChatAttachAlert.java: native Telegram-style file/music/folder tabs,
+    #    zero blind SAF auto-send, zero forced permission nag in sandbox mode,
+    #    SAF-to-DocumentLayout composer bridge, and cancelActiveImport on dismiss.
     # =========================================================================
     chat_attach_alert = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlert.java")
 
-    def _replace_pick(norm: str, mime: str, audio_only: bool) -> str:
-        mode_tag = "audio" if audio_only else "doc"
-        if ("colgram-nonblocking-" + mode_tag) in norm:
-            # Upgrade Pass-1/Pass-2 ProgressListener (safe appCtx Toast + unknown totalBytes MB readout)
-            old_progress_sig = (
-                '                            public void onProgress(int done, int total, String currentName, long bytesCopied, long totalBytes) {\n'
-                '                                long now = android.os.SystemClock.uptimeMillis();\n'
-                '                                if (now - colgramLastToast[0] >= 1800L && totalBytes >= org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n'
-                '                                    colgramLastToast[0] = now;\n'
-                '                                    int pct = totalBytes > 0L ? (int) Math.min(99L, (bytesCopied * 100L) / totalBytes) : 0;\n'
-                '                                    android.widget.Toast.makeText(activity, "Подготовка файла (" + pct + "%): " + currentName, android.widget.Toast.LENGTH_SHORT).show();\n'
-                '                                }\n'
-                '                            }\n'
-                '                            @Override\n'
-                '                            public void onRejected(String fileName, String reason) {\n'
-                '                                String msg = "file_too_large".equals(reason)\n'
-                '                                        ? ("Файл слишком большой (" + (colgramPremium ? "4 ГБ" : "2 ГБ") + "): " + fileName)\n'
-                '                                        : ("insufficient_storage".equals(reason)\n'
-                '                                                ? ("Недостаточно места на диске для: " + fileName)\n'
-                '                                                : ("Не удалось подготовить файл: " + fileName));\n'
-                '                                android.widget.Toast.makeText(activity, msg, android.widget.Toast.LENGTH_LONG).show();\n'
-                '                            }'
-            )
-            new_progress_sig = (
-                '                            final android.content.Context colgramAppCtx = activity.getApplicationContext();\n'
-                '                            @Override\n'
-                '                            public void onProgress(int done, int total, String currentName, long bytesCopied, long totalBytes) {\n'
-                '                                long now = android.os.SystemClock.uptimeMillis();\n'
-                '                                long effectiveMax = Math.max(totalBytes, bytesCopied);\n'
-                '                                if (now - colgramLastToast[0] >= 1800L && effectiveMax >= org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n'
-                '                                    colgramLastToast[0] = now;\n'
-                '                                    String label = totalBytes > 0L\n'
-                '                                            ? ((int) Math.min(99L, (bytesCopied * 100L) / totalBytes) + "%")\n'
-                '                                            : ((bytesCopied / (1024L * 1024L)) + " МБ");\n'
-                '                                    android.widget.Toast.makeText(colgramAppCtx, "Подготовка файла (" + label + "): " + currentName, android.widget.Toast.LENGTH_SHORT).show();\n'
-                '                                }\n'
-                '                            }\n'
-                '                            @Override\n'
-                '                            public void onRejected(String fileName, String reason) {\n'
-                '                                String msg = "file_too_large".equals(reason)\n'
-                '                                        ? ("Файл слишком большой (" + (colgramPremium ? "4 ГБ" : "2 ГБ") + "): " + fileName)\n'
-                '                                        : ("insufficient_storage".equals(reason)\n'
-                '                                                ? ("Недостаточно места на диске для: " + fileName)\n'
-                '                                                : ("Не удалось подготовить файл: " + fileName));\n'
-                '                                android.widget.Toast.makeText(colgramAppCtx, msg, android.widget.Toast.LENGTH_LONG).show();\n'
-                '                            }'
-            )
-            old_progress_head = "                        org.colgram.core.ColgramFileImport.ProgressListener colgramProgress = new org.colgram.core.ColgramFileImport.ProgressListener() {\n                            @Override\n" + old_progress_sig
-            new_progress_head = "                        org.colgram.core.ColgramFileImport.ProgressListener colgramProgress = new org.colgram.core.ColgramFileImport.ProgressListener() {\n" + new_progress_sig
-            if old_progress_head in norm:
-                norm = norm.replace(old_progress_head, new_progress_head, 1)
-            # Upgrade Pass-1 didSelectFiles(paths, -> didSelectFiles(colgramPathsList,
-            pass1_sig = (
-                'org.colgram.core.ColgramFileImport.pickFiles(activity, "' + mime + '", true, colgramMaxBytes, paths -> {\n'
-                '                            if (paths == null || paths.isEmpty()) {\n'
-                '                                return;\n'
-                '                            }\n'
-                '                            try {\n'
-                '                                if (documentsDelegate != null) {\n'
-                '                                    documentsDelegate.didSelectFiles(paths,'
-            )
-            if pass1_sig in norm:
-                norm = norm.replace(
-                    '                                if (documentsDelegate != null) {\n'
-                    '                                    documentsDelegate.didSelectFiles(paths,',
-                    '                                final ArrayList<String> colgramPathsList = new ArrayList<>(paths);\n'
-                    '                                if (documentsDelegate != null) {\n'
-                    '                                    documentsDelegate.didSelectFiles(colgramPathsList,',
-                    1,
-                )
-                norm = norm.replace(
-                    '                                } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
-                    '                                    ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
-                    '                                            .didSelectFiles(paths,',
-                    '                                } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
-                    '                                    ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
-                    '                                            .didSelectFiles(colgramPathsList,',
-                    1,
-                )
+    def _replace_branch_slice(norm: str, start_anchor: str, end_anchor: str, marker: str, replacement: str) -> str:
+        start = norm.find(start_anchor)
+        if start < 0:
             return norm
-        old_block = (
-            '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "' + mime + '", true, paths -> {\n'
-            '                            if (paths == null || paths.isEmpty()) {\n'
-            '                                return;\n'
-            '                            }\n'
-            '                            try {\n'
-            '                                if (documentsDelegate != null) {\n'
-            '                                    documentsDelegate.didSelectFiles(paths, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
-            '                                } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
-            '                                    ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
-            '                                            .didSelectFiles(paths, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
-            '                                }\n'
-            '                            } catch (Throwable t) {\n'
-            '                                FileLog.e(t);\n'
-            '                            } finally {\n'
-            '                                try {\n'
-            '                                    dismiss(true);\n'
-            '                                } catch (Throwable ignored) {}\n'
-            '                            }\n'
-            '                        });'
-        )
-        new_block = (
-            '                        final boolean colgramPremium = org.telegram.messenger.UserConfig.getInstance(currentAccount).isPremium();\n'
-            '                        final long colgramMaxBytes = colgramPremium\n'
-            '                                ? org.colgram.core.ColgramFileImport.PREMIUM_MAX_FILE_BYTES\n'
-            '                                : org.colgram.core.ColgramFileImport.DEFAULT_MAX_FILE_BYTES;\n'
-            '                        final long[] colgramLastToast = new long[]{0L};\n'
-            '                        org.colgram.core.ColgramFileImport.ProgressListener colgramProgress = new org.colgram.core.ColgramFileImport.ProgressListener() {\n'
-            '                            final android.content.Context colgramAppCtx = activity.getApplicationContext();\n'
-            '                            @Override\n'
-            '                            public void onProgress(int done, int total, String currentName, long bytesCopied, long totalBytes) {\n'
-            '                                long now = android.os.SystemClock.uptimeMillis();\n'
-            '                                long effectiveMax = Math.max(totalBytes, bytesCopied);\n'
-            '                                if (now - colgramLastToast[0] >= 1800L && effectiveMax >= org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n'
-            '                                    colgramLastToast[0] = now;\n'
-            '                                    String label = totalBytes > 0L\n'
-            '                                            ? ((int) Math.min(99L, (bytesCopied * 100L) / totalBytes) + "%")\n'
-            '                                            : ((bytesCopied / (1024L * 1024L)) + " МБ");\n'
-            '                                    android.widget.Toast.makeText(colgramAppCtx, "Подготовка файла (" + label + "): " + currentName, android.widget.Toast.LENGTH_SHORT).show();\n'
-            '                                }\n'
-            '                            }\n'
-            '                            @Override\n'
-            '                            public void onRejected(String fileName, String reason) {\n'
-            '                                String msg = "file_too_large".equals(reason)\n'
-            '                                        ? ("Файл слишком большой (" + (colgramPremium ? "4 ГБ" : "2 ГБ") + "): " + fileName)\n'
-            '                                        : ("insufficient_storage".equals(reason)\n'
-            '                                                ? ("Недостаточно места на диске для: " + fileName)\n'
-            '                                                : ("Не удалось подготовить файл: " + fileName));\n'
-            '                                android.widget.Toast.makeText(colgramAppCtx, msg, android.widget.Toast.LENGTH_LONG).show();\n'
-            '                            }\n'
-            '                        };\n'
-            '                        org.colgram.core.ColgramFileImport.pickFiles(activity, "' + mime + '", true, colgramMaxBytes, paths -> {\n'
-            '                            if (paths == null || paths.isEmpty()) {\n'
-            '                                return;\n'
-            '                            }\n'
-            '                            try {\n'
-            '                                final ArrayList<String> colgramPathsList = new ArrayList<>(paths);\n'
-            '                                if (documentsDelegate != null) {\n'
-            '                                    documentsDelegate.didSelectFiles(colgramPathsList, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
-            '                                } else if (baseFragment instanceof ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) {\n'
-            '                                    ((ChatAttachAlertDocumentLayout.DocumentSelectActivityDelegate) baseFragment)\n'
-            '                                            .didSelectFiles(colgramPathsList, "", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n'
-            '                                }\n'
-            '                            } catch (Throwable t) {\n'
-            '                                FileLog.e(t);\n'
-            '                            }\n'
-            '                        }, colgramProgress);\n'
-            '                        try { dismiss(true); } catch (Throwable ignored) {} // colgram-nonblocking-' + mode_tag
-        )
-        if old_block in norm:
-            return norm.replace(old_block, new_block, 1)
-        return norm
+        end = norm.find(end_anchor, start)
+        if end < 0 or (end - start) > 8000:
+            return norm
+        existing = norm[start:end + len(end_anchor)]
+        if marker in existing:
+            return norm
+        return norm[:start] + replacement + norm[end + len(end_anchor):]
 
     def patch_chat_attach(content: str) -> str:
         norm = content.replace("\r\n", "\n")
-        updated = _replace_pick(norm, "audio/*", True)
-        updated = _replace_pick(updated, "*/*", False)
+        updated = norm
+
+        # 1a. num == 3 ("Музыка"): remove blind SAF auto-send hijack; open native audio layout without storage permission nag
+        updated = _replace_branch_slice(
+            updated,
+            "                } else if (num == 3) {\n",
+            "                    openAudioLayout(true);\n",
+            "// colgram-nonblocking-audio (native audio composer)",
+            "                } else if (num == 3) {\n"
+            "                    // colgram-nonblocking-audio (native audio composer)\n"
+            "                    if (!musicEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"
+            "                        return;\n"
+            "                    }\n"
+            "                    if (!org.colgram.core.ColgramConfig.isSandboxStorageEnabled() && activity != null) {\n"
+            "                        if (Build.VERSION.SDK_INT >= 33) {\n"
+            "                            if (activity.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {\n"
+            "                                activity.requestPermissions(new String[]{Manifest.permission.READ_MEDIA_AUDIO}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);\n"
+            "                                return;\n"
+            "                            }\n"
+            "                        } else if (Build.VERSION.SDK_INT >= 23 && activity.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {\n"
+            "                            AndroidUtilities.findActivity(getContext()).requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);\n"
+            "                            return;\n"
+            "                        }\n"
+            "                    }\n"
+            "                    openAudioLayout(true);\n",
+        )
+
+        # 1b. num == 4 ("Файл"): remove blind SAF auto-send hijack; open native DocumentLayout composer with zero permission nag
+        updated = _replace_branch_slice(
+            updated,
+            "                } else if (num == 4) {\n",
+            "                    openDocumentsLayout(true);\n",
+            "// colgram-nonblocking-doc (native document composer)",
+            "                } else if (num == 4) {\n"
+            "                    // colgram-nonblocking-doc (native document composer)\n"
+            "                    if (!documentsEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"
+            "                        return;\n"
+            "                    }\n"
+            "                    if (!org.colgram.core.ColgramConfig.isSandboxStorageEnabled() && activity != null) {\n"
+            "                        if (Build.VERSION.SDK_INT >= 33) {\n"
+            "                            if (activity.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED ||\n"
+            "                                    activity.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {\n"
+            "                                activity.requestPermissions(new String[]{Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);\n"
+            "                                return;\n"
+            "                            }\n"
+            "                        } else if (Build.VERSION.SDK_INT >= 23 && activity.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {\n"
+            "                            AndroidUtilities.findActivity(getContext()).requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);\n"
+            "                            return;\n"
+            "                        }\n"
+            "                    }\n"
+            "                    openDocumentsLayout(true);\n",
+        )
+
+        # 1c. num == 10 ("Папка Colgram"): open directly inside native DocumentLayout instead of single-file blind send
+        old_num10 = (
+            "                } else if (num == 10) {\n"
+            "                    // Our folder, presented on top of the chat; the sheet dismisses itself because\n"
+            "                    // the picker is a full screen now. The listener is one-shot and static: this\n"
+            "                    // sheet does not survive the transition, so nothing could hold the callback.\n"
+            "                    org.telegram.ui.ColgramFilesActivity colgramPick = new org.telegram.ui.ColgramFilesActivity();\n"
+            "                    org.telegram.ui.ColgramFilesActivity.beginPick(colgramPaths -> {\n"
+            "                        if (documentsDelegate != null) {\n"
+            "                            documentsDelegate.didSelectFiles(colgramPaths, \"\", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n"
+            "                        } else if (baseFragment instanceof ChatActivity) {\n"
+            "                            ((ChatActivity) baseFragment).didSelectFiles(colgramPaths, \"\", null, new ArrayList<>(), true, 0, 0, 0, false, 0);\n"
+            "                        }\n"
+            "                    });\n"
+            "                    if (baseFragment != null) {\n"
+            "                        baseFragment.presentFragment(colgramPick);\n"
+            "                    }\n"
+            "                    dismiss();"
+        )
+        new_num10 = (
+            "                } else if (num == 10) {\n"
+            "                    if (!documentsEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"
+            "                        return;\n"
+            "                    }\n"
+            "                    openDocumentsLayout(true);\n"
+            "                    if (documentLayout != null && documentsEnabled) {\n"
+            "                        File colgramSandboxDir = org.colgram.core.ColgramStorageSandbox.getSandboxRootDir(getContext());\n"
+            "                        if (colgramSandboxDir != null) {\n"
+            "                            documentLayout.colgramOpenDirectory(colgramSandboxDir, \"Папка Colgram\");\n"
+            "                        }\n"
+            "                    }"
+        )
+        if old_num10 in updated:
+            updated = updated.replace(old_num10, new_num10, 1)
+
+        # 1d. openAttachLayoutForType(LAYOUT_TYPE_MUSIC): skip forced permission check when sandbox storage is enabled
+        old_type_music = (
+            "        if (layoutType == LAYOUT_TYPE_MUSIC) {\n"
+            "            if (!musicEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"
+            "                return;\n"
+            "            }\n"
+            "            final Activity activity = baseFragment != null ? baseFragment.getParentActivity() : null;\n"
+            "            if (activity != null) {"
+        )
+        new_type_music = (
+            "        if (layoutType == LAYOUT_TYPE_MUSIC) {\n"
+            "            if (!musicEnabled && checkCanRemoveRestrictionsByBoosts()) {\n"
+            "                return;\n"
+            "            }\n"
+            "            final Activity activity = baseFragment != null ? baseFragment.getParentActivity() : null;\n"
+            "            if (!org.colgram.core.ColgramConfig.isSandboxStorageEnabled() && activity != null) {"
+        )
+        if old_type_music in updated:
+            updated = updated.replace(old_type_music, new_type_music, 1)
+
+        # 1e. Suppress false red '!' permission error badges on File & Music tabs in sandbox mode
+        old_doc_err = "                        err = !checkPhotoAndDocumentsPermission(mContext);"
+        new_doc_err = "                        err = !org.colgram.core.ColgramConfig.isSandboxStorageEnabled() && !checkPhotoAndDocumentsPermission(mContext);"
+        if old_doc_err in updated:
+            updated = updated.replace(old_doc_err, new_doc_err, 1)
+
+        old_music_err = "                        err = !checkMusicPermission(mContext);"
+        new_music_err = "                        err = !org.colgram.core.ColgramConfig.isSandboxStorageEnabled() && !checkMusicPermission(mContext);"
+        if old_music_err in updated:
+            updated = updated.replace(old_music_err, new_music_err, 1)
+
+        # 1f. Route documentLayout's startDocumentSelectActivity() through ColgramFileImport into composer
+        old_start_doc = (
+            "                @Override\n"
+            "                public void startDocumentSelectActivity() {\n"
+            "                    if (documentsDelegate != null) {"
+        )
+        new_start_doc = (
+            "                @Override\n"
+            "                public void startDocumentSelectActivity() {\n"
+            "                    if (documentsDelegate == null && baseFragment instanceof ChatActivity) {\n"
+            "                        colgramLaunchSafIntoDocumentComposer(\"*/*\");\n"
+            "                        return;\n"
+            "                    }\n"
+            "                    if (documentsDelegate != null) {"
+        )
+        if old_start_doc in updated and 'colgramLaunchSafIntoDocumentComposer("*/*");' not in updated:
+            updated = updated.replace(old_start_doc, new_start_doc, 1)
+
+        # 1g. Repair any earlier mis-scoped injection inside static AttachAlertLayout.onDestroy()
+        for broken_inner in (
+            "        public void onDestroy() {\n"
+            "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
+            "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
+            "        }\n\n"
+            "        }",
+            "        public void onDestroy() {\n"
+            "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
+            "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
+            "        }\n"
+            "        }",
+        ):
+            if broken_inner in updated:
+                updated = updated.replace(broken_inner, "        public void onDestroy() {\n\n        }")
+
+        # Cancel active SAF copy on outer ChatAttachAlert destroy / dismiss if user did not press Send
+        on_destroy_marker = "// colgram-attach-composer-v2"
+        old_on_destroy = "\n    public void onDestroy() {\n"
+        new_on_destroy = (
+            "\n    public void onDestroy() {\n"
+            f"        {on_destroy_marker}\n"
+            "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
+            "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
+            "        }\n"
+        )
+        if old_on_destroy in updated and on_destroy_marker not in updated:
+            if "\n    public void onDestroy() {\n        if (!buttonPressed && !sent" not in updated:
+                updated = updated.replace(old_on_destroy, new_on_destroy, 1)
+            else:
+                updated = updated.replace(
+                    old_on_destroy,
+                    f"\n    public void onDestroy() {{\n        {on_destroy_marker}\n",
+                    1,
+                )
+
+        old_dismiss_int = "\n    public void dismissInternal() {\n"
+        new_dismiss_int = (
+            "\n    public void dismissInternal() {\n"
+            "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
+            "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
+            "        }\n"
+        )
+        if old_dismiss_int in updated and (old_dismiss_int + "        if (!buttonPressed && !sent") not in updated:
+            updated = updated.replace(old_dismiss_int, new_dismiss_int, 1)
+
+        # 1h. Add shared SAF-to-DocumentLayout composer bridge methods
+        doc_getter_anchor = "    public ChatAttachAlertDocumentLayout getDocumentLayout() {"
+        saf_bridge_methods = (
+            "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress(\n"
+            "            final Context colgramAppCtx, final boolean colgramPremium) {\n"
+            "        final long[] colgramLastToast = new long[]{0L};\n"
+            "        return new org.colgram.core.ColgramFileImport.ProgressListener() {\n"
+            "            @Override\n"
+            "            public void onProgress(int done, int total, String currentName, long bytesCopied, long totalBytes) {\n"
+            "                long now = android.os.SystemClock.uptimeMillis();\n"
+            "                long effectiveMax = Math.max(totalBytes, bytesCopied);\n"
+            "                if (now - colgramLastToast[0] >= 1800L && effectiveMax >= org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n"
+            "                    colgramLastToast[0] = now;\n"
+            "                    String label = totalBytes > 0L\n"
+            "                            ? ((int) Math.min(99L, (bytesCopied * 100L) / totalBytes) + \"%\")\n"
+            "                            : ((bytesCopied / (1024L * 1024L)) + \" МБ\");\n"
+            "                    android.widget.Toast.makeText(colgramAppCtx, \"Подготовка файла (\" + label + \"): \" + currentName, android.widget.Toast.LENGTH_SHORT).show();\n"
+            "                }\n"
+            "            }\n\n"
+            "            @Override\n"
+            "            public void onRejected(String fileName, String reason) {\n"
+            "                String msg = \"file_too_large\".equals(reason)\n"
+            "                        ? (\"Файл слишком большой (\" + (colgramPremium ? \"4 ГБ\" : \"2 ГБ\") + \"): \" + fileName)\n"
+            "                        : (\"insufficient_storage\".equals(reason)\n"
+            "                                ? (\"Недостаточно места на диске для: \" + fileName)\n"
+            "                                : (\"Не удалось подготовить файл: \" + fileName));\n"
+            "                android.widget.Toast.makeText(colgramAppCtx, msg, android.widget.Toast.LENGTH_LONG).show();\n"
+            "            }\n"
+            "        };\n"
+            "    }\n\n"
+            "    private void colgramDeliverImportedPaths(java.util.List<String> paths) {\n"
+            "        if (paths == null || paths.isEmpty() || destroyed || isDismissed()) {\n"
+            "            return;\n"
+            "        }\n"
+            "        try {\n"
+            "            openDocumentsLayout(false);\n"
+            "            if (documentLayout != null) {\n"
+            "                if (currentAttachLayout != documentLayout) {\n"
+            "                    showLayout(documentLayout, LAYOUT_TYPE_DOCUMENTS, false);\n"
+            "                }\n"
+            "                documentLayout.colgramAddImportedFiles(paths);\n"
+            "            }\n"
+            "        } catch (Throwable t) {\n"
+            "            FileLog.e(t);\n"
+            "        }\n"
+            "    }\n\n"
+            "    public void colgramLaunchSafIntoDocumentComposer(String mime) {\n"
+            "        final Activity activity = baseFragment != null\n"
+            "                ? baseFragment.getParentActivity()\n"
+            "                : AndroidUtilities.findActivity(getContext());\n"
+            "        if (activity == null) {\n"
+            "            return;\n"
+            "        }\n"
+            "        final boolean colgramPremium = org.telegram.messenger.UserConfig.getInstance(currentAccount).isPremium();\n"
+            "        final long colgramMaxBytes = colgramPremium\n"
+            "                ? org.colgram.core.ColgramFileImport.PREMIUM_MAX_FILE_BYTES\n"
+            "                : org.colgram.core.ColgramFileImport.DEFAULT_MAX_FILE_BYTES;\n"
+            "        final Context colgramAppCtx = activity.getApplicationContext();\n"
+            "        org.colgram.core.ColgramFileImport.pickFiles(\n"
+            "                activity, mime, true, colgramMaxBytes,\n"
+            "                this::colgramDeliverImportedPaths,\n"
+            "                colgramCreateImportProgress(colgramAppCtx, colgramPremium));\n"
+            "    }\n\n"
+            "    public void colgramStageIntentResultToDocumentComposer(Intent data) {\n"
+            "        final Context ctx = baseFragment != null && baseFragment.getParentActivity() != null\n"
+            "                ? baseFragment.getParentActivity()\n"
+            "                : getContext();\n"
+            "        if (ctx == null || data == null) {\n"
+            "            return;\n"
+            "        }\n"
+            "        final boolean colgramPremium = org.telegram.messenger.UserConfig.getInstance(currentAccount).isPremium();\n"
+            "        final long colgramMaxBytes = colgramPremium\n"
+            "                ? org.colgram.core.ColgramFileImport.PREMIUM_MAX_FILE_BYTES\n"
+            "                : org.colgram.core.ColgramFileImport.DEFAULT_MAX_FILE_BYTES;\n"
+            "        final Context colgramAppCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;\n"
+            "        org.colgram.core.ColgramFileImport.importIntentResult(\n"
+            "                ctx, data, colgramMaxBytes,\n"
+            "                this::colgramDeliverImportedPaths,\n"
+            "                colgramCreateImportProgress(colgramAppCtx, colgramPremium));\n"
+            "    }\n\n"
+            + doc_getter_anchor
+        )
+        if doc_getter_anchor in updated and "public void colgramLaunchSafIntoDocumentComposer(" not in updated:
+            updated = updated.replace(doc_getter_anchor, saf_bridge_methods, 1)
+
         if updated == norm:
             return content
         eol = "\r\n" if "\r\n" in content else "\n"
         return updated.replace("\n", eol)
 
-    patch_file_fn(chat_attach_alert, patch_chat_attach, "Math.max(totalBytes, bytesCopied)", "ChatAttachAlert.java non-blocking 2GB/4GB file picker")
+    patch_file_fn(chat_attach_alert, patch_chat_attach, "// colgram-attach-composer-v2", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
 
     # =========================================================================
-    # 2. ChatAttachAlertDocumentLayout.java: match FileLoader '<' limit + guard
-    #    scoped storage DIRECTORY_DOWNLOADS access.
+    # 2. ChatAttachAlertDocumentLayout.java:
+    #    - Strict < 2GB/4GB limit + scheduleRepeatPeriod forwarding
+    #    - Off-UI-thread recent files from Downloads, ColgramStorageSandbox, MediaStore.Downloads
+    #    - Top "Выбрать с устройства (Файлы / Загрузки)" + "Папка Colgram" roots
+    #    - Gallery media permission prompt only on Gallery tap
+    #    - colgramAddImportedFiles() & colgramOpenDirectory() into native composer
     # =========================================================================
     doc_layout = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertDocumentLayout.java")
     eol_patch_fn(
@@ -200,16 +330,497 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     )
     eol_patch_fn(
         doc_layout,
-        "        checkDirectory(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS));",
-        "        try {\n"
-        "            File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);\n"
-        "            if (downloadsDir != null && downloadsDir.exists() && downloadsDir.canRead()) {\n"
-        "                checkDirectory(downloadsDir);\n"
-        "            }\n"
-        "        } catch (Throwable e) {\n"
-        "            FileLog.e(e);\n"
-        "        }",
-        "ChatAttachAlertDocumentLayout.java safe Downloads scoped-storage guard",
+        "delegate.didSelectFiles(files, caption, captionEntities, fmessages, notify, scheduleDate, 0, effectId, invertMedia, payStars);",
+        "delegate.didSelectFiles(files, caption, captionEntities, fmessages, notify, scheduleDate, scheduleRepeatPeriod, effectId, invertMedia, payStars);",
+        "ChatAttachAlertDocumentLayout.java forward scheduleRepeatPeriod",
+    )
+
+    def patch_doc_layout(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        updated = norm
+
+        # 2a. Safe SAF-null root tap + Gallery media permission prompt on demand
+        old_click = (
+            "                if (!BuildVars.NO_SCOPED_STORAGE && (item.icon == R.drawable.files_storage || item.icon == R.drawable.files_internal) && !isExternalStorageManager) {\n"
+            "                    delegate.startDocumentSelectActivity();\n"
+            "                } else if (file == null) {\n"
+            "                    if (item.icon == R.drawable.files_gallery) {"
+        )
+        new_click = (
+            "                if (item.icon == R.drawable.files_storage && file == null) {\n"
+            "                    if (delegate != null) {\n"
+            "                        delegate.startDocumentSelectActivity();\n"
+            "                    }\n"
+            "                } else if (!BuildVars.NO_SCOPED_STORAGE && (item.icon == R.drawable.files_storage || item.icon == R.drawable.files_internal) && !isExternalStorageManager) {\n"
+            "                    if (delegate != null) {\n"
+            "                        delegate.startDocumentSelectActivity();\n"
+            "                    }\n"
+            "                } else if (file == null) {\n"
+            "                    if (item.icon == R.drawable.files_gallery) {\n"
+            "                        android.app.Activity galleryAct = parentAlert != null && parentAlert.baseFragment != null\n"
+            "                                ? parentAlert.baseFragment.getParentActivity()\n"
+            "                                : AndroidUtilities.findActivity(getContext());\n"
+            "                        if (galleryAct != null) {\n"
+            "                            if (Build.VERSION.SDK_INT >= 33) {\n"
+            "                                if (galleryAct.checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES) != android.content.pm.PackageManager.PERMISSION_GRANTED\n"
+            "                                        || galleryAct.checkSelfPermission(android.Manifest.permission.READ_MEDIA_VIDEO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {\n"
+            "                                    galleryAct.requestPermissions(new String[]{android.Manifest.permission.READ_MEDIA_IMAGES, android.Manifest.permission.READ_MEDIA_VIDEO}, org.telegram.ui.BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);\n"
+            "                                    return;\n"
+            "                                }\n"
+            "                            } else if (Build.VERSION.SDK_INT >= 23 && galleryAct.checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {\n"
+            "                                galleryAct.requestPermissions(new String[]{android.Manifest.permission.READ_EXTERNAL_STORAGE}, org.telegram.ui.BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);\n"
+            "                                return;\n"
+            "                            }\n"
+            "                        }"
+        )
+        if old_click in updated and "if (item.icon == R.drawable.files_storage && file == null)" not in updated:
+            updated = updated.replace(old_click, new_click, 1)
+
+        # 2b. listRoots(): add top SAF picker + browsable "Папка Colgram" root; hide redundant unbrowsable storage row under Scoped Storage
+        old_roots_anchor = (
+            "        boolean isExternalStorageManager = false;\n"
+            "        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {\n"
+            "            isExternalStorageManager = Environment.isExternalStorageManager();\n"
+            "        }\n"
+            "        // TODO add permission for read all files and uncomment for direct version\n"
+            "//        if (!BuildVars.NO_SCOPED_STORAGE && !isExternalStorageManager) {\n"
+            "//            ListItem ext = new ListItem();\n"
+            "//            ext.title = LocaleController.getString(R.string.InternalStorage);\n"
+            "//            ext.icon = R.drawable.files_storage;\n"
+            "//            ext.subtitle = LocaleController.getString(R.string.InternalFolderInfo);\n"
+            "//            items.add(ext);\n"
+            "//        } else {\n"
+            "            String defaultPath = Environment.getExternalStorageDirectory().getPath();"
+        )
+        new_roots_anchor = (
+            "        boolean isExternalStorageManager = false;\n"
+            "        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {\n"
+            "            isExternalStorageManager = Environment.isExternalStorageManager();\n"
+            "        }\n"
+            "        ListItem safRoot = new ListItem();\n"
+            "        safRoot.title = \"Выбрать с устройства (Файлы / Загрузки)\";\n"
+            "        safRoot.subtitle = \"Открыть системный проводник Android\";\n"
+            "        safRoot.icon = R.drawable.files_storage;\n"
+            "        safRoot.file = null;\n"
+            "        listAdapter.items.add(safRoot);\n"
+            "        try {\n"
+            "            File colgramSandboxDir = org.colgram.core.ColgramStorageSandbox.getSandboxRootDir(ApplicationLoader.applicationContext);\n"
+            "            if (colgramSandboxDir != null && colgramSandboxDir.exists()) {\n"
+            "                ListItem colgramRoot = new ListItem();\n"
+            "                colgramRoot.title = \"Папка Colgram\";\n"
+            "                colgramRoot.subtitle = \"Песочница и сохранённые файлы\";\n"
+            "                colgramRoot.icon = R.drawable.files_folder;\n"
+            "                colgramRoot.file = colgramSandboxDir;\n"
+            "                listAdapter.items.add(colgramRoot);\n"
+            "                paths.add(colgramSandboxDir.getPath());\n"
+            "            }\n"
+            "        } catch (Throwable ignored) {}\n"
+            "        if (BuildVars.NO_SCOPED_STORAGE || isExternalStorageManager) {\n"
+            "            String defaultPath = Environment.getExternalStorageDirectory().getPath();"
+        )
+        if old_roots_anchor in updated and 'safRoot.title = "Выбрать с устройства (Файлы / Загрузки)";' not in updated:
+            updated = updated.replace(old_roots_anchor, new_roots_anchor, 1)
+            old_roots_close = (
+                "            }\n"
+                "        //}\n\n"
+                "        ListItem fs;"
+            )
+            new_roots_close = (
+                "            }\n"
+                "        }\n\n"
+                "        ListItem fs;"
+            )
+            if old_roots_close in updated:
+                updated = updated.replace(old_roots_close, new_roots_close, 1)
+
+        # 2c. Off-UI-thread loadRecentFiles + ColgramStorageSandbox + MediaStore.Downloads + Composer bridge methods
+        recent_start = "    public void loadRecentFiles() {\n"
+        recent_end = "\n    private void sortRecentItems() {"
+        rs = updated.find(recent_start)
+        re_pos = updated.find(recent_end, rs) if rs >= 0 else -1
+        if rs >= 0 and re_pos > rs and "colgramAddImportedFiles" not in updated[rs:re_pos]:
+            new_recent_block = (
+                "    public boolean colgramIsSendPressed() {\n"
+                "        return sendPressed;\n"
+                "    }\n\n"
+                "    public void colgramOpenDirectory(File dir, String title) {\n"
+                "        if (dir == null || !dir.isDirectory() || !dir.canRead()) {\n"
+                "            return;\n"
+                "        }\n"
+                "        HistoryEntry he = new HistoryEntry();\n"
+                "        he.dir = currentDir;\n"
+                "        he.title = (parentAlert != null && parentAlert.actionBar != null && parentAlert.actionBar.getTitle() != null)\n"
+                "                ? parentAlert.actionBar.getTitle()\n"
+                "                : LocaleController.getString(R.string.SelectFile);\n"
+                "        listAdapter.history.add(he);\n"
+                "        if (!listFiles(dir)) {\n"
+                "            listAdapter.history.remove(he);\n"
+                "            return;\n"
+                "        }\n"
+                "        if (parentAlert != null && parentAlert.actionBar != null && title != null && !title.isEmpty()) {\n"
+                "            parentAlert.actionBar.setTitle(title);\n"
+                "        }\n"
+                "        updateSearchButton();\n"
+                "        updateEmptyView();\n"
+                "        if (listView != null && listView.getChildCount() == 0 && layoutManager != null) {\n"
+                "            layoutManager.scrollToPositionWithOffset(0, 0);\n"
+                "        }\n"
+                "    }\n\n"
+                "    public void colgramAddImportedFiles(java.util.List<String> paths) {\n"
+                "        if (paths == null || paths.isEmpty()) {\n"
+                "            return;\n"
+                "        }\n"
+                "        int acc = parentAlert != null ? parentAlert.currentAccount : UserConfig.selectedAccount;\n"
+                "        boolean isPremium = UserConfig.getInstance(acc).isPremium();\n"
+                "        boolean addedAny = false;\n"
+                "        for (int i = 0; i < paths.size(); i++) {\n"
+                "            String path = paths.get(i);\n"
+                "            if (path == null || path.isEmpty()) {\n"
+                "                continue;\n"
+                "            }\n"
+                "            if (maxSelectedFiles >= 0 && selectedFiles.size() >= maxSelectedFiles) {\n"
+                "                break;\n"
+                "            }\n"
+                "            File file = new File(path);\n"
+                "            if (!file.exists() || !file.isFile() || !file.canRead() || file.length() <= 0L) {\n"
+                "                continue;\n"
+                "            }\n"
+                "            if ((file.length() >= FileLoader.DEFAULT_MAX_FILE_SIZE && !isPremium) || file.length() >= FileLoader.DEFAULT_MAX_FILE_SIZE_PREMIUM) {\n"
+                "                org.colgram.core.ColgramFileImport.cleanupRejectedStagedFile(ApplicationLoader.applicationContext, path);\n"
+                "                continue;\n"
+                "            }\n"
+                "            if (isSoundPicker && !isRingtone(file)) {\n"
+                "                continue;\n"
+                "            }\n"
+                "            ListItem item = colgramCreateFileListItem(file);\n"
+                "            if (canSelectOnlyImageFiles && item.thumb == null) {\n"
+                "                continue;\n"
+                "            }\n"
+                "            String absPath = file.getAbsolutePath();\n"
+                "            for (int r = listAdapter.recentItems.size() - 1; r >= 0; r--) {\n"
+                "                ListItem existing = listAdapter.recentItems.get(r);\n"
+                "                if (existing.file != null && absPath.equals(existing.file.getAbsolutePath())) {\n"
+                "                    listAdapter.recentItems.remove(r);\n"
+                "                }\n"
+                "            }\n"
+                "            listAdapter.recentItems.add(0, item);\n"
+                "            if (!selectedFiles.containsKey(absPath)) {\n"
+                "                selectedFiles.put(absPath, item);\n"
+                "                selectedFilesOrder.add(absPath);\n"
+                "            }\n"
+                "            addedAny = true;\n"
+                "        }\n"
+                "        if (!addedAny) {\n"
+                "            return;\n"
+                "        }\n"
+                "        if (searching && parentAlert != null && parentAlert.actionBar != null) {\n"
+                "            parentAlert.actionBar.closeSearchField();\n"
+                "        }\n"
+                "        if (!listAdapter.history.isEmpty() || currentDir != null) {\n"
+                "            listAdapter.history.clear();\n"
+                "            currentDir = null;\n"
+                "            listRoots();\n"
+                "            if (parentAlert != null && parentAlert.actionBar != null) {\n"
+                "                parentAlert.actionBar.setTitle(LocaleController.getString(R.string.SelectFile));\n"
+                "            }\n"
+                "        }\n"
+                "        hasFiles = true;\n"
+                "        updateSearchButton();\n"
+                "        listAdapter.notifyDataSetChanged();\n"
+                "        if (parentAlert != null) {\n"
+                "            parentAlert.updateCountButton(1);\n"
+                "        }\n"
+                "    }\n\n"
+                "    private static ListItem colgramCreateFileListItem(File file) {\n"
+                "        ListItem item = new ListItem();\n"
+                "        String fname = file.getName();\n"
+                "        item.title = fname;\n"
+                "        item.file = file;\n"
+                "        String[] sp = fname.split(\"\\\\.\");\n"
+                "        item.ext = sp.length > 1 ? sp[sp.length - 1] : \"?\";\n"
+                "        item.subtitle = AndroidUtilities.formatFileSize(file.length());\n"
+                "        String lower = fname.toLowerCase(Locale.US);\n"
+                "        if (lower.endsWith(\".jpg\") || lower.endsWith(\".png\") || lower.endsWith(\".gif\") || lower.endsWith(\".jpeg\") || lower.endsWith(\".webp\")) {\n"
+                "            item.thumb = file.getAbsolutePath();\n"
+                "        }\n"
+                "        return item;\n"
+                "    }\n\n"
+                "    private static boolean colgramIsSkippedRecentName(String name) {\n"
+                "        return name == null || name.isEmpty() || name.startsWith(\".\") || \".nomedia\".equalsIgnoreCase(name) || name.startsWith(\".cgtmp\") || name.endsWith(\".cgtmp\");\n"
+                "    }\n\n"
+                "    private static void colgramCollectRecentFromDir(File rootDir, ArrayList<ListItem> out, HashSet<String> seen, File storiesDir, int maxCount) {\n"
+                "        if (rootDir == null || !rootDir.isDirectory() || !rootDir.canRead() || out.size() >= maxCount) {\n"
+                "            return;\n"
+                "        }\n"
+                "        File[] files = rootDir.listFiles();\n"
+                "        if (files == null) {\n"
+                "            return;\n"
+                "        }\n"
+                "        for (int a = 0; a < files.length && out.size() < maxCount; a++) {\n"
+                "            File file = files[a];\n"
+                "            if (file == null || file.equals(storiesDir) || colgramIsSkippedRecentName(file.getName())) {\n"
+                "                continue;\n"
+                "            }\n"
+                "            if (file.isDirectory()) {\n"
+                "                if (\"Telegram\".equals(file.getName())) {\n"
+                "                    colgramCollectRecentFromDir(file, out, seen, storiesDir, maxCount);\n"
+                "                }\n"
+                "                continue;\n"
+                "            }\n"
+                "            if (!file.isFile() || !file.canRead() || file.length() <= 0L) {\n"
+                "                continue;\n"
+                "            }\n"
+                "            String abs = file.getAbsolutePath();\n"
+                "            if (seen.add(abs)) {\n"
+                "                out.add(colgramCreateFileListItem(file));\n"
+                "            }\n"
+                "        }\n"
+                "    }\n\n"
+                "    private void colgramMergeRecentItems(ArrayList<ListItem> loaded) {\n"
+                "        if (loaded == null || loaded.isEmpty()) {\n"
+                "            return;\n"
+                "        }\n"
+                "        HashSet<String> existing = new HashSet<>();\n"
+                "        for (int i = 0; i < listAdapter.recentItems.size(); i++) {\n"
+                "            ListItem cur = listAdapter.recentItems.get(i);\n"
+                "            if (cur != null && cur.file != null) {\n"
+                "                existing.add(cur.file.getAbsolutePath());\n"
+                "            }\n"
+                "        }\n"
+                "        for (int i = 0; i < loaded.size(); i++) {\n"
+                "            ListItem item = loaded.get(i);\n"
+                "            if (item != null && item.file != null && existing.add(item.file.getAbsolutePath())) {\n"
+                "                listAdapter.recentItems.add(item);\n"
+                "            }\n"
+                "        }\n"
+                "        sortRecentItems();\n"
+                "        if (!listAdapter.recentItems.isEmpty()) {\n"
+                "            hasFiles = true;\n"
+                "        }\n"
+                "        updateSearchButton();\n"
+                "        listAdapter.notifyDataSetChanged();\n"
+                "    }\n\n"
+                "    public void loadRecentFiles() {\n"
+                "        final boolean soundMode = isSoundPicker;\n"
+                "        Utilities.globalQueue.postRunnable(() -> {\n"
+                "            final ArrayList<ListItem> loaded = new ArrayList<>();\n"
+                "            try {\n"
+                "                Context appCtx = ApplicationLoader.applicationContext;\n"
+                "                if (appCtx == null) {\n"
+                "                    return;\n"
+                "                }\n"
+                "                if (soundMode) {\n"
+                "                    if (Build.VERSION.SDK_INT >= 23) {\n"
+                "                        String perm = Build.VERSION.SDK_INT >= 33 ? android.Manifest.permission.READ_MEDIA_AUDIO : android.Manifest.permission.READ_EXTERNAL_STORAGE;\n"
+                "                        if (appCtx.checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED) {\n"
+                "                            return;\n"
+                "                        }\n"
+                "                    }\n"
+                "                    String[] projection = {\n"
+                "                            MediaStore.Audio.Media._ID,\n"
+                "                            MediaStore.Audio.Media.DATA,\n"
+                "                            MediaStore.Audio.Media.DURATION,\n"
+                "                            MediaStore.Audio.Media.SIZE,\n"
+                "                            MediaStore.Audio.Media.MIME_TYPE\n"
+                "                    };\n"
+                "                    try (Cursor cursor = appCtx.getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, MediaStore.Audio.Media.IS_MUSIC + \" != 0\", null, MediaStore.Audio.Media.DATE_ADDED + \" DESC\")) {\n"
+                "                        while (cursor != null && cursor.moveToNext()) {\n"
+                "                            String dataPath = cursor.getString(1);\n"
+                "                            if (dataPath == null || dataPath.isEmpty()) continue;\n"
+                "                            File file = new File(dataPath);\n"
+                "                            if (!file.isFile() || !file.canRead()) continue;\n"
+                "                            long duration = cursor.getLong(2);\n"
+                "                            long fileSize = cursor.getLong(3);\n"
+                "                            String mimeType = cursor.getString(4);\n"
+                "                            if (duration > MessagesController.getInstance(UserConfig.selectedAccount).ringtoneDurationMax * 1000 || fileSize > MessagesController.getInstance(UserConfig.selectedAccount).ringtoneSizeMax || (!TextUtils.isEmpty(mimeType) && !(\"audio/mpeg\".equals(mimeType) || !\"audio/mpeg4\".equals(mimeType)))) {\n"
+                "                                continue;\n"
+                "                            }\n"
+                "                            loaded.add(colgramCreateFileListItem(file));\n"
+                "                        }\n"
+                "                    } catch (Throwable e) {\n"
+                "                        FileLog.e(e);\n"
+                "                    }\n"
+                "                } else {\n"
+                "                    final HashSet<String> seen = new HashSet<>();\n"
+                "                    final File storiesDir = FileLoader.checkDirectory(FileLoader.MEDIA_DIR_STORIES);\n"
+                "                    try {\n"
+                "                        File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);\n"
+                "                        colgramCollectRecentFromDir(downloadsDir, loaded, seen, storiesDir, 40);\n"
+                "                    } catch (Throwable e) {\n"
+                "                        FileLog.e(e);\n"
+                "                    }\n"
+                "                    try {\n"
+                "                        colgramCollectRecentFromDir(org.colgram.core.ColgramStorageSandbox.getSandboxedDirectory(appCtx, 3), loaded, seen, storiesDir, 80);\n"
+                "                        colgramCollectRecentFromDir(org.colgram.core.ColgramStorageSandbox.getSandboxedDirectory(appCtx, 5), loaded, seen, storiesDir, 100);\n"
+                "                        colgramCollectRecentFromDir(appCtx.getExternalFilesDir(\"colgram_inbox\"), loaded, seen, storiesDir, 120);\n"
+                "                        if (appCtx.getFilesDir() != null) {\n"
+                "                            colgramCollectRecentFromDir(new File(appCtx.getFilesDir(), \"colgram_inbox\"), loaded, seen, storiesDir, 130);\n"
+                "                        }\n"
+                "                    } catch (Throwable ignored) {}\n"
+                "                    if (Build.VERSION.SDK_INT >= 29) {\n"
+                "                        try {\n"
+                "                            String[] dlProj = {\n"
+                "                                    MediaStore.MediaColumns._ID,\n"
+                "                                    MediaStore.MediaColumns.DISPLAY_NAME,\n"
+                "                                    MediaStore.MediaColumns.SIZE,\n"
+                "                                    MediaStore.MediaColumns.DATE_MODIFIED,\n"
+                "                                    MediaStore.MediaColumns.DATA\n"
+                "                            };\n"
+                "                            try (Cursor c = appCtx.getContentResolver().query(\n"
+                "                                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,\n"
+                "                                    dlProj, null, null,\n"
+                "                                    MediaStore.MediaColumns.DATE_MODIFIED + \" DESC\")) {\n"
+                "                                int count = 0;\n"
+                "                                while (c != null && c.moveToNext() && count < 60) {\n"
+                "                                    String p = c.getString(4);\n"
+                "                                    if (p == null || p.isEmpty()) continue;\n"
+                "                                    File f = new File(p);\n"
+                "                                    if (colgramIsSkippedRecentName(f.getName()) || !f.isFile() || !f.canRead() || f.length() <= 0L) {\n"
+                "                                        continue;\n"
+                "                                    }\n"
+                "                                    if (seen.add(f.getAbsolutePath())) {\n"
+                "                                        loaded.add(colgramCreateFileListItem(f));\n"
+                "                                        count++;\n"
+                "                                    }\n"
+                "                                }\n"
+                "                            }\n"
+                "                        } catch (Throwable ignored) {}\n"
+                "                    }\n"
+                "                }\n"
+                "            } catch (Throwable e) {\n"
+                "                FileLog.e(e);\n"
+                "            }\n"
+                "            if (!loaded.isEmpty()) {\n"
+                "                AndroidUtilities.runOnUIThread(() -> colgramMergeRecentItems(loaded));\n"
+                "            }\n"
+                "        });\n"
+                "    }\n\n"
+                "    private void checkDirectory(File rootDir) {\n"
+                "        if (rootDir == null || !rootDir.isDirectory() || !rootDir.canRead()) {\n"
+                "            return;\n"
+                "        }\n"
+                "        File[] files = rootDir.listFiles();\n"
+                "        File storiesDir = FileLoader.checkDirectory(FileLoader.MEDIA_DIR_STORIES);\n"
+                "        if (files != null) {\n"
+                "            for (int a = 0; a < files.length; a++) {\n"
+                "                File file = files[a];\n"
+                "                if (file == null || colgramIsSkippedRecentName(file.getName()) || file.equals(storiesDir)) {\n"
+                "                    continue;\n"
+                "                }\n"
+                "                if (file.isDirectory() && file.getName().equals(\"Telegram\")) {\n"
+                "                    checkDirectory(file);\n"
+                "                    continue;\n"
+                "                }\n"
+                "                if (file.isFile() && file.canRead()) {\n"
+                "                    listAdapter.recentItems.add(colgramCreateFileListItem(file));\n"
+                "                }\n"
+                "            }\n"
+                "        }\n"
+                "    }"
+            )
+            updated = updated[:rs] + new_recent_block + updated[re_pos:]
+
+        if updated == norm:
+            return content
+        eol = "\r\n" if "\r\n" in content else "\n"
+        return updated.replace("\n", eol)
+
+    patch_file_fn(
+        doc_layout,
+        patch_doc_layout,
+        "colgramAddImportedFiles(",
+        "ChatAttachAlertDocumentLayout.java SAF/Colgram roots, off-UI recent files, and composer bridge",
+    )
+
+    # =========================================================================
+    # 2b. ChatAttachAlertAudioLayout.java:
+    #     - Guard MediaStore.Audio query when audio permission is ungranted
+    #     - Add "Выбрать аудиофайл с устройства" SAF-to-composer button
+    # =========================================================================
+    audio_layout = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertAudioLayout.java")
+
+    def patch_audio_layout(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        updated = norm
+
+        old_consts = "    private int LOAD_MORE_SEARCH_PROFILE = 3;"
+        new_consts = (
+            "    private int LOAD_MORE_SEARCH_PROFILE = 3;\n"
+            "    private static final int COLGRAM_PICK_AUDIO_SAF = 4099;"
+        )
+        if old_consts in updated and "COLGRAM_PICK_AUDIO_SAF" not in updated:
+            updated = updated.replace(old_consts, new_consts, 1)
+
+        old_fill = (
+            "        items.add(UItem.asSpace(-100, dp(1)));\n"
+            "        int firstIndex = items.size();"
+        )
+        new_fill = (
+            "        items.add(UItem.asSpace(-100, dp(1)));\n"
+            "        if (TextUtils.isEmpty(query) && parentAlert != null && !parentAlert.isStoryAudioPicker && !parentAlert.isPollAttach) {\n"
+            "            adapter.whiteSectionStart();\n"
+            "            items.add(UItem.asButton(COLGRAM_PICK_AUDIO_SAF, R.drawable.msg_openin, \"Выбрать аудиофайл с устройства\").accent());\n"
+            "            adapter.whiteSectionEnd();\n"
+            "            items.add(UItem.asShadow(-101, null));\n"
+            "        }\n"
+            "        int firstIndex = items.size();"
+        )
+        if old_fill in updated and "COLGRAM_PICK_AUDIO_SAF, R.drawable.msg_openin" not in updated:
+            updated = updated.replace(old_fill, new_fill, 1)
+
+        old_click = (
+            "    private void onItemClick(UItem item, View view, int position, float x, float y) {\n"
+            "        if (item != null && item.id == LOAD_MORE_SEARCH_PROFILE) {"
+        )
+        new_click = (
+            "    private void onItemClick(UItem item, View view, int position, float x, float y) {\n"
+            "        if (item != null && item.id == COLGRAM_PICK_AUDIO_SAF) {\n"
+            "            if (parentAlert != null) {\n"
+            "                parentAlert.colgramLaunchSafIntoDocumentComposer(\"audio/*\");\n"
+            "            }\n"
+            "            return;\n"
+            "        }\n"
+            "        if (item != null && item.id == LOAD_MORE_SEARCH_PROFILE) {"
+        )
+        if old_click in updated and "item.id == COLGRAM_PICK_AUDIO_SAF" not in updated:
+            updated = updated.replace(old_click, new_click, 1)
+
+        old_load = (
+            "    private void loadAudio() {\n"
+            "        loadingAudio = true;\n"
+            "        Utilities.globalQueue.postRunnable(() -> {"
+        )
+        new_load = (
+            "    private void loadAudio() {\n"
+            "        if (android.os.Build.VERSION.SDK_INT >= 23) {\n"
+            "            String perm = android.os.Build.VERSION.SDK_INT >= 33\n"
+            "                    ? android.Manifest.permission.READ_MEDIA_AUDIO\n"
+            "                    : android.Manifest.permission.READ_EXTERNAL_STORAGE;\n"
+            "            if (ApplicationLoader.applicationContext == null\n"
+            "                    || ApplicationLoader.applicationContext.checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED) {\n"
+            "                loadingAudio = false;\n"
+            "                if (listView != null) {\n"
+            "                    updateWithSavingScroll();\n"
+            "                }\n"
+            "                return;\n"
+            "            }\n"
+            "        }\n"
+            "        loadingAudio = true;\n"
+            "        Utilities.globalQueue.postRunnable(() -> {"
+        )
+        if old_load in updated and "Manifest.permission.READ_MEDIA_AUDIO" not in updated:
+            updated = updated.replace(old_load, new_load, 1)
+
+        if updated == norm:
+            return content
+        eol = "\r\n" if "\r\n" in content else "\n"
+        return updated.replace("\n", eol)
+
+    patch_file_fn(
+        audio_layout,
+        patch_audio_layout,
+        "COLGRAM_PICK_AUDIO_SAF",
+        "ChatAttachAlertAudioLayout.java permission guard and SAF audio picker button",
     )
 
     # =========================================================================
@@ -1145,11 +1756,32 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
 
     # =========================================================================
     # 11. ChatActivity.java:
+    #     - Route requestCode == 21 through ColgramFileImport into DocumentLayout composer
     #     - Preserve waitingForLoad/endReached on 9s firstLoadMessages timeout
     #     - Exclude mid<=0 / unsent from processDeletedMessages preserve
     #     - Cancel active transfers on option 9990 local delete
     # =========================================================================
     chat_act = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
+    eol_patch_fn(
+        chat_act,
+        "            } else if (requestCode == 21) {\n"
+        "                if (data == null) {\n"
+        "                    showAttachmentError();\n"
+        "                    return;\n"
+        "                }\n"
+        "                if (editingMessageObject == null && chatMode == MODE_SCHEDULED) {",
+        "            } else if (requestCode == 21) {\n"
+        "                if (data == null) {\n"
+        "                    showAttachmentError();\n"
+        "                    return;\n"
+        "                }\n"
+        "                if (chatAttachAlert != null && chatAttachAlert.isShowing()) {\n"
+        "                    chatAttachAlert.colgramStageIntentResultToDocumentComposer(data);\n"
+        "                    return;\n"
+        "                }\n"
+        "                if (editingMessageObject == null && chatMode == MODE_SCHEDULED) {",
+        "ChatActivity.java route requestCode 21 through ColgramFileImport into DocumentLayout composer",
+    )
     eol_patch_fn(
         chat_act,
         "                waitingForLoad.clear();\n"

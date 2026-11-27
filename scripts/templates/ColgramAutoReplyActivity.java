@@ -1,5 +1,6 @@
 package org.telegram.ui;
 
+import android.app.Activity;
 import android.app.TimePickerDialog;
 import android.content.Context;
 import android.text.InputType;
@@ -14,7 +15,6 @@ import org.colgram.core.ColgramConfig;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
-import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
@@ -174,23 +174,22 @@ public class ColgramAutoReplyActivity extends BaseFragment {
 
     private void showTextEditor(boolean awayMode) {
         if (!canOpenDialog()) return;
-        Context context = getParentActivity();
-        final EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
-                context, resourceProvider, "Переменные: {name}, {first_name}, {username}, {time}", true);
-        input.setText(awayMode ? ColgramConfig.getAutoReplyAwayText() : ColgramConfig.getAutoReplyText());
-        input.setSelection(input.getText().length());
-
-        int pad = AndroidUtilities.dp(18);
-        FrameLayout container = new FrameLayout(context);
-        container.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(4));
-        container.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        showDialog(new AlertDialog.Builder(context, resourceProvider)
-                .setTitle(awayMode ? "Текст вне графика (Нет на месте)" : "Шаблон автоответа")
-                .setMessage("Доступные теги: {name}, {first_name}, {username}, {time}")
-                .setView(container)
-                .setPositiveButton("Сохранить", (d, w) -> {
-                    String text = input.getText().toString().trim();
+        Activity context = getParentActivity();
+        ColgramUiKit.showInputSheet(
+                context,
+                resourceProvider,
+                R.drawable.msg_edit,
+                awayMode ? "Текст вне графика (Нет на месте)" : "Шаблон автоответа",
+                "Доступные теги: {name}, {first_name}, {username}, {time}",
+                "Переменные: {name}, {first_name}, {username}, {time}",
+                awayMode ? ColgramConfig.getAutoReplyAwayText() : ColgramConfig.getAutoReplyText(),
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE,
+                false,
+                false,
+                false,
+                "Сохранить",
+                raw -> {
+                    String text = raw == null ? "" : raw.trim();
                     if (!text.isEmpty()) {
                         if (awayMode) ColgramConfig.setAutoReplyAwayText(text);
                         else ColgramConfig.setAutoReplyText(text);
@@ -198,36 +197,42 @@ public class ColgramAutoReplyActivity extends BaseFragment {
                             listAdapter.notifyItemChanged(awayMode ? awayTextRow : textRow);
                         }
                     }
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                },
+                null,
+                null
+        );
     }
 
     private void showAudiencePicker() {
         if (!canOpenDialog()) return;
-        Context context = getParentActivity();
+        Activity context = getParentActivity();
         String[] labels = {
                 "Все чаты",
                 "Только контакты",
                 "Кроме контактов (незнакомцы)",
                 "Только личные чаты"
         };
-        showDialog(new AlertDialog.Builder(context, resourceProvider)
-                .setTitle("Кому отвечать")
-                .setItems(labels, (d, which) -> {
+        ColgramUiKit.showChoiceSheet(
+                context,
+                resourceProvider,
+                R.drawable.msg_openprofile,
+                "Кому отвечать",
+                null,
+                labels,
+                ColgramConfig.getAutoReplyAudience(),
+                which -> {
                     ColgramConfig.setAutoReplyAudience(which);
                     if (listAdapter != null) {
                         listAdapter.notifyItemChanged(heroRow);
                         listAdapter.notifyItemChanged(audienceRow);
                     }
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                }
+        );
     }
 
     private void showCooldownPicker() {
         if (!canOpenDialog()) return;
-        Context context = getParentActivity();
+        Activity context = getParentActivity();
         final int[] options = {0, 60, 300, 900, 3600, 86400};
         final String[] labels = {
                 "Без паузы (на каждое сообщение)",
@@ -237,37 +242,49 @@ public class ColgramAutoReplyActivity extends BaseFragment {
                 "1 час",
                 "24 часа"
         };
-        showDialog(new AlertDialog.Builder(context, resourceProvider)
-                .setTitle("Пауза на один чат")
-                .setItems(labels, (d, which) -> {
+        int cur = ColgramConfig.getAutoReplyCooldownSec();
+        int selIdx = -1;
+        for (int i = 0; i < options.length; i++) {
+            if (options[i] == cur) { selIdx = i; break; }
+        }
+        ColgramUiKit.showChoiceSheet(
+                context,
+                resourceProvider,
+                R.drawable.msg_speed,
+                "Пауза на один чат",
+                null,
+                labels,
+                selIdx,
+                which -> {
                     ColgramConfig.setAutoReplyCooldownSec(options[which]);
                     if (listAdapter != null) listAdapter.notifyItemChanged(cooldownRow);
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                }
+        );
     }
 
     private void showBlacklistEditor() {
         if (!canOpenDialog()) return;
-        Context context = getParentActivity();
-        final EditTextBoldCursor input = ColgramMenuChrome.makeDialogEditText(
-                context, resourceProvider, "ID чатов через запятую (напр. 123456, -100987654)", false);
-        input.setText(ColgramConfig.getAutoReplyBlacklist());
-        input.setInputType(InputType.TYPE_CLASS_TEXT);
-        int pad = AndroidUtilities.dp(18);
-        FrameLayout container = new FrameLayout(context);
-        container.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(4));
-        container.addView(input, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        showDialog(new AlertDialog.Builder(context, resourceProvider)
-                .setTitle("Исключения (чёрный список ID)")
-                .setView(container)
-                .setPositiveButton("Сохранить", (d, w) -> {
-                    ColgramConfig.setAutoReplyBlacklist(input.getText().toString().trim());
+        Activity context = getParentActivity();
+        ColgramUiKit.showInputSheet(
+                context,
+                resourceProvider,
+                R.drawable.msg_block,
+                "Исключения (чёрный список ID)",
+                "Идентификаторы чатов или пользователей через запятую",
+                "ID чатов через запятую (напр. 123456, -100987654)",
+                ColgramConfig.getAutoReplyBlacklist(),
+                InputType.TYPE_CLASS_TEXT,
+                false,
+                false,
+                true,
+                "Сохранить",
+                raw -> {
+                    ColgramConfig.setAutoReplyBlacklist(raw == null ? "" : raw.trim());
                     if (listAdapter != null && blacklistRow >= 0) listAdapter.notifyItemChanged(blacklistRow);
-                })
-                .setNegativeButton("Отмена", null)
-                .create());
+                },
+                null,
+                null
+        );
     }
 
     private void pickTime(boolean isStart) {
@@ -306,11 +323,18 @@ public class ColgramAutoReplyActivity extends BaseFragment {
         String preview = chosen == null
                 ? "Сейчас активен рабочий период графика — автоответ в этот час отправляться не будет."
                 : ColgramAutoReplyPolicy.renderTemplate(chosen, "Иван Петров", "ivan_demo", h, m);
-        showDialog(new AlertDialog.Builder(context, resourceProvider)
-                .setTitle("Предпросмотр ответа")
-                .setMessage(preview)
-                .setPositiveButton("ОК", null)
-                .create());
+        ColgramUiKit.showInfoSheet(
+                getParentActivity(),
+                resourceProvider,
+                R.drawable.msg_reply_small,
+                "Предпросмотр ответа",
+                preview,
+                "ОК",
+                null,
+                null,
+                null,
+                true
+        );
     }
 
     private String audienceLabel(int mode) {
