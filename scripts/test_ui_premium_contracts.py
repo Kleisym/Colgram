@@ -106,9 +106,11 @@ class UiPremiumContractsTests(unittest.TestCase):
         self.assertGreaterEqual(ap.count('"ColgramSavedTagsBarView.java"'), 2)
         self.assertIn("from ui_premium_patches import apply as inject_ui_premium_patches", ap)
 
-        # Progress HUD wired into ChatAttachAlert replacing percentage Toasts
+        # Progress HUD wired into ChatAttachAlert replacing percentage Toasts (fully qualified for Components package)
         adp = (SCRIPTS / "attach_del_perf_patches.py").read_text(encoding="utf-8")
-        self.assertIn("ColgramUiKit.showProgressHud(", adp)
+        self.assertIn("org.telegram.ui.ColgramUiKit.ProgressHudHandle", adp)
+        self.assertIn("org.telegram.ui.ColgramUiKit.showProgressHud(", adp)
+        self.assertIn("org.telegram.ui.ColgramUiKit.showNotice(", adp)
         self.assertIn("colgramImportHud.complete(", adp)
         self.assertNotIn('Toast.makeText(colgramAppCtx, "Подготовка файла', adp)
 

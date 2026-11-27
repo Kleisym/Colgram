@@ -193,15 +193,18 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
 
         # Cancel active SAF copy on outer ChatAttachAlert destroy / dismiss if user did not press Send
         on_destroy_marker = "// colgram-attach-composer-v2"
-        old_on_destroy = "\n    public void onDestroy() {\n"
-        new_on_destroy = (
-            "\n    public void onDestroy() {\n"
-            f"        {on_destroy_marker}\n"
+        hud_dismiss_lines = (
             "        if (colgramImportHud != null) {\n"
             "            colgramImportHud.dismiss();\n"
             "            colgramImportHud = null;\n"
             "        }\n"
-            "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
+        )
+        old_on_destroy = "\n    public void onDestroy() {\n"
+        new_on_destroy = (
+            "\n    public void onDestroy() {\n"
+            f"        {on_destroy_marker}\n"
+            + hud_dismiss_lines
+            + "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
             "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
             "        }\n"
         )
@@ -211,29 +214,28 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             else:
                 updated = updated.replace(
                     old_on_destroy,
-                    f"\n    public void onDestroy() {{\n        {on_destroy_marker}\n",
+                    f"\n    public void onDestroy() {{\n        {on_destroy_marker}\n{hud_dismiss_lines}",
                     1,
                 )
 
         old_dismiss_int = "\n    public void dismissInternal() {\n"
         new_dismiss_int = (
             "\n    public void dismissInternal() {\n"
-            "        if (colgramImportHud != null) {\n"
-            "            colgramImportHud.dismiss();\n"
-            "            colgramImportHud = null;\n"
-            "        }\n"
-            "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
+            + hud_dismiss_lines
+            + "        if (!buttonPressed && !sent && (documentLayout == null || !documentLayout.colgramIsSendPressed())) {\n"
             "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
             "        }\n"
         )
-        if old_dismiss_int in updated and (old_dismiss_int + "        if (colgramImportHud != null)") not in updated:
+        if old_dismiss_int in updated and "if (colgramImportHud != null)" not in updated.split(old_dismiss_int, 1)[1][:300]:
             if (old_dismiss_int + "        if (!buttonPressed && !sent") not in updated:
                 updated = updated.replace(old_dismiss_int, new_dismiss_int, 1)
+            else:
+                updated = updated.replace(old_dismiss_int, old_dismiss_int + hud_dismiss_lines, 1)
 
         # 1h. Add shared SAF-to-DocumentLayout composer bridge methods
         doc_getter_anchor = "    public ChatAttachAlertDocumentLayout getDocumentLayout() {"
-        saf_bridge_methods = (
-            "    private ColgramUiKit.ProgressHudHandle colgramImportHud;\n\n"
+        hud_progress_and_deliver = (
+            "    private org.telegram.ui.ColgramUiKit.ProgressHudHandle colgramImportHud;\n\n"
             "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress(\n"
             "            final Context colgramAppCtx, final boolean colgramPremium) {\n"
             "        return new org.colgram.core.ColgramFileImport.ProgressListener() {\n"
@@ -246,7 +248,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "                if (colgramImportHud == null) {\n"
             "                    android.app.Activity act = baseFragment != null ? baseFragment.getParentActivity() : null;\n"
             "                    Context hudCtx = act != null ? act : colgramAppCtx;\n"
-            "                    colgramImportHud = ColgramUiKit.showProgressHud(\n"
+            "                    colgramImportHud = org.telegram.ui.ColgramUiKit.showProgressHud(\n"
             "                            hudCtx, R.drawable.msg_download, currentName, \"\",\n"
             "                            () -> {\n"
             "                                colgramImportHud = null;\n"
@@ -270,7 +272,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "                    colgramImportHud.fail(\"Не удалось подготовить\", msg);\n"
             "                    colgramImportHud = null;\n"
             "                } else {\n"
-            "                    ColgramUiKit.showNotice(colgramAppCtx, R.drawable.msg_info, msg, true);\n"
+            "                    org.telegram.ui.ColgramUiKit.showNotice(colgramAppCtx, R.drawable.msg_info, msg, true);\n"
             "                }\n"
             "            }\n"
             "        };\n"
@@ -302,7 +304,10 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "            FileLog.e(t);\n"
             "        }\n"
             "    }\n\n"
-            "    public void colgramLaunchSafIntoDocumentComposer(String mime) {\n"
+        )
+        saf_bridge_methods = (
+            hud_progress_and_deliver
+            + "    public void colgramLaunchSafIntoDocumentComposer(String mime) {\n"
             "        final Activity activity = baseFragment != null\n"
             "                ? baseFragment.getParentActivity()\n"
             "                : AndroidUtilities.findActivity(getContext());\n"
@@ -340,13 +345,20 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         )
         if doc_getter_anchor in updated and "public void colgramLaunchSafIntoDocumentComposer(" not in updated:
             updated = updated.replace(doc_getter_anchor, saf_bridge_methods, 1)
+        elif "public void colgramLaunchSafIntoDocumentComposer(String mime) {" in updated and "private org.telegram.ui.ColgramUiKit.ProgressHudHandle colgramImportHud;" not in updated:
+            _old_prog_hdr = "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress("
+            _launch_hdr = "    public void colgramLaunchSafIntoDocumentComposer(String mime) {"
+            if _old_prog_hdr in updated:
+                _s_idx = updated.index(_old_prog_hdr)
+                _e_idx = updated.index(_launch_hdr, _s_idx)
+                updated = updated[:_s_idx] + hud_progress_and_deliver + updated[_e_idx:]
 
         if updated == norm:
             return content
         eol = "\r\n" if "\r\n" in content else "\n"
         return updated.replace("\n", eol)
 
-    patch_file_fn(chat_attach_alert, patch_chat_attach, "// colgram-attach-composer-v2", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
+    patch_file_fn(chat_attach_alert, patch_chat_attach, "org.telegram.ui.ColgramUiKit.ProgressHudHandle", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
 
     # =========================================================================
     # 2. ChatAttachAlertDocumentLayout.java:
