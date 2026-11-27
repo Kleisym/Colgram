@@ -144,15 +144,15 @@ public final class ColgramDohResolver {
             new Endpoint("1.1.1.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
             new Endpoint("94.140.14.14", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
             new Endpoint("76.76.2.0", "freedns.controld.com", "freedns.controld.com", 443, false, false, "controld"),
-            // Wave 2 triplet: Google + DNS.SB + Cloudflare backup (non-RU encrypted DoH)
+            // Wave 2 triplet: Google + DNS.SB + Comss RU (keeps RU-reachable encrypted DoH in Wave 2 unless max-anonymity strips RU)
             new Endpoint("8.8.8.8", "dns.google", "dns.google", 443, false, true, "google"),
             new Endpoint("45.11.45.11", "doh.dns.sb", "doh.dns.sb", 443, false, true, "dnssb"),
-            new Endpoint("1.0.0.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
-            // Wave 3 triplet: AdGuard backup + Google backup + Comss RU (RU fallback only after non-RU)
+            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            // Wave 3 triplet: AdGuard backup + Google backup + Cloudflare backup
             new Endpoint("94.140.15.15", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
             new Endpoint("8.8.4.4", "dns.google", "dns.google", 443, false, true, "google"),
-            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
-            // Wave 4+ RU-whitelisted DoH/DoT & AliDNS backups (only when non-RU DoH fails and max-anonymity is OFF)
+            new Endpoint("1.0.0.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
+            // Wave 4+ RU-whitelisted DoH/DoT & AliDNS backups (only when earlier waves fail and max-anonymity is OFF)
             new Endpoint("77.88.8.8", "common.dot.dns.yandex.net", "common.dot.dns.yandex.net", 853, true, true, "yandex"),
             new Endpoint("141.133.183.77", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
             new Endpoint("223.5.5.5", "dns.alidns.com", "dns.alidns.com", 443, false, true, "alidns"),
@@ -615,7 +615,7 @@ public final class ColgramDohResolver {
         if (isIpLiteral(cleaned)) return resolveSystem(cleaned);
         InetAddress[] viaDoh = resolve(cleaned);
         if (viaDoh != null && viaDoh.length > 0) return viaDoh;
-        if (isStrictEncryptedDnsOnly()) {
+        if (ColgramConfig.isMaxAnonymityEnabled()) {
             return new InetAddress[0];
         }
         InetAddress[] system = resolveSystem(cleaned);
@@ -633,7 +633,7 @@ public final class ColgramDohResolver {
         InetAddress[] viaDoh = resolve(cleaned);
         InetAddress usable = pickReachable(viaDoh);
         if (usable != null) return usable;
-        if (isStrictEncryptedDnsOnly()) {
+        if (ColgramConfig.isMaxAnonymityEnabled()) {
             return null;
         }
         InetAddress[] system = resolveSystem(cleaned);
@@ -848,11 +848,11 @@ public final class ColgramDohResolver {
                 result = queryEndpoints(key, cleaned, System.currentTimeMillis(), true);
                 if (result != null) return result;
             }
-            if (isStrictEncryptedDnsOnly()) {
+            if (ColgramConfig.isMaxAnonymityEnabled()) {
                 return null;
             }
         }
-        if (isStrictEncryptedDnsOnly()) {
+        if (ColgramConfig.isMaxAnonymityEnabled()) {
             return null;
         }
         return resolveSystem(cleaned);
@@ -908,7 +908,7 @@ public final class ColgramDohResolver {
                 }
             }
         }
-        if (merged.isEmpty() && !isStrictEncryptedDnsOnly()) {
+        if (merged.isEmpty() && !ColgramConfig.isMaxAnonymityEnabled()) {
             InetAddress[] sys = resolveSystem(cleaned);
             if (sys != null) {
                 for (InetAddress a : sys) {
@@ -1103,7 +1103,7 @@ public final class ColgramDohResolver {
             }
         }
 
-        for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
+        for (int waveIdx = 0; waveIdx < 3 && !remaining.isEmpty(); waveIdx++) {
             List<Endpoint> wave = pickDiverseWave(remaining, 3);
             for (Endpoint ep : wave) triedKeys.add(ep.key());
             byte[] raced = raceEndpointsWave(wave, wireQuery, sockProtector, fdProtector,
@@ -1472,8 +1472,15 @@ public final class ColgramDohResolver {
                     }
                 }
             }
-            for (int waveIdx = 0; waveIdx < 2 && !remaining.isEmpty(); waveIdx++) {
+            java.util.Set<String> triedKeys = new java.util.HashSet<>();
+            if (pinnedTried != null) {
+                triedKeys.add(pinnedTried.key());
+            }
+            for (int waveIdx = 0; waveIdx < 3 && !remaining.isEmpty(); waveIdx++) {
                 List<Endpoint> wave = pickDiverseWave(remaining, 3);
+                for (Endpoint ep : wave) {
+                    triedKeys.add(ep.key());
+                }
                 byte[] reply = raceEndpointsWave(wave, wireQuery, protector, fdProtector,
                         RACE_WAVE_DEADLINE_MS, qtype);
                 if (reply != null && reply.length >= 12) {
@@ -1486,6 +1493,30 @@ public final class ColgramDohResolver {
                         cacheAndConvertRecords(key, 28, null);
                         return null;
                     }
+                }
+            }
+            if (!ColgramConfig.isMaxAnonymityEnabled()) {
+                Endpoint[] ruFallbacks = {EMERGENCY_RU_DOT, EMERGENCY_RU_DOT_SECONDARY};
+                for (Endpoint ruDot : ruFallbacks) {
+                    if (triedKeys.contains(ruDot.key())) continue;
+                    try {
+                        long dotDeadline = System.currentTimeMillis() + 2600L;
+                        byte[] ruReply = queryWire(ruDot, wireQuery, protector, fdProtector, dotDeadline, null);
+                        if (ruReply != null && ruReply.length >= 12) {
+                            cutUntil.remove(ruDot.key());
+                            String[] found = qtype == 28 ? parseRecords(ruReply, true) : parseARecords(ruReply);
+                            if (found.length > 0) {
+                                lastResolver = ruDot.key();
+                                lastWorkingEndpoint = ruDot;
+                                resolved = cacheAndConvertRecords(key, qtype, found);
+                                if (resolved != null) return resolved;
+                            }
+                            if (qtype == 28) {
+                                cacheAndConvertRecords(key, 28, null);
+                                return null;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
                 }
             }
             return null;

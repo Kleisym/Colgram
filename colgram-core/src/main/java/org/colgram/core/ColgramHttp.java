@@ -224,7 +224,8 @@ public final class ColgramHttp {
             conn.setInstanceFollowRedirects(false);
         }
         if (conn instanceof javax.net.ssl.HttpsURLConnection && externalProxy) {
-            java.net.InetAddress viaProxy = ColgramDohResolver.resolveOrNull(url.getHost());
+            java.net.InetAddress viaProxy = (proxy.type() == Proxy.Type.SOCKS)
+                    ? null : ColgramDohResolver.resolveOrNull(url.getHost());
             conn = ColgramPinnedConnection.create(
                     (javax.net.ssl.HttpsURLConnection) conn, url, viaProxy, proxy);
         }
@@ -510,9 +511,8 @@ public final class ColgramHttp {
                 conn.setInstanceFollowRedirects(false);
             }
             if (conn instanceof javax.net.ssl.HttpsURLConnection) {
-                java.net.InetAddress viaProxy = ColgramDohResolver.resolveOrNull(url.getHost());
                 conn = ColgramPinnedConnection.create(
-                        (javax.net.ssl.HttpsURLConnection) conn, url, viaProxy, socksProxy);
+                        (javax.net.ssl.HttpsURLConnection) conn, url, null, socksProxy);
             }
         }
         return conn;

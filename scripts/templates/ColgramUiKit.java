@@ -525,7 +525,7 @@ public final class ColgramUiKit {
         cancelBtn.setOnClickListener(v -> sheet.dismiss());
         root.addView(cancelBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, CTA_HEIGHT_DP));
 
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return sheet;
     }
 
@@ -593,7 +593,7 @@ public final class ColgramUiKit {
             root.addView(btnNeutral, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, CTA_HEIGHT_DP, 0, 8, 0, 0));
         }
 
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return sheet;
     }
 
@@ -651,7 +651,7 @@ public final class ColgramUiKit {
             root.addView(closeBtn, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, CTA_HEIGHT_DP));
         }
 
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return sheet;
     }
 
@@ -726,10 +726,11 @@ public final class ColgramUiKit {
         }
 
         sheet.setOnShowListener(d -> UI_HANDLER.postDelayed(() -> {
+            if (!sheet.isShowing() || sheet.isDismissed() || !isValidActivity(act)) return;
             editText.requestFocus();
             AndroidUtilities.showKeyboard(editText);
         }, 120L));
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return sheet;
     }
 
@@ -794,7 +795,7 @@ public final class ColgramUiKit {
             root.addView(btnNeutral, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, CTA_HEIGHT_DP, 0, 8, 0, 0));
         }
 
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return sheet;
     }
 
@@ -875,8 +876,12 @@ public final class ColgramUiKit {
             hBar = new ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal);
             hBar.setMax(100);
             hBar.setIndeterminate(true);
-            hBar.getProgressDrawable().setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
-            hBar.getIndeterminateDrawable().setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
+            if (hBar.getProgressDrawable() != null) {
+                hBar.getProgressDrawable().setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
+            }
+            if (hBar.getIndeterminateDrawable() != null) {
+                hBar.getIndeterminateDrawable().setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
+            }
             card.addView(hBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 6, 0, 0, 0, 6));
 
             pctView = new TextView(act);
@@ -887,7 +892,9 @@ public final class ColgramUiKit {
             card.addView(pctView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         } else {
             ProgressBar spinner = new ProgressBar(act);
-            spinner.getIndeterminateDrawable().setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
+            if (spinner.getIndeterminateDrawable() != null) {
+                spinner.getIndeterminateDrawable().setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
+            }
             card.addView(spinner, LayoutHelper.createLinear(32, 32, Gravity.CENTER_HORIZONTAL));
         }
         root.addView(card, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
@@ -907,7 +914,7 @@ public final class ColgramUiKit {
             sheet.setCancelable(false);
             sheet.setCanceledOnTouchOutside(false);
         }
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return new ProgressSheetHandle(sheet, statusView, hBar, pctView);
     }
 
@@ -1096,7 +1103,7 @@ public final class ColgramUiKit {
         btnRow.addView(cancelBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f));
         root.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        sheet.show();
+        presentBottomSheet(act, sheet);
     }
 
     public static BottomSheet showEmojiTagPickerSheet(
@@ -1205,8 +1212,26 @@ public final class ColgramUiKit {
         btnRow.addView(doneBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f));
         root.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        sheet.show();
+        presentBottomSheet(act, sheet);
         return sheet;
+    }
+
+    private static void presentBottomSheet(Activity act, BottomSheet sheet) {
+        if (sheet == null || !isValidActivity(act)) return;
+        if (act instanceof org.telegram.ui.LaunchActivity) {
+            try {
+                BaseFragment last = org.telegram.ui.LaunchActivity.getSafeLastFragment();
+                if (last != null && !last.isFinishing() && last.getParentLayout() != null && last.getParentActivity() == act) {
+                    android.app.Dialog visible = last.getVisibleDialog();
+                    if (visible == null || (visible instanceof BottomSheet && ((BottomSheet) visible).isDismissed())) {
+                        if (last.showDialog(sheet) != null) {
+                            return;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        sheet.show();
     }
 
     private static Activity resolveHudActivity(Context ctx) {
@@ -1538,10 +1563,10 @@ public final class ColgramUiKit {
         public void complete(CharSequence doneTitle, CharSequence doneSub) {
             Runnable r = () -> {
                 if (dismissed || finished) return;
-                finished = true;
                 if (!attached) {
                     attachAndShowOnUi();
                 }
+                finished = true;
                 if (cardView != null) {
                     ColgramHudManager.getInstance().completeProgressCard(cardView, doneTitle, doneSub);
                 }
@@ -1553,10 +1578,10 @@ public final class ColgramUiKit {
         public void fail(CharSequence errTitle, CharSequence errSub) {
             Runnable r = () -> {
                 if (dismissed || finished) return;
-                finished = true;
                 if (!attached) {
                     attachAndShowOnUi();
                 }
+                finished = true;
                 if (cardView != null) {
                     ColgramHudManager.getInstance().failProgressCard(cardView, errTitle, errSub);
                 }
@@ -1622,7 +1647,9 @@ public final class ColgramUiKit {
                 activeBanner = null;
             }
 
-            HudCardView card = new HudCardView(act, false, () -> dismissCard(activeBanner));
+            final HudCardView[] cardHolder = new HudCardView[1];
+            HudCardView card = new HudCardView(act, false, () -> dismissCard(cardHolder[0]));
+            cardHolder[0] = card;
             card.bindBanner(pal, effIcon, effAccent, title, subtitle, actionLabel, onAction);
             activeBanner = card;
             attachAndAnimateIn(host, card, false);
@@ -1696,12 +1723,16 @@ public final class ColgramUiKit {
 
         private void removeImmediate(HudCardView card) {
             if (card == null) return;
+            card.animate().setListener(null).cancel();
+            ViewCompat.setOnApplyWindowInsetsListener(card, null);
             if (card.progressBar != null) {
                 card.progressBar.stopAnimations();
             }
             if (card.getParent() instanceof ViewGroup) {
                 ((ViewGroup) card.getParent()).removeView(card);
             }
+            if (card == activeBanner) activeBanner = null;
+            if (card == activeProgress) activeProgress = null;
         }
 
         private ViewGroup resolveOverlayHost(Activity act) {
@@ -1710,7 +1741,9 @@ public final class ColgramUiKit {
                 BaseFragment last = LaunchActivity.getSafeLastFragment();
                 if (last != null && last.getVisibleDialog() instanceof BottomSheet) {
                     BottomSheet bs = (BottomSheet) last.getVisibleDialog();
-                    if (bs.isShowing() && bs.getWindow() != null && bs.getWindow().getDecorView() instanceof ViewGroup) {
+                    if (bs.isShowing() && !bs.isDismissed() && bs.getWindow() != null
+                            && bs.getWindow().getDecorView() instanceof ViewGroup
+                            && bs.getWindow().getDecorView().isAttachedToWindow()) {
                         return (ViewGroup) bs.getWindow().getDecorView();
                     }
                 }
@@ -1722,9 +1755,12 @@ public final class ColgramUiKit {
         }
 
         private void attachAndAnimateIn(ViewGroup host, HudCardView card, boolean topOverlay) {
-            int screenW = AndroidUtilities.displaySize != null && AndroidUtilities.displaySize.x > 0
-                    ? AndroidUtilities.displaySize.x : dp(360);
-            int maxW = Math.min(screenW - dp(28), dp(420));
+            int hostW = host.getWidth();
+            if (hostW <= 0) {
+                hostW = AndroidUtilities.displaySize != null && AndroidUtilities.displaySize.x > 0
+                        ? AndroidUtilities.displaySize.x : dp(360);
+            }
+            int maxW = Math.max(dp(200), Math.min(hostW - dp(28), dp(420)));
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     maxW,
                     FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -1769,12 +1805,23 @@ public final class ColgramUiKit {
                 topInset = Math.max(topInset, sys.top);
                 bottomInset = Math.max(bottomInset, Math.max(sys.bottom, ime.bottom));
             }
+            boolean changed = false;
             if (topOverlay) {
-                lp.topMargin = topInset + dp(10);
+                int targetTop = topInset + dp(10);
+                if (lp.topMargin != targetTop) {
+                    lp.topMargin = targetTop;
+                    changed = true;
+                }
             } else {
-                lp.bottomMargin = bottomInset + dp(14);
+                int targetBottom = bottomInset + dp(14);
+                if (lp.bottomMargin != targetBottom) {
+                    lp.bottomMargin = targetBottom;
+                    changed = true;
+                }
             }
-            card.setLayoutParams(lp);
+            if (changed) {
+                card.setLayoutParams(lp);
+            }
         }
 
         private static int safeLen(String s) {
@@ -2034,24 +2081,45 @@ public final class ColgramUiKit {
                         swiping = true;
                     }
                     if (swiping) {
-                        setTranslationX(dx);
-                        setAlpha(Math.max(0.25f, 1f - Math.abs(dx) / (float) Math.max(1, getWidth())));
+                        if (Math.abs(dy) > Math.abs(dx)) {
+                            float clampedY = topOverlay ? Math.min(0f, dy) : Math.max(0f, dy);
+                            setTranslationX(0f);
+                            setTranslationY(clampedY);
+                            setAlpha(Math.max(0.25f, 1f - Math.abs(clampedY) / (float) Math.max(1, getHeight() * 2)));
+                        } else {
+                            setTranslationY(0f);
+                            setTranslationX(dx);
+                            setAlpha(Math.max(0.25f, 1f - Math.abs(dx) / (float) Math.max(1, getWidth())));
+                        }
                     }
                     return true;
                 } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                     float dx = ev.getRawX() - downX;
                     float dy = ev.getRawY() - downY;
-                    if (swiping && (Math.abs(dx) > dp(56) || (topOverlay && dy < -dp(32)) || (!topOverlay && dy > dp(32)))) {
+                    boolean horizDismiss = Math.abs(dx) >= Math.abs(dy) && Math.abs(dx) > dp(topOverlay ? 72 : 56);
+                    boolean vertDismiss = !topOverlay && Math.abs(dy) > Math.abs(dx) && dy > dp(32);
+                    if (swiping && (horizDismiss || vertDismiss)) {
                         if (onClose != null) {
                             onClose.run();
                         }
                     } else if (swiping) {
-                        animate().translationX(0f).alpha(1f).setDuration(160L).start();
+                        animate().translationX(0f).translationY(0f).alpha(1f).setDuration(160L).start();
                     }
                     swiping = false;
                     return true;
                 }
                 return super.onTouchEvent(ev);
+            }
+
+            @Override
+            protected void onDetachedFromWindow() {
+                super.onDetachedFromWindow();
+                if (progressBar != null) {
+                    progressBar.stopAnimations();
+                }
+                ColgramHudManager mgr = ColgramHudManager.getInstance();
+                if (mgr.activeBanner == this) mgr.activeBanner = null;
+                if (mgr.activeProgress == this) mgr.activeProgress = null;
             }
         }
     }
@@ -2159,6 +2227,9 @@ public final class ColgramUiKit {
                     withAlpha(pal.accentPrimary, pal.dark ? 0x26 : 0x16));
             badge.setBackground(makeRoundedBg(withAlpha(pal.accentPrimary, pal.dark ? 0x26 : 0x16),
                     ICON_BADGE_RADIUS_DP, withAlpha(pal.accentPrimary, 0x42), 1f));
+            if (badge.getChildCount() > 0 && badge.getChildAt(0) instanceof ImageView) {
+                ((ImageView) badge.getChildAt(0)).setColorFilter(pal.accentPrimary, PorterDuff.Mode.SRC_IN);
+            }
             titleView.setTextColor(pal.textPrimary);
             lineStealth.setTextColor(pal.textSecondary);
             lineBridge.setTextColor(pal.textSecondary);

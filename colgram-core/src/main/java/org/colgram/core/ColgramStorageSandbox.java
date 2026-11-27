@@ -61,19 +61,30 @@ public class ColgramStorageSandbox {
         } catch (Throwable ignored) {}
 
         File baseDir = externalBase != null ? externalBase : appCtx.getFilesDir();
-        final File resolvedRoot = sandboxOn
+        File candidateRoot = sandboxOn
                 ? (baseDir != null ? new File(baseDir, name) : null)
                 : baseDir;
+        if (candidateRoot != null && !canUseRootFast(candidateRoot)) {
+            File internalFallback = sandboxOn
+                    ? new File(appCtx.getFilesDir(), name)
+                    : appCtx.getFilesDir();
+            if (internalFallback != null && (internalFallback.exists() ? internalFallback.isDirectory() : internalFallback.mkdirs())) {
+                candidateRoot = internalFallback;
+            }
+        }
+        final File resolvedRoot = candidateRoot;
         final File resolvedCache = resolvedRoot != null
                 ? new File(resolvedRoot, "Cache")
                 : new File(appCtx.getCacheDir(), "Colgram");
 
-        invalidateResolvedDirCaches();
-        sandboxRoot = resolvedRoot;
-        cacheRoot = resolvedCache;
-        sandboxedDirCacheRoot = resolvedRoot;
+        synchronized (ColgramStorageSandbox.class) {
+            invalidateResolvedDirCaches();
+            sandboxRoot = resolvedRoot;
+            cacheRoot = resolvedCache;
+            sandboxedDirCacheRoot = resolvedRoot;
+        }
 
-        // Defer directory/.nomedia writes & MediaScanner silencing onto background priority thread off UI startup.
+        // Defer .nomedia creation & MediaScanner silencing onto background thread without ever flipping sandboxRoot.
         Thread t = new Thread(() -> {
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
@@ -81,39 +92,35 @@ public class ColgramStorageSandbox {
             try {
                 ensureDirWithNoMedia(resolvedRoot);
                 ensureDirWithNoMedia(resolvedCache);
-                if (resolvedCache != null) {
+                if (resolvedCache != null && cacheRoot == resolvedCache) {
                     ensuredCacheRootFile = resolvedCache;
                 }
-                File root = sandboxRoot;
-                if (root != null && !isWritable(root)) {
-                    File internalFallback = sandboxOn
-                            ? new File(appCtx.getFilesDir(), name)
-                            : appCtx.getFilesDir();
-                    if (internalFallback != null) {
-                        ensureDirWithNoMedia(internalFallback);
-                        invalidateResolvedDirCaches();
-                        File fallbackCache = new File(internalFallback, "Cache");
-                        ensureDirWithNoMedia(fallbackCache);
-                        sandboxRoot = internalFallback;
-                        cacheRoot = fallbackCache;
-                        sandboxedDirCacheRoot = internalFallback;
-                        ensuredCacheRootFile = fallbackCache;
-                        root = internalFallback;
-                    }
-                }
-                if (root != null) {
-                    ensureAllSubdirsWithNoMedia(root);
+                if (resolvedRoot != null) {
+                    ensureAllSubdirsWithNoMedia(resolvedRoot);
                 }
                 ColgramStorageIndex.init(appCtx.getFilesDir());
                 silenceLegacyPublicDocumentsDir(appCtx, name);
-                if (cacheRoot != null) {
-                    Log.i(TAG, "media sandbox=" + (root != null ? root.getAbsolutePath() : "null")
-                            + " cache=" + cacheRoot.getAbsolutePath());
+                if (resolvedCache != null) {
+                    Log.i(TAG, "media sandbox=" + (resolvedRoot != null ? resolvedRoot.getAbsolutePath() : "null")
+                            + " cache=" + resolvedCache.getAbsolutePath());
                 }
             } catch (Throwable ignored) {}
         }, "colgram-sandbox-init");
         t.setDaemon(true);
         t.start();
+    }
+
+    /** Fast synchronous root readiness check; only writes a probe file if the directory had to be created. */
+    private static boolean canUseRootFast(File dir) {
+        if (dir == null) return false;
+        try {
+            if (dir.exists()) {
+                return dir.isDirectory() && dir.canWrite();
+            }
+            return isWritable(dir);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** Ensures directory exists and contains a .nomedia marker so Android MediaStore never indexes it. */
@@ -290,13 +297,33 @@ public class ColgramStorageSandbox {
         return previews;
     }
 
-    /** Returns all active sandbox and cache roots for unified disk cap scanning. */
+    /** Returns all active non-overlapping sandbox and cache roots for unified disk cap scanning. */
     public static java.util.List<File> getAllSandboxDirectories(Context context) {
         java.util.List<File> dirs = new java.util.ArrayList<>();
         File root = getSandboxRootDir(context);
-        if (root != null) dirs.add(root);
+        String rootCanon = null;
+        if (root != null) {
+            dirs.add(root);
+            try {
+                rootCanon = root.getCanonicalPath();
+            } catch (Throwable ignored) {
+                rootCanon = root.getAbsolutePath();
+            }
+        }
         File cache = getCacheRootDir(context);
-        if (cache != null && !dirs.contains(cache)) dirs.add(cache);
+        if (cache != null) {
+            String cacheCanon;
+            try {
+                cacheCanon = cache.getCanonicalPath();
+            } catch (Throwable ignored) {
+                cacheCanon = cache.getAbsolutePath();
+            }
+            boolean insideRoot = rootCanon != null
+                    && (cacheCanon.equals(rootCanon) || cacheCanon.startsWith(rootCanon + File.separator));
+            if (!insideRoot && !dirs.contains(cache)) {
+                dirs.add(cache);
+            }
+        }
         return dirs;
     }
 

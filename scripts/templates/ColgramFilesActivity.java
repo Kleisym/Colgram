@@ -368,8 +368,10 @@ public class ColgramFilesActivity extends BaseFragment {
                 return;
             }
             if (position == unlimitedCacheRow) {
-                boolean next = !ColgramConfig.isUnlimitedMemoryEnabled();
+                boolean curOn = ColgramConfig.isUnlimitedMemoryEnabled() && !ColgramShieldConfig.isStorageCapEnabled();
+                boolean next = !curOn;
                 ColgramConfig.setUnlimitedMemoryEnabled(next);
+                ColgramShieldConfig.setStorageCapEnabled(!next);
                 ColgramUnlimitedMemory.apply(getParentActivity(), next);
                 if (listAdapter != null) {
                     if (heroRow >= 0) listAdapter.notifyItemChanged(heroRow);
@@ -1104,7 +1106,7 @@ public class ColgramFilesActivity extends BaseFragment {
     public ArrayList<ThemeDescription> getThemeDescriptions() {
         ArrayList<ThemeDescription> list = new ArrayList<>();
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_CELLBACKGROUNDCOLOR,
-                new Class[]{HeaderCell.class, TextSettingsCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
+                new Class[]{HeaderCell.class, TextSettingsCell.class, TextCheckCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
         list.add(new ThemeDescription(fragmentView, ThemeDescription.FLAG_BACKGROUND,
                 null, null, null, null, Theme.key_windowBackgroundGray));
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_BACKGROUND,
@@ -1123,6 +1125,14 @@ public class ColgramFilesActivity extends BaseFragment {
                 new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         list.add(new ThemeDescription(listView, 0,
                 new Class[]{TextSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteValueText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrack));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrackChecked));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
                 new Class[]{ShadowSectionCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_TEXTCOLOR,

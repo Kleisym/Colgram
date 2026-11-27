@@ -1220,9 +1220,39 @@ public class ColgramDesignStudioActivity extends BaseFragment {
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_BACKGROUND, null, null, null, null, Theme.key_actionBarDefault));
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_ITEMSCOLOR, null, null, null, null, Theme.key_actionBarDefaultIcon));
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_TITLECOLOR, null, null, null, null, Theme.key_actionBarDefaultTitle));
+        list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_SELECTORCOLOR, null, null, null, null, Theme.key_actionBarDefaultSelector));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_SELECTOR, null, null, null, null, Theme.key_listSelector));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_CELLBACKGROUNDCOLOR,
                 new Class[]{HeaderCell.class, TextCheckCell.class, TextDetailSettingsCell.class, SwatchRowCell.class, SliderRowCell.class},
                 null, null, null, Theme.key_windowBackgroundWhite));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{HeaderCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlueHeader));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrack));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrackChecked));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
+                new Class[]{TextInfoPrivacyCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextInfoPrivacyCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText4));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
+                new Class[]{ShadowSectionCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_TEXTCOLOR,
+                new Class[]{View.class}, Theme.dividerPaint, null, null, Theme.key_divider));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{LivePreviewCell.class, SwatchRowCell.class, SliderRowCell.class}, null, null, () -> {
+            if (listView != null && adapter != null) {
+                adapter.notifyDataSetChanged();
+            }
+        }, Theme.key_windowBackgroundWhite));
         return list;
     }
 

@@ -576,8 +576,43 @@ public class ColgramPremiumActivity extends BaseFragment {
                 null, null, null, null, Theme.key_actionBarDefaultIcon));
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_TITLECOLOR,
                 null, null, null, null, Theme.key_actionBarDefaultTitle));
+        list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_SELECTORCOLOR,
+                null, null, null, null, Theme.key_actionBarDefaultSelector));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_SELECTOR,
                 null, null, null, null, Theme.key_listSelector));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{HeaderCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlueHeader));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrack));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrackChecked));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
+                new Class[]{TextInfoPrivacyCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextInfoPrivacyCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText4));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
+                new Class[]{ShadowSectionCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
+        list.add(new ThemeDescription(listView, ThemeDescription.FLAG_TEXTCOLOR,
+                new Class[]{View.class}, Theme.dividerPaint, null, null, Theme.key_divider));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{ColgramMenuChrome.HeroBannerCell.class}, null, null, () -> {
+            if (listView != null) {
+                for (int i = 0; i < listView.getChildCount(); i++) {
+                    View ch = listView.getChildAt(i);
+                    if (ch instanceof ColgramMenuChrome.HeroBannerCell) {
+                        ((ColgramMenuChrome.HeroBannerCell) ch).updateTheme();
+                    }
+                }
+            }
+        }, Theme.key_windowBackgroundWhite));
         return list;
     }
 }

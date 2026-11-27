@@ -484,13 +484,14 @@ public final class ColgramAccountSwitcherHelper {
                 }
                 final int savedCount = saved;
                 AndroidUtilities.runOnUIThread(() -> {
-                    ColgramUiKit.showNotice(ctx, R.drawable.msg_secret, "Зашифровано аккаунтов: " + savedCount, false);
                     if (holder[0] != null && holder[0].isShowing()) {
                         holder[0].dismiss();
                         if (!fragment.isFinishing() && !activity.isFinishing() && !activity.isDestroyed()) {
                             showAccountVaultSheet(fragment, currentAccount);
                         }
                     }
+                    ColgramUiKit.showNotice(activity != null && !activity.isFinishing() && !activity.isDestroyed() ? activity : ctx,
+                            R.drawable.msg_secret, "Зашифровано аккаунтов: " + savedCount, false);
                 });
             });
         });

@@ -48,6 +48,7 @@ public final class ColgramLocalTranslator {
     }
 
     private static final Object CACHE_LOCK = new Object();
+    private static final Object DISK_WRITE_LOCK = new Object();
     private static final LinkedHashMap<String, String> MEM_CACHE =
             new LinkedHashMap<String, String>(64, 0.75f, true) {
                 @Override
@@ -80,21 +81,32 @@ public final class ColgramLocalTranslator {
         final String targetLang = normalizeLang(toLang);
         final String sourceLang = normalizeSourceLang(fromLang);
         final String cacheKey = targetLang + "\0" + text;
+        final Context appCtx = ctx != null && ctx.getApplicationContext() != null
+                ? ctx.getApplicationContext() : ctx;
 
-        ensureDiskLoaded(ctx);
-        synchronized (CACHE_LOCK) {
-            String cached = MEM_CACHE.get(cacheKey);
-            if (cached != null) {
-                deliverMain(() -> callback.onResult(true, cached, false));
-                return;
+        if (diskLoaded) {
+            synchronized (CACHE_LOCK) {
+                String cached = MEM_CACHE.get(cacheKey);
+                if (cached != null) {
+                    deliverMain(() -> callback.onResult(true, cached, false));
+                    return;
+                }
             }
         }
 
         EXEC.execute(() -> {
+            ensureDiskLoaded(appCtx);
+            synchronized (CACHE_LOCK) {
+                String cached = MEM_CACHE.get(cacheKey);
+                if (cached != null) {
+                    deliverMain(() -> callback.onResult(true, cached, false));
+                    return;
+                }
+            }
             boolean[] rateLimited = new boolean[]{false};
             String translated = translateChunksSync(text, sourceLang, targetLang, rateLimited);
             if (translated != null) {
-                putCache(ctx, cacheKey, translated);
+                putCache(appCtx, cacheKey, translated);
                 deliverMain(() -> callback.onResult(true, translated, false));
             } else {
                 deliverMain(() -> callback.onResult(false, null, rateLimited[0]));
@@ -156,7 +168,9 @@ public final class ColgramLocalTranslator {
                 try {
                     via = ColgramDohResolver.resolveOrNull(url.getHost());
                 } catch (Throwable ignored) {}
-                conn = ColgramPinnedConnection.create((HttpsURLConnection) conn, url, via, effectiveProxy);
+                if (via != null || effectiveProxy.type() == Proxy.Type.SOCKS) {
+                    conn = ColgramPinnedConnection.create((HttpsURLConnection) conn, url, via, effectiveProxy);
+                }
             }
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(7000);
@@ -393,27 +407,33 @@ public final class ColgramLocalTranslator {
             snapshot = new ArrayList<>(MEM_CACHE.entrySet());
         }
         EXEC.execute(() -> {
-            File tmp = new File(target.getParentFile(), CACHE_FILENAME + ".tmp");
-            try (DataOutputStream dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(tmp)))) {
-                int start = Math.max(0, snapshot.size() - MAX_DISK_CACHE);
-                int count = snapshot.size() - start;
-                dos.writeInt(count);
-                for (int i = start; i < snapshot.size(); i++) {
-                    Map.Entry<String, String> e = snapshot.get(i);
-                    byte[] kb = e.getKey().getBytes(StandardCharsets.UTF_8);
-                    byte[] vb = e.getValue().getBytes(StandardCharsets.UTF_8);
-                    dos.writeInt(kb.length);
-                    dos.writeInt(vb.length);
-                    dos.write(kb);
-                    dos.write(vb);
+            synchronized (DISK_WRITE_LOCK) {
+                File parent = target.getParentFile();
+                if (parent != null && !parent.isDirectory()) {
+                    parent.mkdirs();
                 }
-                dos.flush();
-            } catch (Throwable t) {
-                tmp.delete();
-                return;
-            }
-            if (!tmp.renameTo(target)) {
-                tmp.delete();
+                File tmp = new File(parent, CACHE_FILENAME + ".tmp");
+                try (DataOutputStream dos = new DataOutputStream(new GZIPOutputStream(new FileOutputStream(tmp)))) {
+                    int start = Math.max(0, snapshot.size() - MAX_DISK_CACHE);
+                    int count = snapshot.size() - start;
+                    dos.writeInt(count);
+                    for (int i = start; i < snapshot.size(); i++) {
+                        Map.Entry<String, String> e = snapshot.get(i);
+                        byte[] kb = e.getKey().getBytes(StandardCharsets.UTF_8);
+                        byte[] vb = e.getValue().getBytes(StandardCharsets.UTF_8);
+                        dos.writeInt(kb.length);
+                        dos.writeInt(vb.length);
+                        dos.write(kb);
+                        dos.write(vb);
+                    }
+                    dos.flush();
+                } catch (Throwable t) {
+                    tmp.delete();
+                    return;
+                }
+                if (!tmp.renameTo(target)) {
+                    tmp.delete();
+                }
             }
         });
     }

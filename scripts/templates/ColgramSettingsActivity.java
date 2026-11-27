@@ -707,6 +707,12 @@ public class ColgramSettingsActivity extends BaseFragment {
                         val ? "Безлимит хранилища и автосжатие включены"
                                 : "Восстановлен стандартный лимит кэша",
                         false);
+            } else if (position == dpiBypassRow) {
+                ColgramProxyManager.recheckBypassListener();
+                ColgramUiKit.showNotice(this, R.drawable.outline_shield_check,
+                        "Перезапускаю локальный обходник DPI (127.0.0.1)…", false);
+                uiHandler.removeCallbacks(refreshVisibleNetworkState);
+                uiHandler.postDelayed(refreshVisibleNetworkState, 350L);
             } else if (position == sandboxFilesRow) {
                 // The folder itself. Attaching a file should not require handing Telegram the
                 // whole media library, so this is where files live and where they get picked up.
@@ -1656,14 +1662,14 @@ public class ColgramSettingsActivity extends BaseFragment {
                    || position == infiniteStorageRow || position == storageCapRow
                    || position == lazyShadowVaultRow || position == malwareShieldRow
                    || position == antiPingBigGroupsRow || position == collapseSpamPingsRow
-                   || position == autoClearMentionsRow;
+                   || position == autoClearMentionsRow || position == dpiBypassRow;
         }
 
         @Override
         public int getItemViewType(int position) {
             if (position == heroBannerRow) return 5;
             if (position == liveTelemetryRow) return 6;
-            if (position == dpiBypassRow) return 4; // Non-interactive TextInfoPrivacyCell, never a switch.
+            if (position == dpiBypassRow) return 4; // Clickable TextInfoPrivacyCell (recheckBypassListener), never a switch.
             if (position == cloakingHeaderRow || position == vaultHeaderRow || position == ghostHeaderRow ||
                 position == networkHeaderRow || position == resourceHeaderRow || position == sandboxHeaderRow ||
                 position == botsHeaderRow) {
@@ -2110,7 +2116,7 @@ public class ColgramSettingsActivity extends BaseFragment {
     public ArrayList<ThemeDescription> getThemeDescriptions() {
         ArrayList<ThemeDescription> list = new ArrayList<>();
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_CELLBACKGROUNDCOLOR,
-                new Class[]{HeaderCell.class, TextCheckCell.class, TextSettingsCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
+                new Class[]{HeaderCell.class, TextCheckCell.class, TextSettingsCell.class, TextDetailSettingsCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
         list.add(new ThemeDescription(fragmentView, ThemeDescription.FLAG_BACKGROUND,
                 null, null, null, null, Theme.key_windowBackgroundGray));
         list.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_BACKGROUND,

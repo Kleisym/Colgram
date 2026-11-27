@@ -160,9 +160,26 @@ public class ColgramTempMailActivity extends BaseFragment {
         return true;
     }
 
+    private boolean executeBg(Runnable task) {
+        if (isDestroyed || executor.isShutdown()) {
+            return false;
+        }
+        try {
+            executor.execute(() -> {
+                if (!isDestroyed) {
+                    task.run();
+                }
+            });
+            return true;
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            return false;
+        }
+    }
+
     private void startAutomaticBootstrap() {
+        if (isDestroyed) return;
         discoveryRunning = true;
-        executor.execute(() -> {
+        if (!executeBg(() -> {
             try {
                 final ArrayList<String> fastDomains = fetchFastDomains();
                 mainHandler.post(() -> {
@@ -212,7 +229,9 @@ public class ColgramTempMailActivity extends BaseFragment {
             } catch (Throwable t) {
                 Log.w(TAG, "background discovery failed: " + t.getMessage());
             }
-        });
+        })) {
+            discoveryRunning = false;
+        }
     }
 
     private void mergeAvailableDomains(List<String> incoming) {
@@ -430,24 +449,28 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private void manualRefresh() {
         final Context ctx = getParentActivity();
-        if (ctx == null) return;
+        if (isDestroyed || ctx == null) return;
         if (currentEmail == null || currentEmail.isEmpty()) {
             showToast("Сначала создайте ящик");
             return;
         }
         showToast("Обновление входящих...");
-        executor.execute(() -> {
+        executeBg(() -> {
             if (ColgramTempMailDiscovery.PROTOCOL_HYDRA.equals(provider)) {
                 String fresh = refreshMailToken();
                 if (fresh != null || (mailTmToken != null && !mailTmToken.isEmpty())) {
                     fetchMessages(true);
                 } else {
-                    mainHandler.post(() -> showToast("Не удалось обновить токен ящика"));
+                    mainHandler.post(() -> {
+                        if (!isDestroyed) showToast("Не удалось обновить токен ящика");
+                    });
                 }
                 return;
             }
             if (!hasActiveSession()) {
-                mainHandler.post(() -> showToast("Сессия ящика истекла, создайте новый ящик"));
+                mainHandler.post(() -> {
+                    if (!isDestroyed) showToast("Сессия ящика истекла, создайте новый ящик");
+                });
                 return;
             }
             fetchMessages(true);
@@ -456,13 +479,13 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private void showDomainPicker() {
         final Context ctx = getParentActivity();
-        if (ctx == null) return;
+        if (isDestroyed || ctx == null) return;
         if (!availableDomains.isEmpty()) {
             presentDomainDialog();
             return;
         }
         showToast("Загрузка доменов...");
-        executor.execute(() -> {
+        executeBg(() -> {
             ArrayList<String> got = fetchFastDomains();
             if (got.isEmpty()) got = fetchSlowFallbackDomains();
             final ArrayList<String> resolved = got;
@@ -577,7 +600,7 @@ public class ColgramTempMailActivity extends BaseFragment {
 
     private void runInternetDiscovery() {
         final Context ctx = getParentActivity();
-        if (ctx == null) return;
+        if (isDestroyed || ctx == null) return;
         if (discoveryRunning) {
             showToast("Поиск уже выполняется...");
             return;
@@ -586,7 +609,7 @@ public class ColgramTempMailActivity extends BaseFragment {
         if (listAdapter != null) listAdapter.notifyDataSetChanged();
         showToast("Поиск и проверка бесплатных почтовых API в сети...");
 
-        executor.execute(() -> {
+        if (!executeBg(() -> {
             DiscoveryResult res = null;
             Throwable error = null;
             try {
@@ -619,7 +642,9 @@ public class ColgramTempMailActivity extends BaseFragment {
                 }
                 presentDiscoveryReport(finalRes);
             });
-        });
+        })) {
+            discoveryRunning = false;
+        }
     }
 
     private void presentDiscoveryReport(DiscoveryResult res) {
@@ -719,8 +744,9 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void probeAndSaveCustomUrl(String rawUrl) {
+        if (isDestroyed) return;
         showToast("Проверка источника " + rawUrl + "...");
-        executor.execute(() -> {
+        executeBg(() -> {
             synchronized (customSeeds) {
                 customSeeds.add(rawUrl);
             }
@@ -730,6 +756,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             }
             ProviderSpec verified = null;
             for (String candidateUrl : extracted) {
+                if (isDestroyed) return;
                 ProviderSpec probe = ColgramTempMailDiscovery.probeProvider(
                         new ProviderSpec("custom_" + Integer.toHexString(candidateUrl.hashCode()),
                                 hostOf(candidateUrl), candidateUrl, ColgramTempMailDiscovery.PROTOCOL_HYDRA,
@@ -741,6 +768,7 @@ public class ColgramTempMailActivity extends BaseFragment {
             }
             final ProviderSpec finalSpec = verified;
             mainHandler.post(() -> {
+                if (isDestroyed) return;
                 saveDiscoveryState();
                 if (finalSpec != null) {
                     upsertDiscoveredProvider(finalSpec);
@@ -1037,17 +1065,21 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void generateNewMailbox() {
-        if (mailboxGenerating) return;
+        if (isDestroyed || mailboxGenerating) return;
         mailboxGenerating = true;
         if (listAdapter != null) listAdapter.notifyDataSetChanged();
 
         final String chosenDomain = pendingDomain;
         final ProviderSpec chosenProvider = pendingProvider;
 
-        executor.execute(() -> {
+        if (!executeBg(() -> {
             Throwable lastError = null;
             List<ProviderSpec> chain = buildCreationChain(chosenProvider, chosenDomain);
             for (ProviderSpec candidate : chain) {
+                if (isDestroyed) {
+                    mailboxGenerating = false;
+                    return;
+                }
                 try {
                     if (createMailboxOnProvider(candidate, chosenDomain)) {
                         return;
@@ -1064,7 +1096,9 @@ public class ColgramTempMailActivity extends BaseFragment {
                 showToast("Не удалось создать ящик: " + errText);
                 if (listAdapter != null) listAdapter.notifyDataSetChanged();
             });
-        });
+        })) {
+            mailboxGenerating = false;
+        }
     }
 
     private List<ProviderSpec> buildCreationChain(ProviderSpec explicitProvider, String explicitDomain) {
@@ -1413,8 +1447,8 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void fetchMessages(boolean notifyUser) {
-        if (!hasActiveSession()) return;
-        executor.execute(() -> {
+        if (isDestroyed || !hasActiveSession()) return;
+        executeBg(() -> {
             try {
                 List<TempMessage> list;
                 try {
@@ -1751,9 +1785,9 @@ public class ColgramTempMailActivity extends BaseFragment {
     }
 
     private void readMessageContent(int messageId) {
-        if (getParentActivity() == null || !hasActiveSession()) return;
+        if (isDestroyed || getParentActivity() == null || !hasActiveSession()) return;
         showToast("Загрузка письма...");
-        executor.execute(() -> {
+        executeBg(() -> {
             try {
                 TempMessage target = null;
                 synchronized (messages) {
@@ -2405,6 +2439,8 @@ public class ColgramTempMailActivity extends BaseFragment {
         list.add(new ThemeDescription(listView, 0,
                 new Class[]{TextCheckCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextCheckCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        list.add(new ThemeDescription(listView, 0,
                 new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrack));
         list.add(new ThemeDescription(listView, 0,
                 new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrackChecked));
@@ -2412,6 +2448,10 @@ public class ColgramTempMailActivity extends BaseFragment {
                 new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         list.add(new ThemeDescription(listView, 0,
                 new Class[]{TextSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteValueText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        list.add(new ThemeDescription(listView, 0,
+                new Class[]{TextDetailSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_BACKGROUNDFILTER,
                 new Class[]{ShadowSectionCell.class}, null, null, null, Theme.key_windowBackgroundGrayShadow));
         list.add(new ThemeDescription(listView, ThemeDescription.FLAG_TEXTCOLOR,

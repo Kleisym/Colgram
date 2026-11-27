@@ -161,10 +161,108 @@ class SpamStorageContractsTest(unittest.TestCase):
             dl_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/DownloadController.java"].decode("utf-8")
             self.assertIn("ColgramPremiumConfig.isBlockSponsoredAdsEnabled()", dl_text)
             self.assertIn("ColgramFileSafetyPolicy.shouldBlockAutoDownload", dl_text)
+            self.assertIn("getFileLoader().loadFile(document, downloadObject.parent, FileLoader.PRIORITY_LOW, downloadObject.secret ? 2 : 0, true);", dl_text)
+
+            fl_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java"].decode("utf-8")
+            self.assertNotIn("document != null && priority <= PRIORITY_LOW", fl_text)
+            self.assertIn("loadFile(document, parentObject, priority, cacheType, false);", fl_text)
+            self.assertEqual(fl_text.count("private FileLoadOperation loadFileInternal("), 1)
+            self.assertIn(", cacheType, false);", fl_text.split("protected FileLoadOperation loadStreamFile(final FileLoadOperationStream stream, final TLRPC.Document document, final ImageLocation location, final Object parentObject, final long offset, final boolean priority, int loadingPriority, int cacheType)", 1)[1].split("awaitFileLoadOperation(", 1)[0])
+            fl_internal = fl_text.split("private FileLoadOperation loadFileInternal(", 1)[1].split("FileLoadOperation operation = loadOperationPaths.get(", 1)[0]
+            self.assertIn("final boolean isAutoDownload", fl_internal)
+            self.assertIn("if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {", fl_internal)
+            self.assertIn("priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX", fl_text.split("private FileLoadOperation loadFileInternal(", 1)[1].split("\n    public static boolean canSaveAsFile(", 1)[0])
+            self.assertLess(
+                fl_internal.index("if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {"),
+                fl_internal.index("loadOperationPathsUI.put("),
+            )
+            self.assertLess(
+                fl_internal.index("if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {"),
+                fl_internal.index("getDownloadController().startDownloadFile("),
+            )
 
             ms_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java"].decode("utf-8")
+            self.assertEqual(ms_text.count("public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId)"), 1)
             self.assertIn("colgramPreFilterSpamMentions(messages);", ms_text)
             self.assertIn("ColgramNativeColemailerBridge.isStorageAutoDownloadBlocked", ms_text)
+            self.assertIn("ColgramHookHandler.beginShadowCaptureBatch();", ms_text)
+            self.assertIn("ColgramHookHandler.flushShadowCaptureBatch();", ms_text)
+            self.assertIn("MessageObject.getDialogId(m);", ms_text)
+            self.assertNotIn("markMentionMessageAsRead(m.dialog_id, m.id, m.dialog_id);", ms_text)
+
+            adt_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/AutoDeleteMediaTask.java"].decode("utf-8")
+            self.assertIn("colgramMergeSandboxDirsDedup(paths,", adt_text)
+            self.assertIn("1000 + i", adt_text)
+            self.assertIn("ColgramStorageCapEnforcer.isProtectedDirectoryName(", adt_text)
+
+            cc_text = pass1["TMessagesProj/src/main/java/org/telegram/ui/CacheControlActivity.java"].decode("utf-8")
+            self.assertIn("options.add(-100);", cc_text)
+            self.assertIn("if (opt == -100 || opt == 0)", cc_text)
+            self.assertIn("if (currentLimit == 0) currentLimit = -100;", cc_text)
+
+            au_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java"].decode("utf-8")
+            self.assertIn("String colgramDocName = FileLoader.getDocumentFileName(document);", au_text)
+
+            mo_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java"].decode("utf-8")
+            self.assertIn("public boolean colgramLayoutCollapsed;", mo_text)
+            self.assertIn("colgramLayoutCollapsed = colgramCollapsed;", mo_text)
+
+            cmc_text = pass1["TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java"].decode("utf-8").replace("\r\n", "\n")
+            self.assertEqual(cmc_text.count("boolean colgramNowCollapsedCheck ="), 1)
+            self.assertIn("photoImage.setImage(null, null, ImageLocation.getForPath(colgramShadowPreview), currentPhotoFilter, null, 0, null, messageObject, 0);", cmc_text)
+            shadow_idx = cmc_text.index("String colgramShadowPreview = org.colgram.core.ColgramHookHandler.getShadowPreviewPath(")
+            self.assertNotIn("photoNotSet = false;", cmc_text[max(0, shadow_idx - 120):shadow_idx + 350])
+            self.assertIn("messageObject.colgramLayoutCollapsed != colgramNowCollapsedCheck", cmc_text)
+            for motion_fn in ("checkTextBlockMotionEvent(", "checkCaptionMotionEvent(", "checkLinkPreviewMotionEvent("):
+                slice_body = cmc_text.split(motion_fn, 1)[1][:220]
+                self.assertIn("if (colgramCollapsedSpamVisible) {", slice_body, motion_fn)
+            self.assertIn("final MessageObject targetMsg = currentMessageObject;", cmc_text)
+            self.assertIn("final TLRPC.Document targetDoc = documentAttach;", cmc_text)
+            self.assertIn("targetMsg.putInDownloadsStore = true;", cmc_text)
+
+    def test_track2_hotfix_core_and_bridge_contracts(self):
+        sc_src = _read(os.path.join(CORE_DIR, "ColgramShieldConfig.java"))
+        self.assertIn("ColgramConfig.isUnlimitedMemoryEnabled()", sc_src)
+
+        um_src = _read(os.path.join(CORE_DIR, "ColgramUnlimitedMemory.java"))
+        self.assertIn('destName.endsWith(".webp")', um_src)
+        self.assertIn("Bitmap.CompressFormat.JPEG", um_src)
+        self.assertIn("maxDecodePixels", um_src)
+
+        ce_src = _read(os.path.join(CORE_DIR, "ColgramStorageCapEnforcer.java"))
+        self.assertIn("isCompressibleLogFile(", ce_src)
+        self.assertIn("public static boolean isProtectedDirectoryName(String dirName)", ce_src)
+        self.assertIn("pruneAbandonedInbox(", ce_src)
+        self.assertIn("computeDirBytes(shadowDir)", ce_src)
+
+        hh_src = _read(os.path.join(CORE_DIR, "ColgramHookHandler.java"))
+        shadow_getter = hh_src.split("public static String getShadowPreviewPath(", 1)[1].split("\n    public static void notifyMediaFileLoaded(", 1)[0]
+        self.assertIn("hookIoExecutor.execute(", shadow_getter)
+        self.assertNotIn(".isFile()", shadow_getter.split("hookIoExecutor.execute(", 1)[0])
+        self.assertIn("ColgramProxyManager.activateBuiltinProxy(appContext);", hh_src)
+        init_body = hh_src.split("public static void init(Context context) {", 1)[1].split("public static boolean canAutoRestartDpiBypass()", 1)[0]
+        self.assertGreaterEqual(init_body.count("catch (Throwable"), 6)
+
+        sb_src = _read(os.path.join(CORE_DIR, "ColgramStorageSandbox.java"))
+        self.assertIn("canUseRootFast(", sb_src)
+        self.assertIn("getCanonicalPath()", sb_src)
+
+        db_src = _read(os.path.join(CORE_DIR, "ColgramDatabase.java"))
+        self.assertIn("upsertShadowMessagesBatch(", db_src)
+        batch_body = db_src.split("public void upsertShadowMessagesBatch(", 1)[1].split("public void clearShadowPreviewPath(", 1)[0]
+        self.assertNotIn("CONFLICT_REPLACE", batch_body)
+
+        eng_src = _read(os.path.join(CORE_DIR, "ColgramColemailerEngine.java"))
+        self.assertIn("public synchronized void recordCampaignDispatchOutcome(", eng_src)
+
+        bs_src = _read(os.path.join(CORE_DIR, "ColgramBotSync.java"))
+        self.assertIn("AtomicInteger permitRefs", bs_src)
+
+        br_src = _read(os.path.join(TMPL_DIR, "ColgramNativeColemailerBridge.java"))
+        self.assertIn("TLRPC.TL_inputPeerEmpty", br_src)
+        self.assertIn("markup.rows == null", br_src)
+        self.assertIn("collectOwnUsernames(", br_src)
+        self.assertIn("cc.isContact(userId)", br_src)
 
 
 if __name__ == "__main__":

@@ -197,11 +197,20 @@ def inject_hooks(repo_path):
                  "        ProxyRotationController.init();\n"
                  "\n"
                  "        // Colgram: initialise LAST, once AndroidUtilities, the native library and\n"
-                 "        // the Java<->native bridge all exist. See the note in apply-patches.py -\n"
-                 "        // this used to run before super.onCreate() and that was a real bug.\n"
+                 "        // the Java<->native bridge all exist. Each bootstrap step stays isolated in its\n"
+                 "        // own try/catch and ColgramUiBridge installs before hook initialization.\n"
+                 "        try {\n"
+                 "            org.colgram.core.ColgramCrashGuard.install(applicationContext);\n"
+                 "        } catch (Throwable ignore) {\n"
+                 "\n"
+                 "        }\n"
+                 "        try {\n"
+                 "            org.colgram.core.ColgramUiBridge.install(this);\n"
+                 "        } catch (Throwable ignore) {\n"
+                 "\n"
+                 "        }\n"
                  "        try {\n"
                  "            org.colgram.core.ColgramHookHandler.init(applicationContext);\n"
-                 "            org.colgram.core.ColgramUiBridge.install(this);\n"
                  "        } catch (Throwable ignore) {\n"
                  "\n"
                  "        }\n")
@@ -231,7 +240,7 @@ def inject_hooks(repo_path):
                 "        }\n")
 
         pieces = [
-            ("ColgramUiBridge.install(this)", piece_init),
+            ("ColgramHookHandler.init(applicationContext)", piece_init),
             ("ColgramBotSync.applyIpv4Policy()", piece_ipv4),
             ("ColgramForegroundService.start(this)", piece_service),
         ]
@@ -6299,8 +6308,11 @@ def inject_hooks(repo_path):
             ' android:permission="android.permission.BIND_VPN_SERVICE"'
             ' android:exported="false"'
             ' android:foregroundServiceType="specialUse">'
-            '\n            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"'
+            '\n            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"'
             ' android:value="Colgram VPN tunnel" />'
+            '\n            <intent-filter>'
+            '\n                <action android:name="android.net.VpnService" />'
+            '\n            </intent-filter>'
             '\n        </service>'
         )
         return content[:match.end()] + service + content[match.end():]
@@ -6838,10 +6850,14 @@ def inject_warp_device_test_support(repo_path, root_dir):
             declaration = f'    <uses-permission android:name="{permission}" />\n'
             manifest_content = manifest_content[:app_at] + declaration + manifest_content[app_at:]
             app_at += len(declaration)
-    if "PROPERTY_SPECIAL_USE_FGS_SUBJECT" not in manifest_content:
+    if "PROPERTY_SPECIAL_USE_FGS_SUBTYPE" not in manifest_content:
+        manifest_content = manifest_content.replace(
+            "PROPERTY_SPECIAL_USE_FGS_SUBJECT", "PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        )
+    if "PROPERTY_SPECIAL_USE_FGS_SUBTYPE" not in manifest_content:
         app_end = manifest_content.rfind("</application>")
         if app_end >= 0:
-            subject = ('    <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"'
+            subject = ('    <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"'
                        ' android:value="Colgram VPN tunnel" />\n')
             manifest_content = manifest_content[:app_end] + subject + manifest_content[app_end:]
     activity_marker = "org.colgram.core.ColgramVpnConsentHostActivity"
@@ -7732,7 +7748,7 @@ def configure_package_and_branding(repo_path):
                 '\n'
                 '        <!-- Colgram: keeps the process alive so bot chats keep syncing without push.\n'
                 '             specialUse avoids Android 15/16 dataSync 6h rolling timeout crash loops;\n'
-                '             PROPERTY_SPECIAL_USE_FGS_SUBJECT satisfies API 34+ specialUse manifest check. -->\n'
+                '             PROPERTY_SPECIAL_USE_FGS_SUBTYPE satisfies API 34+ specialUse manifest check. -->\n'
                 '        <service\n'
                 '            android:name="org.colgram.core.ColgramForegroundService"\n'
                 '            android:enabled="true"\n'
@@ -7740,7 +7756,7 @@ def configure_package_and_branding(repo_path):
                 '            android:foregroundServiceType="specialUse"\n'
                 '            android:stopWithTask="false">\n'
                 '            <property\n'
-                '                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"\n'
+                '                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"\n'
                 '                android:value="Continuous private bot chat sync and privacy proxy bypass" />\n'
                 '        </service>\n'
                 '\n'
@@ -7786,7 +7802,7 @@ def configure_package_and_branding(repo_path):
                 '            android:foregroundServiceType="specialUse"\n'
                 '            android:stopWithTask="false">\n'
                 '            <property\n'
-                '                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"\n'
+                '                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"\n'
                 '                android:value="Continuous private bot chat sync and privacy proxy bypass" />\n'
                 '        </service>'
             )
@@ -8066,9 +8082,125 @@ def normalize_variant_manifests(repo_path):
             with open(path, "r", encoding="utf-8") as source:
                 text = source.read()
             fixed = remove_measurement_components(normalize_variant_application_label(text))
+            fixed = fixed.replace("android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT", "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE")
             if fixed != text:
                 with open(path, "w", encoding="utf-8") as target:
                     target.write(fixed)
+
+
+def inject_bypass_boot_and_manifest_hotfixes(repo_path):
+    """Idempotent Track 1 hotfixes for Android 14+ FGS/VpnService manifests, ApplicationLoader init, and native push thread."""
+    manifest_paths = [
+        os.path.join(repo_path, "TMessagesProj", "src", "main", "AndroidManifest.xml"),
+        os.path.join(repo_path, "TMessagesProj_AppStandalone", "src", "main", "AndroidManifest.xml"),
+    ]
+    cfg_dir = os.path.join(repo_path, "TMessagesProj", "config")
+    if os.path.isdir(cfg_dir):
+        for root, _, files in os.walk(cfg_dir):
+            for name in files:
+                if name.startswith("AndroidManifest") and name.endswith(".xml"):
+                    manifest_paths.append(os.path.join(root, name))
+
+    for idx, mpath in enumerate(manifest_paths):
+        if not os.path.isfile(mpath):
+            continue
+        with open(mpath, "r", encoding="utf-8", errors="ignore") as mf:
+            orig = mf.read()
+        eol = "\r\n" if "\r\n" in orig else "\n"
+        updated = orig.replace(
+            "android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT",
+            "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE",
+        )
+        if idx == 0 and "org.colgram.singbox.ColgramVpnService" in updated:
+            def _ensure_vpn_filter(match):
+                block = match.group(0)
+                if "android.net.VpnService" in block:
+                    return block
+                if block.endswith("/>"):
+                    return (
+                        block[:-2]
+                        + f">{eol}            <intent-filter>{eol}                <action android:name=\"android.net.VpnService\" />{eol}            </intent-filter>{eol}        </service>"
+                    )
+                return block.replace(
+                    "</service>",
+                    f"    <intent-filter>{eol}                <action android:name=\"android.net.VpnService\" />{eol}            </intent-filter>{eol}        </service>",
+                    1,
+                )
+
+            updated = re.sub(
+                r'<service\b[^>]*android:name="org\.colgram\.singbox\.ColgramVpnService"[^>]*(?:/>|>[\s\S]*?</service>)',
+                _ensure_vpn_filter,
+                updated,
+                count=1,
+            )
+        if updated != orig:
+            with open(mpath, "w", encoding="utf-8", newline="") as mf:
+                mf.write(updated)
+            print(f" [+] Upgraded AndroidManifest specialUse/VpnService contract in {os.path.basename(mpath)}")
+
+    app_loader = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java"
+    )
+    if os.path.isfile(app_loader):
+        with open(app_loader, "r", encoding="utf-8", errors="ignore") as af:
+            src = af.read()
+        eol = "\r\n" if "\r\n" in src else "\n"
+        combined_re = re.compile(
+            r'([ \t]*)try\s*\{\s*\r?\n'
+            r'(?:[ \t]*org\.colgram\.core\.ColgramCrashGuard\.install\(applicationContext\);\s*\r?\n)?'
+            r'[ \t]*org\.colgram\.core\.ColgramHookHandler\.init\(applicationContext\);\s*\r?\n'
+            r'[ \t]*org\.colgram\.core\.ColgramUiBridge\.install\(this\);\s*\r?\n'
+            r'[ \t]*\}\s*catch\s*\(\s*Throwable\s+[A-Za-z_][A-Za-z0-9_]*\s*\)\s*\{\s*\r?\n(?:\s*\r?\n)*[ \t]*\}'
+        )
+        def _split_bootstrap(m):
+            ind = m.group(1)
+            has_crash = "ColgramCrashGuard.install(applicationContext)" in m.group(0)
+            blocks = []
+            if has_crash:
+                blocks.append(
+                    f"{ind}try {{{eol}"
+                    f"{ind}    org.colgram.core.ColgramCrashGuard.install(applicationContext);{eol}"
+                    f"{ind}}} catch (Throwable ignore) {{{eol}{eol}{ind}}}"
+                )
+            blocks.append(
+                f"{ind}try {{{eol}"
+                f"{ind}    org.colgram.core.ColgramUiBridge.install(this);{eol}"
+                f"{ind}}} catch (Throwable ignore) {{{eol}{eol}{ind}}}"
+            )
+            blocks.append(
+                f"{ind}try {{{eol}"
+                f"{ind}    org.colgram.core.ColgramHookHandler.init(applicationContext);{eol}"
+                f"{ind}}} catch (Throwable ignore) {{{eol}{eol}{ind}}}"
+            )
+            return eol.join(blocks)
+
+        upgraded, n_boot = combined_re.subn(_split_bootstrap, src, count=1)
+        if n_boot > 0 and upgraded != src:
+            with open(app_loader, "w", encoding="utf-8", newline="") as af:
+                af.write(upgraded)
+            print(" [+] Isolated ApplicationLoader ColgramUiBridge/HookHandler init blocks")
+
+    conn_cpp = os.path.join(repo_path, "TMessagesProj", "jni", "tgnet", "ConnectionsManager.cpp")
+    if os.path.isfile(conn_cpp):
+        with open(conn_cpp, "r", encoding="utf-8", errors="ignore") as cf:
+            cpp_src = cf.read()
+        eol = "\r\n" if "\r\n" in cpp_src else "\n"
+        tp_start = cpp_src.find("void *ConnectionsManager::ThreadProc(void *data)")
+        if tp_start >= 0:
+            tp_loop = cpp_src.find("do {", tp_start)
+            if tp_loop > tp_start:
+                tp_slice = cpp_src[tp_start:tp_loop]
+                target_push = "    if (networkManager->currentUserId != 0 && networkManager->pushConnectionEnabled) {"
+                if "networkManager->checkPendingTasks();" not in tp_slice:
+                    fixed_slice = tp_slice.replace(
+                        target_push,
+                        f"    networkManager->checkPendingTasks();{eol}{target_push}",
+                        1,
+                    )
+                    if fixed_slice != tp_slice:
+                        with open(conn_cpp, "w", encoding="utf-8", newline="") as cf:
+                            cf.write(cpp_src[:tp_start] + fixed_slice + cpp_src[tp_loop:])
+                        print(" [+] Draining ConnectionsManager.cpp pendingTasks before createPushConnection()")
 
 
 def sync_colgram_extra_templates_and_assets(repo_path, root_dir, koliti_enabled=True):
@@ -17956,6 +18088,7 @@ def main():
     patch_video_wallpaper_fixes(target_repo)
     inject_chat_wallpaper_unlock_patches(target_repo)
     inject_attach_spoof_delete_patches(target_repo)
+    inject_bypass_boot_and_manifest_hotfixes(target_repo)
     from bypass_bg_patches import apply as inject_bypass_bg_patches
     inject_bypass_bg_patches(target_repo, patch_file, _patch_file_eol)
     from attach_del_perf_patches import apply as inject_attach_del_perf_patches

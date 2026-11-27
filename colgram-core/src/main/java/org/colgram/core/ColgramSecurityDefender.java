@@ -311,7 +311,7 @@ public final class ColgramSecurityDefender {
         boolean dpiBound = ColgramDpiBypass.isBound();
         if (!dpiBound) {
             boolean recovered = false;
-            if (autoClose) {
+            if (autoClose && !ColgramDpiBypass.wasExplicitlyStopped() && !ColgramConfig.isWarpEnabled()) {
                 try {
                     recovered = ColgramDpiBypass.restartIfDeadAndWait(2000L);
                 } catch (Throwable ignored) {}

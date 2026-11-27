@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 
 def _patch_eol_variants(eol_patch_fn, filepath: str, anchors: list[str], replacement: str, desc: str) -> None:
@@ -275,13 +276,36 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     conn_mgr = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java"
     )
-    eol_patch_fn(
+    if os.path.isfile(conn_mgr):
+        with open(conn_mgr, "r", encoding="utf-8", errors="ignore") as _cm_f:
+            _cm_raw = _cm_f.read()
+        _dup_sig_re = re.compile(
+            r'(public static String colgramGetLastProxySignature\(\)\s*\{\s*return colgramLastProxySignature;\s*\})'
+            r'(\r?\n){2,}[ \t]*public static void colgramResetProxySignature\(\)\s*\{\s*colgramLastProxySignature = null;\s*\}'
+        )
+        _cm_dedup, _cm_dedup_n = _dup_sig_re.subn(r'\1', _cm_raw, count=1)
+        if _cm_dedup_n > 0 and _cm_dedup != _cm_raw:
+            with open(conn_mgr, "w", encoding="utf-8", newline="") as _cm_f:
+                _cm_f.write(_cm_dedup)
+    _patch_eol_variants(
+        eol_patch_fn,
         conn_mgr,
-        "    private static volatile String colgramLastProxySignature = null;",
+        [
+            """    private static volatile String colgramLastProxySignature = null;
+
+    public static void colgramResetProxySignature() {
+        colgramLastProxySignature = null;
+    }""",
+            "    private static volatile String colgramLastProxySignature = null;",
+        ],
         """    private static volatile String colgramLastProxySignature = null;
 
     public static void colgramResetProxySignature() {
         colgramLastProxySignature = null;
+    }
+
+    public static String colgramGetLastProxySignature() {
+        return colgramLastProxySignature;
     }""",
         "ConnectionsManager.java add colgramResetProxySignature()",
     )
@@ -372,6 +396,57 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     }""",
         "ConnectionsManager.java bypass stageQueue on outbound instant send requests and propagate Contract A read exemption",
     )
+    if os.path.isfile(conn_mgr):
+        with open(conn_mgr, "r", encoding="utf-8", errors="ignore") as _cm_f:
+            _cm_txt = _cm_f.read()
+        if "colgramShouldDropFirewallRequest" in _cm_txt:
+            eol_patch_fn(
+                conn_mgr,
+                """    private static TLObject colgramSyntheticFirewallResponse(TLObject object) {
+        if (object instanceof TLRPC.TL_messages_getSponsoredMessages) {
+            return new TLRPC.TL_messages_sponsoredMessages();
+        }
+        if (object instanceof TLRPC.TL_messages_readHistory
+                || object instanceof TLRPC.TL_messages_readMessageContents
+                || object instanceof TLRPC.TL_channels_readMessageContents) {
+            return new TLRPC.TL_messages_affectedMessages();
+        }
+        if (object instanceof TLRPC.TL_channels_readHistory
+                || object instanceof TLRPC.TL_messages_readSavedHistory
+                || object instanceof TLRPC.TL_messages_readMentions
+                || object instanceof TLRPC.TL_messages_readReactions) {
+            return new TLRPC.TL_messages_affectedHistory();
+        }
+        return new TLRPC.TL_boolTrue();
+    }""",
+                """    private static TLObject colgramSyntheticFirewallResponse(TLObject object) {
+        if (object instanceof TLRPC.TL_messages_getSponsoredMessages) {
+            return new TLRPC.TL_messages_sponsoredMessages();
+        }
+        if (object instanceof TLRPC.TL_contacts_getSponsoredPeers) {
+            return new TLRPC.TL_contacts_sponsoredPeersEmpty();
+        }
+        if (object instanceof org.telegram.tgnet.tl.TL_stories.TL_stories_readStories) {
+            return new org.telegram.tgnet.Vector<>(org.telegram.tgnet.Vector.Int::TLDeserialize);
+        }
+        if (object instanceof TLRPC.TL_messages_readPollVotes
+                || object instanceof TLRPC.TL_messages_readMentions
+                || object instanceof TLRPC.TL_messages_readReactions) {
+            return new TLRPC.TL_messages_affectedHistory();
+        }
+        if (object instanceof TLRPC.TL_messages_readHistory
+                || object instanceof TLRPC.TL_messages_readMessageContents) {
+            return new TLRPC.TL_messages_affectedMessages();
+        }
+        if (object instanceof TLRPC.TL_channels_readHistory
+                || object instanceof TLRPC.TL_messages_readSavedHistory
+                || object instanceof TLRPC.TL_channels_readMessageContents) {
+            return new TLRPC.TL_boolTrue();
+        }
+        return new TLRPC.TL_boolTrue();
+    }""",
+                "ConnectionsManager.java fix synthetic firewall TL response types",
+            )
     _patch_eol_variants(
         eol_patch_fn,
         conn_mgr,
@@ -427,16 +502,25 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         if (object instanceof TLRPC.TL_messages_getSponsoredMessages) {
             return new TLRPC.TL_messages_sponsoredMessages();
         }
+        if (object instanceof TLRPC.TL_contacts_getSponsoredPeers) {
+            return new TLRPC.TL_contacts_sponsoredPeersEmpty();
+        }
+        if (object instanceof org.telegram.tgnet.tl.TL_stories.TL_stories_readStories) {
+            return new org.telegram.tgnet.Vector<>(org.telegram.tgnet.Vector.Int::TLDeserialize);
+        }
+        if (object instanceof TLRPC.TL_messages_readPollVotes
+                || object instanceof TLRPC.TL_messages_readMentions
+                || object instanceof TLRPC.TL_messages_readReactions) {
+            return new TLRPC.TL_messages_affectedHistory();
+        }
         if (object instanceof TLRPC.TL_messages_readHistory
-                || object instanceof TLRPC.TL_messages_readMessageContents
-                || object instanceof TLRPC.TL_channels_readMessageContents) {
+                || object instanceof TLRPC.TL_messages_readMessageContents) {
             return new TLRPC.TL_messages_affectedMessages();
         }
         if (object instanceof TLRPC.TL_channels_readHistory
                 || object instanceof TLRPC.TL_messages_readSavedHistory
-                || object instanceof TLRPC.TL_messages_readMentions
-                || object instanceof TLRPC.TL_messages_readReactions) {
-            return new TLRPC.TL_messages_affectedHistory();
+                || object instanceof TLRPC.TL_channels_readMessageContents) {
+            return new TLRPC.TL_boolTrue();
         }
         return new TLRPC.TL_boolTrue();
     }
@@ -469,12 +553,21 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         [
             """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
             installer = "com.android.vending";
-        }"""
+        }""",
+            """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+            packageId = "org.telegram.messenger";
+            regId = "";
+            cFingerprint = "";
+            timezoneOffset = 0;
+        }""",
         ],
         """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
             installer = "com.android.vending";
             packageId = "org.telegram.messenger";
-            regId = "";
+            if (!enablePushConnection) {
+                regId = "";
+            }
             cFingerprint = "";
             timezoneOffset = 0;
         }""",
@@ -500,13 +593,22 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         conn_mgr,
         [
-            """            ByteArrayOutputStream outbuf = null;
-            InputStream httpConnectionStream = null;
-            boolean done = false;
-            try {
-                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");"""
-        ],
-        """            if (org.colgram.core.ColgramConfig.isDohEnabled()
+            """            if (org.colgram.core.ColgramConfig.isDohEnabled()) {
+                try {
+                    java.net.InetAddress[] doh = org.colgram.core.ColgramDohResolver.resolve(currentHostName);
+                    if (doh != null && doh.length > 0) {
+                        ArrayList<String> addresses = new ArrayList<>(doh.length);
+                        for (java.net.InetAddress addr : doh) {
+                            if (addr != null) addresses.add(addr.getHostAddress());
+                        }
+                        if (!addresses.isEmpty()) {
+                            return new ResolvedDomain(addresses, SystemClock.elapsedRealtime());
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (org.colgram.core.ColgramConfig.isDohEnabled()
                     && (org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
                             || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled())) {
                 try {
@@ -522,6 +624,59 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     }
                 } catch (Throwable ignored) {}
                 return null;
+            }
+            ByteArrayOutputStream outbuf = null;
+            InputStream httpConnectionStream = null;
+            boolean done = false;
+            try {
+                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");""",
+            """            if (org.colgram.core.ColgramConfig.isDohEnabled()
+                    && (org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()
+                            || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled())) {
+                try {
+                    InetAddress[] doh = org.colgram.core.ColgramDohResolver.resolve(currentHostName);
+                    if (doh != null && doh.length > 0) {
+                        ArrayList<String> addresses = new ArrayList<>(doh.length);
+                        for (InetAddress addr : doh) {
+                            if (addr != null) addresses.add(addr.getHostAddress());
+                        }
+                        if (!addresses.isEmpty()) {
+                            return new ResolvedDomain(addresses, SystemClock.elapsedRealtime());
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                return null;
+            }
+            ByteArrayOutputStream outbuf = null;
+            InputStream httpConnectionStream = null;
+            boolean done = false;
+            try {
+                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");""",
+            """            ByteArrayOutputStream outbuf = null;
+            InputStream httpConnectionStream = null;
+            boolean done = false;
+            try {
+                URL downloadUrl = new URL("https://www.google.com/resolve?name=" + currentHostName + "&type=A");""",
+        ],
+        """            if (org.colgram.core.ColgramConfig.isDohEnabled()) {
+                try {
+                    InetAddress[] doh = org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()
+                            ? org.colgram.core.ColgramDohResolver.resolve(currentHostName)
+                            : org.colgram.core.ColgramDohResolver.resolveOrSystem(currentHostName);
+                    if (doh != null && doh.length > 0) {
+                        ArrayList<String> addresses = new ArrayList<>(doh.length);
+                        for (InetAddress addr : doh) {
+                            if (addr != null) addresses.add(addr.getHostAddress());
+                        }
+                        if (!addresses.isEmpty()) {
+                            return new ResolvedDomain(addresses, SystemClock.elapsedRealtime());
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()
+                        || org.colgram.core.ColgramConfig.isStrictProxySecurityEnabled()) {
+                    return null;
+                }
             }
             ByteArrayOutputStream outbuf = null;
             InputStream httpConnectionStream = null;
@@ -688,29 +843,19 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         send_helper,
         [
-            """    private void colgramPrepareInstantSend() {
-        ConnectionsManager connectionsManager = getConnectionsManager();
+            """        ConnectionsManager connectionsManager = getConnectionsManager();
         if (connectionsManager.getPauseTime() != 0 || connectionsManager.getConnectionState() != ConnectionsManager.ConnectionStateConnected) {
             connectionsManager.resumeNetworkMaybe();
             connectionsManager.checkConnection();
-        }
-        if (org.colgram.core.ColgramConfig.isBuiltinProxyEnabled() && !org.colgram.core.ColgramDpiBypass.isBound()) {
-            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);
-        }
-    }""",
+        }""",
         ],
-        """    private void colgramPrepareInstantSend() {
-        ConnectionsManager connectionsManager = getConnectionsManager();
+        """        ConnectionsManager connectionsManager = getConnectionsManager();
         if (connectionsManager.getPauseTime() != 0) {
             connectionsManager.resumeNetworkMaybe();
         }
         if (connectionsManager.colgramIsRawDisconnected()) {
             Utilities.globalQueue.postRunnable(connectionsManager::checkConnection);
-        }
-        if (org.colgram.core.ColgramConfig.isBuiltinProxyEnabled() && !org.colgram.core.ColgramDpiBypass.isBound()) {
-            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);
-        }
-    }""",
+        }""",
         "SendMessagesHelper.java make colgramPrepareInstantSend() non-blocking on UI thread",
     )
     eol_patch_fn(
@@ -1928,13 +2073,24 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         return dataSource.open(dataSpec);""",
         "ExtendedDefaultDataSource.java route ExoPlayer HTTP(S) through ColgramBrowserRoutes proxy",
     )
+    if os.path.isfile(ext_ds):
+        with open(ext_ds, "r", encoding="utf-8", errors="ignore") as _ds_f:
+            _ds_raw = _ds_f.read()
+        if _ds_raw.count("private DataSource getColgramHttpDataSource()") > 1:
+            _ds_block_re = re.compile(
+                r'\r?\n    private @Nullable DataSource colgramHttpDataSource;\r?\n\r?\n    private DataSource getColgramHttpDataSource\(\) \{[\s\S]*?return colgramHttpDataSource;\r?\n    \}'
+            )
+            _first_m = _ds_block_re.search(_ds_raw)
+            if _first_m is not None:
+                _tail_dedup, _tail_n = _ds_block_re.subn("", _ds_raw[_first_m.end():], count=1)
+                if _tail_n > 0:
+                    with open(ext_ds, "w", encoding="utf-8", newline="") as _ds_f:
+                        _ds_f.write(_ds_raw[:_first_m.end()] + _tail_dedup)
     _patch_eol_variants(
         eol_patch_fn,
         ext_ds,
         [
-            """    private @Nullable DataSource rawResourceDataSource;"""
-        ],
-        """    private @Nullable DataSource rawResourceDataSource;
+            """    private @Nullable DataSource rawResourceDataSource;
     private @Nullable DataSource colgramHttpDataSource;
 
     private DataSource getColgramHttpDataSource() {
@@ -1995,6 +2151,131 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                         }
                         long len = c.getContentLengthLong();
                         return spec.length != -1 ? spec.length : (len >= 0 ? len : -1L);
+                    }
+                    throw new IOException("Too many redirects");
+                }
+
+                @Override
+                public int read(byte[] buffer, int offset, int readLength) throws IOException {
+                    if (readLength == 0) return 0;
+                    if (in == null) return -1;
+                    int n = in.read(buffer, offset, readLength);
+                    if (n > 0 && activeSpec != null) {
+                        for (int i = 0; i < transferListeners.size(); i++) {
+                            transferListeners.get(i).onBytesTransferred(this, activeSpec, true, n);
+                        }
+                    }
+                    return n;
+                }
+
+                @Override
+                public @Nullable Uri getUri() {
+                    return activeUri;
+                }
+
+                @Override
+                public Map<String, List<String>> getResponseHeaders() {
+                    return conn != null ? conn.getHeaderFields() : Collections.emptyMap();
+                }
+
+                @Override
+                public void close() throws IOException {
+                    try {
+                        if (in != null) in.close();
+                    } finally {
+                        in = null;
+                        if (conn != null) {
+                            conn.disconnect();
+                            conn = null;
+                        }
+                        if (activeSpec != null) {
+                            for (int i = 0; i < transferListeners.size(); i++) {
+                                transferListeners.get(i).onTransferEnd(this, activeSpec, true);
+                            }
+                            activeSpec = null;
+                        }
+                        activeUri = null;
+                    }
+                }
+            };
+        }
+        return colgramHttpDataSource;
+    }""",
+            """    private @Nullable DataSource rawResourceDataSource;"""
+        ],
+        """    private @Nullable DataSource rawResourceDataSource;
+    private @Nullable DataSource colgramHttpDataSource;
+
+    private DataSource getColgramHttpDataSource() {
+        if (colgramHttpDataSource == null) {
+            colgramHttpDataSource = new DataSource() {
+                private java.net.HttpURLConnection conn;
+                private java.io.InputStream in;
+                private Uri activeUri;
+                private DataSpec activeSpec;
+
+                @Override
+                public void addTransferListener(TransferListener transferListener) {
+                    // Tracked via outer ExtendedDefaultDataSource listeners
+                }
+
+                @Override
+                public long open(DataSpec spec) throws IOException {
+                    activeSpec = spec;
+                    String cur = spec.uri.toString();
+                    for (int redirects = 0; redirects < 6; redirects++) {
+                        java.net.URLConnection rawConn = org.telegram.ui.ColgramBrowserRoutes.openConnection(new java.net.URL(cur));
+                        if (!(rawConn instanceof java.net.HttpURLConnection)) {
+                            throw new IOException("Expected HttpURLConnection");
+                        }
+                        java.net.HttpURLConnection c = (java.net.HttpURLConnection) rawConn;
+                        boolean colgramHandedOff = false;
+                        try {
+                            c.setConnectTimeout(10000);
+                            c.setReadTimeout(15000);
+                            c.setInstanceFollowRedirects(false);
+                            boolean hasCallerUa = false;
+                            for (Map.Entry<String, String> e : spec.httpRequestHeaders.entrySet()) {
+                                if ("user-agent".equalsIgnoreCase(e.getKey())) {
+                                    hasCallerUa = true;
+                                }
+                                c.setRequestProperty(e.getKey(), e.getValue());
+                            }
+                            if (!hasCallerUa) {
+                                c.setRequestProperty("User-Agent", org.colgram.core.ColgramPolymorphicStealth.pickBrowserUserAgent());
+                            }
+                            if (spec.position > 0 || spec.length != -1) {
+                                String range = "bytes=" + spec.position + "-";
+                                if (spec.length != -1) {
+                                    range += (spec.position + spec.length - 1);
+                                }
+                                c.setRequestProperty("Range", range);
+                            }
+                            int code = c.getResponseCode();
+                            if (code >= 300 && code < 400) {
+                                String loc = c.getHeaderField("Location");
+                                if (loc == null || loc.isEmpty()) throw new IOException("Redirect without Location");
+                                cur = new java.net.URL(new java.net.URL(cur), loc).toString();
+                                continue;
+                            }
+                            if (code < 200 || code >= 300) {
+                                throw new IOException("HTTP response code " + code);
+                            }
+                            conn = c;
+                            activeUri = Uri.parse(cur);
+                            in = c.getInputStream();
+                            colgramHandedOff = true;
+                            for (int i = 0; i < transferListeners.size(); i++) {
+                                transferListeners.get(i).onTransferInitializing(this, spec, true);
+                                transferListeners.get(i).onTransferStart(this, spec, true);
+                            }
+                            long len = c.getContentLengthLong();
+                            return spec.length != -1 ? spec.length : (len >= 0 ? len : -1L);
+                        } finally {
+                            if (!colgramHandedOff) {
+                                c.disconnect();
+                            }
+                        }
                     }
                     throw new IOException("Too many redirects");
                 }
@@ -2147,4 +2428,194 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             final String colgramUrl3 = url;
             org.telegram.ui.ColgramBrowserRoutes.whenProxyReady(this, () -> colgramSuperLoadUrl(colgramUrl3, null));""",
         "BotWebViewContainer.java gate loadUrl on ColgramBrowserRoutes proxy readiness",
+    )
+
+    # 18. SharedConfig & LaunchActivity: sync ColgramProxyManager when Telegram clears proxy & harden LaunchActivity onResume FGS start.
+    shared_cfg = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "SharedConfig.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        shared_cfg,
+        [
+            """            if (enabled) {
+                ConnectionsManager.setProxySettings(false, null);
+            }"""
+        ],
+        """            if (enabled) {
+                ConnectionsManager.setProxySettings(false, null);
+                org.colgram.core.ColgramProxyManager.onTelegramProxyCleared();
+            }""",
+        "SharedConfig.java notify ColgramProxyManager on deleteProxy",
+    )
+
+    _patch_eol_variants(
+        eol_patch_fn,
+        launch_act,
+        [
+            """                        ConnectionsManager.setProxySettings(false, null);
+                        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged);"""
+        ],
+        """                        ConnectionsManager.setProxySettings(false, null);
+                        org.colgram.core.ColgramProxyManager.onTelegramProxyCleared();
+                        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged);""",
+        "LaunchActivity.java notify ColgramProxyManager on proxyErrorDialog dismiss",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        launch_act,
+        [
+            """        if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {
+            org.colgram.core.ColgramForegroundService.start(this);
+            org.colgram.core.ColgramForegroundService.scheduleDozeKeepalive(this);""",
+            """        if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {
+            try {
+                org.colgram.core.ColgramForegroundService.start(this);
+                org.colgram.core.ColgramForegroundService.scheduleDozeKeepalive(this);
+            } catch (Throwable ignored) {}""",
+        ],
+        """        if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {
+            try {
+                org.colgram.core.ColgramForegroundService.start(this);
+                org.colgram.core.ColgramForegroundService.scheduleDozeKeepalive(this);
+            } catch (Throwable ignored) {}""",
+        "LaunchActivity.java guard onResume ColgramForegroundService start",
+    )
+
+    # 19. ProxyListActivity: await prior VPN teardown before System DPI start, surface redacted failures in status/HUD, and wire colgramDpiRow tap.
+    proxy_act = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ProxyListActivity.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        proxy_act,
+        [
+            """    private String colgramSystemDpiStatus() {
+        Context ctx = getContext();
+        String st = org.colgram.core.ColgramCallSocksTunnel.systemDpiStatus(ctx);
+        if ("running".equals(st)) {
+            return "Активен для всего телефона (SNI-разрез + DoH + QUIC-блок)";
+        }
+        if ("starting".equals(st) || colgramSystemDpiPending) {
+            return "Запуск системного локального обхода…";
+        }
+        return "YouTube, Discord, браузеры и звонки • без внешнего VPN";
+    }"""
+        ],
+        """    private String colgramSystemDpiStatus() {
+        Context ctx = getContext();
+        String st = org.colgram.core.ColgramCallSocksTunnel.systemDpiStatus(ctx);
+        if ("running".equals(st)) {
+            return "Активен для всего телефона (SNI-разрез + DoH + QUIC-блок)";
+        }
+        if ("starting".equals(st) || colgramSystemDpiPending) {
+            return "Запуск системного локального обхода…";
+        }
+        if ("failed".equals(st)) {
+            String err = org.colgram.core.ColgramCallSocksTunnel.systemDpiLastError(ctx);
+            return (err != null && !err.isEmpty())
+                    ? ("Ошибка запуска (" + err + ") · нажмите для повтора")
+                    : "Не удалось запустить · нажмите для повтора";
+        }
+        return "YouTube, Discord, браузеры и звонки • без внешнего VPN";
+    }""",
+        "ProxyListActivity.java surface failed status in colgramSystemDpiStatus",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        proxy_act,
+        [
+            """    private void startSystemDpiNow(Context app) {
+        colgramSystemDpiPending = true;
+        org.colgram.core.ColgramRouteEpoch.next();
+        refreshWarpState();
+        warpOperations.execute(() -> {
+            String err = null;
+            try {
+                org.colgram.core.ColgramCallSocksTunnel.startSystemDpi(app);
+            } catch (Throwable t) {
+                err = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+            }
+            final String finalErr = err;
+            AndroidUtilities.runOnUIThread(() -> {
+                colgramSystemDpiPending = false;
+                if (finalErr != null && getContext() != null) {
+                    android.widget.Toast.makeText(getContext(), "Локальный обход: " + finalErr, android.widget.Toast.LENGTH_LONG).show();
+                }
+                refreshWarpState();
+            });
+        });
+    }"""
+        ],
+        """    private void startSystemDpiNow(Context app) {
+        colgramSystemDpiPending = true;
+        org.colgram.core.ColgramRouteEpoch.next();
+        refreshWarpState();
+        warpOperations.execute(() -> {
+            String err = null;
+            try {
+                if (!org.colgram.core.ColgramCallSocksTunnel.awaitStopped(app, 3000L)) {
+                    err = "VPN_TEARDOWN_TIMEOUT";
+                } else {
+                    org.colgram.core.ColgramCallSocksTunnel.startSystemDpi(app);
+                    for (int i = 0; i < 40; i++) {
+                        String curSt = org.colgram.core.ColgramCallSocksTunnel.systemDpiStatus(app);
+                        if (!"starting".equals(curSt)) {
+                            if ("failed".equals(curSt) || !"running".equals(curSt)) {
+                                String last = org.colgram.core.ColgramCallSocksTunnel.systemDpiLastError(app);
+                                err = (last != null && !last.isEmpty()) ? last : ("VPN_" + curSt);
+                            }
+                            break;
+                        }
+                        try { Thread.sleep(75L); } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                    if (err == null && "starting".equals(org.colgram.core.ColgramCallSocksTunnel.systemDpiStatus(app))) {
+                        String last = org.colgram.core.ColgramCallSocksTunnel.systemDpiLastError(app);
+                        if (last != null && !last.isEmpty()) {
+                            err = last;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                String last = org.colgram.core.ColgramCallSocksTunnel.systemDpiLastError(app);
+                err = (last != null && !last.isEmpty()) ? last : t.getClass().getSimpleName();
+            }
+            final String finalErr = err;
+            AndroidUtilities.runOnUIThread(() -> {
+                colgramSystemDpiPending = false;
+                if (finalErr != null && getContext() != null) {
+                    ColgramUiKit.showNotice(ProxyListActivity.this, org.telegram.messenger.R.drawable.msg_info, "Локальный обход: " + finalErr, true);
+                }
+                refreshWarpState();
+            });
+        });
+    }""",
+        "ProxyListActivity.java await VPN teardown and surface System-DPI errors",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        proxy_act,
+        [
+            """                    if (position == colgramDpiRow) {
+                        cell.setText(ColgramSubscriptionControls.label("Локальный слой всегда включён", "Local base is always on")
+                                + "\\n" + colgramDpiStatus());
+                    } else if (position == colgramBackgroundProxyRow) {"""
+        ],
+        """                    if (position == colgramDpiRow) {
+                        cell.setText(ColgramSubscriptionControls.label("Локальный слой всегда включён", "Local base is always on")
+                                + "\\n" + colgramDpiStatus());
+                        cell.setOnClickListener(v -> {
+                            org.colgram.core.ColgramProxyManager.recheckBypassListener();
+                            ColgramUiKit.showNotice(ProxyListActivity.this, org.telegram.messenger.R.drawable.msg_info,
+                                    ColgramSubscriptionControls.label("Перепроверка локального транспорта…", "Re-checking local bypass listener…"),
+                                    false);
+                        });
+                        cell.setClickable(true);
+                        cell.getTextView().setMovementMethod(null);
+                        cell.getTextView().setClickable(false);
+                    } else if (position == colgramBackgroundProxyRow) {""",
+        "ProxyListActivity.java wire colgramDpiRow tap to recheckBypassListener()",
     )

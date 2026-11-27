@@ -251,8 +251,11 @@ public class ColgramAiActivity extends BaseFragment {
                     "Привет! Я Колити — твой друг-помощник в Колграме. Проверка озвучки и ударений прошла успешно!",
                     "ru",
                     R.raw.koliti_user_voice_ref,
-                    (usedClone, file, note) -> AndroidUtilities.runOnUIThread(() ->
-                            ColgramUiKit.showNotice(ctx, R.drawable.msg_voice_speaker, "Режим: " + note, false))
+                    (usedClone, file, note) -> AndroidUtilities.runOnUIThread(() -> {
+                        Activity cbAct = getParentActivity();
+                        if (isFinishing() || cbAct == null || cbAct.isFinishing() || cbAct.isDestroyed()) return;
+                        ColgramUiKit.showNotice(cbAct, R.drawable.msg_voice_speaker, "Режим: " + note, false);
+                    })
             );
             return;
         }
@@ -525,6 +528,16 @@ public class ColgramAiActivity extends BaseFragment {
     public void onRequestPermissionsResultFragment(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResultFragment(requestCode, permissions, grantResults);
         Activity act = getParentActivity();
+        if (requestCode == 6411) {
+            if (act != null && !act.isFinishing() && !act.isDestroyed() && !isFinishing()) {
+                if (grantResults != null && grantResults.length > 0 && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    showRecordVoiceSampleDialog(act);
+                } else {
+                    ColgramUiKit.showNotice(this, R.drawable.input_mic, "Доступ к микрофону отклонён", true);
+                }
+            }
+            return;
+        }
         if (act != null && ColgramAiSheet.handlePermissionResult(act, requestCode, permissions, grantResults)) {
             return;
         }
@@ -565,13 +578,18 @@ public class ColgramAiActivity extends BaseFragment {
                     if (dst.length() > 256) {
                         ColgramAiConfig.setVoiceReferencePath(act, dst.getAbsolutePath());
                         AndroidUtilities.runOnUIThread(() -> {
-                            ColgramUiKit.showNotice(act, R.drawable.msg_check_s, "Образец голоса подключён: " + dst.getName(), false);
+                            Activity cbAct = getParentActivity();
+                            if (isFinishing() || cbAct == null || cbAct.isFinishing() || cbAct.isDestroyed()) return;
+                            ColgramUiKit.showNotice(cbAct, R.drawable.msg_check_s, "Образец голоса подключён: " + dst.getName(), false);
                             refreshRow(voiceSampleRow);
                         });
                     }
                 } catch (Throwable err) {
-                    AndroidUtilities.runOnUIThread(() ->
-                            ColgramUiKit.showNotice(act, R.drawable.msg_info, "Ошибка импорта аудио: " + err.getMessage(), true));
+                    AndroidUtilities.runOnUIThread(() -> {
+                        Activity cbAct = getParentActivity();
+                        if (isFinishing() || cbAct == null || cbAct.isFinishing() || cbAct.isDestroyed()) return;
+                        ColgramUiKit.showNotice(cbAct, R.drawable.msg_info, "Ошибка импорта аудио: " + err.getMessage(), true);
+                    });
                 }
             }, "colgram-voice-ref-import").start();
             return;
@@ -615,15 +633,20 @@ public class ColgramAiActivity extends BaseFragment {
                     }
                     ColgramAiEngine.getInstance().unloadModelAsync();
                     AndroidUtilities.runOnUIThread(() -> {
-                        ColgramUiKit.showNotice(act, R.drawable.msg_check_s, "Файл подключён: " + savedDst.getName(), false);
+                        Activity cbAct = getParentActivity();
+                        if (isFinishing() || cbAct == null || cbAct.isFinishing() || cbAct.isDestroyed()) return;
+                        ColgramUiKit.showNotice(cbAct, R.drawable.msg_check_s, "Файл подключён: " + savedDst.getName(), false);
                         refreshUi();
                     });
                 } catch (Throwable err) {
                     if (dst != null) {
                         try { dst.delete(); } catch (Throwable ignored) {}
                     }
-                    AndroidUtilities.runOnUIThread(() ->
-                            ColgramUiKit.showNotice(act, R.drawable.msg_info, "Ошибка импорта: " + err.getMessage(), true));
+                    AndroidUtilities.runOnUIThread(() -> {
+                        Activity cbAct = getParentActivity();
+                        if (isFinishing() || cbAct == null || cbAct.isFinishing() || cbAct.isDestroyed()) return;
+                        ColgramUiKit.showNotice(cbAct, R.drawable.msg_info, "Ошибка импорта: " + err.getMessage(), true);
+                    });
                 }
             }, "colgram-gguf-import").start();
         }
@@ -844,6 +867,10 @@ public class ColgramAiActivity extends BaseFragment {
         private final ProgressBar progressBar;
         private final TextView primaryBtn;
         private final TextView secondaryBtn;
+        private boolean hasStyledButtons = false;
+        private boolean lastBtnDark = false;
+        private int lastBtnAccent = 0;
+        private int lastBtnCrimson = 0;
 
         KolitiCoreCardView(Context context) {
             super(context);
@@ -871,7 +898,9 @@ public class ColgramAiActivity extends BaseFragment {
 
             progressBar = new ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal);
             progressBar.setMax(100);
-            progressBar.getProgressDrawable().setColorFilter(ColgramMenuChrome.COLOR_CRIMSON, PorterDuff.Mode.SRC_IN);
+            if (progressBar.getProgressDrawable() != null) {
+                progressBar.getProgressDrawable().setColorFilter(ColgramMenuChrome.COLOR_CRIMSON, PorterDuff.Mode.SRC_IN);
+            }
             card.addView(progressBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 5, 0, 0, 0, 12));
 
             LinearLayout btnRow = new LinearLayout(context);
@@ -915,12 +944,18 @@ public class ColgramAiActivity extends BaseFragment {
             titleTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
             descTv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
 
-            ColgramMenuChrome.attachTactileFeedback(primaryBtn, 12, pal.accentPrimary, 0, 0x33FFFFFF);
-            ColgramMenuChrome.attachTactileFeedback(secondaryBtn, 12,
-                    dark ? 0x26F43F5E : 0x14E11D48,
-                    dark ? 0x55FB7185 : 0x44E11D48,
-                    0x28E11D48);
-            secondaryBtn.setTextColor(dark ? 0xFFFDA4AF : pal.semanticCrimson);
+            if (!hasStyledButtons || lastBtnDark != dark || lastBtnAccent != pal.accentPrimary || lastBtnCrimson != pal.semanticCrimson) {
+                ColgramMenuChrome.attachTactileFeedback(primaryBtn, 12, pal.accentPrimary, 0, 0x33FFFFFF);
+                ColgramMenuChrome.attachTactileFeedback(secondaryBtn, 12,
+                        dark ? 0x26F43F5E : 0x14E11D48,
+                        dark ? 0x55FB7185 : 0x44E11D48,
+                        0x28E11D48);
+                secondaryBtn.setTextColor(dark ? 0xFFFDA4AF : pal.semanticCrimson);
+                hasStyledButtons = true;
+                lastBtnDark = dark;
+                lastBtnAccent = pal.accentPrimary;
+                lastBtnCrimson = pal.semanticCrimson;
+            }
 
             ColgramAiModels.ModelSpec spec = ColgramAiModels.findById(ColgramAiConfig.getActiveModelId(ctx));
             ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);

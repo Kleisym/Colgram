@@ -86,9 +86,10 @@ class FunctionalRouteUiTests(unittest.TestCase):
 
     def test_general_settings_does_not_offer_local_base_off_or_an_off_callsite(self):
         source = (ROOT / "scripts/templates/ColgramSettingsActivity.java").read_text(encoding="utf-8")
-        self.assertNotIn("position == dpiBypassRow", method(source, "public boolean isEnabled("))
+        self.assertIn("position == dpiBypassRow", method(source, "public boolean isEnabled("))
         click = source.split("listView.setOnItemClickListener((view, position) -> {", 1)[1].split("return fragmentView;", 1)[0]
-        self.assertNotIn("position == dpiBypassRow", click)
+        self.assertIn("position == dpiBypassRow", click)
+        self.assertIn("ColgramProxyManager.recheckBypassListener();", click)
         self.assertNotIn("setDpiBypassEnabled(false)", source)
         self.assertNotIn("setDpiBypassEnabled(context, false)", source)
         self.assertIn('"Локальный слой всегда включён\\n" + dpiStatusLine()', source)

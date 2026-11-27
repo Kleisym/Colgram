@@ -473,12 +473,16 @@ public class ColgramBotSync {
                     continue;
                 }
                 try {
+                    final java.util.concurrent.atomic.AtomicInteger permitRefs =
+                            new java.util.concurrent.atomic.AtomicInteger(1);
                     IPV4_PROXY_POOL.execute(() -> {
                         try {
-                            colgramHandleProxyClient(client);
+                            colgramHandleProxyClient(client, permitRefs);
                         } catch (Throwable ignored) {
                         } finally {
-                            IPV4_PROXY_SLOTS.release();
+                            if (permitRefs.decrementAndGet() == 0) {
+                                IPV4_PROXY_SLOTS.release();
+                            }
                         }
                     });
                 } catch (Throwable rejected) {
@@ -494,7 +498,8 @@ public class ColgramBotSync {
     }
 
     /** Serve one client: read its request, dial IPv4 upstream, relay. */
-    private static void colgramHandleProxyClient(java.net.Socket client) {
+    private static void colgramHandleProxyClient(java.net.Socket client,
+                                                 java.util.concurrent.atomic.AtomicInteger permitRefs) {
         java.net.Socket upstream = null;
         try {
             client.setSoTimeout(COLGRAM_CONNECT_TIMEOUT_MS);
@@ -599,7 +604,7 @@ public class ColgramBotSync {
 
             java.net.Socket handedUpstream = upstream;
             upstream = null;
-            colgramPump(client, handedUpstream);
+            colgramPump(client, handedUpstream, permitRefs);
         } catch (Throwable t) {
             // One bad client must never take the listener down.
             Log.w(TAG, "proxy: " + t.getClass().getSimpleName() + " " + t.getMessage());
@@ -608,13 +613,28 @@ public class ColgramBotSync {
         }
     }
 
-    /** Relay both directions until either side closes. */
-    private static void colgramPump(final java.net.Socket client, final java.net.Socket upstream) {
+    /** Relay both directions until either side closes, releasing the slot permit only after both threads exit. */
+    private static void colgramPump(final java.net.Socket client, final java.net.Socket upstream,
+                                    final java.util.concurrent.atomic.AtomicInteger permitRefs) {
         final java.net.Socket[] both = new java.net.Socket[] { client, upstream };
+        boolean secondaryDispatched = false;
         try {
-            IPV4_PROXY_POOL.execute(() -> colgramCopy(upstream, client, both));
+            permitRefs.incrementAndGet();
+            IPV4_PROXY_POOL.execute(() -> {
+                try {
+                    colgramCopy(upstream, client, both);
+                } finally {
+                    if (permitRefs.decrementAndGet() == 0) {
+                        IPV4_PROXY_SLOTS.release();
+                    }
+                }
+            });
+            secondaryDispatched = true;
             colgramCopy(client, upstream, both);
         } catch (Throwable t) {
+            if (!secondaryDispatched) {
+                permitRefs.decrementAndGet();
+            }
             for (java.net.Socket s : both) {
                 try { s.close(); } catch (Throwable ignored) {}
             }

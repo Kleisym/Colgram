@@ -190,8 +190,9 @@ public final class ColgramStorageCapEnforcer {
             ColgramShieldConfig.init(appCtx);
             ColgramStorageIndex.init(appCtx.getFilesDir());
             List<File> roots = collectAllManagedRoots(appCtx);
+            File shadowDir = ColgramStorageSandbox.getShadowPreviewsDir(appCtx);
             Set<String> active = ColgramStorageOptimizer.getActiveTelegramFilePaths();
-            long bytes = computeManagedBytes(roots, appCtx.getFilesDir(), active);
+            long bytes = computeManagedBytes(roots, appCtx.getFilesDir(), active) + computeDirBytes(shadowDir);
             trackedCacheBytes.set(bytes);
             if (ColgramShieldConfig.isStorageCapEnabled()) {
                 long cap = ColgramShieldConfig.getStorageHardCapBytes();
@@ -239,6 +240,7 @@ public final class ColgramStorageCapEnforcer {
             EnforcementReport rep = enforceCapSync(
                     roots, appCtx.getFilesDir(), shadowDir, capBytes, activePaths,
                     transcoder, charging, thermalThrottled, capEnabled, nowMs);
+            pruneAbandonedInbox(appCtx.getExternalFilesDir("colgram_inbox"), activePaths, nowMs);
             trackedCacheBytes.set(rep.bytesAfter);
             try {
                 ColgramDatabase db = ColgramDatabase.getInstance(appCtx);
@@ -273,6 +275,7 @@ public final class ColgramStorageCapEnforcer {
             EnforcementReport rep = enforceCapSync(
                     roots, appCtx.getFilesDir(), shadowDir, capBytes, activePaths,
                     transcoder, charging || true, isThermalSevere(appCtx), capEnabled, System.currentTimeMillis(), true);
+            pruneAbandonedInbox(appCtx.getExternalFilesDir("colgram_inbox"), activePaths, System.currentTimeMillis());
             trackedCacheBytes.set(rep.bytesAfter);
             try {
                 ColgramDatabase db = ColgramDatabase.getInstance(appCtx);
@@ -297,7 +300,6 @@ public final class ColgramStorageCapEnforcer {
         if (filesDir != null) {
             addRootIfValid(result, seen, new File(filesDir, "Colgram"));
             addRootIfValid(result, seen, new File(filesDir, "Telegram"));
-            addRootIfValid(result, seen, new File(filesDir, "colgram_inbox"));
             addRootIfValid(result, seen, new File(filesDir, "media_history"));
             addRootIfValid(result, seen, new File(filesDir, "koliti_media"));
         }
@@ -318,7 +320,6 @@ public final class ColgramStorageCapEnforcer {
                         if (ef == null) continue;
                         addRootIfValid(result, seen, new File(ef, "Telegram"));
                         addRootIfValid(result, seen, new File(ef, "Colgram"));
-                        addRootIfValid(result, seen, new File(ef, "colgram_inbox"));
                     }
                 }
             } catch (Throwable ignored) {}
@@ -437,16 +438,36 @@ public final class ColgramStorageCapEnforcer {
         }
         if (filesDir != null) {
             File inbox = new File(filesDir, "colgram_inbox");
-            if (inbox.isDirectory()) {
-                reclaimed += ColgramStorageOptimizer.pruneRegenerableWaste(
-                        Collections.emptyList(), inbox, activePaths, nowMs);
-            }
+            reclaimed += pruneAbandonedInbox(inbox, activePaths, nowMs);
             File rootCas = new File(filesDir, ".colgram_cas");
             if (rootCas.isDirectory() && casCleaned.add(rootCas)) {
                 reclaimed += ColgramStorageOptimizer.pruneOrphanCasBlobs(rootCas);
             }
             reclaimed += rotateMessagesLogIfNeeded(filesDir);
             reclaimed += rotateMessagesLogIfNeeded(new File(filesDir, "Colgram"));
+        }
+        return reclaimed;
+    }
+
+    private static final long INBOX_ABANDONED_AGE_MS = 24L * 3600_000L;
+
+    private static long pruneAbandonedInbox(File inbox, Set<String> activePaths, long nowMs) {
+        if (inbox == null || !inbox.isDirectory()) return 0L;
+        long reclaimed = ColgramStorageOptimizer.pruneRegenerableWaste(
+                Collections.emptyList(), inbox, activePaths, nowMs);
+        File[] files = inbox.listFiles();
+        if (files == null) return reclaimed;
+        for (File f : files) {
+            if (f == null || !f.isFile() || ".nomedia".equals(f.getName())) continue;
+            if (ColgramStorageOptimizer.isPathActive(f, activePaths)) continue;
+            long age = (nowMs > 0L && f.lastModified() > 0L) ? (nowMs - f.lastModified()) : 0L;
+            if (age >= INBOX_ABANDONED_AGE_MS) {
+                long len = f.length();
+                if (f.delete()) {
+                    reclaimed += len;
+                    ColgramStorageIndex.removeEntry(f.getAbsolutePath());
+                }
+            }
         }
         return reclaimed;
     }
@@ -492,10 +513,7 @@ public final class ColgramStorageCapEnforcer {
 
     private static long pruneStaleTempRecursive(File dir, int depth, Set<String> activePaths, long nowMs) {
         if (dir == null || !dir.isDirectory() || depth > 5) return 0L;
-        String dirName = dir.getName().toLowerCase(Locale.ROOT);
-        if ("shadow_previews".equals(dirName) || "colgram_vault".equals(dirName)
-                || "colgram_wallpapers".equals(dirName) || "koliti_models".equals(dirName)
-                || "shared_prefs".equals(dirName)) {
+        if (isProtectedDirectoryName(dir.getName())) {
             return 0L;
         }
         File[] children = dir.listFiles();
@@ -591,7 +609,7 @@ public final class ColgramStorageCapEnforcer {
                     processed++;
                     sleepYield(yieldMs);
                 }
-            } else if (isCompressibleTextName(lower) && f.length() >= TEXT_COMPRESS_MIN_BYTES) {
+            } else if (isCompressibleLogFile(f) && f.length() >= TEXT_COMPRESS_MIN_BYTES) {
                 if (compressTextFileWithGzip(f, report)) {
                     processed++;
                     sleepYield(yieldMs);
@@ -758,7 +776,7 @@ public final class ColgramStorageCapEnforcer {
                 if (age < PHASE_B_SETTLE_MS) continue;
                 String lower = child.getName().toLowerCase(Locale.ROOT);
                 if ((isImageName(lower) && child.length() >= IMAGE_COMPRESS_MIN_BYTES)
-                        || (isCompressibleTextName(lower) && child.length() >= TEXT_COMPRESS_MIN_BYTES)) {
+                        || (isCompressibleLogFile(child) && child.length() >= TEXT_COMPRESS_MIN_BYTES)) {
                     out.add(child);
                 }
             }
@@ -846,17 +864,25 @@ public final class ColgramStorageCapEnforcer {
                 || lowerName.endsWith(".db-wal")
                 || lowerName.endsWith(".db-shm")
                 || lowerName.endsWith(".db-journal")
+                || lowerName.endsWith(".sqlite")
+                || lowerName.endsWith(".sqlite3")
                 || lowerName.endsWith(".enc")
                 || lowerName.endsWith(".key")
                 || lowerName.endsWith(".keystore")
                 || lowerName.endsWith(".gguf")
                 || lowerName.endsWith(".onnx")
                 || lowerName.endsWith(".tflite")
+                || lowerName.endsWith(".py")
+                || lowerName.endsWith(".pyc")
+                || lowerName.endsWith(".cgb")
                 || lowerName.endsWith(".cgorig")) {
             return true;
         }
         String normLower = ColgramStorageIndex.normalizePath(file).toLowerCase(Locale.ROOT);
-        if (normLower.contains("/shadow_previews/")
+        if (normLower.contains("/plugins/")
+                || normLower.contains("/colgram_inbox/")
+                || normLower.contains("/colgram_private_backup/")
+                || normLower.contains("/shadow_previews/")
                 || normLower.contains("/colgram_vault/")
                 || normLower.contains("/colgram_wallpapers/")
                 || normLower.contains("/media_history/")
@@ -881,10 +907,13 @@ public final class ColgramStorageCapEnforcer {
         return false;
     }
 
-    private static boolean isProtectedDirectory(File dir, int depth) {
-        if (dir == null) return true;
-        String lower = dir.getName().toLowerCase(Locale.ROOT);
-        if ("shadow_previews".equals(lower)
+    public static boolean isProtectedDirectoryName(String dirName) {
+        if (dirName == null || dirName.isEmpty()) return false;
+        String lower = dirName.toLowerCase(Locale.ROOT);
+        return "plugins".equals(lower)
+                || "colgram_inbox".equals(lower)
+                || "colgram_private_backup".equals(lower)
+                || "shadow_previews".equals(lower)
                 || "colgram_vault".equals(lower)
                 || "colgram_wallpapers".equals(lower)
                 || "media_history".equals(lower)
@@ -893,21 +922,27 @@ public final class ColgramStorageCapEnforcer {
                 || "models".equals(lower)
                 || "shared_prefs".equals(lower)
                 || "databases".equals(lower)
-                || ".colgram_cas".equals(lower)) {
-            return true;
-        }
-        return false;
+                || ".colgram_cas".equals(lower);
+    }
+
+    private static boolean isProtectedDirectory(File dir, int depth) {
+        if (dir == null) return true;
+        return isProtectedDirectoryName(dir.getName());
     }
 
     private static boolean isImageName(String lower) {
-        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png");
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
     }
 
-    private static boolean isCompressibleTextName(String lower) {
+    private static boolean isCompressibleLogFile(File file) {
+        if (file == null) return false;
+        String lower = file.getName().toLowerCase(Locale.ROOT);
         if (lower.startsWith("colgram_") || lower.startsWith("messages_log")) return false;
-        return lower.endsWith(".log") || lower.endsWith(".txt")
-                || lower.endsWith(".jsonl") || lower.endsWith(".csv")
-                || lower.endsWith(".json");
+        if (!lower.endsWith(".log")) return false;
+        String normLower = ColgramStorageIndex.normalizePath(file).toLowerCase(Locale.ROOT);
+        return normLower.contains("/logs/")
+                || normLower.contains("/cache/")
+                || normLower.contains("/.colgram_cache/");
     }
 
     public static long computeManagedBytes(Collection<File> roots, File filesDir, Set<String> activePaths) {
@@ -933,10 +968,7 @@ public final class ColgramStorageCapEnforcer {
 
     private static long accumulateBytesDedup(File dir, int depth, Set<String> seenFiles) {
         if (dir == null || !dir.isDirectory() || depth > 6) return 0L;
-        String lower = dir.getName().toLowerCase(Locale.ROOT);
-        if ("shadow_previews".equals(lower) || "colgram_vault".equals(lower)
-                || "colgram_wallpapers".equals(lower) || "media_history".equals(lower)
-                || "koliti_models".equals(lower) || "shared_prefs".equals(lower) || "databases".equals(lower)) {
+        if (isProtectedDirectoryName(dir.getName())) {
             return 0L;
         }
         File[] children = dir.listFiles();

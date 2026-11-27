@@ -71,9 +71,9 @@ final class ColgramLocalDnsProxy implements Closeable {
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<byte[]>> inflightByKey =
             new ConcurrentHashMap<>();
-    private final Semaphore inflight = new Semaphore(128);
+    private final Semaphore inflight = new Semaphore(64);
     private final ExecutorService workers = new java.util.concurrent.ThreadPoolExecutor(
-            0, 64, 30L, TimeUnit.SECONDS,
+            0, 68, 30L, TimeUnit.SECONDS,
             new java.util.concurrent.SynchronousQueue<>(),
             r -> {
                 Thread t = new Thread(r, "colgram-local-dns");
@@ -102,7 +102,9 @@ final class ColgramLocalDnsProxy implements Closeable {
     void attach(VpnService service) {
         this.vpn = service;
         if (customForwarder == null && service != null && !closed.get()) {
-            workers.execute(this::prewarmHotDomains);
+            try {
+                workers.execute(this::prewarmHotDomains);
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {}
         }
     }
 

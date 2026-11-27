@@ -22,13 +22,46 @@ def _eol_replace(path: str, old: str, new: str, label: str, eol_patch_fn, marker
     eol_patch_fn(path, old, new, label)
 
 
+def _upgrade_or_patch(
+    path: str,
+    legacy_variants,
+    raw_old: str,
+    new: str,
+    label: str,
+    eol_patch_fn,
+    marker: str = "",
+) -> None:
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+            norm = fh.read().replace("\r\n", "\n")
+        if (marker and marker in norm) or new in norm:
+            return
+        for legacy in legacy_variants:
+            if legacy and legacy in norm:
+                eol_patch_fn(path, legacy, new, label)
+                return
+    eol_patch_fn(path, raw_old, new, label)
+
+
 def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     ui = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
 
-    # 1. CheckBoxCell.java — hide empty valueTextView & fix isMultiline padding/hit height
+    # 1. CheckBoxCell.java — hide empty valueTextView, prevent value/links overlap & fix multiline hit height
     checkbox_cell = os.path.join(ui, "Cells", "CheckBoxCell.java")
-    _eol_replace(
+    _upgrade_or_patch(
         checkbox_cell,
+        (
+            (
+                "        } else if (isMultiline) {\n"
+                "            // colgram-checkbox-layout-v1\n"
+                "            super.onMeasure(MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));\n"
+                "            int colgramMinH = dp(50) + (needDivider ? 1 : 0);\n"
+                "            if (getMeasuredHeight() < colgramMinH) {\n"
+                "                setMeasuredDimension(getMeasuredWidth(), colgramMinH);\n"
+                "            }\n"
+                "        } else {"
+            ),
+        ),
         (
             "        } else if (isMultiline) {\n"
             "            super.onMeasure(MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));\n"
@@ -36,17 +69,29 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         ),
         (
             "        } else if (isMultiline) {\n"
-            "            // colgram-checkbox-layout-v1\n"
-            "            super.onMeasure(MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));\n"
+            "            // colgram-checkbox-layout-v2\n"
+            "            int w = MeasureSpec.getSize(widthMeasureSpec);\n"
+            "            super.onMeasure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));\n"
+            "            if (valueTextView != null && valueTextView.getVisibility() == VISIBLE && textView != null && textView.getLayoutParams() instanceof MarginLayoutParams) {\n"
+            "                int valW = valueTextView.getMeasuredWidth();\n"
+            "                if (valW > 0) {\n"
+            "                    MarginLayoutParams tlp = (MarginLayoutParams) textView.getLayoutParams();\n"
+            "                    int maxTextW = Math.max(dp(80), w - getPaddingLeft() - getPaddingRight() - tlp.leftMargin - tlp.rightMargin - valW - dp(8));\n"
+            "                    if (textView.getMeasuredWidth() > maxTextW) {\n"
+            "                        textView.measure(MeasureSpec.makeMeasureSpec(maxTextW, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));\n"
+            "                        setMeasuredDimension(getMeasuredWidth(), Math.max(getMeasuredHeight(), textView.getMeasuredHeight() + (needDivider ? 1 : 0)));\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
             "            int colgramMinH = dp(50) + (needDivider ? 1 : 0);\n"
             "            if (getMeasuredHeight() < colgramMinH) {\n"
             "                setMeasuredDimension(getMeasuredWidth(), colgramMinH);\n"
             "            }\n"
             "        } else {"
         ),
-        "CheckBoxCell.java isMultiline min height",
+        "CheckBoxCell.java isMultiline min height and value overlap guard",
         eol_patch_fn,
-        marker="// colgram-checkbox-layout-v1",
+        marker="// colgram-checkbox-layout-v2",
     )
     _eol_replace(
         checkbox_cell,
@@ -110,7 +155,7 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         eol_patch_fn,
     )
 
-    # 2. TextSettingsCell.java — exact innerW math in release builds + requestLayout on icon change
+    # 2. TextSettingsCell.java — exact innerW math in release builds + requestLayout on text/icon change + RTL fix
     text_settings_cell = os.path.join(ui, "Cells", "TextSettingsCell.java")
     _eol_replace(
         text_settings_cell,
@@ -118,106 +163,245 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         "    private boolean betterLayout = true;",
         "TextSettingsCell.java enable betterLayout in release",
         eol_patch_fn,
-        marker="// colgram-textsettingscell-layout-v1",
+        marker="// colgram-textsettingscell-layout-v2",
+    )
+    _v1_tsc_measure = (
+        "    @Override\n"
+        "    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {\n"
+        "        // colgram-textsettingscell-layout-v1\n"
+        "        int totalW = MeasureSpec.getSize(widthMeasureSpec);\n"
+        "        int cellH = AndroidUtilities.dp(50) + (needDivider ? 1 : 0);\n"
+        "        setMeasuredDimension(totalW, cellH);\n\n"
+        "        int leftMarginPx = AndroidUtilities.dp(imageView.getVisibility() == VISIBLE ? 58 : padding);\n"
+        "        int rightMarginPx = AndroidUtilities.dp(Math.max(12, padding - 4));\n"
+        "        int innerW = Math.max(0, totalW - getPaddingLeft() - getPaddingRight() - leftMarginPx - rightMarginPx);\n"
+        "        if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "            valueImageView.measure(MeasureSpec.makeMeasureSpec(innerW, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+        "        }\n"
+        "        if (imageView.getVisibility() == VISIBLE) {\n"
+        "            if (imageViewIsColorful) {\n"
+        "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY));\n"
+        "            } else {\n"
+        "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.AT_MOST));\n"
+        "            }\n"
+        "        }\n"
+        "        if (valueBackupImageView != null && valueBackupImageView.getVisibility() == VISIBLE) {\n"
+        "            valueBackupImageView.measure(MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().height, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().width, MeasureSpec.EXACTLY));\n"
+        "            innerW = Math.max(0, innerW - valueBackupImageView.getMeasuredWidth() - AndroidUtilities.dp(8));\n"
+        "        }\n"
+        "        int textW = innerW;\n"
+        "        if (valueTextView.getVisibility() == VISIBLE) {\n"
+        "            int maxValWidth = betterLayout\n"
+        "                    ? Math.max(AndroidUtilities.dp(48), Math.min((int) (innerW * 0.44f), innerW - AndroidUtilities.dp(96)))\n"
+        "                    : innerW / 2;\n"
+        "            maxValWidth = Math.max(0, Math.min(innerW, maxValWidth));\n"
+        "            valueTextView.measure(MeasureSpec.makeMeasureSpec(maxValWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+        "            int valW = valueTextView.getMeasuredWidth();\n"
+        "            textW = Math.max(0, innerW - valW - AndroidUtilities.dp(12));\n"
+        "            if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "                MarginLayoutParams params = (MarginLayoutParams) valueImageView.getLayoutParams();\n"
+        "                if (LocaleController.isRTL) {\n"
+        "                    params.leftMargin = AndroidUtilities.dp(padding + 4) + valW;\n"
+        "                } else {\n"
+        "                    params.rightMargin = AndroidUtilities.dp(padding + 4) + valW;\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "        textView.measure(MeasureSpec.makeMeasureSpec(textW, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+        "    }"
+    )
+    _raw_tsc_measure = (
+        "    @Override\n"
+        "    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {\n"
+        "        setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), AndroidUtilities.dp(50) + (needDivider ? 1 : 0));\n\n"
+        "        int availableWidth = getMeasuredWidth() - getPaddingLeft() - getPaddingRight() - AndroidUtilities.dp(34);\n"
+        "        int width = betterLayout ? availableWidth : availableWidth / 2;\n"
+        "        if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "            valueImageView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY));\n"
+        "        }\n\n"
+        "        if (imageView.getVisibility() == VISIBLE) {\n"
+        "            if (imageViewIsColorful) {\n"
+        "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY));\n"
+        "            } else {\n"
+        "                imageView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.AT_MOST));\n"
+        "            }\n"
+        "            if (betterLayout) width -= imageView.getMeasuredWidth() + AndroidUtilities.dp(8);\n"
+        "        }\n\n"
+        "        if (valueBackupImageView != null) {\n"
+        "            valueBackupImageView.measure(MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().height, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().width, MeasureSpec.EXACTLY));\n"
+        "            if (betterLayout) width -= valueBackupImageView.getMeasuredWidth() + AndroidUtilities.dp(8);\n"
+        "        }\n"
+        "        if (valueTextView.getVisibility() == VISIBLE) {\n"
+        "            int maxValWidth = betterLayout ? Math.max(AndroidUtilities.dp(72), (int) (availableWidth * 0.45f)) : width;\n"
+        "            valueTextView.measure(MeasureSpec.makeMeasureSpec(Math.min(width, maxValWidth), MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY));\n"
+        "            if (betterLayout) {\n"
+        "                width = Math.max(AndroidUtilities.dp(80), width - valueTextView.getMeasuredWidth() - AndroidUtilities.dp(10));\n"
+        "            } else {\n"
+        "                width = Math.max(AndroidUtilities.dp(80), availableWidth - valueTextView.getMeasuredWidth() - AndroidUtilities.dp(8));\n"
+        "            }\n\n"
+        "            if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "                MarginLayoutParams params = (MarginLayoutParams) valueImageView.getLayoutParams();\n"
+        "                if (LocaleController.isRTL) {\n"
+        "                    params.leftMargin = AndroidUtilities.dp(padding + 4) + valueTextView.getMeasuredWidth();\n"
+        "                } else {\n"
+        "                    params.rightMargin = AndroidUtilities.dp(padding + 4) + valueTextView.getMeasuredWidth();\n"
+        "                }\n"
+        "            }\n"
+        "        } else {\n"
+        "            width = availableWidth;\n"
+        "        }\n"
+        "        textView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY));\n"
+        "    }"
+    )
+    _new_tsc_measure = (
+        "    @Override\n"
+        "    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {\n"
+        "        // colgram-textsettingscell-layout-v2\n"
+        "        int totalW = MeasureSpec.getSize(widthMeasureSpec);\n"
+        "        int cellH = AndroidUtilities.dp(50) + (needDivider ? 1 : 0);\n"
+        "        setMeasuredDimension(totalW, cellH);\n\n"
+        "        int leftMarginPx = AndroidUtilities.dp(imageView.getVisibility() == VISIBLE ? 58 : padding);\n"
+        "        int rightMarginPx = AndroidUtilities.dp(Math.max(12, padding - 4));\n"
+        "        int innerW = Math.max(0, totalW - getPaddingLeft() - getPaddingRight() - leftMarginPx - rightMarginPx);\n"
+        "        if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "            valueImageView.measure(MeasureSpec.makeMeasureSpec(innerW, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+        "        }\n"
+        "        if (imageView.getVisibility() == VISIBLE) {\n"
+        "            if (imageViewIsColorful) {\n"
+        "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY));\n"
+        "            } else {\n"
+        "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.AT_MOST));\n"
+        "            }\n"
+        "        }\n"
+        "        if (valueBackupImageView != null && valueBackupImageView.getVisibility() == VISIBLE) {\n"
+        "            valueBackupImageView.measure(MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().height, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().width, MeasureSpec.EXACTLY));\n"
+        "            innerW = Math.max(0, innerW - valueBackupImageView.getMeasuredWidth() - AndroidUtilities.dp(8));\n"
+        "        }\n"
+        "        int textW = innerW;\n"
+        "        if (valueTextView.getVisibility() == VISIBLE) {\n"
+        "            int maxValWidth = betterLayout\n"
+        "                    ? Math.max(AndroidUtilities.dp(48), Math.min((int) (innerW * 0.44f), innerW - AndroidUtilities.dp(96)))\n"
+        "                    : innerW / 2;\n"
+        "            maxValWidth = Math.max(0, Math.min(innerW, maxValWidth));\n"
+        "            valueTextView.measure(MeasureSpec.makeMeasureSpec(maxValWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+        "            int valW = valueTextView.getMeasuredWidth();\n"
+        "            textW = Math.max(0, innerW - valW - AndroidUtilities.dp(12));\n"
+        "            if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "                MarginLayoutParams params = (MarginLayoutParams) valueImageView.getLayoutParams();\n"
+        "                if (LocaleController.isRTL) {\n"
+        "                    params.leftMargin = AndroidUtilities.dp(padding + 4) + valW;\n"
+        "                } else {\n"
+        "                    params.rightMargin = AndroidUtilities.dp(padding + 4) + valW;\n"
+        "                }\n"
+        "                textW = Math.max(0, textW - valueImageView.getMeasuredWidth() - AndroidUtilities.dp(6));\n"
+        "            }\n"
+        "        } else if (valueImageView.getVisibility() == VISIBLE) {\n"
+        "            textW = Math.max(0, textW - valueImageView.getMeasuredWidth() - AndroidUtilities.dp(8));\n"
+        "        }\n"
+        "        textView.measure(MeasureSpec.makeMeasureSpec(textW, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+        "    }"
+    )
+    _upgrade_or_patch(
+        text_settings_cell,
+        (_v1_tsc_measure,),
+        _raw_tsc_measure,
+        _new_tsc_measure,
+        "TextSettingsCell.java release width clamp",
+        eol_patch_fn,
+        marker="// colgram-textsettingscell-layout-v2",
     )
     _eol_replace(
         text_settings_cell,
         (
-            "    @Override\n"
-            "    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {\n"
-            "        setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), AndroidUtilities.dp(50) + (needDivider ? 1 : 0));\n"
-            "\n"
-            "        int availableWidth = getMeasuredWidth() - getPaddingLeft() - getPaddingRight() - AndroidUtilities.dp(34);\n"
-            "        int width = betterLayout ? availableWidth : availableWidth / 2;\n"
-            "        if (valueImageView.getVisibility() == VISIBLE) {\n"
-            "            valueImageView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY));\n"
-            "        }\n"
-            "\n"
-            "        if (imageView.getVisibility() == VISIBLE) {\n"
-            "            if (imageViewIsColorful) {\n"
-            "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY));\n"
-            "            } else {\n"
-            "                imageView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.AT_MOST));\n"
-            "            }\n"
-            "            if (betterLayout) width -= imageView.getMeasuredWidth() + AndroidUtilities.dp(8);\n"
-            "        }\n"
-            "\n"
-            "        if (valueBackupImageView != null) {\n"
-            "            valueBackupImageView.measure(MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().height, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().width, MeasureSpec.EXACTLY));\n"
-            "            if (betterLayout) width -= valueBackupImageView.getMeasuredWidth() + AndroidUtilities.dp(8);\n"
-            "        }\n"
-            "        if (valueTextView.getVisibility() == VISIBLE) {\n"
-            "            int maxValWidth = betterLayout ? Math.max(AndroidUtilities.dp(72), (int) (availableWidth * 0.45f)) : width;\n"
-            "            valueTextView.measure(MeasureSpec.makeMeasureSpec(Math.min(width, maxValWidth), MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY));\n"
-            "            if (betterLayout) {\n"
-            "                width = Math.max(AndroidUtilities.dp(80), width - valueTextView.getMeasuredWidth() - AndroidUtilities.dp(10));\n"
-            "            } else {\n"
-            "                width = Math.max(AndroidUtilities.dp(80), availableWidth - valueTextView.getMeasuredWidth() - AndroidUtilities.dp(8));\n"
-            "            }\n"
-            "\n"
-            "            if (valueImageView.getVisibility() == VISIBLE) {\n"
-            "                MarginLayoutParams params = (MarginLayoutParams) valueImageView.getLayoutParams();\n"
-            "                if (LocaleController.isRTL) {\n"
-            "                    params.leftMargin = AndroidUtilities.dp(padding + 4) + valueTextView.getMeasuredWidth();\n"
-            "                } else {\n"
-            "                    params.rightMargin = AndroidUtilities.dp(padding + 4) + valueTextView.getMeasuredWidth();\n"
-            "                }\n"
-            "            }\n"
-            "        } else {\n"
-            "            width = availableWidth;\n"
-            "        }\n"
-            "        textView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY));\n"
+            "    public void setText(CharSequence text, boolean divider) {\n"
+            "        textView.setText(text);\n"
+            "        valueTextView.setVisibility(INVISIBLE);\n"
+            "        valueImageView.setVisibility(INVISIBLE);\n"
+            "        needDivider = divider;\n"
+            "        setWillNotDraw(!divider);\n"
             "    }"
         ),
         (
-            "    @Override\n"
-            "    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {\n"
-            "        // colgram-textsettingscell-layout-v1\n"
-            "        int totalW = MeasureSpec.getSize(widthMeasureSpec);\n"
-            "        int cellH = AndroidUtilities.dp(50) + (needDivider ? 1 : 0);\n"
-            "        setMeasuredDimension(totalW, cellH);\n"
-            "\n"
-            "        int leftMarginPx = AndroidUtilities.dp(imageView.getVisibility() == VISIBLE ? 58 : padding);\n"
-            "        int rightMarginPx = AndroidUtilities.dp(Math.max(12, padding - 4));\n"
-            "        int innerW = Math.max(0, totalW - getPaddingLeft() - getPaddingRight() - leftMarginPx - rightMarginPx);\n"
-            "        if (valueImageView.getVisibility() == VISIBLE) {\n"
-            "            valueImageView.measure(MeasureSpec.makeMeasureSpec(innerW, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
-            "        }\n"
-            "        if (imageView.getVisibility() == VISIBLE) {\n"
-            "            if (imageViewIsColorful) {\n"
-            "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.EXACTLY));\n"
-            "            } else {\n"
-            "                imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(28), MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.AT_MOST));\n"
-            "            }\n"
-            "        }\n"
-            "        if (valueBackupImageView != null && valueBackupImageView.getVisibility() == VISIBLE) {\n"
-            "            valueBackupImageView.measure(MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().height, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(valueBackupImageView.getLayoutParams().width, MeasureSpec.EXACTLY));\n"
-            "            innerW = Math.max(0, innerW - valueBackupImageView.getMeasuredWidth() - AndroidUtilities.dp(8));\n"
-            "        }\n"
-            "        int textW = innerW;\n"
-            "        if (valueTextView.getVisibility() == VISIBLE) {\n"
-            "            int maxValWidth = betterLayout\n"
-            "                    ? Math.max(AndroidUtilities.dp(48), Math.min((int) (innerW * 0.44f), innerW - AndroidUtilities.dp(96)))\n"
-            "                    : innerW / 2;\n"
-            "            maxValWidth = Math.max(0, Math.min(innerW, maxValWidth));\n"
-            "            valueTextView.measure(MeasureSpec.makeMeasureSpec(maxValWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
-            "            int valW = valueTextView.getMeasuredWidth();\n"
-            "            textW = Math.max(0, innerW - valW - AndroidUtilities.dp(12));\n"
-            "            if (valueImageView.getVisibility() == VISIBLE) {\n"
-            "                MarginLayoutParams params = (MarginLayoutParams) valueImageView.getLayoutParams();\n"
-            "                if (LocaleController.isRTL) {\n"
-            "                    params.leftMargin = AndroidUtilities.dp(padding + 4) + valW;\n"
-            "                } else {\n"
-            "                    params.rightMargin = AndroidUtilities.dp(padding + 4) + valW;\n"
-            "                }\n"
-            "            }\n"
-            "        }\n"
-            "        textView.measure(MeasureSpec.makeMeasureSpec(textW, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(cellH, MeasureSpec.EXACTLY));\n"
+            "    public void setText(CharSequence text, boolean divider) {\n"
+            "        textView.setText(text);\n"
+            "        valueTextView.setVisibility(INVISIBLE);\n"
+            "        valueImageView.setVisibility(INVISIBLE);\n"
+            "        needDivider = divider;\n"
+            "        setWillNotDraw(!divider);\n"
+            "        requestLayout();\n"
             "    }"
         ),
-        "TextSettingsCell.java release width clamp",
+        "TextSettingsCell.java setText requestLayout",
         eol_patch_fn,
-        marker="// colgram-textsettingscell-layout-v1",
+    )
+    _eol_replace(
+        text_settings_cell,
+        (
+            "    public void setTextAndIcon(CharSequence text, int resId, boolean divider) {\n"
+            "        textView.setText(text);\n"
+            "        valueTextView.setVisibility(INVISIBLE);\n"
+            "        if (resId != 0) {\n"
+            "            valueImageView.setVisibility(VISIBLE);\n"
+            "            valueImageView.setImageResource(resId);\n"
+            "        } else {\n"
+            "            valueImageView.setVisibility(INVISIBLE);\n"
+            "        }\n"
+            "        needDivider = divider;\n"
+            "        setWillNotDraw(!divider);\n"
+            "    }"
+        ),
+        (
+            "    public void setTextAndIcon(CharSequence text, int resId, boolean divider) {\n"
+            "        textView.setText(text);\n"
+            "        valueTextView.setVisibility(INVISIBLE);\n"
+            "        if (resId != 0) {\n"
+            "            valueImageView.setVisibility(VISIBLE);\n"
+            "            valueImageView.setImageResource(resId);\n"
+            "        } else {\n"
+            "            valueImageView.setVisibility(INVISIBLE);\n"
+            "        }\n"
+            "        needDivider = divider;\n"
+            "        setWillNotDraw(!divider);\n"
+            "        requestLayout();\n"
+            "    }"
+        ),
+        "TextSettingsCell.java setTextAndIcon requestLayout",
+        eol_patch_fn,
+    )
+    _eol_replace(
+        text_settings_cell,
+        "            imageView.setColorFilter(new PorterDuffColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN));",
+        "            imageView.setColorFilter(new PorterDuffColorFilter(org.colgram.core.ColgramThemePolicy.contrastInkOn(color), PorterDuff.Mode.SRC_IN));",
+        "TextSettingsCell.java setColorfulIcon contrastInkOn",
+        eol_patch_fn,
+    )
+    _eol_replace(
+        text_settings_cell,
+        (
+            "    public void updateRTL() {\n"
+            "        textView.setGravity((LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL);\n"
+            "        removeView(textView);\n"
+            "        addView(textView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP, padding, 0, padding, 0));\n\n"
+            "        valueTextView.setGravity((LocaleController.isRTL ? Gravity.LEFT : Gravity.RIGHT) | Gravity.CENTER_VERTICAL);\n"
+            "        removeView(valueTextView);\n"
+            "        addView(valueTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, (LocaleController.isRTL ? Gravity.LEFT : Gravity.RIGHT) | Gravity.TOP, padding, 0, padding, 0));\n\n"
+            "        removeView(imageView);\n"
+            "        addView(imageView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL, 21, 0, 21, 0));"
+        ),
+        (
+            "    public void updateRTL() {\n"
+            "        int textMargin = imageView.getVisibility() == VISIBLE ? 58 : padding;\n"
+            "        textView.setGravity((LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL);\n"
+            "        removeView(textView);\n"
+            "        addView(textView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP, LocaleController.isRTL ? padding : textMargin, 0, LocaleController.isRTL ? textMargin : padding, 0));\n\n"
+            "        valueTextView.setGravity((LocaleController.isRTL ? Gravity.LEFT : Gravity.RIGHT) | Gravity.CENTER_VERTICAL);\n"
+            "        removeView(valueTextView);\n"
+            "        addView(valueTextView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, (LocaleController.isRTL ? Gravity.LEFT : Gravity.RIGHT) | Gravity.TOP, padding - 4, 0, padding - 4, 0));\n\n"
+            "        removeView(imageView);\n"
+            "        addView(imageView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL, 16, 0, 16, 0));"
+        ),
+        "TextSettingsCell.java updateRTL preserve margins",
+        eol_patch_fn,
     )
     _eol_replace(
         text_settings_cell,
@@ -278,10 +462,23 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         eol_patch_fn,
     )
 
-    # 3. AnimatedTextView.java — clamp AT_MOST width & re-elide when drawable exceeds specSize
+    # 3. AnimatedTextView.java — clamp AT_MOST width against maxWidth & re-elide only when inner bounds change
     anim_text_view = os.path.join(ui, "Components", "AnimatedTextView.java")
-    _eol_replace(
+    _upgrade_or_patch(
         anim_text_view,
+        (
+            (
+                "        if (adaptWidth && MeasureSpec.getMode(widthMeasureSpec) == MeasureSpec.AT_MOST) {\n"
+                "            int specSize = MeasureSpec.getSize(widthMeasureSpec);\n"
+                "            if (drawable.getWidth() > specSize) {\n"
+                "                int innerSpec = Math.max(0, specSize - getPaddingLeft() - getPaddingRight());\n"
+                "                drawable.setBounds(getPaddingLeft(), getPaddingTop(), getPaddingLeft() + innerSpec, height - getPaddingBottom());\n"
+                "                drawable.setText(drawable.getText(), false, true);\n"
+                "            }\n"
+                "            width = Math.min(specSize, getPaddingLeft() + (int) Math.ceil(drawable.getWidth()) + getPaddingRight());\n"
+                "        }"
+            ),
+        ),
         (
             "        if (adaptWidth && MeasureSpec.getMode(widthMeasureSpec) == MeasureSpec.AT_MOST) {\n"
             "            width = getPaddingLeft() + (int) Math.ceil(drawable.getWidth()) + getPaddingRight();\n"
@@ -289,9 +486,9 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         ),
         (
             "        if (adaptWidth && MeasureSpec.getMode(widthMeasureSpec) == MeasureSpec.AT_MOST) {\n"
-            "            int specSize = MeasureSpec.getSize(widthMeasureSpec);\n"
-            "            if (drawable.getWidth() > specSize) {\n"
-            "                int innerSpec = Math.max(0, specSize - getPaddingLeft() - getPaddingRight());\n"
+            "            int specSize = width;\n"
+            "            int innerSpec = Math.max(0, specSize - getPaddingLeft() - getPaddingRight());\n"
+            "            if (drawable.getWidth() > innerSpec && drawable.getBounds().width() != innerSpec) {\n"
             "                drawable.setBounds(getPaddingLeft(), getPaddingTop(), getPaddingLeft() + innerSpec, height - getPaddingBottom());\n"
             "                drawable.setText(drawable.getText(), false, true);\n"
             "            }\n"
@@ -300,10 +497,10 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         ),
         "AnimatedTextView.java clamp AT_MOST width",
         eol_patch_fn,
-        marker="int specSize = MeasureSpec.getSize(widthMeasureSpec);",
+        marker="int innerSpec = Math.max(0, specSize - getPaddingLeft() - getPaddingRight());\n            if (drawable.getWidth() > innerSpec",
     )
 
-    # 4. TextCheckCell.java — dynamic height & valueTextView vertical placement below textView
+    # 4. TextCheckCell.java — dynamic height, wrap reset on recycle & dp(padding) divider
     text_check_cell = os.path.join(ui, "Cells", "TextCheckCell.java")
     _eol_replace(
         text_check_cell,
@@ -355,41 +552,78 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         eol_patch_fn,
         marker="// colgram-textcheck-dynamic-layout-v1",
     )
-    _eol_replace(
+    _old_wrap_fn = (
+        "    public void setColgramWrapTitle(boolean wrap) {\n"
+        "        colgramWrapTitle = wrap;\n"
+        "        if (wrap) {\n"
+        "            textView.setSingleLine(false);\n"
+        "            textView.setLines(0);\n"
+        "            textView.setMaxLines(2);\n"
+        "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);\n"
+        "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
+        "            LayoutParams lp = (LayoutParams) textView.getLayoutParams();\n"
+        "            if (lp != null) {\n"
+        "                lp.height = LayoutParams.WRAP_CONTENT;\n"
+        "                lp.topMargin = AndroidUtilities.dp(10);\n"
+        "                textView.setLayoutParams(lp);\n"
+        "            }\n"
+        "            isMultiline = true;\n"
+        "            requestLayout();\n"
+        "        }\n"
+        "    }"
+    )
+    _raw_wrap_fn = (
+        "    public void setColgramWrapTitle(boolean wrap) {\n"
+        "        colgramWrapTitle = wrap;\n"
+        "        if (wrap) {\n"
+        "            textView.setSingleLine(false);\n"
+        "            textView.setLines(0);\n"
+        "            textView.setMaxLines(2);\n"
+        "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);\n"
+        "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
+        "        }\n"
+        "    }"
+    )
+    _new_wrap_fn = (
+        "    public void setColgramWrapTitle(boolean wrap) {\n"
+        "        colgramWrapTitle = wrap;\n"
+        "        if (wrap) {\n"
+        "            textView.setSingleLine(false);\n"
+        "            textView.setLines(0);\n"
+        "            textView.setMaxLines(2);\n"
+        "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);\n"
+        "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
+        "            LayoutParams lp = (LayoutParams) textView.getLayoutParams();\n"
+        "            if (lp != null) {\n"
+        "                lp.height = LayoutParams.WRAP_CONTENT;\n"
+        "                lp.topMargin = AndroidUtilities.dp(10);\n"
+        "                textView.setLayoutParams(lp);\n"
+        "            }\n"
+        "            isMultiline = true;\n"
+        "            requestLayout();\n"
+        "        } else {\n"
+        "            textView.setSingleLine(true);\n"
+        "            textView.setLines(1);\n"
+        "            textView.setMaxLines(1);\n"
+        "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);\n"
+        "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
+        "            LayoutParams lp = (LayoutParams) textView.getLayoutParams();\n"
+        "            if (lp != null) {\n"
+        "                lp.height = LayoutParams.MATCH_PARENT;\n"
+        "                lp.topMargin = 0;\n"
+        "                textView.setLayoutParams(lp);\n"
+        "            }\n"
+        "            isMultiline = false;\n"
+        "            requestLayout();\n"
+        "        }\n"
+        "    }"
+    )
+    _upgrade_or_patch(
         text_check_cell,
-        (
-            "    public void setColgramWrapTitle(boolean wrap) {\n"
-            "        colgramWrapTitle = wrap;\n"
-            "        if (wrap) {\n"
-            "            textView.setSingleLine(false);\n"
-            "            textView.setLines(0);\n"
-            "            textView.setMaxLines(2);\n"
-            "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);\n"
-            "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
-            "        }\n"
-            "    }"
-        ),
-        (
-            "    public void setColgramWrapTitle(boolean wrap) {\n"
-            "        colgramWrapTitle = wrap;\n"
-            "        if (wrap) {\n"
-            "            textView.setSingleLine(false);\n"
-            "            textView.setLines(0);\n"
-            "            textView.setMaxLines(2);\n"
-            "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);\n"
-            "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
-            "            LayoutParams lp = (LayoutParams) textView.getLayoutParams();\n"
-            "            if (lp != null) {\n"
-            "                lp.height = LayoutParams.WRAP_CONTENT;\n"
-            "                lp.topMargin = AndroidUtilities.dp(10);\n"
-            "                textView.setLayoutParams(lp);\n"
-            "            }\n"
-            "            isMultiline = true;\n"
-            "            requestLayout();\n"
-            "        }\n"
-            "    }"
-        ),
-        "TextCheckCell.java setColgramWrapTitle wrap state",
+        (_old_wrap_fn,),
+        _raw_wrap_fn,
+        _new_wrap_fn,
+        "TextCheckCell.java setColgramWrapTitle wrap and reset state",
         eol_patch_fn,
     )
     _eol_replace(
@@ -406,7 +640,33 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         "TextCheckCell.java clear recycled valueTextView",
         eol_patch_fn,
     )
-    _old_tvc_single = (
+    _eol_replace(
+        text_check_cell,
+        (
+            "        } else {\n"
+            "            layoutParams.height = LayoutParams.MATCH_PARENT;\n"
+            "            layoutParams.gravity = (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP;\n"
+            "            layoutParams.topMargin = 0;\n"
+            "            layoutParams.bottomMargin = 0;\n"
+            "        }"
+        ),
+        (
+            "        } else {\n"
+            "            textView.setSingleLine(true);\n"
+            "            textView.setLines(1);\n"
+            "            textView.setMaxLines(1);\n"
+            "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);\n"
+            "            textView.setEllipsize(TextUtils.TruncateAt.END);\n"
+            "            layoutParams.height = LayoutParams.MATCH_PARENT;\n"
+            "            layoutParams.gravity = (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP;\n"
+            "            layoutParams.topMargin = 0;\n"
+            "            layoutParams.bottomMargin = 0;\n"
+            "        }"
+        ),
+        "TextCheckCell.java setTextAndCheck reset single-line and size",
+        eol_patch_fn,
+    )
+    _tvc_core_raw = (
         "        isMultiline = multiline;\n"
         "        if (multiline) {\n"
         "            valueTextView.setLines(0);\n"
@@ -426,7 +686,7 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         "        textView.setMaxLines(1);\n"
         "        textView.setEllipsize(TextUtils.TruncateAt.END);"
     )
-    _new_tvc_single = (
+    _tvc_core_v1 = (
         "        isMultiline = multiline || colgramWrapTitle;\n"
         "        if (multiline) {\n"
         "            valueTextView.setLines(0);\n"
@@ -452,10 +712,70 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         "        }\n"
         "        textView.setEllipsize(TextUtils.TruncateAt.END);"
     )
-    _eol_replace(text_check_cell, _old_tvc_single, _new_tvc_single, "TextCheckCell.java setTextAndValueAndCheck wrap", eol_patch_fn, marker="isMultiline = multiline || colgramWrapTitle;")
-    _eol_replace(text_check_cell, _old_tvc_single, _new_tvc_single, "TextCheckCell.java setTextAndValue wrap", eol_patch_fn)
+    _tvc_core_v2 = (
+        "        isMultiline = multiline || colgramWrapTitle;\n"
+        "        if (multiline) {\n"
+        "            valueTextView.setLines(0);\n"
+        "            valueTextView.setMaxLines(0);\n"
+        "            valueTextView.setSingleLine(false);\n"
+        "            valueTextView.setEllipsize(null);\n"
+        "            valueTextView.setPadding(0, 0, 0, AndroidUtilities.dp(11));\n"
+        "        } else {\n"
+        "            valueTextView.setLines(1);\n"
+        "            valueTextView.setMaxLines(1);\n"
+        "            valueTextView.setSingleLine(true);\n"
+        "            valueTextView.setEllipsize(TextUtils.TruncateAt.END);\n"
+        "            valueTextView.setPadding(0, 0, 0, colgramWrapTitle ? AndroidUtilities.dp(8) : 0);\n"
+        "        }\n"
+        "        if (colgramWrapTitle) {\n"
+        "            textView.setSingleLine(false);\n"
+        "            textView.setLines(0);\n"
+        "            textView.setMaxLines(2);\n"
+        "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);\n"
+        "        } else {\n"
+        "            textView.setSingleLine(true);\n"
+        "            textView.setLines(1);\n"
+        "            textView.setMaxLines(1);\n"
+        "            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);\n"
+        "        }\n"
+        "        textView.setEllipsize(TextUtils.TruncateAt.END);"
+    )
+    _tvc_prefix_check = (
+        "        checkBox.setVisibility(View.VISIBLE);\n"
+        "        checkBox.setChecked(checked, false);\n"
+        "        needDivider = divider;\n"
+        "        valueTextView.setVisibility(VISIBLE);\n"
+    )
+    _tvc_prefix_val = (
+        "        checkBox.setVisibility(View.GONE);\n"
+        "        needDivider = divider;\n"
+        "        valueTextView.setVisibility(VISIBLE);\n"
+    )
+    _upgrade_or_patch(
+        text_check_cell,
+        (_tvc_prefix_check + _tvc_core_v1,),
+        _tvc_prefix_check + _tvc_core_raw,
+        _tvc_prefix_check + _tvc_core_v2,
+        "TextCheckCell.java setTextAndValueAndCheck wrap",
+        eol_patch_fn,
+    )
+    _upgrade_or_patch(
+        text_check_cell,
+        (_tvc_prefix_val + _tvc_core_v1,),
+        _tvc_prefix_val + _tvc_core_raw,
+        _tvc_prefix_val + _tvc_core_v2,
+        "TextCheckCell.java setTextAndValue wrap",
+        eol_patch_fn,
+    )
+    _eol_replace(
+        text_check_cell,
+        "                if (imageView != null) {\n                    canvas.drawLine(LocaleController.isRTL ? 0 : padding, getMeasuredHeight() - 1, getMeasuredWidth() - (LocaleController.isRTL ? padding : 0), getMeasuredHeight() - 1, dividerPaint);\n                }",
+        "                if (imageView != null) {\n                    canvas.drawLine(LocaleController.isRTL ? 0 : AndroidUtilities.dp(padding), getMeasuredHeight() - 1, getMeasuredWidth() - (LocaleController.isRTL ? AndroidUtilities.dp(padding) : 0), getMeasuredHeight() - 1, dividerPaint);\n                }",
+        "TextCheckCell.java onDraw dp(padding) divider",
+        eol_patch_fn,
+    )
 
-    # 5. TextDetailSettingsCell.java — 2-line titles, dynamic height & padding leak reset
+    # 5. TextDetailSettingsCell.java — 2-line titles, dynamic height, ellipsize & icon/padding reset
     text_detail_cell = os.path.join(ui, "Cells", "TextDetailSettingsCell.java")
     _eol_replace(
         text_detail_cell,
@@ -474,6 +794,24 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         "TextDetailSettingsCell.java 2-line title",
         eol_patch_fn,
         marker="// colgram-textdetail-dynamic-v1",
+    )
+    _eol_replace(
+        text_detail_cell,
+        (
+            "        valueTextView.setLines(1);\n"
+            "        valueTextView.setMaxLines(1);\n"
+            "        valueTextView.setSingleLine(true);\n"
+            "        valueTextView.setPadding(0, 0, 0, 0);"
+        ),
+        (
+            "        valueTextView.setLines(1);\n"
+            "        valueTextView.setMaxLines(1);\n"
+            "        valueTextView.setSingleLine(true);\n"
+            "        valueTextView.setEllipsize(TextUtils.TruncateAt.END);\n"
+            "        valueTextView.setPadding(0, 0, 0, 0);"
+        ),
+        "TextDetailSettingsCell.java single-line value ellipsize",
+        eol_patch_fn,
     )
     _eol_replace(
         text_detail_cell,
@@ -513,29 +851,95 @@ def _patch_ui_cells_and_hud(repo_path: str, patch_file_fn, eol_patch_fn) -> None
         eol_patch_fn,
         marker="// colgram-textdetail-dynamic-v1",
     )
+    _old_td_reset_v1 = (
+        "    public void setTextAndValue(CharSequence text, CharSequence value, boolean divider) {\n"
+        "        textView.setText(text);\n"
+        "        valueTextView.setText(value);\n"
+        "        textView.setPadding(0, 0, 0, 0);\n"
+        "        valueTextView.setPadding(0, 0, 0, multiline ? AndroidUtilities.dp(12) : 0);\n"
+        "        needDivider = divider;\n"
+        "        imageView.setVisibility(GONE);\n"
+        "        setWillNotDraw(!divider);\n"
+        "    }"
+    )
+    _raw_td_reset = (
+        "    public void setTextAndValue(CharSequence text, CharSequence value, boolean divider) {\n"
+        "        textView.setText(text);\n"
+        "        valueTextView.setText(value);\n"
+        "        needDivider = divider;\n"
+        "        imageView.setVisibility(GONE);\n"
+        "        setWillNotDraw(!divider);\n"
+        "    }"
+    )
+    _new_td_reset_v2 = (
+        "    private void colgramResetImageViewStyle() {\n"
+        "        imageView.setBackground(null);\n"
+        "        imageView.setPadding(0, 0, 0, 0);\n"
+        "        imageView.setScaleType(ImageView.ScaleType.CENTER);\n"
+        "        imageView.setColorFilter(new PorterDuffColorFilter(Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon), PorterDuff.Mode.MULTIPLY));\n"
+        "        imageView.setLayoutParams(LayoutHelper.createFrame(52, 52, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP, 8, 6, 8, 0));\n"
+        "    }\n\n"
+        "    public void setTextAndValue(CharSequence text, CharSequence value, boolean divider) {\n"
+        "        textView.setText(text);\n"
+        "        valueTextView.setText(value);\n"
+        "        textView.setPadding(0, 0, 0, 0);\n"
+        "        valueTextView.setPadding(0, 0, 0, multiline ? AndroidUtilities.dp(12) : 0);\n"
+        "        needDivider = divider;\n"
+        "        colgramResetImageViewStyle();\n"
+        "        imageView.setVisibility(GONE);\n"
+        "        setWillNotDraw(!divider);\n"
+        "    }"
+    )
+    _upgrade_or_patch(
+        text_detail_cell,
+        (_old_td_reset_v1,),
+        _raw_td_reset,
+        _new_td_reset_v2,
+        "TextDetailSettingsCell.java reset padding and imageView on reuse",
+        eol_patch_fn,
+        marker="colgramResetImageViewStyle()",
+    )
     _eol_replace(
         text_detail_cell,
         (
-            "    public void setTextAndValue(CharSequence text, CharSequence value, boolean divider) {\n"
+            "    public void setTextAndValueAndIcon(String text, CharSequence value, int resId, boolean divider) {\n"
             "        textView.setText(text);\n"
             "        valueTextView.setText(value);\n"
+            "        imageView.setImageResource(resId);"
+        ),
+        (
+            "    public void setTextAndValueAndIcon(String text, CharSequence value, int resId, boolean divider) {\n"
+            "        textView.setText(text);\n"
+            "        valueTextView.setText(value);\n"
+            "        colgramResetImageViewStyle();\n"
+            "        imageView.setImageResource(resId);"
+        ),
+        "TextDetailSettingsCell.java setTextAndValueAndIcon reset imageView",
+        eol_patch_fn,
+    )
+    _eol_replace(
+        text_detail_cell,
+        (
+            "    public void setTextWithEmojiAnd21Value(String text, CharSequence value, boolean divider) {\n"
+            "        textView.setText(Emoji.replaceEmoji(text, textView.getPaint().getFontMetricsInt(), false));\n"
+            "        valueTextView.setText(value);\n"
             "        needDivider = divider;\n"
-            "        imageView.setVisibility(GONE);\n"
             "        setWillNotDraw(!divider);\n"
             "    }"
         ),
         (
-            "    public void setTextAndValue(CharSequence text, CharSequence value, boolean divider) {\n"
-            "        textView.setText(text);\n"
+            "    public void setTextWithEmojiAnd21Value(String text, CharSequence value, boolean divider) {\n"
+            "        textView.setText(Emoji.replaceEmoji(text, textView.getPaint().getFontMetricsInt(), false));\n"
             "        valueTextView.setText(value);\n"
             "        textView.setPadding(0, 0, 0, 0);\n"
             "        valueTextView.setPadding(0, 0, 0, multiline ? AndroidUtilities.dp(12) : 0);\n"
-            "        needDivider = divider;\n"
+            "        colgramResetImageViewStyle();\n"
             "        imageView.setVisibility(GONE);\n"
+            "        needDivider = divider;\n"
             "        setWillNotDraw(!divider);\n"
             "    }"
         ),
-        "TextDetailSettingsCell.java reset padding on reuse",
+        "TextDetailSettingsCell.java setTextWithEmojiAnd21Value reset padding and icon",
         eol_patch_fn,
     )
 
@@ -742,19 +1146,59 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
 
     # 11. ChatActivity.java — ad-block + noforwards copy/save/local resend + Saved Messages emoji tags bar & menu
     chat_act = os.path.join(ui, "ChatActivity.java")
+    _ch_norm = ""
+    if os.path.isfile(chat_act):
+        with open(chat_act, "r", encoding="utf-8", errors="ignore", newline="") as _chf:
+            _ch_norm = _chf.read().replace("\r\n", "\n")
+
+    _legacy_chat_fields = (
+        "    // colgram-premium-plus-chat-v1\n"
+        "    private ColgramSavedTagsBarView colgramSavedTagsBar;\n"
+        "    private String colgramActiveSavedTagEmoji;\n"
+        "    private boolean colgramSavedTagFiltered;"
+    )
+    _new_chat_fields = _legacy_chat_fields + "\n    private org.colgram.core.ColgramSavedTagsStore.ChangeListener colgramSavedTagsListener;"
+    if _legacy_chat_fields in _ch_norm and "colgramSavedTagsListener;" not in _ch_norm:
+        eol_patch_fn(
+            chat_act,
+            _legacy_chat_fields,
+            _new_chat_fields,
+            "ChatActivity.java Saved Tags listener field upgrade",
+        )
+    else:
+        _eol_replace(
+            chat_act,
+            "    private AnimatedTextView searchOtherButton;",
+            "    private AnimatedTextView searchOtherButton;\n" + _new_chat_fields,
+            "ChatActivity.java Saved Tags fields",
+            eol_patch_fn,
+            marker="colgramSavedTagsListener;",
+        )
     _eol_replace(
         chat_act,
-        "    private AnimatedTextView searchOtherButton;",
         (
-            "    private AnimatedTextView searchOtherButton;\n"
-            "    // colgram-premium-plus-chat-v1\n"
-            "    private ColgramSavedTagsBarView colgramSavedTagsBar;\n"
-            "    private String colgramActiveSavedTagEmoji;\n"
-            "    private boolean colgramSavedTagFiltered;"
+            "        if (starReactionsOverlay != null) {\n"
+            "            starReactionsOverlay.setMessageCell(null);\n"
+            "            AndroidUtilities.removeFromParent(starReactionsOverlay);\n"
+            "            starReactionsOverlay = null;\n"
+            "        }\n"
+            "    }"
         ),
-        "ChatActivity.java Saved Tags fields",
+        (
+            "        if (starReactionsOverlay != null) {\n"
+            "            starReactionsOverlay.setMessageCell(null);\n"
+            "            AndroidUtilities.removeFromParent(starReactionsOverlay);\n"
+            "            starReactionsOverlay = null;\n"
+            "        }\n"
+            "        if (colgramSavedTagsListener != null) {\n"
+            "            org.colgram.core.ColgramSavedTagsStore.removeListener(colgramSavedTagsListener);\n"
+            "            colgramSavedTagsListener = null;\n"
+            "        }\n"
+            "    }"
+        ),
+        "ChatActivity.java remove colgramSavedTagsListener in onFragmentDestroy",
         eol_patch_fn,
-        marker="// colgram-premium-plus-chat-v1",
+        marker="removeListener(colgramSavedTagsListener)",
     )
     _eol_replace(
         chat_act,
@@ -767,41 +1211,197 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         eol_patch_fn,
         marker="OPTION_COLGRAM_SAVED_TAG",
     )
-    _eol_replace(
-        chat_act,
-        (
-            "        contentView.addView(topPanelLayout, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP));\n\n"
-            "        contentView.addView(actionBar);"
-        ),
-        (
-            "        contentView.addView(topPanelLayout, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP));\n"
-            "        if (dialog_id == getUserConfig().getClientUserId() && org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()) {\n"
-            "            colgramSavedTagsBar = new ColgramSavedTagsBarView(context, currentAccount);\n"
-            "            colgramSavedTagsBar.setCallback(new ColgramSavedTagsBarView.Callback() {\n"
-            "                @Override\n"
-            "                public void onFilterChanged(String activeEmojiOrNull, java.util.List<Integer> matchingMsgIds) {\n"
-            "                    colgramApplySavedTagFilter(activeEmojiOrNull, matchingMsgIds);\n"
-            "                }\n"
-            "                @Override\n"
-            "                public void onJumpToMessage(int msgId) {\n"
-            "                    scrollToMessageId(msgId, 0, true, 0, true, 0);\n"
-            "                }\n"
-            "                @Override\n"
-            "                public void onAddTagClicked() {\n"
-            "                    ColgramUiKit.showNotice(ChatActivity.this, R.drawable.msg_reactions,\n"
-            '                            "Удерживайте сообщение -> «Тег (эмодзи)» для разметки", false);\n'
-            "                }\n"
-            "            });\n"
-            "            topPanelLayout.addView(colgramSavedTagsBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));\n"
-            "            topPanelLayout.setPriority(colgramSavedTagsBar, 8);\n"
-            "            topPanelLayout.setViewVisible(colgramSavedTagsBar, true, false);\n"
-            "        }\n\n"
-            "        contentView.addView(actionBar);"
-        ),
-        "ChatActivity.java mount ColgramSavedTagsBarView",
-        eol_patch_fn,
-        marker="colgramSavedTagsBar = new ColgramSavedTagsBarView(",
+    _legacy_mount_end = (
+        "            topPanelLayout.addView(colgramSavedTagsBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));\n"
+        "            topPanelLayout.setPriority(colgramSavedTagsBar, 8);\n"
+        "            topPanelLayout.setViewVisible(colgramSavedTagsBar, true, false);\n"
+        "        }"
     )
+    _new_mount_end = (
+        "            topPanelLayout.addView(colgramSavedTagsBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));\n"
+        "            topPanelLayout.setPriority(colgramSavedTagsBar, 8);\n"
+        "            topPanelLayout.setViewVisible(colgramSavedTagsBar, true, false);\n"
+        "            colgramSavedTagsListener = acc -> {\n"
+        "                if (acc == currentAccount) {\n"
+        "                    AndroidUtilities.runOnUIThread(() -> {\n"
+        "                        if (isFinishing()) return;\n"
+        "                        if (colgramSavedTagsBar != null) colgramSavedTagsBar.rebuild();\n"
+        "                        if (chatAdapter != null) chatAdapter.notifyDataSetChanged();\n"
+        "                        if (chatListView != null) chatListView.requestLayout();\n"
+        "                    });\n"
+        "                }\n"
+        "            };\n"
+        "            org.colgram.core.ColgramSavedTagsStore.addListener(colgramSavedTagsListener);\n"
+        "        }"
+    )
+    if _legacy_mount_end in _ch_norm and "org.colgram.core.ColgramSavedTagsStore.addListener(colgramSavedTagsListener);" not in _ch_norm:
+        eol_patch_fn(
+            chat_act,
+            _legacy_mount_end,
+            _new_mount_end,
+            "ChatActivity.java register colgramSavedTagsListener on mount",
+        )
+    else:
+        _eol_replace(
+            chat_act,
+            (
+                "        contentView.addView(topPanelLayout, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP));\n\n"
+                "        contentView.addView(actionBar);"
+            ),
+            (
+                "        contentView.addView(topPanelLayout, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP));\n"
+                "        if (dialog_id == getUserConfig().getClientUserId() && org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()) {\n"
+                "            colgramSavedTagsBar = new ColgramSavedTagsBarView(context, currentAccount);\n"
+                "            colgramSavedTagsBar.setCallback(new ColgramSavedTagsBarView.Callback() {\n"
+                "                @Override\n"
+                "                public void onFilterChanged(String activeEmojiOrNull, java.util.List<Integer> matchingMsgIds) {\n"
+                "                    colgramApplySavedTagFilter(activeEmojiOrNull, matchingMsgIds);\n"
+                "                }\n"
+                "                @Override\n"
+                "                public void onJumpToMessage(int msgId) {\n"
+                "                    scrollToMessageId(msgId, 0, true, 0, true, 0);\n"
+                "                }\n"
+                "                @Override\n"
+                "                public void onAddTagClicked() {\n"
+                "                    ColgramUiKit.showNotice(ChatActivity.this, R.drawable.msg_reactions,\n"
+                '                            "Удерживайте сообщение -> «Тег (эмодзи)» для разметки", false);\n'
+                "                }\n"
+                "            });\n"
+                + _new_mount_end + "\n\n"
+                "        contentView.addView(actionBar);"
+            ),
+            "ChatActivity.java mount ColgramSavedTagsBarView",
+            eol_patch_fn,
+            marker="org.colgram.core.ColgramSavedTagsStore.addListener(colgramSavedTagsListener);",
+        )
+    _legacy_tag_filter = (
+        "    private void colgramApplySavedTagFilter(String emoji, java.util.List<Integer> matchingIds) {\n"
+        "        if (chatAdapter == null || chatListView == null) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (emoji == null || emoji.isEmpty()) {\n"
+        "            colgramActiveSavedTagEmoji = null;\n"
+        "            if (colgramSavedTagFiltered) {\n"
+        "                colgramSavedTagFiltered = false;\n"
+        "                chatAdapter.isFiltered = false;\n"
+        "                chatAdapter.filteredMessages.clear();\n"
+        "                updateVisibleRows();\n"
+        "                chatAdapter.notifyDataSetChanged();\n"
+        "            }\n"
+        "            return;\n"
+        "        }\n"
+        "        colgramActiveSavedTagEmoji = emoji;\n"
+        "        java.util.HashSet<Integer> idSet = new java.util.HashSet<>();\n"
+        "        if (matchingIds != null) {\n"
+        "            idSet.addAll(matchingIds);\n"
+        "        }\n"
+        "        chatAdapter.filteredMessages.clear();\n"
+        "        for (int i = 0; i < messages.size(); i++) {\n"
+        "            MessageObject m = messages.get(i);\n"
+        "            if (m != null && !m.isDateObject && idSet.contains(m.getId())) {\n"
+        "                chatAdapter.filteredMessages.add(m);\n"
+        "            }\n"
+        "        }\n"
+        "        if (chatAdapter.filteredMessages.isEmpty() && matchingIds != null && !matchingIds.isEmpty()) {\n"
+        "            colgramSavedTagFiltered = false;\n"
+        "            chatAdapter.isFiltered = false;\n"
+        "            updateVisibleRows();\n"
+        "            chatAdapter.notifyDataSetChanged();\n"
+        "            scrollToMessageId(matchingIds.get(0), 0, true, 0, true, 0);\n"
+        "            return;\n"
+        "        }\n"
+        "        colgramSavedTagFiltered = true;\n"
+        "        chatAdapter.isFiltered = true;\n"
+        "        updateVisibleRows();\n"
+        "        chatAdapter.notifyDataSetChanged();\n"
+        "    }"
+    )
+    _new_tag_filter = (
+        "    private void colgramApplySavedTagFilter(String emoji, java.util.List<Integer> matchingIds) {\n"
+        "        if (chatAdapter == null || chatListView == null) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (emoji == null || emoji.isEmpty()) {\n"
+        "            colgramActiveSavedTagEmoji = null;\n"
+        "            if (colgramSavedTagFiltered) {\n"
+        "                colgramSavedTagFiltered = false;\n"
+        "                chatAdapter.isFiltered = false;\n"
+        "                chatAdapter.filteredEndReached = false;\n"
+        "                chatAdapter.filteredMessages.clear();\n"
+        "                if (filteredMessagesDict != null) {\n"
+        "                    filteredMessagesDict.clear();\n"
+        "                }\n"
+        "                updateVisibleRows();\n"
+        "                chatAdapter.notifyDataSetChanged();\n"
+        "            }\n"
+        "            return;\n"
+        "        }\n"
+        "        colgramActiveSavedTagEmoji = emoji;\n"
+        "        java.util.HashSet<Integer> idSet = new java.util.HashSet<>();\n"
+        "        if (matchingIds != null) {\n"
+        "            idSet.addAll(matchingIds);\n"
+        "        }\n"
+        "        if (filteredMessagesDict == null) {\n"
+        "            filteredMessagesDict = new LongSparseArray<>();\n"
+        "        } else {\n"
+        "            filteredMessagesDict.clear();\n"
+        "        }\n"
+        "        chatAdapter.filteredMessages.clear();\n"
+        "        for (int i = 0; i < messages.size(); i++) {\n"
+        "            MessageObject m = messages.get(i);\n"
+        "            if (m != null && !m.isDateObject && idSet.contains(m.getId())) {\n"
+        "                chatAdapter.filteredMessages.add(m);\n"
+        "                filteredMessagesDict.put(m.getId(), m);\n"
+        "            }\n"
+        "        }\n"
+        "        if (chatAdapter.filteredMessages.isEmpty() && matchingIds != null && !matchingIds.isEmpty()) {\n"
+        "            colgramSavedTagFiltered = false;\n"
+        "            chatAdapter.isFiltered = false;\n"
+        "            chatAdapter.filteredEndReached = false;\n"
+        "            filteredMessagesDict.clear();\n"
+        "            updateVisibleRows();\n"
+        "            chatAdapter.notifyDataSetChanged();\n"
+        "            scrollToMessageId(matchingIds.get(0), 0, true, 0, true, 0);\n"
+        "            return;\n"
+        "        }\n"
+        "        colgramSavedTagFiltered = true;\n"
+        "        chatAdapter.isFiltered = true;\n"
+        "        chatAdapter.filteredEndReached = true;\n"
+        "        updateVisibleRows();\n"
+        "        chatAdapter.notifyDataSetChanged();\n"
+        "    }"
+    )
+    _ch_norm = ""
+    if os.path.isfile(chat_act):
+        with open(chat_act, "r", encoding="utf-8", errors="ignore", newline="") as _chf:
+            _ch_norm = _chf.read().replace("\r\n", "\n")
+    if _legacy_tag_filter in _ch_norm:
+        eol_patch_fn(
+            chat_act,
+            _legacy_tag_filter,
+            _new_tag_filter,
+            "ChatActivity.java filter helper filteredMessagesDict and filteredEndReached",
+        )
+    else:
+        _eol_replace(
+            chat_act,
+            (
+                "    private void forwardMessages(ArrayList<MessageObject> arrayList, boolean fromMyName, boolean hideCaption, boolean notify, int scheduleDate, long payStars) {\n"
+                "        if (arrayList == null || arrayList.isEmpty()) {\n"
+                "            return;\n"
+                "        }"
+            ),
+            (
+                _new_tag_filter + "\n\n"
+                "    private void forwardMessages(ArrayList<MessageObject> arrayList, boolean fromMyName, boolean hideCaption, boolean notify, int scheduleDate, long payStars) {\n"
+                "        if (arrayList == null || arrayList.isEmpty()) {\n"
+                "            return;\n"
+                "        }"
+            ),
+            "ChatActivity.java filter helper filteredMessagesDict and filteredEndReached",
+            eol_patch_fn,
+            marker="private void colgramApplySavedTagFilter(",
+        )
     _eol_replace(
         chat_act,
         (
@@ -811,46 +1411,6 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
             "        }"
         ),
         (
-            "    private void colgramApplySavedTagFilter(String emoji, java.util.List<Integer> matchingIds) {\n"
-            "        if (chatAdapter == null || chatListView == null) {\n"
-            "            return;\n"
-            "        }\n"
-            "        if (emoji == null || emoji.isEmpty()) {\n"
-            "            colgramActiveSavedTagEmoji = null;\n"
-            "            if (colgramSavedTagFiltered) {\n"
-            "                colgramSavedTagFiltered = false;\n"
-            "                chatAdapter.isFiltered = false;\n"
-            "                chatAdapter.filteredMessages.clear();\n"
-            "                updateVisibleRows();\n"
-            "                chatAdapter.notifyDataSetChanged();\n"
-            "            }\n"
-            "            return;\n"
-            "        }\n"
-            "        colgramActiveSavedTagEmoji = emoji;\n"
-            "        java.util.HashSet<Integer> idSet = new java.util.HashSet<>();\n"
-            "        if (matchingIds != null) {\n"
-            "            idSet.addAll(matchingIds);\n"
-            "        }\n"
-            "        chatAdapter.filteredMessages.clear();\n"
-            "        for (int i = 0; i < messages.size(); i++) {\n"
-            "            MessageObject m = messages.get(i);\n"
-            "            if (m != null && !m.isDateObject && idSet.contains(m.getId())) {\n"
-            "                chatAdapter.filteredMessages.add(m);\n"
-            "            }\n"
-            "        }\n"
-            "        if (chatAdapter.filteredMessages.isEmpty() && matchingIds != null && !matchingIds.isEmpty()) {\n"
-            "            colgramSavedTagFiltered = false;\n"
-            "            chatAdapter.isFiltered = false;\n"
-            "            updateVisibleRows();\n"
-            "            chatAdapter.notifyDataSetChanged();\n"
-            "            scrollToMessageId(matchingIds.get(0), 0, true, 0, true, 0);\n"
-            "            return;\n"
-            "        }\n"
-            "        colgramSavedTagFiltered = true;\n"
-            "        chatAdapter.isFiltered = true;\n"
-            "        updateVisibleRows();\n"
-            "        chatAdapter.notifyDataSetChanged();\n"
-            "    }\n\n"
             "    private void forwardMessages(ArrayList<MessageObject> arrayList, boolean fromMyName, boolean hideCaption, boolean notify, int scheduleDate, long payStars) {\n"
             "        if (arrayList == null || arrayList.isEmpty()) {\n"
             "            return;\n"
@@ -865,9 +1425,23 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
             "            }\n"
             "        }"
         ),
-        "ChatActivity.java filter helper and noforwards resend",
+        "ChatActivity.java noforwards resend bypass",
         eol_patch_fn,
-        marker="private void colgramApplySavedTagFilter(",
+        marker="org.colgram.core.ColgramPremiumConfig.isBypassNoForwardsEnabled() && !fromMyName",
+    )
+    _eol_replace(
+        chat_act,
+        "        MessageObject obj = chatAdapter != null && chatAdapter.isFiltered ? filteredMessagesDict.get(mid) :  messagesDict[loadIndex].get(mid);",
+        "        MessageObject obj = chatAdapter != null && chatAdapter.isFiltered ? (filteredMessagesDict != null ? filteredMessagesDict.get(mid) : null) : messagesDict[loadIndex].get(mid);",
+        "ChatActivity.java null-safe filteredMessagesDict lookup",
+        eol_patch_fn,
+    )
+    _eol_replace(
+        chat_act,
+        "        if (chatAdapter.isFiltered && !messageObject.hasReaction(searchingReaction)) {",
+        "        if (chatAdapter.isFiltered && !colgramSavedTagFiltered && searchingReaction != null && !messageObject.hasReaction(searchingReaction)) {",
+        "ChatActivity.java preserve Saved Tag filter on reaction updates",
+        eol_patch_fn,
     )
     _eol_replace(
         chat_act,
@@ -949,32 +1523,49 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         eol_patch_fn,
         marker="options.add(OPTION_COLGRAM_SAVED_TAG);",
     )
-    _eol_replace(
-        chat_act,
-        "            case OPTION_FORWARD: {",
-        (
-            "            case OPTION_COLGRAM_SAVED_TAG: {\n"
-            "                final MessageObject tagTarget = selectedObject;\n"
-            "                selectedObject = null;\n"
-            "                selectedObjectToEditCaption = null;\n"
-            "                selectedObjectGroup = null;\n"
-            "                if (tagTarget != null && getParentActivity() != null && tagTarget.getId() > 0) {\n"
-            "                    ColgramUiKit.showEmojiTagPickerSheet(\n"
-            "                            getParentActivity(), themeDelegate, currentAccount, tagTarget.getId(),\n"
-            "                            () -> {\n"
-            "                                if (colgramSavedTagsBar != null) colgramSavedTagsBar.rebuild();\n"
-            "                                if (chatListView != null) chatListView.invalidateViews();\n"
-            "                            }\n"
-            "                    );\n"
-            "                }\n"
-            "                return;\n"
-            "            }\n"
-            "            case OPTION_FORWARD: {"
-        ),
-        "ChatActivity.java processSelectedOption Saved Tag sheet",
-        eol_patch_fn,
-        marker="case OPTION_COLGRAM_SAVED_TAG:",
+    _legacy_opt_body = (
+        "                                if (colgramSavedTagsBar != null) colgramSavedTagsBar.rebuild();\n"
+        "                                if (chatListView != null) chatListView.invalidateViews();"
     )
+    _new_opt_body = (
+        "                                if (colgramSavedTagsBar != null) colgramSavedTagsBar.rebuild();\n"
+        "                                updateVisibleRows();\n"
+        "                                if (chatAdapter != null) chatAdapter.notifyDataSetChanged();\n"
+        "                                if (chatListView != null) chatListView.requestLayout();"
+    )
+    if _legacy_opt_body in _ch_norm:
+        eol_patch_fn(
+            chat_act,
+            _legacy_opt_body,
+            _new_opt_body,
+            "ChatActivity.java processSelectedOption Saved Tag relayout upgrade",
+        )
+    else:
+        _eol_replace(
+            chat_act,
+            "            case OPTION_FORWARD: {",
+            (
+                "            case OPTION_COLGRAM_SAVED_TAG: {\n"
+                "                final MessageObject tagTarget = selectedObject;\n"
+                "                selectedObject = null;\n"
+                "                selectedObjectToEditCaption = null;\n"
+                "                selectedObjectGroup = null;\n"
+                "                if (tagTarget != null && getParentActivity() != null && tagTarget.getId() > 0) {\n"
+                "                    ColgramUiKit.showEmojiTagPickerSheet(\n"
+                "                            getParentActivity(), themeDelegate, currentAccount, tagTarget.getId(),\n"
+                "                            () -> {\n"
+                + _new_opt_body + "\n"
+                "                            }\n"
+                "                    );\n"
+                "                }\n"
+                "                return;\n"
+                "            }\n"
+                "            case OPTION_FORWARD: {"
+            ),
+            "ChatActivity.java processSelectedOption Saved Tag sheet",
+            eol_patch_fn,
+            marker="case OPTION_COLGRAM_SAVED_TAG:",
+        )
     _eol_replace(
         chat_act,
         "        @Override\n        public boolean canPerformActions() {",
@@ -1036,93 +1627,154 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         eol_patch_fn,
         marker="// colgram-saved-tag-pills-v1",
     )
-    _eol_replace(
-        cell_path,
-        (
-            "    public int getAdditionalPaddingHeight() {\n"
-            "        return additionalPaddingHeight;\n"
-            "    }"
-        ),
-        (
-            "    public int getAdditionalPaddingHeight() {\n"
-            "        return additionalPaddingHeight;\n"
-            "    }\n\n"
-            "    private final java.util.ArrayList<android.graphics.RectF> colgramTagHitRects = new java.util.ArrayList<>(4);\n"
-            "    private final java.util.ArrayList<String> colgramTagHitEmojis = new java.util.ArrayList<>(4);\n"
-            "    private Paint colgramTagBgPaint;\n"
-            "    private android.text.TextPaint colgramTagTextPaint;\n\n"
-            "    private int colgramSavedTagExtraHeight() {\n"
-            "        if (currentMessageObject == null\n"
-            "                || !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()\n"
-            "                || currentMessageObject.getDialogId() != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
-            "            return 0;\n"
-            "        }\n"
-            "        java.util.List<String> tags = org.colgram.core.ColgramSavedTagsStore.getTags(currentAccount, currentMessageObject.getId());\n"
-            "        return tags.isEmpty() ? 0 : dp(26);\n"
-            "    }\n\n"
-            "    private boolean colgramCheckSavedTagTouch(MotionEvent event) {\n"
-            "        if (colgramTagHitRects.isEmpty() || delegate == null) return false;\n"
-            "        int act = event.getAction();\n"
-            "        if (act != MotionEvent.ACTION_DOWN && act != MotionEvent.ACTION_UP) return false;\n"
-            "        float ex = getEventX(event);\n"
-            "        float ey = getEventY(event);\n"
-            "        for (int i = 0; i < colgramTagHitRects.size(); i++) {\n"
-            "            if (colgramTagHitRects.get(i).contains(ex, ey)) {\n"
-            "                if (act == MotionEvent.ACTION_UP && i < colgramTagHitEmojis.size()) {\n"
-            "                    playSoundEffect(android.view.SoundEffectConstants.CLICK);\n"
-            "                    delegate.didPressColgramSavedTag(this, colgramTagHitEmojis.get(i));\n"
-            "                }\n"
-            "                return true;\n"
-            "            }\n"
-            "        }\n"
-            "        return false;\n"
-            "    }\n\n"
-            "    private void colgramDrawSavedTagPills(Canvas canvas) {\n"
-            "        colgramTagHitRects.clear();\n"
-            "        colgramTagHitEmojis.clear();\n"
-            "        if (currentMessageObject == null\n"
-            "                || !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()\n"
-            "                || currentMessageObject.getDialogId() != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
-            "            return;\n"
-            "        }\n"
-            "        java.util.List<String> tags = org.colgram.core.ColgramSavedTagsStore.getTags(currentAccount, currentMessageObject.getId());\n"
-            "        if (tags.isEmpty()) return;\n"
-            "        if (colgramTagBgPaint == null) {\n"
-            "            colgramTagBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);\n"
-            "        }\n"
-            "        if (colgramTagTextPaint == null) {\n"
-            "            colgramTagTextPaint = new android.text.TextPaint(Paint.ANTI_ALIAS_FLAG);\n"
-            "            colgramTagTextPaint.setTextSize(dp(12));\n"
-            "        }\n"
-            "        int accent = Theme.getColor(Theme.key_chat_inTimeText, resourcesProvider);\n"
-            "        colgramTagBgPaint.setColor(androidx.core.graphics.ColorUtils.setAlphaComponent(accent, 42));\n"
-            "        colgramTagTextPaint.setColor(Theme.getColor(Theme.key_chat_messageTextIn, resourcesProvider));\n"
-            "        int maxShow = Math.min(3, tags.size());\n"
-            "        float h = dp(20);\n"
-            "        float yTop = Math.max(dp(4), getMeasuredHeight() - dp(23));\n"
-            "        float xCursor = Math.max(dp(12), backgroundDrawableLeft);\n"
-            "        for (int i = 0; i < maxShow; i++) {\n"
-            "            String emoji = tags.get(i);\n"
-            "            String label = (i == maxShow - 1 && tags.size() > maxShow)\n"
-            '                    ? (emoji + " +" + (tags.size() - maxShow))\n'
-            "                    : emoji;\n"
-            "            float tw = colgramTagTextPaint.measureText(label);\n"
-            "            float pillW = tw + dp(14);\n"
-            "            android.graphics.RectF r = new android.graphics.RectF(xCursor, yTop, xCursor + pillW, yTop + h);\n"
-            "            canvas.drawRoundRect(r, dp(10), dp(10), colgramTagBgPaint);\n"
-            "            Paint.FontMetrics fm = colgramTagTextPaint.getFontMetrics();\n"
-            "            float textY = r.centerY() - (fm.ascent + fm.descent) * 0.5f;\n"
-            "            canvas.drawText(label, r.left + dp(7), textY, colgramTagTextPaint);\n"
-            "            colgramTagHitRects.add(r);\n"
-            "            colgramTagHitEmojis.add(emoji);\n"
-            "            xCursor += pillW + dp(5);\n"
-            "        }\n"
-            "    }"
-        ),
-        "ChatMessageCell.java saved tag pill helpers",
-        eol_patch_fn,
-        marker="colgramDrawSavedTagPills(",
+    _legacy_draw_pills = (
+        "        int maxShow = Math.min(3, tags.size());\n"
+        "        float h = dp(20);\n"
+        "        float yTop = Math.max(dp(4), getMeasuredHeight() - dp(23));\n"
+        "        float xCursor = Math.max(dp(12), backgroundDrawableLeft);\n"
+        "        for (int i = 0; i < maxShow; i++) {\n"
+        "            String emoji = tags.get(i);\n"
+        "            String label = (i == maxShow - 1 && tags.size() > maxShow)\n"
+        '                    ? (emoji + " +" + (tags.size() - maxShow))\n'
+        "                    : emoji;\n"
+        "            float tw = colgramTagTextPaint.measureText(label);\n"
+        "            float pillW = tw + dp(14);\n"
+        "            android.graphics.RectF r = new android.graphics.RectF(xCursor, yTop, xCursor + pillW, yTop + h);\n"
+        "            canvas.drawRoundRect(r, dp(10), dp(10), colgramTagBgPaint);\n"
+        "            Paint.FontMetrics fm = colgramTagTextPaint.getFontMetrics();\n"
+        "            float textY = r.centerY() - (fm.ascent + fm.descent) * 0.5f;\n"
+        "            canvas.drawText(label, r.left + dp(7), textY, colgramTagTextPaint);\n"
+        "            colgramTagHitRects.add(r);\n"
+        "            colgramTagHitEmojis.add(emoji);\n"
+        "            xCursor += pillW + dp(5);\n"
+        "        }\n"
+        "    }"
     )
+    _new_draw_pills = (
+        "        int maxShow = Math.min(3, tags.size());\n"
+        "        float h = dp(20);\n"
+        "        float yTop = Math.max(dp(4), getMeasuredHeight() - dp(23));\n"
+        "        String[] labels = new String[maxShow];\n"
+        "        float[] pillWidths = new float[maxShow];\n"
+        "        float totalW = 0f;\n"
+        "        for (int i = 0; i < maxShow; i++) {\n"
+        "            String emoji = tags.get(i);\n"
+        "            String label = (i == maxShow - 1 && tags.size() > maxShow)\n"
+        '                    ? (emoji + " +" + (tags.size() - maxShow))\n'
+        "                    : emoji;\n"
+        "            labels[i] = label;\n"
+        "            pillWidths[i] = colgramTagTextPaint.measureText(label) + dp(14);\n"
+        "            totalW += pillWidths[i];\n"
+        "            if (i + 1 < maxShow) totalW += dp(5);\n"
+        "        }\n"
+        "        float minLeft = dp(12);\n"
+        "        float maxRight = Math.max(minLeft + dp(24), getMeasuredWidth() - dp(12));\n"
+        "        float xCursor;\n"
+        "        if (currentMessageObject.isOutOwner()) {\n"
+        "            float rightAnchor = backgroundDrawableRight > minLeft ? Math.min(maxRight, backgroundDrawableRight) : maxRight;\n"
+        "            xCursor = Math.max(minLeft, rightAnchor - totalW);\n"
+        "        } else {\n"
+        "            float leftAnchor = backgroundDrawableLeft > 0 ? Math.max(minLeft, backgroundDrawableLeft) : minLeft;\n"
+        "            xCursor = Math.max(minLeft, Math.min(leftAnchor, maxRight - totalW));\n"
+        "        }\n"
+        "        for (int i = 0; i < maxShow; i++) {\n"
+        "            if (xCursor >= maxRight) break;\n"
+        "            String emoji = tags.get(i);\n"
+        "            String label = labels[i];\n"
+        "            float pillW = pillWidths[i];\n"
+        "            float pillRight = Math.min(xCursor + pillW, maxRight);\n"
+        "            android.graphics.RectF r = new android.graphics.RectF(xCursor, yTop, pillRight, yTop + h);\n"
+        "            canvas.drawRoundRect(r, dp(10), dp(10), colgramTagBgPaint);\n"
+        "            Paint.FontMetrics fm = colgramTagTextPaint.getFontMetrics();\n"
+        "            float textY = r.centerY() - (fm.ascent + fm.descent) * 0.5f;\n"
+        "            canvas.drawText(label, r.left + dp(7), textY, colgramTagTextPaint);\n"
+        "            colgramTagHitRects.add(r);\n"
+        "            colgramTagHitEmojis.add(emoji);\n"
+        "            xCursor += pillW + dp(5);\n"
+        "        }\n"
+        "    }"
+    )
+    _raw_cell_helper_target = (
+        "    public int getAdditionalPaddingHeight() {\n"
+        "        return additionalPaddingHeight;\n"
+        "    }"
+    )
+    _new_cell_helpers = (
+        "    public int getAdditionalPaddingHeight() {\n"
+        "        return additionalPaddingHeight;\n"
+        "    }\n\n"
+        "    private final java.util.ArrayList<android.graphics.RectF> colgramTagHitRects = new java.util.ArrayList<>(4);\n"
+        "    private final java.util.ArrayList<String> colgramTagHitEmojis = new java.util.ArrayList<>(4);\n"
+        "    private Paint colgramTagBgPaint;\n"
+        "    private android.text.TextPaint colgramTagTextPaint;\n\n"
+        "    private int colgramSavedTagExtraHeight() {\n"
+        "        if (currentMessageObject == null\n"
+        "                || !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()\n"
+        "                || currentMessageObject.getDialogId() != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
+        "            return 0;\n"
+        "        }\n"
+        "        java.util.List<String> tags = org.colgram.core.ColgramSavedTagsStore.getTags(currentAccount, currentMessageObject.getId());\n"
+        "        return tags.isEmpty() ? 0 : dp(26);\n"
+        "    }\n\n"
+        "    private boolean colgramCheckSavedTagTouch(MotionEvent event) {\n"
+        "        if (colgramTagHitRects.isEmpty() || delegate == null) return false;\n"
+        "        int act = event.getAction();\n"
+        "        if (act != MotionEvent.ACTION_DOWN && act != MotionEvent.ACTION_UP) return false;\n"
+        "        float ex = getEventX(event);\n"
+        "        float ey = getEventY(event);\n"
+        "        for (int i = 0; i < colgramTagHitRects.size(); i++) {\n"
+        "            if (colgramTagHitRects.get(i).contains(ex, ey)) {\n"
+        "                if (act == MotionEvent.ACTION_UP && i < colgramTagHitEmojis.size()) {\n"
+        "                    playSoundEffect(android.view.SoundEffectConstants.CLICK);\n"
+        "                    delegate.didPressColgramSavedTag(this, colgramTagHitEmojis.get(i));\n"
+        "                }\n"
+        "                return true;\n"
+        "            }\n"
+        "        }\n"
+        "        return false;\n"
+        "    }\n\n"
+        "    private void colgramDrawSavedTagPills(Canvas canvas) {\n"
+        "        colgramTagHitRects.clear();\n"
+        "        colgramTagHitEmojis.clear();\n"
+        "        if (currentMessageObject == null\n"
+        "                || !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()\n"
+        "                || currentMessageObject.getDialogId() != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
+        "            return;\n"
+        "        }\n"
+        "        java.util.List<String> tags = org.colgram.core.ColgramSavedTagsStore.getTags(currentAccount, currentMessageObject.getId());\n"
+        "        if (tags.isEmpty()) return;\n"
+        "        if (colgramTagBgPaint == null) {\n"
+        "            colgramTagBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);\n"
+        "        }\n"
+        "        if (colgramTagTextPaint == null) {\n"
+        "            colgramTagTextPaint = new android.text.TextPaint(Paint.ANTI_ALIAS_FLAG);\n"
+        "            colgramTagTextPaint.setTextSize(dp(12));\n"
+        "        }\n"
+        "        int accent = Theme.getColor(Theme.key_chat_inTimeText, resourcesProvider);\n"
+        "        colgramTagBgPaint.setColor(androidx.core.graphics.ColorUtils.setAlphaComponent(accent, 42));\n"
+        "        colgramTagTextPaint.setColor(Theme.getColor(Theme.key_chat_messageTextIn, resourcesProvider));\n"
+        + _new_draw_pills
+    )
+    _cm_norm = ""
+    if os.path.isfile(cell_path):
+        with open(cell_path, "r", encoding="utf-8", errors="ignore", newline="") as _cmf:
+            _cm_norm = _cmf.read().replace("\r\n", "\n")
+    if _legacy_draw_pills in _cm_norm:
+        eol_patch_fn(
+            cell_path,
+            _legacy_draw_pills,
+            _new_draw_pills,
+            "ChatMessageCell.java saved tag pill helpers right-aligned clamped upgrade",
+        )
+    else:
+        _eol_replace(
+            cell_path,
+            _raw_cell_helper_target,
+            _new_cell_helpers,
+            "ChatMessageCell.java saved tag pill helpers right-aligned clamped",
+            eol_patch_fn,
+            marker="colgramDrawSavedTagPills(",
+        )
     _eol_replace(
         cell_path,
         (
@@ -1139,8 +1791,32 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         marker="colgramDrawSavedTagPills(canvas);",
     )
 
-    # 13. TranscribeButton.java — 3-tier local STT fallback without Premium
+    # 13. TranscribeButton.java — 3-tier local STT fallback without Premium paywall
     transcribe_path = os.path.join(ui, "Components", "TranscribeButton.java")
+    _eol_replace(
+        transcribe_path,
+        "            if ((premium || canTranscribeTrial(parent.getMessageObject())) && parent.getMessageObject().isSent()) {",
+        "            if ((premium || org.colgram.core.ColgramPremiumConfig.isLocalVoiceTranscribeEnabled() || canTranscribeTrial(parent.getMessageObject())) && parent.getMessageObject().isSent()) {",
+        "TranscribeButton.java onTap loading local STT bypass",
+        eol_patch_fn,
+        marker="org.colgram.core.ColgramPremiumConfig.isLocalVoiceTranscribeEnabled() || canTranscribeTrial",
+    )
+    _eol_replace(
+        transcribe_path,
+        "            if (!premium && toOpen) {",
+        "            if (!premium && !org.colgram.core.ColgramPremiumConfig.isLocalVoiceTranscribeEnabled() && toOpen) {",
+        "TranscribeButton.java onTap click local STT bypass",
+        eol_patch_fn,
+        marker="!premium && !org.colgram.core.ColgramPremiumConfig.isLocalVoiceTranscribeEnabled() && toOpen",
+    )
+    _eol_replace(
+        transcribe_path,
+        "        if (UserConfig.getInstance(messageObject.currentAccount).isPremium()) {",
+        "        if (UserConfig.getInstance(messageObject.currentAccount).isPremium() || org.colgram.core.ColgramPremiumConfig.isLocalVoiceTranscribeEnabled()) {",
+        "TranscribeButton.java showTranscribeLock local STT bypass",
+        eol_patch_fn,
+        marker="isPremium() || org.colgram.core.ColgramPremiumConfig.isLocalVoiceTranscribeEnabled()",
+    )
     _eol_replace(
         transcribe_path,
         (
@@ -1182,70 +1858,243 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         eol_patch_fn,
         marker="colgramRunLocalStt(messageObject);\n                            return;",
     )
-    _eol_replace(
-        transcribe_path,
-        "    public static boolean finishTranscription(MessageObject messageObject, long transcription_id, String text) {",
-        (
-            "    private static void colgramRunLocalStt(final MessageObject messageObject) {\n"
-            "        if (messageObject == null || messageObject.messageOwner == null) return;\n"
-            "        final int account = messageObject.currentAccount;\n"
-            "        if (transcribeOperationsByDialogPosition == null) {\n"
-            "            transcribeOperationsByDialogPosition = new HashMap<>();\n"
-            "        }\n"
-            "        transcribeOperationsByDialogPosition.put((Integer) reqInfoHash(messageObject), messageObject);\n"
-            "        java.io.File path = org.telegram.messenger.FileLoader.getInstance(account).getPathToMessage(messageObject.messageOwner);\n"
-            "        if (path == null || !path.isFile() || path.length() <= 0L) {\n"
-            "            TLRPC.Document doc = messageObject.getDocument();\n"
-            "            if (doc != null) {\n"
-            "                org.telegram.messenger.FileLoader.getInstance(account).loadFile(doc, messageObject, org.telegram.messenger.FileLoader.PRIORITY_HIGH, 1);\n"
-            "            }\n"
-            "            if (transcribeOperationsByDialogPosition != null) {\n"
-            "                transcribeOperationsByDialogPosition.remove((Integer) reqInfoHash(messageObject));\n"
-            "            }\n"
-            "            org.colgram.core.ColgramUiBridge.postNotice(org.telegram.messenger.ApplicationLoader.applicationContext,\n"
-            '                    "Скачивание аудио", "Загружаю голосовое, нажмите ещё раз после загрузки", false);\n'
-            "            AndroidUtilities.runOnUIThread(() ->\n"
-            "                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.voiceTranscriptionUpdate, messageObject));\n"
-            "            return;\n"
-            "        }\n"
-            "        org.colgram.core.ColgramLocalStt.transcribeFileAsync(org.telegram.messenger.ApplicationLoader.applicationContext, path, (ok, text, reason) -> {\n"
-            "            AndroidUtilities.runOnUIThread(() -> {\n"
-            "                if (transcribeOperationsByDialogPosition != null) {\n"
-            "                    transcribeOperationsByDialogPosition.remove((Integer) reqInfoHash(messageObject));\n"
-            "                }\n"
-            "                if (!ok || TextUtils.isEmpty(text)) {\n"
-            "                    org.colgram.core.ColgramUiBridge.postNotice(org.telegram.messenger.ApplicationLoader.applicationContext,\n"
-            '                            "Озвучка -> Текст", reason != null ? reason : "Не удалось распознать речь локально", true);\n'
-            "                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.voiceTranscriptionUpdate, messageObject);\n"
-            "                    return;\n"
-            "                }\n"
-            "                TLRPC.InputPeer peer = MessagesController.getInstance(account).getInputPeer(messageObject.messageOwner.peer_id);\n"
-            "                long dialogId = DialogObject.getPeerDialogId(peer);\n"
-            "                int messageId = messageObject.messageOwner.id;\n"
-            "                TranscribeButton.openVideoTranscription(messageObject);\n"
-            "                messageObject.messageOwner.voiceTranscriptionOpen = true;\n"
-            "                messageObject.messageOwner.voiceTranscriptionFinal = true;\n"
-            "                MessagesStorage.getInstance(account).updateMessageVoiceTranscription(dialogId, messageId, text, messageObject.messageOwner);\n"
-            "                finishTranscription(messageObject, 0L, text);\n"
-            "            });\n"
-            "        });\n"
-            "    }\n\n"
-            "    public static boolean finishTranscription(MessageObject messageObject, long transcription_id, String text) {"
-        ),
-        "TranscribeButton.java colgramRunLocalStt helper",
-        eol_patch_fn,
-        marker="private static void colgramRunLocalStt(",
+    _legacy_run_stt = (
+        "                TLRPC.InputPeer peer = MessagesController.getInstance(account).getInputPeer(messageObject.messageOwner.peer_id);\n"
+        "                long dialogId = DialogObject.getPeerDialogId(peer);\n"
+        "                int messageId = messageObject.messageOwner.id;\n"
+        "                TranscribeButton.openVideoTranscription(messageObject);\n"
+        "                messageObject.messageOwner.voiceTranscriptionOpen = true;\n"
+        "                messageObject.messageOwner.voiceTranscriptionFinal = true;\n"
+        "                MessagesStorage.getInstance(account).updateMessageVoiceTranscription(dialogId, messageId, text, messageObject.messageOwner);\n"
+        "                finishTranscription(messageObject, 0L, text);"
     )
+    _new_run_stt = (
+        "                if (messageObject.isRoundVideo()) {\n"
+        "                    TranscribeButton.openVideoTranscription(messageObject);\n"
+        "                }\n"
+        "                messageObject.messageOwner.voiceTranscriptionOpen = true;\n"
+        "                messageObject.messageOwner.voiceTranscriptionFinal = true;\n"
+        "                finishTranscription(messageObject, 0L, text);"
+    )
+    _tr_norm = ""
+    if os.path.isfile(transcribe_path):
+        with open(transcribe_path, "r", encoding="utf-8", errors="ignore", newline="") as _trf:
+            _tr_norm = _trf.read().replace("\r\n", "\n")
+    if _legacy_run_stt in _tr_norm:
+        eol_patch_fn(
+            transcribe_path,
+            _legacy_run_stt,
+            _new_run_stt,
+            "TranscribeButton.java colgramRunLocalStt round-video guard and single DB write",
+        )
+    else:
+        _eol_replace(
+            transcribe_path,
+            "    public static boolean finishTranscription(MessageObject messageObject, long transcription_id, String text) {",
+            (
+                "    private static void colgramRunLocalStt(final MessageObject messageObject) {\n"
+                "        if (messageObject == null || messageObject.messageOwner == null) return;\n"
+                "        final int account = messageObject.currentAccount;\n"
+                "        if (transcribeOperationsByDialogPosition == null) {\n"
+                "            transcribeOperationsByDialogPosition = new HashMap<>();\n"
+                "        }\n"
+                "        transcribeOperationsByDialogPosition.put((Integer) reqInfoHash(messageObject), messageObject);\n"
+                "        java.io.File path = org.telegram.messenger.FileLoader.getInstance(account).getPathToMessage(messageObject.messageOwner);\n"
+                "        if (path == null || !path.isFile() || path.length() <= 0L) {\n"
+                "            TLRPC.Document doc = messageObject.getDocument();\n"
+                "            if (doc != null) {\n"
+                "                org.telegram.messenger.FileLoader.getInstance(account).loadFile(doc, messageObject, org.telegram.messenger.FileLoader.PRIORITY_HIGH, 1);\n"
+                "            }\n"
+                "            if (transcribeOperationsByDialogPosition != null) {\n"
+                "                transcribeOperationsByDialogPosition.remove((Integer) reqInfoHash(messageObject));\n"
+                "            }\n"
+                "            org.colgram.core.ColgramUiBridge.postNotice(org.telegram.messenger.ApplicationLoader.applicationContext,\n"
+                '                    "Скачивание аудио", "Загружаю голосовое, нажмите ещё раз после загрузки", false);\n'
+                "            AndroidUtilities.runOnUIThread(() ->\n"
+                "                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.voiceTranscriptionUpdate, messageObject));\n"
+                "            return;\n"
+                "        }\n"
+                "        org.colgram.core.ColgramLocalStt.transcribeFileAsync(org.telegram.messenger.ApplicationLoader.applicationContext, path, (ok, text, reason) -> {\n"
+                "            AndroidUtilities.runOnUIThread(() -> {\n"
+                "                if (transcribeOperationsByDialogPosition != null) {\n"
+                "                    transcribeOperationsByDialogPosition.remove((Integer) reqInfoHash(messageObject));\n"
+                "                }\n"
+                "                if (!ok || TextUtils.isEmpty(text)) {\n"
+                "                    org.colgram.core.ColgramUiBridge.postNotice(org.telegram.messenger.ApplicationLoader.applicationContext,\n"
+                '                            "Озвучка -> Текст", reason != null ? reason : "Не удалось распознать речь локально", true);\n'
+                "                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.voiceTranscriptionUpdate, messageObject);\n"
+                "                    return;\n"
+                "                }\n"
+                + _new_run_stt + "\n"
+                "            });\n"
+                "        });\n"
+                "    }\n\n"
+                "    public static boolean finishTranscription(MessageObject messageObject, long transcription_id, String text) {"
+            ),
+            "TranscribeButton.java colgramRunLocalStt helper",
+            eol_patch_fn,
+            marker="private static void colgramRunLocalStt(",
+        )
 
-    # 14. TranslateController.java & TranslateAlert2.java — local keyless translator fallback & routing
+    # 14. TranslateController.java & TranslateAlert2.java — local keyless translator bypass, callback & debounce
     tc_path = os.path.join(msg_dir, "TranslateController.java")
     _eol_replace(
         tc_path,
-        '                    } else if (err != null && "TRANSLATIONS_DISABLED_ALT".equalsIgnoreCase(err.text)) {',
-        '                    } else if (!(res instanceof TLRPC.TL_messages_translateResult) && ((err != null && "TRANSLATIONS_DISABLED_ALT".equalsIgnoreCase(err.text)) || org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled())) {',
-        "TranslateController.java local translator fallback on Premium/RPC errors",
+        (
+            "    public boolean isFeatureAvailable() {\n"
+            "        return isChatTranslateEnabled() && UserConfig.getInstance(currentAccount).isPremium();\n"
+            "    }"
+        ),
+        (
+            "    public boolean isFeatureAvailable() {\n"
+            "        return isChatTranslateEnabled() && (UserConfig.getInstance(currentAccount).isPremium() || org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled());\n"
+            "    }"
+        ),
+        "TranslateController.java isFeatureAvailable local translator",
         eol_patch_fn,
-        marker="ColgramPremiumConfig.isLocalTranslatorEnabled()",
+    )
+    _eol_replace(
+        tc_path,
+        (
+            "        return (\n"
+            "            UserConfig.getInstance(currentAccount).isPremium() ||\n"
+            "            chat != null && chat.autotranslation\n"
+            "        );"
+        ),
+        (
+            "        return (\n"
+            "            UserConfig.getInstance(currentAccount).isPremium() ||\n"
+            "            org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled() ||\n"
+            "            chat != null && chat.autotranslation\n"
+            "        );"
+        ),
+        "TranslateController.java isFeatureAvailable(dialogId) local translator",
+        eol_patch_fn,
+    )
+    _eol_replace(
+        tc_path,
+        "    private Boolean chatTranslateEnabled;",
+        "    private Boolean chatTranslateEnabled;\n    private long colgramLastTranslateErrMs;",
+        "TranslateController.java colgramLastTranslateErrMs field",
+        eol_patch_fn,
+        marker="colgramLastTranslateErrMs;",
+    )
+    _eol_replace(
+        tc_path,
+        (
+            '                if ("alternative".equals(method) || "system".equals(method)) {\n'
+            "                    final String toLanguage = pendingTranslation1.language;\n"
+            "                    for (int i = 0; i < pendingTranslation1.messageIds.size(); ++i) {\n"
+            "                        final int id = pendingTranslation1.messageIds.get(i);\n"
+            "                        final Utilities.Callback4<Boolean, Integer, TLRPC.TL_textWithEntities, String> _callback = pendingTranslation1.callbacks.get(i);\n"
+            "                        final String _text = pendingTranslation1.messageTexts.get(i).text;\n"
+            "                        TranslateAlert2.alternativeTranslate(_text, null, toLanguage, (result, rateLimit) -> {\n"
+            "                            if (result != null) {\n"
+            "                                final TLRPC.TL_textWithEntities resultWithEntities = new TLRPC.TL_textWithEntities();\n"
+            "                                resultWithEntities.text = result;\n"
+            "                                _callback.run(isTranscription, id, resultWithEntities, toLanguage);\n"
+            "                            } else {\n"
+            "                                toggleTranslatingDialog(dialogId, false);\n"
+            "                                NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.showBulletin, Bulletin.TYPE_ERROR, getString(rateLimit ? R.string.TranslationFailedAlert1 : R.string.TranslationFailedAlert2));\n"
+            "                            }\n"
+            "                        });\n"
+            "                    }"
+        ),
+        (
+            '                if ("alternative".equals(method) || "system".equals(method) || (!getUserConfig().isPremium() && org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled())) {\n'
+            "                    final String toLanguage = pendingTranslation1.language;\n"
+            "                    for (int i = 0; i < pendingTranslation1.messageIds.size(); ++i) {\n"
+            "                        final int id = pendingTranslation1.messageIds.get(i);\n"
+            "                        final Utilities.Callback4<Boolean, Integer, TLRPC.TL_textWithEntities, String> _callback = pendingTranslation1.callbacks.get(i);\n"
+            "                        final String _text = pendingTranslation1.messageTexts.get(i).text;\n"
+            "                        TranslateAlert2.alternativeTranslate(_text, null, toLanguage, (result, rateLimit) -> {\n"
+            "                            synchronized (TranslateController.this) {\n"
+            "                                loadingTranslations.remove(id);\n"
+            "                            }\n"
+            "                            if (result != null) {\n"
+            "                                final TLRPC.TL_textWithEntities resultWithEntities = new TLRPC.TL_textWithEntities();\n"
+            "                                resultWithEntities.text = result;\n"
+            "                                _callback.run(isTranscription, id, resultWithEntities, toLanguage);\n"
+            "                            } else {\n"
+            "                                _callback.run(isTranscription, id, null, toLanguage);\n"
+            "                                long nowMs = System.currentTimeMillis();\n"
+            "                                if (nowMs - colgramLastTranslateErrMs >= 4000L) {\n"
+            "                                    colgramLastTranslateErrMs = nowMs;\n"
+            "                                    NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.showBulletin, Bulletin.TYPE_ERROR, getString(rateLimit ? R.string.TranslationFailedAlert1 : R.string.TranslationFailedAlert2));\n"
+            "                                }\n"
+            "                            }\n"
+            "                        });\n"
+            "                    }"
+        ),
+        "TranslateController.java bypass server RPC for non-Premium and invoke _callback(null) cleanly",
+        eol_patch_fn,
+        marker="!getUserConfig().isPremium() && org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled()",
+    )
+    _legacy_tc_fallback = (
+        "                    } else if (!(res instanceof TLRPC.TL_messages_translateResult) && ((err != null && \"TRANSLATIONS_DISABLED_ALT\".equalsIgnoreCase(err.text)) || org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled())) {\n"
+        "                        for (int i = 0; i < ids.size(); ++i) {\n"
+        "                            final int id = ids.get(i);\n"
+        "                            final Utilities.Callback4<Boolean, Integer, TLRPC.TL_textWithEntities, String> _callback = callbacks.get(i);\n"
+        "                            final String _text = texts.get(i).text;\n"
+        "                            TranslateAlert2.alternativeTranslate(_text, null, toLanguage, (result, rateLimit) -> {\n"
+        "                                if (result != null) {\n"
+        "                                    final TLRPC.TL_textWithEntities resultWithEntities = new TLRPC.TL_textWithEntities();\n"
+        "                                    resultWithEntities.text = result;\n"
+        "                                    _callback.run(isTranscription, id, resultWithEntities, toLanguage);\n"
+        "                                } else {\n"
+        "                                    toggleTranslatingDialog(dialogId, false);\n"
+        "                                    NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.showBulletin, Bulletin.TYPE_ERROR, getString(rateLimit ? R.string.TranslationFailedAlert1 : R.string.TranslationFailedAlert2));\n"
+        "                                }\n"
+        "                            });\n"
+        "                        }"
+    )
+    _raw_tc_fallback = (
+        '                    } else if (err != null && "TRANSLATIONS_DISABLED_ALT".equalsIgnoreCase(err.text)) {\n'
+        "                        for (int i = 0; i < ids.size(); ++i) {\n"
+        "                            final int id = ids.get(i);\n"
+        "                            final Utilities.Callback4<Boolean, Integer, TLRPC.TL_textWithEntities, String> _callback = callbacks.get(i);\n"
+        "                            final String _text = texts.get(i).text;\n"
+        "                            TranslateAlert2.alternativeTranslate(_text, null, toLanguage, (result, rateLimit) -> {\n"
+        "                                if (result != null) {\n"
+        "                                    final TLRPC.TL_textWithEntities resultWithEntities = new TLRPC.TL_textWithEntities();\n"
+        "                                    resultWithEntities.text = result;\n"
+        "                                    _callback.run(isTranscription, id, resultWithEntities, toLanguage);\n"
+        "                                } else {\n"
+        "                                    toggleTranslatingDialog(dialogId, false);\n"
+        "                                    NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.showBulletin, Bulletin.TYPE_ERROR, getString(rateLimit ? R.string.TranslationFailedAlert1 : R.string.TranslationFailedAlert2));\n"
+        "                                }\n"
+        "                            });\n"
+        "                        }"
+    )
+    _new_tc_fallback = (
+        "                    } else if (!(res instanceof TLRPC.TL_messages_translateResult) && ((err != null && \"TRANSLATIONS_DISABLED_ALT\".equalsIgnoreCase(err.text)) || org.colgram.core.ColgramPremiumConfig.isLocalTranslatorEnabled())) {\n"
+        "                        for (int i = 0; i < ids.size(); ++i) {\n"
+        "                            final int id = ids.get(i);\n"
+        "                            final Utilities.Callback4<Boolean, Integer, TLRPC.TL_textWithEntities, String> _callback = callbacks.get(i);\n"
+        "                            final String _text = texts.get(i).text;\n"
+        "                            TranslateAlert2.alternativeTranslate(_text, null, toLanguage, (result, rateLimit) -> {\n"
+        "                                if (result != null) {\n"
+        "                                    final TLRPC.TL_textWithEntities resultWithEntities = new TLRPC.TL_textWithEntities();\n"
+        "                                    resultWithEntities.text = result;\n"
+        "                                    _callback.run(isTranscription, id, resultWithEntities, toLanguage);\n"
+        "                                } else {\n"
+        "                                    _callback.run(isTranscription, id, null, toLanguage);\n"
+        "                                    long nowMs = System.currentTimeMillis();\n"
+        "                                    if (nowMs - colgramLastTranslateErrMs >= 4000L) {\n"
+        "                                        colgramLastTranslateErrMs = nowMs;\n"
+        "                                        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.showBulletin, Bulletin.TYPE_ERROR, getString(rateLimit ? R.string.TranslationFailedAlert1 : R.string.TranslationFailedAlert2));\n"
+        "                                    }\n"
+        "                                }\n"
+        "                            });\n"
+        "                        }"
+    )
+    _upgrade_or_patch(
+        tc_path,
+        (_legacy_tc_fallback,),
+        _raw_tc_fallback,
+        _new_tc_fallback,
+        "TranslateController.java local translator fallback callback and debounce",
+        eol_patch_fn,
     )
 
     ta_path = os.path.join(ui, "Components", "TranslateAlert2.java")
@@ -1318,31 +2167,58 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         eol_patch_fn,
         marker="ColgramPremiumConfig.isAutoHideArchiveEnabled() && !SharedConfig.archiveHidden",
     )
-    _eol_replace(
-        dialogs_path,
-        (
-            "                if (filterTabsView.isLocked(filterTabsView.getCurrentTabId())) {\n"
-            "                    filterTabsView.selectFirstTab();\n"
-            "                }\n"
-            "            }"
-        ),
-        (
-            "                if (filterTabsView.isLocked(filterTabsView.getCurrentTabId())) {\n"
-            "                    filterTabsView.selectFirstTab();\n"
-            "                }\n"
-            "                if (!colgramAppliedDefaultFolder && folderId == 0 && communityId == 0 && !onlySelect && initialDialogsType == DIALOGS_TYPE_DEFAULT) {\n"
-            "                    colgramAppliedDefaultFolder = true;\n"
-            "                    final int defFid = org.colgram.core.ColgramPremiumConfig.getDefaultStartFolderId();\n"
-            "                    if (defFid > 0) {\n"
-            "                        AndroidUtilities.runOnUIThread(() -> { if (filterTabsView != null) scrollToFolder(defFid); });\n"
-            "                    }\n"
-            "                }\n"
-            "            }"
-        ),
-        "DialogsActivity.java default start folder tab",
-        eol_patch_fn,
-        marker="ColgramPremiumConfig.getDefaultStartFolderId()",
+    _legacy_start_folder = (
+        "                if (!colgramAppliedDefaultFolder && folderId == 0 && communityId == 0 && !onlySelect && initialDialogsType == DIALOGS_TYPE_DEFAULT) {\n"
+        "                    colgramAppliedDefaultFolder = true;\n"
+        "                    final int defFid = org.colgram.core.ColgramPremiumConfig.getDefaultStartFolderId();\n"
+        "                    if (defFid > 0) {\n"
+        "                        AndroidUtilities.runOnUIThread(() -> { if (filterTabsView != null) scrollToFolder(defFid); });\n"
+        "                    }\n"
+        "                }"
     )
+    _raw_start_folder = (
+        "                if (filterTabsView.isLocked(filterTabsView.getCurrentTabId())) {\n"
+        "                    filterTabsView.selectFirstTab();\n"
+        "                }\n"
+        "            }"
+    )
+    _new_start_folder_body = (
+        "                if (!colgramAppliedDefaultFolder && folderId == 0 && communityId == 0 && !onlySelect && initialDialogsType == DIALOGS_TYPE_DEFAULT) {\n"
+        "                    final int defFid = org.colgram.core.ColgramPremiumConfig.getDefaultStartFolderId();\n"
+        "                    if (defFid <= 0) {\n"
+        "                        colgramAppliedDefaultFolder = true;\n"
+        "                    } else if (filterTabsView.hasTab(defFid)) {\n"
+        "                        colgramAppliedDefaultFolder = true;\n"
+        "                        AndroidUtilities.runOnUIThread(() -> { if (filterTabsView != null) scrollToFolder(defFid); });\n"
+        "                    }\n"
+        "                }"
+    )
+    _dl_pre_norm = ""
+    if os.path.isfile(dialogs_path):
+        with open(dialogs_path, "r", encoding="utf-8", errors="ignore", newline="") as _dlpf:
+            _dl_pre_norm = _dlpf.read().replace("\r\n", "\n")
+    if _legacy_start_folder in _dl_pre_norm:
+        eol_patch_fn(
+            dialogs_path,
+            _legacy_start_folder,
+            _new_start_folder_body,
+            "DialogsActivity.java default start folder tab sync-safe upgrade",
+        )
+    else:
+        _eol_replace(
+            dialogs_path,
+            _raw_start_folder,
+            (
+                "                if (filterTabsView.isLocked(filterTabsView.getCurrentTabId())) {\n"
+                "                    filterTabsView.selectFirstTab();\n"
+                "                }\n"
+                + _new_start_folder_body + "\n"
+                "            }"
+            ),
+            "DialogsActivity.java default start folder tab sync-safe",
+            eol_patch_fn,
+            marker="else if (filterTabsView.hasTab(defFid))",
+        )
     if os.path.isfile(dialogs_path):
         with open(dialogs_path, "r", encoding="utf-8", errors="ignore", newline="") as _dlf:
             _dl_norm = _dlf.read().replace("\r\n", "\n")
@@ -1405,7 +2281,7 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         marker="if (false && MessagesController.getInstance(currentAccount).premiumFeaturesBlocked())",
     )
 
-    # 17. MediaDataController.java — local double-tap reaction override
+    # 17. MediaDataController.java & Double-Tap disabled NPE guards (ReactionsDoubleTapManageActivity + ChatActivity)
     mdc_path = os.path.join(msg_dir, "MediaDataController.java")
     _eol_replace(
         mdc_path,
@@ -1424,6 +2300,35 @@ def _patch_premium_plus_features(repo_path: str, eol_patch_fn) -> None:
         "MediaDataController.java local double-tap reaction override",
         eol_patch_fn,
         marker="ColgramPremiumConfig.getLocalDoubleTapReaction()",
+    )
+    dt_manage_path = os.path.join(ui, "ReactionsDoubleTapManageActivity.java")
+    _eol_replace(
+        dt_manage_path,
+        "                        reactionCell.bind(react, react.reaction.contains(MediaDataController.getInstance(currentAccount).getDoubleTapReaction()), currentAccount);",
+        (
+            "                        String colgramCurDoubleTap = MediaDataController.getInstance(currentAccount).getDoubleTapReaction();\n"
+            "                        reactionCell.bind(react, colgramCurDoubleTap != null && react.reaction.contains(colgramCurDoubleTap), currentAccount);"
+        ),
+        "ReactionsDoubleTapManageActivity.java double-tap disabled null guard",
+        eol_patch_fn,
+        marker="colgramCurDoubleTap",
+    )
+    _eol_replace(
+        chat_act,
+        (
+            "            String reactionString = getMediaDataController().getDoubleTapReaction();\n"
+            '            if (reactionString.startsWith("animated_")) {'
+        ),
+        (
+            "            String reactionString = getMediaDataController().getDoubleTapReaction();\n"
+            "            if (TextUtils.isEmpty(reactionString)) {\n"
+            "                return;\n"
+            "            }\n"
+            '            if (reactionString.startsWith("animated_")) {'
+        ),
+        "ChatActivity.java double-tap disabled null guard",
+        eol_patch_fn,
+        marker="if (TextUtils.isEmpty(reactionString)) {\n                return;\n            }\n            if (reactionString.startsWith",
     )
 
 

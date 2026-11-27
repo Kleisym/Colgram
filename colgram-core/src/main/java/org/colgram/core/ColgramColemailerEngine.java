@@ -501,7 +501,7 @@ public final class ColgramColemailerEngine {
                 : Collections.unmodifiableList(new ArrayList<>(campaigns.values()));
     }
 
-    public void recordCampaignDispatchOutcome(String campaignName, boolean success, String error) {
+    public synchronized void recordCampaignDispatchOutcome(String campaignName, boolean success, String error) {
         if (campaignName == null || campaignName.isEmpty()) return;
         BroadcastCampaign c = campaigns.get(campaignName);
         if (c == null) return;

@@ -51,6 +51,15 @@ public final class ColgramShieldConfig {
             if (prefs != null) return;
             Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
             SharedPreferences sp = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            // Preserve ci183 explicit Unlimited Memory opt-in across upgrade to ci190 hard-cap defaults.
+            if (!sp.contains(KEY_STORAGE_CAP_ENABLED)) {
+                try {
+                    ColgramConfig.init(appCtx);
+                    if (ColgramConfig.isUnlimitedMemoryEnabled()) {
+                        sp.edit().putBoolean(KEY_STORAGE_CAP_ENABLED, false).apply();
+                    }
+                } catch (Throwable ignored) {}
+            }
             prefs = sp;
             loadAll(sp);
             if (prefChangeListener == null) {

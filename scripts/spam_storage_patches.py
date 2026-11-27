@@ -54,26 +54,73 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         messages_storage,
         [
-            """    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {
+            """    private void colgramPreFilterSpamMentions(ArrayList<TLRPC.Message> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
+        org.colgram.core.ColgramHookHandler.beginShadowCaptureBatch();
+        try {
+            if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+                return;
+            }
+            for (int a = 0, n = messages.size(); a < n; a++) {
+                TLRPC.Message m = messages.get(a);
+                if (m == null) {
+                    continue;
+                }
+                MessageObject.getDialogId(m);
+                ColgramNativeColemailerBridge.interceptIncomingSpamPing(currentAccount, m);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            org.colgram.core.ColgramHookHandler.flushShadowCaptureBatch();
+        }
+    }
+
+    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {
         if (messages == null || messages.isEmpty()) {
             return;
         }
         if (useQueue) {
             storageQueue.postRunnable(() -> {
                 if (mode == ChatActivity.MODE_DEFAULT) {
+                    colgramPreFilterSpamMentions(messages);
                     colgramDispatchPlugins(messages);
                 }
                 putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
             });
         } else {
             if (mode == ChatActivity.MODE_DEFAULT) {
+                colgramPreFilterSpamMentions(messages);
                 colgramDispatchPlugins(messages);
             }
             putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
         }
-    }"""
-        ],
-        """    private void colgramPreFilterSpamMentions(ArrayList<TLRPC.Message> messages) {
+    }
+
+    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
+        if (useQueue) {
+            storageQueue.postRunnable(() -> {
+                if (mode == ChatActivity.MODE_DEFAULT) {
+                    colgramPreFilterSpamMentions(messages);
+                    colgramDispatchPlugins(messages);
+                }
+                putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
+            });
+        } else {
+            if (mode == ChatActivity.MODE_DEFAULT) {
+                colgramPreFilterSpamMentions(messages);
+                colgramDispatchPlugins(messages);
+            }
+            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
+        }
+    }
+
+    public void processEphemeralMessages(ArrayList<TL_ephemeral.EphemeralMessage> messages, Runnable callback) {""",
+            """    private void colgramPreFilterSpamMentions(ArrayList<TLRPC.Message> messages) {
         if (messages == null || messages.isEmpty()) {
             return;
         }
@@ -114,7 +161,75 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             }
             putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
         }
-    }""",
+    }
+
+    public void processEphemeralMessages(ArrayList<TL_ephemeral.EphemeralMessage> messages, Runnable callback) {""",
+            """    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
+        if (useQueue) {
+            storageQueue.postRunnable(() -> {
+                if (mode == ChatActivity.MODE_DEFAULT) {
+                    colgramDispatchPlugins(messages);
+                }
+                putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
+            });
+        } else {
+            if (mode == ChatActivity.MODE_DEFAULT) {
+                colgramDispatchPlugins(messages);
+            }
+            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
+        }
+    }
+
+    public void processEphemeralMessages(ArrayList<TL_ephemeral.EphemeralMessage> messages, Runnable callback) {""",
+        ],
+        """    private void colgramPreFilterSpamMentions(ArrayList<TLRPC.Message> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
+        org.colgram.core.ColgramHookHandler.beginShadowCaptureBatch();
+        try {
+            if (getUserConfig().getCurrentUser() != null && getUserConfig().getCurrentUser().bot) {
+                return;
+            }
+            for (int a = 0, n = messages.size(); a < n; a++) {
+                TLRPC.Message m = messages.get(a);
+                if (m == null) {
+                    continue;
+                }
+                MessageObject.getDialogId(m);
+                ColgramNativeColemailerBridge.interceptIncomingSpamPing(currentAccount, m);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            org.colgram.core.ColgramHookHandler.flushShadowCaptureBatch();
+        }
+    }
+
+    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {
+        if (messages == null || messages.isEmpty()) {
+            return;
+        }
+        if (useQueue) {
+            storageQueue.postRunnable(() -> {
+                if (mode == ChatActivity.MODE_DEFAULT) {
+                    colgramPreFilterSpamMentions(messages);
+                    colgramDispatchPlugins(messages);
+                }
+                putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
+            });
+        } else {
+            if (mode == ChatActivity.MODE_DEFAULT) {
+                colgramPreFilterSpamMentions(messages);
+                colgramDispatchPlugins(messages);
+            }
+            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);
+        }
+    }
+
+    public void processEphemeralMessages(ArrayList<TL_ephemeral.EphemeralMessage> messages, Runnable callback) {""",
         "MessagesStorage.java pre-filter incoming spam pings before putMessagesInternal",
     )
 
@@ -486,8 +601,22 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "DownloadController.java processDownloadObjects shield + metered medium photo cap",
     )
 
+    _patch_eol_variants(
+        eol_patch_fn,
+        download_ctrl,
+        [
+            """            } else if (downloadObject.object instanceof TLRPC.Document) {
+                TLRPC.Document document = (TLRPC.Document) downloadObject.object;
+                getFileLoader().loadFile(document, downloadObject.parent, FileLoader.PRIORITY_LOW, downloadObject.secret ? 2 : 0);"""
+        ],
+        """            } else if (downloadObject.object instanceof TLRPC.Document) {
+                TLRPC.Document document = (TLRPC.Document) downloadObject.object;
+                getFileLoader().loadFile(document, downloadObject.parent, FileLoader.PRIORITY_LOW, downloadObject.secret ? 2 : 0, true);""",
+        "DownloadController.java pass explicit auto-download flag for documents",
+    )
+
     # 5. FileLoader.java:
-    #    - Defense-in-depth at PRIORITY_LOW inside loadFileInternal
+    #    - Explicit auto-download gate ONLY (never block manual PRIORITY_LOW clicks) evaluated BEFORE startDownloadFile / loadOperationPathsUI
     #    - Real-time cache accounting & Lazy Shadow Vault capture on didFinishLoadingFile
     file_loader = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java"
@@ -496,11 +625,101 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         file_loader,
         [
-            """        priority = getPriorityValue(priority);
-
-        if (operation != null) {"""
+            """    public void loadFile(TLRPC.Document document, Object parentObject, int priority, int cacheType) {
+        if (document == null) {
+            return;
+        }
+        if (cacheType == 0 && document.key != null) {
+            cacheType = 1;
+        }
+        loadFile(document, null, null, null, null, parentObject, null, 0, priority, cacheType);
+    }"""
         ],
-        """        priority = getPriorityValue(priority);
+        """    public void loadFile(TLRPC.Document document, Object parentObject, int priority, int cacheType) {
+        loadFile(document, parentObject, priority, cacheType, false);
+    }
+
+    public void loadFile(TLRPC.Document document, Object parentObject, int priority, int cacheType, boolean isAutoDownload) {
+        if (document == null) {
+            return;
+        }
+        if (cacheType == 0 && document.key != null) {
+            cacheType = 1;
+        }
+        loadFile(document, null, null, null, null, parentObject, null, 0, priority, cacheType, isAutoDownload);
+    }""",
+        "FileLoader.java explicit auto-download loadFile overload",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        file_loader,
+        [
+            """    private FileLoadOperation loadFileInternal(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, Object parentObject, final String locationExt, final long locationSize, int priority, FileLoadOperationStream stream, final long streamOffset, boolean streamPriority, final int cacheType) {
+        String fileName;
+        if (location != null) {
+            fileName = getAttachFileName(location, locationExt);
+        } else if (secureDocument != null) {
+            fileName = getAttachFileName(secureDocument);
+        } else if (document != null) {
+            fileName = getAttachFileName(document);
+        } else if (webDocument != null) {
+            fileName = getAttachFileName(webDocument);
+        } else {
+            fileName = null;
+        }
+        if (fileName == null || fileName.contains("" + Integer.MIN_VALUE)) {
+            return null;
+        }
+        if (fileName.startsWith("0_0")) {
+            FileLog.e(new RuntimeException("cant get hash from " + document));
+            return null;
+        }
+        if (cacheType != 10 && !TextUtils.isEmpty(fileName) && !fileName.contains("" + Integer.MIN_VALUE)) {
+            loadOperationPathsUI.put(fileName, new LoadOperationUIObject());
+        }
+
+        if (document != null && parentObject instanceof MessageObject && ((MessageObject) parentObject).putInDownloadsStore && !((MessageObject) parentObject).isAnyKindOfSticker()) {
+            getDownloadController().startDownloadFile(document, (MessageObject) parentObject);
+        }
+
+        final String finalFileName = fileName;
+        FileLoadOperation operation = loadOperationPaths.get(finalFileName);
+
+        priority = getPriorityValue(priority);
+
+        if (operation != null) {""",
+            """    private FileLoadOperation loadFileInternal(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, Object parentObject, final String locationExt, final long locationSize, int priority, FileLoadOperationStream stream, final long streamOffset, boolean streamPriority, final int cacheType) {
+        String fileName;
+        if (location != null) {
+            fileName = getAttachFileName(location, locationExt);
+        } else if (secureDocument != null) {
+            fileName = getAttachFileName(secureDocument);
+        } else if (document != null) {
+            fileName = getAttachFileName(document);
+        } else if (webDocument != null) {
+            fileName = getAttachFileName(webDocument);
+        } else {
+            fileName = null;
+        }
+        if (fileName == null || fileName.contains("" + Integer.MIN_VALUE)) {
+            return null;
+        }
+        if (fileName.startsWith("0_0")) {
+            FileLog.e(new RuntimeException("cant get hash from " + document));
+            return null;
+        }
+        if (cacheType != 10 && !TextUtils.isEmpty(fileName) && !fileName.contains("" + Integer.MIN_VALUE)) {
+            loadOperationPathsUI.put(fileName, new LoadOperationUIObject());
+        }
+
+        if (document != null && parentObject instanceof MessageObject && ((MessageObject) parentObject).putInDownloadsStore && !((MessageObject) parentObject).isAnyKindOfSticker()) {
+            getDownloadController().startDownloadFile(document, (MessageObject) parentObject);
+        }
+
+        final String finalFileName = fileName;
+        FileLoadOperation operation = loadOperationPaths.get(finalFileName);
+
+        priority = getPriorityValue(priority);
 
         if (document != null && priority <= PRIORITY_LOW) {
             org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
@@ -515,7 +734,192 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         }
 
         if (operation != null) {""",
-        "FileLoader.java defense-in-depth background auto-download block",
+            """    private boolean isColgramAutoDownloadBlocked(TLRPC.Document document) {
+        if (document == null) {
+            return false;
+        }
+        org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+        boolean isWifi = ApplicationLoader.getAutodownloadNetworkType() == StatsController.TYPE_WIFI;
+        long capBytes = org.colgram.core.ColgramShieldConfig.isStorageCapEnabled()
+                ? org.colgram.core.ColgramShieldConfig.getStorageHardCapBytes() : 0L;
+        return org.colgram.core.ColgramFileSafetyPolicy.shouldBlockAutoDownload(
+                getDocumentFileName(document), document.mime_type, document.size, isWifi, capBytes);
+    }
+
+    private FileLoadOperation loadFileInternal(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, Object parentObject, final String locationExt, final long locationSize, int priority, FileLoadOperationStream stream, final long streamOffset, boolean streamPriority, final int cacheType) {
+        return loadFileInternal(document, secureDocument, webDocument, location, imageLocation, parentObject, locationExt, locationSize, priority, stream, streamOffset, streamPriority, cacheType, false);
+    }
+
+    private FileLoadOperation loadFileInternal(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, Object parentObject, final String locationExt, final long locationSize, int priority, FileLoadOperationStream stream, final long streamOffset, boolean streamPriority, final int cacheType, final boolean isAutoDownload) {
+        String fileName;
+        if (location != null) {
+            fileName = getAttachFileName(location, locationExt);
+        } else if (secureDocument != null) {
+            fileName = getAttachFileName(secureDocument);
+        } else if (document != null) {
+            fileName = getAttachFileName(document);
+        } else if (webDocument != null) {
+            fileName = getAttachFileName(webDocument);
+        } else {
+            fileName = null;
+        }
+        if (fileName == null || fileName.contains("" + Integer.MIN_VALUE)) {
+            return null;
+        }
+        if (fileName.startsWith("0_0")) {
+            FileLog.e(new RuntimeException("cant get hash from " + document));
+            return null;
+        }
+        if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {
+            loadOperationPathsUI.remove(fileName);
+            return null;
+        }
+        if (cacheType != 10 && !TextUtils.isEmpty(fileName) && !fileName.contains("" + Integer.MIN_VALUE)) {
+            loadOperationPathsUI.put(fileName, new LoadOperationUIObject());
+        }
+
+        if (document != null && parentObject instanceof MessageObject && ((MessageObject) parentObject).putInDownloadsStore && !((MessageObject) parentObject).isAnyKindOfSticker()) {
+            getDownloadController().startDownloadFile(document, (MessageObject) parentObject);
+        }
+
+        final String finalFileName = fileName;
+        FileLoadOperation operation = loadOperationPaths.get(finalFileName);
+
+        priority = getPriorityValue(priority);
+
+        if (operation != null) {""",
+        ],
+        """    private boolean isColgramAutoDownloadBlocked(TLRPC.Document document) {
+        if (document == null) {
+            return false;
+        }
+        org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+        boolean isWifi = ApplicationLoader.getAutodownloadNetworkType() == StatsController.TYPE_WIFI;
+        long capBytes = org.colgram.core.ColgramShieldConfig.isStorageCapEnabled()
+                ? org.colgram.core.ColgramShieldConfig.getStorageHardCapBytes() : 0L;
+        return org.colgram.core.ColgramFileSafetyPolicy.shouldBlockAutoDownload(
+                getDocumentFileName(document), document.mime_type, document.size, isWifi, capBytes);
+    }
+
+    private FileLoadOperation loadFileInternal(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, Object parentObject, final String locationExt, final long locationSize, int priority, FileLoadOperationStream stream, final long streamOffset, boolean streamPriority, final int cacheType, final boolean isAutoDownload) {
+        String fileName;
+        if (location != null) {
+            fileName = getAttachFileName(location, locationExt);
+        } else if (secureDocument != null) {
+            fileName = getAttachFileName(secureDocument);
+        } else if (document != null) {
+            fileName = getAttachFileName(document);
+        } else if (webDocument != null) {
+            fileName = getAttachFileName(webDocument);
+        } else {
+            fileName = null;
+        }
+        if (fileName == null || fileName.contains("" + Integer.MIN_VALUE)) {
+            return null;
+        }
+        if (fileName.startsWith("0_0")) {
+            FileLog.e(new RuntimeException("cant get hash from " + document));
+            return null;
+        }
+        if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {
+            loadOperationPathsUI.remove(fileName);
+            return null;
+        }
+        if (cacheType != 10 && !TextUtils.isEmpty(fileName) && !fileName.contains("" + Integer.MIN_VALUE)) {
+            loadOperationPathsUI.put(fileName, new LoadOperationUIObject());
+        }
+
+        if (document != null && parentObject instanceof MessageObject && ((MessageObject) parentObject).putInDownloadsStore && !((MessageObject) parentObject).isAnyKindOfSticker()) {
+            getDownloadController().startDownloadFile(document, (MessageObject) parentObject);
+        }
+
+        final String finalFileName = fileName;
+        FileLoadOperation operation = loadOperationPaths.get(finalFileName);
+
+        priority = getPriorityValue(priority);
+
+        if (operation != null) {""",
+        "FileLoader.java explicit auto-download guard before startDownloadFile and UI map",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        file_loader,
+        [
+            """        return operation;
+    }
+
+    private FileLoadOperation loadFileInternal(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, Object parentObject, final String locationExt, final long locationSize, int priority, FileLoadOperationStream stream, final long streamOffset, boolean streamPriority, final int cacheType) {
+        return loadFileInternal(document, secureDocument, webDocument, location, imageLocation, parentObject, locationExt, locationSize, priority, stream, streamOffset, streamPriority, cacheType, false);
+    }
+
+    public static boolean canSaveAsFile(Object parentObject) {"""
+        ],
+        """        return operation;
+    }
+
+    public static boolean canSaveAsFile(Object parentObject) {""",
+        "FileLoader.java drop duplicate 13-arg loadFileInternal overload",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        file_loader,
+        [
+            """            result[0] = loadFileInternal(document, null, null, document == null && location != null ? location.location : null, location, parentObject, document == null && location != null ? "mp4" : null, document == null && location != null ? location.currentSize : 0, loadingPriority, stream, offset, priority, cacheType);"""
+        ],
+        """            result[0] = loadFileInternal(document, null, null, document == null && location != null ? location.location : null, location, parentObject, document == null && location != null ? "mp4" : null, document == null && location != null ? location.currentSize : 0, loadingPriority, stream, offset, priority, cacheType, false);""",
+        "FileLoader.java pass isAutoDownload=false in loadStreamFile",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        file_loader,
+        [
+            """    private void loadFile(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, final Object parentObject, final String locationExt, final long locationSize, final int priority, final int cacheType) {
+        String fileName;
+        if (location != null) {
+            fileName = getAttachFileName(location, locationExt);
+        } else if (document != null) {
+            fileName = getAttachFileName(document);
+        } else if (webDocument != null) {
+            fileName = getAttachFileName(webDocument);
+        } else {
+            fileName = null;
+        }
+        Runnable runnable = () -> loadFileInternal(document, secureDocument, webDocument, location, imageLocation, parentObject, locationExt, locationSize, priority, null, 0, false, cacheType);
+        if (cacheType != 10 && !TextUtils.isEmpty(fileName) && !fileName.contains("" + Integer.MIN_VALUE)) {
+            LoadOperationUIObject uiObject = new FileLoader.LoadOperationUIObject();
+            uiObject.loadInternalRunnable = runnable;
+            loadOperationPathsUI.put(fileName, uiObject);
+        }
+        fileLoaderQueue.postRunnable(runnable);
+    }"""
+        ],
+        """    private void loadFile(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, final Object parentObject, final String locationExt, final long locationSize, final int priority, final int cacheType) {
+        loadFile(document, secureDocument, webDocument, location, imageLocation, parentObject, locationExt, locationSize, priority, cacheType, false);
+    }
+
+    private void loadFile(final TLRPC.Document document, final SecureDocument secureDocument, final WebFile webDocument, TLRPC.TL_fileLocationToBeDeprecated location, final ImageLocation imageLocation, final Object parentObject, final String locationExt, final long locationSize, final int priority, final int cacheType, final boolean isAutoDownload) {
+        if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {
+            return;
+        }
+        String fileName;
+        if (location != null) {
+            fileName = getAttachFileName(location, locationExt);
+        } else if (document != null) {
+            fileName = getAttachFileName(document);
+        } else if (webDocument != null) {
+            fileName = getAttachFileName(webDocument);
+        } else {
+            fileName = null;
+        }
+        Runnable runnable = () -> loadFileInternal(document, secureDocument, webDocument, location, imageLocation, parentObject, locationExt, locationSize, priority, null, 0, false, cacheType, isAutoDownload);
+        if (cacheType != 10 && !TextUtils.isEmpty(fileName) && !fileName.contains("" + Integer.MIN_VALUE)) {
+            LoadOperationUIObject uiObject = new FileLoader.LoadOperationUIObject();
+            uiObject.loadInternalRunnable = runnable;
+            loadOperationPathsUI.put(fileName, uiObject);
+        }
+        fileLoaderQueue.postRunnable(runnable);
+    }""",
+        "FileLoader.java forward isAutoDownload in private loadFile",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -572,9 +976,8 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     maxCacheSize = 1024L * 1024L * 300L;
                 } else {
                     maxCacheSize = maxCacheGb * 1024L * 1024L * 1000L;
-                }"""
-        ],
-        """            FileLog.cleanupLogs();
+                }""",
+            """            FileLog.cleanupLogs();
             org.colgram.core.ColgramStorageCapEnforcer.enforceIfNeeded(ApplicationLoader.applicationContext, false);
             int maxCacheGb = SharedConfig.getPreferences().getInt("cache_limit", Integer.MAX_VALUE);
             if (maxCacheGb != Integer.MAX_VALUE && maxCacheGb != 0) {
@@ -591,7 +994,148 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                         paths.put(paths.size() + 100, sDir);
                     }
                 }""",
-        "AutoDeleteMediaTask.java enforce CapEnforcer + MB cache_limit + sandbox scan",
+        ],
+        """            FileLog.cleanupLogs();
+            org.colgram.core.ColgramStorageCapEnforcer.enforceIfNeeded(ApplicationLoader.applicationContext, false);
+            int maxCacheGb = SharedConfig.getPreferences().getInt("cache_limit", Integer.MAX_VALUE);
+            if (maxCacheGb != Integer.MAX_VALUE && maxCacheGb != 0) {
+                long maxCacheSize;
+                if (maxCacheGb < 0) {
+                    maxCacheSize = (long) (-maxCacheGb) * 1024L * 1024L;
+                } else if (maxCacheGb == 1) {
+                    maxCacheSize = 1024L * 1024L * 300L;
+                } else {
+                    maxCacheSize = maxCacheGb * 1024L * 1024L * 1000L;
+                }
+                colgramMergeSandboxDirsDedup(paths, org.colgram.core.ColgramStorageSandbox.getAllSandboxDirectories(ApplicationLoader.applicationContext));""",
+        "AutoDeleteMediaTask.java enforce CapEnforcer + MB cache_limit + canonical sandbox dedup",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        auto_del,
+        [
+            """    private static void fillFilesRecursive(final File fromFolder, ArrayList<FileInfoInternal> fileInfoList) {
+        if (fromFolder == null) {
+            return;
+        }
+        File[] files = fromFolder.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (final File fileEntry : files) {
+            if (fileEntry.isDirectory()) {
+                fillFilesRecursive(fileEntry, fileInfoList);"""
+        ],
+        """    private static String colgramCanonicalPath(File dir) {
+        try {
+            return dir.getCanonicalPath();
+        } catch (Throwable ignored) {
+            return dir.getAbsolutePath();
+        }
+    }
+
+    private static boolean colgramIsDescendantOrEqual(String candidate, String root) {
+        if (candidate == null || root == null) {
+            return false;
+        }
+        return candidate.equals(root) || candidate.startsWith(root + File.separator);
+    }
+
+    private static void colgramMergeSandboxDirsDedup(SparseArray<File> paths, java.util.List<File> sandboxDirs) {
+        if (paths == null) {
+            return;
+        }
+        java.util.ArrayList<Integer> existingKeys = new java.util.ArrayList<>(paths.size());
+        java.util.ArrayList<String> existingCanons = new java.util.ArrayList<>(paths.size());
+        for (int a = 0; a < paths.size(); a++) {
+            File f = paths.valueAt(a);
+            if (f == null) {
+                continue;
+            }
+            String canon = colgramCanonicalPath(f);
+            boolean dupOrChild = false;
+            for (int b = 0; b < existingCanons.size(); b++) {
+                if (colgramIsDescendantOrEqual(canon, existingCanons.get(b))) {
+                    dupOrChild = true;
+                    break;
+                }
+            }
+            if (dupOrChild) {
+                continue;
+            }
+            for (int b = existingCanons.size() - 1; b >= 0; b--) {
+                if (colgramIsDescendantOrEqual(existingCanons.get(b), canon)) {
+                    existingCanons.remove(b);
+                    existingKeys.remove(b);
+                }
+            }
+            existingKeys.add(paths.keyAt(a));
+            existingCanons.add(canon);
+        }
+        java.util.ArrayList<File> preservedDirs = new java.util.ArrayList<>(existingKeys.size());
+        for (int a = 0; a < existingKeys.size(); a++) {
+            preservedDirs.add(paths.get(existingKeys.get(a)));
+        }
+        paths.clear();
+        for (int a = 0; a < existingKeys.size(); a++) {
+            paths.put(existingKeys.get(a), preservedDirs.get(a));
+        }
+        if (sandboxDirs == null || sandboxDirs.isEmpty()) {
+            return;
+        }
+        int nextKey = 1000;
+        for (int i = 0; i < sandboxDirs.size(); i++) {
+            File sDir = sandboxDirs.get(i);
+            if (sDir == null) {
+                continue;
+            }
+            String sCanon = colgramCanonicalPath(sDir);
+            boolean skip = false;
+            for (int b = 0; b < existingCanons.size(); b++) {
+                if (colgramIsDescendantOrEqual(sCanon, existingCanons.get(b))) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) {
+                continue;
+            }
+            for (int b = existingCanons.size() - 1; b >= 0; b--) {
+                if (colgramIsDescendantOrEqual(existingCanons.get(b), sCanon)) {
+                    paths.remove(existingKeys.get(b));
+                    existingKeys.remove(b);
+                    existingCanons.remove(b);
+                }
+            }
+            int key = 1000 + i;
+            if (key < nextKey) {
+                key = nextKey;
+            }
+            while (paths.indexOfKey(key) >= 0) {
+                key++;
+            }
+            nextKey = key + 1;
+            paths.put(key, sDir);
+            existingKeys.add(key);
+            existingCanons.add(sCanon);
+        }
+    }
+
+    private static void fillFilesRecursive(final File fromFolder, ArrayList<FileInfoInternal> fileInfoList) {
+        if (fromFolder == null || org.colgram.core.ColgramStorageCapEnforcer.isProtectedDirectoryName(fromFolder.getName())) {
+            return;
+        }
+        File[] files = fromFolder.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (final File fileEntry : files) {
+            if (fileEntry.isDirectory()) {
+                if (org.colgram.core.ColgramStorageCapEnforcer.isProtectedDirectoryName(fileEntry.getName())) {
+                    continue;
+                }
+                fillFilesRecursive(fileEntry, fileInfoList);""",
+        "AutoDeleteMediaTask.java canonical dir dedup helper and skip protected dirs",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -701,9 +1245,12 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                         }
                     });
                     int currentLimit = SharedConfig.getPreferences().getInt("cache_limit",
-                            org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() ? Integer.MAX_VALUE : 0);"""
-        ],
-        """                    ArrayList<Integer> options = new ArrayList<>();
+                            org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() ? Integer.MAX_VALUE : 0);
+                    int i = options.indexOf(currentLimit);
+                    if (i < 0) {
+                        i = options.size() - 1;
+                    }""",
+            """                    ArrayList<Integer> options = new ArrayList<>();
                     options.add(0);
                     options.add(-512);
                     options.add(-1024);
@@ -748,8 +1295,81 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     int fallbackLimit = (org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() && !org.colgram.core.ColgramShieldConfig.isStorageCapEnabled())
                             ? Integer.MAX_VALUE : org.colgram.core.ColgramUnlimitedMemory.toMainConfigCacheLimit(org.colgram.core.ColgramShieldConfig.getStorageHardCapMb());
                     int currentLimit = SharedConfig.getPreferences().getInt("cache_limit", fallbackLimit);
-                    if (currentLimit == 1) currentLimit = -512;""",
-        "CacheControlActivity.java add 1 GB / 512 MB cap options & sync ColgramUnlimitedMemory",
+                    if (currentLimit == 1) currentLimit = -512;
+                    int i = options.indexOf(currentLimit);
+                    if (i < 0) {
+                        i = options.size() - 1;
+                    }""",
+        ],
+        """                    ArrayList<Integer> options = new ArrayList<>();
+                    options.add(-100);
+                    options.add(-512);
+                    options.add(-1024);
+                    options.add(2);
+                    if (totalSizeInGb > 5) {
+                        options.add(5);
+                    }
+                    if (totalSizeInGb > 16) {
+                        options.add(16);
+                    }
+                    if (totalSizeInGb > 32) {
+                        options.add(32);
+                    }
+                    options.add(Integer.MAX_VALUE);
+                    String[] values = new String[options.size()];
+                    for (int i = 0; i < options.size(); i++) {
+                        int opt = options.get(i);
+                        if (opt == -100 || opt == 0) {
+                            values[i] = "100 MB";
+                        } else if (opt == -512) {
+                            values[i] = "512 MB";
+                        } else if (opt == -1024) {
+                            values[i] = "1 GB";
+                        } else if (opt == Integer.MAX_VALUE) {
+                            values[i] = LocaleController.getString(R.string.NoLimit);
+                        } else {
+                            values[i] = String.format("%d GB", opt);
+                        }
+                    }
+                    slideChooseView2.setCallback(i -> {
+                        int chosen = options.get(i);
+                        boolean unlimited = chosen == Integer.MAX_VALUE;
+                        if (unlimited) {
+                            org.colgram.core.ColgramConfig.setUnlimitedMemoryEnabled(true);
+                            org.colgram.core.ColgramUnlimitedMemory.apply(getContext(), true);
+                        } else {
+                            int capMb = chosen < 0 ? -chosen : (chosen == 0 ? 100 : chosen * 1024);
+                            org.colgram.core.ColgramUnlimitedMemory.applyStorageCap(getContext(), capMb);
+                        }
+                    });
+                    org.colgram.core.ColgramShieldConfig.init(getContext());
+                    int fallbackLimit = (org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() && !org.colgram.core.ColgramShieldConfig.isStorageCapEnabled())
+                            ? Integer.MAX_VALUE : org.colgram.core.ColgramUnlimitedMemory.toMainConfigCacheLimit(org.colgram.core.ColgramShieldConfig.getStorageHardCapMb());
+                    int currentLimit = SharedConfig.getPreferences().getInt("cache_limit", fallbackLimit);
+                    if (currentLimit == 0) currentLimit = -100;
+                    if (currentLimit == 1) currentLimit = -512;
+                    int i = options.indexOf(currentLimit);
+                    if (i < 0) {
+                        if (currentLimit == Integer.MAX_VALUE) {
+                            i = options.size() - 1;
+                        } else {
+                            int targetMb = currentLimit < 0 ? -currentLimit : currentLimit * 1024;
+                            int bestIdx = 0;
+                            int bestDiff = Integer.MAX_VALUE;
+                            for (int idxOpt = 0; idxOpt < options.size(); idxOpt++) {
+                                int opt = options.get(idxOpt);
+                                if (opt == Integer.MAX_VALUE) continue;
+                                int optMb = opt < 0 ? -opt : (opt == 0 ? 100 : opt * 1024);
+                                int diff = Math.abs(optMb - targetMb);
+                                if (diff < bestDiff) {
+                                    bestDiff = diff;
+                                    bestIdx = idxOpt;
+                                }
+                            }
+                            i = bestIdx;
+                        }
+                    }""",
+        "CacheControlActivity.java fix -100 MB slider mapping & nearest finite notch",
     )
 
     # 8. AndroidUtilities.java:
@@ -762,16 +1382,27 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         android_utils,
         [
             """        if (f != null && f.exists()) {
-            if (parentFragment != null && f.getName().toLowerCase().endsWith("attheme")) {"""
-        ],
-        """        if (f != null && f.exists()) {
+            if (parentFragment != null && f.getName().toLowerCase().endsWith("attheme")) {""",
+            """        if (f != null && f.exists()) {
             if (colgramWarnIfUnsafeOpen(f, fileName, document.mime_type, activity,
                     parentFragment != null ? parentFragment.getResourceProvider() : null,
                     () -> openDocument(message, activity, parentFragment))) {
                 return;
             }
             if (parentFragment != null && f.getName().toLowerCase().endsWith("attheme")) {""",
-        "AndroidUtilities.java openDocument malware/huge sheet confirmation",
+        ],
+        """        if (f != null && f.exists()) {
+            String colgramDocName = FileLoader.getDocumentFileName(document);
+            if (TextUtils.isEmpty(colgramDocName)) {
+                colgramDocName = fileName;
+            }
+            if (colgramWarnIfUnsafeOpen(f, colgramDocName, document.mime_type, activity,
+                    parentFragment != null ? parentFragment.getResourceProvider() : null,
+                    () -> openDocument(message, activity, parentFragment))) {
+                return;
+            }
+            if (parentFragment != null && f.getName().toLowerCase().endsWith("attheme")) {""",
+        "AndroidUtilities.java openDocument malware/huge sheet confirmation with real filename",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -835,12 +1466,31 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         msg_obj,
         [
+            """    public static final int MESSAGE_SEND_STATE_SENT = 0;"""
+        ],
+        """    public boolean colgramLayoutCollapsed;
+
+    public static final int MESSAGE_SEND_STATE_SENT = 0;""",
+        "MessageObject.java track colgramLayoutCollapsed state",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        msg_obj,
+        [
             """        CharSequence text = messageText;
         try {
-            textLayoutOriginalWidth = maxWidth;"""
+            textLayoutOriginalWidth = maxWidth;""",
+            """        CharSequence text = messageText;
+        if (org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(getDialogId(), getId())) {
+            text = "\\uD83D\\uDEE1 Скрыто Антипингом · Показать";
+        }
+        try {
+            textLayoutOriginalWidth = maxWidth;""",
         ],
         """        CharSequence text = messageText;
-        if (org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(getDialogId(), getId())) {
+        boolean colgramCollapsed = org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(getDialogId(), getId());
+        colgramLayoutCollapsed = colgramCollapsed;
+        if (colgramCollapsed) {
             text = "\\uD83D\\uDEE1 Скрыто Антипингом · Показать";
         }
         try {
@@ -849,9 +1499,9 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     )
 
     # 10. ChatMessageCell.java:
-    #     - Track collapsed spam visibility for compact bubble rebuilds (disjoint from Saved Tags chips!)
-    #     - Display Lazy Shadow Vault offline WebP preview when local photo is absent
-    #     - Gate manual dangerous/huge download tap behind Contract D showMalwareWarningSheet
+    #     - Track collapsed spam visibility for compact bubble rebuilds + guard motion events from phantom link taps
+    #     - Display Lazy Shadow Vault offline WebP preview as thumb (keeping photoNotSet=true so mediaExists stays false)
+    #     - Gate manual dangerous/huge download tap behind Contract D showMalwareWarningSheet safely across ViewHolder recycling
     chat_cell = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "Cells", "ChatMessageCell.java"
     )
@@ -870,13 +1520,73 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         chat_cell,
         [
-            """        if (!colgramMarkedDeleteStateKnown
+            """    private boolean checkTextBlockMotionEvent(MotionEvent event) {
+        if (!(currentMessageObject.type == MessageObject.TYPE_TEXT || currentMessageObject.type == MessageObject.TYPE_EMOJIS || currentMessageObject.type == MessageObject.TYPE_STORY_MENTION) || currentMessageObject.textLayoutBlocks == null || currentMessageObject.textLayoutBlocks.isEmpty() || !(currentMessageObject.messageText instanceof Spannable)) {"""
+        ],
+        """    private boolean checkTextBlockMotionEvent(MotionEvent event) {
+        if (colgramCollapsedSpamVisible) {
+            return false;
+        }
+        if (!(currentMessageObject.type == MessageObject.TYPE_TEXT || currentMessageObject.type == MessageObject.TYPE_EMOJIS || currentMessageObject.type == MessageObject.TYPE_STORY_MENTION) || currentMessageObject.textLayoutBlocks == null || currentMessageObject.textLayoutBlocks.isEmpty() || !(currentMessageObject.messageText instanceof Spannable)) {""",
+        "ChatMessageCell.java guard checkTextBlockMotionEvent on collapsed spam stub",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_cell,
+        [
+            """    private boolean checkCaptionMotionEvent(MotionEvent event) {
+        if (!(currentCaption instanceof Spannable) || captionLayout == null || touchedByExpanation) {"""
+        ],
+        """    private boolean checkCaptionMotionEvent(MotionEvent event) {
+        if (colgramCollapsedSpamVisible) {
+            return false;
+        }
+        if (!(currentCaption instanceof Spannable) || captionLayout == null || touchedByExpanation) {""",
+        "ChatMessageCell.java guard checkCaptionMotionEvent on collapsed spam stub",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_cell,
+        [
+            """    private boolean checkLinkPreviewMotionEvent(MotionEvent event) {
+        if (currentMessageObject.type != MessageObject.TYPE_TEXT && currentMessageObject.type != MessageObject.TYPE_STORY_MENTION || !hasLinkPreview) {"""
+        ],
+        """    private boolean checkLinkPreviewMotionEvent(MotionEvent event) {
+        if (colgramCollapsedSpamVisible) {
+            return false;
+        }
+        if (currentMessageObject.type != MessageObject.TYPE_TEXT && currentMessageObject.type != MessageObject.TYPE_STORY_MENTION || !hasLinkPreview) {""",
+        "ChatMessageCell.java guard checkLinkPreviewMotionEvent on collapsed spam stub",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        chat_cell,
+        [
+            """        boolean colgramNowDeletedCheck = org.colgram.core.ColgramConfig.isAntiDeleteHighlightEnabled()
+                && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId());
+        boolean colgramNowCollapsedCheck = org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(
+                messageObject.getDialogId(), messageObject.getId());
+        if (colgramCollapsedSpamVisible != colgramNowCollapsedCheck) {
+            colgramCollapsedSpamVisible = colgramNowCollapsedCheck;
+            dataChanged = true;
+        }
+        boolean colgramNowCollapsedCheck = org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(
+                messageObject.getDialogId(), messageObject.getId());
+        if (colgramCollapsedSpamVisible != colgramNowCollapsedCheck
+                || messageObject.colgramLayoutCollapsed != colgramNowCollapsedCheck) {
+            colgramCollapsedSpamVisible = colgramNowCollapsedCheck;
+            dataChanged = true;
+            messageObject.resetLayout();
+            messageObject.checkLayout();
+        }
+        if (!colgramMarkedDeleteStateKnown
                 || colgramMarkedDeleteVisible != colgramNowDeletedCheck
                 || (colgramNowDeletedCheck && colgramHasPendingDeleteAnim(messageObject.getDialogId(), messageObject.getId()))) {
             dataChanged = true;
-        }"""
-        ],
-        """        boolean colgramNowCollapsedCheck = org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(
+        }""",
+            """        boolean colgramNowDeletedCheck = org.colgram.core.ColgramConfig.isAntiDeleteHighlightEnabled()
+                && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId());
+        boolean colgramNowCollapsedCheck = org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(
                 messageObject.getDialogId(), messageObject.getId());
         if (colgramCollapsedSpamVisible != colgramNowCollapsedCheck) {
             colgramCollapsedSpamVisible = colgramNowCollapsedCheck;
@@ -887,7 +1597,31 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 || (colgramNowDeletedCheck && colgramHasPendingDeleteAnim(messageObject.getDialogId(), messageObject.getId()))) {
             dataChanged = true;
         }""",
-        "ChatMessageCell.java rebuild collapsed spam stub state cleanly",
+            """        boolean colgramNowDeletedCheck = org.colgram.core.ColgramConfig.isAntiDeleteHighlightEnabled()
+                && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId());
+        if (!colgramMarkedDeleteStateKnown
+                || colgramMarkedDeleteVisible != colgramNowDeletedCheck
+                || (colgramNowDeletedCheck && colgramHasPendingDeleteAnim(messageObject.getDialogId(), messageObject.getId()))) {
+            dataChanged = true;
+        }""",
+        ],
+        """        boolean colgramNowDeletedCheck = org.colgram.core.ColgramConfig.isAntiDeleteHighlightEnabled()
+                && org.colgram.core.ColgramHookHandler.isMessageMarkedDeleted(messageObject.getDialogId(), messageObject.getId());
+        boolean colgramNowCollapsedCheck = org.colgram.core.ColgramHookHandler.isMessageCollapsedSpam(
+                messageObject.getDialogId(), messageObject.getId());
+        if (colgramCollapsedSpamVisible != colgramNowCollapsedCheck
+                || messageObject.colgramLayoutCollapsed != colgramNowCollapsedCheck) {
+            colgramCollapsedSpamVisible = colgramNowCollapsedCheck;
+            dataChanged = true;
+            messageObject.resetLayout();
+            messageObject.checkLayout();
+        }
+        if (!colgramMarkedDeleteStateKnown
+                || colgramMarkedDeleteVisible != colgramNowDeletedCheck
+                || (colgramNowDeletedCheck && colgramHasPendingDeleteAnim(messageObject.getDialogId(), messageObject.getId()))) {
+            dataChanged = true;
+        }""",
+        "ChatMessageCell.java rebuild collapsed spam stub state and text layout cleanly",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -895,9 +1629,15 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         [
             """                                } else {
                                     photoNotSet = true;
-                                    if (currentPhotoObjectThumb != null || currentPhotoObjectThumbStripped != null) {"""
-        ],
-        """                                } else {
+                                    if (currentPhotoObjectThumb != null || currentPhotoObjectThumbStripped != null) {
+                                        photoImage.setImage(null, null, ImageLocation.getForObject(currentPhotoObjectThumb, photoParentObject), String.format(Locale.US, "%d_%d_b", w, h), currentPhotoObjectThumbStripped, 0, null, messageObject, 0);
+                                    } else {
+                                        photoImage.setImageBitmap((Drawable) null);
+                                    }
+                                }
+                            }
+                            clearBlurredImage(blurredPhotoImage);""",
+            """                                } else {
                                     String colgramShadowPreview = org.colgram.core.ColgramHookHandler.getShadowPreviewPath(
                                             messageObject.getDialogId(), messageObject.getId());
                                     if (!TextUtils.isEmpty(colgramShadowPreview)) {
@@ -905,28 +1645,31 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                                         photoImage.setImage(ImageLocation.getForPath(colgramShadowPreview), currentPhotoFilter, null, null, null, 0, null, messageObject, 0);
                                     } else {
                                         photoNotSet = true;
-                                        if (currentPhotoObjectThumb != null || currentPhotoObjectThumbStripped != null) {""",
-        "ChatMessageCell.java load Lazy Shadow Vault WebP micro-preview fallback (part 1)",
-    )
-    _patch_eol_variants(
-        eol_patch_fn,
-        chat_cell,
-        [
-            """                                    } else {
-                                        photoImage.setImageBitmap((Drawable) null);
-                                    }
-                                }
-                            }
-                            clearBlurredImage(blurredPhotoImage);"""
-        ],
-        """                                        } else {
+                                        if (currentPhotoObjectThumb != null || currentPhotoObjectThumbStripped != null) {
+                                        photoImage.setImage(null, null, ImageLocation.getForObject(currentPhotoObjectThumb, photoParentObject), String.format(Locale.US, "%d_%d_b", w, h), currentPhotoObjectThumbStripped, 0, null, messageObject, 0);
+                                        } else {
                                             photoImage.setImageBitmap((Drawable) null);
                                         }
                                     }
                                 }
                             }
                             clearBlurredImage(blurredPhotoImage);""",
-        "ChatMessageCell.java load Lazy Shadow Vault WebP micro-preview fallback (part 2)",
+        ],
+        """                                } else {
+                                    photoNotSet = true;
+                                    String colgramShadowPreview = org.colgram.core.ColgramHookHandler.getShadowPreviewPath(
+                                            messageObject.getDialogId(), messageObject.getId());
+                                    if (!TextUtils.isEmpty(colgramShadowPreview)) {
+                                        photoImage.setImage(null, null, ImageLocation.getForPath(colgramShadowPreview), currentPhotoFilter, null, 0, null, messageObject, 0);
+                                    } else if (currentPhotoObjectThumb != null || currentPhotoObjectThumbStripped != null) {
+                                        photoImage.setImage(null, null, ImageLocation.getForObject(currentPhotoObjectThumb, photoParentObject), String.format(Locale.US, "%d_%d_b", w, h), currentPhotoObjectThumbStripped, 0, null, messageObject, 0);
+                                    } else {
+                                        photoImage.setImageBitmap((Drawable) null);
+                                    }
+                                }
+                            }
+                            clearBlurredImage(blurredPhotoImage);""",
+        "ChatMessageCell.java load Lazy Shadow Vault WebP micro-preview as thumb",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -941,9 +1684,14 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         chat_cell,
         [
-            """        if (buttonState == 0 && (!drawVideoImageButton || video)) {"""
-        ],
-        """        if (buttonState == 0 && (!drawVideoImageButton || video) && !colgramBypassSafetyOnce
+            """        if (currentMessageObject != null && !currentMessageObject.isAnyKindOfSticker()) {
+            currentMessageObject.putInDownloadsStore = true;
+        }
+        if (buttonState == 0 && (!drawVideoImageButton || video)) {""",
+            """        if (currentMessageObject != null && !currentMessageObject.isAnyKindOfSticker()) {
+            currentMessageObject.putInDownloadsStore = true;
+        }
+        if (buttonState == 0 && (!drawVideoImageButton || video) && !colgramBypassSafetyOnce
                 && documentAttach != null && !currentMessageObject.isAnyKindOfSticker() && !currentMessageObject.mediaExists) {
             org.colgram.core.ColgramShieldConfig.init(getContext());
             long capBytes = org.colgram.core.ColgramShieldConfig.isStorageCapEnabled()
@@ -970,7 +1718,50 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             }
         }
         if (buttonState == 0 && (!drawVideoImageButton || video)) {""",
-        "ChatMessageCell.java gate manual dangerous/huge download behind malware sheet",
+        ],
+        """        if (buttonState == 0 && (!drawVideoImageButton || video) && !colgramBypassSafetyOnce
+                && documentAttach != null && currentMessageObject != null && !currentMessageObject.isAnyKindOfSticker() && !currentMessageObject.mediaExists) {
+            org.colgram.core.ColgramShieldConfig.init(getContext());
+            long capBytes = org.colgram.core.ColgramShieldConfig.isStorageCapEnabled()
+                    ? org.colgram.core.ColgramShieldConfig.getStorageHardCapBytes() : 0L;
+            String docName = FileLoader.getDocumentFileName(documentAttach);
+            org.colgram.core.ColgramFileSafetyPolicy.SafetyAssessment safety =
+                    org.colgram.core.ColgramFileSafetyPolicy.assessForManualAction(
+                            docName, documentAttach.mime_type, documentAttach.size, capBytes);
+            if (safety.manualWarningRequired) {
+                android.app.Activity hostAct = AndroidUtilities.findActivity(getContext());
+                if (hostAct != null) {
+                    final MessageObject targetMsg = currentMessageObject;
+                    final TLRPC.Document targetDoc = documentAttach;
+                    final int targetAccount = currentAccount;
+                    org.telegram.ui.ColgramUiKit.showMalwareWarningSheet(
+                            hostAct, resourcesProvider, docName, safety.detectedExtension,
+                            targetDoc.size, safety.threatReason, false, () -> {
+                                if (currentMessageObject == targetMsg && documentAttach == targetDoc) {
+                                    colgramBypassSafetyOnce = true;
+                                    try {
+                                        didPressButton(animated, video);
+                                    } finally {
+                                        colgramBypassSafetyOnce = false;
+                                    }
+                                } else if (targetDoc != null) {
+                                    if (targetMsg != null && !targetMsg.isAnyKindOfSticker()) {
+                                        targetMsg.putInDownloadsStore = true;
+                                        targetMsg.loadingCancelled = false;
+                                    }
+                                    FileLoader.getInstance(targetAccount).loadFile(
+                                            targetDoc, targetMsg, FileLoader.PRIORITY_NORMAL_UP, 0);
+                                }
+                            });
+                    return;
+                }
+            }
+        }
+        if (currentMessageObject != null && !currentMessageObject.isAnyKindOfSticker()) {
+            currentMessageObject.putInDownloadsStore = true;
+        }
+        if (buttonState == 0 && (!drawVideoImageButton || video)) {""",
+        "ChatMessageCell.java gate manual dangerous/huge download safely behind malware sheet",
     )
 
     # 11. ChatActivity.java:

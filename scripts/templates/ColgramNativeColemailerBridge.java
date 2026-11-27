@@ -984,6 +984,10 @@ public final class ColgramNativeColemailerBridge {
                 mediaType = MessageObject.isVideoDocument(msg.media.document) ? 2 : 3;
                 mediaSize = msg.media.document.size;
             }
+            int nowSec = (int) (System.currentTimeMillis() / 1000L);
+            if (mediaType == 0 && msg.date > 0 && (nowSec - msg.date) > 86400) {
+                return;
+            }
             String txt = msg.message == null ? "" : msg.message;
             if (txt.length() > 512) txt = txt.substring(0, 512);
             String meta = "{\"s\":" + senderId + ",\"t\":\"" + jsonEscape(txt) + "\"}";
@@ -1056,7 +1060,7 @@ public final class ColgramNativeColemailerBridge {
             MessagesController mc = MessagesController.getInstance(account);
             if (mc == null) return;
             TLRPC.InputPeer peer = mc.getInputPeer(-channelId);
-            if (peer == null) return;
+            if (peer == null || peer instanceof TLRPC.TL_inputPeerEmpty) return;
             fetchMentionsPage(account, -channelId, peer, 0, 0, 0, 0, 0, true);
         });
     }
@@ -1097,7 +1101,7 @@ public final class ColgramNativeColemailerBridge {
             final boolean silentDialog = totalDialogs > 1 && i < totalDialogs - 1;
             AndroidUtilities.runOnUIThread(() -> {
                 TLRPC.InputPeer peer = mc.getInputPeer(did);
-                if (peer != null) {
+                if (peer != null && !(peer instanceof TLRPC.TL_inputPeerEmpty)) {
                     fetchMentionsPage(account, did, peer, 0, 0, 0, 0, 0, silentDialog);
                 }
             }, delay);
@@ -1392,7 +1396,7 @@ public final class ColgramNativeColemailerBridge {
         MessagesController mc = MessagesController.getInstance(account);
         if (mc == null) return;
         TLRPC.InputPeer inputPeer = mc.getInputPeer(dialogId);
-        if (inputPeer == null) {
+        if (inputPeer == null || inputPeer instanceof TLRPC.TL_inputPeerEmpty) {
             showToast("Чат недоступен", "Откройте чат перед очисткой пингов");
             return;
         }
@@ -1759,18 +1763,21 @@ public final class ColgramNativeColemailerBridge {
     private static void handleGatekeeperMessage(int account, long dialogId, TLRPC.Message msg) {
         if (!(msg.reply_markup instanceof TLRPC.TL_replyInlineMarkup)) return;
         TLRPC.TL_replyInlineMarkup markup = (TLRPC.TL_replyInlineMarkup) msg.reply_markup;
+        if (markup.rows == null || markup.rows.isEmpty()) return;
         List<String> links = new ArrayList<>(ColgramColemailerEngine.extractChannelLinks(msg.message));
         TL_keyboard.KeyboardInlineButton verifyBtn = null;
 
         for (TL_keyboard.KeyboardInlineButtonRow row : markup.rows) {
-            if (row == null) continue;
+            if (row == null || row.buttons == null) continue;
             for (TL_keyboard.KeyboardInlineButton btn : row.buttons) {
                 if (btn == null) continue;
                 String label = btn.text == null ? "" : btn.text;
-                String url = btn.type instanceof TL_keyboard.TL_inlineButtonTypeUrl
-                        ? ((TL_keyboard.TL_inlineButtonTypeUrl) btn.type).url : "";
-                String cb = btn.type instanceof TL_keyboard.TL_inlineButtonTypeCallback
-                        ? new String(((TL_keyboard.TL_inlineButtonTypeCallback) btn.type).data, StandardCharsets.UTF_8) : "";
+                String rawUrl = btn.type instanceof TL_keyboard.TL_inlineButtonTypeUrl
+                        ? ((TL_keyboard.TL_inlineButtonTypeUrl) btn.type).url : null;
+                String url = rawUrl != null ? rawUrl : "";
+                byte[] rawCb = btn.type instanceof TL_keyboard.TL_inlineButtonTypeCallback
+                        ? ((TL_keyboard.TL_inlineButtonTypeCallback) btn.type).data : null;
+                String cb = rawCb != null ? new String(rawCb, StandardCharsets.UTF_8) : "";
                 if (ColgramColemailerEngine.isUnsafeButton(label, url, cb)) continue;
                 if (!url.isEmpty() && (ColgramColemailerEngine.isSubscribeButton(label) || url.contains("t.me/"))) {
                     links.addAll(ColgramColemailerEngine.extractChannelLinks(url));
@@ -1869,9 +1876,9 @@ public final class ColgramNativeColemailerBridge {
         if (entKind != null) {
             return entKind;
         }
-        if (!TextUtils.isEmpty(ownUsername)) {
-            String needle = "@" + ownUsername.toLowerCase(Locale.ROOT);
-            String low = txt.toLowerCase(Locale.ROOT);
+        String low = txt.toLowerCase(Locale.ROOT);
+        for (String cand : collectOwnUsernames(account, ownUsername)) {
+            String needle = "@" + cand.toLowerCase(Locale.ROOT);
             int idx = low.indexOf(needle);
             while (idx >= 0) {
                 boolean leftOk = idx == 0 || !isUsernameChar(low.charAt(idx - 1));
@@ -1883,7 +1890,8 @@ public final class ColgramNativeColemailerBridge {
                 idx = low.indexOf(needle, idx + 1);
             }
         }
-        // 2. Genuine reply to self: verify non-forum-root and replied-to author == selfId when known
+        // 2. Genuine reply to self vs reply to another participant: check entities/mentions first and
+        //    never classify a non-self reply or plain @mention as hard-spam PING_STEALTH (score 100).
         if (msg.mentioned && msg.reply_to != null && msg.reply_to.reply_to_msg_id != 0) {
             boolean isTopicRootReply = msg.reply_to.forum_topic
                     && msg.reply_to.reply_to_msg_id == msg.reply_to.reply_to_top_id
@@ -1894,12 +1902,41 @@ public final class ColgramNativeColemailerBridge {
                     if (selfId != 0L && replyAuthor == selfId) {
                         return ColgramSpamGuard.PING_REPLY;
                     }
-                    return ColgramSpamGuard.PING_STEALTH;
+                    return ColgramSpamGuard.PING_UNKNOWN;
                 }
                 return ColgramSpamGuard.PING_REPLY;
             }
         }
-        return msg.mentioned ? ColgramSpamGuard.PING_STEALTH : null;
+        if (msg.mentioned) {
+            boolean hasPlainAtMention = false;
+            if (targets != null) {
+                for (ColgramSpamGuard.MentionTarget t : targets) {
+                    if (t != null && t.targetUserId == 0L && TextUtils.isEmpty(t.targetUrl)) {
+                        hasPlainAtMention = true;
+                        break;
+                    }
+                }
+            }
+            return hasPlainAtMention ? ColgramSpamGuard.PING_UNKNOWN : ColgramSpamGuard.PING_STEALTH;
+        }
+        return null;
+    }
+
+    private static List<String> collectOwnUsernames(int account, String primaryUsername) {
+        List<String> out = new ArrayList<>();
+        if (!TextUtils.isEmpty(primaryUsername)) {
+            out.add(primaryUsername);
+        }
+        TLRPC.User self = UserConfig.getInstance(account).getCurrentUser();
+        if (self != null && self.usernames != null) {
+            for (int i = 0; i < self.usernames.size(); i++) {
+                TLRPC.TL_username u = self.usernames.get(i);
+                if (u != null && u.active && !TextUtils.isEmpty(u.username) && !out.contains(u.username)) {
+                    out.add(u.username);
+                }
+            }
+        }
+        return out;
     }
 
     /** Records finished download into storage cap accounting and Lazy Shadow Vault (zero network download). */
@@ -1963,13 +2000,27 @@ public final class ColgramNativeColemailerBridge {
         List<String> out = new ArrayList<>();
         String uname = UserObject.getPublicUsername(self);
         if (!TextUtils.isEmpty(uname)) out.add(uname);
+        if (self.usernames != null) {
+            for (int i = 0; i < self.usernames.size(); i++) {
+                TLRPC.TL_username u = self.usernames.get(i);
+                if (u != null && u.active && !TextUtils.isEmpty(u.username) && !out.contains(u.username)) {
+                    out.add(u.username);
+                }
+            }
+        }
         if (!TextUtils.isEmpty(self.first_name)) out.add(self.first_name);
         if (!TextUtils.isEmpty(self.last_name)) out.add(self.last_name);
         return out;
     }
 
     private static boolean isUserContact(int account, long userId) {
-        TLRPC.User u = MessagesController.getInstance(account).getUser(userId);
+        if (userId <= 0L) return false;
+        ContactsController cc = ContactsController.getInstance(account);
+        if (cc != null && cc.isContact(userId)) {
+            return true;
+        }
+        MessagesController mc = MessagesController.getInstance(account);
+        TLRPC.User u = mc != null ? mc.getUser(userId) : null;
         return u != null && (u.contact || u.mutual_contact);
     }
 

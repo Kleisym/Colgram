@@ -244,22 +244,32 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "    private org.telegram.ui.ColgramUiKit.ProgressHudHandle colgramImportHud;\n\n"
             "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress(\n"
             "            final Context colgramAppCtx, final boolean colgramPremium) {\n"
+            "        final java.util.concurrent.atomic.AtomicBoolean colgramCancelled = new java.util.concurrent.atomic.AtomicBoolean(false);\n"
             "        return new org.colgram.core.ColgramFileImport.ProgressListener() {\n"
             "            @Override\n"
             "            public void onProgress(int done, int total, String currentName, long bytesCopied, long totalBytes) {\n"
+            "                if (destroyed || isDismissed() || colgramCancelled.get()) {\n"
+            "                    return;\n"
+            "                }\n"
             "                long effectiveMax = Math.max(totalBytes, bytesCopied);\n"
             "                if (effectiveMax < org.colgram.core.ColgramFileImport.PROGRESS_THRESHOLD_BYTES) {\n"
             "                    return;\n"
             "                }\n"
             "                if (colgramImportHud == null) {\n"
             "                    android.app.Activity act = baseFragment != null ? baseFragment.getParentActivity() : null;\n"
-            "                    Context hudCtx = act != null ? act : colgramAppCtx;\n"
+            "                    if (act == null || act.isFinishing() || (android.os.Build.VERSION.SDK_INT >= 17 && act.isDestroyed())) {\n"
+            "                        return;\n"
+            "                    }\n"
             "                    colgramImportHud = org.telegram.ui.ColgramUiKit.showProgressHud(\n"
-            "                            hudCtx, R.drawable.msg_download, currentName, \"\",\n"
+            "                            act, R.drawable.msg_download, currentName, \"\",\n"
             "                            () -> {\n"
+            "                                colgramCancelled.set(true);\n"
             "                                colgramImportHud = null;\n"
             "                                org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
             "                            });\n"
+            "                }\n"
+            "                if (colgramImportHud == null) {\n"
+            "                    return;\n"
             "                }\n"
             "                if (totalBytes > 0L) {\n"
             "                    colgramImportHud.update(bytesCopied, totalBytes, currentName);\n"
@@ -269,6 +279,9 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "            }\n\n"
             "            @Override\n"
             "            public void onRejected(String fileName, String reason) {\n"
+            "                if (destroyed || isDismissed() || colgramCancelled.get()) {\n"
+            "                    return;\n"
+            "                }\n"
             "                String msg = \"file_too_large\".equals(reason)\n"
             "                        ? (\"Файл слишком большой (\" + (colgramPremium ? \"4 ГБ\" : \"2 ГБ\") + \"): \" + fileName)\n"
             "                        : (\"insufficient_storage\".equals(reason)\n"
@@ -351,8 +364,10 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         )
         if doc_getter_anchor in updated and "public void colgramLaunchSafIntoDocumentComposer(" not in updated:
             updated = updated.replace(doc_getter_anchor, saf_bridge_methods, 1)
-        elif "public void colgramLaunchSafIntoDocumentComposer(String mime) {" in updated and "private org.telegram.ui.ColgramUiKit.ProgressHudHandle colgramImportHud;" not in updated:
-            _old_prog_hdr = "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress("
+        elif "public void colgramLaunchSafIntoDocumentComposer(String mime) {" in updated and "colgramCancelled.get()" not in updated:
+            _old_prog_hdr = "    private org.telegram.ui.ColgramUiKit.ProgressHudHandle colgramImportHud;"
+            if _old_prog_hdr not in updated:
+                _old_prog_hdr = "    private org.colgram.core.ColgramFileImport.ProgressListener colgramCreateImportProgress("
             _launch_hdr = "    public void colgramLaunchSafIntoDocumentComposer(String mime) {"
             if _old_prog_hdr in updated:
                 _s_idx = updated.index(_old_prog_hdr)
@@ -364,7 +379,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol = "\r\n" if "\r\n" in content else "\n"
         return updated.replace("\n", eol)
 
-    patch_file_fn(chat_attach_alert, patch_chat_attach, "\n    public void onDestroy() {\n        // colgram-attach-composer-v2\n        if (colgramImportHud != null) {\n", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
+    patch_file_fn(chat_attach_alert, patch_chat_attach, "colgramCancelled.get()", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
 
     # =========================================================================
     # 2. ChatAttachAlertDocumentLayout.java:
@@ -1064,14 +1079,46 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "                ConnectionsManager.getInstance(currentAccount).cancelRequest(requestTokens.valueAt(a), true);\n"
             "            }\n"
             "            requestTokens.clear();\n"
+            "            cleanup(); // colgram-unlock-in-cleanup\n"
+            "        });\n"
+            "        colgramNotifyFailedOnce();\n"
+            "    }"
+        )
+        old_cancel_with_premature_unlock = (
+            "    public void cancel() {\n"
+            "        if (state == 3 || state == 2) {\n"
+            "            return;\n"
+            "        }\n"
+            "        state = 2;\n"
+            "        Utilities.stageQueue.postRunnable(() -> {\n"
+            "            for (int a = 0; a < requestTokens.size(); a++) {\n"
+            "                ConnectionsManager.getInstance(currentAccount).cancelRequest(requestTokens.valueAt(a), true);\n"
+            "            }\n"
+            "            requestTokens.clear();\n"
             "            cleanup();\n"
             "        });\n"
             "        AutoDeleteMediaTask.unlockFile(uploadingFilePath);\n"
             "        colgramNotifyFailedOnce();\n"
             "    }"
         )
+        old_cancel_unmarked = (
+            "            cleanup();\n"
+            "        });\n"
+            "        colgramNotifyFailedOnce();"
+        )
+        new_cancel_marked = (
+            "            cleanup(); // colgram-unlock-in-cleanup\n"
+            "        });\n"
+            "        colgramNotifyFailedOnce();"
+        )
         if old_cancel in norm:
             norm = norm.replace(old_cancel, new_cancel, 1)
+            changed = True
+        elif old_cancel_with_premature_unlock in norm:
+            norm = norm.replace(old_cancel_with_premature_unlock, new_cancel, 1)
+            changed = True
+        elif old_cancel_unmarked in norm and "colgram-unlock-in-cleanup" not in norm:
+            norm = norm.replace(old_cancel_unmarked, new_cancel_marked, 1)
             changed = True
 
         old_catch = (
@@ -1125,7 +1172,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     patch_file_fn(
         file_upload_op,
         patch_file_upload_cancel,
-        "        colgramNotifyFailedOnce();",
+        "colgram-unlock-in-cleanup",
         "FileUploadOperation.java volatile state, single failed callback, and stageQueue cleanup on cancel",
     )
 
@@ -1185,7 +1232,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         full_block = (
             "    private static final java.util.concurrent.ExecutorService colgramDocPrepExecutor =\n"
             "            java.util.concurrent.Executors.newFixedThreadPool(2);\n"
-            "    private final java.util.HashSet<Integer> colgramCancellingIds = new java.util.HashSet<>();\n"
+            "    private final java.util.Set<Integer> colgramCancellingIds = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());\n"
             "    private volatile boolean colgramHasAnyPendingReply = false;\n"
             "    private final androidx.collection.LongSparseArray<Boolean> colgramPendingReplyPeers = new androidx.collection.LongSparseArray<>();\n\n"
             "    private void colgramRememberPendingReplyIfNeeded(long peer, MessageObject replyToMsg, boolean isDotCmd) {\n"
@@ -1261,11 +1308,20 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "    }\n\n"
             "    public void cancelSendingMessage(MessageObject object) {"
         )
-        if "helper.cancelSendingMessage(msg); // non-reentrant" in norm:
+        old_hashset_cancelling = "    private final java.util.HashSet<Integer> colgramCancellingIds = new java.util.HashSet<>();"
+        new_chm_cancelling = "    private final java.util.Set<Integer> colgramCancellingIds = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());"
+        if "helper.cancelSendingMessage(msg); // non-reentrant" in norm and old_hashset_cancelling not in norm:
             return content
+        if old_hashset_cancelling in norm and "helper.cancelSendingMessage(msg); // non-reentrant" in norm:
+            return norm.replace(old_hashset_cancelling, new_chm_cancelling, 1).replace("\n", eol)
         if "private boolean colgramShouldCancelSending(" in norm:
-            if stale_call in norm:
-                return norm.replace(stale_call, clean_call, 1).replace("\n", eol)
+            updated = norm
+            if stale_call in updated:
+                updated = updated.replace(stale_call, clean_call, 1)
+            if old_hashset_cancelling in updated:
+                updated = updated.replace(old_hashset_cancelling, new_chm_cancelling, 1)
+            if updated != norm:
+                return updated.replace("\n", eol)
             return content
         end_anchor = "    public void cancelSendingMessage(MessageObject object) {"
         old_start = norm.find("    private static final java.util.concurrent.ExecutorService colgramDocPrepExecutor =")
@@ -1279,7 +1335,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     patch_file_fn(
         send_helper,
         patch_send_helper_cancel,
-        "helper.cancelSendingMessage(msg); // non-reentrant",
+        "new java.util.concurrent.ConcurrentHashMap<>());",
         "SendMessagesHelper.java non-reentrant colgramCancelMessageTransfers and pending-reply fast helpers",
     )
 
@@ -1505,6 +1561,17 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "            return ERROR_TYPE_FILE_TOO_LARGE;\n"
         "        }",
         "SendMessagesHelper.java clean up rejected colgram_inbox staged file",
+    )
+
+    eol_patch_fn(
+        send_helper,
+        "        if (org.colgram.core.ColgramConfig.isBuiltinProxyEnabled() && !org.colgram.core.ColgramDpiBypass.isBound()) {\n"
+        "            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);\n"
+        "        }",
+        "        if (org.colgram.core.ColgramHookHandler.canAutoRestartDpiBypass() && !org.colgram.core.ColgramDpiBypass.isBound()) {\n"
+        "            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);\n"
+        "        }",
+        "SendMessagesHelper.java gate colgramPrepareInstantSend DPI restart on !WARP && !stopped",
     )
 
     # =========================================================================

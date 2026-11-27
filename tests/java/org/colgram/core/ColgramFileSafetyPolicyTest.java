@@ -74,9 +74,50 @@ public class ColgramFileSafetyPolicyTest {
                 "30 MB file must be blocked when 25% of 100 MB cap = 25 MB");
     }
 
+    private static void testDoubleExtensionFalsePositivesZeroFalses() {
+        long oneGb = 1024L * MB;
+        // Benign multi-dot / domain / version names ending in safe media or text extensions must NOT trigger spoof warnings
+        String[] benignNames = {
+                "screenshot_google.com.png",
+                "site.com.pdf",
+                "archive_v1.2.backup.img.jpg",
+                "plugin_helper.py.txt",
+                "release.com.zip",
+        };
+        for (String name : benignNames) {
+            check(!ColgramFileSafetyPolicy.isDoubleExtensionSpoof(name),
+                    "Benign multi-dot filename must NOT trigger isDoubleExtensionSpoof: " + name);
+            ColgramFileSafetyPolicy.SafetyAssessment manual = ColgramFileSafetyPolicy.assessForManualAction(
+                    name, "", 2L * MB, oneGb);
+            check(!manual.manualWarningRequired,
+                    "Benign multi-dot filename must NOT require manual security warning: " + name);
+        }
+
+        // Genuine double-extension malware traps and RLO spoofing MUST remain flagged
+        String[] maliciousSpoofs = {
+                "photo.jpg.apk",
+                "invoice.pdf.exe",
+                "archive.zip.bat",
+                "evil.exe.zip",
+        };
+        for (String name : maliciousSpoofs) {
+            check(ColgramFileSafetyPolicy.isDoubleExtensionSpoof(name),
+                    "Genuine double-extension spoof MUST remain flagged: " + name);
+            ColgramFileSafetyPolicy.SafetyAssessment manual = ColgramFileSafetyPolicy.assessForManualAction(
+                    name, "", 2L * MB, oneGb);
+            check(manual.manualWarningRequired,
+                    "Genuine double-extension spoof MUST require manual security warning: " + name);
+        }
+        String rlo = "report\u202Egpj.exe";
+        check(ColgramFileSafetyPolicy.hasBidiSpoofChars(rlo), "RLO spoof MUST remain flagged");
+        check(ColgramFileSafetyPolicy.assessForManualAction(rlo, "", 512 * 1024L, oneGb).manualWarningRequired,
+                "RLO spoof MUST require manual warning");
+    }
+
     public static void main(String[] args) {
         testDangerousExtensionsAndSpoofing();
         testSizeCeilingsAndCleanMedia();
+        testDoubleExtensionFalsePositivesZeroFalses();
         System.out.println("ColgramFileSafetyPolicyTest: PASS");
     }
 }

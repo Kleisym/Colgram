@@ -471,6 +471,16 @@ public final class ColgramColemailerTest {
         restored.loadFromSerializedState("");
         check(restored.getActiveCounterCampaignCount() == 0,
                 "loadFromSerializedState empty must reset activeCounterCampaignCount to 0");
+
+        // 6. Synchronized recordCampaignDispatchOutcome stats & edge-case guards
+        eng.recordCampaignDispatchOutcome("promo_a", true, null);
+        eng.recordCampaignDispatchOutcome("promo_a", false, "FLOOD_WAIT");
+        eng.recordCampaignDispatchOutcome("", true, null);
+        eng.recordCampaignDispatchOutcome("non_existent", false, "ERR");
+        ColgramColemailerEngine.BroadcastCampaign afterOutcome = eng.getCampaign("promo_a");
+        check(afterOutcome != null && afterOutcome.sentCount == 1 && afterOutcome.failedCount == 1
+                        && "FLOOD_WAIT".equals(afterOutcome.lastError),
+                "recordCampaignDispatchOutcome must update sentCount/failedCount/lastError accurately");
     }
 
     public static void main(String[] args) {

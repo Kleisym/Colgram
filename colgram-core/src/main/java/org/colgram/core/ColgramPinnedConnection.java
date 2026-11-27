@@ -44,16 +44,42 @@ final class ColgramPinnedConnection {
 
     static HttpsURLConnection create(HttpsURLConnection original, URL url, InetAddress address,
                                      java.net.Proxy proxy) {
+        if (address == null && (proxy == null || proxy.type() != java.net.Proxy.Type.SOCKS)) {
+            return original;
+        }
         try {
             int connectTimeoutMs = original.getConnectTimeout() > 0
                     ? original.getConnectTimeout() : CONNECT_TIMEOUT_MS;
             int readTimeoutMs = original.getReadTimeout() > 0
                     ? original.getReadTimeout() : READ_TIMEOUT_MS;
+            boolean useDirectIpPin = address != null
+                    && (proxy == null || proxy.type() == java.net.Proxy.Type.DIRECT);
+            final String origHost = url.getHost();
+            final String effectiveSni = sniFor(origHost);
+            URL targetUrl = url;
+            if (useDirectIpPin) {
+                String hostIp = address.getHostAddress();
+                if (address instanceof java.net.Inet6Address && !hostIp.startsWith("[")) {
+                    hostIp = "[" + hostIp + "]";
+                }
+                targetUrl = new URL(url.getProtocol(), hostIp, url.getPort(), url.getFile());
+            }
             HttpsURLConnection copy = (HttpsURLConnection)
-                    (proxy == null ? url.openConnection(java.net.Proxy.NO_PROXY) : url.openConnection(proxy));
+                    (proxy == null ? targetUrl.openConnection(java.net.Proxy.NO_PROXY) : targetUrl.openConnection(proxy));
+            if (useDirectIpPin && origHost != null && !origHost.isEmpty()) {
+                int port = url.getPort();
+                copy.setRequestProperty("Host", port > 0 ? (origHost + ":" + port) : origHost);
+            }
             copy.setSSLSocketFactory(pinning(
                     original.getSSLSocketFactory(), url, address, proxy, connectTimeoutMs, readTimeoutMs));
-            copy.setHostnameVerifier(original.getHostnameVerifier());
+            final javax.net.ssl.HostnameVerifier baseVerifier = original.getHostnameVerifier();
+            copy.setHostnameVerifier((hostname, session) -> {
+                if (baseVerifier == null) return false;
+                if (effectiveSni != null && !effectiveSni.isEmpty() && baseVerifier.verify(effectiveSni, session)) {
+                    return true;
+                }
+                return origHost != null && !origHost.isEmpty() && baseVerifier.verify(origHost, session);
+            });
             copy.setConnectTimeout(connectTimeoutMs);
             copy.setReadTimeout(readTimeoutMs);
             copy.setInstanceFollowRedirects(original.getInstanceFollowRedirects());
@@ -96,9 +122,9 @@ final class ColgramPinnedConnection {
             @Override
             public Socket createSocket(Socket socket, String host, int port, boolean autoClose)
                     throws IOException {
-                // host is the URL's name: the handshake is exactly the one the server expects,
-                // and the socket underneath is already pointed at our address.
-                Socket s = delegate.createSocket(socket, host, port, autoClose);
+                String targetHost = (url != null && url.getHost() != null && !url.getHost().isEmpty())
+                        ? url.getHost() : host;
+                Socket s = delegate.createSocket(socket, sniFor(targetHost), port, autoClose);
                 if (s instanceof javax.net.ssl.SSLSocket) {
                     ColgramDohResolver.hardenTlsSocket((javax.net.ssl.SSLSocket) s);
                 }

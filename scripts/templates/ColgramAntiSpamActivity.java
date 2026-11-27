@@ -14,7 +14,6 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -352,7 +351,7 @@ public class ColgramAntiSpamActivity extends BaseFragment {
                 break;
             case ACT_SYNC_FOLDERS:
                 ColgramNativeColemailerBridge.syncFoldersIntoEngine();
-                Toast.makeText(ctx, "Папки Telegram синхронизированы с кампаниями", Toast.LENGTH_SHORT).show();
+                ColgramUiKit.showNotice(this, R.drawable.msg_folders, "Папки Telegram синхронизированы с кампаниями", false);
                 refreshList(ctx);
                 break;
             case CHK_AUTO_SUB: {

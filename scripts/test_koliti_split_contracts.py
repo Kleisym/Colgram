@@ -129,6 +129,12 @@ class KolitiSplitContractsTest(unittest.TestCase):
                 '            applicationIdSuffix ".web"\n'
                 '        }\n'
                 '    }\n'
+                '    sourceSets.debug {\n'
+                "        manifest.srcFile '../TMessagesProj/config/release/AndroidManifest_standalone.xml'\n"
+                '    }\n'
+                '    sourceSets.standalone {\n'
+                "        manifest.srcFile '../TMessagesProj/config/release/AndroidManifest_standalone.xml'\n"
+                '    }\n'
                 '    productFlavors {\n'
                 '        afat {\n'
                 '            ndk {\n'
@@ -171,6 +177,7 @@ class KolitiSplitContractsTest(unittest.TestCase):
             self.assertNotIn(":colgram-llama", settings.read_text(encoding="utf-8"))
             self.assertNotIn("colgram-llama", tm_gradle.read_text(encoding="utf-8"))
             self.assertIn("useLegacyPackaging = true", sa_once)
+            self.assertIn("sourceSets.release {", sa_once)
             self.assertIn("COLGRAM_RELEASE_R8_CONFIG", sa_once)
             self.assertIn("minifyEnabled true", sa_once)
             self.assertIn("shrinkResources true", sa_once)
@@ -179,7 +186,7 @@ class KolitiSplitContractsTest(unittest.TestCase):
             self.assertIn('noCompress += ["pack", "gguf", "onnx"]', sa_once)
             self.assertIn("colgramAbis", sa_once)
             for pg_marker in (
-                "# COLGRAM_R8_KEEP_RULES = 3",
+                "# COLGRAM_R8_KEEP_RULES = 4",
                 "-dontobfuscate",
                 "-keep class org.colgram.**",
                 "-keep class org.colgram.core.ColgramKolitiVoice",
@@ -189,6 +196,8 @@ class KolitiSplitContractsTest(unittest.TestCase):
                 "-keep class org.telegram.ui.ActionBar.INavigationLayout",
                 "-keep class org.telegram.ui.ChatActivity",
                 "-keep class io.nekohasekai.**",
+                "-keep class go.** { *; }",
+                "-dontwarn go.**",
                 "-keep class com.chaquo.**",
                 "-keep class com.wireguard.**",
                 "-keep class com.k2fsa.sherpa.**",
@@ -197,12 +206,14 @@ class KolitiSplitContractsTest(unittest.TestCase):
             ):
                 self.assertIn(pg_marker, pg_once)
 
-            # Verify v1/v2 -> v3 proguard-rules upgrade and 2-pass convergence
-            proguard.write_text("-keep class org.telegram.messenger.* { *; }\n\n# COLGRAM_R8_KEEP_RULES = 1\n-dontobfuscate\n", encoding="utf-8")
+            # Verify v1/v2/v3 -> v4 proguard-rules upgrade and 2-pass convergence
+            proguard.write_text("-keep class org.telegram.messenger.* { *; }\n\n# COLGRAM_R8_KEEP_RULES = 3\n-keep class io.nekohasekai.** { *; }\n", encoding="utf-8")
             ksp._configure_proguard_rules(str(repo))
             pg_upgraded = proguard.read_text(encoding="utf-8")
-            self.assertNotIn("# COLGRAM_R8_KEEP_RULES = 1", pg_upgraded)
-            self.assertIn("# COLGRAM_R8_KEEP_RULES = 3", pg_upgraded)
+            self.assertNotIn("# COLGRAM_R8_KEEP_RULES = 3", pg_upgraded)
+            self.assertIn("# COLGRAM_R8_KEEP_RULES = 4", pg_upgraded)
+            self.assertIn("-keep class go.** { *; }", pg_upgraded)
+            self.assertIn("-dontwarn go.**", pg_upgraded)
             self.assertIn("-keep class org.telegram.ui.ChatActivity", pg_upgraded)
             ksp._configure_proguard_rules(str(repo))
             self.assertEqual(proguard.read_text(encoding="utf-8"), pg_upgraded)
@@ -211,6 +222,49 @@ class KolitiSplitContractsTest(unittest.TestCase):
             self.assertFalse((core_dir / "ColgramAiEngine.java").exists())
             self.assertTrue((core_dir / "ColgramAiConfig.java").exists())
             self.assertIn("REQ_PICK_MEDIA_FROM_SHEET", (ui_dir / "ColgramAiActivity.java").read_text(encoding="utf-8"))
+
+            # Verify ProxyListActivity telemetry stable ID (-26, distinct from colgramSystemDpiRow -25) on fresh + upgrade
+            proxy_java = ui_dir / "ProxyListActivity.java"
+            proxy_java.write_text(
+                "public class ProxyListActivity {\n"
+                "    private int colgramHeroRow = -1;\n"
+                "    void sync() {\n"
+                "                if (heroChanged) {\n"
+                "                    colgramRefreshBoundRow(colgramHeroRow);\n"
+                "                }\n"
+                "        colgramHeroRow = rowCount++;\n"
+                "        useProxyRow = rowCount++;\n"
+                "    }\n"
+                "            VIEW_TYPE_COLGRAM_HERO = 7;\n"
+                "                    hero.bind(badgeIcon, accent, \"Colgram • Сеть и обход\", subtitle, pill, portChip, dohChip, secChip);\n"
+                "                    break;\n"
+                "                }\n"
+                "                case VIEW_TYPE_COLGRAM_HERO:\n"
+                "                    view = new ColgramMenuChrome.HeroBannerCell(mContext);\n"
+                "                    break;\n"
+                "            if (position == colgramHeroRow) {\n"
+                "                return -24;\n"
+                "            }\n"
+                "            if (position == colgramHeroRow) {\n"
+                "                return VIEW_TYPE_COLGRAM_HERO;\n"
+                "            }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            def _eol_p(p, old, new, label):
+                t = Path(p).read_text(encoding="utf-8")
+                self.assertIn(old, t, label)
+                Path(p).write_text(t.replace(old, new, 1), encoding="utf-8")
+                return True
+            ksp._configure_proxy_list_telemetry(str(repo), _eol_p)
+            p_fresh = proxy_java.read_text(encoding="utf-8")
+            self.assertIn("colgramTelemetryRow) {\n                return -26;", p_fresh)
+            ksp._configure_proxy_list_telemetry(str(repo), _eol_p)
+            self.assertEqual(proxy_java.read_text(encoding="utf-8"), p_fresh)
+            proxy_java.write_text(p_fresh.replace("return -26;", "return -25;"), encoding="utf-8")
+            ksp._configure_proxy_list_telemetry(str(repo), _eol_p)
+            self.assertIn("return -26;", proxy_java.read_text(encoding="utf-8"))
+            self.assertNotIn("colgramTelemetryRow) {\n                return -25;", proxy_java.read_text(encoding="utf-8"))
 
             # Re-enable Koliti
             ksp._write_build_flags(str(repo), True)

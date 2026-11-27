@@ -1,7 +1,10 @@
 package org.colgram.core;
 
+import android.Manifest;
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.media.AudioFormat;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
@@ -108,6 +111,18 @@ public final class ColgramLocalStt {
 
     private static void tryAndroidOnDeviceOrNotify(Context appCtx, File audioFile, SttCallback callback) {
         if (Build.VERSION.SDK_INT >= 33 && isOnDeviceRecognizerAvailable(appCtx)) {
+            if (appCtx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                deliverMain(() -> {
+                    try {
+                        Activity act = ColgramUiBridge.currentActivity();
+                        if (act != null && !act.isFinishing() && !act.isDestroyed()) {
+                            act.requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 6415);
+                        }
+                    } catch (Throwable ignored) {}
+                    callback.onResult(false, "", "Разрешите доступ к микрофону для офлайн-распознавания Android");
+                });
+                return;
+            }
             STT_EXEC.execute(() -> runApi33OnDeviceStt(appCtx, audioFile, callback));
             return;
         }
@@ -115,7 +130,6 @@ public final class ColgramLocalStt {
             String reason = ColgramBuildFlags.KOLITI_ENABLED
                     ? "Не удалось распознать речь локально"
                     : "Для офлайн-расшифровки без Premium нужна сборка Koliti AI или Android 13+";
-            ColgramUiBridge.postNotice(appCtx, "Локальная расшифровка недоступна", reason, true);
             callback.onResult(false, "", reason);
         });
     }
@@ -138,7 +152,6 @@ public final class ColgramLocalStt {
         if (pcm16k == null || pcm16k.length < 1024) {
             deliverMain(() -> {
                 String msg = "Не удалось декодировать аудиодорожку";
-                ColgramUiBridge.postNotice(appCtx, "Локальная расшифровка", msg, true);
                 callback.onResult(false, "", msg);
             });
             return;
@@ -166,7 +179,6 @@ public final class ColgramLocalStt {
                 closeQuietly(finalRead);
                 closeQuietly(finalWrite);
                 String msg = "Системный офлайн-распознаватель недоступен";
-                ColgramUiBridge.postNotice(appCtx, "Локальная расшифровка", msg, true);
                 callback.onResult(false, "", msg);
                 return;
             }
@@ -197,8 +209,9 @@ public final class ColgramLocalStt {
                         handler.removeCallbacks(timeoutTask);
                         try { recognizer.destroy(); } catch (Throwable ignored) {}
                         closeQuietly(finalRead);
-                        String msg = "Скачайте офлайн-пакет языка в настройках Google/Android Speech (код " + error + ")";
-                        ColgramUiBridge.postNotice(appCtx, "Офлайн STT Android", msg, true);
+                        String msg = error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS
+                                ? "Нет разрешения микрофона (RECORD_AUDIO) для офлайн STT Android"
+                                : "Скачайте офлайн-пакет языка в настройках Google/Android Speech (код " + error + ")";
                         callback.onResult(false, "", msg);
                     }
                 }

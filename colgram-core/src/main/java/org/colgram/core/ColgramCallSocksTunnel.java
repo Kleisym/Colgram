@@ -96,6 +96,65 @@ public final class ColgramCallSocksTunnel {
         }
     }
 
+    public static String systemDpiLastError(Context context) {
+        if (context == null) return null;
+        try {
+            Object err = service(context).getMethod("lastError").invoke(null);
+            return err == null ? null : String.valueOf(err);
+        } catch (ReflectiveOperationException | LinkageError unavailable) {
+            return null;
+        }
+    }
+
+    public static boolean awaitStopped(Context context, long timeoutMs) {
+        if (context == null) return true;
+        Context app = context.getApplicationContext();
+        long deadline = System.currentTimeMillis() + Math.max(0L, timeoutMs);
+        while (true) {
+            boolean serviceBusy = false;
+            try {
+                Object stObj = service(app).getMethod("activeState").invoke(null);
+                String st = stObj == null ? "stopped" : String.valueOf(stObj);
+                serviceBusy = "starting".equals(st) || "running".equals(st) || "stopping".equals(st);
+            } catch (ReflectiveOperationException | LinkageError ignored) {}
+            boolean warpBusy = ColgramWarpTunnel.isUp();
+            boolean vpnTransportUp = hasActiveVpnTransport(app);
+            if (!serviceBusy && !warpBusy && !vpnTransportUp) {
+                return true;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                return false;
+            }
+            try {
+                Thread.sleep(75L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+    }
+
+    private static boolean hasActiveVpnTransport(Context app) {
+        try {
+            ConnectivityManager manager = app.getSystemService(ConnectivityManager.class);
+            if (manager == null) return false;
+            Network active = manager.getActiveNetwork();
+            if (active != null) {
+                NetworkCapabilities caps = manager.getNetworkCapabilities(active);
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return true;
+            }
+            Network[] all = manager.getAllNetworks();
+            if (all != null) {
+                for (Network net : all) {
+                    if (net == null) continue;
+                    NetworkCapabilities caps = manager.getNetworkCapabilities(net);
+                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     public static String status(Context context, boolean localDpi) {
         String st = status(context, localDpi, -1L);
         if (localDpi && !"running".equals(st) && "running".equals(systemDpiStatus(context))) {
@@ -167,7 +226,13 @@ public final class ColgramCallSocksTunnel {
                         String.class, String.class, Consumer.class, Runnable.class)
                         .invoke(null, app, id, json, attach, close)).longValue();
             } catch (InvocationTargetException busy) {
-                failure[0] = new IOException("VPN для звонка не запустился");
+                String code = systemDpiLastError(app);
+                if ((code == null || code.isEmpty()) && busy.getCause() != null) {
+                    code = busy.getCause().getClass().getSimpleName();
+                }
+                failure[0] = new IOException(code != null && !code.isEmpty()
+                        ? ("VPN для звонка не запустился (" + code + ")")
+                        : "VPN для звонка не запустился");
             } catch (ReflectiveOperationException | LinkageError unavailable) {
                 failure[0] = new IOException("VPN-бэкенд недоступен");
             } catch (IOException noConsent) {

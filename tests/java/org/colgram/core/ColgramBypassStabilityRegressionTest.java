@@ -27,6 +27,8 @@ public final class ColgramBypassStabilityRegressionTest {
         testPipeStandardOrWsSessionClientCancelDoesNotPoisonRawDcOrStrategy();
         testSilentEndpointTtlExpiry();
         testDefaultEdgeDeprioritizeTtlCapped();
+        testRestartIfDeadClearsStoppedExplicitlyAndMainDcRx();
+        testColgramPinnedConnectionContract();
         System.out.println("ColgramBypassStabilityRegressionTest PASSED");
     }
 
@@ -655,6 +657,82 @@ public final class ColgramBypassStabilityRegressionTest {
         } finally {
             ColgramTelegramWsBridge.clearCooldowns();
         }
+    }
+
+    private static void testRestartIfDeadClearsStoppedExplicitlyAndMainDcRx() throws Exception {
+        ColgramDpiBypass.stop();
+        try {
+            java.lang.reflect.Method stoppedMethod = ColgramDpiBypass.class.getDeclaredMethod("wasExplicitlyStopped");
+            stoppedMethod.setAccessible(true);
+            check((Boolean) stoppedMethod.invoke(null), "stop() must set wasExplicitlyStopped=true");
+            check(!ColgramDpiBypass.isBound(), "stop() must unbind listener");
+
+            check(ColgramDpiBypass.restartIfDeadAndWait(5000L), "restartIfDeadAndWait() must rebind cleanly");
+            check(ColgramDpiBypass.isBound(), "listener must be bound after restartIfDeadAndWait");
+            check(!(Boolean) stoppedMethod.invoke(null),
+                    "restartIfDead()/startNow() must clear stoppedExplicitly=false");
+
+            ColgramDpiBypass.resetCarriageCounters();
+            check(!ColgramDpiBypass.hasRecentMainDcRxWithin(10_000L),
+                    "resetCarriageCounters must clear main-DC RX timestamp");
+            Socket mediaClient = new Socket();
+            ColgramDpiBypass.ActiveSession mediaSession =
+                    ColgramDpiBypass.registerActiveSessionAt(mediaClient, null, true, false, safeElapsedOrMillis());
+            try {
+                mediaSession.onUpstreamRx(safeElapsedOrMillis());
+                check(!ColgramDpiBypass.hasRecentMainDcRxWithin(10_000L),
+                        "media-DC RX must NOT reset main-DC RX freshness");
+                check(ColgramDpiBypass.hasRecentRxWithin(10_000L),
+                        "media-DC RX still updates general RX freshness");
+
+                Socket mainClient = new Socket();
+                ColgramDpiBypass.ActiveSession mainSession =
+                        ColgramDpiBypass.registerActiveSessionAt(mainClient, null, true, true, safeElapsedOrMillis());
+                try {
+                    mainSession.onUpstreamRx(safeElapsedOrMillis());
+                    check(ColgramDpiBypass.hasRecentMainDcRxWithin(10_000L),
+                            "main-DC RX must update main-DC RX freshness");
+                } finally {
+                    ColgramDpiBypass.unregisterActiveSession(mainSession);
+                }
+            } finally {
+                ColgramDpiBypass.unregisterActiveSession(mediaSession);
+            }
+        } finally {
+            ColgramDpiBypass.resetCarriageCounters();
+            ColgramDpiBypass.stop();
+        }
+    }
+
+    private static void testColgramPinnedConnectionContract() throws Exception {
+        java.net.URL target = new java.net.URL("https://example.com/translate");
+        javax.net.ssl.HttpsURLConnection orig =
+                (javax.net.ssl.HttpsURLConnection) target.openConnection(java.net.Proxy.NO_PROXY);
+
+        javax.net.ssl.HttpsURLConnection passthrough =
+                ColgramPinnedConnection.create(orig, target, null, java.net.Proxy.NO_PROXY);
+        check(passthrough == orig,
+                "null address + NO_PROXY must return original connection unchanged (no 0.0.0.0:443)");
+
+        java.net.InetAddress loopback = java.net.InetAddress.getByName("127.0.0.1");
+        javax.net.ssl.HttpsURLConnection pinned =
+                ColgramPinnedConnection.create(orig, target, loopback, java.net.Proxy.NO_PROXY);
+        check(pinned != orig, "direct non-null address must return pinned HttpsURLConnection");
+        check("127.0.0.1".equals(pinned.getURL().getHost()),
+                "direct pin must target resolved IP on Android OkHttp path, got=" + pinned.getURL().getHost());
+        String hostProp = pinned.getRequestProperty("Host");
+        check(hostProp == null || "example.com".equals(hostProp),
+                "direct pin Host header (when not filtered by desktop JDK) must equal original host, got=" + hostProp);
+
+        java.net.Proxy socks = new java.net.Proxy(
+                java.net.Proxy.Type.SOCKS, new java.net.InetSocketAddress("127.0.0.1", 1080));
+        javax.net.ssl.HttpsURLConnection socksOrig =
+                (javax.net.ssl.HttpsURLConnection) target.openConnection(socks);
+        javax.net.ssl.HttpsURLConnection socksPinned =
+                ColgramPinnedConnection.create(socksOrig, target, null, socks);
+        check(socksPinned != socksOrig, "SOCKS proxy with null address must wrap SSF/verifier without error");
+        check("example.com".equals(socksPinned.getURL().getHost()),
+                "SOCKS pin must keep domain host intact for remote proxy resolution");
     }
 
     private static void check(boolean cond, String msg) {

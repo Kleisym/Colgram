@@ -71,6 +71,10 @@ class TrackBContractsTest(unittest.TestCase):
         ):
             self.assertIn(token, fi)
         self.assertIn('getFilesDir(), "colgram_inbox"', fi.split("cleanupRejectedStagedFile(", 1)[1].split("openStagedUriSync", 1)[0])
+        import_async_slice = fi.split("private static boolean importUrisAsync(", 1)[1].split("public static String copyToSandbox(", 1)[0]
+        self.assertIn("IMPORT_EXECUTOR.execute(() -> {", import_async_slice)
+        self.assertIn("openStagedUriSync(", import_async_slice.split("IMPORT_EXECUTOR.execute(() -> {", 1)[1])
+        self.assertNotIn("openStagedUriSync(", import_async_slice.split("IMPORT_EXECUTOR.execute(() -> {", 1)[0])
 
         um = read_text("colgram-core/src/main/java/org/colgram/core/ColgramUnlimitedMemory.java")
         self.assertIn('appCtx.getExternalFilesDir("colgram_inbox")', um)
@@ -87,6 +91,9 @@ class TrackBContractsTest(unittest.TestCase):
         self.assertIn("if (mid <= 0) continue;", hh)
         self.assertIn("public static boolean startsWithCommandPrefix(String text)", hh)
         self.assertIn("public static boolean startsWithDotCommand(String text)", hh)
+        self.assertIn("public static boolean canAutoRestartDpiBypass()", hh)
+        self.assertIn("ColgramProxyManager.activateBuiltinProxy(appContext);", hh)
+        self.assertIn("upsertShadowMessagesBatch(batch);", hh)
         self.assertIn("hookIoExecutor.execute(() -> db.purgeMessagesFromDiskOnly(dialogId, toPurge));", hh)
 
         db = read_text("colgram-core/src/main/java/org/colgram/core/ColgramDatabase.java")
@@ -95,6 +102,7 @@ class TrackBContractsTest(unittest.TestCase):
         self.assertIn("purgePoisonedNonPositiveEntries()", db)
         self.assertIn("purgeMessagesMemoryOnly(", db)
         self.assertIn("purgeMessagesFromDiskOnly(", db)
+        self.assertIn("upsertShadowMessagesBatch(", db)
         self.assertIn("DeletedCacheRefreshListener", db)
         self.assertIn("deletedCacheLoadStarted = false;", db)
         cache_load_body = db.split("private void ensureDeletedCachesLoadedSync() {", 1)[1].split("prepareCacheForLookup()", 1)[0]
@@ -239,6 +247,9 @@ class TrackBContractsTest(unittest.TestCase):
             self.assertNotIn("ColgramFilesActivity.beginPick(", ca_text)
             self.assertIn("// colgram-nonblocking-audio (native audio composer)", ca_text)
             self.assertIn("// colgram-nonblocking-doc (native document composer)", ca_text)
+            self.assertIn("AtomicBoolean colgramCancelled = new java.util.concurrent.atomic.AtomicBoolean(false);", ca_norm)
+            self.assertIn("colgramCancelled.set(true);", ca_norm)
+            self.assertIn("isDestroyed()", ca_norm)
 
             dl_text = patched_text("TMessagesProj/src/main/java/org/telegram/ui/Components/ChatAttachAlertDocumentLayout.java")
             self.assertIn("colgramAddImportedFiles(", dl_text)
@@ -271,6 +282,8 @@ class TrackBContractsTest(unittest.TestCase):
             self.assertIn("object.messageOwner.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;", sm_text)
             self.assertIn("ColgramHookHandler.startsWithCommandPrefix(sendMessageParams.message)", sm_text)
             self.assertIn("colgramRememberPendingReplyIfNeeded(", sm_text)
+            self.assertIn("Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>())", sm_text)
+            self.assertIn("ColgramHookHandler.canAutoRestartDpiBypass()", sm_text)
             cancel_helpers_slice = sm_text.split("public static void colgramCancelFileDownloads(", 1)[1].split("public void cancelSendingMessage(MessageObject object)", 1)[0]
             self.assertNotIn("catch (Throwable", cancel_helpers_slice)
             cancel_xfer_slice = sm_text.split("public static void colgramCancelMessageTransfers(", 1)[1].split("public void cancelSendingMessage(MessageObject object)", 1)[0]
@@ -283,6 +296,7 @@ class TrackBContractsTest(unittest.TestCase):
             cancel_body = fuo_text.split("public void cancel() {", 1)[1].split("private void cleanup() {", 1)[0]
             self.assertIn("cleanup();", cancel_body.split("Utilities.stageQueue.postRunnable", 1)[1].split("});", 1)[0])
             self.assertIn("colgramNotifyFailedOnce();", cancel_body)
+            self.assertNotIn("AutoDeleteMediaTask.unlockFile", cancel_body)
 
             fl_text = patched_text("TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java")
             self.assertIn('tmpFile = File.createTempFile("colgram_dec_", ".tmp", outDir);', fl_text)

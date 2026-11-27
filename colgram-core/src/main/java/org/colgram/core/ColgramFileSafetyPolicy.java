@@ -148,18 +148,18 @@ public final class ColgramFileSafetyPolicy {
         if (parts.length < 3) return false;
         String lastExt = "." + parts[parts.length - 1].toLowerCase(Locale.ROOT);
         String prevExt = "." + parts[parts.length - 2].toLowerCase(Locale.ROOT);
-        if (DANGEROUS_EXTENSIONS.contains(lastExt)
-                && (DECOY_EXTENSIONS.contains(prevExt) || ARCHIVE_EXTENSIONS.contains(prevExt))) {
-            return true;
-        }
-        if (ARCHIVE_EXTENSIONS.contains(lastExt) && DANGEROUS_EXTENSIONS.contains(prevExt)) {
-            return true;
-        }
-        for (int i = 1; i < parts.length - 1; i++) {
-            String midExt = "." + parts[i].toLowerCase(Locale.ROOT);
-            if (DANGEROUS_EXTENSIONS.contains(midExt) && DECOY_EXTENSIONS.contains(lastExt)) {
-                return true;
+        if (DANGEROUS_EXTENSIONS.contains(lastExt)) {
+            for (int i = 1; i < parts.length - 1; i++) {
+                String earlierExt = "." + parts[i].toLowerCase(Locale.ROOT);
+                if (DECOY_EXTENSIONS.contains(earlierExt) || ARCHIVE_EXTENSIONS.contains(earlierExt)) {
+                    return true;
+                }
             }
+        }
+        if (ARCHIVE_EXTENSIONS.contains(lastExt)
+                && DANGEROUS_EXTENSIONS.contains(prevExt)
+                && !".com".equals(prevExt)) {
+            return true;
         }
         return false;
     }

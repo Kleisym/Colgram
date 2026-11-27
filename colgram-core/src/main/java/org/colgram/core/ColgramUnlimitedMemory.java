@@ -596,7 +596,7 @@ public final class ColgramUnlimitedMemory {
         } catch (Throwable ignored) {}
     }
 
-    /** Creates an EXIF-safe ARGB_8888 WebP transcoder for Tier-1 cache & Shadow Micro-Vault compression. */
+    /** Creates an EXIF-safe ARGB_8888 image transcoder preserving extension-to-codec fidelity (WebP for .webp / shadow_previews, JPEG for .jpg/.jpeg). */
     @SuppressWarnings("deprecation")
     public static ColgramStorageOptimizer.ImageTranscoder createWebpTranscoder(final int defaultQuality, final int defaultMaxDim) {
         return new ColgramStorageOptimizer.ImageTranscoder() {
@@ -604,10 +604,21 @@ public final class ColgramUnlimitedMemory {
             public boolean transcode(File source, File tempDest, int preset) throws Exception {
                 if (source == null || tempDest == null || !source.isFile()) return false;
                 String lower = source.getName().toLowerCase(Locale.ROOT);
-                boolean isPng = lower.endsWith(".png");
-                boolean isJpg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
-                boolean isWebp = lower.endsWith(".webp");
-                if (!isPng && !isJpg && !isWebp) return false;
+                boolean srcPng = lower.endsWith(".png");
+                boolean srcJpg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+                boolean srcWebp = lower.endsWith(".webp");
+                if (!srcPng && !srcJpg && !srcWebp) return false;
+
+                String destName = tempDest.getName().toLowerCase(Locale.ROOT);
+                if (destName.endsWith(".cgtmp")) {
+                    destName = destName.substring(0, destName.length() - 6);
+                } else if (destName.endsWith(".tmp")) {
+                    destName = destName.substring(0, destName.length() - 4);
+                }
+                boolean outWebp = destName.endsWith(".webp");
+                boolean outJpg = destName.endsWith(".jpg") || destName.endsWith(".jpeg");
+                // Never overwrite .png or .jpg files with raw WebP bytes under their original extension.
+                if (!outWebp && !outJpg) return false;
 
                 int targetMaxDim = defaultMaxDim > 0
                         ? ((preset == ColgramStorageOptimizer.PRESET_MAX) ? Math.min(defaultMaxDim, 1600) : defaultMaxDim)
@@ -623,7 +634,10 @@ public final class ColgramUnlimitedMemory {
 
                 int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
                 int sampleSize = 1;
-                while ((maxDim / (sampleSize * 2)) >= targetMaxDim) {
+                final long maxDecodePixels = 4_000_000L;
+                while ((maxDim / (sampleSize * 2)) >= targetMaxDim
+                        || ((long) (bounds.outWidth / sampleSize) * (long) (bounds.outHeight / sampleSize)) > maxDecodePixels) {
+                    if (sampleSize >= 64) break;
                     sampleSize *= 2;
                 }
 
@@ -635,12 +649,12 @@ public final class ColgramUnlimitedMemory {
                 if (bmp == null) return false;
 
                 try {
-                    if (isPng && bmp.hasAlpha()) {
+                    if (srcPng && !outWebp && bmp.hasAlpha()) {
                         return false;
                     }
 
                     int exifOrientation = ExifInterface.ORIENTATION_NORMAL;
-                    if (isJpg) {
+                    if (srcJpg) {
                         try {
                             ExifInterface exif = new ExifInterface(source.getAbsolutePath());
                             exifOrientation = exif.getAttributeInt(
@@ -661,9 +675,14 @@ public final class ColgramUnlimitedMemory {
                     }
 
                     try (FileOutputStream fos = new FileOutputStream(tempDest)) {
-                        Bitmap.CompressFormat fmt = android.os.Build.VERSION.SDK_INT >= 30
-                                ? Bitmap.CompressFormat.WEBP_LOSSY
-                                : Bitmap.CompressFormat.WEBP;
+                        Bitmap.CompressFormat fmt;
+                        if (outWebp) {
+                            fmt = android.os.Build.VERSION.SDK_INT >= 30
+                                    ? Bitmap.CompressFormat.WEBP_LOSSY
+                                    : Bitmap.CompressFormat.WEBP;
+                        } else {
+                            fmt = Bitmap.CompressFormat.JPEG;
+                        }
                         if (!bmp.compress(fmt, quality, fos)) {
                             return false;
                         }

@@ -12,7 +12,7 @@
             android:process=":colgram_masque"
             android:exported="false"
             android:foregroundServiceType="specialUse">
-            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBJECT"
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="User-selected encrypted WARP VPN tunnel" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />

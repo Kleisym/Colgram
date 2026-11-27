@@ -17,18 +17,18 @@ public final class ColgramPrivacyCloakTest {
     }
 
     public static void main(String[] args) {
-        // 1. Safe privacy defaults in ColgramConfig static initializers
-        check(ColgramConfig.isGhostReadEnabled(), "ghostReadEnabled default must be true");
-        check(ColgramConfig.isGhostTypingEnabled(), "ghostTypingEnabled default must be true");
-        check(!ColgramConfig.isAutoUpdateEnabled(), "autoUpdateEnabled default must be false");
+        // 1. Safe defaults in ColgramConfig static initializers
+        check(!ColgramConfig.isGhostReadEnabled(), "ghostReadEnabled default must be false");
+        check(!ColgramConfig.isGhostTypingEnabled(), "ghostTypingEnabled default must be false");
+        check(ColgramConfig.isAutoUpdateEnabled(), "autoUpdateEnabled default must be true");
         check(!ColgramConfig.isUnlimitedMemoryEnabled(), "unlimitedMemoryEnabled default must be false");
         check(ColgramConfig.isStrictProxySecurityEnabled(), "strictProxySecurityEnabled default must be true");
 
         // 2. Contract A: ColgramGhostMode spam/mention/read-all clear ThreadLocal gate
         check(!ColgramGhostMode.isAllowingSpamMentionClear(),
                 "isAllowingSpamMentionClear must default to false");
-        check(ColgramGhostMode.shouldPreventReadReceipt(123456L),
-                "shouldPreventReadReceipt must honor ghostReadEnabled=true by default");
+        check(!ColgramGhostMode.shouldPreventReadReceipt(123456L),
+                "shouldPreventReadReceipt must honor ghostReadEnabled=false by default");
 
         ColgramGhostMode.runAllowingSpamMentionClear(() -> {
             check(ColgramGhostMode.isAllowingSpamMentionClear(),

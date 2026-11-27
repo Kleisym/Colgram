@@ -87,8 +87,8 @@ public class ColgramConfig {
     private static volatile boolean antiDeleteWipeEnabled = false;
     private static volatile boolean chatWallpaperEnabled = true;
     private static volatile boolean preserveMediaEnabled = true;
-    private static volatile boolean ghostReadEnabled = true;
-    private static volatile boolean ghostTypingEnabled = true;
+    private static volatile boolean ghostReadEnabled = false;
+    private static volatile boolean ghostTypingEnabled = false;
     private static volatile boolean ghostOnlineEnabled = false;
     private static volatile boolean bypassFlagSecureEnabled = true;
     private static volatile boolean autoHidePhoneEnabled = true;
@@ -98,7 +98,7 @@ public class ColgramConfig {
     private static volatile boolean dohEnabled = true;
     private static volatile boolean proxyBrowserEnabled = true;
     private static volatile String updateRepo = DEFAULT_UPDATE_REPO;
-    private static volatile boolean autoUpdateEnabled = false;
+    private static volatile boolean autoUpdateEnabled = true;
     private static volatile boolean cyberThemeEnabled = false;
     private static volatile String pendingUpstreamTag = null;
     private static volatile boolean miniAppPipEnabled = true;
@@ -266,8 +266,8 @@ public class ColgramConfig {
         antiDeleteWipeEnabled = p.getBoolean(KEY_ANTI_DELETE_WIPE, false);
         chatWallpaperEnabled = p.getBoolean(KEY_CHAT_WALLPAPER_ENABLED, true);
         preserveMediaEnabled = p.getBoolean(KEY_PRESERVE_MEDIA, true);
-        ghostReadEnabled = p.getBoolean(KEY_GHOST_READ, true);
-        ghostTypingEnabled = p.getBoolean(KEY_GHOST_TYPING, true);
+        ghostReadEnabled = p.getBoolean(KEY_GHOST_READ, false);
+        ghostTypingEnabled = p.getBoolean(KEY_GHOST_TYPING, false);
         ghostOnlineEnabled = p.getBoolean(KEY_GHOST_ONLINE, false);
         bypassFlagSecureEnabled = p.getBoolean(KEY_BYPASS_FLAG_SECURE, true);
         autoHidePhoneEnabled = p.getBoolean(KEY_AUTO_HIDE_PHONE, true);
@@ -277,7 +277,7 @@ public class ColgramConfig {
         dohEnabled = p.getBoolean(KEY_DOH_ENABLED, true);
         proxyBrowserEnabled = p.getBoolean(KEY_PROXY_BROWSER_ENABLED, true);
         updateRepo = p.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO);
-        autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, false);
+        autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, true);
         cyberThemeEnabled = p.getBoolean(KEY_CYBER_THEME_ENABLED, false);
         pendingUpstreamTag = p.getString(KEY_PENDING_UPSTREAM_TAG, null);
         miniAppPipEnabled = p.getBoolean(KEY_MINIAPP_PIP_ENABLED, true);
@@ -365,8 +365,8 @@ public class ColgramConfig {
             case KEY_ANTI_DELETE_WIPE: antiDeleteWipeEnabled = p.getBoolean(KEY_ANTI_DELETE_WIPE, false); break;
             case KEY_CHAT_WALLPAPER_ENABLED: chatWallpaperEnabled = p.getBoolean(KEY_CHAT_WALLPAPER_ENABLED, true); break;
             case KEY_PRESERVE_MEDIA: preserveMediaEnabled = p.getBoolean(KEY_PRESERVE_MEDIA, true); break;
-            case KEY_GHOST_READ: ghostReadEnabled = p.getBoolean(KEY_GHOST_READ, true); break;
-            case KEY_GHOST_TYPING: ghostTypingEnabled = p.getBoolean(KEY_GHOST_TYPING, true); break;
+            case KEY_GHOST_READ: ghostReadEnabled = p.getBoolean(KEY_GHOST_READ, false); break;
+            case KEY_GHOST_TYPING: ghostTypingEnabled = p.getBoolean(KEY_GHOST_TYPING, false); break;
             case KEY_GHOST_ONLINE: ghostOnlineEnabled = p.getBoolean(KEY_GHOST_ONLINE, false); break;
             case KEY_BYPASS_FLAG_SECURE: bypassFlagSecureEnabled = p.getBoolean(KEY_BYPASS_FLAG_SECURE, true); break;
             case KEY_AUTO_HIDE_PHONE: autoHidePhoneEnabled = p.getBoolean(KEY_AUTO_HIDE_PHONE, true); break;
@@ -376,7 +376,7 @@ public class ColgramConfig {
             case KEY_DOH_ENABLED: dohEnabled = p.getBoolean(KEY_DOH_ENABLED, true); break;
             case KEY_PROXY_BROWSER_ENABLED: proxyBrowserEnabled = p.getBoolean(KEY_PROXY_BROWSER_ENABLED, true); break;
             case KEY_UPDATE_REPO: updateRepo = p.getString(KEY_UPDATE_REPO, DEFAULT_UPDATE_REPO); break;
-            case KEY_AUTO_UPDATE_ENABLED: autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, false); break;
+            case KEY_AUTO_UPDATE_ENABLED: autoUpdateEnabled = p.getBoolean(KEY_AUTO_UPDATE_ENABLED, true); break;
             case KEY_CYBER_THEME_ENABLED: cyberThemeEnabled = p.getBoolean(KEY_CYBER_THEME_ENABLED, false); break;
             case KEY_PENDING_UPSTREAM_TAG: pendingUpstreamTag = p.getString(KEY_PENDING_UPSTREAM_TAG, null); break;
             case KEY_MINIAPP_PIP_ENABLED: miniAppPipEnabled = p.getBoolean(KEY_MINIAPP_PIP_ENABLED, true); break;

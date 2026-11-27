@@ -52,9 +52,13 @@ class MuMuContractsTest(unittest.TestCase):
         text = source("ColgramDpiBypass.java")
         start = method(text, "private static synchronized void startNow()")
         self.assertIn('candidate.bind(new InetSocketAddress("127.0.0.1", 0))', start)
-        self.assertIn("workerPool.execute(() -> acceptClients(listener, generation))", start)
+        self.assertIn("new Thread(() -> acceptClients(listener, generation)", start)
+        self.assertIn("acceptThread.setDaemon(true);", start)
+        self.assertIn("acceptThread.start();", start)
+        self.assertLess(start.index("acceptThread.start();"), start.index("bound = true;"))
         self.assertIn("serverSocket == listener && listenerGeneration == generation", text)
-        self.assertIn("++listenerGeneration", method(text, "public static synchronized void stop()"))
+        self.assertIn("stopInternal(true);", method(text, "public static synchronized void stop()"))
+        self.assertIn("++listenerGeneration", method(text, "private static synchronized void stopInternal("))
 
     def test_every_native_check_has_its_own_bounded_deadline(self):
         body = method(source("ColgramProxyManager.java"), "private static boolean checkOne")

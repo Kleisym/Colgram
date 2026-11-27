@@ -108,6 +108,14 @@ public class ColgramStorageCapEnforcerTest {
         File wallFile = writeFile(new File(wallpapersDir, "bg.mp4"), 256 * 1024, (byte) 12, old2h);
         File revFile = writeFile(new File(mediaHistory, "rev_1.jpg"), 128 * 1024, (byte) 13, old2h);
         File acacheOld = writeFile(new File(acache, "old.pcache2"), 128 * 1024, (byte) 14, now - 4L * 86_400_000L);
+        File userTxtDoc = writeCompressibleText(new File(sandboxCache, "user_notes.txt"), 128 * 1024, old1h);
+        File userJsonDoc = writeCompressibleText(new File(sandboxCache, "export.json"), 128 * 1024, old1h);
+        File userCsvDoc = writeCompressibleText(new File(sandboxCache, "report.csv"), 128 * 1024, old1h);
+        File userPluginPy = writeCompressibleText(new File(tmpRoot, "Colgram/Plugins/my_plugin.py"), 64 * 1024, old2h);
+        File freshInbox = writeFile(new File(tmpRoot, "colgram_inbox/pending_upload.mp4"), 256 * 1024, (byte) 15, old2h);
+        File abandonedInbox = writeFile(new File(tmpRoot, "colgram_inbox/abandoned_old.mp4"), 256 * 1024, (byte) 16, now - 30L * 3600_000L);
+        File backupCgb = writeFile(new File(tmpRoot, "Colgram/backup.cgb"), 128 * 1024, (byte) 17, old2h);
+        File safePng = writeFile(new File(sandboxImages, "screenshot.png"), 400_000, (byte) 18, old1h);
 
         Set<String> activePaths = new HashSet<>(Collections.singletonList(activeDownload.getAbsolutePath()));
         ColgramStorageOptimizer.ImageTranscoder mockWebpTranscoder = (src, tmpDest, preset) -> {
@@ -159,6 +167,23 @@ public class ColgramStorageCapEnforcerTest {
         check(modelFile.exists(), ".gguf AI models MUST be protected");
         check(wallFile.exists(), "colgram_wallpapers MUST be protected");
         check(revFile.exists(), "media_history revisions MUST be protected");
+        check(userTxtDoc.exists() && !new File(userTxtDoc.getAbsolutePath() + ".gz").exists(),
+                "User .txt document MUST NOT be gzipped or deleted");
+        check(userJsonDoc.exists() && !new File(userJsonDoc.getAbsolutePath() + ".gz").exists(),
+                "User .json document MUST NOT be gzipped or deleted");
+        check(userCsvDoc.exists() && !new File(userCsvDoc.getAbsolutePath() + ".gz").exists(),
+                "User .csv document MUST NOT be gzipped or deleted");
+        check(userPluginPy.exists(), "Plugins/*.py MUST be protected");
+        check(freshInbox.exists(), "Fresh colgram_inbox staging file (<24h) MUST be protected");
+        check(!abandonedInbox.exists(), "Abandoned colgram_inbox file (>24h) MUST be pruned cleanly");
+        check(backupCgb.exists(), ".cgb backup bundle MUST be protected");
+        check(safePng.exists() && safePng.length() == 400_000L,
+                "PNG images MUST NOT be overwritten with WebP bytes");
+        check(ColgramStorageCapEnforcer.isProtectedDirectoryName("Plugins")
+                        && ColgramStorageCapEnforcer.isProtectedDirectoryName("colgram_inbox")
+                        && ColgramStorageCapEnforcer.isProtectedDirectoryName("shadow_previews")
+                        && !ColgramStorageCapEnforcer.isProtectedDirectoryName("Images"),
+                "isProtectedDirectoryName classification mismatch");
 
         ColgramStorageIndex.resetForTest();
     }

@@ -246,9 +246,8 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                         }
                     }
                 }
-            } catch (Exception ignored) {
-            } finally {
                 blockedUsersLoaded = true;
+            } catch (Exception ignored) {
             }
         }
     }
@@ -404,6 +403,7 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                 } catch (Throwable ignored) {}
 
                 // Preload Shadow Micro-Vault preview paths for O(1) deleted photo display
+                java.util.List<long[]> stalePreviews = null;
                 try (Cursor shadowCur = db.query(TABLE_SHADOW_MESSAGES,
                         new String[]{COL_SHADOW_DIALOG_ID, COL_SHADOW_MSG_ID, COL_SHADOW_PREVIEW_PATH},
                         COL_SHADOW_PREVIEW_PATH + " IS NOT NULL AND " + COL_SHADOW_PREVIEW_PATH + " != ''",
@@ -413,10 +413,27 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                         int xm = shadowCur.getInt(1);
                         String xp = shadowCur.getString(2);
                         if (xd != 0L && xm != 0 && xp != null && !xp.isEmpty()) {
-                            shadowPreviewCache.put(deletedKey(xd, xm), xp);
+                            if (new java.io.File(xp).isFile()) {
+                                shadowPreviewCache.put(deletedKey(xd, xm), xp);
+                            } else {
+                                if (stalePreviews == null) stalePreviews = new ArrayList<>();
+                                stalePreviews.add(new long[]{xd, xm});
+                            }
                         }
                     }
                 } catch (Throwable ignored) {}
+                if (stalePreviews != null && !stalePreviews.isEmpty()) {
+                    try {
+                        SQLiteDatabase wdb = getWritableDatabase();
+                        for (long[] pair : stalePreviews) {
+                            ContentValues cv = new ContentValues();
+                            cv.putNull(COL_SHADOW_PREVIEW_PATH);
+                            wdb.update(TABLE_SHADOW_MESSAGES, cv,
+                                    COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?",
+                                    new String[]{String.valueOf(pair[0]), String.valueOf(pair[1])});
+                        }
+                    } catch (Throwable ignored) {}
+                }
 
                 pendingPurgesDuringLoad.clear();
                 deletedCachesLoaded = true;
@@ -585,9 +602,7 @@ public class ColgramDatabase extends SQLiteOpenHelper {
         }
         // v6 -> v7: collapsed_spam_messages + Lazy Shadow Vault shadow_messages
         if (oldVersion < 7) {
-            try {
-                createV7Tables(db);
-            } catch (Exception ignored) {}
+            createV7Tables(db);
         }
     }
 
@@ -755,34 +770,63 @@ public class ColgramDatabase extends SQLiteOpenHelper {
     /** Synchronously clears local tombstones from in-memory caches without touching SQLite on caller thread. */
     public void purgeMessagesMemoryOnly(long dialogId, Collection<Integer> messageIds) {
         if (dialogId == 0L || messageIds == null || messageIds.isEmpty()) return;
-        Set<Integer> dialogSet = deletedMessagesByDialog.get(dialogId);
+        Set<Integer> dialogSet = deletedMessagesByDialog != null ? deletedMessagesByDialog.get(dialogId) : null;
+        ConcurrentHashMap<Integer, String> spamMap = collapsedSpamByDialog != null ? collapsedSpamByDialog.get(dialogId) : null;
         for (Integer id : messageIds) {
             if (id == null || id == 0) continue;
-            if (!deletedCachesLoaded) {
+            if (!deletedCachesLoaded && pendingPurgesDuringLoad != null) {
                 pendingPurgesDuringLoad.add(deletedKey(dialogId, id));
             }
             if (dialogSet != null) {
                 dialogSet.remove(id);
             }
+            if (spamMap != null) {
+                spamMap.remove(id);
+            }
+            if (shadowPreviewCache != null) {
+                shadowPreviewCache.remove(deletedKey(dialogId, id));
+            }
         }
     }
 
-    /** Executes SQLite DELETE statements for purged messages; safe to run on a background I/O thread. */
+    /** Executes SQLite DELETE statements and shadow-preview file cleanup for purged messages; safe on background I/O thread. */
     public void purgeMessagesFromDiskOnly(long dialogId, Collection<Integer> messageIds) {
         if (dialogId == 0L || messageIds == null || messageIds.isEmpty()) return;
+        List<String> previewPathsToDelete = new ArrayList<>();
         SQLiteDatabase db = null;
         SQLiteStatement delStmt = null;
         SQLiteStatement editStmt = null;
         SQLiteStatement mediaStmt = null;
+        SQLiteStatement spamStmt = null;
+        SQLiteStatement shadowStmt = null;
         boolean inTx = false;
         try {
             db = getWritableDatabase();
+            for (Integer id : messageIds) {
+                if (id == null || id == 0) continue;
+                try (Cursor c = db.query(TABLE_SHADOW_MESSAGES,
+                        new String[]{COL_SHADOW_PREVIEW_PATH},
+                        COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?",
+                        new String[]{String.valueOf(dialogId), String.valueOf(id)},
+                        null, null, null, "1")) {
+                    if (c != null && c.moveToFirst() && !c.isNull(0)) {
+                        String p = c.getString(0);
+                        if (p != null && !p.isEmpty()) {
+                            previewPathsToDelete.add(p);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
             delStmt = db.compileStatement("DELETE FROM " + TABLE_DELETED + " WHERE "
                     + COL_DEL_DIALOG_ID + "=? AND " + COL_DEL_MSG_ID + "=?");
             editStmt = db.compileStatement("DELETE FROM " + TABLE_EDITS + " WHERE "
                     + COL_EDIT_DIALOG_ID + "=? AND " + COL_EDIT_MSG_ID + "=?");
             mediaStmt = db.compileStatement("DELETE FROM " + TABLE_MEDIA + " WHERE "
                     + COL_MEDIA_DIALOG_ID + "=? AND " + COL_MEDIA_MSG_ID + "=?");
+            spamStmt = db.compileStatement("DELETE FROM " + TABLE_COLLAPSED_SPAM + " WHERE "
+                    + COL_SPAM_DIALOG_ID + "=? AND " + COL_SPAM_MSG_ID + "=?");
+            shadowStmt = db.compileStatement("DELETE FROM " + TABLE_SHADOW_MESSAGES + " WHERE "
+                    + COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?");
             db.beginTransaction();
             inTx = true;
             for (Integer id : messageIds) {
@@ -801,6 +845,16 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                 mediaStmt.bindLong(1, dialogId);
                 mediaStmt.bindLong(2, id);
                 mediaStmt.executeUpdateDelete();
+
+                spamStmt.clearBindings();
+                spamStmt.bindLong(1, dialogId);
+                spamStmt.bindLong(2, id);
+                spamStmt.executeUpdateDelete();
+
+                shadowStmt.clearBindings();
+                shadowStmt.bindLong(1, dialogId);
+                shadowStmt.bindLong(2, id);
+                shadowStmt.executeUpdateDelete();
             }
             db.setTransactionSuccessful();
         } catch (Exception ignored) {
@@ -808,7 +862,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             if (delStmt != null) try { delStmt.close(); } catch (Throwable ignored) {}
             if (editStmt != null) try { editStmt.close(); } catch (Throwable ignored) {}
             if (mediaStmt != null) try { mediaStmt.close(); } catch (Throwable ignored) {}
+            if (spamStmt != null) try { spamStmt.close(); } catch (Throwable ignored) {}
+            if (shadowStmt != null) try { shadowStmt.close(); } catch (Throwable ignored) {}
             if (db != null && inTx) try { db.endTransaction(); } catch (Throwable ignored) {}
+        }
+        for (String p : previewPathsToDelete) {
+            deleteShadowPreviewFileSafe(p);
         }
     }
 
@@ -1141,11 +1200,32 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             v.put(COL_SPAM_AT, System.currentTimeMillis());
             db.insertWithOnConflict(TABLE_COLLAPSED_SPAM, null, v, SQLiteDatabase.CONFLICT_REPLACE);
             if ((collapsedInsertTick.incrementAndGet() & 63) == 0) {
-                db.execSQL("DELETE FROM " + TABLE_COLLAPSED_SPAM + " WHERE rowid IN ("
-                        + "SELECT rowid FROM " + TABLE_COLLAPSED_SPAM
-                        + " ORDER BY " + COL_SPAM_AT + " DESC LIMIT -1 OFFSET " + MAX_COLLAPSED_SPAM_ROWS + ");");
+                pruneCollapsedSpamOverflow(db);
             }
         } catch (Throwable ignored) {}
+    }
+
+    private void pruneCollapsedSpamOverflow(SQLiteDatabase db) {
+        if (db == null) return;
+        List<long[]> evicted = new ArrayList<>();
+        try (Cursor c = db.rawQuery(
+                "SELECT " + COL_SPAM_DIALOG_ID + ", " + COL_SPAM_MSG_ID + " FROM " + TABLE_COLLAPSED_SPAM
+                        + " ORDER BY " + COL_SPAM_AT + " DESC LIMIT -1 OFFSET " + MAX_COLLAPSED_SPAM_ROWS,
+                null)) {
+            while (c != null && c.moveToNext()) {
+                evicted.add(new long[]{c.getLong(0), c.getInt(1)});
+            }
+        } catch (Throwable ignored) {}
+        if (evicted.isEmpty()) return;
+        db.execSQL("DELETE FROM " + TABLE_COLLAPSED_SPAM + " WHERE rowid IN ("
+                + "SELECT rowid FROM " + TABLE_COLLAPSED_SPAM
+                + " ORDER BY " + COL_SPAM_AT + " DESC LIMIT -1 OFFSET " + MAX_COLLAPSED_SPAM_ROWS + ");");
+        for (long[] pair : evicted) {
+            ConcurrentHashMap<Integer, String> m = collapsedSpamByDialog.get(pair[0]);
+            if (m != null) {
+                m.remove((int) pair[1]);
+            }
+        }
     }
 
     public boolean isCollapsedSpam(long dialogId, int messageId) {
@@ -1177,32 +1257,172 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                                     int mediaType, long mediaSize, String metaJson,
                                     String previewPath, boolean dehydrated) {
         if (dialogId == 0L || messageId <= 0) return;
-        if (previewPath != null && !previewPath.isEmpty()) {
-            shadowPreviewCache.put(deletedKey(dialogId, messageId), previewPath);
+        upsertShadowMessagesBatch(Collections.singletonList(new ShadowMessageRecord(
+                dialogId, messageId, senderId, dateSec, mediaType, mediaSize,
+                metaJson, previewPath, dehydrated, System.currentTimeMillis())));
+    }
+
+    /** Batched API-24-safe shadow vault upsert preserving existing preview_path when new previewPath is empty. */
+    public void upsertShadowMessagesBatch(List<ShadowMessageRecord> records) {
+        if (records == null || records.isEmpty()) return;
+        for (int i = 0; i < records.size(); i++) {
+            ShadowMessageRecord r = records.get(i);
+            if (r != null && r.dialogId != 0L && r.messageId > 0 && r.previewPath != null && !r.previewPath.isEmpty()) {
+                shadowPreviewCache.put(deletedKey(r.dialogId, r.messageId), r.previewPath);
+            }
         }
+        SQLiteDatabase db = null;
+        SQLiteStatement updWithPreview = null;
+        SQLiteStatement updKeepPreview = null;
+        SQLiteStatement insStmt = null;
+        boolean inTx = false;
+        int written = 0;
         try {
-            SQLiteDatabase db = getWritableDatabase();
-            ContentValues v = new ContentValues();
-            v.put(COL_SHADOW_DIALOG_ID, dialogId);
-            v.put(COL_SHADOW_MSG_ID, messageId);
-            v.put(COL_SHADOW_SENDER_ID, senderId);
-            v.put(COL_SHADOW_DATE_SEC, dateSec);
-            v.put(COL_SHADOW_MEDIA_TYPE, mediaType);
-            v.put(COL_SHADOW_MEDIA_SIZE, mediaSize);
-            if (metaJson != null && !metaJson.isEmpty()) {
-                v.put(COL_SHADOW_META_ZLIB, zlibCompressBytes(metaJson.getBytes(StandardCharsets.UTF_8)));
+            db = getWritableDatabase();
+            updWithPreview = db.compileStatement("UPDATE " + TABLE_SHADOW_MESSAGES + " SET "
+                    + COL_SHADOW_SENDER_ID + "=?, " + COL_SHADOW_DATE_SEC + "=?, "
+                    + COL_SHADOW_MEDIA_TYPE + "=?, " + COL_SHADOW_MEDIA_SIZE + "=?, "
+                    + COL_SHADOW_META_ZLIB + "=COALESCE(?, " + COL_SHADOW_META_ZLIB + "), "
+                    + COL_SHADOW_PREVIEW_PATH + "=?, "
+                    + COL_SHADOW_DEHYDRATED + "=?, " + COL_SHADOW_CAPTURED_AT + "=? "
+                    + "WHERE " + COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?");
+            updKeepPreview = db.compileStatement("UPDATE " + TABLE_SHADOW_MESSAGES + " SET "
+                    + COL_SHADOW_SENDER_ID + "=?, " + COL_SHADOW_DATE_SEC + "=?, "
+                    + COL_SHADOW_MEDIA_TYPE + "=?, " + COL_SHADOW_MEDIA_SIZE + "=?, "
+                    + COL_SHADOW_META_ZLIB + "=COALESCE(?, " + COL_SHADOW_META_ZLIB + "), "
+                    + COL_SHADOW_DEHYDRATED + "=?, " + COL_SHADOW_CAPTURED_AT + "=? "
+                    + "WHERE " + COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?");
+            insStmt = db.compileStatement("INSERT OR IGNORE INTO " + TABLE_SHADOW_MESSAGES + " ("
+                    + COL_SHADOW_DIALOG_ID + ", " + COL_SHADOW_MSG_ID + ", "
+                    + COL_SHADOW_SENDER_ID + ", " + COL_SHADOW_DATE_SEC + ", "
+                    + COL_SHADOW_MEDIA_TYPE + ", " + COL_SHADOW_MEDIA_SIZE + ", "
+                    + COL_SHADOW_META_ZLIB + ", " + COL_SHADOW_PREVIEW_PATH + ", "
+                    + COL_SHADOW_DEHYDRATED + ", " + COL_SHADOW_CAPTURED_AT
+                    + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            db.beginTransaction();
+            inTx = true;
+            long defaultNow = System.currentTimeMillis();
+            for (int i = 0; i < records.size(); i++) {
+                ShadowMessageRecord r = records.get(i);
+                if (r == null || r.dialogId == 0L || r.messageId <= 0) continue;
+                byte[] metaBytes = (r.metaJson != null && !r.metaJson.isEmpty())
+                        ? zlibCompressBytes(r.metaJson.getBytes(StandardCharsets.UTF_8))
+                        : null;
+                boolean hasPreview = r.previewPath != null && !r.previewPath.isEmpty();
+                long capTs = r.capturedAtMs > 0L ? r.capturedAtMs : defaultNow;
+                int dehyd = r.dehydrated ? 1 : 0;
+                int updatedRows;
+                if (hasPreview) {
+                    updWithPreview.clearBindings();
+                    updWithPreview.bindLong(1, r.senderId);
+                    updWithPreview.bindLong(2, r.dateSec);
+                    updWithPreview.bindLong(3, r.mediaType);
+                    updWithPreview.bindLong(4, r.mediaSize);
+                    if (metaBytes != null && metaBytes.length > 0) updWithPreview.bindBlob(5, metaBytes);
+                    else updWithPreview.bindNull(5);
+                    updWithPreview.bindString(6, r.previewPath);
+                    updWithPreview.bindLong(7, dehyd);
+                    updWithPreview.bindLong(8, capTs);
+                    updWithPreview.bindLong(9, r.dialogId);
+                    updWithPreview.bindLong(10, r.messageId);
+                    updatedRows = updWithPreview.executeUpdateDelete();
+                } else {
+                    updKeepPreview.clearBindings();
+                    updKeepPreview.bindLong(1, r.senderId);
+                    updKeepPreview.bindLong(2, r.dateSec);
+                    updKeepPreview.bindLong(3, r.mediaType);
+                    updKeepPreview.bindLong(4, r.mediaSize);
+                    if (metaBytes != null && metaBytes.length > 0) updKeepPreview.bindBlob(5, metaBytes);
+                    else updKeepPreview.bindNull(5);
+                    updKeepPreview.bindLong(6, dehyd);
+                    updKeepPreview.bindLong(7, capTs);
+                    updKeepPreview.bindLong(8, r.dialogId);
+                    updKeepPreview.bindLong(9, r.messageId);
+                    updatedRows = updKeepPreview.executeUpdateDelete();
+                }
+                if (updatedRows == 0) {
+                    insStmt.clearBindings();
+                    insStmt.bindLong(1, r.dialogId);
+                    insStmt.bindLong(2, r.messageId);
+                    insStmt.bindLong(3, r.senderId);
+                    insStmt.bindLong(4, r.dateSec);
+                    insStmt.bindLong(5, r.mediaType);
+                    insStmt.bindLong(6, r.mediaSize);
+                    if (metaBytes != null && metaBytes.length > 0) insStmt.bindBlob(7, metaBytes);
+                    else insStmt.bindNull(7);
+                    if (hasPreview) insStmt.bindString(8, r.previewPath);
+                    else insStmt.bindNull(8);
+                    insStmt.bindLong(9, dehyd);
+                    insStmt.bindLong(10, capTs);
+                    insStmt.executeInsert();
+                }
+                written++;
             }
-            if (previewPath != null && !previewPath.isEmpty()) {
-                v.put(COL_SHADOW_PREVIEW_PATH, previewPath);
+            db.setTransactionSuccessful();
+        } catch (Throwable ignored) {
+        } finally {
+            if (updWithPreview != null) try { updWithPreview.close(); } catch (Throwable ignored) {}
+            if (updKeepPreview != null) try { updKeepPreview.close(); } catch (Throwable ignored) {}
+            if (insStmt != null) try { insStmt.close(); } catch (Throwable ignored) {}
+            if (db != null && inTx) try { db.endTransaction(); } catch (Throwable ignored) {}
+        }
+        if (written > 0 && db != null && (shadowInsertTick.addAndGet(written) & 127) < written) {
+            pruneShadowOverflow(db);
+        }
+    }
+
+    private void pruneShadowOverflow(SQLiteDatabase db) {
+        if (db == null) return;
+        List<long[]> evictedKeys = new ArrayList<>();
+        List<String> evictedPaths = new ArrayList<>();
+        try (Cursor c = db.rawQuery(
+                "SELECT " + COL_SHADOW_DIALOG_ID + ", " + COL_SHADOW_MSG_ID + ", " + COL_SHADOW_PREVIEW_PATH
+                        + " FROM " + TABLE_SHADOW_MESSAGES
+                        + " ORDER BY " + COL_SHADOW_CAPTURED_AT + " DESC LIMIT -1 OFFSET " + MAX_SHADOW_MESSAGES_ROWS,
+                null)) {
+            while (c != null && c.moveToNext()) {
+                evictedKeys.add(new long[]{c.getLong(0), c.getInt(1)});
+                String p = c.isNull(2) ? "" : c.getString(2);
+                if (p != null && !p.isEmpty()) {
+                    evictedPaths.add(p);
+                }
             }
-            v.put(COL_SHADOW_DEHYDRATED, dehydrated ? 1 : 0);
-            v.put(COL_SHADOW_CAPTURED_AT, System.currentTimeMillis());
-            db.insertWithOnConflict(TABLE_SHADOW_MESSAGES, null, v, SQLiteDatabase.CONFLICT_REPLACE);
-            if ((shadowInsertTick.incrementAndGet() & 127) == 0) {
-                db.execSQL("DELETE FROM " + TABLE_SHADOW_MESSAGES + " WHERE rowid IN ("
-                        + "SELECT rowid FROM " + TABLE_SHADOW_MESSAGES
-                        + " ORDER BY " + COL_SHADOW_CAPTURED_AT + " DESC LIMIT -1 OFFSET " + MAX_SHADOW_MESSAGES_ROWS + ");");
+        } catch (Throwable ignored) {}
+        if (evictedKeys.isEmpty()) return;
+        try {
+            db.execSQL("DELETE FROM " + TABLE_SHADOW_MESSAGES + " WHERE rowid IN ("
+                    + "SELECT rowid FROM " + TABLE_SHADOW_MESSAGES
+                    + " ORDER BY " + COL_SHADOW_CAPTURED_AT + " DESC LIMIT -1 OFFSET " + MAX_SHADOW_MESSAGES_ROWS + ");");
+        } catch (Throwable ignored) {}
+        for (long[] pair : evictedKeys) {
+            shadowPreviewCache.remove(deletedKey(pair[0], (int) pair[1]));
+        }
+        for (String p : evictedPaths) {
+            deleteShadowPreviewFileSafe(p);
+        }
+    }
+
+    private static void deleteShadowPreviewFileSafe(String previewPath) {
+        if (previewPath == null || previewPath.isEmpty()) return;
+        try {
+            if (!previewPath.contains("shadow_previews")) return;
+            java.io.File f = new java.io.File(previewPath);
+            if (f.isFile()) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
             }
+        } catch (Throwable ignored) {}
+    }
+
+    public void clearShadowPreviewPath(long dialogId, int messageId) {
+        if (dialogId == 0L || messageId <= 0) return;
+        shadowPreviewCache.remove(deletedKey(dialogId, messageId));
+        try {
+            ContentValues cv = new ContentValues();
+            cv.putNull(COL_SHADOW_PREVIEW_PATH);
+            getWritableDatabase().update(TABLE_SHADOW_MESSAGES, cv,
+                    COL_SHADOW_DIALOG_ID + "=? AND " + COL_SHADOW_MSG_ID + "=?",
+                    new String[]{String.valueOf(dialogId), String.valueOf(messageId)});
         } catch (Throwable ignored) {}
     }
 

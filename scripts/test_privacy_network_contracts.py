@@ -81,14 +81,20 @@ class PrivacyNetworkContractTests(unittest.TestCase):
         self.assertIn("stripColgramSuffix(", cloak)
 
         cfg = (CORE / "ColgramConfig.java").read_text(encoding="utf-8")
-        self.assertIn("ghostReadEnabled = true;", cfg)
-        self.assertIn("ghostTypingEnabled = true;", cfg)
-        self.assertIn("autoUpdateEnabled = false;", cfg)
+        self.assertIn("ghostReadEnabled = false;", cfg)
+        self.assertIn("ghostTypingEnabled = false;", cfg)
+        self.assertIn("autoUpdateEnabled = true;", cfg)
         self.assertIn("colgram_defaults_v4_cap_migrated", cfg)
+
+        pinned = (CORE / "ColgramPinnedConnection.java").read_text(encoding="utf-8")
+        self.assertIn("proxy.type() != java.net.Proxy.Type.SOCKS", pinned)
+        self.assertIn("sniFor(targetHost)", pinned)
 
         routes = (ROOT / "scripts/templates/ColgramBrowserRoutes.java").read_text(encoding="utf-8")
         self.assertIn("whenProxyReady(", routes)
         self.assertIn("public static void loadUrl(", routes)
+        self.assertIn("ROUTE_BIND_EXECUTOR", routes)
+        self.assertIn("ColgramUiBridge.postNotice", routes)
         self.assertNotIn("AlertDialog.Builder", routes)
 
         updater = (CORE / "ColgramUpdater.java").read_text(encoding="utf-8")

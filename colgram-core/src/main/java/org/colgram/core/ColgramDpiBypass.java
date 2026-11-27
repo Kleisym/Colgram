@@ -132,6 +132,8 @@ public class ColgramDpiBypass {
 
     private static final java.util.concurrent.atomic.AtomicLong lastRxTimestampMs =
             new java.util.concurrent.atomic.AtomicLong(0L);
+    private static final java.util.concurrent.atomic.AtomicLong lastMainDcRxTimestampMs =
+            new java.util.concurrent.atomic.AtomicLong(0L);
 
     static int maxWorkerPoolThreadsForTest() {
         return MAX_WORKER_POOL_THREADS;
@@ -328,6 +330,7 @@ public class ColgramDpiBypass {
         final Socket client;
         volatile java.io.Closeable upstream;
         final boolean telegram;
+        final boolean mainDc;
         final long createdAtMs;
         volatile long lastTxAtMs;
         volatile long lastRxAtMs;
@@ -336,9 +339,14 @@ public class ColgramDpiBypass {
                 new java.util.concurrent.atomic.AtomicBoolean(false);
 
         ActiveSession(Socket client, java.io.Closeable upstream, boolean telegram, long nowMs) {
+            this(client, upstream, telegram, false, nowMs);
+        }
+
+        ActiveSession(Socket client, java.io.Closeable upstream, boolean telegram, boolean mainDc, long nowMs) {
             this.client = client;
             this.upstream = upstream;
             this.telegram = telegram;
+            this.mainDc = mainDc;
             this.createdAtMs = nowMs;
             this.lastTxAtMs = nowMs;
             this.lastRxAtMs = nowMs;
@@ -362,6 +370,9 @@ public class ColgramDpiBypass {
             lastRxAtMs = nowMs;
             pendingReplySinceMs = 0L;
             lastRxTimestampMs.set(nowMs);
+            if (mainDc) {
+                lastMainDcRxTimestampMs.set(nowMs);
+            }
         }
 
         boolean closeNow() {
@@ -374,12 +385,22 @@ public class ColgramDpiBypass {
     }
 
     static ActiveSession registerActiveSession(Socket client, java.io.Closeable upstream, boolean telegram) {
-        return registerActiveSessionAt(client, upstream, telegram, safeElapsedRealtime());
+        return registerActiveSessionAt(client, upstream, telegram, false, safeElapsedRealtime());
+    }
+
+    static ActiveSession registerActiveSession(Socket client, java.io.Closeable upstream,
+                                               boolean telegram, boolean mainDc) {
+        return registerActiveSessionAt(client, upstream, telegram, mainDc, safeElapsedRealtime());
     }
 
     static ActiveSession registerActiveSessionAt(Socket client, java.io.Closeable upstream,
                                                  boolean telegram, long nowMs) {
-        ActiveSession session = new ActiveSession(client, upstream, telegram, nowMs);
+        return registerActiveSessionAt(client, upstream, telegram, false, nowMs);
+    }
+
+    static ActiveSession registerActiveSessionAt(Socket client, java.io.Closeable upstream,
+                                                 boolean telegram, boolean mainDc, long nowMs) {
+        ActiveSession session = new ActiveSession(client, upstream, telegram, mainDc, nowMs);
         ACTIVE_SESSIONS.add(session);
         evictOverflowSessionsLocked();
         return session;
@@ -467,6 +488,7 @@ public class ColgramDpiBypass {
     public static int closeAllActiveSessions() {
         networkEpoch.incrementAndGet();
         lastRxTimestampMs.set(0L);
+        lastMainDcRxTimestampMs.set(0L);
         int closed = ColgramTelegramWsBridge.drainPrewarmedPool();
         for (ActiveSession s : ACTIVE_SESSIONS) {
             if (s != null && s.closeNow()) {
@@ -995,6 +1017,7 @@ public class ColgramDpiBypass {
 
     /** Bind and publish under the same lock as stop(); only accept runs asynchronously. */
     private static synchronized void startNow() {
+        stoppedExplicitly = false;
         if (isRunning && bound && serverSocket != null && !serverSocket.isClosed()) return;
         final long generation = ++listenerGeneration;
         ServerSocket candidate = null;
@@ -1022,7 +1045,7 @@ public class ColgramDpiBypass {
                 }
             }
             if (candidate == null) {
-                Log.w(TAG, "Fixed port " + LOCAL_PORT + " held externally ("
+                safeLogW("Fixed port " + LOCAL_PORT + " held externally ("
                         + (lastBindError != null ? lastBindError.getMessage() : "busy")
                         + "); falling back to ephemeral loopback once");
                 candidate = new ServerSocket();
@@ -1034,17 +1057,22 @@ public class ColgramDpiBypass {
             activePort = listener.getLocalPort();
             upstreamState = UPSTREAM_WAIT;
             resetCarriageCounters();
+            final Thread acceptThread = new Thread(() -> acceptClients(listener, generation),
+                    "colgram-dpi-accept-" + generation);
+            acceptThread.setDaemon(true);
+            acceptThread.start();
             bound = true;
             isRunning = true;
             synchronized (READY_LOCK) {
                 READY_LOCK.notifyAll();
             }
-            ColgramNativeDesync.runSelfTest();
-            ColgramTelegramWsBridge.warmUp();
-            workerPool.execute(() -> acceptClients(listener, generation));
+            executeDialRace(() -> {
+                try { ColgramNativeDesync.runSelfTest(); } catch (Throwable ignored) {}
+                try { ColgramTelegramWsBridge.warmUp(); } catch (Throwable ignored) {}
+            });
             safeLogD("ColgramDpiBypass started on 127.0.0.1:" + activePort
                     + " nativeDesync=" + ColgramNativeDesync.isAvailable());
-        } catch (Exception failure) {
+        } catch (Throwable failure) {
             closeQuietly(candidate);
             serverSocket = null;
             activePort = LOCAL_PORT;
@@ -1114,8 +1142,12 @@ public class ColgramDpiBypass {
     }
 
     public static synchronized void stop() {
+        stopInternal(true);
+    }
+
+    private static synchronized void stopInternal(boolean explicit) {
         ++listenerGeneration;
-        stoppedExplicitly = true;
+        stoppedExplicitly = explicit;
         isRunning = false;
         bound = false;
         synchronized (READY_LOCK) {
@@ -1206,10 +1238,10 @@ public class ColgramDpiBypass {
         if (isBound() && serverSocket != null && !serverSocket.isClosed()) {
             return true;
         }
-        Log.w(TAG, "restarting the local DPI listener (isRunning=" + isRunning + ", bound=" + bound + ")");
-        stop();
+        safeLogW("restarting the local DPI listener (isRunning=" + isRunning + ", bound=" + bound + ")");
+        stopInternal(false);
         startNow();
-        return true;
+        return isBound();
     }
 
     /**
@@ -1220,7 +1252,7 @@ public class ColgramDpiBypass {
      * mutate the socket state, not to wait for it, so the wait is split out here.
      */
     public static boolean restartIfDeadAndWait(long timeoutMs) {
-        if (!restartIfDead()) return true;
+        if (!restartIfDead()) return false;
         return awaitReady(timeoutMs);
     }
 
@@ -1453,17 +1485,18 @@ public class ColgramDpiBypass {
                 }
                 return null;
             }
-            if (!(ColgramConfig.isDohEnabled()
-                    && (ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled()))) {
-                try {
-                    InetAddress sys = InetAddress.getByName(host);
-                    if (sys != null) {
-                        Socket direct = connectDirectIp(sys.getHostAddress(), port, mssClamp, windowClamp, budgetMs);
-                        if (direct != null) return direct;
-                    }
-                } catch (Throwable ignored) {}
+            if (ColgramConfig.isDohEnabled()
+                    && (ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled())) {
+                return null;
             }
-            // Fallback direct hostname connect when resolver returned null
+            try {
+                InetAddress sys = InetAddress.getByName(host);
+                if (sys != null) {
+                    Socket direct = connectDirectIp(sys.getHostAddress(), port, mssClamp, windowClamp, budgetMs);
+                    if (direct != null) return direct;
+                }
+            } catch (Throwable ignored) {}
+            // Fallback direct hostname connect when resolver returned null and strict encrypted DNS is off
             Socket socket = new Socket();
             if (!track(socket)) return null;
             try {
@@ -2018,7 +2051,8 @@ public class ColgramDpiBypass {
             if (call == null) relayedConnections.incrementAndGet();
             if (viaL3Relay) {
                 pipeViaL3Relay(client, targetSocket, call, generation, null, 0,
-                        call == null && isTelegramDcIp(destHost));
+                        call == null && isTelegramDcIp(destHost),
+                        call == null && isTelegramDcIp(destHost) && !isMedia);
             } else {
                 pipeWithAdvancedDesync(client, targetSocket, call, generation,
                         (call == null || call.systemWide) && ColgramTelegramDcAddresses.isKnownAddress(destHost),
@@ -3322,6 +3356,13 @@ public class ColgramDpiBypass {
                                        final CallListener call, final long generation,
                                        final byte[] initialPayload, final int initialLen,
                                        final boolean telegramTarget) {
+        pipeViaL3Relay(client, relayDest, call, generation, initialPayload, initialLen, telegramTarget, false);
+    }
+
+    private static void pipeViaL3Relay(final Socket client, final Socket relayDest,
+                                       final CallListener call, final long generation,
+                                       final byte[] initialPayload, final int initialLen,
+                                       final boolean telegramTarget, final boolean mainDc) {
         final long startEpoch = currentNetworkEpoch();
         tuneSocketBuffers(client);
         tuneSocketBuffers(relayDest);
@@ -3330,7 +3371,7 @@ public class ColgramDpiBypass {
         final String relayLabel = l3RelayLabelsBySocket.remove(relayDest);
         final java.util.concurrent.atomic.AtomicBoolean firstReplySeen =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
-        final ActiveSession tracked = registerActiveSession(client, relayDest, telegramTarget);
+        final ActiveSession tracked = registerActiveSession(client, relayDest, telegramTarget, mainDc);
 
         if (!executeWorker(() -> {
             try {
@@ -3393,14 +3434,20 @@ public class ColgramDpiBypass {
                     tracked.onUpstreamRx(rxNow);
                     lastL3RelaySuccessAt = rxNow;
                     if (call == null) publishUpstream(generation, UPSTREAM_REPLY);
-                    if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(n);
+                    if (call == null && isCurrentListener(generation)) {
+                        fromTargetBytes.addAndGet(n);
+                        if (mainDc) recordMainDcRx(n, rxNow);
+                    }
                     cout.write(buf, 0, n);
                     cout.flush();
                     while ((n = din.read(buf)) != -1) {
                         long chunkNow = safeElapsedRealtime();
                         tracked.onUpstreamRx(chunkNow);
                         lastL3RelaySuccessAt = chunkNow;
-                        if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(n);
+                        if (call == null && isCurrentListener(generation)) {
+                            fromTargetBytes.addAndGet(n);
+                            if (mainDc) recordMainDcRx(n, chunkNow);
+                        }
                         cout.write(buf, 0, n);
                         flushIfDrained(din, cout);
                     }
@@ -3855,6 +3902,8 @@ public class ColgramDpiBypass {
             new java.util.concurrent.atomic.AtomicLong();
     private static final java.util.concurrent.atomic.AtomicLong fromTargetBytes =
             new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong mainDcFromTargetBytes =
+            new java.util.concurrent.atomic.AtomicLong();
     private static final java.util.concurrent.atomic.AtomicLong relayedConnections =
             new java.util.concurrent.atomic.AtomicLong();
     private static final java.util.concurrent.atomic.AtomicLong completedRelays =
@@ -3878,9 +3927,27 @@ public class ColgramDpiBypass {
         return fromTargetBytes.get();
     }
 
+    public static long mainDcBytesFromTarget() {
+        return mainDcFromTargetBytes.get();
+    }
+
     public static boolean hasRecentRxWithin(long windowMs) {
         long last = lastRxTimestampMs.get();
         return last > 0L && windowMs > 0L && (safeElapsedRealtime() - last) <= windowMs;
+    }
+
+    public static boolean hasRecentMainDcRxWithin(long windowMs) {
+        long last = lastMainDcRxTimestampMs.get();
+        return last > 0L && windowMs > 0L && (safeElapsedRealtime() - last) <= windowMs;
+    }
+
+    private static void recordMainDcRx(long bytes, long nowMs) {
+        if (bytes > 0L) {
+            mainDcFromTargetBytes.addAndGet(bytes);
+        }
+        if (nowMs > 0L) {
+            lastMainDcRxTimestampMs.set(nowMs);
+        }
     }
 
     /** Connections the front opened an upstream socket for. */
@@ -3897,9 +3964,11 @@ public class ColgramDpiBypass {
     public static void resetCarriageCounters() {
         toTargetBytes.set(0);
         fromTargetBytes.set(0);
+        mainDcFromTargetBytes.set(0);
         relayedConnections.set(0);
         completedRelays.set(0);
         lastRxTimestampMs.set(0L);
+        lastMainDcRxTimestampMs.set(0L);
     }
 
     public static void resetRawFailureState() {
@@ -4491,7 +4560,9 @@ public class ColgramDpiBypass {
         tuneSocketBuffers(client);
         final java.util.concurrent.atomic.AtomicLong fromTarget =
                 new java.util.concurrent.atomic.AtomicLong(0);
-        final ActiveSession tracked = registerActiveSession(client, session, true);
+        final boolean mainDc = !ColgramTelegramWsBridge.Obfuscated2FrameSplitter.isMediaDcId(
+                session.rawDcId != 0 ? session.rawDcId : session.dcId);
+        final ActiveSession tracked = registerActiveSession(client, session, true, mainDc);
         tracked.onClientTx(safeElapsedRealtime());
         if (!executeWorker(() -> {
             byte[] buffer = null;
@@ -4522,7 +4593,12 @@ public class ColgramDpiBypass {
             try {
                 OutputStream cout = client.getOutputStream();
                 ColgramTelegramWsBridge.pumpUpstreamFrames(session, cout, count -> {
-                    tracked.onUpstreamRx(safeElapsedRealtime());
+                    long rxNow = safeElapsedRealtime();
+                    tracked.onUpstreamRx(rxNow);
+                    if (call == null && isCurrentListener(generation)) {
+                        fromTargetBytes.addAndGet(count);
+                        if (mainDc) recordMainDcRx(count, rxNow);
+                    }
                     boolean first = fromTarget.getAndAdd(count) == 0L;
                     if (first) {
                         onDirectLayer1Success();
@@ -4661,7 +4737,9 @@ public class ColgramDpiBypass {
         final android.net.VpnService retryVpn = (call != null) ? call.vpn : activeSystemDpiVpn;
         final ColgramDohResolver.SocketProtector retryProt = retryVpn != null ? retryVpn::protect : null;
         final ColgramNativeDesync.FdProtector retryFdProt = retryVpn != null ? retryVpn::protect : null;
-        final ActiveSession tracked = registerActiveSession(client, session, true);
+        final boolean initialMainDc = !ColgramTelegramWsBridge.Obfuscated2FrameSplitter.isMediaDcId(
+                session.rawDcId != 0 ? session.rawDcId : session.dcId);
+        final ActiveSession tracked = registerActiveSession(client, session, true, initialMainDc);
 
         if (!executeWorker(() -> {
             try {
@@ -4858,7 +4936,12 @@ public class ColgramDpiBypass {
                                         + " sni=" + stepSession.sniHost + " bytes=" + count
                                         + (call != null ? " (sysdpi)" : ""));
                             }
-                            if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(count);
+                            if (call == null && isCurrentListener(generation)) {
+                                fromTargetBytes.addAndGet(count);
+                                boolean stepMainDc = !ColgramTelegramWsBridge.Obfuscated2FrameSplitter.isMediaDcId(
+                                        stepSession.rawDcId != 0 ? stepSession.rawDcId : stepSession.dcId);
+                                if (stepMainDc) recordMainDcRx(count, rxNow);
+                            }
                         });
                         waitWhileFailoverOrInitPending(failoverMonitor, failoverInProgress, initPhasePending,
                                 !viaL3Relay && totalS2C == 0L && !clientClosedFirst.get(), 6000L);
@@ -5574,9 +5657,10 @@ public class ColgramDpiBypass {
         // the identical auth_key from two IPs simultaneously and revokes the session (AUTH_KEY_DUPLICATED).
         // Direct raw -> direct official WSS (/apiws) stays enabled because both share the device's IP.
         final boolean l3HandoffCapable = !overlayActive && !telegram && isEligibleForL3RelayCascade(destHost, destPort);
+        final boolean mainDc = telegram && !isMedia;
         final int chosenStrategyVal = pickStrategyForHost(hostKey);
         final java.util.concurrent.atomic.AtomicReference<ActiveSession> trackedRef =
-                new java.util.concurrent.atomic.AtomicReference<>(registerActiveSession(client, dest, telegram));
+                new java.util.concurrent.atomic.AtomicReference<>(registerActiveSession(client, dest, telegram, mainDc));
         final java.util.concurrent.atomic.AtomicBoolean t2cDone =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
         final java.util.concurrent.CountDownLatch t2cLatch =
@@ -5829,15 +5913,22 @@ public class ColgramDpiBypass {
                     }
                 }
                 fromTarget.addAndGet(len);
-                if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(len);
+                if (call == null && isCurrentListener(generation)) {
+                    fromTargetBytes.addAndGet(len);
+                    if (mainDc) recordMainDcRx(len, safeElapsedRealtime());
+                }
                 cout.write(buffer, 0, len);
                 cout.flush();
                 while ((len = din.read(buffer)) != -1) {
+                    long loopNow = safeElapsedRealtime();
                     lastRxAt.set(System.currentTimeMillis());
                     ActiveSession tLoop = trackedRef.get();
-                    if (tLoop != null) tLoop.onUpstreamRx(safeElapsedRealtime());
+                    if (tLoop != null) tLoop.onUpstreamRx(loopNow);
                     fromTarget.addAndGet(len);
-                    if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(len);
+                    if (call == null && isCurrentListener(generation)) {
+                        fromTargetBytes.addAndGet(len);
+                        if (mainDc) recordMainDcRx(len, loopNow);
+                    }
                     cout.write(buffer, 0, len);
                     flushIfDrained(din, cout);
                 }
@@ -5914,13 +6005,15 @@ public class ColgramDpiBypass {
                             }
                             wsDialDone.countDown();
                             if (wsPublished) {
-                                ActiveSession wsTracked = registerActiveSession(client, ws, telegram);
+                                final boolean wsMainDc = telegram && !mediaDc;
+                                ActiveSession wsTracked = registerActiveSession(client, ws, telegram, wsMainDc);
                                 wsTracked.onClientTx(safeElapsedRealtime());
                                 unregisterActiveSession(trackedRef.getAndSet(wsTracked));
                                 OutputStream cout = client.getOutputStream();
                                 final ColgramTelegramWsBridge.WsSession activeSession = ws;
                                 ColgramTelegramWsBridge.pumpUpstreamFrames(ws, cout, count -> {
-                                    wsTracked.onUpstreamRx(safeElapsedRealtime());
+                                    long wsRxNow = safeElapsedRealtime();
+                                    wsTracked.onUpstreamRx(wsRxNow);
                                     boolean first = fromTarget.getAndAdd(count) == 0L;
                                     if (first && telegram && call == null) {
                                         onDirectLayer1Success();
@@ -5929,7 +6022,10 @@ public class ColgramDpiBypass {
                                                 + " edge=" + activeSession.edgeIp
                                                 + " sni=" + activeSession.sniHost + " bytes=" + count);
                                     }
-                                    if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(count);
+                                    if (call == null && isCurrentListener(generation)) {
+                                        fromTargetBytes.addAndGet(count);
+                                        if (wsMainDc) recordMainDcRx(count, wsRxNow);
+                                    }
                                 });
                             }
                         }
@@ -5955,7 +6051,7 @@ public class ColgramDpiBypass {
                             }
                             wsDialDone.countDown();
                             if (l3Published) {
-                                ActiveSession l3Tracked = registerActiveSession(client, l3RelaySock, telegram);
+                                ActiveSession l3Tracked = registerActiveSession(client, l3RelaySock, telegram, mainDc);
                                 l3Tracked.onClientTx(safeElapsedRealtime());
                                 unregisterActiveSession(trackedRef.getAndSet(l3Tracked));
                                 InputStream l3In = l3RelaySock.getInputStream();
@@ -5971,7 +6067,10 @@ public class ColgramDpiBypass {
                                     if (first && call == null) {
                                         publishUpstream(generation, UPSTREAM_REPLY);
                                     }
-                                    if (call == null && isCurrentListener(generation)) fromTargetBytes.addAndGet(n);
+                                    if (call == null && isCurrentListener(generation)) {
+                                        fromTargetBytes.addAndGet(n);
+                                        if (mainDc) recordMainDcRx(n, l3Now);
+                                    }
                                     cout.write(buffer, 0, n);
                                     flushIfDrained(l3In, cout);
                                 }
@@ -6042,163 +6141,166 @@ public class ColgramDpiBypass {
             new java.util.concurrent.Semaphore(16);
 
     private static void pumpAssociated(final java.net.DatagramSocket udp, final Socket client, long generation) {
-        if (!executeWorker(() -> {
-            byte[] packetBuf = borrowUdpBuffer();
-            byte[] chunk = borrowUdpBuffer();
-            byte[] hdr = new byte[10 + 65500];
-            java.net.DatagramPacket packet = new java.net.DatagramPacket(packetBuf, 65535);
-            java.net.DatagramPacket sendPkt = new java.net.DatagramPacket(hdr, hdr.length);
+        final java.util.Map<InetSocketAddress, java.net.DatagramSocket> upstreams =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.concurrent.atomic.AtomicReference<InetSocketAddress> clientUdpRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        final byte[] packetBuf = borrowUdpBuffer();
+        Thread controlWatcher = new Thread(() -> {
+            byte[] discard = new byte[128];
             try {
-                while (isCurrentListener(generation)) {
-                    packet.setLength(65535);
-                    udp.receive(packet);
-                    int pktLen = packet.getLength();
-                    if (pktLen < 10) continue;
-                    int hostAt;
-                    int hostLen;
-                    int atyp = packet.getData()[3] & 0xff;
-                    if (atyp == 1) {
-                        hostAt = 4;
-                        hostLen = 4;
-                    } else if (atyp == 4) {
-                        hostAt = 4;
-                        hostLen = 16;
-                    } else if (atyp == 3) {
-                        hostAt = 5;
-                        hostLen = packet.getData()[4] & 0xff;
-                    } else {
-                        continue;
-                    }
-                    int portAt = hostAt + hostLen;
-                    if (portAt + 2 > pktLen) continue;
-                    byte[] raw = new byte[hostLen];
-                    System.arraycopy(packet.getData(), hostAt, raw, 0, hostLen);
-                    String host = atyp == 3
-                            ? new String(raw, StandardCharsets.UTF_8)
-                            : InetAddress.getByAddress(raw).getHostAddress();
-                    int port = ((packet.getData()[portAt] & 0xFF) << 8)
-                            | (packet.getData()[portAt + 1] & 0xFF);
-                    int payloadAt = portAt + 2;
-                    int payloadLen = pktLen - payloadAt;
-                    if (payloadLen <= 0) continue;
-                    final InetAddress clientAddr = packet.getAddress();
-                    final int clientUdpPort = packet.getPort();
-
-                    Socket up = connectWithBackoff(host, port, generation);
-                    if (up == null) continue;
-                    try {
-                        up.getOutputStream().write(packet.getData(), payloadAt, payloadLen);
-                        up.getOutputStream().flush();
-                        int n = up.getInputStream().read(chunk, 0, 65500);
-                        if (n > 0 && clientAddr != null && clientUdpPort > 0) {
-                            hdr[0] = 0;
-                            hdr[1] = 0;
-                            hdr[2] = 0;
-                            hdr[3] = 1;
-                            if (atyp == 1 && raw.length == 4) {
-                                System.arraycopy(raw, 0, hdr, 4, 4);
-                            } else {
-                                hdr[4] = 0;
-                                hdr[5] = 0;
-                                hdr[6] = 0;
-                                hdr[7] = 0;
-                            }
-                            hdr[8] = (byte) ((port >> 8) & 0xff);
-                            hdr[9] = (byte) (port & 0xff);
-                            System.arraycopy(chunk, 0, hdr, 10, n);
-                            sendPkt.setData(hdr, 0, 10 + n);
-                            sendPkt.setAddress(clientAddr);
-                            sendPkt.setPort(clientUdpPort);
-                            udp.send(sendPkt);
-                        }
-                    } finally {
-                        closeQuietly(up);
-                    }
+                InputStream in = client.getInputStream();
+                while (in.read(discard) >= 0) {
+                    if (!isCurrentListener(generation)) break;
                 }
             } catch (Throwable ignored) {
-                // A closed control connection is the normal way this ends.
             } finally {
-                recycleUdpBuffer(chunk);
-                recycleUdpBuffer(packetBuf);
-                udp.close();
+                closeQuietly(udp);
                 closeQuietly(client);
             }
-        })) {
-            udp.close();
-            closeQuietly(client);
-            return;
-        }
-
-        // Outbound: the client's framed datagrams arrive on the control connection, and this is the
-        // loop that turns them into connections.
+        }, "colgram-socks-udp-ctrl");
+        controlWatcher.setDaemon(true);
         try {
-            java.io.InputStream in = client.getInputStream();
-            while (isCurrentListener(generation)) {
-                byte[] head = ColgramSocks5Codec.readFully(in, 4);
-                int atyp = head[3] & 0xff;
-                int len;
-                if (atyp == 1) {
-                    len = 4 + 2;
-                } else if (atyp == 4) {
-                    len = 16 + 2;
-                } else if (atyp == 3) {
-                    len = 1 + (ColgramSocks5Codec.readByte(in) & 0xff) + 2;
-                } else {
-                    return;
-                }
-                byte[] rest = ColgramSocks5Codec.readFully(in, len);
+            udp.setSoTimeout(180_000);
+            controlWatcher.start();
+            java.net.DatagramPacket packet = new java.net.DatagramPacket(packetBuf, packetBuf.length);
+            while (isCurrentListener(generation) && !udp.isClosed() && !client.isClosed()) {
+                packet.setLength(packetBuf.length);
+                udp.receive(packet);
+                int pktLen = packet.getLength();
+                if (pktLen < 10) continue;
+                byte[] data = packet.getData();
+                if ((data[2] & 0xff) != 0) continue; // RFC 1928: drop fragmented UDP datagrams
+                int atyp = data[3] & 0xff;
                 int hostAt;
                 int hostLen;
-                if (atyp == 3) {
-                    hostAt = 1;
-                    hostLen = rest[0] & 0xff;
+                if (atyp == 1) {
+                    hostAt = 4;
+                    hostLen = 4;
+                } else if (atyp == 4) {
+                    hostAt = 4;
+                    hostLen = 16;
+                } else if (atyp == 3) {
+                    hostAt = 5;
+                    hostLen = data[4] & 0xff;
                 } else {
-                    hostAt = 0;
-                    hostLen = atyp == 1 ? 4 : 16;
-                }
-                byte[] raw = new byte[hostLen];
-                System.arraycopy(rest, hostAt, raw, 0, hostLen);
-                String host = atyp == 3
-                        ? new String(raw, StandardCharsets.UTF_8)
-                        : InetAddress.getByAddress(raw).getHostAddress();
-                int portAt = hostAt + hostLen;
-                int port = ((rest[portAt] & 0xFF) << 8) | (rest[portAt + 1] & 0xFF);
-                int payloadAt = portAt + 2;
-                int payloadLen = rest.length - payloadAt;
-                if (payloadLen <= 0) continue;
-
-                if (!ASSOCIATE_DATAGRAM_SLOTS.tryAcquire()) continue;
-                Socket up = connectWithBackoff(host, port, generation);
-                if (up == null) {
-                    ASSOCIATE_DATAGRAM_SLOTS.release();
                     continue;
                 }
-                final Socket sock = up;
-                final byte[] payload = new byte[payloadLen];
-                System.arraycopy(rest, payloadAt, payload, 0, payloadLen);
-                if (!executeWorker(() -> {
-                    byte[] chunk = borrowUdpBuffer();
-                    try {
-                        sock.setSoTimeout(5000);
-                        sock.getOutputStream().write(payload);
-                        sock.getOutputStream().flush();
-                        int n = sock.getInputStream().read(chunk);
-                        if (n > 0) {
-                            udp.send(new java.net.DatagramPacket(chunk, n,
-                                    InetAddress.getByName("127.0.0.1"), client.getLocalPort()));
-                        }
-                    } catch (Throwable ignored) {
-                    } finally {
-                        recycleUdpBuffer(chunk);
-                        closeQuietly(sock);
-                        ASSOCIATE_DATAGRAM_SLOTS.release();
+                int portAt = hostAt + hostLen;
+                if (portAt + 2 > pktLen) continue;
+                byte[] raw = new byte[hostLen];
+                System.arraycopy(data, hostAt, raw, 0, hostLen);
+                InetAddress targetAddr = null;
+                if (atyp == 3) {
+                    String host = new String(raw, StandardCharsets.UTF_8);
+                    android.net.VpnService protVpn = activeSystemDpiVpn;
+                    targetAddr = protVpn != null
+                            ? ColgramDohResolver.resolveProtected(host, protVpn::protect)
+                            : ColgramDohResolver.resolveOrNull(host);
+                    if (targetAddr == null
+                            && !(ColgramConfig.isDohEnabled()
+                                    && (ColgramConfig.isStrictProxySecurityEnabled()
+                                            || ColgramConfig.isMaxAnonymityEnabled()))) {
+                        try { targetAddr = InetAddress.getByName(host); } catch (Throwable ignored) {}
                     }
-                })) {
-                    closeQuietly(sock);
-                    ASSOCIATE_DATAGRAM_SLOTS.release();
+                } else {
+                    targetAddr = InetAddress.getByAddress(raw);
+                }
+                if (targetAddr == null || targetAddr.isAnyLocalAddress()
+                        || targetAddr.isLoopbackAddress() || targetAddr.isMulticastAddress()) {
+                    continue;
+                }
+                int port = ((data[portAt] & 0xFF) << 8) | (data[portAt + 1] & 0xFF);
+                if (port <= 0) continue;
+                int payloadAt = portAt + 2;
+                int payloadLen = pktLen - payloadAt;
+                if (payloadLen <= 0) continue;
+
+                InetAddress clientAddr = packet.getAddress();
+                int clientUdpPort = packet.getPort();
+                if (clientAddr == null || clientUdpPort <= 0) continue;
+                clientUdpRef.set(new InetSocketAddress(clientAddr, clientUdpPort));
+
+                InetSocketAddress target = new InetSocketAddress(targetAddr, port);
+                java.net.DatagramSocket upstream = upstreams.get(target);
+                if (upstream == null) {
+                    if (upstreams.size() >= 64) continue;
+                    java.net.DatagramSocket created = new java.net.DatagramSocket(null);
+                    try {
+                        android.net.VpnService sysVpn = activeSystemDpiVpn;
+                        if (sysVpn != null && !sysVpn.protect(created)) {
+                            closeQuietly(created);
+                            continue;
+                        }
+                        created.connect(target);
+                        created.setSoTimeout(120_000);
+                    } catch (Throwable failed) {
+                        closeQuietly(created);
+                        continue;
+                    }
+                    java.net.DatagramSocket existing = upstreams.putIfAbsent(target, created);
+                    if (existing != null) {
+                        closeQuietly(created);
+                        upstream = existing;
+                    } else {
+                        upstream = created;
+                        final java.net.DatagramSocket peerSock = created;
+                        final InetSocketAddress peerAddr = target;
+                        if (!executeWorker(() -> {
+                            byte[] chunk = borrowUdpBuffer();
+                            byte[] hdr = borrowUdpBuffer();
+                            try {
+                                byte[] srcIp = peerAddr.getAddress().getAddress();
+                                int hdrLen = 6 + srcIp.length;
+                                hdr[0] = 0;
+                                hdr[1] = 0;
+                                hdr[2] = 0;
+                                hdr[3] = (byte) (srcIp.length == 4 ? 1 : 4);
+                                System.arraycopy(srcIp, 0, hdr, 4, srcIp.length);
+                                hdr[hdrLen - 2] = (byte) ((peerAddr.getPort() >>> 8) & 0xff);
+                                hdr[hdrLen - 1] = (byte) (peerAddr.getPort() & 0xff);
+                                java.net.DatagramPacket rxPkt = new java.net.DatagramPacket(chunk, chunk.length);
+                                java.net.DatagramPacket txPkt = new java.net.DatagramPacket(hdr, hdrLen);
+                                while (isCurrentListener(generation) && !udp.isClosed() && !peerSock.isClosed()) {
+                                    rxPkt.setLength(chunk.length);
+                                    peerSock.receive(rxPkt);
+                                    int n = rxPkt.getLength();
+                                    if (n <= 0 || hdrLen + n > hdr.length) continue;
+                                    InetSocketAddress replyTo = clientUdpRef.get();
+                                    if (replyTo == null) continue;
+                                    System.arraycopy(chunk, 0, hdr, hdrLen, n);
+                                    txPkt.setData(hdr, 0, hdrLen + n);
+                                    txPkt.setAddress(replyTo.getAddress());
+                                    txPkt.setPort(replyTo.getPort());
+                                    udp.send(txPkt);
+                                }
+                            } catch (Throwable ignored) {
+                            } finally {
+                                recycleUdpBuffer(chunk);
+                                recycleUdpBuffer(hdr);
+                                closeQuietly(peerSock);
+                                upstreams.remove(peerAddr, peerSock);
+                            }
+                        })) {
+                            upstreams.remove(target, created);
+                            closeQuietly(created);
+                            continue;
+                        }
+                    }
+                }
+                if (upstream != null && !upstream.isClosed()) {
+                    upstream.send(new java.net.DatagramPacket(data, payloadAt, payloadLen));
                 }
             }
         } catch (Throwable ignored) {
+        } finally {
+            for (java.net.DatagramSocket s : upstreams.values()) {
+                closeQuietly(s);
+            }
+            upstreams.clear();
+            recycleUdpBuffer(packetBuf);
+            closeQuietly(udp);
+            closeQuietly(client);
         }
     }
 

@@ -205,16 +205,40 @@ public final class ColgramBrowserRoutes {
         });
     }
 
+    private static final java.util.concurrent.ExecutorService ROUTE_BIND_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "colgram-browser-route");
+                t.setDaemon(true);
+                return t;
+            });
+
     public static void applyToWebView(WebView webView) {
         if (webView == null) return;
-        Decision decision = evaluate(true);
+        Mode selected = mode();
         boolean strictOrAnon = ColgramConfig.isStrictProxySecurityEnabled() || ColgramConfig.isMaxAnonymityEnabled();
-        boolean needsProxyRule = decision.mode != Mode.CURRENT || ColgramConfig.isMaxAnonymityEnabled();
+        boolean needsProxyRule = selected != Mode.CURRENT || ColgramConfig.isMaxAnonymityEnabled();
         ProxyGateState gate = gateFor(webView);
         synchronized (PROXY_GATE_LOCK) {
             gate.ready = false;
             gate.failed = false;
         }
+        boolean needsAsyncBind = (selected == Mode.LOCAL_DPI && !ColgramDpiBypass.isBound())
+                || selected == Mode.SOCKS5;
+        if (needsAsyncBind) {
+            ROUTE_BIND_EXECUTOR.execute(() -> {
+                Decision decision = evaluate(true);
+                webView.post(() -> applyWebViewProxyOverride(webView, decision, strictOrAnon, needsProxyRule));
+            });
+        } else {
+            Decision decision = evaluate(false);
+            applyWebViewProxyOverride(webView, decision, strictOrAnon, needsProxyRule);
+        }
+        applyWebViewHardening(webView, selected == Mode.SOCKS5 || strictOrAnon);
+    }
+
+    private static void applyWebViewProxyOverride(WebView webView, Decision decision,
+                                                  boolean strictOrAnon, boolean needsProxyRule) {
+        if (webView == null) return;
         boolean asyncCallbackScheduled = false;
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
@@ -228,6 +252,10 @@ public final class ColgramBrowserRoutes {
                             () -> completeProxyGate(webView, true));
                     asyncCallbackScheduled = true;
                 } else if (needsProxyRule && strictOrAnon) {
+                    notifyProxyOverrideIssue(webView,
+                            "Встроенный браузер заблокирован",
+                            "Не удалось поднять прокси-маршрут WebView (" + decision.mode.label + ")",
+                            true);
                     ProxyController.getInstance().clearProxyOverride(Runnable::run,
                             () -> completeProxyGate(webView, false));
                     asyncCallbackScheduled = true;
@@ -236,12 +264,25 @@ public final class ColgramBrowserRoutes {
                             () -> completeProxyGate(webView, true));
                     asyncCallbackScheduled = true;
                 }
-            } else if (needsProxyRule && strictOrAnon) {
-                completeProxyGate(webView, false);
-                asyncCallbackScheduled = true;
+            } else {
+                boolean failClosed = needsProxyRule && strictOrAnon;
+                notifyProxyOverrideIssue(webView,
+                        failClosed ? "Встроенный браузер заблокирован" : "Браузер открыт напрямую",
+                        failClosed
+                                ? "System WebView не поддерживает PROXY_OVERRIDE при строгой политике"
+                                : "System WebView не поддерживает PROXY_OVERRIDE — прокси не применён",
+                        failClosed);
+                if (failClosed) {
+                    completeProxyGate(webView, false);
+                    asyncCallbackScheduled = true;
+                }
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
             if (needsProxyRule && strictOrAnon) {
+                notifyProxyOverrideIssue(webView,
+                        "Ошибка прокси WebView",
+                        t.getClass().getSimpleName(),
+                        true);
                 completeProxyGate(webView, false);
                 asyncCallbackScheduled = true;
             }
@@ -249,9 +290,19 @@ public final class ColgramBrowserRoutes {
         if (!asyncCallbackScheduled) {
             completeProxyGate(webView, !(needsProxyRule && strictOrAnon));
         }
+    }
+
+    private static void notifyProxyOverrideIssue(WebView webView, String title, String subtitle, boolean isError) {
+        try {
+            org.colgram.core.ColgramUiBridge.postNotice(webView != null ? webView.getContext() : null,
+                    title, subtitle, isError);
+        } catch (Throwable ignored) {}
+    }
+
+    private static void applyWebViewHardening(WebView webView, boolean strictFallback) {
         try {
             WebSettings settings = webView.getSettings();
-            boolean harden = decision.strictHttpsOnly
+            boolean harden = strictFallback
                     || org.colgram.core.ColgramHookHandler.shouldHardenWebView()
                     || ColgramConfig.isMaxAnonymityEnabled();
             if (harden) {

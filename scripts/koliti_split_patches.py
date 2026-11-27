@@ -392,6 +392,17 @@ def _configure_standalone_gradle(repo_path: str) -> None:
         count=1,
     )
 
+    if "sourceSets.release" not in text and re.search(r'\bsourceSets\s*\{[^}]*\brelease\s*\{', text) is None:
+        ss_match = re.search(r'^([ \t]*)sourceSets\.standalone\s*\{', text, flags=re.MULTILINE)
+        if ss_match is not None:
+            ind = ss_match.group(1)
+            rel_ss = (
+                f"{ind}sourceSets.release {{\n"
+                f"{ind}    manifest.srcFile '../TMessagesProj/config/release/AndroidManifest_standalone.xml'\n"
+                f"{ind}}}\n"
+            )
+            text = text[:ss_match.start()] + rel_ss + text[ss_match.start():]
+
     # P0-2: explicit release buildType (no applicationIdSuffix) enabling R8 shrinking & resource shrinking
     bt_match = re.search(
         r'(^[ \t]*buildTypes\s*\{[\s\S]*?\n)([ \t]*)(standalone\s*\{)',
@@ -449,13 +460,13 @@ def _configure_proguard_rules(repo_path: str) -> None:
         return
     with open(rules_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
         raw = fh.read()
-    if "# COLGRAM_R8_KEEP_RULES = 3" in raw:
+    if "# COLGRAM_R8_KEEP_RULES = 4" in raw:
         return
     eol = "\r\n" if "\r\n" in raw else "\n"
     text = raw.replace("\r\n", "\n")
-    text = re.sub(r"\n*# COLGRAM_R8_KEEP_RULES = (?:1|2)[\s\S]*$", "", text).rstrip("\n")
+    text = re.sub(r"\n*# COLGRAM_R8_KEEP_RULES = (?:1|2|3)[\s\S]*$", "", text).rstrip("\n")
     block = (
-        "\n\n# COLGRAM_R8_KEEP_RULES = 3\n"
+        "\n\n# COLGRAM_R8_KEEP_RULES = 4\n"
         "-dontobfuscate\n"
         "-keepclasseswithmembernames,includedescriptorclasses class * {\n"
         "    native <methods>;\n"
@@ -478,6 +489,7 @@ def _configure_proguard_rules(repo_path: str) -> None:
         "-keep class androidx.collection.LongSparseArray { *; }\n"
         "-keep class androidx.core.content.FileProvider { *; }\n"
         "-keep class io.nekohasekai.** { *; }\n"
+        "-keep class go.** { *; }\n"
         "-keep class com.chaquo.** { *; }\n"
         "-keep class com.wireguard.** { *; }\n"
         "-keep class com.k2fsa.sherpa.** { *; }\n"
@@ -485,6 +497,7 @@ def _configure_proguard_rules(repo_path: str) -> None:
         "-keep class com.google.gson.** { *; }\n"
         "-dontwarn com.chaquo.**\n"
         "-dontwarn io.nekohasekai.**\n"
+        "-dontwarn go.**\n"
         "-dontwarn com.wireguard.**\n"
         "-dontwarn com.k2fsa.sherpa.**\n"
         "-dontwarn com.google.mlkit.**\n"
@@ -506,7 +519,7 @@ def _configure_proguard_rules(repo_path: str) -> None:
     updated = (text + block).replace("\n", eol)
     with open(rules_path, "w", encoding="utf-8", newline="") as fh:
         fh.write(updated)
-    print(" [+] Appended safe Colgram R8 keep & -dontobfuscate rules (v2) to TMessagesProj/proguard-rules.pro")
+    print(" [+] Appended safe Colgram R8 keep & -dontobfuscate rules (v4) to TMessagesProj/proguard-rules.pro")
 
 
 def _configure_llama_gradle(repo_path: str, koliti_enabled: bool) -> None:
@@ -582,6 +595,14 @@ def _sync_koliti_assets_and_native(repo_path: str, koliti_enabled: bool) -> None
 
     if os.path.isdir(core_build_dir):
         shutil.rmtree(core_build_dir, ignore_errors=True)
+    for stale_rel in (
+        os.path.join("TMessagesProj_AppStandalone", "build", "intermediates", "merged_native_libs"),
+        os.path.join("TMessagesProj_AppStandalone", "build", "intermediates", "stripped_native_libs"),
+        os.path.join("TMessagesProj_AppStandalone", "build", "intermediates", "merged_jni_libs"),
+    ):
+        stale_dir = os.path.join(repo_path, stale_rel)
+        if os.path.isdir(stale_dir):
+            shutil.rmtree(stale_dir, ignore_errors=True)
 
     if not koliti_enabled:
         if os.path.isdir(llama_dir):
@@ -859,7 +880,29 @@ def _configure_proxy_list_telemetry(repo_path: str, eol_patch_fn) -> None:
         return
     with open(proxy_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
         norm = fh.read().replace("\r\n", "\n")
-    if "colgramHeroRow" not in norm or "VIEW_TYPE_COLGRAM_TELEMETRY" in norm:
+    if "VIEW_TYPE_COLGRAM_TELEMETRY" in norm:
+        old_id_pair = (
+            "            if (position == colgramHeroRow) {\n"
+            "                return -24;\n"
+            "            } else if (position == colgramTelemetryRow) {\n"
+            "                return -25;"
+        )
+        new_id_pair = (
+            "            if (position == colgramHeroRow) {\n"
+            "                return -24;\n"
+            "            } else if (position == colgramTelemetryRow) {\n"
+            "                return -26;"
+        )
+        if old_id_pair in norm:
+            _patch_text_replace_eol(
+                proxy_path,
+                old_id_pair,
+                new_id_pair,
+                "ProxyListActivity colgramTelemetryRow stable itemId (-26)",
+                eol_patch_fn,
+            )
+        return
+    if "colgramHeroRow" not in norm:
         return
     specs = (
         (
@@ -905,7 +948,7 @@ def _configure_proxy_list_telemetry(repo_path: str, eol_patch_fn) -> None:
         (
             "ProxyListActivity colgramTelemetryRow itemId",
             "            if (position == colgramHeroRow) {\n                return -24;",
-            "            if (position == colgramHeroRow) {\n                return -24;\n            } else if (position == colgramTelemetryRow) {\n                return -25;",
+            "            if (position == colgramHeroRow) {\n                return -24;\n            } else if (position == colgramTelemetryRow) {\n                return -26;",
         ),
         (
             "ProxyListActivity colgramTelemetryRow itemViewType",

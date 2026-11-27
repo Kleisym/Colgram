@@ -40,6 +40,20 @@ class CallSocksTunnelTest(unittest.TestCase):
         dpi = (CORE / "ColgramDpiBypass.java").read_text(encoding="utf-8")
         self.assertIn("ColgramCallUdpRelay.serve", dpi)
         self.assertIn("owner.protect(socket)", dpi)
+        self.assertIn("if (ColgramConfig.isDohEnabled()", dpi)
+
+    def test_system_dpi_exposes_teardown_wait_and_redacted_fgs_errors(self):
+        api = (CORE / "ColgramCallSocksTunnel.java").read_text(encoding="utf-8")
+        self.assertIn("public static boolean awaitStopped(", api)
+        self.assertIn("public static String systemDpiLastError(", api)
+        service = SERVICE.read_text(encoding="utf-8")
+        self.assertIn("public static synchronized String lastError()", service)
+        self.assertIn("public static synchronized String activeState()", service)
+        self.assertIn("FGS_START_FAILED", service)
+        self.assertNotIn("t.getMessage()", service)
+        manifest = (ROOT / "colgram-core/src/main/AndroidManifest.xml").read_text(encoding="utf-8")
+        self.assertIn("PROPERTY_SPECIAL_USE_FGS_SUBTYPE", manifest)
+        self.assertNotIn("PROPERTY_SPECIAL_USE_FGS_SUBJECT", manifest)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
     private static long controlGeneration;
     private static String controlProfile;
     private static String controlState = "stopped";
+    private static volatile String lastErrorCode;
     private static AppProfile pendingAppProfile;
 
     private CommandServer server;
@@ -58,6 +59,29 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
 
     public static synchronized String status(String profilePath, long generation) {
         return generation == controlGeneration ? status(profilePath) : "stopped";
+    }
+
+    public static synchronized String activeState() {
+        return controlState;
+    }
+
+    public static synchronized String lastError() {
+        return lastErrorCode;
+    }
+
+    private static String classifyStartError(Throwable t) {
+        if (t == null) return "VPN_START_FAILED";
+        if (t instanceof SecurityException) return "VPN_SECURITY_DENIED";
+        if (t instanceof FgsStartException) return "FGS_START_FAILED";
+        if (t instanceof IllegalStateException && "TUN_ESTABLISH_FAILED".equals(lastErrorCode)) {
+            return "TUN_ESTABLISH_FAILED";
+        }
+        String simple = t.getClass().getSimpleName();
+        return (simple != null && !simple.isEmpty()) ? ("VPN_" + simple) : "VPN_START_FAILED";
+    }
+
+    private static final class FgsStartException extends IllegalStateException {
+        FgsStartException() { super("FGS_START_FAILED"); }
     }
 
     /**
@@ -91,10 +115,12 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         intent.putExtra(EXTRA_GENERATION, ++controlGeneration);
         controlProfile = profilePath;
         controlState = "starting";
+        lastErrorCode = null;
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent);
             else context.startService(intent);
         } catch (RuntimeException failure) {
+            lastErrorCode = classifyStartError(failure);
             controlState = "failed";
             if (pendingAppProfile != null) {
                 pendingAppProfile.close();
@@ -194,7 +220,14 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             return START_NOT_STICKY;
         }
         // Satisfy the foreground start deadline even if a newer request invalidated this one.
-        startForegroundCompat();
+        if (!startForegroundCompat()) {
+            synchronized (ColgramVpnService.class) {
+                lastErrorCode = "FGS_START_FAILED";
+                controlState = "failed";
+            }
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         long requestedGeneration = intent.getLongExtra(EXTRA_GENERATION, -1L);
         String path = intent.getStringExtra("profile");
         synchronized (ColgramVpnService.class) {
@@ -227,12 +260,26 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
                 if (startId >= 0) stopSelf(startId);
                 return;
             }
-            if (!tunEstablished) throw new IllegalStateException("Android did not establish a VPN interface");
+            if (!tunEstablished) {
+                synchronized (ColgramVpnService.class) {
+                    if (lastErrorCode == null) lastErrorCode = "TUN_ESTABLISH_FAILED";
+                }
+                throw new IllegalStateException("Android did not establish a VPN interface");
+            }
+            if (!startForegroundCompat()) {
+                synchronized (ColgramVpnService.class) {
+                    lastErrorCode = "FGS_START_FAILED";
+                }
+                throw new FgsStartException();
+            }
             publishState("running");
-            startForegroundCompat();
         } catch (Throwable t) {
             // Engine errors may contain profile configuration (provider secrets).
-            Log.e(TAG, "tunnel start failed: " + t.getClass().getSimpleName());
+            String code = classifyStartError(t);
+            synchronized (ColgramVpnService.class) {
+                if (lastErrorCode == null) lastErrorCode = code;
+            }
+            Log.e(TAG, "tunnel start failed: " + code);
             publishState("failed");
             new ColgramNotification(this).fail("Проверьте выбранный узел и разрешение Android VPN.");
             releaseResources();
@@ -360,7 +407,7 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
         Log.i(TAG, "the engine is initialised, working in " + base.getAbsolutePath());
     }
 
-    private void startForegroundCompat() {
+    private boolean startForegroundCompat() {
         try {
             Notification notification = buildOngoingNotification();
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -368,8 +415,10 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             } else {
                 startForeground(FOREGROUND_ID, notification);
             }
+            return true;
         } catch (Throwable t) {
-            Log.w(TAG, "startForegroundCompat failed: " + t.getMessage());
+            Log.w(TAG, "startForegroundCompat failed: " + t.getClass().getSimpleName());
+            return false;
         }
     }
 
@@ -548,6 +597,9 @@ public final class ColgramVpnService extends VpnService implements ColgramTunCon
             }
             ParcelFileDescriptor descriptor = builder.establish();
             if (descriptor == null) {
+                synchronized (ColgramVpnService.class) {
+                    lastErrorCode = "TUN_ESTABLISH_FAILED";
+                }
                 Log.e(TAG, "establish() returned no descriptor");
             } else {
                 if (!ownsControl()) {

@@ -19,12 +19,28 @@ public class ColgramHookHandler {
 
     public static void init(Context context) {
         if (context == null || ColgramProcess.isMasqueProcess(context)) return;
+        appContext = context.getApplicationContext();
         try {
-            appContext = context.getApplicationContext();
             ColgramCrashGuard.install(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramCrashGuard init failed", t);
+        }
+        try {
             ColgramOptimizer.optimizeStartup(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramOptimizer init failed", t);
+        }
+        try {
             ColgramConfig.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramConfig init failed", t);
+        }
+        try {
             ColgramShieldConfig.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramShieldConfig init failed", t);
+        }
+        try {
             hookIoExecutor.execute(() -> {
                 try {
                     java.io.File cacheDir = appContext.getCacheDir();
@@ -34,9 +50,25 @@ public class ColgramHookHandler {
                     ColgramNativeDesync.runSelfTest();
                 } catch (Throwable ignored) {}
             });
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramNativeDesync warmup failed", t);
+        }
+        try {
             ColgramUnlimitedMemory.restore(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramUnlimitedMemory restore failed", t);
+        }
+        try {
             ColgramStorageSandbox.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramStorageSandbox init failed", t);
+        }
+        try {
             ColgramDatabase.getInstance(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramDatabase init failed", t);
+        }
+        try {
             // Registers the context only. The CPython runtime itself is started
             // lazily by ColgramPythonEngine.ensureInitialized() on first real use:
             // booting an interpreter (with its own libssl/libsqlite3 sockets) inside
@@ -44,16 +76,41 @@ public class ColgramHookHandler {
             // ConnectionSocket over the process descriptor table, which fdsan turns
             // into a SIGABRT in libtmessages.49.so.
             ColgramPythonEngine.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramPythonEngine init failed", t);
+        }
+        try {
             ColgramPluginManager.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramPluginManager init failed", t);
+        }
 
+        // Cross-Track Contract: built-in proxy activation MUST always run regardless of earlier subsystem failures.
+        try {
             // Proxy / DPI-bypass work is socket-heavy (local listener + TCP probes
             // + Telegram proxy reconfiguration). ColgramProxyManager defers it
             // internally; starting the bypass engine again here would defeat that,
             // so this method no longer calls ColgramDpiBypass.start() directly.
             ColgramProxyManager.activateBuiltinProxy(appContext);
+        } catch (Throwable t) {
+            android.util.Log.e("ColgramHookHandler", "ColgramProxyManager activate failed", t);
+        }
+        try {
             ColgramProxyDoctor.init(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramProxyDoctor init failed", t);
+        }
+        try {
             ColgramSecurityDefender.runStartupAutoHeal(appContext);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "ColgramSecurityDefender init failed", t);
+        }
+        try {
             ColgramOptimizer.scheduleAfterStartup(ColgramHookHandler::invokeBridgeStartScheduler);
+        } catch (Throwable t) {
+            android.util.Log.w("ColgramHookHandler", "Bridge scheduler init failed", t);
+        }
+        try {
             // WARP that was left on: re-establish it on every start (consent is already
             // granted system-wide after the first dialog; prepare() returns null then).
             if (ColgramConfig.isWarpEnabled()) {
@@ -75,8 +132,15 @@ public class ColgramHookHandler {
                 }, "colgram-warp-restore").start();
             }
         } catch (Throwable t) {
-            android.util.Log.e("ColgramHookHandler", "Error during Colgram initialization", t);
+            android.util.Log.w("ColgramHookHandler", "WARP restore launch failed", t);
         }
+    }
+
+    /** True when built-in DPI bypass may be auto-restarted (not WARP and not explicitly stopped). */
+    public static boolean canAutoRestartDpiBypass() {
+        return ColgramConfig.isBuiltinProxyEnabled()
+                && !ColgramConfig.isWarpEnabled()
+                && !ColgramDpiBypass.wasExplicitlyStopped();
     }
 
     /**
@@ -1608,6 +1672,27 @@ public class ColgramHookHandler {
         ColgramSpamGuard.recordOutgoingInteraction(userId);
     }
 
+    private static final ThreadLocal<java.util.List<ColgramDatabase.ShadowMessageRecord>> shadowBatchLocal =
+            new ThreadLocal<>();
+
+    public static void beginShadowCaptureBatch() {
+        if (shadowBatchLocal.get() == null) {
+            shadowBatchLocal.set(new java.util.ArrayList<>());
+        }
+    }
+
+    public static void flushShadowCaptureBatch() {
+        java.util.List<ColgramDatabase.ShadowMessageRecord> batch = shadowBatchLocal.get();
+        shadowBatchLocal.remove();
+        if (batch == null || batch.isEmpty() || appContext == null) return;
+        final Context ctx = appContext;
+        hookIoExecutor.execute(() -> {
+            try {
+                ColgramDatabase.getInstance(ctx).upsertShadowMessagesBatch(batch);
+            } catch (Throwable ignored) {}
+        });
+    }
+
     /** Captures zlib-compressed metadata into Lazy Shadow Vault without network traffic. */
     public static void captureShadowMessageMetadata(long dialogId, int messageId, long senderId,
                                                   int dateSec, int mediaType, long mediaSize,
@@ -1615,18 +1700,20 @@ public class ColgramHookHandler {
         if (appContext == null || dialogId == 0L || messageId <= 0) return;
         ColgramShieldConfig.init(appContext);
         if (!ColgramShieldConfig.isLazyShadowVaultEnabled()) return;
-        final long did = dialogId;
-        final int mid = messageId;
-        final long sid = senderId;
-        final int dt = dateSec;
-        final int mt = mediaType;
-        final long ms = mediaSize;
-        final String mj = metaJson;
-        final String pp = previewPath;
+        ColgramDatabase.ShadowMessageRecord rec = new ColgramDatabase.ShadowMessageRecord(
+                dialogId, messageId, senderId, dateSec, mediaType, mediaSize,
+                metaJson, previewPath, false, System.currentTimeMillis());
+        java.util.List<ColgramDatabase.ShadowMessageRecord> batch = shadowBatchLocal.get();
+        if (batch != null) {
+            batch.add(rec);
+            return;
+        }
+        final Context ctx = appContext;
         hookIoExecutor.execute(() -> {
             try {
-                ColgramDatabase.getInstance(appContext).upsertShadowMessage(
-                        did, mid, sid, dt, mt, ms, mj, pp, false);
+                ColgramDatabase.getInstance(ctx).upsertShadowMessage(
+                        rec.dialogId, rec.messageId, rec.senderId, rec.dateSec,
+                        rec.mediaType, rec.mediaSize, rec.metaJson, rec.previewPath, false);
             } catch (Throwable ignored) {}
         });
     }
@@ -1675,13 +1762,33 @@ public class ColgramHookHandler {
         });
     }
 
+    private static final java.util.Map<String, Boolean> verifiedShadowPreviewKeys =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<String, Boolean>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Boolean> eldest) {
+                    return size() > 2048;
+                }
+            });
+
     public static String getShadowPreviewPath(long dialogId, int messageId) {
         if (appContext == null || dialogId == 0L || messageId <= 0) return null;
-        String p = ColgramDatabase.getInstance(appContext).getShadowPreviewPath(dialogId, messageId);
-        if (p != null && !p.isEmpty() && new File(p).isFile()) {
-            return p;
+        final String p = ColgramDatabase.getInstance(appContext).getShadowPreviewPath(dialogId, messageId);
+        if (p == null || p.isEmpty()) {
+            return null;
         }
-        return null;
+        final String key = dialogId + ":" + messageId;
+        if (verifiedShadowPreviewKeys.put(key, Boolean.TRUE) == null) {
+            final Context ctx = appContext;
+            hookIoExecutor.execute(() -> {
+                try {
+                    if (!new File(p).isFile()) {
+                        verifiedShadowPreviewKeys.remove(key);
+                        ColgramDatabase.getInstance(ctx).clearShadowPreviewPath(dialogId, messageId);
+                    }
+                } catch (Throwable ignored) {}
+            });
+        }
+        return p;
     }
 
     public static void notifyMediaFileLoaded(File file) {

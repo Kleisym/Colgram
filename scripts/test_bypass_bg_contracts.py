@@ -38,6 +38,9 @@ TRACK_A_TELEGRAM_RELS = (
     "TMessagesProj/src/main/java/org/telegram/messenger/secretmedia/ExtendedDefaultDataSourceFactory.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/secretmedia/ExtendedDefaultDataSource.java",
     "TMessagesProj/src/main/java/org/telegram/ui/web/BotWebViewContainer.java",
+    "TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java",
+    "TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java",
+    "TMessagesProj/jni/tgnet/ConnectionsManager.cpp",
     "TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java",
 )
 IMAGE_LOADER_REL = TRACK_A_TELEGRAM_RELS[-1]
@@ -201,7 +204,8 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
 
         wd = extract_method(pm, "private static void connectionWatchdogTick()")
         self.assertIn("mainDcStallTimedOut", wd)
-        self.assertIn(">= 40_000L", wd)
+        self.assertIn(">= 16_000L", wd)
+        self.assertIn("hasRecentMainDcRxWithin(16_000L)", wd)
         self.assertIn("hasRecentRxWithin(25_000L)", wd)
         self.assertIn("maintainForegroundPrewarmIfNeeded(", wd)
 
@@ -215,8 +219,11 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertNotIn("tgnetForceReconnect(", fg)
         fr = extract_method(pm, "private static void tgnetForceReconnect(String reason)")
         self.assertIn("currentForceReconnectBackoffMs()", fr)
-        self.assertIn("FORCE_RECONNECT_MAX_BACKOFF_MS = 120_000L;", pm)
+        self.assertIn("FORCE_RECONNECT_COOLDOWN_MS = 4_500L;", pm)
+        self.assertIn("FORCE_RECONNECT_MAX_BACKOFF_MS = 30_000L;", pm)
         self.assertIn("tgCmNativeResumeNetwork", pm)
+        self.assertIn("public static void onTelegramProxyCleared()", pm)
+        self.assertIn("isTgnetProxyDetached()", pm)
 
         stop_bg = extract_method(pm, "private static void stopBackgroundFeedScraping()")
         self.assertIn("watchdogTask", stop_bg)
@@ -321,8 +328,10 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
                 shutil.copy2(ROOT / "Telegram-Src" / rel, dst)
 
             ap.PATCH_MISSES.clear()
+            ap.inject_bypass_boot_and_manifest_hotfixes(str(tmp_path))
             bypass_bg_patches.apply(str(tmp_path), ap.patch_file, ap._patch_file_eol)
             self.assertEqual(ap.PATCH_MISSES, [])
+            ap.inject_bypass_boot_and_manifest_hotfixes(str(tmp_path))
             bypass_bg_patches.apply(str(tmp_path), ap.patch_file, ap._patch_file_eol)
             self.assertEqual(ap.PATCH_MISSES, [])
 
@@ -336,14 +345,25 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             self.assertNotIn(".SmsReceiver", manifest_txt)
             self.assertNotIn(".RefererReceiver", manifest_txt)
             self.assertNotIn(".WearAuthListenerService", manifest_txt)
+            self.assertNotIn("PROPERTY_SPECIAL_USE_FGS_SUBJECT", manifest_txt)
+            self.assertGreaterEqual(manifest_txt.count("PROPERTY_SPECIAL_USE_FGS_SUBTYPE"), 2)
+            self.assertIn('<action android:name="android.net.VpnService" />', manifest_txt)
             ET.parse(manifest_path)
 
             al = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[1])
             self.assertIn("ColgramForegroundService.start(applicationContext)", al)
             self.assertIn("colgramLastCapRefreshMs", al)
+            self.assertLess(al.index("ColgramUiBridge.install(this)"), al.index("ColgramHookHandler.init(applicationContext)"))
 
             cm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[2])
-            self.assertIn("public static void colgramResetProxySignature()", cm)
+            self.assertEqual(cm.count("public static void colgramResetProxySignature()"), 1)
+            self.assertEqual(cm.count("public static String colgramGetLastProxySignature()"), 1)
+            self.assertEqual(cm.count("TL_contacts_sponsoredPeersEmpty"), 1)
+            self.assertEqual(cm.count("org.telegram.tgnet.Vector.Int::TLDeserialize"), 1)
+            self.assertIn("if (!enablePushConnection)", cm)
+            doh_task = extract_method(cm, "private static class ResolveHostByNameTask")
+            self.assertEqual(doh_task.count("ColgramDohResolver.resolve("), 1)
+            self.assertEqual(doh_task.count("ColgramDohResolver.resolveOrSystem("), 1)
             self.assertIn("TLRPC.TL_inputMediaGame", extract_method(cm, "private static boolean colgramIsDirectSendResponseSafe("))
             self.assertIn("colgramShouldDropFirewallRequest", cm)
             self.assertIn("isAllowingSpamMentionClear()", cm)
@@ -372,7 +392,8 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
 
             fl = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[7])
             self.assertIn("operation.totalBytesCount > 2 * 1024 * 1024 || isStory", fl)
-            load_int = extract_method(fl, "private FileLoadOperation loadFileInternal(")
+            load_int_idx = fl.rfind("private FileLoadOperation loadFileInternal(")
+            load_int = extract_method(fl[load_int_idx:], "private FileLoadOperation loadFileInternal(")
             self.assertNotIn("priority = PRIORITY_HIGH;", load_int)
             self.assertIn("priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX", load_int)
 
@@ -405,6 +426,24 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             self.assertNotIn("Mode.DIRECT", ext_ds_src)
             self.assertIn("org.colgram.core.ColgramBrowserRoutePolicy.Mode.CURRENT", ext_ds_src)
             self.assertEqual(ext_ds_src.count("dataSource = getColgramHttpDataSource();"), 1)
+            self.assertEqual(ext_ds_src.count("private DataSource getColgramHttpDataSource()"), 1)
+            self.assertEqual(ext_ds_src.count("DataSource colgramHttpDataSource;"), 1)
+            self.assertIn("if (!colgramHandedOff)", ext_ds_src)
+            self.assertIn("hasCallerUa", ext_ds_src)
+
+            shared_cfg = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java")
+            self.assertIn("ColgramProxyManager.onTelegramProxyCleared()", shared_cfg)
+            launch_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java")
+            self.assertIn("ColgramProxyManager.onTelegramProxyCleared()", launch_src)
+            proxy_act = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java")
+            self.assertIn("ColgramCallSocksTunnel.awaitStopped(app, 3000L)", proxy_act)
+            self.assertIn("ColgramCallSocksTunnel.systemDpiLastError(", proxy_act)
+            self.assertIn("ColgramProxyManager.recheckBypassListener()", proxy_act)
+            cpp_src = read_text(tmp_path / "TMessagesProj/jni/tgnet/ConnectionsManager.cpp")
+            self.assertLess(
+                cpp_src.index("networkManager->checkPendingTasks();"),
+                cpp_src.index("createPushConnection()"),
+            )
 
     def test_image_loader_converges_on_fresh_upstream_clone(self):
         sys.path.insert(0, str(ROOT / "scripts"))

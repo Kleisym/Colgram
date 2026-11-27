@@ -112,6 +112,10 @@ jobs:
 
       - name: Build Main APK (Universal 4-ABI, Zero Koliti)
         run: |
+          rm -rf Telegram-Src/TMessagesProj_AppStandalone/build/intermediates/merged_native_libs \
+                 Telegram-Src/TMessagesProj_AppStandalone/build/intermediates/stripped_native_libs \
+                 Telegram-Src/TMessagesProj_AppStandalone/build/intermediates/merged_jni_libs \
+                 Telegram-Src/colgram-core/build
           cd Telegram-Src
           chmod +x gradlew
           INIT_SCRIPT="$GITHUB_WORKSPACE/.github/gradle/ci-maven-mirror.init.gradle"
@@ -172,6 +176,12 @@ jobs:
               sys.exit(1)
           print("Main APK Koliti exclusion audit: PASS")
           ' "$APK"
+          USAGE_TXT="Telegram-Src/TMessagesProj_AppStandalone/build/outputs/mapping/afatRelease/usage.txt"
+          if [ -f "$USAGE_TXT" ] && grep -Eq "^go\.(Seq|Universe|error)" "$USAGE_TXT"; then
+            echo "::error::R8 stripped go.* JNI bridge classes in Main APK usage.txt"
+            grep -E "^go\.(Seq|Universe|error)" "$USAGE_TXT" | head -n 20
+            status=1
+          fi
           if [ "$status" -ne 0 ]; then exit 1; fi
 
           if [ -z "$KEYSTORE_B64" ]; then
@@ -312,6 +322,12 @@ jobs:
                       sys.exit(1)
           print("Koliti offline asset audit: PASS")
           ' "$APK"
+          USAGE_TXT="Telegram-Src/TMessagesProj_AppStandalone/build/outputs/mapping/afatRelease/usage.txt"
+          if [ -f "$USAGE_TXT" ] && grep -Eq "^go\.(Seq|Universe|error)" "$USAGE_TXT"; then
+            echo "::error::R8 stripped go.* JNI bridge classes in Koliti APK usage.txt"
+            grep -E "^go\.(Seq|Universe|error)" "$USAGE_TXT" | head -n 20
+            status=1
+          fi
           if [ "$status" -ne 0 ]; then exit 1; fi
 
           printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > colgram.keystore

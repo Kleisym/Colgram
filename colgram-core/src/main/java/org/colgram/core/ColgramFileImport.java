@@ -268,16 +268,13 @@ public final class ColgramFileImport {
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         final ContentResolver cr = appCtx.getContentResolver();
         final int dataFlags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
-        final List<StagedUri> stagedUris = new ArrayList<>(uris.size());
-        for (int i = 0; i < uris.size(); i++) {
-            Uri uri = uris.get(i);
-            if (dataFlags != 0) {
+        if (dataFlags != 0) {
+            for (int i = 0; i < uris.size(); i++) {
                 try {
-                    cr.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    cr.takePersistableUriPermission(uris.get(i), Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 } catch (Throwable ignored) {
                 }
             }
-            stagedUris.add(openStagedUriSync(appCtx, cr, uri));
         }
 
         IMPORT_EXECUTOR.execute(() -> {
@@ -286,9 +283,12 @@ public final class ColgramFileImport {
             try {
                 File inboxDir = ensureInboxDir(appCtx);
                 pruneStaleTemps(inboxDir);
-                int total = stagedUris.size();
+                int total = uris.size();
                 for (int i = 0; i < total; i++) {
-                    StagedUri staged = stagedUris.get(i);
+                    if (session.cancelled.get()) {
+                        break;
+                    }
+                    StagedUri staged = openStagedUriSync(appCtx, cr, uris.get(i));
                     try {
                         if (session.cancelled.get()) {
                             break;
@@ -303,9 +303,6 @@ public final class ColgramFileImport {
                 }
             } catch (Throwable ignored) {
             } finally {
-                for (int i = 0; i < stagedUris.size(); i++) {
-                    stagedUris.get(i).closeQuietly();
-                }
                 activeImportSession.compareAndSet(session, null);
                 deliverResult(session.callback, results);
             }
