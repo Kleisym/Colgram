@@ -201,6 +201,51 @@ public final class ColgramAttachDeleteSecurityTest {
                 "importIntentResult(null, null) must return false and deliver empty list safely");
     }
 
+    private static void testSendPrefixFastPathAndPurgeMemoryOnly() throws Exception {
+        check(!ColgramHookHandler.startsWithCommandPrefix(null), "null is not command");
+        check(!ColgramHookHandler.startsWithCommandPrefix(""), "empty string is not command");
+        check(!ColgramHookHandler.startsWithCommandPrefix("   \t\n "), "whitespace is not command");
+        check(!ColgramHookHandler.startsWithCommandPrefix("hello world"), "normal message is not command");
+        check(!ColgramHookHandler.startsWithCommandPrefix("hello .defender"), "mid-string dot is not command");
+        check(ColgramHookHandler.startsWithCommandPrefix(".defender"), ".defender matches command prefix");
+        check(ColgramHookHandler.startsWithCommandPrefix("  \t.мут"), "leading whitespace + dot matches");
+        check(ColgramHookHandler.startsWithCommandPrefix("/audit"), "/audit matches command prefix");
+        check(ColgramHookHandler.startsWithDotCommand("  .help"), "startsWithDotCommand detects leading dot");
+        check(!ColgramHookHandler.startsWithDotCommand("/audit"), "startsWithDotCommand rejects slash");
+        check(!ColgramHookHandler.hookOnSendMessage(0, 12345L, 0, "ordinary chat message", 0L),
+                "ordinary message must fast-bail false from hookOnSendMessage");
+        check(!ColgramHookHandler.hookOnSendMessage(0, 12345L, 0, "/start", 0L),
+                "non-defender slash message must return false");
+
+        // Verify purgeMessagesMemoryOnly clears tombstones without touching SQLite
+        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+        java.lang.reflect.Field f = unsafeClass.getDeclaredField("theUnsafe");
+        f.setAccessible(true);
+        Object unsafe = f.get(null);
+        ColgramDatabase db = (ColgramDatabase) unsafeClass
+                .getMethod("allocateInstance", Class.class)
+                .invoke(unsafe, ColgramDatabase.class);
+        setField(db, "deletedMessagesByDialog", new ConcurrentHashMap<>());
+        setField(db, "deletedDialogsCache", ConcurrentHashMap.newKeySet());
+        setField(db, "blockedUsersCache", ConcurrentHashMap.newKeySet());
+        setField(db, "pendingPurgesDuringLoad", ConcurrentHashMap.newKeySet());
+        setField(db, "cacheLoadLock", new Object());
+        setField(db, "blockedCacheLock", new Object());
+        setField(db, "deletedCachesLoaded", Boolean.TRUE);
+        setField(db, "deletedCacheLoadStarted", Boolean.TRUE);
+        setField(db, "blockedUsersLoaded", Boolean.TRUE);
+
+        long did = -100777666555L;
+        db.markMessagesDeleted(did, Arrays.asList(101, 102));
+        check(db.isMessageDeleted(did, 101) && db.isMessageDeleted(did, 102), "precondition: tombstones present");
+        db.purgeMessagesMemoryOnly(did, Arrays.asList(-1, 0, 101));
+        check(!db.isMessageDeleted(did, 101), "purgeMessagesMemoryOnly must immediately clear 101");
+        check(db.isMessageDeleted(did, 102), "unrelated tombstone 102 must remain intact");
+
+        ColgramHookHandler.purgeMessagesCompletely(did, Arrays.asList(-500, -1, 0));
+        check(ColgramHookHandler.isForcePurged(did, -500), "negative ID marked force-purged in RAM");
+    }
+
     private static void setField(Object target, String name, Object val) throws Exception {
         java.lang.reflect.Field f = target.getClass().getDeclaredField(name);
         f.setAccessible(true);
@@ -213,6 +258,7 @@ public final class ColgramAttachDeleteSecurityTest {
         testVaultMasterKeyGuardAndDeserializeBounds();
         testCloakProfileAndWebViewCoherence();
         testPersistentBackupRejectsNoPassphraseExport();
+        testSendPrefixFastPathAndPurgeMemoryOnly();
         System.out.println("ColgramAttachDeleteSecurityTest: PASS");
     }
 }

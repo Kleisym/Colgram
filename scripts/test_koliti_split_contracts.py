@@ -106,9 +106,40 @@ class KolitiSplitContractsTest(unittest.TestCase):
             tm_gradle.parent.mkdir(parents=True, exist_ok=True)
             tm_gradle.write_text("dependencies {\n    implementation project(':colgram-singbox')\n    implementation project(':colgram-llama')\n}\n", encoding="utf-8")
 
+            proguard = repo / "TMessagesProj/proguard-rules.pro"
+            proguard.write_text("-keep class org.telegram.messenger.* { *; }\n", encoding="utf-8")
+
             sa_gradle = repo / "TMessagesProj_AppStandalone/build.gradle"
             sa_gradle.parent.mkdir(parents=True, exist_ok=True)
-            sa_gradle.write_text('noCompress += ["pack", "gguf"]\nabiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"\n', encoding="utf-8")
+            sa_gradle.write_text(
+                'android {\n'
+                '    packagingOptions {\n'
+                '        jniLibs {\n'
+                "            pickFirsts += ['**/*.so']\n"
+                '        }\n'
+                '    }\n'
+                '    androidResources {\n'
+                '        noCompress += ["pack", "gguf"]\n'
+                '    }\n'
+                '    signingConfigs {\n'
+                '        release {}\n'
+                '    }\n'
+                '    buildTypes {\n'
+                '        debug {}\n'
+                '        standalone {\n'
+                '            applicationIdSuffix ".web"\n'
+                '        }\n'
+                '    }\n'
+                '    productFlavors {\n'
+                '        afat {\n'
+                '            ndk {\n'
+                '                abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"\n'
+                '            }\n'
+                '        }\n'
+                '    }\n'
+                '}\n',
+                encoding="utf-8",
+            )
 
             (repo / "colgram-llama").mkdir(parents=True, exist_ok=True)
             raw_dir = repo / "TMessagesProj/src/main/res/raw"
@@ -125,14 +156,55 @@ class KolitiSplitContractsTest(unittest.TestCase):
             # Disable Koliti
             ksp._write_build_flags(str(repo), False)
             ksp._configure_standalone_gradle(str(repo))
+            ksp._configure_proguard_rules(str(repo))
             ksp._configure_llama_gradle(str(repo), False)
             ksp._sync_koliti_assets_and_native(str(repo), False)
+
+            sa_once = sa_gradle.read_text(encoding="utf-8")
+            pg_once = proguard.read_text(encoding="utf-8")
+            # Pass 2 idempotency on build.gradle and proguard-rules.pro
+            ksp._configure_standalone_gradle(str(repo))
+            ksp._configure_proguard_rules(str(repo))
+            self.assertEqual(sa_gradle.read_text(encoding="utf-8"), sa_once)
+            self.assertEqual(proguard.read_text(encoding="utf-8"), pg_once)
 
             self.assertIn("KOLITI_ENABLED = false;", flags.read_text(encoding="utf-8"))
             self.assertNotIn(":colgram-llama", settings.read_text(encoding="utf-8"))
             self.assertNotIn("colgram-llama", tm_gradle.read_text(encoding="utf-8"))
-            self.assertIn('noCompress += ["pack", "gguf", "onnx"]', sa_gradle.read_text(encoding="utf-8"))
-            self.assertIn("colgramAbis", sa_gradle.read_text(encoding="utf-8"))
+            self.assertIn("useLegacyPackaging = true", sa_once)
+            self.assertIn("COLGRAM_RELEASE_R8_CONFIG", sa_once)
+            self.assertIn("minifyEnabled true", sa_once)
+            self.assertIn("shrinkResources true", sa_once)
+            rel_part = sa_once.split("// COLGRAM_RELEASE_R8_CONFIG", 1)[1].split("standalone {", 1)[0]
+            self.assertNotIn("applicationIdSuffix", rel_part)
+            self.assertIn('noCompress += ["pack", "gguf", "onnx"]', sa_once)
+            self.assertIn("colgramAbis", sa_once)
+            for pg_marker in (
+                "# COLGRAM_R8_KEEP_RULES = 2",
+                "-dontobfuscate",
+                "-keep class org.colgram.**",
+                "-keep class org.telegram.ui.Colgram*",
+                "-keep class org.telegram.ui.ActionBar.AlertDialog$*",
+                "-keep class org.telegram.ui.ActionBar.INavigationLayout",
+                "-keep class org.telegram.ui.ChatActivity",
+                "-keep class io.nekohasekai.**",
+                "-keep class com.chaquo.**",
+                "-keep class com.wireguard.**",
+                "-keep class com.k2fsa.sherpa.**",
+                "-keep class androidx.media3.**",
+                "-keep class com.google.gson.**",
+            ):
+                self.assertIn(pg_marker, pg_once)
+
+            # Verify v1 -> v2 proguard-rules upgrade and 2-pass convergence
+            proguard.write_text("-keep class org.telegram.messenger.* { *; }\n\n# COLGRAM_R8_KEEP_RULES = 1\n-dontobfuscate\n", encoding="utf-8")
+            ksp._configure_proguard_rules(str(repo))
+            pg_upgraded = proguard.read_text(encoding="utf-8")
+            self.assertNotIn("# COLGRAM_R8_KEEP_RULES = 1", pg_upgraded)
+            self.assertIn("# COLGRAM_R8_KEEP_RULES = 2", pg_upgraded)
+            self.assertIn("-keep class org.telegram.ui.ChatActivity", pg_upgraded)
+            ksp._configure_proguard_rules(str(repo))
+            self.assertEqual(proguard.read_text(encoding="utf-8"), pg_upgraded)
             self.assertFalse((repo / "colgram-llama").exists())
             self.assertFalse((raw_dir / "koliti_song.ogg").exists())
             self.assertFalse((core_dir / "ColgramAiEngine.java").exists())
@@ -145,6 +217,27 @@ class KolitiSplitContractsTest(unittest.TestCase):
             self.assertIn("KOLITI_ENABLED = true;", flags.read_text(encoding="utf-8"))
             self.assertIn("include ':colgram-llama'", settings.read_text(encoding="utf-8"))
             self.assertIn("implementation project(':colgram-llama')", tm_gradle.read_text(encoding="utf-8"))
+
+    def test_track3_perf_packaging_and_ui_hotpaths(self):
+        wall = (ROOT / "colgram-core/src/main/java/org/colgram/core/ColgramLiveWallpaper.java").read_text(encoding="utf-8")
+        for m in ("STATIC_CACHE_SCALE = 0.5f", "drawStaticCached", "releaseStaticCache", "TintSnapshot", "cachedTintSnapshot", "waveShaders", "colaShaders"):
+            self.assertIn(m, wall)
+
+        aero = (SCRIPTS / "templates/ColgramAeroStyler.java").read_text(encoding="utf-8")
+        for m in ("ensureDialogRowCache", "cachedRowRev", "if (strokeCol != 0)"):
+            self.assertIn(m, aero)
+
+        chrome = (SCRIPTS / "templates/ColgramMenuChrome.java").read_text(encoding="utf-8")
+        for m in ("SPRING_PRESS_INTERP", "SPRING_RELEASE_INTERP", "springCancelledByMove"):
+            self.assertIn(m, chrome)
+
+        orb = (SCRIPTS / "templates/ColgramGlobalOrbController.java").read_text(encoding="utf-8")
+        for m in ("!orbIntendedVisible && !lastKeyboardOpen", "!ColgramAiConfig.isOrbEnabled(activity)"):
+            self.assertIn(m, orb)
+
+        sa_live = (ROOT / "Telegram-Src/TMessagesProj_AppStandalone/build.gradle").read_text(encoding="utf-8")
+        self.assertIn("jniLibs", sa_live)
+        self.assertIn("standalone {", sa_live)
 
     def test_ci_workflow_dual_apk_and_signing_contracts(self):
         yml = (ROOT / ".github/workflows/build-colgram.yml").read_text(encoding="utf-8")

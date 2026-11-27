@@ -136,6 +136,7 @@ public final class ColgramAiModelManager {
 
     private static volatile boolean extracting = false;
     private static volatile Boolean cachedHasEmbeddedAssets = null;
+    private static volatile Boolean cachedHasEmbeddedVision = null;
     private static volatile DownloadState currentState = DownloadState.IDLE;
     private static volatile Closeable activeStreamCloseable = null;
     private static volatile Thread activeDownloadThread = null;
@@ -241,20 +242,62 @@ public final class ColgramAiModelManager {
         try {
             AssetManager am = ctx.getAssets();
             String[] list = am.list("koliti");
-            boolean found = false;
+            boolean foundCore = false;
+            boolean foundVision = false;
             if (list != null) {
                 for (String name : list) {
                     if ("koliti_core.gguf".equals(name)) {
+                        foundCore = true;
+                    } else if ("koliti_vision.gguf".equals(name)) {
+                        foundVision = true;
+                    }
+                }
+            }
+            cachedHasEmbeddedAssets = foundCore;
+            cachedHasEmbeddedVision = foundVision;
+            return foundCore;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** Returns true when this APK bundles koliti_vision.gguf directly inside assets/koliti/. */
+    public static boolean hasEmbeddedVisionAsset(Context ctx) {
+        if (ctx == null) return false;
+        Boolean cached = cachedHasEmbeddedVision;
+        if (cached != null) return cached;
+        hasEmbeddedAssets(ctx);
+        Boolean after = cachedHasEmbeddedVision;
+        if (after != null) return after;
+        try {
+            AssetManager am = ctx.getAssets();
+            String[] list = am.list("koliti");
+            boolean found = false;
+            if (list != null) {
+                for (String name : list) {
+                    if ("koliti_vision.gguf".equals(name)) {
                         found = true;
                         break;
                     }
                 }
             }
-            cachedHasEmbeddedAssets = found;
+            cachedHasEmbeddedVision = found;
             return found;
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    /** Returns true when the bundled koliti_vision.gguf is present in assets/koliti/ but missing/corrupt on disk. */
+    public static boolean needsEmbeddedVisionExtract(Context ctx) {
+        if (ctx == null || !hasEmbeddedVisionAsset(ctx)) return false;
+        if (!ColgramAiConfig.getCustomModelPath(ctx).isEmpty()) return false;
+        String activeId = ColgramAiConfig.getActiveModelId(ctx);
+        if (!ColgramAiModels.KOLITI_MODEL_ID.equals(activeId)) {
+            return false;
+        }
+        File destVis = mmprojFileFor(ctx, ColgramAiModels.primary());
+        return destVis == null || !isValidGgufFile(destVis) || destVis.length() < 10_000_000L;
     }
 
     public static boolean isExtractingEmbedded() {
@@ -274,9 +317,9 @@ public final class ColgramAiModelManager {
         return vf != null && isValidGgufFile(vf);
     }
 
-    /** Returns true when this APK bundles a newer koliti_core.gguf revision than what is extracted on disk. */
+    /** Returns true when this APK bundles a newer koliti_core.gguf revision or unextracted koliti_vision.gguf. */
     public static boolean needsEmbeddedUpgrade(Context ctx) {
-        if (ctx == null || !hasEmbeddedAssets(ctx)) return false;
+        if (ctx == null || (!hasEmbeddedAssets(ctx) && !hasEmbeddedVisionAsset(ctx))) return false;
         if (!ColgramAiConfig.getCustomModelPath(ctx).isEmpty()) return false;
         String activeId = ColgramAiConfig.getActiveModelId(ctx);
         if (!ColgramAiModels.KOLITI_MODEL_ID.equals(activeId)) {
@@ -286,7 +329,8 @@ public final class ColgramAiModelManager {
             }
         }
         File destModel = modelFileFor(ctx, ColgramAiModels.primary());
-        return needsEmbeddedCoreUpgrade(ctx, destModel);
+        return (hasEmbeddedAssets(ctx) && needsEmbeddedCoreUpgrade(ctx, destModel))
+                || needsEmbeddedVisionExtract(ctx);
     }
 
     private static boolean needsEmbeddedCoreUpgrade(Context ctx, File destModel) {
@@ -310,29 +354,35 @@ public final class ColgramAiModelManager {
             return new ResolvedModelPaths("", "", ColgramAiModels.primary().title, false);
         }
         ColgramAiModels.ModelSpec spec = ColgramAiModels.primary();
-        File checkModel = modelFileFor(ctx, spec);
-        boolean upgradeNeeded = hasEmbeddedAssets(ctx) && needsEmbeddedCoreUpgrade(ctx, checkModel);
-        ResolvedModelPaths existing = resolveActiveModel(ctx);
-        if (!upgradeNeeded && existing.isReady() && (existing.hasVision() || !hasEmbeddedAssets(ctx))) {
-            return existing;
+        boolean hasCoreAsset = hasEmbeddedAssets(ctx);
+        boolean hasVisAsset = hasEmbeddedVisionAsset(ctx);
+        if (!hasCoreAsset && !hasVisAsset) {
+            return resolveActiveModel(ctx);
         }
-        if (!hasEmbeddedAssets(ctx)) {
+        File checkModel = modelFileFor(ctx, spec);
+        boolean upgradeNeeded = (hasCoreAsset && needsEmbeddedCoreUpgrade(ctx, checkModel))
+                || needsEmbeddedVisionExtract(ctx);
+        ResolvedModelPaths existing = resolveActiveModel(ctx);
+        if (!upgradeNeeded && existing.isReady() && (existing.hasVision() || !hasVisAsset)) {
             return existing;
         }
 
         synchronized (EXTRACT_LOCK) {
             existing = resolveActiveModel(ctx);
-            upgradeNeeded = needsEmbeddedCoreUpgrade(ctx, modelFileFor(ctx, spec));
-            if (!upgradeNeeded && existing.isReady() && existing.hasVision()) {
+            boolean coreNeeded = hasCoreAsset && needsEmbeddedCoreUpgrade(ctx, modelFileFor(ctx, spec));
+            boolean visNeeded = needsEmbeddedVisionExtract(ctx);
+            if (!coreNeeded && !visNeeded && existing.isReady() && (existing.hasVision() || !hasVisAsset)) {
                 return existing;
             }
             extracting = true;
+            String initPhase = coreNeeded ? "Распаковка встроенного ядра…" : "Распаковка Vision-модуля…";
+            long approxInitBytes = coreNeeded ? spec.approxModelBytes : spec.approxMmprojBytes;
             publishState(new DownloadState(
                     true, true, spec.id, spec.title,
-                    "Распаковка встроенного ядра…", 0L, spec.approxModelBytes, 0.0, false, ""));
+                    initPhase, 0L, approxInitBytes, 0.0, false, ""));
             try {
                 File destModel = modelFileFor(ctx, spec);
-                if (needsEmbeddedCoreUpgrade(ctx, destModel)) {
+                if (coreNeeded) {
                     extractAssetFile(ctx.getAssets(), spec.bundledModelAsset, destModel,
                             spec.id, spec.title,
                             "Обновление встроенного ядра Koliti", spec.approxModelBytes, progressListener);
@@ -341,32 +391,28 @@ public final class ColgramAiModelManager {
                     }
                 }
                 File destVis = mmprojFileFor(ctx, spec);
-                if (destVis != null && spec.bundledMmprojAsset != null && !spec.bundledMmprojAsset.isEmpty()) {
+                if (hasVisAsset && destVis != null && spec.bundledMmprojAsset != null && !spec.bundledMmprojAsset.isEmpty()) {
                     if (!isValidGgufFile(destVis) || destVis.length() < 10_000_000L) {
-                        try {
-                            extractAssetFile(ctx.getAssets(), spec.bundledMmprojAsset, destVis,
-                                    spec.id, spec.title,
-                                    "Распаковка Vision-модуля (фото/видео)", spec.approxMmprojBytes, progressListener);
-                        } catch (Throwable ignored) {
-                            // Vision asset optional if stripped
-                        }
+                        extractAssetFile(ctx.getAssets(), spec.bundledMmprojAsset, destVis,
+                                spec.id, spec.title,
+                                "Распаковка Vision-модуля (фото/видео)", spec.approxMmprojBytes, progressListener);
                     }
                 }
                 ColgramAiConfig.setActiveModelId(ctx, spec.id);
-                boolean ok = isValidGgufFile(destModel);
+                boolean ok = isValidGgufFile(destModel) && (!hasVisAsset || isValidGgufFile(destVis));
                 extracting = false;
                 publishState(ok
                         ? DownloadState.IDLE
-                        : new DownloadState(false, false, spec.id, spec.title, "", 0L, spec.approxModelBytes,
-                                0.0, false, "Не удалось распаковать ядро"));
+                        : new DownloadState(false, false, spec.id, spec.title, "", 0L, approxInitBytes,
+                                0.0, false, "Не удалось распаковать ядро/Vision"));
                 if (progressListener != null) {
                     progressListener.onComplete(ok,
-                            ok ? ("Встроенное ядро " + spec.title + " готово!") : "Не удалось распаковать ядро");
+                            ok ? ("Встроенное ядро " + spec.title + " готово!") : "Не удалось распаковать ядро/Vision");
                 }
             } catch (Throwable err) {
                 extracting = false;
                 String msg = "Ошибка распаковки ядра: " + err.getMessage();
-                publishState(new DownloadState(false, false, spec.id, spec.title, "", 0L, spec.approxModelBytes,
+                publishState(new DownloadState(false, false, spec.id, spec.title, "", 0L, approxInitBytes,
                         0.0, false, msg));
                 if (progressListener != null) {
                     progressListener.onComplete(false, msg);
@@ -389,7 +435,9 @@ public final class ColgramAiModelManager {
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             } catch (Throwable ignored) {}
-            if (!hasEmbeddedAssets(appCtx)) {
+            boolean hasCoreAsset = hasEmbeddedAssets(appCtx);
+            boolean hasVisAsset = hasEmbeddedVisionAsset(appCtx);
+            if (!hasCoreAsset && !hasVisAsset) {
                 if (listener != null) {
                     ResolvedModelPaths cur = resolveActiveModel(appCtx);
                     listener.onComplete(cur != null && cur.isReady(),
@@ -399,7 +447,9 @@ public final class ColgramAiModelManager {
             }
             ResolvedModelPaths existing = resolveActiveModel(appCtx);
             File checkModel = modelFileFor(appCtx, ColgramAiModels.primary());
-            if (!needsEmbeddedCoreUpgrade(appCtx, checkModel) && existing.isReady() && existing.hasVision()) {
+            boolean coreOk = !hasCoreAsset || (!needsEmbeddedCoreUpgrade(appCtx, checkModel) && existing.isReady());
+            boolean visOk = !hasVisAsset || existing.hasVision();
+            if (coreOk && visOk) {
                 if (listener != null) listener.onComplete(true, "Встроенное ядро " + ColgramAiModels.primary().title + " готово!");
                 return;
             }

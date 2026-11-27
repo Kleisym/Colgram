@@ -535,27 +535,28 @@ public class ColgramProxyManager {
     public static void activateBuiltinProxy(final Context context) {
         if (context == null || !initialized.compareAndSet(false, true)) return;
         appContext = context.getApplicationContext();
-        ColgramDpiBypass.setAppContext(appContext);
-        ColgramTelegramDcAddresses.init(appContext);
-        ColgramDohResolver.prefetchCriticalHosts();
-        ColgramTelegramWsBridge.warmUp();
         // Handed to the MASQUE client so its availability probe can answer from the package without
         // loading the library into this process - see ColgramMasqueNative.isAvailableForProbe().
         ColgramMasqueNative.setProbeContext(appContext);
-        ColgramBootJobService.scheduleProxyRefresh(appContext);
         scheduleBackgroundProxyCheck(PROXY_START_DELAY_MS);
-        registerNetworkCallback(appContext);
-        SharedPreferences startupPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
-        if (startupPrefs.getBoolean("proxy_enabled", false) && !startupPrefs.getBoolean("proxy_auto_applied", false))
-            startupSavedProxy = findSavedProxy(startupPrefs);
         executor.execute(() -> {
+            ColgramDpiBypass.setAppContext(appContext);
+            ColgramTelegramDcAddresses.init(appContext);
+            ColgramDohResolver.prefetchCriticalHosts();
+            ColgramTelegramWsBridge.warmUp();
+            SharedPreferences startupPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+            if (startupPrefs.getBoolean("proxy_enabled", false) && !startupPrefs.getBoolean("proxy_auto_applied", false)) {
+                startupSavedProxy = findSavedProxy(startupPrefs);
+            }
             ColgramDpiBypass.startImmediately();
             if (ColgramDpiBypass.awaitReady(500L)) {
                 if (mainHandler != null) mainHandler.post(() -> ensureLocalBaseRoute(appContext));
                 else ensureLocalBaseRoute(appContext);
             }
+            registerNetworkCallback(appContext);
+            ColgramBootJobService.scheduleProxyRefresh(appContext);
+            ensureLocalWatchSchedulerRunning();
         });
-        ensureLocalWatchSchedulerRunning();
 
         // Everything below touches sockets: binding the local DPI listener,
         // probing proxies over TCP, and flipping Telegram's proxy settings (which
@@ -949,9 +950,14 @@ public class ColgramProxyManager {
     private static final long STARTUP_ACTIVATION_DELAY_MS = 150L;
 
     private static void activateBuiltinProxyNow(long startupEpoch) {
+        if (startupSavedProxy == null && appContext != null) {
+            SharedPreferences startupPrefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
+            if (startupPrefs.getBoolean("proxy_enabled", false) && !startupPrefs.getBoolean("proxy_auto_applied", false)) {
+                startupSavedProxy = findSavedProxy(startupPrefs);
+            }
+        }
+        ColgramDpiBypass.startImmediately();
         mainHandler.post(() -> ColgramRouteEpoch.runIfCurrent(startupEpoch, () -> {
-            ColgramDpiBypass.startImmediately();
-            SharedPreferences prefs = appContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE);
             ProxyItem saved = startupSavedProxy;
             if (!ColgramConfig.isWarpEnabled() && !isUserProxyDisabled()
                     && saved != null && !isInternalLoopbackEndpoint(saved)) {
@@ -1170,6 +1176,9 @@ public class ColgramProxyManager {
                 if (state == TG_STATE_CONNECTED) {
                     applied.nativeFailures = 0;
                     applied.failedVerdicts = 0;
+                    if (!hasSystemVpn(ctx)) {
+                        ColgramTelegramWsBridge.maintainForegroundPrewarmIfNeeded(ctx);
+                    }
                 }
                 localBaseUnconnectedTicks = 0;
                 localBaseUpdatingTicks = 0;
@@ -4918,7 +4927,7 @@ public static void reportProxyFailure() {
             ColgramDpiBypass.resetL3WhitelistCache();
             ColgramDpiBypass.clearTransientCooldowns();
             ColgramTelegramWsBridge.clearCooldowns();
-            int reaped = ColgramDpiBypass.reapStaleSessions(5_000L, 15_000L);
+            int reaped = ColgramDpiBypass.reapStaleSessions(5_000L, 40_000L);
             if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                 ColgramDpiBypass.startImmediately();
                 mainHandler.post(() -> ensureLocalBaseRoute(appContext));
@@ -4946,8 +4955,8 @@ public static void reportProxyFailure() {
                 ColgramDpiBypass.resetL3WhitelistCache();
                 ColgramDpiBypass.clearTransientCooldowns();
                 ColgramTelegramWsBridge.clearCooldowns();
-                int reaped = awayMs >= 12_000L
-                        ? ColgramDpiBypass.reapStaleSessions(5_000L, 12_000L)
+                int reaped = awayMs >= 45_000L
+                        ? ColgramDpiBypass.reapStaleSessions(5_000L, 40_000L)
                         : ColgramDpiBypass.reapStaleSessions(8_000L, 0L);
                 if (!ColgramDpiBypass.wasExplicitlyStopped() && !ColgramDpiBypass.isBound()) {
                     ColgramDpiBypass.startImmediately();

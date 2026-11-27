@@ -61,8 +61,14 @@ public class ColgramAiActivity extends BaseFragment {
     public static final int REQ_PICK_MEDIA_FROM_SHEET = 6403;
     public static final int REQ_VOICE_RECOGNIZE = 6404;
     public static final int REQ_PICK_VOICE_REF = 6405;
+    public static final int REQ_CAPTURE_CAMERA_FROM_SHEET = 6406;
+    public static final int REQ_PICK_FILE_FROM_SHEET = 6407;
+    public static final int REQ_PERM_MIC_KOLITI = 6410;
+    public static final int REQ_PERM_CAMERA_KOLITI = 6412;
     public static ColgramAiSheet pendingSheetForMedia;
     public static ColgramAiSheet pendingSheetForVoice;
+    public static ColgramAiSheet pendingSheetForCameraPerm;
+    public static String pendingCameraOutputPath;
 
     private RecyclerListView listView;
     private ListAdapter adapter;
@@ -497,49 +503,60 @@ public class ColgramAiActivity extends BaseFragment {
 
     private void launchFilePicker(int reqCode, String chooserTitle) {
         try {
-            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.setType("*/*");
             intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivityForResult(Intent.createChooser(intent, chooserTitle), reqCode);
         } catch (Throwable t) {
-            Toast.makeText(getParentActivity(), "Не удалось открыть проводник", Toast.LENGTH_SHORT).show();
+            try {
+                Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+                fallback.setType("*/*");
+                fallback.addCategory(Intent.CATEGORY_OPENABLE);
+                fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                startActivityForResult(Intent.createChooser(fallback, chooserTitle), reqCode);
+            } catch (Throwable t2) {
+                Toast.makeText(getParentActivity(), "Не удалось открыть проводник", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResultFragment(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResultFragment(requestCode, permissions, grantResults);
+        Activity act = getParentActivity();
+        if (act != null && ColgramAiSheet.handlePermissionResult(act, requestCode, permissions, grantResults)) {
+            return;
         }
     }
 
     @Override
     public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
         super.onActivityResultFragment(requestCode, resultCode, data);
-        if (resultCode != Activity.RESULT_OK || data == null) return;
         Activity act = getParentActivity();
-        if (act == null || act.isFinishing() || act.isDestroyed()) return;
-
-        if (requestCode == REQ_PICK_MEDIA_FROM_SHEET && pendingSheetForMedia != null) {
-            ColgramAiSheet targetSheet = pendingSheetForMedia;
-            pendingSheetForMedia = null;
-            android.content.ClipData clip = data.getClipData();
-            if (clip != null && clip.getItemCount() > 0) {
-                int count = Math.min(4, clip.getItemCount());
-                for (int i = 0; i < count; i++) {
-                    Uri itemUri = clip.getItemAt(i) != null ? clip.getItemAt(i).getUri() : null;
-                    if (itemUri != null) {
-                        targetSheet.attachExternalMediaUri(act, itemUri);
-                    }
-                }
-            } else if (data.getData() != null) {
-                targetSheet.attachExternalMediaUri(act, data.getData());
-            }
+        if (act != null && !act.isFinishing() && !act.isDestroyed()
+                && ColgramAiSheet.handleActivityResult(act, requestCode, resultCode, data)) {
             return;
         }
+        if (resultCode != Activity.RESULT_OK || data == null) return;
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
         Uri uri = data.getData();
         if (uri == null) return;
         if (requestCode == REQ_PICK_VOICE_REF) {
+            final android.content.res.AssetFileDescriptor stagedAfd;
+            try {
+                stagedAfd = act.getContentResolver().openAssetFileDescriptor(uri, "r");
+            } catch (Throwable err) {
+                Toast.makeText(act, "Не удалось прочитать аудиофайл", Toast.LENGTH_SHORT).show();
+                return;
+            }
             Toast.makeText(act, "Сохраняю образец голоса…", Toast.LENGTH_SHORT).show();
             new Thread(() -> {
-                try {
+                try (android.content.res.AssetFileDescriptor afd = stagedAfd) {
                     File dir = new File(act.getFilesDir(), "koliti_voice_ref");
                     if (!dir.exists()) dir.mkdirs();
                     File dst = new File(dir, "user_voice_ref_" + System.currentTimeMillis() + ".ogg");
-                    try (InputStream is = act.getContentResolver().openInputStream(uri);
+                    try (InputStream is = afd != null ? afd.createInputStream() : act.getContentResolver().openInputStream(uri);
                          FileOutputStream fos = new FileOutputStream(dst)) {
                         byte[] buf = new byte[16384];
                         int n;
@@ -560,15 +577,22 @@ public class ColgramAiActivity extends BaseFragment {
             return;
         }
         if (requestCode == REQ_PICK_GGUF || requestCode == REQ_PICK_MMPROJ) {
+            final android.content.res.AssetFileDescriptor stagedModelAfd;
+            try {
+                stagedModelAfd = act.getContentResolver().openAssetFileDescriptor(uri, "r");
+            } catch (Throwable err) {
+                Toast.makeText(act, "Не удалось прочитать файл модели", Toast.LENGTH_SHORT).show();
+                return;
+            }
             Toast.makeText(act, "Импорт файла в хранилище Koliti…", Toast.LENGTH_SHORT).show();
             new Thread(() -> {
                 File dst = null;
-                try {
+                try (android.content.res.AssetFileDescriptor afd = stagedModelAfd) {
                     File dir = ColgramAiModelManager.modelsRootDir(act);
                     String name = (requestCode == REQ_PICK_GGUF ? "custom_koliti_" : "custom_mmproj_")
                             + System.currentTimeMillis() + ".gguf";
                     dst = new File(dir, name);
-                    try (InputStream is = act.getContentResolver().openInputStream(uri)) {
+                    try (InputStream is = afd != null ? afd.createInputStream() : act.getContentResolver().openInputStream(uri)) {
                         if (is == null) {
                             throw new java.io.IOException("Не удалось открыть поток файла");
                         }
@@ -662,6 +686,7 @@ public class ColgramAiActivity extends BaseFragment {
                             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
                             intent.setType("audio/*");
                             intent.addCategory(Intent.CATEGORY_OPENABLE);
+                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                             startActivityForResult(Intent.createChooser(intent, "Образец голоса (.ogg / .wav)"), REQ_PICK_VOICE_REF);
                         } catch (Throwable t) {
                             launchFilePicker(REQ_PICK_VOICE_REF, "Образец голоса");
@@ -940,11 +965,13 @@ public class ColgramAiActivity extends BaseFragment {
                 secondaryBtn.setVisibility(GONE);
             } else if (activeFileReady) {
                 progressBar.setVisibility(GONE);
-                statusTv.setTextColor(pal.semanticEmerald);
+                boolean visionMissing = !activeVisionReady && (hasCustom || spec.supportsVision());
+                statusTv.setTextColor(visionMissing ? pal.semanticCrimson : pal.semanticEmerald);
                 boolean inRam = ColgramAiEngine.getInstance().isModelLoaded();
                 String loadedNote = inRam ? " • Активно в RAM" : " • Спит (0 МБ в RAM / 0% CPU)";
+                String visNote = activeVisionReady ? " (Текст + Vision)" : (visionMissing ? " (Только текст · Vision не установлен)" : " (Текст)");
                 statusTv.setText((specEmbedded ? "Встроено офлайн" : "Установлено локально")
-                        + (activeVisionReady ? " (Текст + Vision)" : " (Текст)") + loadedNote);
+                        + visNote + loadedNote);
                 primaryBtn.setText(inRam ? "Усыпить сейчас (0 МБ)" : "Открыть чат с " + org.colgram.core.ColgramDesignConfig.getKolitiDisplayName());
                 primaryBtn.setOnClickListener(v -> {
                     if (ColgramAiEngine.getInstance().isModelLoaded()) {
@@ -957,9 +984,39 @@ public class ColgramAiActivity extends BaseFragment {
                         ColgramAiSheet.show(ColgramAiActivity.this, null, null);
                     }
                 });
-                secondaryBtn.setVisibility(specEmbedded ? GONE : VISIBLE);
-                secondaryBtn.setText("Удалить");
-                secondaryBtn.setOnClickListener(v -> confirmDeleteCore(ctx));
+                if (specEmbedded && visionMissing && ColgramAiModelManager.hasEmbeddedVisionAsset(ctx)) {
+                    secondaryBtn.setVisibility(VISIBLE);
+                    secondaryBtn.setText("Распаковать Vision");
+                    secondaryBtn.setOnClickListener(v -> {
+                        ColgramAiModelManager.ensureEmbeddedReadyAsync(ctx, new ColgramAiModelManager.DownloadListener() {
+                            @Override
+                            public void onProgress(String phase, long downloadedBytes, long totalBytes, double speedMbPerSec) {}
+
+                            @Override
+                            public void onComplete(boolean success, String message) {
+                                AndroidUtilities.runOnUIThread(() -> {
+                                    Activity cur = getParentActivity();
+                                    if (cur != null && !cur.isFinishing() && !cur.isDestroyed()) {
+                                        Toast.makeText(cur, message, Toast.LENGTH_SHORT).show();
+                                        refreshUi();
+                                    }
+                                });
+                            }
+                        });
+                    });
+                } else if (!specEmbedded && visionMissing && !hasCustom && spec.supportsVision()) {
+                    statusTv.setText((specEmbedded ? "Встроено офлайн" : "Установлено локально")
+                            + " (Vision не скачан — нажмите для загрузки)" + loadedNote);
+                    statusTv.setOnClickListener(v -> startDownloadForSpec(ctx, spec));
+                    secondaryBtn.setVisibility(VISIBLE);
+                    secondaryBtn.setText("Удалить");
+                    secondaryBtn.setOnClickListener(v -> confirmDeleteCore(ctx));
+                } else {
+                    statusTv.setOnClickListener(null);
+                    secondaryBtn.setVisibility(specEmbedded ? GONE : VISIBLE);
+                    secondaryBtn.setText("Удалить");
+                    secondaryBtn.setOnClickListener(v -> confirmDeleteCore(ctx));
+                }
             } else if (specEmbedded) {
                 progressBar.setVisibility(GONE);
                 statusTv.setTextColor(pal.semanticCyan);

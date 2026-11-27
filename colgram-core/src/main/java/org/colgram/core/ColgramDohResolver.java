@@ -555,7 +555,10 @@ public final class ColgramDohResolver {
                     0, 96, 30L, java.util.concurrent.TimeUnit.SECONDS,
                     new java.util.concurrent.SynchronousQueue<>(),
                     r -> {
-                        Thread t = new Thread(r, "colgram-doh-race");
+                        Thread t = new Thread(() -> {
+                            ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                            r.run();
+                        }, "colgram-doh-race");
                         t.setDaemon(true);
                         t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "doh worker err: " + ex));
                         return t;
@@ -624,7 +627,10 @@ public final class ColgramDohResolver {
         try {
             DOH_RACE_POOL.execute(() -> resolve(hostname));
         } catch (Throwable rejected) {
-            Thread thread = new Thread(() -> resolve(hostname), "colgram-doh-prefetch");
+            Thread thread = new Thread(() -> {
+                ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                resolve(hostname);
+            }, "colgram-doh-prefetch");
             thread.setDaemon(true);
             thread.start();
         }

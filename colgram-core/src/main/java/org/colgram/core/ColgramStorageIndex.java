@@ -307,16 +307,27 @@ public final class ColgramStorageIndex {
                 new InputStreamReader(new GZIPInputStream(new FileInputStream(file)), StandardCharsets.UTF_8))) {
             String line;
             while ((line = br.readLine()) != null) {
-                if (line.isEmpty() || line.startsWith("#")) continue;
-                String[] parts = line.split("\t", -1);
-                if (parts.length < 7) continue;
-                String path = parts[0];
-                long origSize = parseLongSafe(parts[1], 0L);
-                long storedSize = parseLongSafe(parts[2], 0L);
-                long mtime = parseLongSafe(parts[3], 0L);
-                String sha = parts[4];
-                int state = (int) parseLongSafe(parts[5], 0L);
-                long updated = parseLongSafe(parts[6], 0L);
+                if (line.isEmpty() || line.charAt(0) == '#') continue;
+                int t1 = line.indexOf('\t');
+                if (t1 < 0) continue;
+                int t2 = line.indexOf('\t', t1 + 1);
+                if (t2 < 0) continue;
+                int t3 = line.indexOf('\t', t2 + 1);
+                if (t3 < 0) continue;
+                int t4 = line.indexOf('\t', t3 + 1);
+                if (t4 < 0) continue;
+                int t5 = line.indexOf('\t', t4 + 1);
+                if (t5 < 0) continue;
+                int t6 = line.indexOf('\t', t5 + 1);
+                if (t6 < 0) continue;
+                int t7 = line.indexOf('\t', t6 + 1);
+                String path = line.substring(0, t1);
+                long origSize = parseLongSafe(line.substring(t1 + 1, t2), 0L);
+                long storedSize = parseLongSafe(line.substring(t2 + 1, t3), 0L);
+                long mtime = parseLongSafe(line.substring(t3 + 1, t4), 0L);
+                String sha = line.substring(t4 + 1, t5);
+                int state = (int) parseLongSafe(line.substring(t5 + 1, t6), 0L);
+                long updated = parseLongSafe(t7 >= 0 ? line.substring(t6 + 1, t7) : line.substring(t6 + 1), 0L);
                 Entry e = new Entry(path, origSize, storedSize, mtime, sha, state, updated);
                 entriesByPath.put(e.path, e);
                 String fn = fileNameOf(e.path);

@@ -81,7 +81,13 @@ public final class ColgramGlobalOrbController {
     private final ViewTreeObserver.OnGlobalLayoutListener keyboardListener = this::onGlobalLayoutChanged;
 
     private void onGlobalLayoutChanged() {
-        if (detached || overlayHost == null) return;
+        if (detached || overlayHost == null || activity == null) return;
+        if (!ColgramAiConfig.isOrbEnabled(activity) || hostPaused || modalSuppressionCount.get() > 0) {
+            return;
+        }
+        if (!orbIntendedVisible && !lastKeyboardOpen) {
+            return;
+        }
         boolean kbOpen = isGlobalKeyboardVisible();
         if (kbOpen != lastKeyboardOpen) {
             lastKeyboardOpen = kbOpen;
@@ -339,7 +345,9 @@ public final class ColgramGlobalOrbController {
             return;
         }
 
-        if (isGlobalKeyboardVisible()) {
+        boolean kbVisible = isGlobalKeyboardVisible();
+        lastKeyboardOpen = kbVisible;
+        if (kbVisible) {
             setOrbVisible(false);
             return;
         }

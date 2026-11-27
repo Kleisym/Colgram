@@ -5,12 +5,18 @@ import android.app.Activity;
 import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ImageDecoder;
+import android.graphics.Matrix;
 import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
@@ -20,7 +26,13 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
+import android.os.StatFs;
+import android.os.ext.SdkExtensions;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
@@ -44,6 +56,7 @@ import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.LinearInterpolator;
 import android.view.inputmethod.EditorInfo;
+import android.webkit.MimeTypeMap;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -54,6 +67,11 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.core.content.FileProvider;
+import androidx.core.view.ContentInfoCompat;
+import androidx.core.view.ViewCompat;
+import androidx.exifinterface.media.ExifInterface;
+
 import org.colgram.core.ColgramAiAgentTools;
 import org.colgram.core.ColgramAiChatStore;
 import org.colgram.core.ColgramAiConfig;
@@ -61,30 +79,40 @@ import org.colgram.core.ColgramAiContextEngine;
 import org.colgram.core.ColgramAiEngine;
 import org.colgram.core.ColgramAiModelManager;
 import org.colgram.core.ColgramAiModels;
+import org.colgram.core.ColgramAiVisionProcessor;
 import org.colgram.core.ColgramAiWebSearch;
 import org.colgram.core.ColgramKolitiVoice;
+import org.colgram.core.ColgramStorageSandbox;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.FileLoader;
+import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
+import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Components.LayoutHelper;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -98,6 +126,12 @@ import java.util.regex.Pattern;
 public final class ColgramAiSheet {
 
     private static final ExecutorService MEDIA_THUMB_EXEC = Executors.newFixedThreadPool(2);
+    private static final int MAX_ATTACHMENTS = 4;
+    private static final long MAX_IMAGE_ATTACH_BYTES = 50L * 1024L * 1024L;
+    private static final long MAX_DOC_ATTACH_BYTES = 25L * 1024L * 1024L;
+    private static final long MAX_VIDEO_ATTACH_BYTES = 250L * 1024L * 1024L;
+    private static final long MEDIA_STATFS_HEADROOM_BYTES = 16L * 1024L * 1024L;
+    private static final AtomicInteger ATTACH_SEQ = new AtomicInteger(1);
     private static final int ACCENT_CRIMSON = 0xFFE11D48;
     private static final int ACCENT_CORAL = 0xFFF43F5E;
     private static final int ACCENT_AMBER = 0xFFF59E0B;
@@ -151,7 +185,8 @@ public final class ColgramAiSheet {
     private long activeRequestSeq = 0L;
     private boolean allowHandleSwipeDismiss = false;
     private boolean attachActiveChatContext;
-    private final List<String> attachedPaths = new ArrayList<>();
+    private final List<String> attachedPaths = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private int loadingAttachmentCount = 0;
     private ColgramAiChatStore.ChatSession activeSession;
     private View emptyStateView;
     private SpeechRecognizer speechRecognizer;
@@ -176,7 +211,7 @@ public final class ColgramAiSheet {
 
     public static ColgramAiSheet show(BaseFragment parentFragment, ChatActivity chatActivity, ColgramAiOrbView orbView) {
         if (resolveValidActivity(parentFragment) == null) return null;
-        return new ColgramAiSheet(parentFragment, chatActivity, orbView, null);
+        return new ColgramAiSheet(parentFragment, chatActivity, orbView, null, null, null, null, false);
     }
 
     public static ColgramAiSheet showWithQuickPrompt(
@@ -186,14 +221,151 @@ public final class ColgramAiSheet {
             String autoPrompt
     ) {
         if (resolveValidActivity(parentFragment) == null) return null;
-        return new ColgramAiSheet(parentFragment, chatActivity, orbView, autoPrompt);
+        return new ColgramAiSheet(parentFragment, chatActivity, orbView, autoPrompt, null, null, null, false);
+    }
+
+    public static ColgramAiSheet showWithAttachment(
+            BaseFragment parentFragment,
+            ChatActivity chatActivity,
+            ColgramAiOrbView orbView,
+            String filePath,
+            String displayName,
+            String prefillPrompt
+    ) {
+        List<String> paths = (filePath != null && !filePath.trim().isEmpty())
+                ? Collections.singletonList(filePath.trim()) : null;
+        List<String> names = (displayName != null && !displayName.trim().isEmpty())
+                ? Collections.singletonList(displayName.trim()) : null;
+        return showWithAttachment(parentFragment, chatActivity, orbView, paths, names, prefillPrompt);
+    }
+
+    public static ColgramAiSheet showWithAttachment(
+            BaseFragment parentFragment,
+            ChatActivity chatActivity,
+            ColgramAiOrbView orbView,
+            List<String> filePaths,
+            List<String> displayNames,
+            String prefillPrompt
+    ) {
+        if (resolveValidActivity(parentFragment) == null) return null;
+        return new ColgramAiSheet(parentFragment, chatActivity, orbView, null, filePaths, displayNames, prefillPrompt, true);
+    }
+
+    public static boolean handleActivityResult(Activity act, int requestCode, int resultCode, Intent data) {
+        if (requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE) {
+            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForVoice;
+            ColgramAiActivity.pendingSheetForVoice = null;
+            if (resultCode == Activity.RESULT_OK && data != null && pending != null && !pending.cleanedUp.get()) {
+                ArrayList<String> matches = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                if (matches != null && !matches.isEmpty() && !TextUtils.isEmpty(matches.get(0))) {
+                    pending.onVoiceRecognizedResult(matches.get(0));
+                }
+            }
+            return true;
+        }
+        if (requestCode == ColgramAiActivity.REQ_CAPTURE_CAMERA_FROM_SHEET) {
+            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForMedia;
+            ColgramAiActivity.pendingSheetForMedia = null;
+            String camPath = ColgramAiActivity.pendingCameraOutputPath;
+            ColgramAiActivity.pendingCameraOutputPath = null;
+            if (resultCode == Activity.RESULT_OK && pending != null && !pending.cleanedUp.get() && act != null) {
+                File camFile = camPath != null ? new File(camPath) : null;
+                if (camFile != null && camFile.isFile() && camFile.length() > 0L) {
+                    pending.attachReadyPathOnUi(camFile.getAbsolutePath());
+                } else if (data != null && data.getData() != null) {
+                    pending.attachExternalMediaUrisSyncStaged(act, Collections.singletonList(data.getData()), data.getFlags());
+                } else if (data != null && data.getExtras() != null && data.getExtras().get("data") instanceof Bitmap) {
+                    Bitmap thumbBmp = (Bitmap) data.getExtras().get("data");
+                    pending.saveCameraBitmapFallback(act, thumbBmp);
+                } else if (camFile != null && camFile.exists() && camFile.length() == 0L) {
+                    //noinspection ResultOfMethodCallIgnored
+                    camFile.delete();
+                }
+            } else if (camPath != null) {
+                File camFile = new File(camPath);
+                if (camFile.exists() && camFile.length() == 0L) {
+                    //noinspection ResultOfMethodCallIgnored
+                    camFile.delete();
+                }
+            }
+            return true;
+        }
+        if (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET
+                || requestCode == ColgramAiActivity.REQ_PICK_FILE_FROM_SHEET) {
+            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForMedia;
+            ColgramAiActivity.pendingSheetForMedia = null;
+            if (resultCode == Activity.RESULT_OK && data != null && pending != null && !pending.cleanedUp.get() && act != null) {
+                List<Uri> uris = extractUrisFromIntent(data);
+                if (!uris.isEmpty()) {
+                    pending.attachExternalMediaUrisSyncStaged(act, uris, data.getFlags());
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    public static boolean handlePermissionResult(Activity act, int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == ColgramAiActivity.REQ_PERM_CAMERA_KOLITI) {
+            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForCameraPerm;
+            ColgramAiActivity.pendingSheetForCameraPerm = null;
+            boolean granted = grantResults != null && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted && pending != null && !pending.cleanedUp.get() && act != null) {
+                pending.launchCameraCapture(act);
+            } else if (!granted && act != null) {
+                Toast.makeText(act, "Нужно разрешение камеры для съёмки фото", Toast.LENGTH_SHORT).show();
+            }
+            return true;
+        }
+        if (requestCode == ColgramAiActivity.REQ_PERM_MIC_KOLITI) {
+            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForVoice;
+            ColgramAiActivity.pendingSheetForVoice = null;
+            boolean granted = grantResults != null && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted && pending != null && !pending.cleanedUp.get() && act != null) {
+                pending.toggleVoiceInput(act);
+            } else if (!granted && act != null) {
+                Toast.makeText(act, "Разрешите микрофон, чтобы говорить с Koliti", Toast.LENGTH_SHORT).show();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static List<Uri> extractUrisFromIntent(Intent data) {
+        List<Uri> uris = new ArrayList<>();
+        if (data == null) return uris;
+        Set<String> seen = new LinkedHashSet<>();
+        ClipData clip = data.getClipData();
+        if (clip != null && clip.getItemCount() > 0) {
+            int count = Math.min(MAX_ATTACHMENTS, clip.getItemCount());
+            for (int i = 0; i < count; i++) {
+                ClipData.Item item = clip.getItemAt(i);
+                Uri u = item != null ? item.getUri() : null;
+                if (u != null && seen.add(u.toString())) {
+                    uris.add(u);
+                }
+            }
+        }
+        if (uris.isEmpty() && data.getData() != null) {
+            Uri u = data.getData();
+            if (seen.add(u.toString())) {
+                uris.add(u);
+            }
+        }
+        return uris;
     }
 
     private ColgramAiSheet(
             BaseFragment parentFragment,
             ChatActivity chatActivity,
             ColgramAiOrbView orbView,
-            String autoPrompt
+            String autoPrompt,
+            List<String> initialAttachPaths,
+            List<String> initialAttachNames,
+            String prefillPrompt,
+            boolean skipWelcome
     ) {
         this.parentFragment = parentFragment;
         this.chatActivity = chatActivity != null ? chatActivity : ColgramAiChatBridge.resolveActiveChat(parentFragment);
@@ -243,6 +415,7 @@ public final class ColgramAiSheet {
                 return allowHandleSwipeDismiss;
             }
         };
+        this.sheet.colgramKeepOnPause = true;
 
         LinearLayout root = new LinearLayout(act) {
             @Override
@@ -531,8 +704,11 @@ public final class ColgramAiSheet {
         String openChatTitle = this.chatActivity != null ? ColgramAiChatBridge.resolveChatTitle(this.chatActivity) : "";
         activeSession = ColgramAiChatStore.getOrCreateSessionForDialog(openDialogId, openChatTitle);
         attachActiveChatContext = (openDialogId != 0L && activeSession.boundDialogId == openDialogId);
-        boolean shouldWelcomeAudio = activeSession != null && activeSession.messages.isEmpty()
-                && (autoPrompt == null || autoPrompt.trim().isEmpty());
+        boolean shouldWelcomeAudio = !skipWelcome
+                && activeSession != null && activeSession.messages.isEmpty()
+                && (autoPrompt == null || autoPrompt.trim().isEmpty())
+                && (prefillPrompt == null || prefillPrompt.trim().isEmpty())
+                && (initialAttachPaths == null || initialAttachPaths.isEmpty());
         updateHeaderForSession();
         updateContextPillUi();
         updateVoiceOverPillUi(act);
@@ -570,9 +746,9 @@ public final class ColgramAiSheet {
         inputRow.setElevation(isDark ? 0f : dp(2));
         root.addView(inputRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        ImageView mediaBtn = makeIconBtn(act, R.drawable.msg_media, Color.TRANSPARENT, cIconMuted);
-        mediaBtn.setContentDescription("Прикрепить фото или видео");
-        mediaBtn.setOnClickListener(v -> attachRecentMediaOrPick());
+        ImageView mediaBtn = makeIconBtn(act, R.drawable.input_attach, Color.TRANSPARENT, cIconMuted);
+        mediaBtn.setContentDescription("Прикрепить фото, файл или с камеры");
+        mediaBtn.setOnClickListener(v -> showAttachSourceMenu(act));
         inputRow.addView(mediaBtn, LayoutHelper.createLinear(38, 38, 0, 0, 4, 0));
 
         promptInput = new EditText(act);
@@ -584,14 +760,31 @@ public final class ColgramAiSheet {
         promptInput.setImeOptions(EditorInfo.IME_ACTION_SEND);
         promptInput.setMaxLines(5);
         promptInput.setBackground(null);
+        ViewCompat.setOnReceiveContentListener(
+                promptInput,
+                new String[]{"image/*", "application/pdf", "text/*"},
+                (view, payload) -> {
+                    if (payload == null || cleanedUp.get()) return payload;
+                    android.util.Pair<ContentInfoCompat, ContentInfoCompat> split =
+                            payload.partition(item -> item != null && item.getUri() != null);
+                    if (split.first != null && split.first.getClip() != null) {
+                        ClipData clip = split.first.getClip();
+                        List<Uri> uris = new ArrayList<>();
+                        for (int i = 0; i < clip.getItemCount(); i++) {
+                            Uri u = clip.getItemAt(i) != null ? clip.getItemAt(i).getUri() : null;
+                            if (u != null) uris.add(u);
+                        }
+                        if (!uris.isEmpty()) {
+                            attachExternalMediaUrisSyncStaged(act, uris, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        }
+                    }
+                    return split.second;
+                }
+        );
         promptInput.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_SEND) {
                 if (!busyGenerating && !ColgramAiEngine.getInstance().isBusy()) {
-                    String q = promptInput.getText().toString().trim();
-                    if (!q.isEmpty() || !attachedPaths.isEmpty()) {
-                        promptInput.setText("");
-                        submitPrompt(q.isEmpty() ? "Опиши прикреплённое фото или видео." : q);
-                    }
+                    submitComposerPrompt();
                 }
                 return true;
             }
@@ -622,11 +815,7 @@ public final class ColgramAiSheet {
                 toggleDirectVoiceRecording(act);
                 return;
             }
-            String q = promptInput.getText().toString().trim();
-            if (!q.isEmpty() || !attachedPaths.isEmpty()) {
-                promptInput.setText("");
-                submitPrompt(q.isEmpty() ? "Опиши прикреплённое фото или видео." : q);
-            }
+            submitComposerPrompt();
         });
         inputRow.addView(sendButton, LayoutHelper.createLinear(38, 38));
 
@@ -655,9 +844,20 @@ public final class ColgramAiSheet {
                 }
                 if (ColgramAiActivity.pendingSheetForMedia == ColgramAiSheet.this) {
                     ColgramAiActivity.pendingSheetForMedia = null;
+                    if (ColgramAiActivity.pendingCameraOutputPath != null) {
+                        File camTmp = new File(ColgramAiActivity.pendingCameraOutputPath);
+                        if (camTmp.exists() && camTmp.length() == 0L) {
+                            //noinspection ResultOfMethodCallIgnored
+                            camTmp.delete();
+                        }
+                        ColgramAiActivity.pendingCameraOutputPath = null;
+                    }
                 }
                 if (ColgramAiActivity.pendingSheetForVoice == ColgramAiSheet.this) {
                     ColgramAiActivity.pendingSheetForVoice = null;
+                }
+                if (ColgramAiActivity.pendingSheetForCameraPerm == ColgramAiSheet.this) {
+                    ColgramAiActivity.pendingSheetForCameraPerm = null;
                 }
                 ColgramGlobalOrbController.popModalSuppression();
                 ColgramKolitiVoice.setSpeakingStateListener(null);
@@ -698,6 +898,18 @@ public final class ColgramAiSheet {
         } catch (Throwable showErr) {
             cleanupAction.run();
             return;
+        }
+
+        if (initialAttachPaths != null && !initialAttachPaths.isEmpty()) {
+            attachLocalFilesAsync(act, initialAttachPaths, initialAttachNames);
+        }
+        if (prefillPrompt != null && !prefillPrompt.trim().isEmpty()) {
+            boolean hasInitialAtt = initialAttachPaths != null && !initialAttachPaths.isEmpty();
+            String formattedPrefill = hasInitialAtt
+                    ? prefillPrompt.trim()
+                    : ("Проанализируй это сообщение:\n«" + prefillPrompt.trim() + "»");
+            promptInput.setText(formattedPrefill);
+            promptInput.setSelection(formattedPrefill.length());
         }
 
         if (autoPrompt != null && !autoPrompt.trim().isEmpty()) {
@@ -1035,8 +1247,7 @@ public final class ColgramAiSheet {
                 false
         );
         boolean needActiveChat = linkThisChat && (prePlan.shouldUseActiveChatContext
-                || prePlan.shouldDraftIntoInput
-                || prePlan.resolvedMode == ColgramAiContextEngine.AssistantMode.VISION);
+                || prePlan.shouldDraftIntoInput);
         boolean needCrossChat = prePlan.shouldIncludeCrossChat && ColgramAiConfig.isCrossChatRagEnabled(act);
         boolean needDialogDir = ColgramAiAgentTools.queryNeedsDialogDirectory(query, "")
                 || queryContainsPronounRef(query);
@@ -1747,120 +1958,894 @@ public final class ColgramAiSheet {
         }
     }
 
+    private static final class StagedExternalUri {
+        final Uri uri;
+        final AssetFileDescriptor afd;
+        final ParcelFileDescriptor pfd;
+        final String displayName;
+        final long knownSize;
+
+        StagedExternalUri(Uri uri, AssetFileDescriptor afd, ParcelFileDescriptor pfd, String displayName, long knownSize) {
+            this.uri = uri;
+            this.afd = afd;
+            this.pfd = pfd;
+            this.displayName = displayName;
+            this.knownSize = knownSize;
+        }
+
+        void closeQuietly() {
+            if (afd != null) {
+                try { afd.close(); } catch (Throwable ignored) {}
+            }
+            if (pfd != null) {
+                try { pfd.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private static final class RecentChatAttachment {
+        final String path;
+        final String displayName;
+        final String subtitle;
+        final int iconRes;
+
+        RecentChatAttachment(String path, String displayName, String subtitle, int iconRes) {
+            this.path = path;
+            this.displayName = displayName;
+            this.subtitle = subtitle;
+            this.iconRes = iconRes;
+        }
+    }
+
+    private void submitComposerPrompt() {
+        if (promptInput == null) return;
+        String q = promptInput.getText().toString().trim();
+        if (loadingAttachmentCount > 0 && attachedPaths.isEmpty()) {
+            Activity act = resolveValidActivity(parentFragment);
+            if (act != null) {
+                Toast.makeText(act, "Файл ещё подготавливается…", Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
+        if (!q.isEmpty() || !attachedPaths.isEmpty()) {
+            promptInput.setText("");
+            submitPrompt(q.isEmpty() ? buildDefaultAttachmentPrompt(attachedPaths) : q);
+        }
+    }
+
+    private static String buildDefaultAttachmentPrompt(List<String> paths) {
+        if (paths == null || paths.isEmpty()) {
+            return "Опиши прикреплённый файл.";
+        }
+        int imgCount = 0;
+        int vidCount = 0;
+        int pdfCount = 0;
+        int docCount = 0;
+        for (String p : paths) {
+            ColgramAiVisionProcessor.AttachmentKind kind = ColgramAiVisionProcessor.classifyKind(p);
+            if (kind == ColgramAiVisionProcessor.AttachmentKind.IMAGE) imgCount++;
+            else if (kind == ColgramAiVisionProcessor.AttachmentKind.VIDEO) vidCount++;
+            else if (kind == ColgramAiVisionProcessor.AttachmentKind.PDF) pdfCount++;
+            else docCount++;
+        }
+        int total = paths.size();
+        if (imgCount == total) {
+            return total == 1 ? "Опиши прикреплённое фото." : "Опиши прикреплённые фото.";
+        }
+        if (vidCount == total) {
+            return "Опиши прикреплённое видео.";
+        }
+        if (pdfCount == total) {
+            return "Проанализируй прикреплённый PDF-документ и перескажи главное.";
+        }
+        if (docCount == total) {
+            return "Проанализируй прикреплённый файл и помоги разобраться с содержимым.";
+        }
+        if (imgCount + vidCount == total) {
+            return "Опиши прикреплённое фото или видео.";
+        }
+        return "Проанализируй прикреплённые файлы и изображения.";
+    }
+
+    private static File ensureKolitiMediaDir(Context ctx) {
+        File mediaDir = new File(ctx.getFilesDir(), "koliti_media");
+        ColgramStorageSandbox.ensureDirWithNoMedia(mediaDir);
+        return mediaDir;
+    }
+
     public void attachExternalMediaUri(Context ctx, Uri uri) {
         if (ctx == null || uri == null) return;
-        final Context appCtx = ctx.getApplicationContext();
+        attachExternalMediaUrisSyncStaged(ctx, Collections.singletonList(uri), Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    }
+
+    /**
+     * Stages all picked URIs synchronously via AssetFileDescriptor / ParcelFileDescriptor INSIDE
+     * onActivityResult before Android 11-16 temporary read grants expire, then copies them off-thread.
+     */
+    private void attachExternalMediaUrisSyncStaged(Context ctx, List<Uri> uris, int intentFlags) {
+        if (ctx == null || uris == null || uris.isEmpty() || cleanedUp.get()) return;
+        final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+        final ContentResolver cr = appCtx.getContentResolver();
+        int cap = Math.min(MAX_ATTACHMENTS, uris.size());
+        final List<StagedExternalUri> stagedList = new ArrayList<>(cap);
+        String firstRejectMsg = null;
+
+        for (int i = 0; i < cap; i++) {
+            Uri uri = uris.get(i);
+            if (uri == null) continue;
+            if ((intentFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                try {
+                    cr.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Throwable ignored) {}
+            }
+            StagedExternalUri staged = openStagedExternalUriSync(cr, uri);
+            if (staged == null) {
+                if (firstRejectMsg == null) firstRejectMsg = "Не удалось открыть выбранный файл";
+                continue;
+            }
+            String reject = validateAttachmentLimits(appCtx, staged.displayName, staged.knownSize);
+            if (reject != null) {
+                staged.closeQuietly();
+                if (firstRejectMsg == null) firstRejectMsg = reject;
+                continue;
+            }
+            stagedList.add(staged);
+        }
+
+        if (stagedList.isEmpty()) {
+            final String msg = firstRejectMsg != null ? firstRejectMsg : "Не удалось прочитать файл";
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!cleanedUp.get()) {
+                    Toast.makeText(appCtx, msg, Toast.LENGTH_SHORT).show();
+                }
+            });
+            return;
+        }
+
+        if (firstRejectMsg != null) {
+            final String warnMsg = firstRejectMsg;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!cleanedUp.get()) Toast.makeText(appCtx, warnMsg, Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        final int batchCount = stagedList.size();
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!cleanedUp.get()) {
+                loadingAttachmentCount += batchCount;
+                refreshAttachmentStrip();
+            }
+        });
+
+        final Set<String> activeProtected = new LinkedHashSet<>(attachedPaths);
+        MEDIA_THUMB_EXEC.execute(() -> {
+            try {
+                File mediaDir = ensureKolitiMediaDir(appCtx);
+                pruneOldKolitiMedia(mediaDir, 250, activeProtected);
+                for (int i = 0; i < stagedList.size(); i++) {
+                    StagedExternalUri staged = stagedList.get(i);
+                    File dst = null;
+                    try {
+                        long maxBytes = maxAttachBytesForName(staged.displayName);
+                        dst = allocateUniqueMediaFile(mediaDir, staged.displayName);
+                        long totalCopied = 0L;
+                        try (InputStream is = openStagedInputStream(cr, staged);
+                             FileOutputStream fos = new FileOutputStream(dst)) {
+                            if (is == null) {
+                                throw new java.io.IOException("open_failed");
+                            }
+                            byte[] buf = new byte[32768];
+                            int n;
+                            while ((n = is.read(buf)) != -1) {
+                                totalCopied += n;
+                                if (totalCopied > maxBytes) {
+                                    throw new java.io.IOException("too_large");
+                                }
+                                fos.write(buf, 0, n);
+                            }
+                            fos.flush();
+                        }
+                        if (dst.length() > 0L) {
+                            final String savedPath = dst.getAbsolutePath();
+                            AndroidUtilities.runOnUIThread(() -> {
+                                loadingAttachmentCount = Math.max(0, loadingAttachmentCount - 1);
+                                attachReadyPathOnUi(savedPath);
+                            });
+                        } else {
+                            //noinspection ResultOfMethodCallIgnored
+                            dst.delete();
+                            decrementLoadingOnUi();
+                        }
+                    } catch (Throwable err) {
+                        if (dst != null) {
+                            try { dst.delete(); } catch (Throwable ignored) {}
+                        }
+                        decrementLoadingOnUi();
+                        final String errTxt = "too_large".equals(err.getMessage())
+                                ? "Файл слишком большой для прикрепления"
+                                : "Не удалось прочитать файл";
+                        AndroidUtilities.runOnUIThread(() -> {
+                            if (!cleanedUp.get()) Toast.makeText(appCtx, errTxt, Toast.LENGTH_SHORT).show();
+                        });
+                    } finally {
+                        staged.closeQuietly();
+                    }
+                }
+            } finally {
+                for (StagedExternalUri s : stagedList) {
+                    s.closeQuietly();
+                }
+            }
+        });
+    }
+
+    private void decrementLoadingOnUi() {
+        AndroidUtilities.runOnUIThread(() -> {
+            loadingAttachmentCount = Math.max(0, loadingAttachmentCount - 1);
+            if (!cleanedUp.get()) {
+                refreshAttachmentStrip();
+            }
+        });
+    }
+
+    private void attachReadyPathOnUi(String savedPath) {
+        if (cleanedUp.get() || savedPath == null || savedPath.isEmpty()) return;
+        if (attachedPaths.contains(savedPath)) {
+            refreshAttachmentStrip();
+            return;
+        }
+        while (attachedPaths.size() >= MAX_ATTACHMENTS) {
+            attachedPaths.remove(0);
+        }
+        attachedPaths.add(savedPath);
+        refreshAttachmentStrip();
+    }
+
+    private void attachLocalFilesAsync(Context ctx, List<String> sourcePaths, List<String> displayNames) {
+        if (ctx == null || sourcePaths == null || sourcePaths.isEmpty() || cleanedUp.get()) return;
+        final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+        final List<String> pathsCopy = new ArrayList<>();
+        final List<String> namesCopy = new ArrayList<>();
+        for (int i = 0; i < sourcePaths.size() && pathsCopy.size() < MAX_ATTACHMENTS; i++) {
+            String sp = sourcePaths.get(i);
+            if (sp == null || sp.trim().isEmpty()) continue;
+            File f = new File(sp.trim());
+            if (!f.isFile() || f.length() <= 0L) continue;
+            pathsCopy.add(f.getAbsolutePath());
+            String dn = (displayNames != null && i < displayNames.size() && displayNames.get(i) != null)
+                    ? displayNames.get(i).trim() : f.getName();
+            namesCopy.add(dn.isEmpty() ? f.getName() : dn);
+        }
+        if (pathsCopy.isEmpty()) return;
+        loadingAttachmentCount += pathsCopy.size();
+        refreshAttachmentStrip();
+
+        final Set<String> activeProtected = new LinkedHashSet<>(attachedPaths);
+        MEDIA_THUMB_EXEC.execute(() -> {
+            File mediaDir = ensureKolitiMediaDir(appCtx);
+            pruneOldKolitiMedia(mediaDir, 250, activeProtected);
+            for (int i = 0; i < pathsCopy.size(); i++) {
+                File src = new File(pathsCopy.get(i));
+                String wantName = sanitizeAttachFileName(namesCopy.get(i), src.getName());
+                if (wantName.indexOf('.') < 0 && src.getName().indexOf('.') > 0) {
+                    wantName = wantName + src.getName().substring(src.getName().lastIndexOf('.'));
+                }
+                String reject = validateAttachmentLimits(appCtx, wantName, src.length());
+                if (reject != null) {
+                    decrementLoadingOnUi();
+                    final String msg = reject;
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (!cleanedUp.get()) Toast.makeText(appCtx, msg, Toast.LENGTH_SHORT).show();
+                    });
+                    continue;
+                }
+                File dst = null;
+                try {
+                    if (src.getParentFile() != null && src.getParentFile().equals(mediaDir)) {
+                        final String ready = src.getAbsolutePath();
+                        AndroidUtilities.runOnUIThread(() -> {
+                            loadingAttachmentCount = Math.max(0, loadingAttachmentCount - 1);
+                            attachReadyPathOnUi(ready);
+                        });
+                        continue;
+                    }
+                    dst = allocateUniqueMediaFile(mediaDir, wantName);
+                    try (FileInputStream fis = new FileInputStream(src);
+                         FileOutputStream fos = new FileOutputStream(dst)) {
+                        byte[] buf = new byte[32768];
+                        int n;
+                        while ((n = fis.read(buf)) != -1) fos.write(buf, 0, n);
+                        fos.flush();
+                    }
+                    if (dst.length() > 0L) {
+                        final String saved = dst.getAbsolutePath();
+                        AndroidUtilities.runOnUIThread(() -> {
+                            loadingAttachmentCount = Math.max(0, loadingAttachmentCount - 1);
+                            attachReadyPathOnUi(saved);
+                        });
+                    } else {
+                        //noinspection ResultOfMethodCallIgnored
+                        dst.delete();
+                        decrementLoadingOnUi();
+                    }
+                } catch (Throwable err) {
+                    if (dst != null) {
+                        try { dst.delete(); } catch (Throwable ignored) {}
+                    }
+                    decrementLoadingOnUi();
+                }
+            }
+        });
+    }
+
+    private void saveCameraBitmapFallback(Context ctx, Bitmap bmp) {
+        if (ctx == null || bmp == null) return;
+        final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+        loadingAttachmentCount++;
+        refreshAttachmentStrip();
         MEDIA_THUMB_EXEC.execute(() -> {
             File dst = null;
             try {
-                File mediaDir = new File(appCtx.getFilesDir(), "koliti_media");
-                if (!mediaDir.exists()) mediaDir.mkdirs();
-                pruneOldKolitiMedia(mediaDir, 50);
-                String mime = appCtx.getContentResolver().getType(uri);
-                String ext = ".jpg";
-                if (mime != null) {
-                    String low = mime.toLowerCase(Locale.US);
-                    if (low.contains("video")) ext = ".mp4";
-                    else if (low.contains("png")) ext = ".png";
-                    else if (low.contains("webp")) ext = ".webp";
-                    else if (low.contains("gif")) ext = ".gif";
+                File mediaDir = ensureKolitiMediaDir(appCtx);
+                dst = new File(mediaDir, "cam_" + System.currentTimeMillis() + "_" + ATTACH_SEQ.getAndIncrement() + ".jpg");
+                try (FileOutputStream fos = new FileOutputStream(dst)) {
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 90, fos);
                 }
-                dst = new File(mediaDir, "media_" + System.currentTimeMillis() + "_" + System.nanoTime() + ext);
-                try (InputStream is = appCtx.getContentResolver().openInputStream(uri);
-                     FileOutputStream fos = new FileOutputStream(dst)) {
-                    byte[] buf = new byte[32768];
-                    int n;
-                    while (is != null && (n = is.read(buf)) != -1) fos.write(buf, 0, n);
-                }
-                if (dst.length() > 0) {
-                    final String savedPath = dst.getAbsolutePath();
+                if (dst.length() > 0L) {
+                    final String saved = dst.getAbsolutePath();
                     AndroidUtilities.runOnUIThread(() -> {
-                        if (cleanedUp.get()) return;
-                        if (attachedPaths.size() >= 4) {
-                            attachedPaths.remove(0);
-                        }
-                        attachedPaths.add(savedPath);
-                        refreshAttachmentStrip();
+                        loadingAttachmentCount = Math.max(0, loadingAttachmentCount - 1);
+                        attachReadyPathOnUi(saved);
                     });
                 } else {
-                    try { dst.delete(); } catch (Throwable ignored) {}
+                    decrementLoadingOnUi();
                 }
             } catch (Throwable err) {
                 if (dst != null) {
                     try { dst.delete(); } catch (Throwable ignored) {}
                 }
-                AndroidUtilities.runOnUIThread(() ->
-                        Toast.makeText(appCtx, "Не удалось прочитать файл", Toast.LENGTH_SHORT).show());
+                decrementLoadingOnUi();
             }
         });
     }
 
-    private static void pruneOldKolitiMedia(File dir, int maxFiles) {
+    private static StagedExternalUri openStagedExternalUriSync(ContentResolver cr, Uri uri) {
+        if (cr == null || uri == null) return null;
+        String mime = null;
+        try {
+            mime = cr.getType(uri);
+        } catch (Throwable ignored) {}
+
+        String displayName = queryUriDisplayName(cr, uri);
+        long knownSize = queryUriSize(cr, uri);
+        AssetFileDescriptor afd = null;
+        ParcelFileDescriptor pfd = null;
+        try {
+            afd = cr.openTypedAssetFileDescriptor(uri, (mime != null && !mime.isEmpty()) ? mime : "*/*", null);
+        } catch (Throwable ignored) {
+            try {
+                afd = cr.openAssetFileDescriptor(uri, "r");
+            } catch (Throwable ignored2) {
+                afd = null;
+            }
+        }
+        if (afd == null) {
+            try {
+                pfd = cr.openFileDescriptor(uri, "r");
+            } catch (Throwable ignored3) {
+                pfd = null;
+            }
+        }
+        if (afd == null && pfd == null && !"file".equalsIgnoreCase(uri.getScheme())) {
+            return null;
+        }
+        if (knownSize <= 0L && afd != null && afd.getLength() > 0L) {
+            knownSize = afd.getLength();
+        } else if (knownSize <= 0L && pfd != null && pfd.getStatSize() > 0L) {
+            knownSize = pfd.getStatSize();
+        }
+        displayName = resolveSanitizedFileName(cr, uri, mime, displayName);
+        return new StagedExternalUri(uri, afd, pfd, displayName, knownSize);
+    }
+
+    private static InputStream openStagedInputStream(ContentResolver cr, StagedExternalUri staged) throws java.io.IOException {
+        if (staged.afd != null) {
+            return staged.afd.createInputStream();
+        }
+        if (staged.pfd != null) {
+            return new ParcelFileDescriptor.AutoCloseInputStream(staged.pfd);
+        }
+        return cr.openInputStream(staged.uri);
+    }
+
+    private static String queryUriDisplayName(ContentResolver cr, Uri uri) {
+        Cursor c = null;
+        try {
+            c = cr.query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) {
+                    String n = c.getString(idx);
+                    if (n != null && !n.trim().isEmpty()) return n.trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (c != null) {
+                try { c.close(); } catch (Throwable ignored) {}
+            }
+        }
+        String last = uri.getLastPathSegment();
+        if (last != null && !last.trim().isEmpty()) {
+            int slash = last.lastIndexOf('/');
+            String tail = slash >= 0 ? last.substring(slash + 1) : last;
+            int colon = tail.lastIndexOf(':');
+            if (colon >= 0 && colon + 1 < tail.length()) {
+                tail = tail.substring(colon + 1);
+            }
+            if (!tail.trim().isEmpty()) return tail.trim();
+        }
+        return "";
+    }
+
+    private static long queryUriSize(ContentResolver cr, Uri uri) {
+        Cursor c = null;
+        try {
+            c = cr.query(uri, new String[]{OpenableColumns.SIZE}, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.SIZE);
+                if (idx >= 0 && !c.isNull(idx)) {
+                    long s = c.getLong(idx);
+                    if (s > 0L) return s;
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (c != null) {
+                try { c.close(); } catch (Throwable ignored) {}
+            }
+        }
+        return -1L;
+    }
+
+    private static String resolveSanitizedFileName(ContentResolver cr, Uri uri, String mime, String rawName) {
+        String clean = sanitizeAttachFileName(rawName, "");
+        if (clean.isEmpty()) {
+            clean = "att_" + System.currentTimeMillis();
+        }
+        if (clean.indexOf('.') < 0) {
+            String ext = null;
+            if (mime != null && !mime.isEmpty()) {
+                String low = mime.toLowerCase(Locale.US);
+                if (low.contains("pdf")) ext = "pdf";
+                else if (low.contains("png")) ext = "png";
+                else if (low.contains("webp")) ext = "webp";
+                else if (low.contains("gif")) ext = "gif";
+                else if (low.contains("heic")) ext = "heic";
+                else if (low.contains("heif")) ext = "heif";
+                else if (low.contains("jpeg") || low.contains("jpg")) ext = "jpg";
+                else if (low.startsWith("video/")) ext = "mp4";
+                else if (low.contains("wordprocessingml")) ext = "docx";
+                else if (low.contains("opendocument.text")) ext = "odt";
+                else if (low.contains("json")) ext = "json";
+                else if (low.startsWith("text/plain")) ext = "txt";
+                else ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(low);
+            }
+            if (ext != null && !ext.isEmpty()) {
+                clean = clean + "." + ext.toLowerCase(Locale.US);
+            } else {
+                clean = clean + ".bin";
+            }
+        }
+        return clean;
+    }
+
+    private static String sanitizeAttachFileName(String raw, String fallback) {
+        if (raw == null || raw.trim().isEmpty()) return fallback;
+        String base = new File(raw.trim()).getName().replaceAll("[\\\\/:*?\"<>|\\x00-\\x1F]", "_").trim();
+        if (base.isEmpty() || ".".equals(base) || "..".equals(base)) return fallback;
+        if (base.length() > 96) {
+            int dot = base.lastIndexOf('.');
+            if (dot > 0 && base.length() - dot <= 12) {
+                String ext = base.substring(dot);
+                base = base.substring(0, 96 - ext.length()) + ext;
+            } else {
+                base = base.substring(0, 96);
+            }
+        }
+        return base;
+    }
+
+    private static File allocateUniqueMediaFile(File dir, String sanitizedName) {
+        String name = sanitizeAttachFileName(sanitizedName, "file_" + System.currentTimeMillis() + ".bin");
+        int dot = name.lastIndexOf('.');
+        String stem = dot > 0 ? name.substring(0, dot) : name;
+        String ext = dot > 0 ? name.substring(dot) : "";
+        String prefix = stem + "_" + System.currentTimeMillis() + "_" + ATTACH_SEQ.getAndIncrement();
+        return new File(dir, prefix + ext);
+    }
+
+    private static long maxAttachBytesForName(String name) {
+        ColgramAiVisionProcessor.AttachmentKind kind = ColgramAiVisionProcessor.classifyKind(name);
+        if (kind == ColgramAiVisionProcessor.AttachmentKind.VIDEO) return MAX_VIDEO_ATTACH_BYTES;
+        if (kind == ColgramAiVisionProcessor.AttachmentKind.IMAGE) return MAX_IMAGE_ATTACH_BYTES;
+        return MAX_DOC_ATTACH_BYTES;
+    }
+
+    private static String validateAttachmentLimits(Context ctx, String displayName, long knownBytes) {
+        if (knownBytes > 0L) {
+            long limit = maxAttachBytesForName(displayName);
+            if (knownBytes > limit) {
+                return "Файл «" + displayName + "» больше лимита (" + ColgramAiVisionProcessor.formatFileSize(limit) + ")";
+            }
+            try {
+                StatFs sf = new StatFs(ensureKolitiMediaDir(ctx).getAbsolutePath());
+                long avail = sf.getAvailableBytes();
+                if (avail > 0L && avail < knownBytes + MEDIA_STATFS_HEADROOM_BYTES) {
+                    return "Недостаточно памяти устройства для копирования «" + displayName + "»";
+                }
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    private static void pruneOldKolitiMedia(File dir, int maxFiles, Set<String> activeProtected) {
         try {
             File[] files = dir.listFiles();
             if (files == null || files.length <= maxFiles) return;
-            Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-            int toDelete = files.length - maxFiles;
+            Set<String> protectedPaths = activeProtected != null
+                    ? new LinkedHashSet<>(activeProtected)
+                    : new LinkedHashSet<>();
+            try {
+                for (ColgramAiChatStore.ChatSession s : ColgramAiChatStore.listSessions()) {
+                    if (s == null || s.messages == null) continue;
+                    for (ColgramAiChatStore.ChatMessage m : s.messages) {
+                        if (m == null || m.mediaPaths == null) continue;
+                        for (String mp : m.mediaPaths) {
+                            if (mp != null && !mp.isEmpty()) protectedPaths.add(mp);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            List<File> evictable = new ArrayList<>();
+            for (File f : files) {
+                if (f == null || !f.isFile()) continue;
+                if (".nomedia".equals(f.getName())) continue;
+                if (protectedPaths.contains(f.getAbsolutePath())) continue;
+                evictable.add(f);
+            }
+            if (evictable.size() <= maxFiles) return;
+            Collections.sort(evictable, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+            int toDelete = evictable.size() - maxFiles;
             for (int i = 0; i < toDelete; i++) {
                 //noinspection ResultOfMethodCallIgnored
-                files[i].delete();
+                evictable.get(i).delete();
             }
         } catch (Throwable ignored) {}
     }
 
-    private void attachRecentMediaOrPick() {
-        Activity act = parentFragment != null ? parentFragment.getParentActivity() : LaunchActivity.instance;
-        if (act == null) return;
-        List<String> recent = ColgramAiChatBridge.collectRecentChatMediaPaths(chatActivity, 1);
-        if (!recent.isEmpty() && !attachedPaths.contains(recent.get(0))) {
-            final String recentPath = recent.get(0);
-            java.util.List<ColgramUiKit.ChoiceItem> items = new java.util.ArrayList<>(2);
-            items.add(ColgramUiKit.ChoiceItem.of("Выбрать фото или видео из галереи", "Системная медиатека", R.drawable.msg_photos));
-            items.add(ColgramUiKit.ChoiceItem.of("Взять последнее медиа из этого чата", "Быстрое прикрепление", R.drawable.msg_media));
-            ColgramUiKit.showChoiceSheet(
-                    act,
-                    parentFragment != null ? parentFragment.getResourceProvider() : null,
-                    R.drawable.msg_media,
-                    "Прикрепить к Koliti",
-                    "Выберите источник медиа",
-                    items,
-                    which -> {
-                        if (which == 0) {
-                            launchMediaPicker(act);
-                        } else {
-                            if (attachedPaths.size() >= 4) attachedPaths.remove(0);
-                            attachedPaths.add(recentPath);
-                            refreshAttachmentStrip();
-                        }
+    private static Uri getClipboardAttachmentUri(Activity act) {
+        if (act == null) return null;
+        try {
+            ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return null;
+            for (int i = 0; i < clip.getItemCount(); i++) {
+                ClipData.Item item = clip.getItemAt(i);
+                if (item != null && item.getUri() != null) {
+                    return item.getUri();
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private List<RecentChatAttachment> collectRecentChatAttachments(int maxItems) {
+        List<RecentChatAttachment> out = new ArrayList<>();
+        if (chatActivity == null || chatActivity.messages == null || chatActivity.messages.isEmpty()) {
+            return out;
+        }
+        FileLoader loader = FileLoader.getInstance(chatActivity.getCurrentAccount());
+        Set<String> seen = new LinkedHashSet<>();
+        ArrayList<MessageObject> copy = new ArrayList<>(chatActivity.messages);
+        int scanLimit = Math.min(copy.size(), 80);
+        for (int i = 0; i < scanLimit && out.size() < maxItems; i++) {
+            MessageObject m = copy.get(i);
+            if (m == null || m.messageOwner == null) continue;
+            if (!m.isPhoto() && !m.isVideo() && !m.isRoundVideo() && !m.isDocument()) continue;
+            try {
+                File f = resolveLocalFileForMessage(loader, m);
+                if (f == null || !f.isFile() || f.length() <= 0L) continue;
+                String abs = f.getAbsolutePath();
+                if (!seen.add(abs)) continue;
+                String displayName = f.getName();
+                int icon = R.drawable.msg_view_file;
+                String kindLabel = "Файл";
+                if (m.isPhoto()) {
+                    icon = R.drawable.msg_photos;
+                    kindLabel = "Фото";
+                    if (!ColgramAiVisionProcessor.isImagePath(displayName)) {
+                        displayName = "photo_" + m.getId() + ".jpg";
                     }
-            );
+                } else if (m.isVideo() || m.isRoundVideo()) {
+                    icon = R.drawable.msg_media;
+                    kindLabel = m.isRoundVideo() ? "Видеокружок" : "Видео";
+                    if (!ColgramAiVisionProcessor.isVideoPath(displayName)) {
+                        displayName = "video_" + m.getId() + ".mp4";
+                    }
+                } else if (m.messageOwner.media != null && m.messageOwner.media.document != null) {
+                    String docName = FileLoader.getDocumentFileName(m.messageOwner.media.document);
+                    if (docName != null && !docName.trim().isEmpty()) {
+                        displayName = docName.trim();
+                    }
+                    if (ColgramAiVisionProcessor.isImagePath(displayName)) {
+                        icon = R.drawable.msg_photos;
+                        kindLabel = "Изображение";
+                    } else if (ColgramAiVisionProcessor.isVideoPath(displayName)) {
+                        icon = R.drawable.msg_media;
+                        kindLabel = "Видео";
+                    }
+                }
+                String sub = kindLabel + " • " + ColgramAiVisionProcessor.formatFileSize(f.length());
+                out.add(new RecentChatAttachment(abs, displayName, sub, icon));
+            } catch (Throwable ignored) {}
+        }
+        return out;
+    }
+
+    private static File resolveLocalFileForMessage(FileLoader loader, MessageObject m) {
+        if (m == null || m.messageOwner == null) return null;
+        if (!TextUtils.isEmpty(m.messageOwner.attachPath)) {
+            File af = new File(m.messageOwner.attachPath);
+            if (af.isFile() && af.length() > 0L) return af;
+        }
+        if (loader != null) {
+            File mf = loader.getPathToMessage(m.messageOwner);
+            if (mf != null && mf.isFile() && mf.length() > 0L) return mf;
+            if (m.messageOwner.media != null && m.messageOwner.media.photo != null
+                    && m.messageOwner.media.photo.sizes != null) {
+                for (int sIdx = m.messageOwner.media.photo.sizes.size() - 1; sIdx >= 0; sIdx--) {
+                    TLRPC.PhotoSize ps = m.messageOwner.media.photo.sizes.get(sIdx);
+                    if (ps == null || ps instanceof TLRPC.TL_photoStrippedSize || ps instanceof TLRPC.TL_photoPathSize) continue;
+                    File pf = loader.getPathToAttach(ps, false);
+                    if (pf == null || !pf.isFile() || pf.length() == 0L) pf = loader.getPathToAttach(ps, true);
+                    if (pf != null && pf.isFile() && pf.length() > 0L) return pf;
+                }
+            }
+            if (m.messageOwner.media != null && m.messageOwner.media.document != null) {
+                File df = loader.getPathToAttach(m.messageOwner.media.document, false);
+                if (df == null || !df.isFile() || df.length() == 0L) df = loader.getPathToAttach(m.messageOwner.media.document, true);
+                if (df != null && df.isFile() && df.length() > 0L) return df;
+            }
+        }
+        return null;
+    }
+
+    private void showAttachSourceMenu(Activity act) {
+        if (act == null || act.isFinishing() || act.isDestroyed()) return;
+        final List<ColgramUiKit.ChoiceItem> items = new ArrayList<>();
+        final List<Runnable> actions = new ArrayList<>();
+
+        items.add(ColgramUiKit.ChoiceItem.of("Фото или видео из галереи", "Системная медиатека · до 4 файлов", R.drawable.msg_photos));
+        actions.add(() -> launchMediaPicker(act));
+
+        items.add(ColgramUiKit.ChoiceItem.of("Сделать фото (Камера)", "Снимок прямо в Koliti", R.drawable.msg_camera));
+        actions.add(() -> launchCameraCapture(act));
+
+        items.add(ColgramUiKit.ChoiceItem.of("Файл, документ или код", "PDF, DOCX, TXT, PY, JSON, код и др.", R.drawable.msg_view_file));
+        actions.add(() -> launchDocumentPicker(act));
+
+        final Uri clipUri = getClipboardAttachmentUri(act);
+        if (clipUri != null) {
+            items.add(ColgramUiKit.ChoiceItem.of("Вставить из буфера обмена", "Картинка или файл из буфера", R.drawable.msg_copy));
+            actions.add(() -> attachExternalMediaUrisSyncStaged(act, Collections.singletonList(clipUri), Intent.FLAG_GRANT_READ_URI_PERMISSION));
+        }
+
+        final List<RecentChatAttachment> recentChatItems = collectRecentChatAttachments(6);
+        if (!recentChatItems.isEmpty()) {
+            items.add(ColgramUiKit.ChoiceItem.of("Взять медиа или файл из чата", "Последние из открытой переписки (" + recentChatItems.size() + ")", R.drawable.msg_media));
+            actions.add(() -> showRecentChatPicker(act, recentChatItems));
+        }
+
+        ColgramUiKit.showChoiceSheet(
+                act,
+                parentFragment != null ? parentFragment.getResourceProvider() : null,
+                R.drawable.input_attach,
+                "Прикрепить к Koliti",
+                "Фото, видео, камера или документы",
+                items,
+                which -> {
+                    if (which >= 0 && which < actions.size()) {
+                        actions.get(which).run();
+                    }
+                }
+        );
+    }
+
+    private void showRecentChatPicker(Activity act, List<RecentChatAttachment> recent) {
+        if (recent.size() == 1) {
+            RecentChatAttachment one = recent.get(0);
+            attachLocalFilesAsync(act, Collections.singletonList(one.path), Collections.singletonList(one.displayName));
             return;
         }
-        launchMediaPicker(act);
+        List<ColgramUiKit.ChoiceItem> items = new ArrayList<>(recent.size());
+        for (RecentChatAttachment r : recent) {
+            items.add(ColgramUiKit.ChoiceItem.of(shorten(r.displayName, 36), r.subtitle, r.iconRes));
+        }
+        ColgramUiKit.showChoiceSheet(
+                act,
+                parentFragment != null ? parentFragment.getResourceProvider() : null,
+                R.drawable.msg_media,
+                "Файлы из этого чата",
+                "Выберите медиа или документ",
+                items,
+                idx -> {
+                    if (idx >= 0 && idx < recent.size()) {
+                        RecentChatAttachment picked = recent.get(idx);
+                        attachLocalFilesAsync(act, Collections.singletonList(picked.path), Collections.singletonList(picked.displayName));
+                    }
+                }
+        );
+    }
+
+    private static boolean hasNativePhotoPicker() {
+        if (Build.VERSION.SDK_INT >= 33) return true;
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                return SdkExtensions.getExtensionVersion(Build.VERSION_CODES.R) >= 2;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private void startSheetActivityForResult(Activity act, Intent intent, int requestCode) {
+        if (parentFragment != null && parentFragment.getParentLayout() != null) {
+            parentFragment.startActivityForResult(intent, requestCode);
+        } else {
+            act.startActivityForResult(intent, requestCode);
+        }
     }
 
     private void launchMediaPicker(Activity act) {
-        try {
-            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-            intent.setType("*/*");
-            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
-            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            ColgramAiActivity.pendingSheetForMedia = this;
-            Intent chooser = Intent.createChooser(intent, "Фото или видео для Koliti");
-            if (parentFragment != null) {
-                parentFragment.startActivityForResult(chooser, ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET);
-            } else {
-                act.startActivityForResult(chooser, ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET);
+        if (act == null) return;
+        int remaining = Math.max(1, MAX_ATTACHMENTS - attachedPaths.size() - loadingAttachmentCount);
+        Intent primary = null;
+        if (hasNativePhotoPicker()) {
+            Intent pick = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            if (remaining > 1) {
+                pick.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, remaining);
             }
+            pick.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            if (pick.resolveActivity(act.getPackageManager()) != null) {
+                primary = pick;
+            }
+        }
+        if (primary == null) {
+            Intent doc = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            doc.addCategory(Intent.CATEGORY_OPENABLE);
+            doc.setType("*/*");
+            doc.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
+            doc.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            doc.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            primary = doc;
+        }
+        try {
+            ColgramAiActivity.pendingSheetForMedia = this;
+            startSheetActivityForResult(act, primary, ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET);
         } catch (Throwable t) {
-            Toast.makeText(act, "Не удалось открыть выбор файла", Toast.LENGTH_SHORT).show();
+            try {
+                Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+                fallback.setType("*/*");
+                fallback.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
+                fallback.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                fallback.addCategory(Intent.CATEGORY_OPENABLE);
+                fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Intent chooser = Intent.createChooser(fallback, "Фото или видео для Koliti");
+                chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                ColgramAiActivity.pendingSheetForMedia = this;
+                startSheetActivityForResult(act, chooser, ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET);
+            } catch (Throwable t2) {
+                if (ColgramAiActivity.pendingSheetForMedia == this) {
+                    ColgramAiActivity.pendingSheetForMedia = null;
+                }
+                Toast.makeText(act, "Не удалось открыть галерею", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void launchDocumentPicker(Activity act) {
+        if (act == null) return;
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            ColgramAiActivity.pendingSheetForMedia = this;
+            startSheetActivityForResult(act, intent, ColgramAiActivity.REQ_PICK_FILE_FROM_SHEET);
+        } catch (Throwable t) {
+            try {
+                Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+                fallback.addCategory(Intent.CATEGORY_OPENABLE);
+                fallback.setType("*/*");
+                fallback.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Intent chooser = Intent.createChooser(fallback, "Документ или код для Koliti");
+                chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                ColgramAiActivity.pendingSheetForMedia = this;
+                startSheetActivityForResult(act, chooser, ColgramAiActivity.REQ_PICK_FILE_FROM_SHEET);
+            } catch (Throwable t2) {
+                if (ColgramAiActivity.pendingSheetForMedia == this) {
+                    ColgramAiActivity.pendingSheetForMedia = null;
+                }
+                Toast.makeText(act, "Не удалось открыть проводник файлов", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void launchCameraCapture(Activity act) {
+        if (act == null) return;
+        if (Build.VERSION.SDK_INT >= 23
+                && act.checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ColgramAiActivity.pendingSheetForCameraPerm = this;
+            act.requestPermissions(new String[]{android.Manifest.permission.CAMERA}, ColgramAiActivity.REQ_PERM_CAMERA_KOLITI);
+            Toast.makeText(act, "Разрешите доступ к камере для съёмки", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        File photo = null;
+        try {
+            File mediaDir = ensureKolitiMediaDir(act);
+            photo = new File(mediaDir, "cam_" + System.currentTimeMillis() + "_" + ATTACH_SEQ.getAndIncrement() + ".jpg");
+            final Set<String> camProtected = new LinkedHashSet<>(attachedPaths);
+            camProtected.add(photo.getAbsolutePath());
+            MEDIA_THUMB_EXEC.execute(() -> pruneOldKolitiMedia(mediaDir, 250, camProtected));
+            Uri outUri = FileProvider.getUriForFile(act, ApplicationLoader.getApplicationId() + ".provider", photo);
+            Intent cam = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            cam.putExtra(MediaStore.EXTRA_OUTPUT, outUri);
+            cam.setClipData(ClipData.newRawUri("koliti_camera", outUri));
+            cam.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            ColgramAiActivity.pendingSheetForMedia = this;
+            ColgramAiActivity.pendingCameraOutputPath = photo.getAbsolutePath();
+            startSheetActivityForResult(act, cam, ColgramAiActivity.REQ_CAPTURE_CAMERA_FROM_SHEET);
+        } catch (Throwable t) {
+            if (ColgramAiActivity.pendingSheetForMedia == this) {
+                ColgramAiActivity.pendingSheetForMedia = null;
+            }
+            ColgramAiActivity.pendingCameraOutputPath = null;
+            if (photo != null && photo.exists() && photo.length() == 0L) {
+                //noinspection ResultOfMethodCallIgnored
+                photo.delete();
+            }
+            Toast.makeText(act, "Камера недоступна на этом устройстве", Toast.LENGTH_SHORT).show();
         }
     }
 
     private void refreshAttachmentStrip() {
         attachmentStripContainer.removeAllViews();
-        if (attachedPaths.isEmpty()) {
+        if (promptInput != null) {
+            if (attachedPaths.isEmpty() && loadingAttachmentCount <= 0) {
+                promptInput.setHint("Спросите Koliti о чём угодно…");
+            } else if (!attachedPaths.isEmpty()) {
+                boolean hasDoc = false;
+                boolean hasMedia = false;
+                for (String p : attachedPaths) {
+                    ColgramAiVisionProcessor.AttachmentKind k = ColgramAiVisionProcessor.classifyKind(p);
+                    if (k == ColgramAiVisionProcessor.AttachmentKind.IMAGE || k == ColgramAiVisionProcessor.AttachmentKind.VIDEO) {
+                        hasMedia = true;
+                    } else {
+                        hasDoc = true;
+                    }
+                }
+                promptInput.setHint(hasDoc && !hasMedia
+                        ? "Спросите Koliti об этом файле…"
+                        : "Спросите Koliti о вложении…");
+            }
+        }
+        if (attachedPaths.isEmpty() && loadingAttachmentCount <= 0) {
             attachmentStripScroll.setVisibility(View.GONE);
             return;
         }
@@ -1868,34 +2853,42 @@ public final class ColgramAiSheet {
         attachmentStripScroll.setVisibility(View.VISIBLE);
         for (int i = 0; i < attachedPaths.size(); i++) {
             final String path = attachedPaths.get(i);
-            final int idx = i;
             FrameLayout itemWrap = new FrameLayout(ctx);
-
-            View thumb = buildRoundedMediaThumb(ctx, path, dp(58), dp(58), dp(12), true);
-            itemWrap.addView(thumb, LayoutHelper.createFrame(58, 58, Gravity.BOTTOM | Gravity.START, 0, 5, 5, 0));
+            boolean isMediaVisual = isVisualMediaPath(path);
+            if (isMediaVisual) {
+                View thumb = buildRoundedMediaThumb(ctx, path, dp(58), dp(58), dp(12), true);
+                itemWrap.addView(thumb, LayoutHelper.createFrame(58, 58, Gravity.BOTTOM | Gravity.START, 0, 6, 6, 0));
+            } else {
+                View docCard = buildDocumentCard(ctx, path, true, false);
+                itemWrap.addView(docCard, LayoutHelper.createFrame(134, 58, Gravity.BOTTOM | Gravity.START, 0, 6, 6, 0));
+            }
 
             TextView removeBtn = new TextView(ctx);
             removeBtn.setText("×");
             removeBtn.setTextColor(Color.WHITE);
-            removeBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
+            removeBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f);
             removeBtn.setTypeface(AndroidUtilities.bold());
             removeBtn.setGravity(Gravity.CENTER);
             GradientDrawable rmBg = new GradientDrawable();
             rmBg.setShape(GradientDrawable.OVAL);
-            rmBg.setColor(0xD9111827);
-            rmBg.setStroke(dp(1), 0x80FFFFFF);
+            rmBg.setColor(0xE6111827);
+            rmBg.setStroke(dp(1), 0x99FFFFFF);
             removeBtn.setBackground(rmBg);
             removeBtn.setOnClickListener(v -> {
                 if (attachedPaths.remove(path)) {
                     refreshAttachmentStrip();
                 }
             });
-            itemWrap.addView(removeBtn, LayoutHelper.createFrame(20, 20, Gravity.TOP | Gravity.END));
+            itemWrap.addView(removeBtn, LayoutHelper.createFrame(24, 24, Gravity.TOP | Gravity.END));
 
-            attachmentStripContainer.addView(itemWrap, LayoutHelper.createLinear(64, 64, 0, 0, 6, 0));
+            attachmentStripContainer.addView(itemWrap, LayoutHelper.createLinear(isMediaVisual ? 66 : 142, 66, 0, 0, 6, 0));
         }
 
-        if (attachedPaths.size() < 4) {
+        for (int l = 0; l < loadingAttachmentCount && (attachedPaths.size() + l) < MAX_ATTACHMENTS; l++) {
+            attachmentStripContainer.addView(buildLoadingAttachmentPill(ctx), LayoutHelper.createLinear(64, 58, 0, 6, 6, 0));
+        }
+
+        if (attachedPaths.size() + loadingAttachmentCount < MAX_ATTACHMENTS) {
             TextView addMore = new TextView(ctx);
             addMore.setText("+");
             addMore.setTextColor(cTextSecondary);
@@ -1908,18 +2901,166 @@ public final class ColgramAiSheet {
             addMore.setBackground(addBg);
             ColgramMenuChrome.attachSpringPress(addMore);
             addMore.setOnClickListener(v -> {
-                Activity act = parentFragment != null ? parentFragment.getParentActivity() : LaunchActivity.instance;
-                if (act != null) launchMediaPicker(act);
+                Activity act = resolveValidActivity(parentFragment);
+                if (act != null) showAttachSourceMenu(act);
             });
-            attachmentStripContainer.addView(addMore, LayoutHelper.createLinear(56, 56, 0, 4, 2, 0));
+            attachmentStripContainer.addView(addMore, LayoutHelper.createLinear(56, 58, 0, 6, 2, 0));
         }
         scrollToBottomSmooth();
     }
 
+    private View buildLoadingAttachmentPill(Context ctx) {
+        FrameLayout box = new FrameLayout(ctx);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(cChipBg);
+        bg.setCornerRadius(dp(12));
+        bg.setStroke(dp(1), cBorder);
+        box.setBackground(bg);
+
+        ProgressBar pb = new ProgressBar(ctx);
+        pb.setIndeterminate(true);
+        if (pb.getIndeterminateDrawable() != null) {
+            pb.getIndeterminateDrawable().setColorFilter(cAccent, PorterDuff.Mode.SRC_IN);
+        }
+        box.addView(pb, LayoutHelper.createFrame(24, 24, Gravity.CENTER));
+        return box;
+    }
+
+    private static boolean isVisualMediaPath(String path) {
+        ColgramAiVisionProcessor.AttachmentKind kind = ColgramAiVisionProcessor.classifyKind(path);
+        return kind == ColgramAiVisionProcessor.AttachmentKind.IMAGE
+                || kind == ColgramAiVisionProcessor.AttachmentKind.VIDEO;
+    }
+
     private static boolean isVideoPath(String path) {
-        if (path == null) return false;
-        String low = path.toLowerCase(Locale.US);
-        return low.endsWith(".mp4") || low.endsWith(".mkv") || low.endsWith(".mov") || low.endsWith(".webm") || low.endsWith(".avi");
+        return ColgramAiVisionProcessor.isVideoPath(path);
+    }
+
+    private static int badgeColorForExtension(String extUpper) {
+        if ("PDF".equals(extUpper)) return 0xFFEF4444;
+        if ("DOCX".equals(extUpper) || "ODT".equals(extUpper) || "RTF".equals(extUpper)) return 0xFF2563EB;
+        if ("JSON".equals(extUpper) || "XML".equals(extUpper) || "YAML".equals(extUpper)
+                || "YML".equals(extUpper) || "CSV".equals(extUpper)) return 0xFFD97706;
+        if ("TXT".equals(extUpper) || "MD".equals(extUpper) || "LOG".equals(extUpper)) return 0xFF10B981;
+        return 0xFF6366F1;
+    }
+
+    private View buildDocumentCard(Context ctx, String path, boolean compactStrip, boolean inUserBubble) {
+        File f = new File(path);
+        String name = f.getName();
+        String ext = ColgramAiVisionProcessor.getExtensionUpper(name);
+        int badgeColor = badgeColorForExtension(ext);
+        String sizeStr = f.isFile() ? ColgramAiVisionProcessor.formatFileSize(f.length()) : "";
+
+        LinearLayout card = new LinearLayout(ctx);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(8), dp(7), dp(8), dp(7));
+        GradientDrawable bg = new GradientDrawable();
+        if (inUserBubble) {
+            bg.setColor(0x28FFFFFF);
+            bg.setStroke(dp(1), 0x4DFFFFFF);
+        } else {
+            bg.setColor(cCardElevated);
+            bg.setStroke(dp(1), cBorder);
+        }
+        bg.setCornerRadius(dp(12));
+        card.setBackground(bg);
+
+        TextView extPill = new TextView(ctx);
+        extPill.setText(ext);
+        extPill.setTextColor(Color.WHITE);
+        extPill.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f);
+        extPill.setTypeface(AndroidUtilities.bold());
+        extPill.setGravity(Gravity.CENTER);
+        extPill.setPadding(dp(5), dp(4), dp(5), dp(4));
+        GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setColor(badgeColor);
+        pillBg.setCornerRadius(dp(8));
+        extPill.setBackground(pillBg);
+        card.addView(extPill, LayoutHelper.createLinear(38, 34, 0, 0, 8, 0));
+
+        LinearLayout metaCol = new LinearLayout(ctx);
+        metaCol.setOrientation(LinearLayout.VERTICAL);
+        card.addView(metaCol, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
+
+        TextView nameTv = new TextView(ctx);
+        nameTv.setText(name);
+        nameTv.setTextColor(inUserBubble ? Color.WHITE : cTextPrimary);
+        nameTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, compactStrip ? 11.5f : 12.5f);
+        nameTv.setTypeface(AndroidUtilities.bold());
+        nameTv.setSingleLine(true);
+        nameTv.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        metaCol.addView(nameTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+        if (!sizeStr.isEmpty()) {
+            TextView sizeTv = new TextView(ctx);
+            sizeTv.setText(sizeStr);
+            sizeTv.setTextColor(inUserBubble ? 0xD9FFFFFF : cTextSecondary);
+            sizeTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f);
+            sizeTv.setSingleLine(true);
+            metaCol.addView(sizeTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 1, 0, 0));
+        }
+
+        ColgramMenuChrome.attachSpringPress(card);
+        card.setOnClickListener(v -> showDocumentPreviewSheet(ctx, path));
+        return card;
+    }
+
+    private void showDocumentPreviewSheet(Context ctx, String path) {
+        if (ctx == null || path == null) return;
+        File f = new File(path);
+        if (!f.isFile()) return;
+        Activity host = AndroidUtilities.findActivity(ctx);
+        if (host == null) host = resolveValidActivity(parentFragment);
+        if (host == null) return;
+        final Activity finalHost = host;
+        MEDIA_THUMB_EXEC.execute(() -> {
+            ColgramAiVisionProcessor.AttachmentKind kind = ColgramAiVisionProcessor.classifyKind(f.getName());
+            String previewBody;
+            if (kind == ColgramAiVisionProcessor.AttachmentKind.TEXT_DOC) {
+                ColgramAiVisionProcessor.PreparedAttachment pa = ColgramAiVisionProcessor.prepareDocumentAttachment(f);
+                previewBody = (pa != null && pa.hasText())
+                        ? pa.extractedText
+                        : ("Файл: " + f.getName() + "\nРазмер: " + ColgramAiVisionProcessor.formatFileSize(f.length()));
+            } else {
+                previewBody = "Файл: " + f.getName()
+                        + "\nТип: " + ColgramAiVisionProcessor.getExtensionUpper(f.getName())
+                        + "\nРазмер: " + ColgramAiVisionProcessor.formatFileSize(f.length());
+            }
+            AndroidUtilities.runOnUIThread(() -> {
+                if (cleanedUp.get() || finalHost.isFinishing() || finalHost.isDestroyed()) return;
+                ColgramUiKit.showInfoSheet(
+                        finalHost,
+                        parentFragment != null ? parentFragment.getResourceProvider() : null,
+                        R.drawable.msg_view_file,
+                        f.getName(),
+                        previewBody,
+                        "Открыть",
+                        () -> openAttachedFileExternally(finalHost, f),
+                        "Закрыть",
+                        null,
+                        true
+                );
+            });
+        });
+    }
+
+    private static void openAttachedFileExternally(Activity act, File f) {
+        try {
+            Uri uri = FileProvider.getUriForFile(act, ApplicationLoader.getApplicationId() + ".provider", f);
+            String ext = ColgramAiVisionProcessor.getExtensionUpper(f.getName()).toLowerCase(Locale.US);
+            String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+            if (mime == null || mime.isEmpty()) {
+                mime = ColgramAiVisionProcessor.isPdfPath(f.getName()) ? "application/pdf" : "*/*";
+            }
+            Intent view = new Intent(Intent.ACTION_VIEW);
+            view.setDataAndType(uri, mime);
+            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            act.startActivity(Intent.createChooser(view, f.getName()));
+        } catch (Throwable t) {
+            Toast.makeText(act, "Нет приложения для просмотра этого файла", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private static Bitmap decodeMediaThumbnail(String path, int reqW, int reqH) {
@@ -1944,20 +3085,56 @@ public final class ColgramAiSheet {
             }
             return null;
         }
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                ImageDecoder.Source src = ImageDecoder.createSource(f);
+                return ImageDecoder.decodeBitmap(src, (decoder, info, source) -> {
+                    decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                    int iw = info.getSize().getWidth();
+                    int ih = info.getSize().getHeight();
+                    if (iw > 0 && ih > 0 && reqW > 0 && reqH > 0) {
+                        float scale = Math.min(1f, Math.max(reqW / (float) iw, reqH / (float) ih));
+                        int tw = Math.max(1, Math.round(iw * scale));
+                        int th = Math.max(1, Math.round(ih * scale));
+                        if (tw < iw || th < ih) {
+                            decoder.setTargetSize(tw, th);
+                        }
+                    }
+                });
+            } catch (Throwable ignored) {}
+        }
         try {
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
             BitmapFactory.decodeFile(path, bounds);
-            int inSample = 1;
             int w = bounds.outWidth;
             int h = bounds.outHeight;
-            while (w > 0 && h > 0 && (w / (inSample * 2) >= reqW || h / (inSample * 2) >= reqH)) {
+            if (w <= 0 || h <= 0) return null;
+            int inSample = 1;
+            while ((w / (inSample * 2) >= reqW) && (h / (inSample * 2) >= reqH)) {
                 inSample *= 2;
             }
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inSampleSize = Math.max(1, inSample);
-            opts.inPreferredConfig = Bitmap.Config.RGB_565;
-            return BitmapFactory.decodeFile(path, opts);
+            opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            Bitmap bmp = BitmapFactory.decodeFile(path, opts);
+            if (bmp == null) return null;
+            try {
+                ExifInterface exif = new ExifInterface(path);
+                int orient = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
+                int[] tf = ColgramAiVisionProcessor.exifFlipAndRotate(orient);
+                if (tf[0] != 0 || tf[1] != 1 || tf[2] != 1) {
+                    Matrix m = new Matrix();
+                    if (tf[0] != 0) m.postRotate(tf[0]);
+                    if (tf[1] != 1 || tf[2] != 1) m.postScale(tf[1], tf[2]);
+                    Bitmap rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+                    if (rotated != null && rotated != bmp) {
+                        bmp.recycle();
+                        bmp = rotated;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            return bmp;
         } catch (Throwable ignored) {
             return null;
         }
@@ -2158,16 +3335,28 @@ public final class ColgramAiSheet {
         bubble.setBackground(bg);
 
         if (validMedia.size() == 1) {
-            View thumb = buildRoundedMediaThumb(ctx, validMedia.get(0), dp(210), dp(160), dp(14), true);
-            bubble.addView(thumb, LayoutHelper.createLinear(210, 160));
+            String p0 = validMedia.get(0);
+            if (isVisualMediaPath(p0)) {
+                View thumb = buildRoundedMediaThumb(ctx, p0, dp(210), dp(160), dp(14), true);
+                bubble.addView(thumb, LayoutHelper.createLinear(210, 160));
+            } else {
+                View docCard = buildDocumentCard(ctx, p0, false, true);
+                bubble.addView(docCard, LayoutHelper.createLinear(218, LayoutHelper.WRAP_CONTENT));
+            }
         } else {
             HorizontalScrollView rowScroll = new HorizontalScrollView(ctx);
             rowScroll.setHorizontalScrollBarEnabled(false);
             LinearLayout row = new LinearLayout(ctx);
             row.setOrientation(LinearLayout.HORIZONTAL);
             for (int i = 0; i < validMedia.size(); i++) {
-                View thumb = buildRoundedMediaThumb(ctx, validMedia.get(i), dp(116), dp(116), dp(12), true);
-                row.addView(thumb, LayoutHelper.createLinear(116, 116, 0, 0, i < validMedia.size() - 1 ? 6 : 0, 0));
+                String pi = validMedia.get(i);
+                if (isVisualMediaPath(pi)) {
+                    View thumb = buildRoundedMediaThumb(ctx, pi, dp(116), dp(116), dp(12), true);
+                    row.addView(thumb, LayoutHelper.createLinear(116, 116, 0, 0, i < validMedia.size() - 1 ? 6 : 0, 0));
+                } else {
+                    View docCard = buildDocumentCard(ctx, pi, false, true);
+                    row.addView(docCard, LayoutHelper.createLinear(150, 72, Gravity.CENTER_VERTICAL, 0, 0, i < validMedia.size() - 1 ? 6 : 0, 0));
+                }
             }
             rowScroll.addView(row);
             bubble.addView(rowScroll, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
@@ -2898,7 +4087,8 @@ public final class ColgramAiSheet {
         }
         if (android.os.Build.VERSION.SDK_INT >= 23
                 && act.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            act.requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, 6410);
+            ColgramAiActivity.pendingSheetForVoice = this;
+            act.requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, ColgramAiActivity.REQ_PERM_MIC_KOLITI);
             Toast.makeText(act, "Разрешите микрофон, чтобы говорить с Koliti", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -2924,11 +4114,7 @@ public final class ColgramAiSheet {
             intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите с Koliti…");
             if (intent.resolveActivity(act.getPackageManager()) != null) {
                 ColgramAiActivity.pendingSheetForVoice = this;
-                if (parentFragment != null) {
-                    parentFragment.startActivityForResult(intent, ColgramAiActivity.REQ_VOICE_RECOGNIZE);
-                } else {
-                    act.startActivityForResult(intent, ColgramAiActivity.REQ_VOICE_RECOGNIZE);
-                }
+                startSheetActivityForResult(act, intent, ColgramAiActivity.REQ_VOICE_RECOGNIZE);
                 return;
             }
         } catch (Throwable ignored) {}
@@ -3019,7 +4205,8 @@ public final class ColgramAiSheet {
         if (!recordingVoiceNote) {
             if (android.os.Build.VERSION.SDK_INT >= 23
                     && act.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                act.requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, 6410);
+                ColgramAiActivity.pendingSheetForVoice = this;
+                act.requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, ColgramAiActivity.REQ_PERM_MIC_KOLITI);
                 Toast.makeText(act, "Разрешите доступ к микрофону", Toast.LENGTH_SHORT).show();
                 return;
             }

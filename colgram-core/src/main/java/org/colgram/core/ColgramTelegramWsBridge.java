@@ -3,6 +3,7 @@ package org.colgram.core;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -187,24 +188,26 @@ public final class ColgramTelegramWsBridge {
     private static final long DEPRIORITIZE_TTL_MS = 45_000L;
     private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
 
-    private static final ExecutorService RACE_POOL = new java.util.concurrent.ThreadPoolExecutor(
-            0, 64, 30L, TimeUnit.SECONDS,
-            new java.util.concurrent.SynchronousQueue<>(),
-            r -> {
-                Thread t = new Thread(r, "colgram-ws-dial");
-                t.setDaemon(true);
-                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws dial err: " + ex));
-                return t;
-            });
-    private static final ExecutorService TCP_RACE_POOL = new java.util.concurrent.ThreadPoolExecutor(
-            0, 96, 30L, TimeUnit.SECONDS,
-            new java.util.concurrent.SynchronousQueue<>(),
-            r -> {
-                Thread t = new Thread(r, "colgram-ws-tcp");
-                t.setDaemon(true);
-                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws tcp err: " + ex));
-                return t;
-            });
+    private static ExecutorService createWsDaemonPool(int maxThreads, final String prefix,
+                                                      final String errLabel, final int androidPriority) {
+        return new java.util.concurrent.ThreadPoolExecutor(
+                0, maxThreads, 90L, TimeUnit.SECONDS,
+                new java.util.concurrent.SynchronousQueue<>(),
+                r -> {
+                    Thread t = new Thread(() -> {
+                        ColgramDpiBypass.setThreadPriorityQuiet(androidPriority);
+                        r.run();
+                    }, prefix);
+                    t.setDaemon(true);
+                    t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, errLabel + ex));
+                    return t;
+                });
+    }
+
+    private static final ExecutorService RACE_POOL = createWsDaemonPool(
+            64, "colgram-ws-dial", "ws dial err: ", android.os.Process.THREAD_PRIORITY_LESS_FAVORABLE);
+    private static final ExecutorService TCP_RACE_POOL = createWsDaemonPool(
+            96, "colgram-ws-tcp", "ws tcp err: ", android.os.Process.THREAD_PRIORITY_LESS_FAVORABLE);
 
     static final class EdgeEndpoint {
         final String ip;
@@ -275,9 +278,9 @@ public final class ColgramTelegramWsBridge {
     }
 
     private static int defaultFragModeForNetwork(boolean cellular) {
-        // Prefer plain spoofed RU-whitelist SNI once validated (0 fragmentation sleeps),
-        // racing FRAG_SPOOF_SNI_TLSREC on cold start when needed for strict TSPU DPI.
-        return FRAG_SPOOF_SNI_TLSREC;
+        // Prefer plain spoofed RU-whitelist SNI on Wi-Fi (0 fragment writes) and 2-record TLS SNI
+        // split on stricter cellular TSPU DPI; cold-start Wave-1 races both automatically.
+        return cellular ? FRAG_SPOOF_SNI_TLSREC : FRAG_SPOOF_SNI_PLAIN;
     }
 
     private static final int DC_BUCKET_COUNT = 12; // 0=other, 1..5=generic DC1..5, 6..10=media DC1..5
@@ -285,19 +288,13 @@ public final class ColgramTelegramWsBridge {
     private static final long DIAL_SLOT_ACQUIRE_WAIT_MS = 2200L;
     private static final SecureRandom SHARED_MASK_SEEDER = new SecureRandom();
     static final int PREWARM_MAX_PER_BUCKET = 3;
-    static final long PREWARM_TTL_MS = 60_000L;
-    static final long PREWARM_REFRESH_MS = 42_000L;
+    static final long PREWARM_TTL_MS = 38_000L;
+    static final long PREWARM_REFRESH_MS = 28_000L;
     private static final long DC135_DEAD_COOLDOWN_MS = 120_000L;
+    private static final byte[] EMPTY_BYTES = new byte[0];
     private static final int[] PREWARM_TARGET_DCS = {2, 4, -2, -4};
-    private static final ExecutorService PREWARM_POOL = new java.util.concurrent.ThreadPoolExecutor(
-            0, 8, 20L, TimeUnit.SECONDS,
-            new java.util.concurrent.SynchronousQueue<>(),
-            r -> {
-                Thread t = new Thread(r, "colgram-ws-prewarm");
-                t.setDaemon(true);
-                t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ws prewarm err: " + ex));
-                return t;
-            });
+    private static final ExecutorService PREWARM_POOL = createWsDaemonPool(
+            8, "colgram-ws-prewarm", "ws prewarm err: ", android.os.Process.THREAD_PRIORITY_BACKGROUND);
 
     private static final PrewarmedWsPool PREWARMED_POOL = new PrewarmedWsPool();
     private static volatile boolean prewarmEnabled = true;
@@ -374,6 +371,7 @@ public final class ColgramTelegramWsBridge {
         public final String edgeIp;
         public final String sniHost;
         public final Socket socket;
+        public final Socket rawSocket;
         public final InputStream in;
         public final OutputStream out;
         private final Object writeLock = new Object();
@@ -384,16 +382,22 @@ public final class ColgramTelegramWsBridge {
 
         WsSession(int dcId, String edgeIp, String sniHost, Socket socket,
                   InputStream in, OutputStream out) {
-            this(dcId, dcId, edgeIp, sniHost, socket, in, out);
+            this(dcId, dcId, edgeIp, sniHost, socket, null, in, out);
         }
 
         WsSession(int dcId, int rawDcId, String edgeIp, String sniHost, Socket socket,
                   InputStream in, OutputStream out) {
+            this(dcId, rawDcId, edgeIp, sniHost, socket, null, in, out);
+        }
+
+        WsSession(int dcId, int rawDcId, String edgeIp, String sniHost, Socket socket,
+                  Socket rawSocket, InputStream in, OutputStream out) {
             this.dcId = dcId;
             this.rawDcId = rawDcId;
             this.edgeIp = edgeIp;
             this.sniHost = sniHost;
             this.socket = socket;
+            this.rawSocket = rawSocket;
             this.in = in;
             this.out = out;
             long seed;
@@ -436,18 +440,18 @@ public final class ColgramTelegramWsBridge {
         }
 
         public void sendPing() throws IOException {
-            writeFrame(0x89, new byte[0], 0, 0);
+            writeFrame(0x89, EMPTY_BYTES, 0, 0);
         }
 
         public void sendPong(byte[] payload, int len) throws IOException {
-            byte[] safe = payload == null ? new byte[0] : payload;
+            byte[] safe = payload == null ? EMPTY_BYTES : payload;
             int clamped = Math.max(0, Math.min(len, Math.min(safe.length, 125)));
             writeFrame(0x8A, safe, 0, clamped);
         }
 
         public void sendClose() {
             try {
-                writeFrame(0x88, new byte[0], 0, 0);
+                writeFrame(0x88, EMPTY_BYTES, 0, 0);
             } catch (Throwable ignored) {
             }
         }
@@ -536,8 +540,14 @@ public final class ColgramTelegramWsBridge {
         @Override
         public void close() {
             if (!closed.compareAndSet(false, true)) return;
+            if (rawSocket != null && rawSocket != socket) {
+                try {
+                    rawSocket.close();
+                } catch (Throwable ignored) {
+                }
+            }
             try {
-                socket.close();
+                if (socket != null) socket.close();
             } catch (Throwable ignored) {
             }
         }
@@ -590,6 +600,30 @@ public final class ColgramTelegramWsBridge {
                 return false;
             }
             return ColgramTelegramWsBridge.isPrewarmUsable(entry.session);
+        }
+
+        boolean needsForegroundRefresh(int normDc, boolean media, boolean wantProtected, long nowMs) {
+            int bucket = bucketFor(normDc, media);
+            if (inFlight.get(bucket) > 0) return false;
+            java.util.concurrent.ConcurrentLinkedDeque<PrewarmedEntry> q = buckets[bucket];
+            pruneExpired(q, nowMs);
+            PrewarmedEntry newest = null;
+            for (PrewarmedEntry entry : q) {
+                if (entry.protectedSocket == wantProtected && isPrewarmUsable(entry, nowMs)) {
+                    if (newest == null || entry.createdAtMs > newest.createdAtMs) {
+                        newest = entry;
+                    }
+                }
+            }
+            if (newest == null) return true;
+            if ((nowMs - newest.createdAtMs) >= PREWARM_REFRESH_MS) {
+                if (q.size() >= PREWARM_MAX_PER_BUCKET) {
+                    PrewarmedEntry evicted = q.pollLast();
+                    if (evicted != null) evicted.session.close();
+                }
+                return true;
+            }
+            return false;
         }
 
         WsSession take(int normDc, boolean media, boolean wantProtected, long nowMs) {
@@ -806,6 +840,34 @@ public final class ColgramTelegramWsBridge {
         warmUp();
     }
 
+    /**
+     * Lightweight foreground-only pool maintenance called from the existing 8s watchdog tick.
+     * Evicts expired entries and refreshes aging prewarmed buckets (>= PREWARM_REFRESH_MS)
+     * without adding any background timers or wakeups.
+     */
+    public static void maintainForegroundPrewarmIfNeeded(android.content.Context ctx) {
+        if (!prewarmEnabled || !ColgramUiBridge.isAppInForeground()) return;
+        if (ColgramDpiBypass.wasExplicitlyStopped()
+                || ColgramDpiBypass.isOverlayVpnActive()
+                || ColgramDpiBypass.isStrictL3WhitelistDetected()) {
+            return;
+        }
+        if (ctx != null && ColgramPowerGuard.shouldThrottle(ctx)) return;
+        long now = System.currentTimeMillis();
+        PREWARMED_POOL.evictExpired(now);
+        if (!workedOnNetwork && !ColgramDpiBypass.isWsPreferredAnyBucket()) {
+            return;
+        }
+        boolean wantProtected = ColgramDpiBypass.activeSystemDpiVpn() != null;
+        for (int signedDc : PREWARM_TARGET_DCS) {
+            int normDc = Math.abs(signedDc);
+            boolean media = signedDc < 0;
+            if (PREWARMED_POOL.needsForegroundRefresh(normDc, media, wantProtected, now)) {
+                replenishPrewarmedAsync(normDc, media, 1);
+            }
+        }
+    }
+
     public static boolean hasPrewarmed(int dcId, boolean media) {
         int norm = Obfuscated2FrameSplitter.normalizeDcId(dcId);
         if (norm < 1 || norm > 5) return false;
@@ -851,7 +913,7 @@ public final class ColgramTelegramWsBridge {
         }
     }
 
-    private static void replenishPrewarmedAsync(final int normDc, final boolean media) {
+    private static void replenishPrewarmedAsync(final int normDc, final boolean media, final int maxToSpawn) {
         if (!prewarmEnabled || !ColgramUiBridge.isAppInForeground() || normDc < 1 || normDc > 5) return;
         if (ColgramDpiBypass.wasExplicitlyStopped()
                 || ColgramDpiBypass.isOverlayVpnActive()
@@ -866,7 +928,8 @@ public final class ColgramTelegramWsBridge {
         PREWARMED_POOL.evictExpired(now);
         int current = PREWARMED_POOL.size(bucket);
         int pending = PREWARMED_POOL.inFlight.get(bucket);
-        int deficit = PREWARM_MAX_PER_BUCKET - (current + pending);
+        int freeSlots = PREWARM_MAX_PER_BUCKET - (current + pending);
+        int deficit = Math.min(Math.max(1, maxToSpawn), freeSlots);
         if (deficit <= 0) return;
 
         final long gen = PREWARMED_POOL.currentGeneration();
@@ -918,6 +981,10 @@ public final class ColgramTelegramWsBridge {
         }
     }
 
+    private static void replenishPrewarmedAsync(final int normDc, final boolean media) {
+        replenishPrewarmedAsync(normDc, media, PREWARM_MAX_PER_BUCKET);
+    }
+
     static boolean offerPrewarmedForTest(WsSession session, long createdAtMs, boolean wantProtected) {
         if (session == null) return false;
         int norm = Obfuscated2FrameSplitter.normalizeDcId(session.dcId);
@@ -946,6 +1013,25 @@ public final class ColgramTelegramWsBridge {
 
     static int preferredFragModeForTest() {
         return preferredFragMode;
+    }
+
+    static void setLastWorkingForTest(int rawDcId, String ip, String sniHost) {
+        int bucket = dcBucket(rawDcId);
+        lastWorkingByDc.set(bucket, new EdgeEndpoint(ip, sniHost));
+    }
+
+    static String lastWorkingForTest(int rawDcId) {
+        EdgeEndpoint ep = lastWorkingByDc.get(dcBucket(rawDcId));
+        return ep != null ? ep.key() : null;
+    }
+
+    static boolean isDeprioritizedForTest(String ip, String sniHost) {
+        Long until = deprioritizedUntil.get(new EdgeEndpoint(ip, sniHost).key());
+        return until != null && until > System.currentTimeMillis();
+    }
+
+    static boolean needsForegroundRefreshForTest(int normDc, boolean media, boolean wantProtected, long nowMs) {
+        return PREWARMED_POOL.needsForegroundRefresh(normDc, media, wantProtected, nowMs);
     }
 
     static void restoreBypassHint(boolean cellular, int fragMode, int sniCursor) {
@@ -1568,7 +1654,7 @@ public final class ColgramTelegramWsBridge {
                 hostnameMismatch = true;
                 throw new IOException("TLS cert not official Telegram edge for " + realHost);
             }
-            OutputStream out = ssl.getOutputStream();
+            OutputStream out = wrapBufferedOutput(ssl.getOutputStream());
             InputStream in = new BufferedInputStream(ssl.getInputStream(), 32768);
             if (!upgradeWebSocket(in, out, realHost)) {
                 throw new IOException("WebSocket upgrade rejected by " + ip + " (" + realHost + ")");
@@ -1591,7 +1677,7 @@ public final class ColgramTelegramWsBridge {
             cooldownUntilByDc.set(bucket, 0L);
             Log.i(TAG, "WSS upgraded ok: " + tcp.endpoint + " tlsSni=" + tlsSni
                     + " fragMode=" + fragMode + " dc=" + normDc + " wireDc=" + wireDcId);
-            return new HandshakeResult(new WsSession(normDc, wireDcId, ip, realHost, ssl, in, out), false, false);
+            return new HandshakeResult(new WsSession(normDc, wireDcId, ip, realHost, ssl, tcp.socket, in, out), false, false);
         } catch (Throwable t) {
             if (isSpoofSniFragMode(fragMode)) {
                 spoofSniCursor.incrementAndGet();
@@ -1604,6 +1690,13 @@ public final class ColgramTelegramWsBridge {
             }
             return new HandshakeResult(null, wrapperRejected, hostnameMismatch);
         }
+    }
+
+    private static OutputStream wrapBufferedOutput(OutputStream rawOut) {
+        if (rawOut == null || rawOut instanceof BufferedOutputStream) {
+            return rawOut;
+        }
+        return new BufferedOutputStream(rawOut, 16384);
     }
 
     /**
@@ -1677,7 +1770,7 @@ public final class ColgramTelegramWsBridge {
             if (!verifyOfficialTelegramSession(ssl.getSession(), host)) {
                 throw new IOException("TLS cert not official Telegram edge over relay for " + host);
             }
-            OutputStream out = ssl.getOutputStream();
+            OutputStream out = wrapBufferedOutput(ssl.getOutputStream());
             InputStream in = new BufferedInputStream(ssl.getInputStream(), 32768);
             if (!upgradeWebSocket(in, out, host)) {
                 throw new IOException("WebSocket upgrade rejected over relay " + label + " (" + host + ")");
@@ -1689,7 +1782,7 @@ public final class ColgramTelegramWsBridge {
                 Log.i(TAG, "WSS-over-L3-relay upgraded ok: relay=" + label + " host=" + host
                         + " tlsSni=" + tlsSni + " dc=" + normDc + " wireDc=" + wireDcId);
             } catch (Throwable ignored) {}
-            return new WsSession(normDc, wireDcId, label, host, ssl, in, out);
+            return new WsSession(normDc, wireDcId, label, host, ssl, relayTcpSocket, in, out);
         } catch (Throwable t) {
             spoofSniCursor.incrementAndGet();
             try {
@@ -2003,19 +2096,20 @@ public final class ColgramTelegramWsBridge {
     public static long pumpUpstreamFrames(WsSession session, OutputStream clientOut,
                                           OnBytes onReply) throws IOException {
         long total = 0L;
-        byte[] buf = new byte[32768];
+        byte[] buf = ColgramDpiBypass.borrowRelayBuffer();
         byte[] maskBuf = new byte[4];
-        InputStream in = session.in;
-        if (!(in instanceof BufferedInputStream) && !(in instanceof ByteArrayInputStream)) {
-            in = new BufferedInputStream(in, 32768);
-        }
-        boolean inFragmentedData = false;
-        if (session.socket != null) {
-            try { session.socket.setSoTimeout(0); } catch (Throwable ignored) {}
-        }
-        while (true) {
-            int b0 = in.read();
-            if (b0 < 0) break;
+        try {
+            InputStream in = session.in;
+            if (!(in instanceof BufferedInputStream) && !(in instanceof ByteArrayInputStream)) {
+                in = new BufferedInputStream(in, 32768);
+            }
+            boolean inFragmentedData = false;
+            if (session.socket != null) {
+                try { session.socket.setSoTimeout(0); } catch (Throwable ignored) {}
+            }
+            while (true) {
+                int b0 = in.read();
+                if (b0 < 0) break;
                 int b1 = in.read();
                 if (b1 < 0) break;
                 boolean fin = (b0 & 0x80) != 0;
@@ -2097,6 +2191,9 @@ public final class ColgramTelegramWsBridge {
             }
             clientOut.flush();
             return total;
+        } finally {
+            ColgramDpiBypass.recycleRelayBuffer(buf);
+        }
     }
 
     public interface OnBytes {

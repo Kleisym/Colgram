@@ -73,20 +73,17 @@ public class ColgramStorageSandbox {
         cacheRoot = resolvedCache;
         sandboxedDirCacheRoot = resolvedRoot;
 
-        // Synchronously create root, cache, and top-level .nomedia guards so any immediate
-        // FileLoader call lands in a protected directory.
-        ensureDirWithNoMedia(resolvedRoot);
-        ensureDirWithNoMedia(resolvedCache);
-        if (resolvedCache != null) {
-            ensuredCacheRootFile = resolvedCache;
-        }
-
-        // Complete full subdirectory tree & silence any legacy public Documents/<name> folder off the UI thread.
+        // Defer directory/.nomedia writes & MediaScanner silencing onto background priority thread off UI startup.
         Thread t = new Thread(() -> {
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             } catch (Throwable ignored) {}
             try {
+                ensureDirWithNoMedia(resolvedRoot);
+                ensureDirWithNoMedia(resolvedCache);
+                if (resolvedCache != null) {
+                    ensuredCacheRootFile = resolvedCache;
+                }
                 File root = sandboxRoot;
                 if (root != null && !isWritable(root)) {
                     File internalFallback = sandboxOn

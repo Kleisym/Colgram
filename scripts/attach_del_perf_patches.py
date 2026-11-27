@@ -953,7 +953,9 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     )
 
     # =========================================================================
-    # 5. FileUploadOperation.java: fix 64-bit checkpoint byte offset arithmetic
+    # 5. FileUploadOperation.java: fix 64-bit checkpoint byte offset arithmetic,
+    #    make state volatile, notify didFailedUploadingFile at most once, and
+    #    close stream strictly on stageQueue to prevent cancel race.
     # =========================================================================
     file_upload_op = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/messenger/FileUploadOperation.java")
     eol_patch_fn(
@@ -963,9 +965,122 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "FileUploadOperation.java 64-bit chunk offset multiplication",
     )
 
+    def patch_file_upload_cancel(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        eol = "\r\n" if "\r\n" in content else "\n"
+        changed = False
+
+        old_state = "    private int state;"
+        new_state = (
+            "    private volatile int state;\n"
+            "    private final java.util.concurrent.atomic.AtomicBoolean colgramFailedNotified = new java.util.concurrent.atomic.AtomicBoolean(false);\n\n"
+            "    private void colgramNotifyFailedOnce() {\n"
+            "        if (delegate != null && colgramFailedNotified.compareAndSet(false, true)) {\n"
+            "            delegate.didFailedUploadingFile(this);\n"
+            "        }\n"
+            "    }"
+        )
+        if old_state in norm and "colgramFailedNotified" not in norm:
+            norm = norm.replace(old_state, new_state, 1)
+            changed = True
+
+        old_cancel = (
+            "    public void cancel() {\n"
+            "        if (state == 3) {\n"
+            "            return;\n"
+            "        }\n"
+            "        state = 2;\n"
+            "        Utilities.stageQueue.postRunnable(() -> {\n"
+            "            for (int a = 0; a < requestTokens.size(); a++) {\n"
+            "                ConnectionsManager.getInstance(currentAccount).cancelRequest(requestTokens.valueAt(a), true);\n"
+            "            }\n"
+            "        });\n"
+            "        AutoDeleteMediaTask.unlockFile(uploadingFilePath);\n"
+            "        delegate.didFailedUploadingFile(this);\n"
+            "        cleanup();\n"
+            "    }"
+        )
+        new_cancel = (
+            "    public void cancel() {\n"
+            "        if (state == 3 || state == 2) {\n"
+            "            return;\n"
+            "        }\n"
+            "        state = 2;\n"
+            "        Utilities.stageQueue.postRunnable(() -> {\n"
+            "            for (int a = 0; a < requestTokens.size(); a++) {\n"
+            "                ConnectionsManager.getInstance(currentAccount).cancelRequest(requestTokens.valueAt(a), true);\n"
+            "            }\n"
+            "            requestTokens.clear();\n"
+            "            cleanup();\n"
+            "        });\n"
+            "        AutoDeleteMediaTask.unlockFile(uploadingFilePath);\n"
+            "        colgramNotifyFailedOnce();\n"
+            "    }"
+        )
+        if old_cancel in norm:
+            norm = norm.replace(old_cancel, new_cancel, 1)
+            changed = True
+
+        old_catch = (
+            "        } catch (Exception e) {\n"
+            "            FileLog.e(e);\n"
+            "            state = 4;\n"
+            "            delegate.didFailedUploadingFile(this);\n"
+            "            cleanup();\n"
+            "            return;\n"
+            "        }"
+        )
+        new_catch = (
+            "        } catch (Exception e) {\n"
+            "            FileLog.e(e);\n"
+            "            if (state != 2 && state != 3) {\n"
+            "                state = 4;\n"
+            "                colgramNotifyFailedOnce();\n"
+            "            }\n"
+            "            cleanup();\n"
+            "            return;\n"
+            "        }"
+        )
+        if old_catch in norm:
+            norm = norm.replace(old_catch, new_catch, 1)
+            changed = True
+
+        old_rpc_fail = (
+            "            } else {\n"
+            "                state = 4;\n"
+            "                delegate.didFailedUploadingFile(FileUploadOperation.this);\n"
+            "                cleanup();\n"
+            "            }"
+        )
+        new_rpc_fail = (
+            "            } else {\n"
+            "                if (state != 2 && state != 3) {\n"
+            "                    state = 4;\n"
+            "                    colgramNotifyFailedOnce();\n"
+            "                }\n"
+            "                cleanup();\n"
+            "            }"
+        )
+        if old_rpc_fail in norm:
+            norm = norm.replace(old_rpc_fail, new_rpc_fail, 1)
+            changed = True
+
+        if not changed:
+            return content
+        return norm.replace("\n", eol)
+
+    patch_file_fn(
+        file_upload_op,
+        patch_file_upload_cancel,
+        "        colgramNotifyFailedOnce();",
+        "FileUploadOperation.java volatile state, single failed callback, and stageQueue cleanup on cancel",
+    )
+
     # =========================================================================
     # 6. SendMessagesHelper.java:
-    #    - Shared colgramCancelMessageTransfers helper
+    #    - Non-reentrant colgramCancelMessageTransfers (catch Exception only, never Error)
+    #    - Guard cancelSendingMessage with colgramCancellingIds & immediate send_state update
+    #    - Skip redundant rememberPendingReply(..., null) on normal text sends
     #    - Offload prepareSendingDocuments URI copies off Utilities.globalQueue
     #    - Clean up rejected colgram_inbox staged files
     # =========================================================================
@@ -995,44 +1110,301 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "                    fl.cancelLoadFile(ps, true);\n"
             "                }\n"
             "            }\n"
-            "        } catch (Throwable ignored) {}\n"
+            "        } catch (Exception ignored) {}\n"
             "    }\n\n"
+        )
+        clean_call = (
+            "            if (helper != null && helper.colgramShouldCancelSending(msg)) {\n"
+            "                helper.cancelSendingMessage(msg); // non-reentrant\n"
+            "            }\n"
+        )
+        stale_call = (
+            "            if (helper != null && helper.colgramShouldCancelSending(msg)) {\n"
+            "                int mid = msg.getId();\n"
+            "                helper.colgramCancellingIds.add(mid);\n"
+            "                try {\n"
+            "                    helper.cancelSendingMessage(msg);\n"
+            "                } finally {\n"
+            "                    helper.colgramCancellingIds.remove(mid);\n"
+            "                }\n"
+            "            }\n"
         )
         full_block = (
             "    private static final java.util.concurrent.ExecutorService colgramDocPrepExecutor =\n"
-            "            java.util.concurrent.Executors.newFixedThreadPool(2);\n\n"
+            "            java.util.concurrent.Executors.newFixedThreadPool(2);\n"
+            "    private final java.util.HashSet<Integer> colgramCancellingIds = new java.util.HashSet<>();\n"
+            "    private volatile boolean colgramHasAnyPendingReply = false;\n"
+            "    private final androidx.collection.LongSparseArray<Boolean> colgramPendingReplyPeers = new androidx.collection.LongSparseArray<>();\n\n"
+            "    private void colgramRememberPendingReplyIfNeeded(long peer, MessageObject replyToMsg, boolean isDotCmd) {\n"
+            "        if (isDotCmd) {\n"
+            "            synchronized (colgramPendingReplyPeers) {\n"
+            "                colgramPendingReplyPeers.put(peer, Boolean.TRUE);\n"
+            "                colgramHasAnyPendingReply = true;\n"
+            "            }\n"
+            "            ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, peer, replyToMsg);\n"
+            "            return;\n"
+            "        }\n"
+            "        if (!colgramHasAnyPendingReply) {\n"
+            "            return;\n"
+            "        }\n"
+            "        boolean hadPeer = false;\n"
+            "        synchronized (colgramPendingReplyPeers) {\n"
+            "            int idx = colgramPendingReplyPeers.indexOfKey(peer);\n"
+            "            if (idx >= 0) {\n"
+            "                colgramPendingReplyPeers.removeAt(idx);\n"
+            "                hadPeer = true;\n"
+            "                colgramHasAnyPendingReply = colgramPendingReplyPeers.size() > 0;\n"
+            "            }\n"
+            "        }\n"
+            "        if (hadPeer) {\n"
+            "            ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, peer, null);\n"
+            "        }\n"
+            "    }\n\n"
+            "    private boolean colgramHasDelayedMessage(int mid) {\n"
+            "        if (delayedMessages == null || delayedMessages.isEmpty()) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        for (HashMap.Entry<String, ArrayList<DelayedMessage>> entry : delayedMessages.entrySet()) {\n"
+            "            ArrayList<DelayedMessage> messages = entry.getValue();\n"
+            "            if (messages == null) continue;\n"
+            "            for (int a = 0; a < messages.size(); a++) {\n"
+            "                DelayedMessage dm = messages.get(a);\n"
+            "                if (dm == null) continue;\n"
+            "                if (dm.type == 4 && dm.messageObjects != null) {\n"
+            "                    for (int b = 0; b < dm.messageObjects.size(); b++) {\n"
+            "                        MessageObject mo = dm.messageObjects.get(b);\n"
+            "                        if (mo != null && mo.getId() == mid) return true;\n"
+            "                    }\n"
+            "                } else if (dm.obj != null && dm.obj.getId() == mid) {\n"
+            "                    return true;\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "        return false;\n"
+            "    }\n\n"
+            "    private boolean colgramShouldCancelSending(MessageObject msg) {\n"
+            "        if (msg == null || msg.messageOwner == null) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        int mid = msg.getId();\n"
+            "        if (colgramCancellingIds.contains(mid)) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        if (!(msg.isSending() || msg.isEditing())) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        return isSendingMessage(mid) || uploadMessages.indexOfKey(mid) >= 0 || colgramHasDelayedMessage(mid);\n"
+            "    }\n\n"
             + downloads_helper
             + "    public static void colgramCancelMessageTransfers(int account, MessageObject msg) {\n"
             "        if (msg == null) {\n"
             "            return;\n"
             "        }\n"
             "        try {\n"
-            "            if (msg.isSending() || (msg.messageOwner != null && msg.messageOwner.send_state != 0 && msg.messageOwner.send_state != 3)) {\n"
-            "                getInstance(account).cancelSendingMessage(msg);\n"
-            "            }\n"
-            "        } catch (Throwable ignored) {}\n"
+            "            SendMessagesHelper helper = getInstance(account);\n"
+            + clean_call +
+            "        } catch (Exception ignored) {}\n"
             "        colgramCancelFileDownloads(account, msg);\n"
             "    }\n\n"
             "    public void cancelSendingMessage(MessageObject object) {"
         )
-        if "public static void colgramCancelFileDownloads(" in norm:
+        if "helper.cancelSendingMessage(msg); // non-reentrant" in norm:
             return content
-        pass1_marker = "    public static void colgramCancelMessageTransfers(int account, MessageObject msg) {"
-        end_pass1 = "    public void cancelSendingMessage(MessageObject object) {"
-        if pass1_marker in norm and end_pass1 in norm:
-            p1 = norm.find("    private static final java.util.concurrent.ExecutorService colgramDocPrepExecutor =")
-            p2 = norm.find(end_pass1, p1)
-            if p1 >= 0 and p2 > p1:
-                return (norm[:p1] + full_block + norm[p2 + len(end_pass1):]).replace("\n", eol)
-        if end_pass1 in norm:
-            return norm.replace(end_pass1, full_block, 1).replace("\n", eol)
+        if "private boolean colgramShouldCancelSending(" in norm:
+            if stale_call in norm:
+                return norm.replace(stale_call, clean_call, 1).replace("\n", eol)
+            return content
+        end_anchor = "    public void cancelSendingMessage(MessageObject object) {"
+        old_start = norm.find("    private static final java.util.concurrent.ExecutorService colgramDocPrepExecutor =")
+        old_end = norm.find(end_anchor, old_start) if old_start >= 0 else -1
+        if old_start >= 0 and old_end > old_start:
+            return (norm[:old_start] + full_block + norm[old_end + len(end_anchor):]).replace("\n", eol)
+        if end_anchor in norm:
+            return norm.replace(end_anchor, full_block, 1).replace("\n", eol)
         return content
 
     patch_file_fn(
         send_helper,
         patch_send_helper_cancel,
-        "public static void colgramCancelFileDownloads(",
-        "SendMessagesHelper.java shared colgramCancelMessageTransfers and colgramCancelFileDownloads helpers",
+        "helper.cancelSendingMessage(msg); // non-reentrant",
+        "SendMessagesHelper.java non-reentrant colgramCancelMessageTransfers and pending-reply fast helpers",
+    )
+
+    def patch_send_helper_cancel_array(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        eol = "\r\n" if "\r\n" in content else "\n"
+        if "ArrayList<Integer> colgramGuardIds" in norm:
+            return content
+        old_head = (
+            "    public void cancelSendingMessage(ArrayList<MessageObject> objects) {\n"
+            "        ArrayList<String> keysToRemove = new ArrayList<>();\n"
+            "        ArrayList<DelayedMessage> checkReadyToSendGroups = new ArrayList<>();\n"
+            "        ArrayList<Integer> messageIds = new ArrayList<>();\n"
+            "        boolean enc = false;\n"
+            "        boolean scheduled = false;\n"
+            "        long dialogId = 0;\n"
+            "        int topicId = 0;\n"
+            "        for (int c = 0; c < objects.size(); c++) {\n"
+            "            MessageObject object = objects.get(c);\n"
+            "            if (object.scheduled) {"
+        )
+        new_head = (
+            "    public void cancelSendingMessage(ArrayList<MessageObject> objects) {\n"
+            "        if (objects == null || objects.isEmpty()) {\n"
+            "            return;\n"
+            "        }\n"
+            "        ArrayList<Integer> colgramGuardIds = new ArrayList<>(objects.size());\n"
+            "        try {\n"
+            "        ArrayList<String> keysToRemove = new ArrayList<>();\n"
+            "        ArrayList<DelayedMessage> checkReadyToSendGroups = new ArrayList<>();\n"
+            "        ArrayList<Integer> messageIds = new ArrayList<>();\n"
+            "        boolean enc = false;\n"
+            "        boolean scheduled = false;\n"
+            "        long dialogId = 0;\n"
+            "        int topicId = 0;\n"
+            "        for (int c = 0; c < objects.size(); c++) {\n"
+            "            MessageObject object = objects.get(c);\n"
+            "            if (object == null) {\n"
+            "                continue;\n"
+            "            }\n"
+            "            int colgramObjId = object.getId();\n"
+            "            if (!colgramCancellingIds.add(colgramObjId)) {\n"
+            "                continue;\n"
+            "            }\n"
+            "            colgramGuardIds.add(colgramObjId);\n"
+            "            if (object.messageOwner != null && !object.isEditing()) {\n"
+            "                object.messageOwner.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;\n"
+            "            }\n"
+            "            if (object.scheduled) {"
+        )
+        old_tail = (
+            "        for (int a = 0; a < keysToRemove.size(); a++) {\n"
+            "            String key = keysToRemove.get(a);\n"
+            "            if (key.startsWith(\"http\")) {\n"
+            "                ImageLoader.getInstance().cancelLoadHttpFile(key);\n"
+            "            } else {\n"
+            "                getFileLoader().cancelFileUpload(key, enc);\n"
+            "            }\n"
+            "            delayedMessages.remove(key);\n"
+            "        }\n"
+            "        for (int a = 0, N = checkReadyToSendGroups.size(); a < N; a++) {\n"
+            "            sendReadyToSendGroup(checkReadyToSendGroups.get(a), false, true);\n"
+            "        }\n"
+            "        if (objects.size() == 1 && objects.get(0).isEditing() && objects.get(0).previousMedia != null) {\n"
+            "            revertEditingMessageObject(objects.get(0));\n"
+            "        } else if (objects.size() == 1 && objects.get(0).isEditing() && objects.get(0).isPoll()) {\n"
+            "            // do not delete polls if lose previousMedia field\n"
+            "        } else {\n"
+            "            int mode = 0;\n"
+            "            if (!objects.isEmpty() && objects.get(0).isWelcomeMessage()) {\n"
+            "                mode = ChatActivity.MODE_WELCOME_MESSAGES;\n"
+            "            } else if (!objects.isEmpty() && objects.get(0).isQuickReply()) {\n"
+            "                mode = ChatActivity.MODE_QUICK_REPLIES;\n"
+            "            } else if (scheduled) {\n"
+            "                mode = ChatActivity.MODE_SCHEDULED;\n"
+            "            }\n"
+            "            getMessagesController().deleteMessages(messageIds, null, null, dialogId, topicId, false, mode);\n"
+            "        }\n"
+            "    }"
+        )
+        new_tail = (
+            "        if (colgramGuardIds.isEmpty()) {\n"
+            "            return;\n"
+            "        }\n"
+            "        for (int a = 0; a < keysToRemove.size(); a++) {\n"
+            "            String key = keysToRemove.get(a);\n"
+            "            if (key.startsWith(\"http\")) {\n"
+            "                ImageLoader.getInstance().cancelLoadHttpFile(key);\n"
+            "            } else {\n"
+            "                getFileLoader().cancelFileUpload(key, enc);\n"
+            "            }\n"
+            "            delayedMessages.remove(key);\n"
+            "        }\n"
+            "        for (int a = 0, N = checkReadyToSendGroups.size(); a < N; a++) {\n"
+            "            sendReadyToSendGroup(checkReadyToSendGroups.get(a), false, true);\n"
+            "        }\n"
+            "        if (objects.size() == 1 && objects.get(0).isEditing() && objects.get(0).previousMedia != null) {\n"
+            "            revertEditingMessageObject(objects.get(0));\n"
+            "        } else if (objects.size() == 1 && objects.get(0).isEditing() && objects.get(0).isPoll()) {\n"
+            "            // do not delete polls if lose previousMedia field\n"
+            "        } else {\n"
+            "            int mode = 0;\n"
+            "            if (!objects.isEmpty() && objects.get(0).isWelcomeMessage()) {\n"
+            "                mode = ChatActivity.MODE_WELCOME_MESSAGES;\n"
+            "            } else if (!objects.isEmpty() && objects.get(0).isQuickReply()) {\n"
+            "                mode = ChatActivity.MODE_QUICK_REPLIES;\n"
+            "            } else if (scheduled) {\n"
+            "                mode = ChatActivity.MODE_SCHEDULED;\n"
+            "            }\n"
+            "            if (!messageIds.isEmpty()) {\n"
+            "                getMessagesController().deleteMessages(messageIds, null, null, dialogId, topicId, false, mode);\n"
+            "            }\n"
+            "        }\n"
+            "        } finally {\n"
+            "            for (int cgi = 0; cgi < colgramGuardIds.size(); cgi++) {\n"
+            "                colgramCancellingIds.remove(colgramGuardIds.get(cgi));\n"
+            "            }\n"
+            "        }\n"
+            "    }"
+        )
+        pos = norm.find(old_head)
+        if pos < 0:
+            return content
+        tail_pos = norm.find(old_tail, pos)
+        if tail_pos < 0 or (tail_pos - pos) > 8000:
+            return content
+        norm = norm[:pos] + new_head + norm[pos + len(old_head):tail_pos] + new_tail + norm[tail_pos + len(old_tail):]
+        return norm.replace("\n", eol)
+
+    patch_file_fn(
+        send_helper,
+        patch_send_helper_cancel_array,
+        "ArrayList<Integer> colgramGuardIds",
+        "SendMessagesHelper.java re-entrancy guard and send_state clear in cancelSendingMessage",
+    )
+
+    eol_patch_fn(
+        send_helper,
+        "        if (sendMessageParams != null && sendMessageParams.message != null) {\n"
+        "            int replyId = sendMessageParams.replyToMsg != null ? sendMessageParams.replyToMsg.getId() : 0;\n"
+        "            long colgramReplySender = 0L;\n"
+        "            if (sendMessageParams.replyToMsg != null) {\n"
+        "                colgramReplySender = sendMessageParams.replyToMsg.getSenderId();\n"
+        "                if (colgramReplySender == 0L && sendMessageParams.replyToMsg.messageOwner != null\n"
+        "                        && sendMessageParams.replyToMsg.messageOwner.from_id != null) {\n"
+        "                    colgramReplySender = MessageObject.getPeerId(sendMessageParams.replyToMsg.messageOwner.from_id);\n"
+        "                }\n"
+        "            }\n"
+        "            if (sendMessageParams.message.trim().startsWith(\".\")) {\n"
+        "                ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, sendMessageParams.peer, sendMessageParams.replyToMsg);\n"
+        "            } else {\n"
+        "                ColgramNativeColemailerBridge.rememberPendingReply(currentAccount, sendMessageParams.peer, null);\n"
+        "            }\n"
+        "            if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(currentAccount, sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {\n"
+        "                return;\n"
+        "            }\n"
+        "        }",
+        "        if (sendMessageParams != null && sendMessageParams.message != null) {\n"
+        "            if (org.colgram.core.ColgramHookHandler.startsWithCommandPrefix(sendMessageParams.message)) {\n"
+        "                int replyId = sendMessageParams.replyToMsg != null ? sendMessageParams.replyToMsg.getId() : 0;\n"
+        "                long colgramReplySender = 0L;\n"
+        "                if (sendMessageParams.replyToMsg != null) {\n"
+        "                    colgramReplySender = sendMessageParams.replyToMsg.getSenderId();\n"
+        "                    if (colgramReplySender == 0L && sendMessageParams.replyToMsg.messageOwner != null\n"
+        "                            && sendMessageParams.replyToMsg.messageOwner.from_id != null) {\n"
+        "                        colgramReplySender = MessageObject.getPeerId(sendMessageParams.replyToMsg.messageOwner.from_id);\n"
+        "                    }\n"
+        "                }\n"
+        "                colgramRememberPendingReplyIfNeeded(sendMessageParams.peer, sendMessageParams.replyToMsg,\n"
+        "                        org.colgram.core.ColgramHookHandler.startsWithDotCommand(sendMessageParams.message));\n"
+        "                if (org.colgram.core.ColgramHookHandler.hookOnSendMessage(currentAccount, sendMessageParams.peer, replyId, sendMessageParams.message, colgramReplySender)) {\n"
+        "                    return;\n"
+        "                }\n"
+        "            } else if (colgramHasAnyPendingReply) {\n"
+        "                colgramRememberPendingReplyIfNeeded(sendMessageParams.peer, null, false);\n"
+        "            }\n"
+        "        }",
+        "SendMessagesHelper.java zero-alloc command check and skip redundant rememberPendingReply null",
     )
 
     def patch_send_helper_prep(content: str) -> str:
@@ -1235,6 +1607,78 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         patch_msgs_ctrl_delete,
         "SendMessagesHelper.getInstance(currentAccount).isSendingMessage(id)",
         "MessagesController.java scoped mid<=0/unsent anti-delete rejection",
+    )
+
+    eol_patch_fn(
+        msgs_ctrl,
+        "                if (!alreadyDeletedPurge.isEmpty()) {\n"
+        "                    if (channelId == 0) {\n"
+        "                        for (int a = 0; a < alreadyDeletedPurge.size(); a++) {\n"
+        "                            Integer id = alreadyDeletedPurge.get(a);\n"
+        "                            MessageObject obj = dialogMessagesByIds.get(id);\n"
+        "                            if (obj != null) {\n"
+        "                                obj.deleted = true;\n"
+        "                            }\n"
+        "                        }\n"
+        "                    } else {\n"
+        "                        markDialogMessageAsDeleted(dialogId, alreadyDeletedPurge);\n"
+        "                    }\n"
+        "                    org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(targetDid, alreadyDeletedPurge);\n"
+        "                    if (dialogId != targetDid) {\n"
+        "                        org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(dialogId, alreadyDeletedPurge);\n"
+        "                    }\n"
+        "                    getMessagesStorage().markMessagesAsDeletedLocal(dialogId, alreadyDeletedPurge, true, forAll, 0, topicId);\n"
+        "                    getMessagesStorage().updateDialogsWithDeletedMessages(dialogId, channelId, alreadyDeletedPurge, null);\n"
+        "                }",
+        "                if (!alreadyDeletedPurge.isEmpty()) {\n"
+        "                    boolean colgramHasPositivePurge = false;\n"
+        "                    for (int a = 0; a < alreadyDeletedPurge.size(); a++) {\n"
+        "                        Integer id = alreadyDeletedPurge.get(a);\n"
+        "                        if (id != null && id > 0) {\n"
+        "                            colgramHasPositivePurge = true;\n"
+        "                            break;\n"
+        "                        }\n"
+        "                    }\n"
+        "                    if (channelId == 0) {\n"
+        "                        for (int a = 0; a < alreadyDeletedPurge.size(); a++) {\n"
+        "                            Integer id = alreadyDeletedPurge.get(a);\n"
+        "                            MessageObject obj = dialogMessagesByIds.get(id);\n"
+        "                            if (obj != null) {\n"
+        "                                obj.deleted = true;\n"
+        "                            }\n"
+        "                        }\n"
+        "                    } else {\n"
+        "                        markDialogMessageAsDeleted(dialogId, alreadyDeletedPurge);\n"
+        "                    }\n"
+        "                    if (colgramHasPositivePurge) {\n"
+        "                        org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(targetDid, alreadyDeletedPurge);\n"
+        "                        if (dialogId != targetDid) {\n"
+        "                            org.colgram.core.ColgramHookHandler.purgeMessagesCompletely(dialogId, alreadyDeletedPurge);\n"
+        "                        }\n"
+        "                    }\n"
+        "                    getMessagesStorage().markMessagesAsDeletedLocal(dialogId, alreadyDeletedPurge, true, forAll, 0, topicId);\n"
+        "                    getMessagesStorage().updateDialogsWithDeletedMessages(dialogId, channelId, alreadyDeletedPurge, null);\n"
+        "                }",
+        "MessagesController.java skip UI-thread SQLite purge when alreadyDeletedPurge has only mid<=0",
+    )
+
+    eol_patch_fn(
+        msgs_ctrl,
+        "        if (cacheOnly) {\n"
+        "            return;\n"
+        "        }\n\n"
+        "        long newTaskId;",
+        "        if (cacheOnly) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (taskId == 0 && (toSend == null || toSend.isEmpty())) {\n"
+        "            if (randoms != null && encryptedChat != null && !randoms.isEmpty()) {\n"
+        "                getSecretChatHelper().sendMessagesDeleteMessage(encryptedChat, randoms, null);\n"
+        "            }\n"
+        "            return;\n"
+        "        }\n\n"
+        "        long newTaskId;",
+        "MessagesController.java guard deleteMessages against empty toSend RPC and pending_tasks",
     )
 
     # =========================================================================
@@ -1545,6 +1989,74 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
 
     patch_file_fn(msgs_storage, patch_msgs_storage_tx_and_filter, "colgram-tx-outside-loop", "MessagesStorage.java loop tx fix, media_v4 keepClauseDel, and unsent filter")
 
+    eol_patch_fn(
+        msgs_storage,
+        "    private void colgramDispatchPlugins(ArrayList<TLRPC.Message> messages) {\n"
+        "        try {\n"
+        "            if (messages == null || messages.isEmpty()) {\n"
+        "                return;\n"
+        "            }",
+        "    private void colgramDispatchPlugins(ArrayList<TLRPC.Message> messages) {\n"
+        "        try {\n"
+        "            if (messages == null || messages.isEmpty()) {\n"
+        "                return;\n"
+        "            }\n"
+        "            boolean colgramHasPositive = false;\n"
+        "            for (int ci = 0, cn = messages.size(); ci < cn; ci++) {\n"
+        "                TLRPC.Message cm = messages.get(ci);\n"
+        "                if (cm != null && cm.id > 0) {\n"
+        "                    colgramHasPositive = true;\n"
+        "                    break;\n"
+        "                }\n"
+        "            }\n"
+        "            if (!colgramHasPositive) {\n"
+        "                return;\n"
+        "            }",
+        "MessagesStorage.java fast-skip mid<=0 in colgramDispatchPlugins",
+    )
+
+    eol_patch_fn(
+        msgs_storage,
+        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {\n"
+        "        if (mode == ChatActivity.MODE_DEFAULT) {\n"
+        "            colgramDispatchPlugins(messages);\n"
+        "        }\n"
+        "        putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);\n"
+        "    }\n\n"
+        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {\n"
+        "        if (messages == null || messages.isEmpty()) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (useQueue) {\n"
+        "            storageQueue.postRunnable(() -> putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId));\n"
+        "        } else {\n"
+        "            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
+        "        }\n"
+        "    }",
+        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, int mode, long threadMessageId) {\n"
+        "        putMessages(messages, withTransaction, useQueue, doNotUpdateDialogDate, downloadMask, false, mode, threadMessageId);\n"
+        "    }\n\n"
+        "    public void putMessages(ArrayList<TLRPC.Message> messages, boolean withTransaction, boolean useQueue, boolean doNotUpdateDialogDate, int downloadMask, boolean ifNoLastMessage, int mode, long threadMessageId) {\n"
+        "        if (messages == null || messages.isEmpty()) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (useQueue) {\n"
+        "            storageQueue.postRunnable(() -> {\n"
+        "                if (mode == ChatActivity.MODE_DEFAULT) {\n"
+        "                    colgramDispatchPlugins(messages);\n"
+        "                }\n"
+        "                putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
+        "            });\n"
+        "        } else {\n"
+        "            if (mode == ChatActivity.MODE_DEFAULT) {\n"
+        "                colgramDispatchPlugins(messages);\n"
+        "            }\n"
+        "            putMessagesInternal(messages, withTransaction, doNotUpdateDialogDate, downloadMask, ifNoLastMessage, mode, threadMessageId);\n"
+        "        }\n"
+        "    }",
+        "MessagesStorage.java move colgramDispatchPlugins off UI thread into storageQueue",
+    )
+
     # =========================================================================
     # 10. SavedMessagesController.java:
     #     - Transaction in saveCache()
@@ -1794,21 +2306,72 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "ChatActivity.java keep waitingForLoad/endReached intact on 9s firstLoad timer",
     )
 
+    def patch_chat_process_deleted(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        eol = "\r\n" if "\r\n" in content else "\n"
+        desired_marker = "SendMessagesHelper.colgramCancelFileDownloads(currentAccount, existingObj);"
+        if desired_marker in norm:
+            return content
+        old_pass1 = (
+            "                if (unsentOrLocal && existingObj != null) {\n"
+            "                    SendMessagesHelper.colgramCancelMessageTransfers(currentAccount, existingObj);\n"
+            "                }"
+        )
+        new_downloads = (
+            "                if (unsentOrLocal && existingObj != null) {\n"
+            "                    SendMessagesHelper.colgramCancelFileDownloads(currentAccount, existingObj);\n"
+            "                }"
+        )
+        if old_pass1 in norm:
+            return norm.replace(old_pass1, new_downloads, 1).replace("\n", eol)
+        fresh_anchor = (
+            "                boolean forcePurged = org.colgram.core.ColgramHookHandler.consumeForcePurged(dialog_id, messageId)\n"
+            "                        || (objDid != dialog_id && org.colgram.core.ColgramHookHandler.consumeForcePurged(objDid, messageId))\n"
+            "                        || (existingObj != null && existingObj.deleted);"
+        )
+        new_fresh = (
+            "                boolean unsentOrLocal = messageId <= 0 || (existingObj != null && (existingObj.isSending()\n"
+            "                        || (existingObj.messageOwner != null && existingObj.messageOwner.send_state != 0 && existingObj.messageOwner.send_state != 3)));\n"
+            "                if (unsentOrLocal && existingObj != null) {\n"
+            "                    SendMessagesHelper.colgramCancelFileDownloads(currentAccount, existingObj);\n"
+            "                }\n"
+            "                boolean forcePurged = unsentOrLocal\n"
+            "                        || org.colgram.core.ColgramHookHandler.consumeForcePurged(dialog_id, messageId)\n"
+            "                        || (objDid != dialog_id && org.colgram.core.ColgramHookHandler.consumeForcePurged(objDid, messageId))\n"
+            "                        || (existingObj != null && existingObj.deleted);"
+        )
+        if fresh_anchor in norm:
+            return norm.replace(fresh_anchor, new_fresh, 1).replace("\n", eol)
+        return content
+
+    patch_file_fn(
+        chat_act,
+        patch_chat_process_deleted,
+        "SendMessagesHelper.colgramCancelFileDownloads(currentAccount, existingObj);",
+        "ChatActivity.java non-reentrant colgramCancelFileDownloads in processDeletedMessages",
+    )
+
     eol_patch_fn(
         chat_act,
-        "                boolean forcePurged = org.colgram.core.ColgramHookHandler.consumeForcePurged(dialog_id, messageId)\n"
-        "                        || (objDid != dialog_id && org.colgram.core.ColgramHookHandler.consumeForcePurged(objDid, messageId))\n"
-        "                        || (existingObj != null && existingObj.deleted);",
-        "                boolean unsentOrLocal = messageId <= 0 || (existingObj != null && (existingObj.isSending()\n"
-        "                        || (existingObj.messageOwner != null && existingObj.messageOwner.send_state != 0 && existingObj.messageOwner.send_state != 3)));\n"
-        "                if (unsentOrLocal && existingObj != null) {\n"
-        "                    SendMessagesHelper.colgramCancelMessageTransfers(currentAccount, existingObj);\n"
+        "            case OPTION_CANCEL_SENDING: {\n"
+        "                if (selectedObject.isEditing() || selectedObject.isSending() && selectedObjectGroup == null) {\n"
+        "                    getSendMessagesHelper().cancelSendingMessage(selectedObject);\n"
+        "                } else if (selectedObject.isSending() && selectedObjectGroup != null) {\n"
+        "                    for (int a = 0; a < selectedObjectGroup.messages.size(); a++) {\n"
+        "                        getSendMessagesHelper().cancelSendingMessage(new ArrayList<>(selectedObjectGroup.messages));\n"
+        "                    }\n"
         "                }\n"
-        "                boolean forcePurged = unsentOrLocal\n"
-        "                        || org.colgram.core.ColgramHookHandler.consumeForcePurged(dialog_id, messageId)\n"
-        "                        || (objDid != dialog_id && org.colgram.core.ColgramHookHandler.consumeForcePurged(objDid, messageId))\n"
-        "                        || (existingObj != null && existingObj.deleted);",
-        "ChatActivity.java exclude mid<=0 and unsent from processDeletedMessages preserve",
+        "                break;\n"
+        "            }",
+        "            case OPTION_CANCEL_SENDING: {\n"
+        "                if (selectedObject.isEditing() || selectedObject.isSending() && selectedObjectGroup == null) {\n"
+        "                    getSendMessagesHelper().cancelSendingMessage(selectedObject);\n"
+        "                } else if (selectedObject.isSending() && selectedObjectGroup != null && !selectedObjectGroup.messages.isEmpty()) {\n"
+        "                    getSendMessagesHelper().cancelSendingMessage(new ArrayList<>(selectedObjectGroup.messages));\n"
+        "                }\n"
+        "                break;\n"
+        "            }",
+        "ChatActivity.java fix OPTION_CANCEL_SENDING grouped-messages N-times cancel loop",
     )
 
     eol_patch_fn(
@@ -2051,6 +2614,155 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "FileLoader.java unique File.createTempFile with IOException guard",
     )
 
+    def patch_file_loader_upload_cancel(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        eol = "\r\n" if "\r\n" in content else "\n"
+        changed = False
+
+        old_fields = (
+            "    private int currentUploadOperationsCount = 0;\n"
+            "    private int currentUploadSmallOperationsCount = 0;"
+        )
+        new_fields = (
+            "    private int currentUploadOperationsCount = 0;\n"
+            "    private int currentUploadSmallOperationsCount = 0;\n"
+            "    private final java.util.HashSet<FileUploadOperation> colgramSkippedCancelOps = new java.util.HashSet<>();"
+        )
+        if old_fields in norm and "colgramSkippedCancelOps" not in norm:
+            norm = norm.replace(old_fields, new_fields, 1)
+            changed = True
+
+        old_cancel = (
+            "            if (operation != null) {\n"
+            "                uploadOperationPathsEnc.remove(location);\n"
+            "                uploadOperationQueue.remove(operation);\n"
+            "                uploadSmallOperationQueue.remove(operation);\n"
+            "                operation.cancel();\n"
+            "            }"
+        )
+        new_cancel = (
+            "            if (operation != null) {\n"
+            "                if (enc) {\n"
+            "                    uploadOperationPathsEnc.remove(location);\n"
+            "                } else {\n"
+            "                    uploadOperationPaths.remove(location);\n"
+            "                }\n"
+            "                boolean colgramWasQueued = uploadOperationQueue.remove(operation) | uploadSmallOperationQueue.remove(operation);\n"
+            "                if (colgramWasQueued) {\n"
+            "                    colgramSkippedCancelOps.add(operation);\n"
+            "                }\n"
+            "                operation.cancel();\n"
+            "            }"
+        )
+        if old_cancel in norm:
+            norm = norm.replace(old_cancel, new_cancel, 1)
+            changed = True
+
+        old_finish_counts = (
+            "                        if (small) {\n"
+            "                            currentUploadSmallOperationsCount--;\n"
+            "                            if (currentUploadSmallOperationsCount < 1) {\n"
+            "                                FileUploadOperation operation12 = uploadSmallOperationQueue.poll();\n"
+            "                                if (operation12 != null) {\n"
+            "                                    currentUploadSmallOperationsCount++;\n"
+            "                                    operation12.start();\n"
+            "                                }\n"
+            "                            }\n"
+            "                        } else {\n"
+            "                            currentUploadOperationsCount--;\n"
+            "                            if (currentUploadOperationsCount < 1) {\n"
+            "                                FileUploadOperation operation12 = uploadOperationQueue.poll();\n"
+            "                                if (operation12 != null) {\n"
+            "                                    currentUploadOperationsCount++;\n"
+            "                                    operation12.start();\n"
+            "                                }\n"
+            "                            }\n"
+            "                        }"
+        )
+        new_finish_counts = (
+            "                        if (small) {\n"
+            "                            currentUploadSmallOperationsCount = Math.max(0, currentUploadSmallOperationsCount - 1);\n"
+            "                            if (currentUploadSmallOperationsCount < 1) {\n"
+            "                                FileUploadOperation operation12 = uploadSmallOperationQueue.poll();\n"
+            "                                if (operation12 != null) {\n"
+            "                                    currentUploadSmallOperationsCount++;\n"
+            "                                    operation12.start();\n"
+            "                                }\n"
+            "                            }\n"
+            "                        } else {\n"
+            "                            currentUploadOperationsCount = Math.max(0, currentUploadOperationsCount - 1);\n"
+            "                            if (currentUploadOperationsCount < 1) {\n"
+            "                                FileUploadOperation operation12 = uploadOperationQueue.poll();\n"
+            "                                if (operation12 != null) {\n"
+            "                                    currentUploadOperationsCount++;\n"
+            "                                    operation12.start();\n"
+            "                                }\n"
+            "                            }\n"
+            "                        }"
+        )
+        if old_finish_counts in norm:
+            norm = norm.replace(old_finish_counts, new_finish_counts, 1)
+            changed = True
+
+        old_fail_counts = (
+            "                        if (small) {\n"
+            "                            currentUploadSmallOperationsCount--;\n"
+            "                            if (currentUploadSmallOperationsCount < 1) {\n"
+            "                                FileUploadOperation operation1 = uploadSmallOperationQueue.poll();\n"
+            "                                if (operation1 != null) {\n"
+            "                                    currentUploadSmallOperationsCount++;\n"
+            "                                    operation1.start();\n"
+            "                                }\n"
+            "                            }\n"
+            "                        } else {\n"
+            "                            currentUploadOperationsCount--;\n"
+            "                            if (currentUploadOperationsCount < 1) {\n"
+            "                                FileUploadOperation operation1 = uploadOperationQueue.poll();\n"
+            "                                if (operation1 != null) {\n"
+            "                                    currentUploadOperationsCount++;\n"
+            "                                    operation1.start();\n"
+            "                                }\n"
+            "                            }\n"
+            "                        }"
+        )
+        new_fail_counts = (
+            "                        if (!colgramSkippedCancelOps.remove(operation)) {\n"
+            "                            if (small) {\n"
+            "                                currentUploadSmallOperationsCount = Math.max(0, currentUploadSmallOperationsCount - 1);\n"
+            "                                if (currentUploadSmallOperationsCount < 1) {\n"
+            "                                    FileUploadOperation operation1 = uploadSmallOperationQueue.poll();\n"
+            "                                    if (operation1 != null) {\n"
+            "                                        currentUploadSmallOperationsCount++;\n"
+            "                                        operation1.start();\n"
+            "                                    }\n"
+            "                                }\n"
+            "                            } else {\n"
+            "                                currentUploadOperationsCount = Math.max(0, currentUploadOperationsCount - 1);\n"
+            "                                if (currentUploadOperationsCount < 1) {\n"
+            "                                    FileUploadOperation operation1 = uploadOperationQueue.poll();\n"
+            "                                    if (operation1 != null) {\n"
+            "                                        currentUploadOperationsCount++;\n"
+            "                                        operation1.start();\n"
+            "                                    }\n"
+            "                                }\n"
+            "                            }\n"
+            "                        }"
+        )
+        if old_fail_counts in norm:
+            norm = norm.replace(old_fail_counts, new_fail_counts, 1)
+            changed = True
+
+        if not changed:
+            return content
+        return norm.replace("\n", eol)
+
+    patch_file_fn(
+        file_loader,
+        patch_file_loader_upload_cancel,
+        "if (!colgramSkippedCancelOps.remove(operation)) {",
+        "FileLoader.java cancelFileUpload map fix and upload counter underflow guard",
+    )
+
     secret_viewer = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/SecretMediaViewer.java")
 
     def patch_secret_viewer_async(content: str) -> str:
@@ -2106,4 +2818,715 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         patch_secret_viewer_async,
         "org.telegram.messenger.Utilities.globalQueue.postRunnable(() -> {",
         "SecretMediaViewer.java resolve encrypted playable file off UI thread",
+    )
+
+    # =========================================================================
+    # 16. NotificationCenter.java:
+    #     Wrap postNotificationNameInternal observer dispatch in try/finally so
+    #     broadcasting can never leak >= 1 and lock out all app observers.
+    # =========================================================================
+    notif_center = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/messenger/NotificationCenter.java")
+    eol_patch_fn(
+        notif_center,
+        "        broadcasting++;\n"
+        "        ArrayList<NotificationCenterDelegate> objects = observers.get(id);\n"
+        "        if (objects != null && !objects.isEmpty()) {\n"
+        "            for (int a = 0; a < objects.size(); a++) {\n"
+        "                NotificationCenterDelegate obj = objects.get(a);\n"
+        "                obj.didReceivedNotification(id, currentAccount, args);\n"
+        "            }\n"
+        "        }\n"
+        "        broadcasting--;\n"
+        "        if (broadcasting == 0) {\n"
+        "            if (removeAfterBroadcast.size() != 0) {\n"
+        "                for (int a = 0; a < removeAfterBroadcast.size(); a++) {\n"
+        "                    int key = removeAfterBroadcast.keyAt(a);\n"
+        "                    ArrayList<NotificationCenterDelegate> arrayList = removeAfterBroadcast.get(key);\n"
+        "                    for (int b = 0; b < arrayList.size(); b++) {\n"
+        "                        removeObserver(arrayList.get(b), key);\n"
+        "                    }\n"
+        "                }\n"
+        "                removeAfterBroadcast.clear();\n"
+        "            }\n"
+        "            if (addAfterBroadcast.size() != 0) {\n"
+        "                for (int a = 0; a < addAfterBroadcast.size(); a++) {\n"
+        "                    int key = addAfterBroadcast.keyAt(a);\n"
+        "                    ArrayList<NotificationCenterDelegate> arrayList = addAfterBroadcast.get(key);\n"
+        "                    for (int b = 0; b < arrayList.size(); b++) {\n"
+        "                        addObserverInternal(arrayList.get(b), key);\n"
+        "                    }\n"
+        "                }\n"
+        "                addAfterBroadcast.clear();\n"
+        "            }\n"
+        "        }",
+        "        broadcasting++;\n"
+        "        try {\n"
+        "            ArrayList<NotificationCenterDelegate> objects = observers.get(id);\n"
+        "            if (objects != null && !objects.isEmpty()) {\n"
+        "                for (int a = 0; a < objects.size(); a++) {\n"
+        "                    NotificationCenterDelegate obj = objects.get(a);\n"
+        "                    obj.didReceivedNotification(id, currentAccount, args);\n"
+        "                }\n"
+        "            }\n"
+        "        } finally {\n"
+        "            broadcasting--;\n"
+        "            if (broadcasting == 0) {\n"
+        "                if (removeAfterBroadcast.size() != 0) {\n"
+        "                    for (int a = 0; a < removeAfterBroadcast.size(); a++) {\n"
+        "                        int key = removeAfterBroadcast.keyAt(a);\n"
+        "                        ArrayList<NotificationCenterDelegate> arrayList = removeAfterBroadcast.get(key);\n"
+        "                        for (int b = 0; b < arrayList.size(); b++) {\n"
+        "                            removeObserver(arrayList.get(b), key);\n"
+        "                        }\n"
+        "                    }\n"
+        "                    removeAfterBroadcast.clear();\n"
+        "                }\n"
+        "                if (addAfterBroadcast.size() != 0) {\n"
+        "                    for (int a = 0; a < addAfterBroadcast.size(); a++) {\n"
+        "                        int key = addAfterBroadcast.keyAt(a);\n"
+        "                        ArrayList<NotificationCenterDelegate> arrayList = addAfterBroadcast.get(key);\n"
+        "                        for (int b = 0; b < arrayList.size(); b++) {\n"
+        "                            addObserverInternal(arrayList.get(b), key);\n"
+        "                        }\n"
+        "                    }\n"
+        "                    addAfterBroadcast.clear();\n"
+        "                }\n"
+        "            }\n"
+        "        }",
+        "NotificationCenter.java try/finally guard for broadcasting counter",
+    )
+
+    # =========================================================================
+    # 17. UserConfig.java:
+    #     Gate persistent auto-backup scheduling on withFile so saveConfig(false)
+    #     on every sent message does not schedule backup I/O.
+    # =========================================================================
+    user_cfg = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java")
+    eol_patch_fn(
+        user_cfg,
+        "                    editor.apply();\n"
+        "                    if (currentUser != null && ApplicationLoader.applicationContext != null) {\n"
+        "                        try {\n"
+        "                            org.colgram.core.ColgramPersistentBackup.scheduleAutoBackup(ApplicationLoader.applicationContext);\n"
+        "                        } catch (Throwable ignored) {}\n"
+        "                    }",
+        "                    editor.apply();\n"
+        "                    if (withFile && currentUser != null && ApplicationLoader.applicationContext != null) {\n"
+        "                        try {\n"
+        "                            org.colgram.core.ColgramPersistentBackup.scheduleAutoBackup(ApplicationLoader.applicationContext);\n"
+        "                        } catch (Throwable ignored) {}\n"
+        "                    }",
+        "UserConfig.java gate scheduleAutoBackup on withFile",
+    )
+
+    # =========================================================================
+    # 18. Theme.java + ChatActivity.java (P0-3):
+    #     Eliminate uncached double colgramGuardImpl in getColor(key, provider)
+    #     and add per-instance ThemeDelegate cache when chatTheme != null.
+    # =========================================================================
+    theme_java = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/ActionBar/Theme.java")
+    eol_patch_fn(
+        theme_java,
+        "    public static int getNonAnimatedColor(int key) {\n"
+        "        return getColor(key, null, true);\n"
+        "    }",
+        "    public static int getNonAnimatedColor(int key) {\n"
+        "        return getColor(key, null, true);\n"
+        "    }\n\n"
+        "    public static boolean colgramCanUseUiColorCache() {\n"
+        "        return colgramIsMainThread() && !colgramUiInGuard;\n"
+        "    }",
+        "Theme.java expose colgramCanUseUiColorCache helper",
+    )
+    eol_patch_fn(
+        theme_java,
+        "    public interface ResourcesProvider {\n\n        int getColor(int key);\n",
+        "    public interface ResourcesProvider {\n\n        int getColor(int key);\n\n"
+        "        default boolean colgramDelegatesToGlobalTheme() {\n"
+        "            return false;\n"
+        "        }\n\n"
+        "        default boolean colgramReturnsGuardedColor() {\n"
+        "            return false;\n"
+        "        }\n",
+        "Theme.java ResourcesProvider colgramDelegatesToGlobalTheme & colgramReturnsGuardedColor defaults",
+    )
+    eol_patch_fn(
+        theme_java,
+        "    public static int getColor(int key, ResourcesProvider provider) {\n"
+        "        if (provider == null) {\n"
+        "            return getColor(key);\n"
+        "        }\n"
+        "        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n"
+        "            // Delegate to the shared palette so this path and the\n"
+        "            // getColor(key, isDefault, ignoreAnimation) wrapper cannot disagree.\n"
+        "            int colgramCyberColor = colgramCyberOverride(key);\n"
+        "            if (colgramCyberColor != 0) {\n"
+        "                return colgramGuard(key, colgramCyberColor, provider);\n"
+        "            }\n"
+        "        }\n"
+        "        int resolved = provider.getColor(key);\n"
+        "        if (resolved == 0 && (provider.isDark() || colgramHasDarkSurface())) {\n"
+        "            if (colgramNightHasKey(key)) {\n"
+        "                resolved = colgramNightColor(key);\n"
+        "            } else if (colgramIsReadableKey(key)) {\n"
+        "                resolved = 0xffffffff;\n"
+        "            } else if (colgramLooksLikeBackground(key)) {\n"
+        "                resolved = colgramNightColor(key_windowBackgroundWhite);\n"
+        "            }\n"
+        "        }\n"
+        "        return colgramGuard(key, resolved, provider);\n"
+        "    }",
+        "    public static int getColor(int key, ResourcesProvider provider) {\n"
+        "        if (provider == null || provider.colgramDelegatesToGlobalTheme()) {\n"
+        "            return getColor(key);\n"
+        "        }\n"
+        "        if (org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n"
+        "            // Delegate to the shared palette so this path and the\n"
+        "            // getColor(key, isDefault, ignoreAnimation) wrapper cannot disagree.\n"
+        "            int colgramCyberColor = colgramCyberOverride(key);\n"
+        "            if (colgramCyberColor != 0) {\n"
+        "                return colgramGuard(key, colgramCyberColor, provider);\n"
+        "            }\n"
+        "        }\n"
+        "        int resolved = provider.getColor(key);\n"
+        "        boolean colgramNeedsGuard = !provider.colgramReturnsGuardedColor();\n"
+        "        if (resolved == 0 && (provider.isDark() || colgramHasDarkSurface())) {\n"
+        "            if (colgramNightHasKey(key)) {\n"
+        "                resolved = colgramNightColor(key);\n"
+        "                colgramNeedsGuard = true;\n"
+        "            } else if (colgramIsReadableKey(key)) {\n"
+        "                resolved = 0xffffffff;\n"
+        "                colgramNeedsGuard = true;\n"
+        "            } else if (colgramLooksLikeBackground(key)) {\n"
+        "                resolved = colgramNightColor(key_windowBackgroundWhite);\n"
+        "                colgramNeedsGuard = true;\n"
+        "            }\n"
+        "        }\n"
+        "        return colgramNeedsGuard ? colgramGuard(key, resolved, provider) : resolved;\n"
+        "    }",
+        "Theme.java short-circuit global ThemeDelegate and avoid double colgramGuard",
+    )
+
+    eol_patch_fn(
+        chat_act,
+        "        private boolean isDark;\n"
+        "        private AnimatorSet patternAlphaAnimator;\n\n"
+        "        MessageDrawable animatingMessageDrawable;\n"
+        "        MessageDrawable animatingMessageMediaDrawable;\n",
+        "        private boolean isDark;\n"
+        "        private AnimatorSet patternAlphaAnimator;\n"
+        "        private SparseIntArray colgramGuardedColorCache;\n"
+        "        private long colgramCacheThemeRev = -1L;\n"
+        "        private long colgramCacheDesignRev = -1L;\n"
+        "        private boolean colgramCacheCyber;\n"
+        "        private SparseIntArray colgramCacheColorsRef;\n\n"
+        "        MessageDrawable animatingMessageDrawable;\n"
+        "        MessageDrawable animatingMessageMediaDrawable;\n",
+        "ChatActivity.ThemeDelegate cache fields for guarded colors",
+    )
+    def patch_chat_theme_delegate_cache(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        eol = "\r\n" if "\r\n" in content else "\n"
+        new_body = (
+            "        @Override\n"
+            "        public boolean colgramDelegatesToGlobalTheme() {\n"
+            "            return chatTheme == null && animatingColors == null;\n"
+            "        }\n\n"
+            "        @Override\n"
+            "        public boolean colgramReturnsGuardedColor() {\n"
+            "            return true;\n"
+            "        }\n\n"
+            "        @Override\n"
+            "        public int getColor(int key) {\n"
+            "            if (animatingColors != null) {\n"
+            "                int index = animatingColors.indexOfKey(key);\n"
+            "                if (index >= 0) {\n"
+            "                    return Theme.colgramGuard(key, animatingColors.valueAt(index), this);\n"
+            "                }\n"
+            "            }\n"
+            "            if (chatTheme == null) {\n"
+            "                return Theme.getColor(key);\n"
+            "            }\n"
+            "            final boolean canUseCache = Theme.colgramCanUseUiColorCache();\n"
+            "            final SparseIntArray colorsRef = currentColors;\n"
+            "            SparseIntArray cache = null;\n"
+            "            if (canUseCache) {\n"
+            "                final long tRev = Theme.colgramGetThemeRevision();\n"
+            "                final long dRev = org.colgram.core.ColgramDesignConfig.getRevision();\n"
+            "                final boolean cyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();\n"
+            "                cache = colgramGuardedColorCache;\n"
+            "                if (cache == null\n"
+            "                        || colgramCacheThemeRev != tRev\n"
+            "                        || colgramCacheDesignRev != dRev\n"
+            "                        || colgramCacheCyber != cyber\n"
+            "                        || colgramCacheColorsRef != colorsRef) {\n"
+            "                    if (cache == null) {\n"
+            "                        cache = new SparseIntArray(64);\n"
+            "                        colgramGuardedColorCache = cache;\n"
+            "                    } else {\n"
+            "                        cache.clear();\n"
+            "                    }\n"
+            "                    colgramCacheThemeRev = tRev;\n"
+            "                    colgramCacheDesignRev = dRev;\n"
+            "                    colgramCacheCyber = cyber;\n"
+            "                    colgramCacheColorsRef = colorsRef;\n"
+            "                } else {\n"
+            "                    int cachedIdx = cache.indexOfKey(key);\n"
+            "                    if (cachedIdx >= 0) {\n"
+            "                        return cache.valueAt(cachedIdx);\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
+            "            final int result;\n"
+            "            int index = colorsRef != null ? colorsRef.indexOfKey(key) : -1;\n"
+            "            if (index >= 0) {\n"
+            "                result = Theme.colgramGuard(key, colorsRef.valueAt(index), this);\n"
+            "            } else {\n"
+            "                int fallbackKey = Theme.getFallbackKey(key);\n"
+            "                if (fallbackKey >= 0 && colorsRef != null) {\n"
+            "                    index = colorsRef.indexOfKey(fallbackKey);\n"
+            "                } else {\n"
+            "                    index = -1;\n"
+            "                }\n"
+            "                if (index >= 0) {\n"
+            "                    result = Theme.colgramGuard(key, colorsRef.valueAt(index), this);\n"
+            "                } else {\n"
+            "                    result = Theme.getColor(key);\n"
+            "                }\n"
+            "            }\n"
+            "            if (cache != null) {\n"
+            "                cache.put(key, result);\n"
+            "            }\n"
+            "            return result;\n"
+            "        }"
+        )
+        if "final boolean canUseCache = Theme.colgramCanUseUiColorCache();" in norm:
+            return content
+        old_body = (
+            "        @Override\n"
+            "        public int getColor(int key) {\n"
+            "            if (animatingColors != null) {\n"
+            "                int index = animatingColors.indexOfKey(key);\n"
+            "                if (index >= 0) {\n"
+            "                    return Theme.colgramGuard(key, animatingColors.valueAt(index), this);\n"
+            "                }\n"
+            "            }\n"
+            "            if (chatTheme == null) {\n"
+            "                return Theme.getColor(key);\n"
+            "            }\n"
+            "            int index = currentColors.indexOfKey(key);\n"
+            "            if (index >= 0) {\n"
+            "                return Theme.colgramGuard(key, currentColors.valueAt(index), this);\n"
+            "            }\n\n"
+            "            int fallbackKey = Theme.getFallbackKey(key);\n"
+            "            if (fallbackKey >= 0) {\n"
+            "                index = currentColors.indexOfKey(fallbackKey);\n"
+            "                if (index >= 0) {\n"
+            "                    return Theme.colgramGuard(key, currentColors.valueAt(index), this);\n"
+            "                }\n"
+            "            }\n"
+            "            return Theme.getColor(key);\n"
+            "        }"
+        )
+        prev_body = (
+            "        @Override\n"
+            "        public boolean colgramDelegatesToGlobalTheme() {\n"
+            "            return chatTheme == null && animatingColors == null;\n"
+            "        }\n\n"
+            "        @Override\n"
+            "        public boolean colgramReturnsGuardedColor() {\n"
+            "            return true;\n"
+            "        }\n\n"
+            "        @Override\n"
+            "        public int getColor(int key) {\n"
+            "            if (animatingColors != null) {\n"
+            "                int index = animatingColors.indexOfKey(key);\n"
+            "                if (index >= 0) {\n"
+            "                    return Theme.colgramGuard(key, animatingColors.valueAt(index), this);\n"
+            "                }\n"
+            "            }\n"
+            "            if (chatTheme == null) {\n"
+            "                return Theme.getColor(key);\n"
+            "            }\n"
+            "            final long tRev = Theme.colgramGetThemeRevision();\n"
+            "            final long dRev = org.colgram.core.ColgramDesignConfig.getRevision();\n"
+            "            final boolean cyber = org.colgram.core.ColgramConfig.isCyberThemeEnabled();\n"
+            "            final SparseIntArray colorsRef = currentColors;\n"
+            "            SparseIntArray cache = colgramGuardedColorCache;\n"
+            "            if (cache == null\n"
+            "                    || colgramCacheThemeRev != tRev\n"
+            "                    || colgramCacheDesignRev != dRev\n"
+            "                    || colgramCacheCyber != cyber\n"
+            "                    || colgramCacheColorsRef != colorsRef) {\n"
+            "                if (cache == null) {\n"
+            "                    cache = new SparseIntArray(64);\n"
+            "                    colgramGuardedColorCache = cache;\n"
+            "                } else {\n"
+            "                    cache.clear();\n"
+            "                }\n"
+            "                colgramCacheThemeRev = tRev;\n"
+            "                colgramCacheDesignRev = dRev;\n"
+            "                colgramCacheCyber = cyber;\n"
+            "                colgramCacheColorsRef = colorsRef;\n"
+            "            } else {\n"
+            "                int cachedIdx = cache.indexOfKey(key);\n"
+            "                if (cachedIdx >= 0) {\n"
+            "                    return cache.valueAt(cachedIdx);\n"
+            "                }\n"
+            "            }\n"
+            "            final int result;\n"
+            "            int index = colorsRef != null ? colorsRef.indexOfKey(key) : -1;\n"
+            "            if (index >= 0) {\n"
+            "                result = Theme.colgramGuard(key, colorsRef.valueAt(index), this);\n"
+            "            } else {\n"
+            "                int fallbackKey = Theme.getFallbackKey(key);\n"
+            "                if (fallbackKey >= 0 && colorsRef != null) {\n"
+            "                    index = colorsRef.indexOfKey(fallbackKey);\n"
+            "                } else {\n"
+            "                    index = -1;\n"
+            "                }\n"
+            "                if (index >= 0) {\n"
+            "                    result = Theme.colgramGuard(key, colorsRef.valueAt(index), this);\n"
+            "                } else {\n"
+            "                    result = Theme.getColor(key);\n"
+            "                }\n"
+            "            }\n"
+            "            cache.put(key, result);\n"
+            "            return result;\n"
+            "        }"
+        )
+        for cand in (prev_body, old_body):
+            if cand in norm:
+                return norm.replace(cand, new_body, 1).replace("\n", eol)
+        return content
+
+    patch_file_fn(
+        chat_act,
+        patch_chat_theme_delegate_cache,
+        "final boolean canUseCache = Theme.colgramCanUseUiColorCache();",
+        "ChatActivity.ThemeDelegate colgramDelegatesToGlobalTheme & re-entrancy-safe UI color cache",
+    )
+    eol_patch_fn(
+        chat_act,
+        "        private void setupChatTheme(EmojiThemes chatTheme, TLRPC.WallPaper wallPaper, boolean withAnimation, boolean createNewResources) {\n"
+        "            if (parentThemeDelegate != null) return;\n\n"
+        "            this.chatTheme = chatTheme;",
+        "        private void setupChatTheme(EmojiThemes chatTheme, TLRPC.WallPaper wallPaper, boolean withAnimation, boolean createNewResources) {\n"
+        "            if (parentThemeDelegate != null) return;\n"
+        "            if (colgramGuardedColorCache != null) {\n"
+        "                colgramGuardedColorCache.clear();\n"
+        "            }\n"
+        "            colgramCacheColorsRef = null;\n\n"
+        "            this.chatTheme = chatTheme;",
+        "ChatActivity.ThemeDelegate clear guarded cache on setupChatTheme",
+    )
+
+    # =========================================================================
+    # 19. ChatActivity.java & DialogsActivity.java (P0-4):
+    #     Increase RecyclerListView view cache, RecycledViewPool, and prefetch.
+    # =========================================================================
+    eol_patch_fn(
+        chat_act,
+        "        chatListView.setLayoutManager(chatLayoutManager);",
+        "        chatListView.setLayoutManager(chatLayoutManager);\n"
+        "        chatListView.setItemViewCacheSize(16);\n"
+        "        chatListView.getRecycledViewPool().setMaxRecycledViews(0, 24);\n"
+        "        chatLayoutManager.setInitialPrefetchItemCount(6);",
+        "ChatActivity.java RecyclerListView cache, pool, and prefetch tuning",
+    )
+    dialogs_activity = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java")
+    eol_patch_fn(
+        dialogs_activity,
+        "            viewPage.listView.setLayoutManager(viewPage.layoutManager);",
+        "            viewPage.listView.setLayoutManager(viewPage.layoutManager);\n"
+        "            viewPage.listView.setItemViewCacheSize(12);\n"
+        "            viewPage.listView.getRecycledViewPool().setMaxRecycledViews(0, 20);\n"
+        "            viewPage.layoutManager.setInitialPrefetchItemCount(6);",
+        "DialogsActivity.java RecyclerListView cache, pool, and prefetch tuning",
+    )
+
+    # =========================================================================
+    # 20. ChatActivity.java (P0-7):
+    #     Coalesce continuous 120Hz scroll-blur recaptures to 60Hz (16ms cadence)
+    #     while applying clip/position/scroll-idle updates immediately.
+    # =========================================================================
+    eol_patch_fn(
+        chat_act,
+        "                    updateVisibleRows();\n"
+        "                    invalidateMergedVisibleBlurredPositionsAndSources(BLUR_INVALIDATE_FLAG_SCROLL);\n"
+        "                    scrollByTouch = false;",
+        "                    updateVisibleRows();\n"
+        "                    colgramLastChatBlurMs = 0L;\n"
+        "                    invalidateMergedVisibleBlurredPositionsAndSources(BLUR_INVALIDATE_FLAG_SCROLL);\n"
+        "                    scrollByTouch = false;",
+        "ChatActivity.java reset blur coalesce timestamp on SCROLL_STATE_IDLE",
+    )
+    eol_patch_fn(
+        chat_act,
+        "    private void invalidateMergedVisibleBlurredPositionsAndSourcesImpl(int flags) {\n"
+        "        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || scrollableViewNoiseSuppressor == null) {\n"
+        "            return;\n"
+        "        }\n\n"
+        "        if (BitwiseUtils.hasFlag(flags, BLUR_INVALIDATE_FLAG_CLIP)) {",
+        "    private long colgramLastChatBlurMs;\n\n"
+        "    private void invalidateMergedVisibleBlurredPositionsAndSourcesImpl(int flags) {\n"
+        "        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || scrollableViewNoiseSuppressor == null) {\n"
+        "            return;\n"
+        "        }\n"
+        "        final boolean immediate = BitwiseUtils.hasFlag(flags, BLUR_INVALIDATE_FLAG_CLIP)\n"
+        "                || BitwiseUtils.hasFlag(flags, BLUR_INVALIDATE_FLAG_POSITIONS);\n"
+        "        final long nowMs = android.os.SystemClock.uptimeMillis();\n"
+        "        if (!immediate && nowMs - colgramLastChatBlurMs < 16L) {\n"
+        "            return;\n"
+        "        }\n"
+        "        colgramLastChatBlurMs = nowMs;\n\n"
+        "        if (BitwiseUtils.hasFlag(flags, BLUR_INVALIDATE_FLAG_CLIP)) {",
+        "ChatActivity.java coalesce scroll-blur RenderNode recaptures to 60Hz",
+    )
+
+    # =========================================================================
+    # 21. MessagesStorage.java (P0-8):
+    #     SQLite synchronous=NORMAL + 64MB mmap + 16MB page cache + busy_timeout,
+    #     strictly preserving PRAGMA secure_delete = ON.
+    # =========================================================================
+    def patch_messages_storage_pragmas(content: str) -> str:
+        norm = content.replace("\r\n", "\n")
+        eol = "\r\n" if "\r\n" in content else "\n"
+        open_old = (
+            '            database.executeFast("PRAGMA secure_delete = ON").stepThis().dispose();\n'
+            '            database.executeFast("PRAGMA temp_store = MEMORY").stepThis().dispose();\n'
+            '            database.executeFast("PRAGMA journal_mode = WAL").stepThis().dispose();\n'
+            '            database.executeFast("PRAGMA journal_size_limit = 10485760").stepThis().dispose();'
+        )
+        open_new = (
+            open_old + "\n"
+            '            database.executeFast("PRAGMA synchronous = NORMAL").stepThis().dispose();\n'
+            '            database.executeFast("PRAGMA mmap_size = 67108864").stepThis().dispose();\n'
+            '            database.executeFast("PRAGMA cache_size = -16384").stepThis().dispose();\n'
+            '            database.executeFast("PRAGMA busy_timeout = 5000").stepThis().dispose();'
+        )
+        rec_old = (
+            '                database.executeFast("PRAGMA secure_delete = ON").stepThis().dispose();\n'
+            '                database.executeFast("PRAGMA temp_store = MEMORY").stepThis().dispose();\n'
+            '                database.executeFast("PRAGMA journal_mode = WAL").stepThis().dispose();\n'
+            '                database.executeFast("PRAGMA journal_size_limit = 10485760").stepThis().dispose();'
+        )
+        rec_new = (
+            rec_old + "\n"
+            '                database.executeFast("PRAGMA synchronous = NORMAL").stepThis().dispose();\n'
+            '                database.executeFast("PRAGMA mmap_size = 67108864").stepThis().dispose();\n'
+            '                database.executeFast("PRAGMA cache_size = -16384").stepThis().dispose();\n'
+            '                database.executeFast("PRAGMA busy_timeout = 5000").stepThis().dispose();'
+        )
+        updated = norm
+        if open_new not in updated and open_old in updated:
+            updated = updated.replace(open_old, open_new, 1)
+        if rec_new not in updated and rec_old in updated:
+            updated = updated.replace(rec_old, rec_new, 1)
+        return updated if updated == norm else updated.replace("\n", eol)
+
+    patch_file_fn(
+        msgs_storage,
+        patch_messages_storage_pragmas,
+        '                database.executeFast("PRAGMA mmap_size = 67108864").stepThis().dispose();',
+        "MessagesStorage.java SQLite WAL/mmap/cache/busy_timeout PRAGMAs preserving secure_delete",
+    )
+
+    # =========================================================================
+    # 22. Telegram background worker thread priorities (P0-10):
+    #     Yield DispatchQueuePriority, RLottie, AnimatedFileDrawable, ImageLoader,
+    #     FileLoader, and Utilities background queues below UI/RenderThread.
+    #     Keep Utilities.stageQueue at default priority.
+    # =========================================================================
+    dispatch_prio = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/DispatchQueuePriority.java")
+    eol_patch_fn(
+        dispatch_prio,
+        "        ThreadFactory factory = r -> {\n"
+        "            Thread t = new Thread(r, prefix + threadNumber.getAndIncrement());\n"
+        "            t.setDaemon(true);\n"
+        "            return t;\n"
+        "        };",
+        "        ThreadFactory factory = r -> {\n"
+        "            Thread t = new Thread(() -> {\n"
+        "                try {\n"
+        "                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);\n"
+        "                } catch (Throwable ignored) {}\n"
+        "                r.run();\n"
+        "            }, prefix + threadNumber.getAndIncrement());\n"
+        "            t.setDaemon(true);\n"
+        "            return t;\n"
+        "        };",
+        "DispatchQueuePriority.java THREAD_PRIORITY_BACKGROUND worker priority",
+    )
+
+    rlottie = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/Components/RLottieDrawable.java")
+    eol_patch_fn(
+        rlottie,
+        '    private static final Executor loadFrameRunnableQueue = Executors.newFixedThreadPool(4, r -> new Thread(r, "Lottie-" + threadId.getAndIncrement()));\n'
+        '    private static final Executor loadFrameRunnableQueueLimitFps = Executors.newFixedThreadPool(2, r -> new Thread(r, "LottieLow-" + threadId2.getAndIncrement()));',
+        '    private static final Executor loadFrameRunnableQueue = Executors.newFixedThreadPool(4, r -> new Thread(() -> {\n'
+        '        try {\n'
+        '            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '        } catch (Throwable ignored) {}\n'
+        '        r.run();\n'
+        '    }, "Lottie-" + threadId.getAndIncrement()));\n'
+        '    private static final Executor loadFrameRunnableQueueLimitFps = Executors.newFixedThreadPool(2, r -> new Thread(() -> {\n'
+        '        try {\n'
+        '            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '        } catch (Throwable ignored) {}\n'
+        '        r.run();\n'
+        '    }, "LottieLow-" + threadId2.getAndIncrement()));',
+        "RLottieDrawable.java THREAD_PRIORITY_BACKGROUND on decode pools",
+    )
+
+    anim_file = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/ui/Components/AnimatedFileDrawable.java")
+    eol_patch_fn(
+        anim_file,
+        "    private static final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(8, new ThreadPoolExecutor.DiscardPolicy());",
+        "    private static final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(8, r -> {\n"
+        "        Thread t = new Thread(() -> {\n"
+        "            try {\n"
+        "                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);\n"
+        "            } catch (Throwable ignored) {}\n"
+        "            r.run();\n"
+        "        }, \"AnimatedFileDrawable\");\n"
+        "        t.setDaemon(true);\n"
+        "        return t;\n"
+        "    }, new ThreadPoolExecutor.DiscardPolicy());",
+        "AnimatedFileDrawable.java THREAD_PRIORITY_BACKGROUND on decode executor",
+    )
+
+    image_loader = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java")
+    eol_patch_fn(
+        image_loader,
+        '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue");\n'
+        '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue");',
+        '    private DispatchQueue thumbGeneratingQueue = new DispatchQueue("thumbGeneratingQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '    private DispatchQueue imageLoadQueue = new DispatchQueue("imageLoadQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);',
+        "ImageLoader.java THREAD_PRIORITY_BACKGROUND on thumb and image load queues",
+    )
+
+    eol_patch_fn(
+        file_loader,
+        '    private volatile static DispatchQueue fileLoaderQueue = new DispatchQueue("fileUploadQueue");',
+        '    private volatile static DispatchQueue fileLoaderQueue = new DispatchQueue("fileUploadQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);',
+        "FileLoader.java THREAD_PRIORITY_BACKGROUND on fileLoaderQueue",
+    )
+
+    utilities = _join(repo_path, "TMessagesProj/src/main/java/org/telegram/messenger/Utilities.java")
+    eol_patch_fn(
+        utilities,
+        '    public static volatile DispatchQueue stageQueue = new DispatchQueue("stageQueue");\n'
+        '    public static volatile DispatchQueue globalQueue = new DispatchQueue("globalQueue");\n'
+        '    public static volatile DispatchQueue cacheClearQueue = new DispatchQueue("cacheClearQueue");\n'
+        '    public static volatile DispatchQueue searchQueue = new DispatchQueue("searchQueue");\n'
+        '    public static volatile DispatchQueue phoneBookQueue = new DispatchQueue("phoneBookQueue");\n'
+        '    public static volatile DispatchQueue themeQueue = new DispatchQueue("themeQueue");\n'
+        '    public static volatile DispatchQueue externalNetworkQueue = new DispatchQueue("externalNetworkQueue");',
+        '    public static volatile DispatchQueue stageQueue = new DispatchQueue("stageQueue");\n'
+        '    public static volatile DispatchQueue globalQueue = new DispatchQueue("globalQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '    public static volatile DispatchQueue cacheClearQueue = new DispatchQueue("cacheClearQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '    public static volatile DispatchQueue searchQueue = new DispatchQueue("searchQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '    public static volatile DispatchQueue phoneBookQueue = new DispatchQueue("phoneBookQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '    public static volatile DispatchQueue themeQueue = new DispatchQueue("themeQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);\n'
+        '    public static volatile DispatchQueue externalNetworkQueue = new DispatchQueue("externalNetworkQueue", true, android.os.Process.THREAD_PRIORITY_BACKGROUND);',
+        "Utilities.java THREAD_PRIORITY_BACKGROUND on background queues keeping stageQueue default",
+    )
+
+    # =========================================================================
+    # 23. ChatActivity.java (P1-1):
+    #     Lazy-allocate ColgramVideoWallpaperView ONLY when a non-empty videoPath
+    #     is resolved instead of eagerly creating TextureView on every chat open.
+    # =========================================================================
+    eol_patch_fn(
+        chat_act,
+        "        colgramWallpaperHostActive = !paused;\n"
+        "        colgramVideoWallpaperView = new ColgramVideoWallpaperView(context);\n"
+        "        colgramVideoWallpaperView.setHostPaused(!colgramWallpaperHostActive);\n"
+        "        colgramVideoWallpaperView.setVisibility(View.GONE);\n"
+        "        contentView.addView(colgramVideoWallpaperView, 0, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));",
+        "        colgramWallpaperHostActive = !paused;\n"
+        "        colgramVideoWallpaperView = null;",
+        "ChatActivity.java remove eager ColgramVideoWallpaperView allocation on createView",
+    )
+    eol_patch_fn(
+        chat_act,
+        "    private void colgramEnsureVideoWallpaperZOrder() {",
+        "    private ColgramVideoWallpaperView colgramEnsureVideoWallpaperView() {\n"
+        "        if (colgramVideoWallpaperView != null || contentView == null) {\n"
+        "            return colgramVideoWallpaperView;\n"
+        "        }\n"
+        "        Context ctx = contentView.getContext() != null ? contentView.getContext() : getParentActivity();\n"
+        "        if (ctx == null) {\n"
+        "            return null;\n"
+        "        }\n"
+        "        colgramVideoWallpaperView = new ColgramVideoWallpaperView(ctx);\n"
+        "        colgramVideoWallpaperView.setHostPaused(!colgramWallpaperHostActive);\n"
+        "        colgramVideoWallpaperView.setVisibility(View.GONE);\n"
+        "        contentView.addView(colgramVideoWallpaperView, 0, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));\n"
+        "        return colgramVideoWallpaperView;\n"
+        "    }\n\n"
+        "    private void colgramEnsureVideoWallpaperZOrder() {",
+        "ChatActivity.java add lazy colgramEnsureVideoWallpaperView helper",
+    )
+    eol_patch_fn(
+        chat_act,
+        "            if (colgramVideoWallpaperView != null) {\n"
+        "                colgramEnsureVideoWallpaperZOrder();\n"
+        "                colgramVideoWallpaperView.setHostPaused(!colgramWallpaperHostActive);\n"
+        "                colgramVideoWallpaperView.setVideoPath(videoPath);\n"
+        "            }\n"
+        "            ColgramVideoWallpaperView.resolveWallpaperAsync(",
+        "            ColgramVideoWallpaperView lazyVideoView = colgramEnsureVideoWallpaperView();\n"
+        "            if (lazyVideoView != null) {\n"
+        "                colgramEnsureVideoWallpaperZOrder();\n"
+        "                lazyVideoView.setHostPaused(!colgramWallpaperHostActive);\n"
+        "                lazyVideoView.setVideoPath(videoPath);\n"
+        "            }\n"
+        "            ColgramVideoWallpaperView.resolveWallpaperAsync(",
+        "ChatActivity.java lazy-init ColgramVideoWallpaperView on non-empty videoPath",
+    )
+    eol_patch_fn(
+        chat_act,
+        "        contentView.setSkipBackgroundDrawing(false);\n"
+        "        if (colgramVideoWallpaperView != null) {\n"
+        "            colgramEnsureVideoWallpaperZOrder();\n"
+        "            colgramVideoWallpaperView.setHostPaused(!colgramWallpaperHostActive);\n"
+        "            colgramVideoWallpaperView.setVideoPath(videoPath);\n"
+        "        }",
+        "        contentView.setSkipBackgroundDrawing(false);\n"
+        "        ColgramVideoWallpaperView lazyResolvedView = (videoPath != null && !videoPath.isEmpty())\n"
+        "                ? colgramEnsureVideoWallpaperView()\n"
+        "                : colgramVideoWallpaperView;\n"
+        "        if (lazyResolvedView != null) {\n"
+        "            colgramEnsureVideoWallpaperZOrder();\n"
+        "            lazyResolvedView.setHostPaused(!colgramWallpaperHostActive);\n"
+        "            lazyResolvedView.setVideoPath(videoPath);\n"
+        "        }",
+        "ChatActivity.java lazy-init ColgramVideoWallpaperView on colgramApplyResolvedVideoWallpaper",
+    )
+
+    # =========================================================================
+    # 24. ImageLoader.java (P1-5):
+    #     Expand bitmap LruCache headroom on >=512MB heap devices without altering
+    #     the >=192MB baseline formula.
+    # =========================================================================
+    eol_patch_fn(
+        image_loader,
+        "        if (canForce8888 = memoryClass >= 192) {\n"
+        "            maxSize = unlimited ? 30 : 24;\n"
+        "        } else {\n"
+        "            maxSize = unlimited ? 15 : 12;\n"
+        "        }\n"
+        "        int cacheSize = DEBUG_MODE ? 1 : Math.min(maxSize, memoryClass / 7) * 1024 * 1024;",
+        "        if (canForce8888 = memoryClass >= 192) {\n"
+        "            maxSize = unlimited ? 30 : 24;\n"
+        "        } else {\n"
+        "            maxSize = unlimited ? 15 : 12;\n"
+        "        }\n"
+        "        if (memoryClass >= 512) {\n"
+        "            maxSize = unlimited ? 56 : 44;\n"
+        "        }\n"
+        "        int cacheSize = DEBUG_MODE ? 1 : Math.min(maxSize, memoryClass / 7) * 1024 * 1024;",
+        "ImageLoader.java high-RAM bitmap cache headroom",
     )

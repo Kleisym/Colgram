@@ -221,11 +221,27 @@ static int wait_fd_event(DesyncConn *conn, short events, int timeout_ms) {
         if (pfds[1].revents & POLLIN) {
             return -2;
         }
-        if (pfds[0].revents & (POLLERR | POLLNVAL)) {
+        if ((pfds[0].revents & (POLLERR | POLLNVAL))
+                || ((events & POLLOUT) && (pfds[0].revents & POLLHUP))) {
             return -2;
         }
         return 1;
     }
+}
+
+static int wait_pollout_slices(DesyncConn *conn, int total_ms) {
+    int waited = 0;
+    while (waited < total_ms) {
+        int slice = total_ms - waited;
+        if (slice > 500) slice = 500;
+        int w = wait_fd_event(conn, POLLOUT, slice);
+        if (w == -1) {
+            waited += slice;
+            continue;
+        }
+        return w;
+    }
+    return -1;
 }
 
 /*
@@ -284,7 +300,7 @@ static int send_all(DesyncConn *conn, const uint8_t *buf, size_t len, int flags)
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            int w = wait_fd_event(conn, POLLOUT, 5000);
+            int w = wait_pollout_slices(conn, 5000);
             if (w <= 0) return -2;
             continue;
         }
@@ -442,7 +458,7 @@ static int send_oob_chunk(DesyncConn *conn, const uint8_t *buf, size_t len, uint
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            int w = wait_fd_event(conn, POLLOUT, 5000);
+            int w = wait_pollout_slices(conn, 5000);
             if (w <= 0) return -2;
             continue;
         }
@@ -746,7 +762,7 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
 #endif
 #ifdef TCP_USER_TIMEOUT
     {
-        int user_timeout = 60000;
+        int user_timeout = 12000;
         setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout));
     }
 #endif
@@ -810,6 +826,12 @@ Java_org_colgram_core_ColgramNativeDesync_nativeConnect(JNIEnv *env, jclass claz
             return 0;
         }
     }
+#ifdef TCP_QUICKACK
+    {
+        int qack = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+    }
+#endif
 
     int wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (wake_fd < 0) {
@@ -1289,6 +1311,12 @@ Java_org_colgram_core_ColgramNativeDesync_nativeRead(JNIEnv *env, jclass clazz,
         }
         ssize_t n = recv(conn->fd, tmp, want, 0);
         if (n > 0) {
+#ifdef TCP_QUICKACK
+            if (n < 4096) {
+                int qack = 1;
+                setsockopt(conn->fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+            }
+#endif
             (*env)->SetByteArrayRegion(env, jBuf, off, (jsize)n, (const jbyte *)tmp);
             if ((*env)->ExceptionCheck(env)) {
                 (*env)->ExceptionClear(env);

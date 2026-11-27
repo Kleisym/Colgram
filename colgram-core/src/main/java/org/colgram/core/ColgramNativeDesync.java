@@ -131,6 +131,14 @@ public final class ColgramNativeDesync {
             try {
                 SSLContext ctx = SSLContext.getInstance("TLS");
                 ctx.init(null, null, null);
+                try {
+                    javax.net.ssl.SSLSessionContext sessionCtx = ctx.getClientSessionContext();
+                    if (sessionCtx != null) {
+                        sessionCtx.setSessionCacheSize(32);
+                        sessionCtx.setSessionTimeout(3600);
+                    }
+                } catch (Throwable ignored) {
+                }
                 factory = ctx.getSocketFactory();
             } catch (Throwable t) {
                 factory = (SSLSocketFactory) SSLSocketFactory.getDefault();

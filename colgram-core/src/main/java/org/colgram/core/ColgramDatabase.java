@@ -97,12 +97,26 @@ public class ColgramDatabase extends SQLiteOpenHelper {
         super(context, DATABASE_NAME, null, DATABASE_VERSION);
     }
 
+    private static void execPragmaQuiet(SQLiteDatabase db, String sql) {
+        if (db == null) return;
+        try (Cursor c = db.rawQuery(sql, null)) {
+            if (c != null) {
+                c.moveToFirst();
+            }
+        } catch (Throwable ignored) {}
+    }
+
     @Override
     public void onConfigure(SQLiteDatabase db) {
         super.onConfigure(db);
         try {
             db.enableWriteAheadLogging();
         } catch (Throwable ignored) {}
+        execPragmaQuiet(db, "PRAGMA synchronous=NORMAL");
+        execPragmaQuiet(db, "PRAGMA temp_store=MEMORY");
+        execPragmaQuiet(db, "PRAGMA cache_size=-4096");
+        execPragmaQuiet(db, "PRAGMA mmap_size=16777216");
+        execPragmaQuiet(db, "PRAGMA busy_timeout=5000");
     }
 
     /**
@@ -146,6 +160,9 @@ public class ColgramDatabase extends SQLiteOpenHelper {
             deletedCacheLoadStarted = true;
         }
         Thread t = new Thread(() -> {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (Throwable ignored) {}
             ensureBlockedUsersLoadedSync();
             ensureDeletedCachesLoadedSync();
         }, "colgram-vault-preload");
@@ -601,6 +618,12 @@ public class ColgramDatabase extends SQLiteOpenHelper {
      * leaves zero preserved trace in ColgramDatabase.
      */
     public void purgeMessagesCompletely(long dialogId, Collection<Integer> messageIds) {
+        purgeMessagesMemoryOnly(dialogId, messageIds);
+        purgeMessagesFromDiskOnly(dialogId, messageIds);
+    }
+
+    /** Synchronously clears local tombstones from in-memory caches without touching SQLite on caller thread. */
+    public void purgeMessagesMemoryOnly(long dialogId, Collection<Integer> messageIds) {
         if (dialogId == 0L || messageIds == null || messageIds.isEmpty()) return;
         Set<Integer> dialogSet = deletedMessagesByDialog.get(dialogId);
         for (Integer id : messageIds) {
@@ -612,6 +635,11 @@ public class ColgramDatabase extends SQLiteOpenHelper {
                 dialogSet.remove(id);
             }
         }
+    }
+
+    /** Executes SQLite DELETE statements for purged messages; safe to run on a background I/O thread. */
+    public void purgeMessagesFromDiskOnly(long dialogId, Collection<Integer> messageIds) {
+        if (dialogId == 0L || messageIds == null || messageIds.isEmpty()) return;
         SQLiteDatabase db = null;
         SQLiteStatement delStmt = null;
         SQLiteStatement editStmt = null;

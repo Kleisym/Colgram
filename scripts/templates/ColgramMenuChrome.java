@@ -240,6 +240,9 @@ public final class ColgramMenuChrome {
         attachSpringPress(target);
     }
 
+    private static final DecelerateInterpolator SPRING_PRESS_INTERP = new DecelerateInterpolator();
+    private static final OvershootInterpolator SPRING_RELEASE_INTERP = new OvershootInterpolator(1.35f);
+
     public static void attachSpringPress(View target) {
         if (target == null || Boolean.TRUE.equals(target.getTag(0x636f6c01))) return;
         if (target instanceof TextCheckCell
@@ -252,21 +255,35 @@ public final class ColgramMenuChrome {
             return;
         }
         target.setTag(0x636f6c01, Boolean.TRUE);
-        target.setOnTouchListener((v, ev) -> {
-            int action = ev.getActionMasked();
-            if (action == MotionEvent.ACTION_DOWN) {
-                v.animate().scaleX(0.965f).scaleY(0.965f).setDuration(85L)
-                        .setInterpolator(new DecelerateInterpolator()).start();
-            } else if (action == MotionEvent.ACTION_MOVE) {
-                if (ev.getX() < -dp(8) || ev.getY() < -dp(8) || ev.getX() > v.getWidth() + dp(8) || ev.getY() > v.getHeight() + dp(8)) {
-                    v.animate().scaleX(1f).scaleY(1f).setDuration(140L)
-                            .setInterpolator(new DecelerateInterpolator()).start();
+        target.setOnTouchListener(new View.OnTouchListener() {
+            private boolean springCancelledByMove;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent ev) {
+                int action = ev.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    springCancelledByMove = false;
+                    v.animate().scaleX(0.965f).scaleY(0.965f).setDuration(85L)
+                            .setInterpolator(SPRING_PRESS_INTERP).start();
+                } else if (action == MotionEvent.ACTION_MOVE) {
+                    if (!springCancelledByMove) {
+                        float slop = dp(8);
+                        if (ev.getX() < -slop || ev.getY() < -slop
+                                || ev.getX() > v.getWidth() + slop || ev.getY() > v.getHeight() + slop) {
+                            springCancelledByMove = true;
+                            v.animate().scaleX(1f).scaleY(1f).setDuration(140L)
+                                    .setInterpolator(SPRING_PRESS_INTERP).start();
+                        }
+                    }
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    if (!springCancelledByMove) {
+                        springCancelledByMove = true;
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(220L)
+                                .setInterpolator(SPRING_RELEASE_INTERP).start();
+                    }
                 }
-            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-                v.animate().scaleX(1f).scaleY(1f).setDuration(220L)
-                        .setInterpolator(new OvershootInterpolator(1.35f)).start();
+                return false;
             }
-            return false;
         });
     }
 

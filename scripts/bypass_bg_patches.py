@@ -179,7 +179,8 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "ApplicationLoader.java gate screenStateChanged network refresh on foreground",
     )
 
-    # 3. ConnectionsManager.java: expose colgramResetProxySignature() so bypass restart/fallback clears cached signature.
+    # 3. ConnectionsManager.java: expose colgramResetProxySignature(), volatile state fields,
+    #    direct instant-send dispatch, and non-blocking checkConnection offload.
     conn_mgr = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java"
     )
@@ -192,6 +193,245 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         colgramLastProxySignature = null;
     }""",
         "ConnectionsManager.java add colgramResetProxySignature()",
+    )
+    eol_patch_fn(
+        conn_mgr,
+        """    private long lastPauseTime = System.currentTimeMillis();
+    private boolean appPaused = true;
+    private boolean isUpdating;
+    private int connectionState;""",
+        """    private volatile long lastPauseTime = System.currentTimeMillis();
+    private volatile boolean appPaused = true;
+    private volatile boolean isUpdating;
+    private volatile int connectionState;""",
+        "ConnectionsManager.java volatile state fields for direct instant send",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        Utilities.stageQueue.postRunnable(() -> {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        });
+        return requestToken;
+    }""",
+            """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+        return object instanceof TLRPC.TL_messages_sendMessage
+                || object instanceof TLRPC.TL_messages_sendMedia
+                || object instanceof TLRPC.TL_messages_sendMultiMedia;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            return requestToken;
+        }
+        Utilities.stageQueue.postRunnable(() -> {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        });
+        return requestToken;
+    }""",
+        ],
+        """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+        if (object instanceof TLRPC.TL_messages_sendMedia) {
+            return !(((TLRPC.TL_messages_sendMedia) object).media instanceof TLRPC.TL_inputMediaGame);
+        }
+        return object instanceof TLRPC.TL_messages_sendMessage
+                || object instanceof TLRPC.TL_messages_sendMultiMedia;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            return requestToken;
+        }
+        Utilities.stageQueue.postRunnable(() -> {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        });
+        return requestToken;
+    }""",
+        "ConnectionsManager.java bypass stageQueue on outbound instant send requests",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """        if (colgramInstantWake) {
+            if (lastPauseTime != 0 || appPaused) {
+                resumeNetworkMaybe();
+            }
+            if (connectionState != ConnectionStateConnected) {
+                checkConnection();
+            }
+            if (!org.colgram.core.ColgramDpiBypass.isBound()
+                    && org.colgram.core.ColgramConfig.isBuiltinProxyEnabled()) {
+                try {
+                    org.colgram.core.ColgramDpiBypass.restartIfDead();
+                } catch (Throwable ignored) {}
+            }
+        }""",
+        ],
+        """        if (colgramInstantWake && (lastPauseTime != 0 || appPaused)) {
+            resumeNetworkMaybe();
+        }""",
+        "ConnectionsManager.java keep pre-send instant wake non-blocking",
+    )
+    eol_patch_fn(
+        conn_mgr,
+        """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
+        } catch (Exception e) {""",
+        """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
+            if (colgramInstantWake) {
+                final boolean colgramNeedConnCheck = colgramIsRawDisconnected();
+                final boolean colgramNeedBypassWake = !org.colgram.core.ColgramDpiBypass.isBound()
+                        && org.colgram.core.ColgramConfig.isBuiltinProxyEnabled();
+                if (colgramNeedConnCheck || colgramNeedBypassWake) {
+                    Utilities.globalQueue.postRunnable(() -> {
+                        if (colgramNeedConnCheck) {
+                            checkConnection();
+                        }
+                        if (colgramNeedBypassWake) {
+                            try {
+                                org.colgram.core.ColgramDpiBypass.restartIfDead();
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {""",
+        "ConnectionsManager.java offload checkConnection and bypass restart after native_sendRequest",
+    )
+    eol_patch_fn(
+        conn_mgr,
+        """                    final TLObject finalResponse = resp;
+                    final TLRPC.TL_error finalError = error;
+                    Utilities.stageQueue.postRunnable(() -> {
+                        if (onComplete != null) {
+                            onComplete.run(finalResponse, finalError);
+                        } else if (onCompleteTimestamp != null) {
+                            onCompleteTimestamp.run(finalResponse, finalError, timestamp);
+                        } else if (finalResponse instanceof TLRPC.Updates) {
+                            KeepAliveJob.finishJob();
+                            AccountInstance.getInstance(currentAccount).getMessagesController().processUpdates((TLRPC.Updates) finalResponse, false);
+                        }
+                        if (finalResponse != null) {
+                            finalResponse.freeResources();
+                        }
+                        if (colgramTriggersOnline && finalError == null && org.colgram.core.ColgramHookHandler.shouldStayOffline()) {
+                            AccountInstance.getInstance(currentAccount).getMessagesController().scheduleGhostOfflineAfterActivity();
+                        }
+                    });""",
+        """                    final TLObject finalResponse = resp;
+                    final TLRPC.TL_error finalError = error;
+                    if (finalError == null && onComplete != null && colgramIsDirectSendResponseSafe(object)) {
+                        onComplete.run(finalResponse, null);
+                        if (colgramTriggersOnline && org.colgram.core.ColgramHookHandler.shouldStayOffline()) {
+                            Utilities.stageQueue.postRunnable(() -> AccountInstance.getInstance(currentAccount).getMessagesController().scheduleGhostOfflineAfterActivity());
+                        }
+                    } else {
+                        Utilities.stageQueue.postRunnable(() -> {
+                            if (onComplete != null) {
+                                onComplete.run(finalResponse, finalError);
+                            } else if (onCompleteTimestamp != null) {
+                                onCompleteTimestamp.run(finalResponse, finalError, timestamp);
+                            } else if (finalResponse instanceof TLRPC.Updates) {
+                                KeepAliveJob.finishJob();
+                                AccountInstance.getInstance(currentAccount).getMessagesController().processUpdates((TLRPC.Updates) finalResponse, false);
+                            }
+                            if (finalResponse != null) {
+                                finalResponse.freeResources();
+                            }
+                            if (colgramTriggersOnline && finalError == null && org.colgram.core.ColgramHookHandler.shouldStayOffline()) {
+                                AccountInstance.getInstance(currentAccount).getMessagesController().scheduleGhostOfflineAfterActivity();
+                            }
+                        });
+                    }""",
+        "ConnectionsManager.java bypass stageQueue on inbound send response completion",
+    )
+    eol_patch_fn(
+        conn_mgr,
+        """    public int getConnectionState() {
+        if (connectionState == ConnectionStateConnected && isUpdating) {
+            return ConnectionStateUpdating;
+        }
+        return connectionState;
+    }""",
+        """    public int getConnectionState() {
+        if (connectionState == ConnectionStateConnected && isUpdating) {
+            return ConnectionStateUpdating;
+        }
+        return connectionState;
+    }
+
+    public boolean colgramIsRawDisconnected() {
+        return connectionState != ConnectionStateConnected;
+    }""",
+        "ConnectionsManager.java add colgramIsRawDisconnected()",
+    )
+
+    # 3b. SendMessagesHelper.java: keep UI-thread instant-send preparation non-blocking and
+    #     remove redundant second messageReceivedByServer broadcasts after storageQueue.
+    send_helper = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "SendMessagesHelper.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        send_helper,
+        [
+            """    private void colgramPrepareInstantSend() {
+        ConnectionsManager connectionsManager = getConnectionsManager();
+        if (connectionsManager.getPauseTime() != 0 || connectionsManager.getConnectionState() != ConnectionsManager.ConnectionStateConnected) {
+            connectionsManager.resumeNetworkMaybe();
+            connectionsManager.checkConnection();
+        }
+        if (org.colgram.core.ColgramConfig.isBuiltinProxyEnabled() && !org.colgram.core.ColgramDpiBypass.isBound()) {
+            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);
+        }
+    }""",
+        ],
+        """    private void colgramPrepareInstantSend() {
+        ConnectionsManager connectionsManager = getConnectionsManager();
+        if (connectionsManager.getPauseTime() != 0) {
+            connectionsManager.resumeNetworkMaybe();
+        }
+        if (connectionsManager.colgramIsRawDisconnected()) {
+            Utilities.globalQueue.postRunnable(connectionsManager::checkConnection);
+        }
+        if (org.colgram.core.ColgramConfig.isBuiltinProxyEnabled() && !org.colgram.core.ColgramDpiBypass.isBound()) {
+            Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead);
+        }
+    }""",
+        "SendMessagesHelper.java make colgramPrepareInstantSend() non-blocking on UI thread",
+    )
+    eol_patch_fn(
+        send_helper,
+        """                                    getMediaDataController().increasePeerRaiting(newMsgObj.dialog_id);
+                                    getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByServer, oldId, newMsgObj.id, newMsgObj, newMsgObj.dialog_id, grouped_id, existFlags, finalCurrentSchedule);
+                                    getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByServer2, oldId, newMsgObj.id, newMsgObj, newMsgObj.dialog_id, grouped_id, existFlags, finalCurrentSchedule);
+                                    processSentMessage(oldId);""",
+        """                                    getMediaDataController().increasePeerRaiting(newMsgObj.dialog_id);
+                                    processSentMessage(oldId);""",
+        "SendMessagesHelper.java remove redundant second messageReceivedByServer in performSendMessageRequestMulti",
+    )
+    eol_patch_fn(
+        send_helper,
+        """                                    AndroidUtilities.runOnUIThread(() -> {
+                                        getMediaDataController().increasePeerRaiting(newMsgObj.dialog_id);
+                                        getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByServer, oldId, newMsgObj.id, newMsgObj, newMsgObj.dialog_id, 0L, existFlags, scheduled);
+                                        getNotificationCenter().postNotificationName(NotificationCenter.messageReceivedByServer2, oldId, newMsgObj.id, newMsgObj, newMsgObj.dialog_id, 0L, existFlags, scheduled);
+                                        processSentMessage(oldId);
+                                        removeFromSendingMessages(oldId, scheduled);
+                                    });""",
+        """                                    AndroidUtilities.runOnUIThread(() -> {
+                                        getMediaDataController().increasePeerRaiting(newMsgObj.dialog_id);
+                                        processSentMessage(oldId);
+                                        removeFromSendingMessages(oldId, scheduled);
+                                    });""",
+        "SendMessagesHelper.java remove redundant second messageReceivedByServer in performSendMessageRequest",
     )
 
     # 4. MessagesController.java: never permanently mark dialogsEndReached on offline/network error; retry on reconnect.

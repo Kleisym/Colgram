@@ -25,8 +25,10 @@ TRACK_A_TELEGRAM_RELS = (
     "TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java",
+    "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java",
     "TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java",
 )
+IMAGE_LOADER_REL = TRACK_A_TELEGRAM_RELS[-1]
 
 
 def read_text(path: Path) -> str:
@@ -87,19 +89,46 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("stepSession.fromPrewarm", pipe)
         self.assertIn("tryRedialFreshPrewarmSession(", pipe)
         self.assertIn("evictPrewarmedBucket(", pipe)
+        self.assertIn("lastTxAtMs", dpi)
+        self.assertIn("void setUpstream(", dpi)
+        self.assertIn("probeClientClosedQuick(", dpi)
+        self.assertIn("long wsHeadStartMs = cellularNetwork ? 0L : 25L;", dpi)
+        self.assertIn("ColgramSocks5Codec.readFully(in, 2)", dpi)
+        self.assertIn("RELAY_BUF_POOL_MAX = 24;", dpi)
+        self.assertIn("UDP_BUF_POOL_MAX = 4;", dpi)
+        self.assertIn("borrowRelayBuffer()", dpi)
+        self.assertIn("recycleRelayBuffer(", dpi)
+        self.assertIn("borrowUdpBuffer()", dpi)
+        self.assertIn("setThreadPriorityQuiet(", dpi)
+        self.assertIn("THREAD_PRIORITY_LESS_FAVORABLE", dpi)
+        self.assertIn("THREAD_PRIORITY_BACKGROUND", dpi)
+        # Ensure hot relay / UDP loops no longer allocate per-loop 32KB/65KB arrays
+        pump_assoc = extract_method(dpi, "private static void pumpAssociated(")
+        self.assertIn("borrowUdpBuffer()", pump_assoc)
+        self.assertNotIn("new byte[65500]", pump_assoc)
 
     def test_ws_bridge_native_keepalive_wrap_fix_and_prewarm_safety(self):
         ws = read_text(CORE / "ColgramTelegramWsBridge.java")
         self.assertIn("volatile boolean fromPrewarm = false;", ws)
         self.assertIn("PREWARM_MAX_PER_BUCKET = 3;", ws)
-        self.assertIn("PREWARM_TTL_MS = 60_000L;", ws)
-        self.assertIn("PREWARM_REFRESH_MS = 42_000L;", ws)
+        self.assertIn("PREWARM_TTL_MS = 38_000L;", ws)
+        self.assertIn("PREWARM_REFRESH_MS = 28_000L;", ws)
+        self.assertIn("maintainForegroundPrewarmIfNeeded(", ws)
+        self.assertIn("replenishPrewarmedAsync(normDc, media, 1);", extract_method(ws, "public static void maintainForegroundPrewarmIfNeeded("))
+        self.assertIn("wrapBufferedOutput(", ws)
+        self.assertIn("public final Socket rawSocket;", ws)
+        self.assertIn("EMPTY_BYTES = new byte[0];", ws)
+        self.assertIn("createWsDaemonPool(", ws)
+        self.assertIn("THREAD_PRIORITY_LESS_FAVORABLE", ws)
+        self.assertIn("THREAD_PRIORITY_BACKGROUND", ws)
         self.assertIn("public static void onBackgroundPause()", ws)
         self.assertIn("public static void onForegroundResume()", ws)
         self.assertIn("public static String getLiveTelemetrySummary()", ws)
         self.assertIn("public static int getLastHandshakeRttMs()", ws)
         self.assertIn("public static int getPrewarmedTotalCount()", ws)
-        self.assertIn("!ColgramUiBridge.isAppInForeground()", extract_method(ws, "private static void replenishPrewarmedAsync("))
+        replenish = extract_method(ws, "private static void replenishPrewarmedAsync(")
+        self.assertIn("!ColgramUiBridge.isAppInForeground()", replenish)
+        self.assertIn("int deficit = Math.min(Math.max(1, maxToSpawn), freeSlots);", replenish)
         self.assertIn(
             "hit.fromPrewarm = true;",
             extract_method(ws, "static WsSession takePrewarmed(int normDc, boolean media, boolean wantProtected)"),
@@ -117,7 +146,8 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertNotIn("setSendBufferSize(262144)", race)
 
         pump = extract_method(ws, "public static long pumpUpstreamFrames(")
-        self.assertIn("new byte[32768]", pump)
+        self.assertIn("ColgramDpiBypass.borrowRelayBuffer()", pump)
+        self.assertIn("ColgramDpiBypass.recycleRelayBuffer(buf)", pump)
         self.assertIn("session.socket.setSoTimeout(0)", pump)
         self.assertNotIn("sendPing(", pump)
 
@@ -142,6 +172,13 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         wd = extract_method(pm, "private static void connectionWatchdogTick()")
         self.assertIn("mainDcStallTimedOut", wd)
         self.assertIn(">= 15_000L", wd)
+        self.assertIn("maintainForegroundPrewarmIfNeeded(", wd)
+
+        screen_on = extract_method(pm, "public static void onScreenTurnedOn(")
+        self.assertIn("40_000L", screen_on)
+        fg = extract_method(pm, "public static void onAppForegrounded(")
+        self.assertIn(">= 45_000L", fg)
+        self.assertIn("40_000L", fg)
 
         stop_bg = extract_method(pm, "private static void stopBackgroundFeedScraping()")
         self.assertIn("watchdogTask", stop_bg)
@@ -152,13 +189,33 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("onBackgroundPause()", extract_method(pm, "public static void onAppBackgrounded()"))
         self.assertNotIn("awayMs >= 20_000L", extract_method(pm, "public static void onAppForegrounded()"))
 
+        act = extract_method(pm, "public static void activateBuiltinProxy(final Context context)")
+        exec_idx = act.index("executor.execute(() -> {")
+        pre_exec = act[:exec_idx]
+        post_exec = act[exec_idx:]
+        self.assertNotIn("registerNetworkCallback(", pre_exec)
+        self.assertNotIn("scheduleProxyRefresh(", pre_exec)
+        self.assertNotIn("mainconfig", pre_exec)
+        self.assertIn("ColgramDpiBypass.setAppContext(appContext);", post_exec)
+        self.assertIn("registerNetworkCallback(appContext);", post_exec)
+        self.assertIn("ColgramBootJobService.scheduleProxyRefresh(appContext);", post_exec)
+        self.assertIn("ensureLocalWatchSchedulerRunning();", post_exec)
+
+        act_now = extract_method(pm, "private static void activateBuiltinProxyNow(long startupEpoch)")
+        self.assertLess(act_now.index("ColgramDpiBypass.startImmediately();"), act_now.index("mainHandler.post("))
+
     def test_helpers_doze_sync_build_flag_and_native_c(self):
         remap = read_text(CORE / "ColgramDcRemap.java")
         self.assertIn("STREAM_COPY_BUFFER_BYTES = 32768", remap)
         self.assertNotIn("SOCKET_BUFFER_BYTES", remap)
         self.assertIn("if (upstreamBytes < MIN_ANSWER_BYTES) {", remap)
+        self.assertGreaterEqual(remap.count("setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND)"), 5)
+
+        front = read_text(CORE / "ColgramLocalTcpFront.java")
+        self.assertIn("setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_LESS_FAVORABLE)", front)
 
         doh = read_text(CORE / "ColgramDohResolver.java")
+        self.assertGreaterEqual(doh.count("setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND)"), 2)
         pref = extract_method(doh, "public static void prefetchCriticalHosts()")
         self.assertIn("ColgramDpiBypass.activeSystemDpiVpn() != null", pref)
         self.assertIn('".telegram.dog"', pref)
@@ -193,9 +250,14 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("int buf_sz = 131072;", c_src)
         self.assertIn("int keepidle = 180;", c_src)
         self.assertIn("int keepintvl = 30;", c_src)
-        self.assertIn("int user_timeout = 60000;", c_src)
+        self.assertIn("int user_timeout = 12000;", c_src)
+        self.assertIn("wait_pollout_slices(", c_src)
+        self.assertIn("TCP_QUICKACK", c_src)
         self.assertIn("nativeIsSocketIdleClean(", c_src)
         self.assertIn("nativeSetKeepalive(", c_src)
+        native_java = read_text(CORE / "ColgramNativeDesync.java")
+        self.assertIn("setSessionCacheSize(32)", native_java)
+        self.assertIn("setSessionTimeout(3600)", native_java)
 
         for abi in ("arm64-v8a", "armeabi-v7a", "x86", "x86_64"):
             so_core = JNI_DIR / abi / "libcolgramdesync.so"
@@ -238,6 +300,7 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
 
             cm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[2])
             self.assertIn("public static void colgramResetProxySignature()", cm)
+            self.assertIn("TLRPC.TL_inputMediaGame", extract_method(cm, "private static boolean colgramIsDirectSendResponseSafe("))
 
             mc = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[3])
             self.assertIn("AndroidUtilities.runOnUIThread(() -> colgramDialogsRetryPending.put(folderId, false));", mc)
@@ -268,7 +331,10 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             fpq = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[8])
             self.assertIn("type == TYPE_LARGE ? 3 : 12", fpq)
 
-            il = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[9])
+            sm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[9])
+            self.assertIn("connectionsManager.colgramIsRawDisconnected()", sm)
+
+            il = read_text(tmp_path / IMAGE_LOADER_REL)
             self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il)
             self.assertIn('new DispatchQueuePriority("cacheThumbOutQueue", 2)', il)
             self.assertIn('new DispatchQueuePriority("colgramLottieOutQueue", 1)', il)
@@ -335,13 +401,24 @@ public class ImageLoader {
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / "Telegram-Src" / rel, dst)
 
-            il_path = tmp_path / TRACK_A_TELEGRAM_RELS[9]
+            il_path = tmp_path / IMAGE_LOADER_REL
             il_path.parent.mkdir(parents=True, exist_ok=True)
             il_path.write_text(fresh_upstream_image_loader, encoding="utf-8")
 
             ap.PATCH_MISSES.clear()
             bypass_bg_patches.apply(str(tmp_path), ap.patch_file, ap._patch_file_eol)
             self.assertEqual(ap.PATCH_MISSES, [])
+
+            cm_pass1 = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java")
+            direct_safe = extract_method(cm_pass1, "private static boolean colgramIsDirectSendResponseSafe(")
+            self.assertIn("TLRPC.TL_inputMediaGame", direct_safe)
+            self.assertIn("colgramNeedConnCheck = colgramIsRawDisconnected();", cm_pass1)
+
+            sm_pass1 = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java")
+            prep_pass1 = extract_method(sm_pass1, "private void colgramPrepareInstantSend()")
+            self.assertIn("connectionsManager.colgramIsRawDisconnected()", prep_pass1)
+            self.assertIn("Utilities.globalQueue.postRunnable(connectionsManager::checkConnection);", prep_pass1)
+            self.assertNotIn("connectionsManager.checkConnection()", prep_pass1)
 
             il_pass1 = read_text(il_path)
             self.assertIn('new DispatchQueuePriority("cacheOutQueue", 3)', il_pass1)
@@ -356,6 +433,14 @@ public class ImageLoader {
             bypass_bg_patches.apply(str(tmp_path), ap.patch_file, ap._patch_file_eol)
             self.assertEqual(ap.PATCH_MISSES, [])
             self.assertEqual(read_text(il_path), il_pass1)
+            self.assertEqual(
+                read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java"),
+                cm_pass1,
+            )
+            self.assertEqual(
+                read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java"),
+                sm_pass1,
+            )
 
 
 if __name__ == "__main__":

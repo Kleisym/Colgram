@@ -21,6 +21,10 @@ public final class ColgramBypassStabilityRegressionTest {
         testPrewarmPoolDrainAndBucketEvict();
         testLoopbackGuardTelemetryAndStealthContracts();
         testPipeOverWebSocketFailoverSynchronization();
+        testActiveUploadProtectedFromReaperAndSetUpstreamClosesHandoff();
+        testWsSessionCloseClosesRawSocketBeforeSlowSslSocket();
+        testPipeOverWebSocketClientCancelDoesNotPoisonEdgeOrPool();
+        testPipeStandardOrWsSessionClientCancelDoesNotPoisonRawDcOrStrategy();
         System.out.println("ColgramBypassStabilityRegressionTest PASSED");
     }
 
@@ -346,6 +350,244 @@ public final class ColgramBypassStabilityRegressionTest {
                             + total + ", failC2s=" + failC2sWrite + ", delayInit=" + delayClientInit + ")");
             check(dialCalls.get() == 1, "exactly one fresh redial expected, got " + dialCalls.get());
             check(freshOutWrites.get() >= 1, "fresh WSS session must receive replayed init packet");
+        }
+    }
+
+    private static void testActiveUploadProtectedFromReaperAndSetUpstreamClosesHandoff() throws Exception {
+        ColgramDpiBypass.closeAllActiveSessions();
+        List<Socket> toClose = new ArrayList<>();
+        try {
+            Socket client = new Socket();
+            Socket rawUp = new Socket();
+            Socket wsUp = new Socket();
+            toClose.add(client);
+            toClose.add(rawUp);
+            toClose.add(wsUp);
+
+            ColgramDpiBypass.ActiveSession uploadSess =
+                    ColgramDpiBypass.registerActiveSessionAt(client, rawUp, true, 10_000L);
+            for (long t = 11_000L; t <= 35_000L; t += 1_000L) {
+                uploadSess.onClientTx(t);
+            }
+            int reapedActive = ColgramDpiBypass.reapStaleSessionsAt(36_000L, 12_000L, 0L);
+            check(reapedActive == 0, "actively transmitting upload must NOT be reaped after 25s without reply, got=" + reapedActive);
+            check(!client.isClosed() && !rawUp.isClosed(), "active upload sockets must remain open");
+
+            // Simulate WS/L3 handoff replacing upstream, then continuing TX past 60s without any reply
+            uploadSess.setUpstream(wsUp);
+            for (long t = 36_000L; t <= 74_000L; t += 2_000L) {
+                uploadSess.onClientTx(t);
+            }
+            int reapedHardCap = ColgramDpiBypass.reapStaleSessionsAt(75_000L, 12_000L, 0L);
+            check(reapedHardCap == 1, "upload stalled >60s with zero server RX must still be reaped");
+            check(wsUp.isClosed() && client.isClosed(), "handoff upstream and client must close on reap");
+        } finally {
+            ColgramDpiBypass.closeAllActiveSessions();
+            for (Socket s : toClose) {
+                try { s.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private static void testWsSessionCloseClosesRawSocketBeforeSlowSslSocket() throws Exception {
+        final java.util.concurrent.atomic.AtomicInteger closeSeq = new java.util.concurrent.atomic.AtomicInteger(0);
+        final java.util.concurrent.atomic.AtomicInteger rawOrder = new java.util.concurrent.atomic.AtomicInteger(0);
+        final java.util.concurrent.atomic.AtomicInteger sslOrder = new java.util.concurrent.atomic.AtomicInteger(0);
+        final AtomicBoolean rawClosed = new AtomicBoolean(false);
+        Socket rawSock = new Socket() {
+            @Override
+            public synchronized void close() {
+                rawOrder.compareAndSet(0, closeSeq.incrementAndGet());
+                rawClosed.set(true);
+            }
+        };
+        Socket slowSslSock = new Socket() {
+            @Override
+            public synchronized void close() {
+                try {
+                    Thread.sleep(60L);
+                } catch (InterruptedException ignored) {}
+                sslOrder.compareAndSet(0, closeSeq.incrementAndGet());
+            }
+        };
+        ColgramTelegramWsBridge.WsSession session = new ColgramTelegramWsBridge.WsSession(
+                2, 2, "149.154.167.220", "kws2.web.telegram.org",
+                slowSslSock, rawSock,
+                new java.io.ByteArrayInputStream(new byte[0]),
+                new java.io.ByteArrayOutputStream());
+        session.close();
+        check(rawClosed.get(), "rawSocket must be closed by WsSession.close()");
+        check(rawOrder.get() == 1 && sslOrder.get() == 2,
+                "rawSocket must close BEFORE sslSocket so blocking SSL close_notify cannot stall cancel (raw="
+                        + rawOrder.get() + ", ssl=" + sslOrder.get() + ")");
+    }
+
+    private static void testPipeOverWebSocketClientCancelDoesNotPoisonEdgeOrPool() throws Exception {
+        java.lang.reflect.Method pipeWs = ColgramDpiBypass.class.getDeclaredMethod(
+                "pipeOverWebSocket",
+                Socket.class,
+                ColgramTelegramWsBridge.WsSession.class,
+                ColgramDpiBypass.CallListener.class,
+                long.class,
+                boolean.class);
+        pipeWs.setAccessible(true);
+
+        java.util.concurrent.atomic.AtomicInteger dialCalls = new java.util.concurrent.atomic.AtomicInteger(0);
+        ColgramTelegramWsBridge.setPrewarmEnabledForTest(true);
+        ColgramTelegramWsBridge.drainPrewarmedPool();
+        ColgramTelegramWsBridge.clearCooldowns();
+        ColgramDpiBypass.skipListenerCheckForTest = true;
+        ColgramTelegramWsBridge.dialFreshOverrideForTest = (signedDc, prot, fdProt) -> {
+            dialCalls.incrementAndGet();
+            return null;
+        };
+
+        String edgeIp = "149.154.167.220";
+        String sni = "kws2-1.web.telegram.org";
+        ColgramTelegramWsBridge.setLastWorkingForTest(-2, edgeIp, sni);
+
+        try (java.net.ServerSocket edgeServer = new java.net.ServerSocket(0, 4, java.net.InetAddress.getLoopbackAddress());
+             java.net.ServerSocket clientListener = new java.net.ServerSocket(0, 4, java.net.InetAddress.getLoopbackAddress());
+             Socket prewarmDummy = new Socket("127.0.0.1", edgeServer.getLocalPort());
+             Socket prewarmAccepted = edgeServer.accept();
+             Socket edgeClient = new Socket("127.0.0.1", edgeServer.getLocalPort());
+             Socket edgeAccepted = edgeServer.accept();
+             Socket clientEnd = new Socket("127.0.0.1", clientListener.getLocalPort());
+             Socket proxySide = clientListener.accept()) {
+            ColgramTelegramWsBridge.WsSession pooled = new ColgramTelegramWsBridge.WsSession(
+                    2, -2, edgeIp, sni, prewarmDummy,
+                    prewarmDummy.getInputStream(), prewarmDummy.getOutputStream());
+            edgeAccepted.setSoTimeout(5000);
+            check(ColgramTelegramWsBridge.offerPrewarmedForTest(pooled, System.currentTimeMillis(), false),
+                    "expected media prewarm offer to succeed");
+            check(ColgramTelegramWsBridge.prewarmedPoolSizeForTest(2, true) == 1,
+                    "expected DC2 media prewarm bucket size 1");
+
+            ColgramTelegramWsBridge.WsSession activeSess = new ColgramTelegramWsBridge.WsSession(
+                    2, -2, edgeIp, sni, edgeClient, edgeClient,
+                    edgeClient.getInputStream(), edgeClient.getOutputStream());
+            activeSess.fromPrewarm = true;
+
+            pipeWs.invoke(null, proxySide, activeSess, null, 1L, false);
+
+            java.io.OutputStream cOut = clientEnd.getOutputStream();
+            cOut.write(buildTestObfuscated2Header());
+            cOut.write(new byte[256]);
+            cOut.flush();
+
+            // Wait until upstream WS server receives the initial frame before client aborts upload
+            byte[] drainBuf = new byte[512];
+            int got = edgeAccepted.getInputStream().read(drainBuf);
+            check(got > 0, "expected upstream WS server to receive upload frame");
+
+            long abortStartMs = System.currentTimeMillis();
+            clientEnd.setSoLinger(true, 0);
+            clientEnd.close();
+
+            long deadline = System.currentTimeMillis() + 1500L;
+            while (!edgeClient.isClosed() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(5L);
+            }
+            long closeMs = System.currentTimeMillis() - abortStartMs;
+            Thread.sleep(40L);
+
+            check(edgeClient.isClosed(), "client cancel must close active upload WsSession");
+            check(closeMs < 1000L, "client cancel cleanup took too long: " + closeMs + "ms");
+            check(dialCalls.get() == 0, "client cancel must NOT trigger prewarm redial, got=" + dialCalls.get());
+            check(!ColgramTelegramWsBridge.isDeprioritizedForTest(edgeIp, sni),
+                    "client cancel must NOT deprioritize working WSS edge");
+            check((edgeIp + "|" + sni).equals(ColgramTelegramWsBridge.lastWorkingForTest(-2)),
+                    "client cancel must NOT clear lastWorkingByDc");
+            check(ColgramTelegramWsBridge.prewarmedPoolSizeForTest(2, true) == 1,
+                    "client cancel must NOT evict DC2 media prewarm pool");
+        } finally {
+            ColgramDpiBypass.skipListenerCheckForTest = false;
+            ColgramTelegramWsBridge.dialFreshOverrideForTest = null;
+            ColgramTelegramWsBridge.drainPrewarmedPool();
+            ColgramTelegramWsBridge.clearCooldowns();
+            ColgramTelegramWsBridge.setPrewarmEnabledForTest(false);
+        }
+    }
+
+    private static void testPipeStandardOrWsSessionClientCancelDoesNotPoisonRawDcOrStrategy() throws Exception {
+        java.lang.reflect.Method pipeStd = ColgramDpiBypass.class.getDeclaredMethod(
+                "pipeStandardOrWsSession",
+                Socket.class,
+                Socket.class,
+                ColgramDpiBypass.CallListener.class,
+                long.class,
+                boolean.class,
+                String.class,
+                int.class,
+                boolean.class,
+                byte[].class,
+                boolean.class,
+                String.class,
+                boolean.class,
+                long.class);
+        pipeStd.setAccessible(true);
+
+        ColgramDpiBypass.closeAllActiveSessions();
+        ColgramDpiBypass.resetStrategyStateForTest(false, ColgramDpiBypass.STRATEGY_TLS_2REC_SNI);
+        ColgramDpiBypass.clearSilentEndpointsForTest();
+        ColgramDpiBypass.skipListenerCheckForTest = true;
+
+        try (java.net.ServerSocket dcServer = new java.net.ServerSocket(0, 4, java.net.InetAddress.getLoopbackAddress());
+             java.net.ServerSocket clientListener = new java.net.ServerSocket(0, 4, java.net.InetAddress.getLoopbackAddress())) {
+            int dcPort = dcServer.getLocalPort();
+            long epoch = ColgramDpiBypass.currentNetworkEpochForTest();
+            byte[] initHdr = buildTestObfuscated2Header();
+
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try (Socket destEnd = new Socket("127.0.0.1", dcPort);
+                     Socket dcAccepted = dcServer.accept();
+                     Socket clientEnd = new Socket("127.0.0.1", clientListener.getLocalPort());
+                     Socket proxySide = clientListener.accept()) {
+                    dcAccepted.setSoTimeout(5000);
+                    final Throwable[] pipeErr = new Throwable[1];
+                    Thread pipeThread = new Thread(() -> {
+                        try {
+                            pipeStd.invoke(null, proxySide, destEnd, null, 1L, true,
+                                    "127.0.0.1", dcPort, false, initHdr, false, "dc2-upload-cancel", true, epoch);
+                        } catch (Throwable t) {
+                            pipeErr[0] = t;
+                        }
+                    }, "test-pipe-std-cancel");
+                    pipeThread.start();
+
+                    // Wait for desynced firstPayload to arrive at DC without sending any server reply
+                    byte[] rx = new byte[256];
+                    int n = dcAccepted.getInputStream().read(rx);
+                    check(n > 0, "expected upload init payload at DC server");
+
+                    clientEnd.getOutputStream().write(new byte[128]);
+                    clientEnd.getOutputStream().flush();
+                    Thread.sleep(20L);
+
+                    clientEnd.setSoLinger(true, 0);
+                    clientEnd.close();
+
+                    pipeThread.join(3000L);
+                    check(!pipeThread.isAlive(), "pipeStandardOrWsSession must finish promptly on client cancel");
+                    if (pipeErr[0] != null) throw new AssertionError("pipeStandardOrWsSession failed", pipeErr[0]);
+                    long deadline = System.currentTimeMillis() + 1500L;
+                    while ((!destEnd.isClosed() || ColgramDpiBypass.activeSessionCountForTest() > 0)
+                            && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(5L);
+                    }
+                    Thread.sleep(30L);
+                    check(destEnd.isClosed(), "dest socket must close promptly on client cancel");
+                }
+            }
+
+            check(!ColgramDpiBypass.isEndpointSilentForTest("127.0.0.1", dcPort),
+                    "repeated client upload cancel must NOT add raw DC endpoint to silentEndpoints");
+            check(ColgramDpiBypass.strategyFailCountForTest(ColgramDpiBypass.STRATEGY_TLS_2REC_SNI) == 0,
+                    "client upload cancel must NOT increment strategy fail count");
+        } finally {
+            ColgramDpiBypass.skipListenerCheckForTest = false;
+            ColgramDpiBypass.clearSilentEndpointsForTest();
+            ColgramDpiBypass.closeAllActiveSessions();
         }
     }
 

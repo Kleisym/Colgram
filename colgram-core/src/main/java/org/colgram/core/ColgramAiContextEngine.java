@@ -194,9 +194,9 @@ public final class ColgramAiContextEngine {
                 "везде", "во всех переписк", "общее по чатам", "что нового в чатах", "across chats");
         boolean crossChat = explicitCrossChat;
 
-        // 7. Only inject active Telegram chat/channel messages when the user actually asks about it, drafts a reply, or uses chat media.
-        //    Normal questions ("привет", "напиши код", "объясни...") stay 100% pure, fast, and unpolluted!
-        boolean useActiveChat = hasActiveChat && (strictlyAboutThisChat || draft || vision);
+        // 7. Only inject active Telegram chat/channel messages when the user actually asks about it, drafts a reply,
+        //    or asks about implicit chat media (never pollute explicit gallery/file Vision attachments with unrelated chatter!).
+        boolean useActiveChat = hasActiveChat && (strictlyAboutThisChat || draft || (vision && !hasAttachedMedia));
 
         AssistantMode resolved;
         if (vision) resolved = AssistantMode.VISION;
@@ -827,6 +827,11 @@ public final class ColgramAiContextEngine {
                 webContext, "", attachedFramesCount, videoGridMode, history);
     }
 
+    public static String sanitizeMediaMarker(String s) {
+        if (s == null || s.isEmpty()) return s == null ? "" : s;
+        return s.replace("<__media__>", "<_media_>");
+    }
+
     public static String buildUserPrompt(
             String userQuery,
             String activeChatTitle,
@@ -834,6 +839,22 @@ public final class ColgramAiContextEngine {
             String crossChatContext,
             String webContext,
             String dialogDirectory,
+            int attachedFramesCount,
+            boolean videoGridMode,
+            List<ConversationTurn> history
+    ) {
+        return buildUserPrompt(userQuery, activeChatTitle, activeChatContext, crossChatContext,
+                webContext, dialogDirectory, "", attachedFramesCount, videoGridMode, history);
+    }
+
+    public static String buildUserPrompt(
+            String userQuery,
+            String activeChatTitle,
+            String activeChatContext,
+            String crossChatContext,
+            String webContext,
+            String dialogDirectory,
+            String attachedDocContext,
             int attachedFramesCount,
             boolean videoGridMode,
             List<ConversationTurn> history
@@ -848,10 +869,12 @@ public final class ColgramAiContextEngine {
             effectiveWeb = ("Текущая дата: " + ColgramAiWebSearch.currentDateRu() + "\n" + effectiveWeb).trim();
         }
         String dirBlock = dialogDirectory == null ? "" : dialogDirectory.trim();
+        String docBlock = attachedDocContext == null ? "" : attachedDocContext.trim();
         boolean hasExtra = (activeChatContext != null && !activeChatContext.isEmpty())
                 || (crossChatContext != null && !crossChatContext.isEmpty())
                 || !effectiveWeb.isEmpty()
                 || !dirBlock.isEmpty()
+                || !docBlock.isEmpty()
                 || attachedFramesCount > 0
                 || (history != null && !history.isEmpty());
         // For clean conversational turns (with native multi-turn ChatML in C++), pass the raw user message directly!
@@ -891,6 +914,9 @@ public final class ColgramAiContextEngine {
         if (!effectiveWeb.isEmpty()) {
             sb.append("### Данные из сети:\n").append(effectiveWeb).append("\n\n");
         }
+        if (!docBlock.isEmpty()) {
+            sb.append("### Прикреплённые документы:\n").append(docBlock).append("\n\n");
+        }
         if (attachedFramesCount > 0) {
             sb.append("### Вложение: ");
             if (videoGridMode) {
@@ -900,7 +926,8 @@ public final class ColgramAiContextEngine {
             }
         }
         sb.append(cleanQuery);
-        return sb.toString().trim();
+        String result = sb.toString().trim();
+        return attachedFramesCount > 0 ? sanitizeMediaMarker(result) : result;
     }
 
     public static String stripThinkingTags(String raw, boolean keepThinking) {

@@ -78,7 +78,12 @@ public class ColgramBotSync {
                 TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueCapacity),
                 r -> {
-                    Thread t = new Thread(r, threadPrefix + seq.getAndIncrement());
+                    Thread t = new Thread(() -> {
+                        try {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                        } catch (Throwable ignored) {}
+                        r.run();
+                    }, threadPrefix + seq.getAndIncrement());
                     t.setDaemon(true);
                     return t;
                 },
@@ -410,7 +415,12 @@ public class ColgramBotSync {
                     0, 96, 30L, java.util.concurrent.TimeUnit.SECONDS,
                     new java.util.concurrent.SynchronousQueue<>(),
                     r -> {
-                        Thread t = new Thread(r, "colgram-ipv4-proxy-conn");
+                        Thread t = new Thread(() -> {
+                            try {
+                                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                            } catch (Throwable ignored) {}
+                            r.run();
+                        }, "colgram-ipv4-proxy-conn");
                         t.setDaemon(true);
                         t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "ipv4 proxy err: " + ex));
                         return t;
@@ -427,7 +437,12 @@ public class ColgramBotSync {
                 java.net.ServerSocket ss = new java.net.ServerSocket(0, 64,
                         java.net.InetAddress.getByName("127.0.0.1"));
                 final int port = ss.getLocalPort();
-                Thread t = new Thread(() -> colgramIpv4ProxyLoop(ss), "colgram-ipv4-proxy");
+                Thread t = new Thread(() -> {
+                    try {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    } catch (Throwable ignored) {}
+                    colgramIpv4ProxyLoop(ss);
+                }, "colgram-ipv4-proxy");
                 t.setDaemon(true);
                 t.start();
                 colgramIpv4ProxyPort = port;
@@ -1560,6 +1575,9 @@ public class ColgramBotSync {
         try {
             final Context appContext = context.getApplicationContext();
             Thread poller = new Thread(() -> {
+                try {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
                     Log.i(TAG, "Starting bot updates poller for account " + account);
 
                 String token = getBotToken(appContext, account);
@@ -4278,7 +4296,12 @@ public class ColgramBotSync {
 
     private static void hydrateExistingBotPhotosOnceAsync(final Context appContext, final int account) {
         if (appContext == null || !hydratedBotMediaAccounts.add(account)) return;
-        Thread t = new Thread(() -> hydrateExistingBotPhotos(appContext, account), "colgram-bot-media-hydrate-" + account);
+        Thread t = new Thread(() -> {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (Throwable ignored) {}
+            hydrateExistingBotPhotos(appContext, account);
+        }, "colgram-bot-media-hydrate-" + account);
         t.setDaemon(true);
         t.start();
     }

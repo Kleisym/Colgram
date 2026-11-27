@@ -8527,17 +8527,39 @@ def inject_reliability_and_backup_patches(repo_path):
 
     user_cfg = os.path.join(tg_msg, "UserConfig.java")
     if os.path.exists(user_cfg):
+        def _patch_user_cfg_backup(content):
+            eol = "\r\n" if "\r\n" in content else "\n"
+            norm = content.replace("\r\n", "\n")
+            new_block = (
+                "                    editor.apply();\n"
+                "                    if (withFile && currentUser != null && ApplicationLoader.applicationContext != null) {\n"
+                "                        try {\n"
+                "                            org.colgram.core.ColgramPersistentBackup.scheduleAutoBackup(ApplicationLoader.applicationContext);\n"
+                "                        } catch (Throwable ignored) {}\n"
+                "                    }\n"
+                "                } catch (Exception e) {"
+            )
+            if new_block in norm:
+                return CONVERGED
+            for old_block in (
+                "                    editor.apply();\n"
+                "                    if (currentUser != null && ApplicationLoader.applicationContext != null) {\n"
+                "                        try {\n"
+                "                            org.colgram.core.ColgramPersistentBackup.scheduleAutoBackup(ApplicationLoader.applicationContext);\n"
+                "                        } catch (Throwable ignored) {}\n"
+                "                    }\n"
+                "                } catch (Exception e) {",
+                "                    editor.apply();\n"
+                "                } catch (Exception e) {",
+            ):
+                if old_block in norm:
+                    return norm.replace(old_block, new_block, 1).replace("\n", eol)
+            return content
+
         patch_file(
             user_cfg,
-            "                    editor.apply();\n"
-            "                } catch (Exception e) {",
-            "                    editor.apply();\n"
-            "                    if (currentUser != null && ApplicationLoader.applicationContext != null) {\n"
-            "                        try {\n"
-            "                            org.colgram.core.ColgramPersistentBackup.scheduleAutoBackup(ApplicationLoader.applicationContext);\n"
-            "                        } catch (Throwable ignored) {}\n"
-            "                    }\n"
-            "                } catch (Exception e) {",
+            _patch_user_cfg_backup,
+            "if (withFile && currentUser != null && ApplicationLoader.applicationContext != null)",
             "UserConfig.saveConfig persistent auto-backup trigger",
         )
 
@@ -13770,6 +13792,7 @@ _PERFORMANCE_PATCH_SPECS = [
             '        }\n'
             '\n'
             '        private boolean colgramBlurredLastFrame;\n'
+            '        private long colgramLastBlurInvalidateMs;\n'
             '\n'
             '        @Override\n'
             '        protected void dispatchDraw(Canvas canvas) {\n'
@@ -13777,9 +13800,14 @@ _PERFORMANCE_PATCH_SPECS = [
             '            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n'
             '                boolean blurActive = SharedConfig.chatBlurEnabled()\n'
             '                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n'
-            '                if (blurActive || colgramBlurredLastFrame) {\n'
+            '                boolean stateChanged = blurActive != colgramBlurredLastFrame;\n'
+            '                if (stateChanged || blurActive) {\n'
             '                    colgramBlurredLastFrame = blurActive;\n'
-            '                    blur3_InvalidateBlur();\n'
+            '                    long nowMs = android.os.SystemClock.uptimeMillis();\n'
+            '                    if (stateChanged || nowMs - colgramLastBlurInvalidateMs >= 16L) {\n'
+            '                        colgramLastBlurInvalidateMs = nowMs;\n'
+            '                        blur3_InvalidateBlur();\n'
+            '                    }\n'
             '                }\n'
             '            }\n'
             '\n'
@@ -13859,6 +13887,23 @@ _PERFORMANCE_PATCH_SPECS = [
         ),
     ),
     (
+        'TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java',
+        'ChatActivity.java perf #1',
+        (
+            '            if (obj != null) {\n'
+            '                checkChecksHint();\n'
+            '        if (ColgramGlobalOrbController.getInstance() != null) {\n'
+            '            ColgramGlobalOrbController.getInstance().scheduleRelayout();\n'
+            '        }\n'
+            '                if (obj.shouldRemoveVideoEditedInfo) {\n'
+        ),
+        (
+            '            if (obj != null) {\n'
+            '                checkChecksHint();\n'
+            '                if (obj.shouldRemoveVideoEditedInfo) {\n'
+        ),
+    ),
+    (
         'TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java',
         'DialogsActivity.java perf #5',
         (
@@ -13877,6 +13922,208 @@ _PERFORMANCE_PATCH_SPECS = [
             '        if (ColgramGlobalOrbController.getInstance() != null) {\n'
             '            ColgramGlobalOrbController.getInstance().scheduleRelayout();\n'
             '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java',
+        'DialogsActivity.java perf #1b',
+        (
+            '        @Override\n'
+            '        public void invalidateBlur() {\n'
+            '            super.invalidateBlur();\n'
+            '            blur3_InvalidateBlur();\n'
+            '        }\n'
+        ),
+        (
+            '        @Override\n'
+            '        public void invalidateBlur() {\n'
+            '            super.invalidateBlur();\n'
+            '            colgramLastBlurInvalidateMs = 0L;\n'
+            '            blur3_InvalidateBlur();\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java',
+        'DialogCell.java perf #16',
+        (
+            '    private int colgramLastCheckTint;\n'
+            '    private android.graphics.PorterDuffColorFilter colgramLastCheckFilter;\n'
+            '    private int colgramLastReadCheckTint;\n'
+            '    private android.graphics.PorterDuffColorFilter colgramLastReadCheckFilter;\n'
+            '\n'
+            '    private void drawCheckStatus(Canvas canvas, boolean drawClock, boolean drawCheck1, boolean drawCheck2, boolean moveCheck,  float alpha) {\n'
+            '        if (alpha == 0 && !moveCheck) {\n'
+            '            return;\n'
+            '        }\n'
+            '        if (org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled()\n'
+            '                || org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n'
+            '            if (drawClock && Theme.dialogs_clockDrawable != null) {\n'
+            '                Theme.setDrawableColor(Theme.dialogs_clockDrawable, Theme.getColor(Theme.key_chats_sentClock, resourcesProvider));\n'
+            '            } else if (drawCheck2) {\n'
+            '                if (drawCheck1) {\n'
+            '                    int readColor = Theme.getColor(Theme.key_chats_sentReadCheck, resourcesProvider);\n'
+            '                    if (colgramLastReadCheckFilter == null || colgramLastReadCheckTint != readColor) {\n'
+            '                        colgramLastReadCheckTint = readColor;\n'
+            '                        colgramLastReadCheckFilter = new android.graphics.PorterDuffColorFilter(readColor, android.graphics.PorterDuff.Mode.MULTIPLY);\n'
+            '                    }\n'
+            '                    if (Theme.dialogs_halfCheckDrawable != null) {\n'
+            '                        Theme.dialogs_halfCheckDrawable.setColorFilter(colgramLastReadCheckFilter);\n'
+            '                    }\n'
+            '                    if (Theme.dialogs_checkReadDrawable != null) {\n'
+            '                        Theme.dialogs_checkReadDrawable.setColorFilter(colgramLastReadCheckFilter);\n'
+            '                    }\n'
+            '                } else {\n'
+            '                    int sentColor = Theme.getColor(Theme.key_chats_sentCheck, resourcesProvider);\n'
+            '                    if (colgramLastCheckFilter == null || colgramLastCheckTint != sentColor) {\n'
+            '                        colgramLastCheckTint = sentColor;\n'
+            '                        colgramLastCheckFilter = new android.graphics.PorterDuffColorFilter(sentColor, android.graphics.PorterDuff.Mode.MULTIPLY);\n'
+            '                    }\n'
+            '                    if (Theme.dialogs_checkDrawable != null) {\n'
+            '                        Theme.dialogs_checkDrawable.setColorFilter(colgramLastCheckFilter);\n'
+            '                    }\n'
+            '                }\n'
+            '            }\n'
+            '        }\n'
+        ),
+        (
+            '    private static final android.graphics.PorterDuffColorFilter COLGRAM_SHARED_WHITE_CHECK_FILTER =\n'
+            '            new android.graphics.PorterDuffColorFilter(0xffffffff, android.graphics.PorterDuff.Mode.MULTIPLY);\n'
+            '    private static volatile int colgramSharedCheckTint;\n'
+            '    private static volatile android.graphics.PorterDuffColorFilter colgramSharedCheckFilter;\n'
+            '    private static volatile int colgramSharedReadCheckTint;\n'
+            '    private static volatile android.graphics.PorterDuffColorFilter colgramSharedReadCheckFilter;\n'
+            '\n'
+            '    private static android.graphics.PorterDuffColorFilter colgramResolveCheckFilter(int color) {\n'
+            '        if (color == 0xffffffff) {\n'
+            '            return COLGRAM_SHARED_WHITE_CHECK_FILTER;\n'
+            '        }\n'
+            '        android.graphics.PorterDuffColorFilter cached = colgramSharedCheckFilter;\n'
+            '        if (cached == null || colgramSharedCheckTint != color) {\n'
+            '            cached = new android.graphics.PorterDuffColorFilter(color, android.graphics.PorterDuff.Mode.MULTIPLY);\n'
+            '            colgramSharedCheckTint = color;\n'
+            '            colgramSharedCheckFilter = cached;\n'
+            '        }\n'
+            '        return cached;\n'
+            '    }\n'
+            '\n'
+            '    private static android.graphics.PorterDuffColorFilter colgramResolveReadCheckFilter(int color) {\n'
+            '        if (color == 0xffffffff) {\n'
+            '            return COLGRAM_SHARED_WHITE_CHECK_FILTER;\n'
+            '        }\n'
+            '        android.graphics.PorterDuffColorFilter cached = colgramSharedReadCheckFilter;\n'
+            '        if (cached == null || colgramSharedReadCheckTint != color) {\n'
+            '            cached = new android.graphics.PorterDuffColorFilter(color, android.graphics.PorterDuff.Mode.MULTIPLY);\n'
+            '            colgramSharedReadCheckTint = color;\n'
+            '            colgramSharedReadCheckFilter = cached;\n'
+            '        }\n'
+            '        return cached;\n'
+            '    }\n'
+            '\n'
+            '    private static void colgramApplyCheckFilter(android.graphics.drawable.Drawable drawable,\n'
+            '                                                android.graphics.PorterDuffColorFilter filter) {\n'
+            '        if (drawable != null && drawable.getColorFilter() != filter) {\n'
+            '            drawable.setColorFilter(filter);\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    private void drawCheckStatus(Canvas canvas, boolean drawClock, boolean drawCheck1, boolean drawCheck2, boolean moveCheck,  float alpha) {\n'
+            '        if (alpha == 0 && !moveCheck) {\n'
+            '            return;\n'
+            '        }\n'
+            '        if (org.colgram.core.ColgramDesignConfig.isSmartColorContrastEnabled()\n'
+            '                || org.colgram.core.ColgramConfig.isCyberThemeEnabled()) {\n'
+            '            if (drawClock && Theme.dialogs_clockDrawable != null) {\n'
+            '                Theme.setDrawableColor(Theme.dialogs_clockDrawable, Theme.getColor(Theme.key_chats_sentClock, resourcesProvider));\n'
+            '            } else if (drawCheck2) {\n'
+            '                if (drawCheck1) {\n'
+            '                    android.graphics.PorterDuffColorFilter readFilter = colgramResolveReadCheckFilter(\n'
+            '                            Theme.getColor(Theme.key_chats_sentReadCheck, resourcesProvider));\n'
+            '                    colgramApplyCheckFilter(Theme.dialogs_halfCheckDrawable, readFilter);\n'
+            '                    colgramApplyCheckFilter(Theme.dialogs_checkReadDrawable, readFilter);\n'
+            '                } else {\n'
+            '                    android.graphics.PorterDuffColorFilter sentFilter = colgramResolveCheckFilter(\n'
+            '                            Theme.getColor(Theme.key_chats_sentCheck, resourcesProvider));\n'
+            '                    colgramApplyCheckFilter(Theme.dialogs_checkDrawable, sentFilter);\n'
+            '                }\n'
+            '            }\n'
+            '        }\n'
+        ),
+    ),
+    (
+        'TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java',
+        'ApplicationLoader.java perf #1 (defer BootJobService and Updater)',
+        (
+            '        try {\n'
+            '            if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {\n'
+            '                org.colgram.core.ColgramBootJobService.schedule(this);\n'
+            '            }\n'
+            '        } catch (Throwable ignore) {\n'
+            '\n'
+            '        }\n'
+            '\n'
+            '        // Colgram: throttled background OTA update check (every 4 hours when auto-update is enabled)\n'
+            '        try {\n'
+            '            long nowMs = System.currentTimeMillis();\n'
+            '            if (nowMs - org.colgram.core.ColgramConfig.getLastAutoUpdateCheckMs() > 4L * 60L * 60L * 1000L) {\n'
+            '                org.colgram.core.ColgramUpdater.checkForUpdatesIfEnabled(BuildVars.BUILD_VERSION_STRING, new org.colgram.core.ColgramUpdater.UpdateCheckCallback() {\n'
+            '                    @Override\n'
+            '                    public void onUpdateAvailable(String newVersion, String releaseNotes, String downloadUrl) {\n'
+            '                        org.colgram.core.ColgramConfig.setLastAutoUpdateCheckMs(System.currentTimeMillis());\n'
+            '                        FileLog.d("Colgram OTA update available: " + newVersion + " -> " + downloadUrl);\n'
+            '                        AndroidUtilities.runOnUIThread(() -> {\n'
+            '                            if (org.telegram.ui.LaunchActivity.instance != null) {\n'
+            '                                org.telegram.ui.LaunchActivity.instance.checkPendingColgramOtaUpdate();\n'
+            '                            }\n'
+            '                        });\n'
+            '                    }\n'
+            '                    @Override\n'
+            '                    public void onUpToDate() {\n'
+            '                        org.colgram.core.ColgramConfig.setLastAutoUpdateCheckMs(System.currentTimeMillis());\n'
+            '                    }\n'
+            '                    @Override\n'
+            '                    public void onError(String error) {}\n'
+            '                });\n'
+            '            }\n'
+            '        } catch (Throwable ignore) {\n'
+            '\n'
+            '        }\n'
+        ),
+        (
+            '        org.colgram.core.ColgramOptimizer.scheduleAfterStartup(() -> {\n'
+            '            try {\n'
+            '                if (org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled()) {\n'
+            '                    org.colgram.core.ColgramBootJobService.schedule(ApplicationLoader.this);\n'
+            '                }\n'
+            '            } catch (Throwable ignore) {\n'
+            '            }\n'
+            '\n'
+            '            // Colgram: throttled background OTA update check (every 4 hours when auto-update is enabled)\n'
+            '            try {\n'
+            '                long nowMs = System.currentTimeMillis();\n'
+            '                if (nowMs - org.colgram.core.ColgramConfig.getLastAutoUpdateCheckMs() > 4L * 60L * 60L * 1000L) {\n'
+            '                    org.colgram.core.ColgramUpdater.checkForUpdatesIfEnabled(BuildVars.BUILD_VERSION_STRING, new org.colgram.core.ColgramUpdater.UpdateCheckCallback() {\n'
+            '                        @Override\n'
+            '                        public void onUpdateAvailable(String newVersion, String releaseNotes, String downloadUrl) {\n'
+            '                            org.colgram.core.ColgramConfig.setLastAutoUpdateCheckMs(System.currentTimeMillis());\n'
+            '                            FileLog.d("Colgram OTA update available: " + newVersion + " -> " + downloadUrl);\n'
+            '                            AndroidUtilities.runOnUIThread(() -> {\n'
+            '                                if (org.telegram.ui.LaunchActivity.instance != null) {\n'
+            '                                    org.telegram.ui.LaunchActivity.instance.checkPendingColgramOtaUpdate();\n'
+            '                                }\n'
+            '                            });\n'
+            '                        }\n'
+            '                        @Override\n'
+            '                        public void onUpToDate() {\n'
+            '                            org.colgram.core.ColgramConfig.setLastAutoUpdateCheckMs(System.currentTimeMillis());\n'
+            '                        }\n'
+            '                        @Override\n'
+            '                        public void onError(String error) {}\n'
+            '                    });\n'
+            '                }\n'
+            '            } catch (Throwable ignore) {\n'
+            '            }\n'
+            '        });\n'
         ),
     ),
 ]
@@ -14035,6 +14282,10 @@ _SUPERSEDED_PERF_MARKERS = {
     "ChatMessageCell.java perf #1": "colgramConsumePendingDeleteAnim(",
     "ChatMessageCell.java perf #2": "colgramHasPendingDeleteAnim(",
     "ChatMessageCell.java perf #3": "colgramConsumePendingDeleteAnim(deleteDialogId",
+    "DispatchQueuePriority.java perf #1": "android.os.Process.THREAD_PRIORITY_BACKGROUND",
+    "ImageLoader.java perf #12": "if (memoryClass >= 512)",
+    "Theme.java perf #11": "if (provider == null || provider.colgramDelegatesToGlobalTheme())",
+    "Theme.java perf #12": "boolean colgramNeedsGuard = !provider.colgramReturnsGuardedColor();",
 }
 
 _SUPERSEDED_NETWORK_MARKERS = {
@@ -14047,6 +14298,8 @@ _SUPERSEDED_TURBO_MARKERS = {
     "ImageLoader.java turbo #3": "colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);",
     "ImageLoader.java turbo #4": "img.runningTask = colgramLottieOutQueue.postRunnable(img.cacheTask, img.priority);",
     "ImageLoader.java turbo #5": "colgramLottieOutQueue.postRunnable(task, task.cacheImage.priority);",
+    "ConnectionsManager.java turbo #4": "colgramNeedConnCheck",
+    "SendMessagesHelper.java turbo #27": "colgramIsRawDisconnected()",
 }
 
 _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
@@ -14056,6 +14309,7 @@ _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
     "AlertsCreator.java wire colgramDeleteMessages in deleteAction": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
     "DeleteMessagesBottomSheet.java wire colgramDeleteMessages in proceed": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
     "AlertsCreator.java permanent local delete checkbox UI": 'purgeCell.setText("Удалить полностью у себя",',
+    "MessagesController.java alreadyDeletedPurge full DB purge": "if (colgramHasPositivePurge)",
 }
 
 
@@ -14069,6 +14323,46 @@ def _has_superseded_marker(filepath, label, marker_map):
 
 def inject_performance_patches(repo_path):
     """Apply and converge performance, caching, and memory-safety hunks in Telegram-Src."""
+    dialogs_path = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "DialogsActivity.java")
+    if os.path.exists(dialogs_path):
+        _patch_file_eol(
+            dialogs_path,
+            (
+                "        private boolean colgramBlurredLastFrame;\n\n"
+                "        @Override\n"
+                "        protected void dispatchDraw(Canvas canvas) {\n"
+                "            Theme.colgramSyncDrawableTintsIfNeeded();\n"
+                "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
+                "                boolean blurActive = SharedConfig.chatBlurEnabled()\n"
+                "                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n"
+                "                if (blurActive || colgramBlurredLastFrame) {\n"
+                "                    colgramBlurredLastFrame = blurActive;\n"
+                "                    blur3_InvalidateBlur();\n"
+                "                }\n"
+                "            }\n"
+            ),
+            (
+                "        private boolean colgramBlurredLastFrame;\n"
+                "        private long colgramLastBlurInvalidateMs;\n\n"
+                "        @Override\n"
+                "        protected void dispatchDraw(Canvas canvas) {\n"
+                "            Theme.colgramSyncDrawableTintsIfNeeded();\n"
+                "            if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {\n"
+                "                boolean blurActive = SharedConfig.chatBlurEnabled()\n"
+                "                        && BlurredBackgroundProviderImpl.checkBlurEnabled(currentAccount, resourceProvider);\n"
+                "                boolean stateChanged = blurActive != colgramBlurredLastFrame;\n"
+                "                if (stateChanged || blurActive) {\n"
+                "                    colgramBlurredLastFrame = blurActive;\n"
+                "                    long nowMs = android.os.SystemClock.uptimeMillis();\n"
+                "                    if (stateChanged || nowMs - colgramLastBlurInvalidateMs >= 16L) {\n"
+                "                        colgramLastBlurInvalidateMs = nowMs;\n"
+                "                        blur3_InvalidateBlur();\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+            ),
+            "DialogsActivity.java perf #1 (upgrade blur coalesce)",
+        )
     for rel_path, label, bypass_marker, target, replacement in _PRE_BYPASS_BG_SPECS:
         full_path = os.path.join(repo_path, *rel_path.split("/"))
         if os.path.exists(full_path):

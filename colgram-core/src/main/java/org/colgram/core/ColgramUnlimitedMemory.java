@@ -160,10 +160,10 @@ public final class ColgramUnlimitedMemory {
     public static void restore(Context context) {
         if (context == null) return;
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
-        try {
-            ColgramStorageIndex.init(appCtx.getFilesDir());
-        } catch (Throwable ignored) {}
         ColgramOptimizer.scheduleAfterStartup(() -> {
+            try {
+                ColgramStorageIndex.init(appCtx.getFilesDir());
+            } catch (Throwable ignored) {}
             if (ColgramConfig.isUnlimitedMemoryEnabled()) {
                 apply(appCtx, true);
                 if (ColgramConfig.isAutoCompressStorageEnabled()) {

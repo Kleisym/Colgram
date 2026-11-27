@@ -123,7 +123,10 @@ public final class ColgramDcRemap {
                 ServerSocket ss = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
                 boundPort = ss.getLocalPort();
                 listener = ss;
-                Thread t = new Thread(ColgramDcRemap::acceptLoop, "colgram-dc-remap");
+                Thread t = new Thread(() -> {
+                    ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    acceptLoop();
+                }, "colgram-dc-remap");
                 t.setDaemon(true);
                 t.start();
                 Log.i(TAG, "DC remap listening on 127.0.0.1:" + boundPort);
@@ -178,7 +181,10 @@ public final class ColgramDcRemap {
                     0, 256, 30L, java.util.concurrent.TimeUnit.SECONDS,
                     new java.util.concurrent.SynchronousQueue<>(),
                     r -> {
-                        Thread t = new Thread(r, "colgram-dc-remap-worker");
+                        Thread t = new Thread(() -> {
+                            ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                            r.run();
+                        }, "colgram-dc-remap-worker");
                         t.setDaemon(true);
                         t.setUncaughtExceptionHandler((th, ex) -> Log.w(TAG, "dc remap worker err: " + ex));
                         return t;
@@ -422,6 +428,7 @@ public final class ColgramDcRemap {
             control.setSoTimeout(0);
             final DatagramSocket bound = relay;
             Thread controlWatch = new Thread(() -> {
+                ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
                 try {
                     byte[] sink = new byte[64];
                     while (control.getInputStream().read(sink) >= 0) {
@@ -553,6 +560,7 @@ public final class ColgramDcRemap {
                                             final ConcurrentHashMap<String, DatagramSocket> upstreams,
                                             final String key) {
         Thread reader = new Thread(() -> {
+            ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             byte[] buffer = new byte[UDP_BUFFER_BYTES];
             try {
                 while (!upstream.isClosed() && !client.isClosed()) {
@@ -690,6 +698,7 @@ public final class ColgramDcRemap {
                 new java.util.concurrent.CountDownLatch(1);
         for (final String candidate : candidates) {
             Thread t = new Thread(() -> {
+                ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_BACKGROUND);
                 if (winner.get() != null) return;
                 if (probe(port, candidate) && winner.compareAndSet(null, candidate)) {
                     answered.countDown();

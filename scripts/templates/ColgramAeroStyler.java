@@ -381,6 +381,33 @@ public final class ColgramAeroStyler {
     private static final RectF ROW_RECT = new RectF();
     private static final RectF ROW_BAR_RECT = new RectF();
 
+    // Cached geometry & state palette for DialogCell rows keyed by (designRev, dark, cyber, density)
+    private static long cachedRowRev = Long.MIN_VALUE;
+    private static boolean cachedRowDark;
+    private static boolean cachedRowCyber;
+    private static float cachedRowDensity = -1f;
+    private static int cachedRowCardStyle;
+    private static float cachedRowRadius;
+    private static float cachedRowPadX;
+    private static float cachedRowPadY;
+    private static float cachedRowStrokeW;
+    private static float cachedRowBarInsetTop;
+    private static float cachedRowBarThin;
+    private static float cachedRowBarThick;
+    private static float cachedRowBarRadius;
+    private static float cachedRowNeonMul;
+    private static int cachedRowBgSel;
+    private static int cachedRowStrokeSel;
+    private static int cachedRowBgNeon;
+    private static int cachedRowStrokeNeonPinned;
+    private static int cachedRowStrokeNeonNormal;
+    private static int cachedRowBgPinned;
+    private static int cachedRowStrokePinned;
+    private static int cachedRowBgNormal;
+    private static int cachedRowStrokeNormal;
+    private static int cachedRowAccentActive;
+    private static int cachedRowAccentIdle;
+
     // Cached immutable origin-anchored badge shader + Paint (0 local-matrix mutations & 0 allocations per DialogCell)
     private static LinearGradient cachedBadgeShader;
     private static boolean cachedBadgeCyber;
@@ -491,6 +518,56 @@ public final class ColgramAeroStyler {
         return gd;
     }
 
+    private static void ensureDialogRowCache(boolean dark) {
+        long rev = org.colgram.core.ColgramDesignConfig.getRevision();
+        boolean cyber = dark && ColgramConfig.isCyberThemeEnabled();
+        float density = AndroidUtilities.density;
+        if (cachedRowRev == rev && cachedRowDark == dark && cachedRowCyber == cyber && cachedRowDensity == density) {
+            return;
+        }
+        cachedRowRev = rev;
+        cachedRowDark = dark;
+        cachedRowCyber = cyber;
+        cachedRowDensity = density;
+
+        int cardStyle = org.colgram.core.ColgramDesignConfig.getCardStyle();
+        cachedRowCardStyle = cardStyle;
+        int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
+        int accentRgb = (customAccent != 0 ? customAccent : (cyber ? 0xFFFF3344 : 0xFFE11D48)) & 0x00FFFFFF;
+        float neonMul = org.colgram.core.ColgramDesignConfig.getNeonMultiplier();
+        cachedRowNeonMul = neonMul;
+        cachedRowRadius = dp(cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_SOFT_PILL
+                ? Math.max(18, org.colgram.core.ColgramDesignConfig.getCornerRadiusDp())
+                : org.colgram.core.ColgramDesignConfig.getCornerRadiusDp());
+        cachedRowPadX = dp(cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_SOFT_PILL ? 10 : 8);
+        cachedRowPadY = dp(2.5f);
+        cachedRowStrokeW = Math.max(1f, AndroidUtilities.dpf2(
+                cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_NEON_BORDER ? 1.15f : 0.75f));
+        cachedRowBarInsetTop = dp(14);
+        cachedRowBarThin = dp(1.5f);
+        cachedRowBarThick = dp(4f);
+        cachedRowBarRadius = dp(1.5f);
+
+        cachedRowBgSel = ((dark ? 0x24 : 0x16) << 24) | accentRgb;
+        cachedRowStrokeSel = (Math.min(255, Math.round((dark ? 0x62 : 0x48) * Math.max(0.6f, neonMul))) << 24) | accentRgb;
+
+        cachedRowBgNeon = dark ? 0x0AFFFFFF : 0x050F172A;
+        cachedRowStrokeNeonPinned = (Math.min(255, Math.round(0x5A * Math.max(0.4f, neonMul))) << 24) | accentRgb;
+        cachedRowStrokeNeonNormal = (Math.min(255, Math.round(0x36 * Math.max(0.4f, neonMul))) << 24) | accentRgb;
+
+        cachedRowBgPinned = (cyber || customAccent != 0)
+                ? (((dark ? 0x11 : 0x09) << 24) | accentRgb)
+                : (dark ? 0x0FFFFFFF : 0x060F172A);
+        int aPin = Math.min(255, Math.round((dark ? 0x28 : 0x1A) * Math.max(0.35f, neonMul)));
+        cachedRowStrokePinned = (cyber || customAccent != 0) ? ((aPin << 24) | accentRgb) : (dark ? 0x18FFFFFF : 0x120F172A);
+
+        cachedRowBgNormal = dark ? 0x07FFFFFF : 0x00000000;
+        cachedRowStrokeNormal = dark ? 0x0EFFFFFF : 0x0A0F172A;
+
+        cachedRowAccentActive = 0xFF000000 | accentRgb;
+        cachedRowAccentIdle = dark ? 0x8894A3B8 : 0x8864748B;
+    }
+
     /**
      * Allocation-free, RTL-aware, Cyber-aware card surface & crisp edge indicator for DialogCell rows.
      */
@@ -504,65 +581,53 @@ public final class ColgramAeroStyler {
             boolean hasUnread
     ) {
         if (width <= 0 || height <= 0) return;
-        int cardStyle = org.colgram.core.ColgramDesignConfig.getCardStyle();
+        ensureDialogRowCache(dark);
+        int cardStyle = cachedRowCardStyle;
         if (cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_CLASSIC_FLAT && !isSelected) {
             return;
         }
-        boolean cyber = dark && ColgramConfig.isCyberThemeEnabled();
-        int customAccent = org.colgram.core.ColgramDesignConfig.getAccentColor();
-        int accentRgb = (customAccent != 0 ? customAccent : (cyber ? 0xFFFF3344 : 0xFFE11D48)) & 0x00FFFFFF;
-        float neonMul = org.colgram.core.ColgramDesignConfig.getNeonMultiplier();
-        float radius = dp(cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_SOFT_PILL
-                ? Math.max(18, org.colgram.core.ColgramDesignConfig.getCornerRadiusDp())
-                : org.colgram.core.ColgramDesignConfig.getCornerRadiusDp());
-
-        float padX = dp(cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_SOFT_PILL ? 10 : 8);
-        float padY = dp(2.5f);
+        float padX = cachedRowPadX;
+        float padY = cachedRowPadY;
+        float radius = cachedRowRadius;
         ROW_RECT.set(padX, padY, width - padX, height - padY);
 
         int cardBg;
         int strokeCol;
         if (isSelected) {
-            cardBg = ((dark ? 0x24 : 0x16) << 24) | accentRgb;
-            strokeCol = (Math.min(255, Math.round((dark ? 0x62 : 0x48) * Math.max(0.6f, neonMul))) << 24) | accentRgb;
+            cardBg = cachedRowBgSel;
+            strokeCol = cachedRowStrokeSel;
         } else if (cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_NEON_BORDER) {
-            cardBg = dark ? 0x0AFFFFFF : 0x050F172A;
-            int a = Math.min(255, Math.round((isPinned ? 0x5A : 0x36) * Math.max(0.4f, neonMul)));
-            strokeCol = (a << 24) | accentRgb;
+            cardBg = cachedRowBgNeon;
+            strokeCol = isPinned ? cachedRowStrokeNeonPinned : cachedRowStrokeNeonNormal;
         } else if (isPinned) {
-            cardBg = (cyber || customAccent != 0)
-                    ? (((dark ? 0x11 : 0x09) << 24) | accentRgb)
-                    : (dark ? 0x0FFFFFFF : 0x060F172A);
-            int a = Math.min(255, Math.round((dark ? 0x28 : 0x1A) * Math.max(0.35f, neonMul)));
-            strokeCol = (cyber || customAccent != 0) ? ((a << 24) | accentRgb) : (dark ? 0x18FFFFFF : 0x120F172A);
+            cardBg = cachedRowBgPinned;
+            strokeCol = cachedRowStrokePinned;
         } else {
-            cardBg = dark ? 0x07FFFFFF : 0x00000000;
-            strokeCol = dark ? 0x0EFFFFFF : 0x0A0F172A;
+            cardBg = cachedRowBgNormal;
+            strokeCol = cachedRowStrokeNormal;
         }
 
         if (cardBg != 0) {
             ROW_CARD_PAINT.setColor(cardBg);
             canvas.drawRoundRect(ROW_RECT, radius, radius, ROW_CARD_PAINT);
         }
-        ROW_STROKE_PAINT.setStrokeWidth(Math.max(1f, AndroidUtilities.dpf2(
-                cardStyle == org.colgram.core.ColgramDesignConfig.CARD_STYLE_NEON_BORDER ? 1.15f : 0.75f)));
-        ROW_STROKE_PAINT.setColor(strokeCol);
-        canvas.drawRoundRect(ROW_RECT, radius, radius, ROW_STROKE_PAINT);
+        if (strokeCol != 0) {
+            ROW_STROKE_PAINT.setStrokeWidth(cachedRowStrokeW);
+            ROW_STROKE_PAINT.setColor(strokeCol);
+            canvas.drawRoundRect(ROW_RECT, radius, radius, ROW_STROKE_PAINT);
+        }
 
-        if ((isPinned || isSelected || hasUnread) && neonMul > 0f) {
-            float barTop = padY + dp(14);
-            float barBot = height - padY - dp(14);
+        if ((isPinned || isSelected || hasUnread) && cachedRowNeonMul > 0f) {
+            float barTop = padY + cachedRowBarInsetTop;
+            float barBot = height - padY - cachedRowBarInsetTop;
             if (barBot > barTop) {
                 if (LocaleController.isRTL) {
-                    ROW_BAR_RECT.set(width - padX - dp(4f), barTop, width - padX - dp(1.5f), barBot);
+                    ROW_BAR_RECT.set(width - padX - cachedRowBarThick, barTop, width - padX - cachedRowBarThin, barBot);
                 } else {
-                    ROW_BAR_RECT.set(padX + dp(1.5f), barTop, padX + dp(4f), barBot);
+                    ROW_BAR_RECT.set(padX + cachedRowBarThin, barTop, padX + cachedRowBarThick, barBot);
                 }
-                int accentColor;
-                if (isSelected || hasUnread) accentColor = 0xFF000000 | accentRgb;
-                else accentColor = dark ? 0x8894A3B8 : 0x8864748B;
-                ROW_ACCENT_PAINT.setColor(accentColor);
-                canvas.drawRoundRect(ROW_BAR_RECT, dp(1.5f), dp(1.5f), ROW_ACCENT_PAINT);
+                ROW_ACCENT_PAINT.setColor((isSelected || hasUnread) ? cachedRowAccentActive : cachedRowAccentIdle);
+                canvas.drawRoundRect(ROW_BAR_RECT, cachedRowBarRadius, cachedRowBarRadius, ROW_ACCENT_PAINT);
             }
         }
     }

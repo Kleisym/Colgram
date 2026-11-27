@@ -22,7 +22,10 @@ public final class ColgramLocalTcpFront implements AutoCloseable {
             0, 192, 30L, java.util.concurrent.TimeUnit.SECONDS,
             new java.util.concurrent.SynchronousQueue<>(),
             r -> {
-                Thread t = new Thread(r, "colgram-base-pipe");
+                Thread t = new Thread(() -> {
+                    ColgramDpiBypass.setThreadPriorityQuiet(android.os.Process.THREAD_PRIORITY_LESS_FAVORABLE);
+                    r.run();
+                }, "colgram-base-pipe");
                 t.setDaemon(true);
                 t.setUncaughtExceptionHandler((th, ex) -> {});
                 return t;

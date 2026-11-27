@@ -1,10 +1,12 @@
 package org.colgram.core;
 
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.Rect;
 import android.graphics.Shader;
 import android.os.SystemClock;
 
@@ -89,6 +91,22 @@ public final class ColgramLiveWallpaper {
     private static final boolean[] cachedColaDark = {false, false};
     private static final LinearGradient[][] colaShaders = new LinearGradient[2][2];
 
+    // 0.5x offscreen Bitmap cache for static chat wallpaper overlays (timeSec == 0f)
+    private static final float STATIC_CACHE_SCALE = 0.5f;
+    private static final Rect STATIC_DST_RECT = new Rect();
+    private static final Paint STATIC_BLIT_PAINT = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private static Bitmap staticChatBitmap;
+    private static Canvas staticChatCanvas;
+    private static int staticCacheW = -1;
+    private static int staticCacheH = -1;
+    private static int staticCacheScaledW = -1;
+    private static int staticCacheScaledH = -1;
+    private static int staticCacheStyle = -1;
+    private static int staticCacheTint = 0;
+    private static boolean staticCacheDark = false;
+    private static boolean staticCacheCyber = false;
+    private static float staticCacheDensity = 0f;
+
     static {
         strokePaint.setStyle(Paint.Style.STROKE);
         strokePaint.setStrokeCap(Paint.Cap.ROUND);
@@ -126,10 +144,13 @@ public final class ColgramLiveWallpaper {
                                    boolean isDark, float timeSec, float density) {
         int style = ColgramConfig.getLiveWallpaperStyle();
         if (style == STYLE_OFF || width <= 0 || height <= 0 || canvas == null) {
+            if (style == STYLE_OFF) {
+                releaseStaticCache();
+            }
             return;
         }
         boolean isCyber = isDark && ColgramConfig.isCyberThemeEnabled();
-        drawScene(canvas, width, height, style, accentColor, isDark, isCyber, false, timeSec, Math.max(1f, density));
+        drawScene(canvas, width, height, style, accentColor, isDark, isCyber, false, timeSec, Math.max(1f, density), true);
     }
 
     /** Calm, restrained live wave backdrop behind the main chat list (DialogsActivity). */
@@ -139,12 +160,70 @@ public final class ColgramLiveWallpaper {
         if (style == STYLE_OFF || width <= 0 || height <= 0 || canvas == null) {
             return;
         }
-        drawScene(canvas, width, height, style, accentColor, isDark, isCyber, true, timeSec, Math.max(1f, density));
+        drawScene(canvas, width, height, style, accentColor, isDark, isCyber, true, timeSec, Math.max(1f, density), false);
+    }
+
+    private static void releaseStaticCache() {
+        staticChatCanvas = null;
+        if (staticChatBitmap != null) {
+            try {
+                staticChatBitmap.recycle();
+            } catch (Throwable ignored) {}
+            staticChatBitmap = null;
+        }
+        staticCacheW = -1;
+        staticCacheH = -1;
+        staticCacheScaledW = -1;
+        staticCacheScaledH = -1;
+        staticCacheStyle = -1;
+    }
+
+    private static boolean drawStaticCached(Canvas canvas, int width, int height, int style,
+                                            int accentColor, TintSnapshot snap, boolean isDark,
+                                            boolean isCyber, float d) {
+        try {
+            int sw = Math.max(1, Math.round(width * STATIC_CACHE_SCALE));
+            int sh = Math.max(1, Math.round(height * STATIC_CACHE_SCALE));
+            if (staticChatBitmap == null || staticChatBitmap.isRecycled()
+                    || staticCacheScaledW != sw || staticCacheScaledH != sh) {
+                releaseStaticCache();
+                staticChatBitmap = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888);
+                if (staticChatBitmap == null) {
+                    return false;
+                }
+                staticChatCanvas = new Canvas(staticChatBitmap);
+                staticCacheScaledW = sw;
+                staticCacheScaledH = sh;
+                staticCacheStyle = -1;
+            }
+            if (staticCacheW != width || staticCacheH != height || staticCacheStyle != style
+                    || staticCacheTint != snap.baseTint || staticCacheDark != isDark
+                    || staticCacheCyber != isCyber || staticCacheDensity != d) {
+                staticChatBitmap.eraseColor(Color.TRANSPARENT);
+                staticChatCanvas.save();
+                staticChatCanvas.scale(sw / (float) width, sh / (float) height);
+                drawScene(staticChatCanvas, width, height, style, accentColor, isDark, isCyber, false, 0f, d, false);
+                staticChatCanvas.restore();
+                staticCacheW = width;
+                staticCacheH = height;
+                staticCacheStyle = style;
+                staticCacheTint = snap.baseTint;
+                staticCacheDark = isDark;
+                staticCacheCyber = isCyber;
+                staticCacheDensity = d;
+            }
+            STATIC_DST_RECT.set(0, 0, width, height);
+            canvas.drawBitmap(staticChatBitmap, null, STATIC_DST_RECT, STATIC_BLIT_PAINT);
+            return true;
+        } catch (Throwable ignored) {
+            releaseStaticCache();
+            return false;
+        }
     }
 
     private static void drawScene(Canvas canvas, int width, int height, int style,
                                   int accentColor, boolean isDark, boolean isCyber,
-                                  boolean menuMode, float timeSec, float d) {
+                                  boolean menuMode, float timeSec, float d, boolean allowStaticCache) {
         int baseTint = resolveMonochromeBase(accentColor, isDark, isCyber);
         TintSnapshot snap = cachedTintSnapshot;
         if (snap == null || snap.baseTint != baseTint || snap.isDark != isDark || snap.isCyber != isCyber) {
@@ -153,6 +232,11 @@ public final class ColgramLiveWallpaper {
             int crestTint = isCyber ? 0xFFFF4D6A : shadeTone(baseTint, isDark ? 1.18f : 0.95f, isDark ? 0.82f : 0.95f, hsv);
             snap = new TintSnapshot(baseTint, isDark, isCyber, deepTint, crestTint);
             cachedTintSnapshot = snap;
+        }
+        if (allowStaticCache && !menuMode && timeSec == 0f) {
+            if (drawStaticCached(canvas, width, height, style, accentColor, snap, isDark, isCyber, d)) {
+                return;
+            }
         }
         int deepTint = snap.deepTint;
         int crestTint = snap.crestTint;

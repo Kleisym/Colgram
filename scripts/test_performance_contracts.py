@@ -100,11 +100,16 @@ class BypassConcurrencyAndNoSleepContractsTest(unittest.TestCase):
         self.assertIn("splitter.feedInitAndTailToSession(", ws_pipe)
         self.assertIn("splitter.feedToSession(", ws_pipe)
         self.assertIn("splitter.feedToSession(", ws_after_init)
+        self.assertIn("long wsHeadStartMs = cellularNetwork ? 0L : 25L;", dpi)
+        self.assertIn("ColgramSocks5Codec.readFully(in, 2)", dpi)
         self.assertNotIn("WS_C2S_CHUNK", dpi)
 
     def test_ws_bridge_batching_unroll_and_zero_copy_contracts(self):
         ws = read_text(CORE / "ColgramTelegramWsBridge.java")
         self.assertIn("void sendBinaryUnflushed(", ws)
+        self.assertIn("wrapBufferedOutput(", ws)
+        self.assertIn("PREWARM_TTL_MS = 38_000L;", ws)
+        self.assertIn("PREWARM_REFRESH_MS = 28_000L;", ws)
         self.assertIn("void flushOut(", ws)
         self.assertIn("private int nextMaskInt()", ws)
         self.assertIn("sink.onFrame(data, off + hdrStart, fullLen);", ws)
@@ -373,7 +378,11 @@ class TurboMessagingAndPushContractsTest(unittest.TestCase):
         prep = extract_method(sm, "private void colgramPrepareInstantSend()")
         self.assertIn("connectionsManager.getPauseTime() != 0", prep)
         self.assertIn("connectionsManager.resumeNetworkMaybe()", prep)
-        self.assertIn("connectionsManager.checkConnection()", prep)
+        if "colgramIsRawDisconnected()" in prep:
+            self.assertIn("Utilities.globalQueue.postRunnable(connectionsManager::checkConnection);", prep)
+            self.assertNotIn("connectionsManager.checkConnection()", prep)
+        else:
+            self.assertIn("connectionsManager.checkConnection()", prep)
         self.assertIn("!org.colgram.core.ColgramDpiBypass.isBound()", prep)
         self.assertIn("Utilities.globalQueue.postRunnable(org.colgram.core.ColgramDpiBypass::restartIfDead)", prep)
         self.assertNotIn("Thread.sleep", prep)
@@ -486,6 +495,8 @@ class TurboMessagingAndPushContractsTest(unittest.TestCase):
             mod.PATCH_MISSES.clear()
             for rel, label, target, replacement in mod._PERFORMANCE_PATCH_SPECS:
                 if rel in owned_rels:
+                    if mod._has_superseded_marker(str(tmp_tg / rel), label, mod._SUPERSEDED_PERF_MARKERS):
+                        continue
                     mod._patch_file_eol(str(tmp_tg / rel), target, replacement, label)
             mod.inject_network_switch_patches(str(tmp_tg))
             mod.inject_turbo_messaging_patches(str(tmp_tg))
@@ -504,6 +515,58 @@ class TurboMessagingAndPushContractsTest(unittest.TestCase):
         idx_post = start_hb.index("handler.postDelayed(this, delay);")
         self.assertLess(idx_stop, idx_post)
         self.assertIn("return;", start_hb[idx_stop:idx_post])
+
+
+class StartupSqliteAndPriorityOptimizationContractsTest(unittest.TestCase):
+    def test_core_cold_start_offload_zero_regex_and_sqlite_pragmas(self):
+        db = read_text(CORE / "ColgramDatabase.java")
+        on_cfg = extract_method(db, "public void onConfigure(SQLiteDatabase db)")
+        for pragma in (
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA cache_size=-4096",
+            "PRAGMA mmap_size=16777216",
+            "PRAGMA busy_timeout=5000",
+        ):
+            self.assertIn(pragma, on_cfg)
+        self.assertIn("THREAD_PRIORITY_BACKGROUND", extract_method(db, "private void startPreloadDeletedCachesAsync()"))
+
+        hh = read_text(CORE / "ColgramHookHandler.java")
+        init_fn = extract_method(hh, "public static void init(Context context)")
+        self.assertNotIn("\n            ColgramStorageIndex.init(", init_fn)
+        self.assertIn("ColgramOptimizer.scheduleAfterStartup(ColgramHookHandler::invokeBridgeStartScheduler);", init_fn)
+        self.assertIn("hookIoExecutor.execute(", init_fn)
+        sched_fn = extract_method(hh, "private static void invokeBridgeStartScheduler()")
+        self.assertIn("if (!ColgramConfig.isBroadcasterEnabled())", sched_fn)
+        self.assertEqual(hh.count("THREAD_PRIORITY_BACKGROUND"), 3)
+
+        um = read_text(CORE / "ColgramUnlimitedMemory.java")
+        restore_fn = extract_method(um, "public static void restore(Context context)")
+        before_sched, after_sched = restore_fn.split("ColgramOptimizer.scheduleAfterStartup(", 1)
+        self.assertNotIn("ColgramStorageIndex.init(", before_sched)
+        self.assertIn("ColgramStorageIndex.init(", after_sched)
+
+        si = read_text(CORE / "ColgramStorageIndex.java")
+        load_fn = extract_method(si, "private static void loadLocked(File file)")
+        self.assertNotIn('.split("\\t"', load_fn)
+        self.assertIn("line.indexOf('\\t')", load_fn)
+
+        sb = read_text(CORE / "ColgramStorageSandbox.java")
+        sb_init = extract_method(sb, "public static void init(Context context)")
+        before_thread, in_thread = sb_init.split("Thread t = new Thread(", 1)
+        self.assertNotIn("ensureDirWithNoMedia(", before_thread)
+        self.assertIn("ensureDirWithNoMedia(resolvedRoot);", in_thread)
+        self.assertIn("ensureDirWithNoMedia(resolvedCache);", in_thread)
+
+        fi = read_text(CORE / "ColgramFileImport.java")
+        self.assertIn("THREAD_PRIORITY_BACKGROUND", fi)
+        bs = read_text(CORE / "ColgramBotSync.java")
+        self.assertGreaterEqual(bs.count("THREAD_PRIORITY_BACKGROUND"), 5)
+
+    def test_release_publish_mentions_10x_optimizations(self):
+        rp = read_text(ROOT / "scripts/release_publish.py")
+        self.assertIn("10x Optimization Pass", rp)
+        self.assertIn("64 МБ `mmap`", rp)
 
 
 if __name__ == "__main__":

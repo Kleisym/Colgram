@@ -24,16 +24,17 @@ public class ColgramHookHandler {
             ColgramCrashGuard.install(appContext);
             ColgramOptimizer.optimizeStartup(appContext);
             ColgramConfig.init(appContext);
-            try {
-                java.io.File cacheDir = appContext.getCacheDir();
-                if (cacheDir != null) {
-                    ColgramNativeDesync.setTempDir(cacheDir.getAbsolutePath());
-                }
-                ColgramNativeDesync.runSelfTest();
-            } catch (Throwable ignored) {}
+            hookIoExecutor.execute(() -> {
+                try {
+                    java.io.File cacheDir = appContext.getCacheDir();
+                    if (cacheDir != null) {
+                        ColgramNativeDesync.setTempDir(cacheDir.getAbsolutePath());
+                    }
+                    ColgramNativeDesync.runSelfTest();
+                } catch (Throwable ignored) {}
+            });
             ColgramUnlimitedMemory.restore(appContext);
             ColgramStorageSandbox.init(appContext);
-            ColgramStorageIndex.init(appContext.getFilesDir());
             ColgramDatabase.getInstance(appContext);
             // Registers the context only. The CPython runtime itself is started
             // lazily by ColgramPythonEngine.ensureInitialized() on first real use:
@@ -51,12 +52,15 @@ public class ColgramHookHandler {
             ColgramProxyManager.activateBuiltinProxy(appContext);
             ColgramProxyDoctor.init(appContext);
             ColgramSecurityDefender.runStartupAutoHeal(appContext);
-            invokeBridgeStartScheduler();
+            ColgramOptimizer.scheduleAfterStartup(ColgramHookHandler::invokeBridgeStartScheduler);
             // WARP that was left on: re-establish it on every start (consent is already
             // granted system-wide after the first dialog; prepare() returns null then).
             if (ColgramConfig.isWarpEnabled()) {
                 final long restoreEpoch = ColgramRouteEpoch.snapshot();
                 new Thread(() -> {
+                    try {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    } catch (Throwable ignored) {}
                     if (!ColgramRouteEpoch.isCurrent(restoreEpoch) || !ColgramConfig.isWarpEnabled()) return;
                     try {
                         ColgramWarpTunnel.bringUp(appContext, restoreEpoch);
@@ -87,11 +91,41 @@ public class ColgramHookHandler {
         return hookOnSendMessage(resolveSelectedAccount(), dialogId, replyToMsgId, text, replySenderId);
     }
 
+    private static char firstNonWhitespaceChar(String text) {
+        if (text == null) return '\0';
+        int len = text.length();
+        for (int i = 0; i < len; i++) {
+            char c = text.charAt(i);
+            if (c > ' ') {
+                return c;
+            }
+        }
+        return '\0';
+    }
+
+    /** Zero-allocation fast check whether outgoing text starts with a command prefix ('.' or '/'). */
+    public static boolean startsWithCommandPrefix(String text) {
+        char first = firstNonWhitespaceChar(text);
+        return first == '.' || first == '/';
+    }
+
+    /** Zero-allocation fast check whether outgoing text starts with a dot command ('.'). */
+    public static boolean startsWithDotCommand(String text) {
+        return firstNonWhitespaceChar(text) == '.';
+    }
+
     /** Account-scoped outgoing hook so commands never cross accounts when selectedAccount changes. */
     public static boolean hookOnSendMessage(int account, long dialogId, int replyToMsgId, String text, long replySenderId) {
+        char first = firstNonWhitespaceChar(text);
+        if (first != '.' && first != '/') {
+            return false;
+        }
         int resolvedAcc = account >= 0 && account < 5 ? account : resolveSelectedAccount();
         if (invokeBridgeChatCommand(resolvedAcc, dialogId, replyToMsgId, text, replySenderId)) {
             return true;
+        }
+        if (first != '.') {
+            return false;
         }
         return ColgramPluginManager.hookOnSendMessage(resolvedAcc, dialogId, replyToMsgId, text, replySenderId);
     }
@@ -108,6 +142,9 @@ public class ColgramHookHandler {
     }
 
     private static void invokeBridgeStartScheduler() {
+        if (!ColgramConfig.isBroadcasterEnabled()) {
+            return;
+        }
         try {
             initBridgeHandles();
             if (cachedBridgeStartSchedulerMethod != null) {
@@ -117,25 +154,21 @@ public class ColgramHookHandler {
     }
 
     private static boolean invokeBridgeChatCommand(int account, long dialogId, int replyToMsgId, String text, long replySenderId) {
-        if (text == null) return false;
+        char first = firstNonWhitespaceChar(text);
+        if (first != '.' && first != '/') return false;
         String trimmed = text.trim();
-        String lower = trimmed.toLowerCase(java.util.Locale.ROOT);
-        if (lower.equals(".defender") || lower.equals(".защита") || lower.equals(".audit")
-                || lower.equals("/defender") || lower.equals("/audit") || lower.equals(".clean")) {
-            final Context ctx = appContext;
-            hookIoExecutor.execute(() -> {
-                String report = ColgramSecurityDefender.handleCommand(ctx, trimmed);
-                if (ctx != null) {
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                        try {
-                            android.widget.Toast.makeText(ctx, report, android.widget.Toast.LENGTH_LONG).show();
-                        } catch (Throwable ignored) {}
-                    });
-                }
-            });
+        if (first == '/') {
+            if ("/defender".equalsIgnoreCase(trimmed) || "/audit".equalsIgnoreCase(trimmed)) {
+                dispatchDefenderCommand(trimmed);
+                return true;
+            }
+            return false;
+        }
+        if (".defender".equalsIgnoreCase(trimmed) || ".защита".equalsIgnoreCase(trimmed)
+                || ".audit".equalsIgnoreCase(trimmed) || ".clean".equalsIgnoreCase(trimmed)) {
+            dispatchDefenderCommand(trimmed);
             return true;
         }
-        if (!trimmed.startsWith(".")) return false;
         try {
             initBridgeHandles();
             if (cachedBridgeHandleCmd5Method != null) {
@@ -150,6 +183,20 @@ public class ColgramHookHandler {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static void dispatchDefenderCommand(String trimmed) {
+        final Context ctx = appContext;
+        hookIoExecutor.execute(() -> {
+            String report = ColgramSecurityDefender.handleCommand(ctx, trimmed);
+            if (ctx != null) {
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    try {
+                        android.widget.Toast.makeText(ctx, report, android.widget.Toast.LENGTH_LONG).show();
+                    } catch (Throwable ignored) {}
+                });
+            }
+        });
     }
 
     /**
@@ -383,13 +430,23 @@ public class ColgramHookHandler {
     private static final java.util.HashMap<String, Long> colgramAutoReplyAt = new java.util.HashMap<>();
     private static final java.util.concurrent.ScheduledExecutorService hookIoExecutor =
             java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "colgram-hook-io");
+                Thread t = new Thread(() -> {
+                    try {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    } catch (Throwable ignored) {}
+                    r.run();
+                }, "colgram-hook-io");
                 t.setDaemon(true);
                 return t;
             });
     private static final java.util.concurrent.ExecutorService editHistoryExecutor =
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "colgram-edit-history");
+                Thread t = new Thread(() -> {
+                    try {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    } catch (Throwable ignored) {}
+                    r.run();
+                }, "colgram-edit-history");
                 t.setDaemon(true);
                 return t;
             });
@@ -1077,13 +1134,23 @@ public class ColgramHookHandler {
     /** Completely removes deleted tombstones and saved edit/media revisions for a message batch. */
     public static void purgeMessagesCompletely(long dialogId, java.util.Collection<Integer> messageIds) {
         if (dialogId == 0 || messageIds == null || messageIds.isEmpty()) return;
+        java.util.ArrayList<Integer> positiveIds = null;
         for (Integer id : messageIds) {
             if (id != null && id != 0) {
                 markForcePurged(dialogId, id);
+                if (id > 0) {
+                    if (positiveIds == null) {
+                        positiveIds = new java.util.ArrayList<>(messageIds.size());
+                    }
+                    positiveIds.add(id);
+                }
             }
         }
-        if (appContext != null) {
-            ColgramDatabase.getInstance(appContext).purgeMessagesCompletely(dialogId, messageIds);
+        if (positiveIds != null && appContext != null) {
+            final ColgramDatabase db = ColgramDatabase.getInstance(appContext);
+            final java.util.ArrayList<Integer> toPurge = positiveIds;
+            db.purgeMessagesMemoryOnly(dialogId, toPurge);
+            hookIoExecutor.execute(() -> db.purgeMessagesFromDiskOnly(dialogId, toPurge));
         }
     }
 

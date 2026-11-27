@@ -96,7 +96,12 @@ public final class ColgramFileImport {
     }
 
     private static final ExecutorService IMPORT_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "colgram-file-import");
+        Thread t = new Thread(() -> {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (Throwable ignored) {}
+            r.run();
+        }, "colgram-file-import");
         t.setDaemon(true);
         return t;
     });

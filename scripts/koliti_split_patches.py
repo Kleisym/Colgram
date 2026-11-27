@@ -19,8 +19,14 @@ public class ColgramAiActivity extends BaseFragment {
     public static final int REQ_PICK_MEDIA_FROM_SHEET = 6403;
     public static final int REQ_VOICE_RECOGNIZE = 6404;
     public static final int REQ_PICK_VOICE_REF = 6405;
+    public static final int REQ_CAPTURE_CAMERA_FROM_SHEET = 6406;
+    public static final int REQ_PICK_FILE_FROM_SHEET = 6407;
+    public static final int REQ_PERM_MIC_KOLITI = 6410;
+    public static final int REQ_PERM_CAMERA_KOLITI = 6412;
     public static ColgramAiSheet pendingSheetForMedia;
     public static ColgramAiSheet pendingSheetForVoice;
+    public static ColgramAiSheet pendingSheetForCameraPerm;
+    public static String pendingCameraOutputPath;
 
     @Override
     public View createView(Context context) {
@@ -32,11 +38,15 @@ public class ColgramAiActivity extends BaseFragment {
 
 _NOOP_COLGRAM_AI_SHEET = """package org.telegram.ui;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.net.Uri;
 import android.view.View;
 
 import org.telegram.ui.ActionBar.BaseFragment;
+
+import java.util.List;
 
 public final class ColgramAiSheet {
     private ColgramAiSheet() {}
@@ -47,6 +57,36 @@ public final class ColgramAiSheet {
 
     public static ColgramAiSheet showWithQuickPrompt(BaseFragment parentFragment, ChatActivity chatActivity, ColgramAiOrbView orbView, String autoPrompt) {
         return null;
+    }
+
+    public static ColgramAiSheet showWithAttachment(
+            BaseFragment parentFragment,
+            ChatActivity chatActivity,
+            ColgramAiOrbView orbView,
+            String filePath,
+            String displayName,
+            String prefillPrompt
+    ) {
+        return null;
+    }
+
+    public static ColgramAiSheet showWithAttachment(
+            BaseFragment parentFragment,
+            ChatActivity chatActivity,
+            ColgramAiOrbView orbView,
+            List<String> filePaths,
+            List<String> displayNames,
+            String prefillPrompt
+    ) {
+        return null;
+    }
+
+    public static boolean handleActivityResult(Activity act, int requestCode, int resultCode, Intent data) {
+        return false;
+    }
+
+    public static boolean handlePermissionResult(Activity act, int requestCode, String[] permissions, int[] grantResults) {
+        return false;
     }
 
     public void attachExternalMediaUri(Context ctx, Uri uri) {}
@@ -200,18 +240,6 @@ _GATE_PATCH_SPECS = [
         ),
     ),
     (
-        "TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java",
-        "LaunchActivity REQ_PICK_MEDIA_FROM_SHEET Koliti gate",
-        "        if (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET) {",
-        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET) {",
-    ),
-    (
-        "TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java",
-        "LaunchActivity REQ_VOICE_RECOGNIZE Koliti gate",
-        "        if (requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE) {",
-        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE) {",
-    ),
-    (
         "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java",
         "ChatActivity orb creation Koliti gate",
         (
@@ -243,12 +271,6 @@ _GATE_PATCH_SPECS = [
             "                    && !inPreviewMode && !isInsideContainer\n"
             "                    && org.colgram.core.ColgramAiConfig.isOrbEnabled(ApplicationLoader.applicationContext)) ? dp(54) : 0;"
         ),
-    ),
-    (
-        "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java",
-        "ChatActivity REQ_PICK_MEDIA_FROM_SHEET Koliti gate",
-        "            if (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET && data != null && data.getData() != null) {",
-        "            if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET && data != null && data.getData() != null) {",
     ),
     (
         "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java",
@@ -352,6 +374,16 @@ def _configure_standalone_gradle(repo_path: str) -> None:
     eol = "\r\n" if "\r\n" in raw else "\n"
     text = raw.replace("\r\n", "\n")
 
+    # P0-1: compress multi-ABI .so files inside base APK (keeps .pack/.gguf/.onnx uncompressed via noCompress)
+    if "useLegacyPackaging" not in text and "jniLibs" in text:
+        text = re.sub(
+            r'^([ \t]*jniLibs\s*\{)',
+            r'\1\n            useLegacyPackaging = true',
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+
     # Ensure noCompress includes pack, gguf, and onnx
     text = re.sub(
         r'noCompress\s*\+=\s*(?:\[[^\]]*\]|"pack")',
@@ -359,6 +391,29 @@ def _configure_standalone_gradle(repo_path: str) -> None:
         text,
         count=1,
     )
+
+    # P0-2: explicit release buildType (no applicationIdSuffix) enabling R8 shrinking & resource shrinking
+    bt_match = re.search(
+        r'(^[ \t]*buildTypes\s*\{[\s\S]*?\n)([ \t]*)(standalone\s*\{)',
+        text,
+        flags=re.MULTILINE,
+    )
+    if bt_match is not None and re.search(r'^[ \t]*release\s*\{', bt_match.group(1), flags=re.MULTILINE) is None:
+        ind = bt_match.group(2)
+        release_block = (
+            f"{ind}release {{\n"
+            f"{ind}    // COLGRAM_RELEASE_R8_CONFIG\n"
+            f"{ind}    debuggable false\n"
+            f"{ind}    jniDebuggable false\n"
+            f"{ind}    signingConfig signingConfigs.release\n"
+            f"{ind}    minifyEnabled true\n"
+            f"{ind}    shrinkResources true\n"
+            f"{ind}    multiDexEnabled true\n"
+            f"{ind}    proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), '../TMessagesProj/proguard-rules.pro'\n"
+            f"{ind}    ndk.debugSymbolLevel = 'FULL'\n"
+            f"{ind}}}\n"
+        )
+        text = text[:bt_match.start(2)] + release_block + text[bt_match.start(2):]
 
     # Allow -PcolgramAbis=arm64-v8a,x86_64 to override afat ABI filters cleanly
     if "colgramAbis" not in text:
@@ -385,7 +440,71 @@ def _configure_standalone_gradle(repo_path: str) -> None:
     if updated != raw:
         with open(gradle_path, "w", encoding="utf-8", newline="") as fh:
             fh.write(updated)
-        print(" [+] Configured TMessagesProj_AppStandalone/build.gradle (noCompress + colgramAbis)")
+        print(" [+] Configured TMessagesProj_AppStandalone/build.gradle (useLegacyPackaging + R8 release + noCompress + colgramAbis)")
+
+
+def _configure_proguard_rules(repo_path: str) -> None:
+    rules_path = os.path.join(repo_path, "TMessagesProj", "proguard-rules.pro")
+    if not os.path.isfile(rules_path):
+        return
+    with open(rules_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        raw = fh.read()
+    if "# COLGRAM_R8_KEEP_RULES = 2" in raw:
+        return
+    eol = "\r\n" if "\r\n" in raw else "\n"
+    text = raw.replace("\r\n", "\n")
+    text = re.sub(r"\n*# COLGRAM_R8_KEEP_RULES = 1[\s\S]*$", "", text).rstrip("\n")
+    block = (
+        "\n\n# COLGRAM_R8_KEEP_RULES = 2\n"
+        "-dontobfuscate\n"
+        "-keepclasseswithmembernames,includedescriptorclasses class * {\n"
+        "    native <methods>;\n"
+        "}\n"
+        "-keep class org.colgram.** { *; }\n"
+        "-keep class org.telegram.ui.Colgram* { *; }\n"
+        "-keep class org.telegram.ui.Colgram*$* { *; }\n"
+        "-keep class org.telegram.messenger.Colgram* { *; }\n"
+        "-keep class org.telegram.messenger.Colgram*$* { *; }\n"
+        "-keep class org.telegram.ui.ActionBar.AlertDialog { *; }\n"
+        "-keep class org.telegram.ui.ActionBar.AlertDialog$* { *; }\n"
+        "-keep class org.telegram.ui.ActionBar.BaseFragment { *; }\n"
+        "-keep class org.telegram.ui.ActionBar.INavigationLayout { *; }\n"
+        "-keep class org.telegram.ui.ActionBar.Theme { *; }\n"
+        "-keep class org.telegram.ui.ChatActivity { *; }\n"
+        "-keep class org.telegram.ui.LaunchActivity { *; }\n"
+        "-keep class org.telegram.utils.proxy.** { *; }\n"
+        "-keep class androidx.collection.LongSparseArray { *; }\n"
+        "-keep class androidx.core.content.FileProvider { *; }\n"
+        "-keep class io.nekohasekai.** { *; }\n"
+        "-keep class com.chaquo.** { *; }\n"
+        "-keep class com.wireguard.** { *; }\n"
+        "-keep class com.k2fsa.sherpa.** { *; }\n"
+        "-keep class androidx.media3.** { *; }\n"
+        "-keep class com.google.gson.** { *; }\n"
+        "-dontwarn com.chaquo.**\n"
+        "-dontwarn io.nekohasekai.**\n"
+        "-dontwarn com.wireguard.**\n"
+        "-dontwarn com.k2fsa.sherpa.**\n"
+        "-dontwarn com.google.mlkit.**\n"
+        "-dontwarn com.google.android.gms.**\n"
+        "-dontwarn com.google.firebase.**\n"
+        "-dontwarn com.google.errorprone.**\n"
+        "-dontwarn com.google.j2objc.**\n"
+        "-dontwarn org.codehaus.mojo.animal_sniffer.**\n"
+        "-dontwarn javax.annotation.**\n"
+        "-dontwarn java.lang.invoke.**\n"
+        "-dontwarn sun.misc.Unsafe\n"
+        "-dontwarn org.conscrypt.**\n"
+        "-dontwarn org.bouncycastle.**\n"
+        "-dontwarn org.openjsse.**\n"
+        "-dontwarn com.stripe.**\n"
+        "-dontwarn com.huawei.**\n"
+        "-dontwarn org.telegram.ui.ColgramAi*\n"
+    )
+    updated = (text + block).replace("\n", eol)
+    with open(rules_path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(updated)
+    print(" [+] Appended safe Colgram R8 keep & -dontobfuscate rules (v2) to TMessagesProj/proguard-rules.pro")
 
 
 def _configure_llama_gradle(repo_path: str, koliti_enabled: bool) -> None:
@@ -787,6 +906,426 @@ def _configure_proxy_list_telemetry(repo_path: str, eol_patch_fn) -> None:
         _patch_text_replace_eol(proxy_path, target, replacement, label, eol_patch_fn)
 
 
+def _apply_first_matching_eol(
+    full_path: str,
+    old_variants,
+    replacement: str,
+    label: str,
+    presence_marker: str,
+    eol_patch_fn,
+) -> None:
+    if not os.path.isfile(full_path):
+        return
+    with open(full_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+        norm = fh.read().replace("\r\n", "\n")
+    if replacement.replace("\r\n", "\n") in norm:
+        return
+    if presence_marker and presence_marker not in norm:
+        return
+    for variant in old_variants:
+        if variant.replace("\r\n", "\n") in norm:
+            eol_patch_fn(full_path, variant, replacement, label)
+            return
+    eol_patch_fn(full_path, old_variants[0], replacement, label)
+
+
+def _configure_keep_on_pause(repo_path: str, eol_patch_fn) -> None:
+    bottom_sheet_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "BottomSheet.java"
+    )
+    _apply_first_matching_eol(
+        bottom_sheet_path,
+        ("    public boolean useBackgroundTopPadding = true;",),
+        "    public boolean useBackgroundTopPadding = true;\n    public boolean colgramKeepOnPause = false;",
+        "BottomSheet.colgramKeepOnPause flag",
+        "useBackgroundTopPadding = true;",
+        eol_patch_fn,
+    )
+
+    base_frag_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ActionBar", "BaseFragment.java"
+    )
+    _apply_first_matching_eol(
+        base_frag_path,
+        (
+            "    public boolean dismissDialogOnPause(Dialog dialog) {\n        return true;\n    }",
+        ),
+        (
+            "    public boolean dismissDialogOnPause(Dialog dialog) {\n"
+            "        if (dialog instanceof BottomSheet && ((BottomSheet) dialog).colgramKeepOnPause) {\n"
+            "            return false;\n"
+            "        }\n"
+            "        return true;\n"
+            "    }"
+        ),
+        "BaseFragment.dismissDialogOnPause respects colgramKeepOnPause",
+        "dismissDialogOnPause(Dialog dialog)",
+        eol_patch_fn,
+    )
+    _apply_first_matching_eol(
+        base_frag_path,
+        (
+            "        isFinished = true;\n        if (actionBar != null) {",
+        ),
+        (
+            "        isFinished = true;\n"
+            "        if (visibleDialog instanceof BottomSheet && ((BottomSheet) visibleDialog).colgramKeepOnPause) {\n"
+            "            try {\n"
+            "                if (visibleDialog.isShowing()) {\n"
+            "                    visibleDialog.dismiss();\n"
+            "                }\n"
+            "            } catch (Throwable ignored) {}\n"
+            "            visibleDialog = null;\n"
+            "        }\n"
+            "        if (actionBar != null) {"
+        ),
+        "BaseFragment.onFragmentDestroy cleans up colgramKeepOnPause dialog",
+        "onFragmentDestroy()",
+        eol_patch_fn,
+    )
+
+
+def _configure_koliti_activity_and_perm_routing(repo_path: str, eol_patch_fn) -> None:
+    launch_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "LaunchActivity.java"
+    )
+    old_launch_pre = (
+        "        // COLGRAM_AI_MEDIA_PICKER\n"
+        "        if (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET) {\n"
+        "            super.onActivityResult(requestCode, resultCode, data);\n"
+        "            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForMedia;\n"
+        "            ColgramAiActivity.pendingSheetForMedia = null;\n"
+        "            if (resultCode == Activity.RESULT_OK && data != null && pending != null) {\n"
+        "                if (data.getClipData() != null && data.getClipData().getItemCount() > 0) {\n"
+        "                    int count = Math.min(4, data.getClipData().getItemCount());\n"
+        "                    for (int i = 0; i < count; i++) {\n"
+        "                        Uri u = data.getClipData().getItemAt(i).getUri();\n"
+        "                        if (u != null) {\n"
+        "                            pending.attachExternalMediaUri(this, u);\n"
+        "                        }\n"
+        "                    }\n"
+        "                } else if (data.getData() != null) {\n"
+        "                    pending.attachExternalMediaUri(this, data.getData());\n"
+        "                }\n"
+        "            }\n"
+        "            return;\n"
+        "        }\n"
+        "        if (requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE) {\n"
+        "            super.onActivityResult(requestCode, resultCode, data);\n"
+        "            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForVoice;\n"
+        "            ColgramAiActivity.pendingSheetForVoice = null;\n"
+        "            if (resultCode == Activity.RESULT_OK && data != null && pending != null) {\n"
+        "                java.util.ArrayList<String> matches = data.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS);\n"
+        '                if (matches != null && !matches.isEmpty() && !android.text.TextUtils.isEmpty(matches.get(0))) {\n'
+        "                    pending.onVoiceRecognizedResult(matches.get(0));\n"
+        "                }\n"
+        "            }\n"
+        "            return;\n"
+        "        }"
+    )
+    old_launch_gated = (
+        "        // COLGRAM_AI_MEDIA_PICKER\n"
+        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET) {\n"
+        "            super.onActivityResult(requestCode, resultCode, data);\n"
+        "            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForMedia;\n"
+        "            ColgramAiActivity.pendingSheetForMedia = null;\n"
+        "            if (resultCode == Activity.RESULT_OK && data != null && pending != null) {\n"
+        "                if (data.getClipData() != null && data.getClipData().getItemCount() > 0) {\n"
+        "                    int count = Math.min(4, data.getClipData().getItemCount());\n"
+        "                    for (int i = 0; i < count; i++) {\n"
+        "                        Uri u = data.getClipData().getItemAt(i).getUri();\n"
+        "                        if (u != null) {\n"
+        "                            pending.attachExternalMediaUri(this, u);\n"
+        "                        }\n"
+        "                    }\n"
+        "                } else if (data.getData() != null) {\n"
+        "                    pending.attachExternalMediaUri(this, data.getData());\n"
+        "                }\n"
+        "            }\n"
+        "            return;\n"
+        "        }\n"
+        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE) {\n"
+        "            super.onActivityResult(requestCode, resultCode, data);\n"
+        "            ColgramAiSheet pending = ColgramAiActivity.pendingSheetForVoice;\n"
+        "            ColgramAiActivity.pendingSheetForVoice = null;\n"
+        "            if (resultCode == Activity.RESULT_OK && data != null && pending != null) {\n"
+        "                java.util.ArrayList<String> matches = data.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS);\n"
+        "                if (matches != null && !matches.isEmpty() && !android.text.TextUtils.isEmpty(matches.get(0))) {\n"
+        "                    pending.onVoiceRecognizedResult(matches.get(0));\n"
+        "                }\n"
+        "            }\n"
+        "            return;\n"
+        "        }"
+    )
+    new_launch_result = (
+        "        // COLGRAM_AI_MEDIA_PICKER\n"
+        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED\n"
+        "                && (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET\n"
+        "                        || requestCode == ColgramAiActivity.REQ_PICK_FILE_FROM_SHEET\n"
+        "                        || requestCode == ColgramAiActivity.REQ_CAPTURE_CAMERA_FROM_SHEET\n"
+        "                        || requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE)) {\n"
+        "            super.onActivityResult(requestCode, resultCode, data);\n"
+        "            ColgramAiSheet.handleActivityResult(this, requestCode, resultCode, data);\n"
+        "            return;\n"
+        "        }"
+    )
+    _apply_first_matching_eol(
+        launch_path,
+        (old_launch_gated, old_launch_pre),
+        new_launch_result,
+        "LaunchActivity ColgramAiSheet activity result routing",
+        "COLGRAM_AI_MEDIA_PICKER",
+        eol_patch_fn,
+    )
+
+    old_perm = (
+        "    @Override\n"
+        "    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {\n"
+        "        super.onRequestPermissionsResult(requestCode, permissions, grantResults);\n"
+        "        if (!checkPermissionsResult(requestCode, permissions, grantResults)) return;"
+    )
+    new_perm = (
+        "    @Override\n"
+        "    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {\n"
+        "        super.onRequestPermissionsResult(requestCode, permissions, grantResults);\n"
+        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED\n"
+        "                && ColgramAiSheet.handlePermissionResult(this, requestCode, permissions, grantResults)) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (!checkPermissionsResult(requestCode, permissions, grantResults)) return;"
+    )
+    _apply_first_matching_eol(
+        launch_path,
+        (old_perm,),
+        new_perm,
+        "LaunchActivity ColgramAiSheet permission result routing",
+        "checkPermissionsResult(requestCode, permissions, grantResults)",
+        eol_patch_fn,
+    )
+
+    chat_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java"
+    )
+    new_chat_prefix = (
+        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED\n"
+        "                && (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET\n"
+        "                        || requestCode == ColgramAiActivity.REQ_PICK_FILE_FROM_SHEET\n"
+        "                        || requestCode == ColgramAiActivity.REQ_CAPTURE_CAMERA_FROM_SHEET\n"
+        "                        || requestCode == ColgramAiActivity.REQ_VOICE_RECOGNIZE)\n"
+        "                && ColgramAiSheet.handleActivityResult(getParentActivity(), requestCode, resultCode, data)) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (resultCode == Activity.RESULT_OK) {"
+    )
+    _apply_first_matching_eol(
+        chat_path,
+        ("        if (resultCode == Activity.RESULT_OK) {",),
+        new_chat_prefix,
+        "ChatActivity.onActivityResultFragment ColgramAiSheet unified routing",
+        "onActivityResultFragment(",
+        eol_patch_fn,
+    )
+    if os.path.isfile(chat_path):
+        with open(chat_path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+            chat_norm = fh.read().replace("\r\n", "\n")
+        legacy_blocks = (
+            (
+                "            if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET && data != null && data.getData() != null) {\n"
+                "                if (ColgramAiActivity.pendingSheetForMedia != null) {\n"
+                "                    ColgramAiActivity.pendingSheetForMedia.attachExternalMediaUri(getParentActivity(), data.getData());\n"
+                "                    ColgramAiActivity.pendingSheetForMedia = null;\n"
+                "                }\n"
+                "                return;\n"
+                "            }"
+            ),
+            (
+                "            if (requestCode == ColgramAiActivity.REQ_PICK_MEDIA_FROM_SHEET && data != null && data.getData() != null) {\n"
+                "                if (ColgramAiActivity.pendingSheetForMedia != null) {\n"
+                "                    ColgramAiActivity.pendingSheetForMedia.attachExternalMediaUri(getParentActivity(), data.getData());\n"
+                "                    ColgramAiActivity.pendingSheetForMedia = null;\n"
+                "                }\n"
+                "                return;\n"
+                "            }"
+            ),
+        )
+        for legacy_block in legacy_blocks:
+            if legacy_block in chat_norm:
+                eol_patch_fn(
+                    chat_path,
+                    legacy_block,
+                    "            // ColgramAiSheet media/file/camera/voice results routed above",
+                    "ChatActivity.onActivityResultFragment strip legacy REQ_PICK_MEDIA_FROM_SHEET",
+                )
+                break
+
+
+def _configure_provider_paths_koliti(repo_path: str, eol_patch_fn) -> None:
+    provider_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "res", "xml", "provider_paths.xml"
+    )
+    _apply_first_matching_eol(
+        provider_path,
+        (
+            '    <files-path name="media_history" path="/media_history/"/>\n</paths>',
+        ),
+        (
+            '    <files-path name="media_history" path="/media_history/"/>\n'
+            '    <files-path name="koliti_media" path="/koliti_media/"/>\n'
+            "</paths>"
+        ),
+        "provider_paths.xml koliti_media FileProvider path",
+        "media_history",
+        eol_patch_fn,
+    )
+
+
+def _configure_koliti_chat_message_action(repo_path: str, eol_patch_fn) -> None:
+    chat_path = os.path.join(
+        repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java"
+    )
+    old_menu = (
+        '        if (selectedObject != null && selectedObject.getId() > 0) {\n'
+        '            items.add("Удалить только у себя");\n'
+        '            options.add(9990);\n'
+        '            icons.add(R.drawable.msg_delete);\n'
+        '        }\n'
+        '        final MessageObject message = selectedObject;\n'
+        '        final MessageObject.GroupedMessages groupedMessages = selectedObjectGroup;'
+    )
+    new_menu = (
+        '        if (selectedObject != null && selectedObject.getId() > 0) {\n'
+        '            items.add("Удалить только у себя");\n'
+        '            options.add(9990);\n'
+        '            icons.add(R.drawable.msg_delete);\n'
+        '        }\n'
+        '        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && selectedObject != null\n'
+        '                && selectedObject.messageOwner != null\n'
+        '                && !(selectedObject.messageOwner instanceof TLRPC.TL_messageService)) {\n'
+        '            items.add("Спросить Koliti");\n'
+        '            options.add(9991);\n'
+        '            icons.add(R.drawable.msg_bot);\n'
+        '        }\n'
+        '        final MessageObject message = selectedObject;\n'
+        '        final MessageObject.GroupedMessages groupedMessages = selectedObjectGroup;'
+    )
+    _apply_first_matching_eol(
+        chat_path,
+        (old_menu,),
+        new_menu,
+        "ChatActivity.fillMessageMenu Ask Koliti option 9991",
+        "options.add(9990);",
+        eol_patch_fn,
+    )
+
+    old_opt = (
+        "    private void processSelectedOption(int option) {\n"
+        "        if (selectedObject == null || getParentActivity() == null) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (option == 9988) {"
+    )
+    new_opt = (
+        "    private void processSelectedOption(int option) {\n"
+        "        if (selectedObject == null || getParentActivity() == null) {\n"
+        "            return;\n"
+        "        }\n"
+        "        if (org.colgram.core.ColgramBuildFlags.KOLITI_ENABLED && option == 9991) {\n"
+        "            ArrayList<String> kolitiPaths = new ArrayList<>();\n"
+        "            ArrayList<String> kolitiNames = new ArrayList<>();\n"
+        "            java.util.LinkedHashSet<String> seenPaths = new java.util.LinkedHashSet<>();\n"
+        "            ArrayList<MessageObject> targetMsgs = new ArrayList<>();\n"
+        "            if (selectedObjectGroup != null && selectedObjectGroup.messages != null && !selectedObjectGroup.messages.isEmpty()) {\n"
+        "                targetMsgs.add(selectedObject);\n"
+        "                for (int gi = 0; gi < selectedObjectGroup.messages.size(); gi++) {\n"
+        "                    MessageObject gm = selectedObjectGroup.messages.get(gi);\n"
+        "                    if (gm != null && gm != selectedObject) {\n"
+        "                        targetMsgs.add(gm);\n"
+        "                    }\n"
+        "                }\n"
+        "            } else {\n"
+        "                targetMsgs.add(selectedObject);\n"
+        "            }\n"
+        "            boolean hasDownloadableMedia = false;\n"
+        "            for (int mi = 0; mi < targetMsgs.size() && kolitiPaths.size() < 4; mi++) {\n"
+        "                MessageObject mo = targetMsgs.get(mi);\n"
+        "                if (mo == null || mo.messageOwner == null) continue;\n"
+        "                if (mo.messageOwner.media != null && (mo.messageOwner.media.photo != null || mo.messageOwner.media.document != null)) {\n"
+        "                    hasDownloadableMedia = true;\n"
+        "                }\n"
+        "                String resolvedPath = null;\n"
+        "                try {\n"
+        "                    if (!TextUtils.isEmpty(mo.messageOwner.attachPath)) {\n"
+        "                        File af = new File(mo.messageOwner.attachPath);\n"
+        "                        if (af.isFile() && af.length() > 0) resolvedPath = af.getAbsolutePath();\n"
+        "                    }\n"
+        "                    if (resolvedPath == null) {\n"
+        "                        File mf = getFileLoader().getPathToMessage(mo.messageOwner);\n"
+        "                        if (mf != null && mf.isFile() && mf.length() > 0) resolvedPath = mf.getAbsolutePath();\n"
+        "                    }\n"
+        "                    if (resolvedPath == null && mo.messageOwner.media != null && mo.messageOwner.media.photo != null\n"
+        "                            && mo.messageOwner.media.photo.sizes != null) {\n"
+        "                        for (int sIdx = mo.messageOwner.media.photo.sizes.size() - 1; sIdx >= 0; sIdx--) {\n"
+        "                            TLRPC.PhotoSize ps = mo.messageOwner.media.photo.sizes.get(sIdx);\n"
+        "                            if (ps == null || ps instanceof TLRPC.TL_photoStrippedSize || ps instanceof TLRPC.TL_photoPathSize) continue;\n"
+        "                            File pf = getFileLoader().getPathToAttach(ps, false);\n"
+        "                            if (pf == null || !pf.isFile() || pf.length() == 0) pf = getFileLoader().getPathToAttach(ps, true);\n"
+        "                            if (pf != null && pf.isFile() && pf.length() > 0) {\n"
+        "                                resolvedPath = pf.getAbsolutePath();\n"
+        "                                break;\n"
+        "                            }\n"
+        "                        }\n"
+        "                    }\n"
+        "                    if (resolvedPath == null && mo.messageOwner.media != null && mo.messageOwner.media.document != null) {\n"
+        "                        File df = getFileLoader().getPathToAttach(mo.messageOwner.media.document, false);\n"
+        "                        if (df == null || !df.isFile() || df.length() == 0) df = getFileLoader().getPathToAttach(mo.messageOwner.media.document, true);\n"
+        "                        if (df != null && df.isFile() && df.length() > 0) resolvedPath = df.getAbsolutePath();\n"
+        "                    }\n"
+        "                } catch (Throwable ignored) {}\n"
+        "                if (resolvedPath != null && seenPaths.add(resolvedPath)) {\n"
+        "                    String dName = null;\n"
+        "                    if (mo.messageOwner.media != null && mo.messageOwner.media.document != null) {\n"
+        "                        dName = FileLoader.getDocumentFileName(mo.messageOwner.media.document);\n"
+        "                    }\n"
+        "                    if (TextUtils.isEmpty(dName)) {\n"
+        "                        dName = new File(resolvedPath).getName();\n"
+        "                    }\n"
+        "                    kolitiPaths.add(resolvedPath);\n"
+        "                    kolitiNames.add(dName);\n"
+        "                }\n"
+        "            }\n"
+        "            String msgText = selectedObject.messageOwner != null && selectedObject.messageOwner.message != null\n"
+        '                    ? selectedObject.messageOwner.message\n'
+        '                    : (selectedObject.messageText != null ? selectedObject.messageText.toString() : "");\n'
+        "            msgText = msgText != null ? msgText.trim() : \"\";\n"
+        "            selectedObject = null;\n"
+        "            selectedObjectGroup = null;\n"
+        "            selectedObjectToEditCaption = null;\n"
+        "            closeMenu(true);\n"
+        "            if (kolitiPaths.isEmpty() && hasDownloadableMedia && TextUtils.isEmpty(msgText)) {\n"
+        '                BulletinFactory.of(this).createErrorBulletin("Файл ещё не загружен — откройте или скачайте его в чате", themeDelegate).show();\n'
+        "                return;\n"
+        "            }\n"
+        "            ColgramAiSheet.showWithAttachment(\n"
+        "                    this,\n"
+        "                    this,\n"
+        "                    colgramAiOrb,\n"
+        "                    kolitiPaths.isEmpty() ? null : kolitiPaths,\n"
+        "                    kolitiNames.isEmpty() ? null : kolitiNames,\n"
+        '                    msgText.isEmpty() ? null : msgText);\n'
+        "            return;\n"
+        "        }\n"
+        "        if (option == 9988) {"
+    )
+    _apply_first_matching_eol(
+        chat_path,
+        (old_opt,),
+        new_opt,
+        "ChatActivity.processSelectedOption Ask Koliti option 9991",
+        "processSelectedOption(int option)",
+        eol_patch_fn,
+    )
+
+
 def apply(repo_path: str, patch_file_fn, eol_patch_fn, koliti_enabled: bool = True) -> None:
     """Apply compile-time Koliti split gates, Gradle ABI/module wiring, and asset pruning."""
     _write_build_flags(repo_path, koliti_enabled)
@@ -825,6 +1364,11 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn, koliti_enabled: bool = Tr
     _upgrade_data_settings_memory_sheet(repo_path, eol_patch_fn)
     _harmonize_dialogs_overflow_menu(repo_path, eol_patch_fn)
     _configure_proxy_list_telemetry(repo_path, eol_patch_fn)
+    _configure_keep_on_pause(repo_path, eol_patch_fn)
+    _configure_koliti_activity_and_perm_routing(repo_path, eol_patch_fn)
+    _configure_provider_paths_koliti(repo_path, eol_patch_fn)
+    _configure_koliti_chat_message_action(repo_path, eol_patch_fn)
     _configure_standalone_gradle(repo_path)
+    _configure_proguard_rules(repo_path)
     _configure_llama_gradle(repo_path, koliti_enabled)
     _sync_koliti_assets_and_native(repo_path, koliti_enabled)

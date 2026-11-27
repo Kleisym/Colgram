@@ -171,7 +171,9 @@ public final class ColgramAiEngine {
         }
     }
 
-    private static final ColgramAiEngine INSTANCE = new ColgramAiEngine();
+    private static final class Holder {
+        static final ColgramAiEngine INSTANCE = new ColgramAiEngine();
+    }
     private static final int MAX_MEMORY_TURNS = 12;
     private static final int MAX_AGENT_STEPS = 5;
 
@@ -198,7 +200,7 @@ public final class ColgramAiEngine {
     private ColgramAiEngine() {}
 
     public static ColgramAiEngine getInstance() {
-        return INSTANCE;
+        return Holder.INSTANCE;
     }
 
     public boolean isBusy() {
@@ -306,7 +308,7 @@ public final class ColgramAiEngine {
                 if (busy.get()) return;
                 ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);
                 if ((!paths.isReady() || ColgramAiModelManager.needsEmbeddedUpgrade(ctx))
-                        && ColgramAiModelManager.hasEmbeddedAssets(ctx)) {
+                        && (ColgramAiModelManager.hasEmbeddedAssets(ctx) || ColgramAiModelManager.hasEmbeddedVisionAsset(ctx))) {
                     if (modelLoaded) {
                         ColgramNativeLlama.nativeUnload();
                         modelLoaded = false;
@@ -394,7 +396,8 @@ public final class ColgramAiEngine {
         // Deterministic command shortcuts only serve as offline fallback when no native model exists.
         ColgramAiModelManager.ResolvedModelPaths paths = ColgramAiModelManager.resolveActiveModel(ctx);
         boolean upgradeEmbedded = ColgramAiModelManager.needsEmbeddedUpgrade(ctx);
-        if ((!paths.isReady() || upgradeEmbedded) && ColgramAiModelManager.hasEmbeddedAssets(ctx)) {
+        if ((!paths.isReady() || upgradeEmbedded)
+                && (ColgramAiModelManager.hasEmbeddedAssets(ctx) || ColgramAiModelManager.hasEmbeddedVisionAsset(ctx))) {
             if (modelLoaded && upgradeEmbedded) {
                 ColgramNativeLlama.nativeUnload();
                 modelLoaded = false;
@@ -462,7 +465,7 @@ public final class ColgramAiEngine {
             return;
         }
 
-        // 2. Prepare attached OR auto-grabbed chat media (images & video storyboard keyframes)
+        // 2. Prepare attached OR auto-grabbed chat media (images, video keyframes, PDF pages, text/code/DOCX)
         List<String> rawMedia = new ArrayList<>();
         if (req.mediaPaths != null) rawMedia.addAll(req.mediaPaths);
         if (rawMedia.isEmpty() && plan.shouldAutoGrabMedia && req.fallbackChatMediaPaths != null) {
@@ -470,15 +473,36 @@ public final class ColgramAiEngine {
         }
 
         List<String> processedImagePaths = new ArrayList<>();
+        StringBuilder docTextSb = new StringBuilder();
+        List<String> attachmentErrors = new ArrayList<>();
         boolean hasVideoGrid = false;
         if (!rawMedia.isEmpty()) {
-            postFor(reqId, () -> listener.onStage("Подготавливаю кадры для Vision…"));
+            postFor(reqId, () -> listener.onStage("Подготавливаю вложения…"));
             for (String rawPath : rawMedia) {
                 if (cancelled.get() || requestSeq.get() != reqId) return;
-                ColgramAiVisionProcessor.PreparedMedia pm = ColgramAiVisionProcessor.prepareMediaFile(ctx, rawPath);
-                if (pm != null && pm.file.isFile()) {
-                    processedImagePaths.add(pm.file.getAbsolutePath());
-                    if (pm.isVideoGrid) hasVideoGrid = true;
+                ColgramAiVisionProcessor.PreparedAttachment pa = ColgramAiVisionProcessor.prepareAttachment(ctx, rawPath);
+                if (pa == null) continue;
+                if (pa.kind == ColgramAiVisionProcessor.AttachmentKind.UNSUPPORTED) {
+                    if (!pa.errorMessage.isEmpty()) {
+                        attachmentErrors.add(pa.errorMessage);
+                    }
+                    continue;
+                }
+                if (pa.hasImages()) {
+                    for (java.io.File imgFile : pa.imageFiles) {
+                        if (imgFile != null && imgFile.isFile() && processedImagePaths.size() < 6) {
+                            processedImagePaths.add(imgFile.getAbsolutePath());
+                        }
+                    }
+                    if (pa.isVideoGrid) hasVideoGrid = true;
+                }
+                if (pa.hasText() && docTextSb.length() < 6500) {
+                    if (docTextSb.length() > 0) docTextSb.append("\n\n");
+                    int remain = 6500 - docTextSb.length();
+                    String chunk = pa.extractedText.length() > remain
+                            ? pa.extractedText.substring(0, remain) + "\n… [обрезано]"
+                            : pa.extractedText;
+                    docTextSb.append(chunk);
                 }
             }
         }
@@ -487,10 +511,32 @@ public final class ColgramAiEngine {
             return;
         }
 
+        if (!rawMedia.isEmpty() && processedImagePaths.isEmpty() && docTextSb.length() == 0 && !attachmentErrors.isEmpty()) {
+            final String errText = String.join("\n", attachmentErrors);
+            postFor(reqId, () -> listener.onError(errText));
+            return;
+        }
+
+        if (nativeAvailable && !processedImagePaths.isEmpty() && !paths.hasVision()) {
+            if (docTextSb.length() == 0) {
+                postFor(reqId, () -> listener.onError(
+                        "Модуль Vision для анализа фото, видео и PDF не установлен. "
+                                + "Откройте Koliti Studio и загрузите Vision-модуль для активной модели."));
+                return;
+            }
+            processedImagePaths.clear();
+            docTextSb.insert(0, "(Примечание: изображения/PDF пропущены, так как Vision-модуль не установлен в Koliti Studio.)\n\n");
+        }
+        if (!attachmentErrors.isEmpty() && (docTextSb.length() > 0 || !processedImagePaths.isEmpty())) {
+            if (docTextSb.length() > 0) docTextSb.append("\n\n");
+            docTextSb.append("(Пропущены вложения: ").append(String.join("; ", attachmentErrors)).append(')');
+        }
+        String docBlock = docTextSb.toString().trim();
+
         // 3. Focused BM25 + Recency compression — ONLY inject Telegram chat/channel context when asked or explicitly attached!
         long totalRamMb = queryTotalRamMb(ctx);
         boolean needsVision = !processedImagePaths.isEmpty() && paths.hasVision();
-        int ctxBudget = resolveEffectiveContext(ctx, totalRamMb, needsVision);
+        int ctxBudget = resolveEffectiveContext(ctx, totalRamMb, processedImagePaths.size(), docBlock.length());
         int maxChatChars = Math.min(1800, Math.max(900, (ctxBudget * 2) / 3));
 
         boolean includeActiveChat = (plan.shouldUseActiveChatContext || req.forceAttachChatContext)
@@ -534,13 +580,16 @@ public final class ColgramAiEngine {
             executeNativePipeline(
                     ctx, req, listener, reqId, paths, plan,
                     processedImagePaths, hasVideoGrid, needsVision, ctxBudget,
-                    activeBlock, crossBlock, webBlock, verifiedMath, history);
+                    activeBlock, crossBlock, webBlock, docBlock, verifiedMath, history);
             return;
         }
 
         // Only reached if native llama library or embedded weights are completely absent
         String answer = ColgramAiContextEngine.synthesizeSmartAnswer(
                 plan, req.userQuery, req.activeChatTitle, activePicked, crossPicked, webHits, !processedImagePaths.isEmpty());
+        if (answer.isEmpty() && !docBlock.isEmpty()) {
+            answer = "Текстовое содержимое документа извлечено. Для анализа файла установите локальное ядро Koliti Core в Koliti Studio.";
+        }
         if (answer.isEmpty()) {
             String reason = !ColgramNativeLlama.isLoaded()
                     ? (" (" + ColgramNativeLlama.getLoadError() + ")")
@@ -549,8 +598,9 @@ public final class ColgramAiEngine {
             return;
         }
         recordTurn(req.userQuery, answer);
-        String footer = plan.intentSummary + (webHits.isEmpty() ? "" : " • Источников: " + webHits.size());
-        postFor(reqId, () -> listener.onFinished(answer, footer, false));
+        final String finalAnswer = answer;
+        final String finalFooter = plan.intentSummary + (webHits.isEmpty() ? "" : " • Источников: " + webHits.size());
+        postFor(reqId, () -> listener.onFinished(finalAnswer, finalFooter, false));
     }
 
     private static final class NativeRunState {
@@ -619,12 +669,14 @@ public final class ColgramAiEngine {
             String activeBlock,
             String crossBlock,
             String webBlock,
+            String docBlock,
             String verifiedMath,
             List<ColgramAiContextEngine.ConversationTurn> history
     ) {
         NativeRunState st = new NativeRunState();
         boolean hasChatCtx = !activeBlock.isEmpty() || !crossBlock.isEmpty();
         boolean hasWebCtx = !webBlock.isEmpty();
+        boolean hasDocCtx = docBlock != null && !docBlock.isEmpty();
 
         st.naturalSend = ColgramAiAgentTools.parseNaturalMessagingIntent(
                 req.userQuery, lastReferencedChatTarget, req.dialogDirectory);
@@ -674,7 +726,7 @@ public final class ColgramAiEngine {
 
         st.currentStepPrompt = ColgramAiContextEngine.buildUserPrompt(
                 effectiveQuery, req.activeChatTitle, activeBlock, crossBlock, webBlock,
-                dirForPrompt, processedImagePaths.size(), hasVideoGrid, null);
+                dirForPrompt, docBlock, processedImagePaths.size(), hasVideoGrid, null);
 
         String[] baseHistoryPairs = plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN
                 ? null
@@ -686,7 +738,9 @@ public final class ColgramAiEngine {
         }
         if (baseHistoryPairs != null) {
             for (String hp : baseHistoryPairs) {
-                st.agentLoopHistory.add(hp);
+                st.agentLoopHistory.add(processedImagePaths.isEmpty()
+                        ? hp
+                        : ColgramAiContextEngine.sanitizeMediaMarker(hp));
             }
         }
 
@@ -702,13 +756,14 @@ public final class ColgramAiEngine {
 
         int reasoningTier = ColgramAiContextEngine.classifyReasoningTier(req.userQuery);
         int thinkingBudget = reasoningTier <= 1 ? 384 : 512;
-        int fastBudget = isSongAsk ? 192 : (reasoningTier == 0 ? 192 : 256);
+        int fastBudget = isSongAsk ? 192
+                : ((!processedImagePaths.isEmpty() || hasDocCtx) ? 448 : (reasoningTier == 0 ? 192 : 256));
         st.baseMaxTokens = effectiveLocalDraft ? 192
                 : (st.remoteTargetOverride ? 256
                 : (st.baseNativeThinking ? thinkingBudget
                 : (plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN ? 768 : fastBudget)));
         st.baseTemp = ColgramAiConfig.getTemperature(ctx);
-        st.strictGrounded = hasChatCtx || hasWebCtx || st.includeDirectory || st.remoteTargetOverride
+        st.strictGrounded = hasChatCtx || hasWebCtx || hasDocCtx || st.includeDirectory || st.remoteTargetOverride
                 || plan.resolvedMode == ColgramAiContextEngine.AssistantMode.PLUGIN
                 || effectiveLocalDraft || verifiedMath != null;
         return st;
@@ -891,6 +946,7 @@ public final class ColgramAiEngine {
             String activeBlock,
             String crossBlock,
             String webBlock,
+            String docBlock,
             String verifiedMath,
             List<ColgramAiContextEngine.ConversationTurn> history
     ) {
@@ -900,7 +956,7 @@ public final class ColgramAiEngine {
         postFor(reqId, () -> listener.onStage("Koliti отвечает…"));
         NativeRunState st = buildNativeRunState(
                 ctx, req, plan, processedImagePaths, hasVideoGrid,
-                activeBlock, crossBlock, webBlock, verifiedMath, history);
+                activeBlock, crossBlock, webBlock, docBlock, verifiedMath, history);
 
         for (int step = 0; step < MAX_AGENT_STEPS && !cancelled.get(); step++) {
             boolean keepGoing = executeSingleAgentStep(ctx, req, listener, reqId, plan, history, st, step);
@@ -1183,14 +1239,35 @@ public final class ColgramAiEngine {
         return new ToolResult(true, false, false, ta, "", "");
     }
 
-    private int resolveEffectiveContext(Context ctx, long totalRamMb, boolean needsVision) {
-        int override = ColgramAiConfig.getContextSizeOverride(ctx);
-        if (override >= 1024) {
-            return needsVision ? Math.max(override, 3072) : override;
+    public static int computeVisionContextBudget(int overrideCtx, int imageCount, int docChars) {
+        int dynamicBase = 2048;
+        if (imageCount > 0) {
+            dynamicBase = imageCount >= 3
+                    ? 4096
+                    : Math.max(3072, 2048 + imageCount * 448);
         }
-        return needsVision
-                ? ColgramAiModels.recommendContextForVision(totalRamMb)
-                : ColgramAiModels.recommendContextForTotalRamMb(totalRamMb);
+        if (docChars > 2000) {
+            dynamicBase = Math.max(dynamicBase, 4096);
+        }
+        if (overrideCtx >= 1024) {
+            return Math.max(overrideCtx, dynamicBase);
+        }
+        return dynamicBase;
+    }
+
+    private int resolveEffectiveContext(Context ctx, long totalRamMb, boolean needsVision) {
+        return resolveEffectiveContext(ctx, totalRamMb, needsVision ? 1 : 0, 0);
+    }
+
+    private int resolveEffectiveContext(Context ctx, long totalRamMb, int imageCount, int docChars) {
+        int override = ColgramAiConfig.getContextSizeOverride(ctx);
+        if (imageCount > 0 || docChars > 2000) {
+            return computeVisionContextBudget(override, imageCount, docChars);
+        }
+        if (override >= 1024) {
+            return override;
+        }
+        return ColgramAiModels.recommendContextForTotalRamMb(totalRamMb);
     }
 
     private int resolveThreads(Context ctx) {
