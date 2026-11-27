@@ -1,8 +1,8 @@
 {
   "telegram_version": "12.10.6",
   "telegram_commit": "f2908b14133bbffbf7ab04f641ecb5bfaf533242",
-  "apk_url": "https://github.com/Kleisym/Colgram/releases/download/v12.10.6-ci179/Colgram-12.10.6.apk",
-  "apk_sha256": "f25e456f57f6ae352b98a5d84010829ab7a2d22d1c3cbd0af7e53c8e6f6e4d9d",
+  "apk_url": "https://github.com/Kleisym/Colgram/releases/download/v12.10.6-ci183/Colgram-12.10.6.apk",
+  "apk_sha256": "fe3fb62e320b4d83a40233980b09880c750557dc7fa1b8f6115327711c92e93a",
   "entries": {
     "lib/arm64-v8a/libtmessages.49.so": {
       "sha256": "f61bde6cfbd7535559f9b3293a7a51be6dfc266339f17bed4491bd68bb5b2960",
