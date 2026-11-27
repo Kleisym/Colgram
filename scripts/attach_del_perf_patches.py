@@ -208,8 +208,14 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             "            org.colgram.core.ColgramFileImport.cancelActiveImport();\n"
             "        }\n"
         )
-        if old_on_destroy in updated and on_destroy_marker not in updated:
-            if "\n    public void onDestroy() {\n        if (!buttonPressed && !sent" not in updated:
+        if old_on_destroy in updated and "if (colgramImportHud != null)" not in updated.split(old_on_destroy, 1)[1][:300]:
+            if f"\n    public void onDestroy() {{\n        {on_destroy_marker}\n" in updated:
+                updated = updated.replace(
+                    f"\n    public void onDestroy() {{\n        {on_destroy_marker}\n",
+                    f"\n    public void onDestroy() {{\n        {on_destroy_marker}\n{hud_dismiss_lines}",
+                    1,
+                )
+            elif "\n    public void onDestroy() {\n        if (!buttonPressed && !sent" not in updated:
                 updated = updated.replace(old_on_destroy, new_on_destroy, 1)
             else:
                 updated = updated.replace(
@@ -358,7 +364,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol = "\r\n" if "\r\n" in content else "\n"
         return updated.replace("\n", eol)
 
-    patch_file_fn(chat_attach_alert, patch_chat_attach, "org.telegram.ui.ColgramUiKit.ProgressHudHandle", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
+    patch_file_fn(chat_attach_alert, patch_chat_attach, "\n    public void onDestroy() {\n        // colgram-attach-composer-v2\n        if (colgramImportHud != null) {\n", "ChatAttachAlert.java native composer routing for File, Music, and Colgram Folder")
 
     # =========================================================================
     # 2. ChatAttachAlertDocumentLayout.java:

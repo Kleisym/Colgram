@@ -1188,7 +1188,9 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     if "isAvatarOrSmallImage" in _fl_prio_src:
         eol_patch_fn(
             file_loader,
-            """        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {
+            """        FileLoadOperation operation = loadOperationPaths.get(finalFileName);
+
+        if (priority != PRIORITY_STREAM && priority != PRIORITY_LOW) {
             boolean isAvatarOrSmallImage = parentObject instanceof TLRPC.User
                     || parentObject instanceof TLRPC.UserFull
                     || parentObject instanceof TLRPC.Chat
@@ -1201,7 +1203,9 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             }
         }
         priority = getPriorityValue(priority);""",
-            "        priority = getPriorityValue(priority);",
+            """        FileLoadOperation operation = loadOperationPaths.get(finalFileName);
+
+        priority = getPriorityValue(priority);""",
             "FileLoader.java stop blanket PRIORITY_HIGH",
         )
     eol_patch_fn(
