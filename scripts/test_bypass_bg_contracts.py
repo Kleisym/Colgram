@@ -89,7 +89,14 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("sessionEvictTier(s, nowMs)", evict)
         tier = extract_method(dpi, "private static int sessionEvictTier(")
         self.assertIn("isClosed()", tier)
+        self.assertIn("!s.writingUpstream", tier)
         self.assertIn(">= 15_000L", tier)
+        reap = extract_method(dpi, "static int reapStaleSessionsAt(")
+        self.assertIn("s.writingUpstream", reap)
+        self.assertIn("MAX_ACTIVE_UPLOAD_UNREPLIED_MS", reap)
+        self.assertIn("static boolean shouldSkipDcBackoffSleep(", dpi)
+        self.assertIn("static boolean shouldSkipRawForWs(", dpi)
+        self.assertIn("wsSession.forcePatchDc = (call == null && !wsEdgeHost && signedDc != 0);", dpi)
 
         close_all = extract_method(dpi, "public static int closeAllActiveSessions()")
         self.assertIn("ColgramTelegramWsBridge.drainPrewarmedPool()", close_all)
@@ -104,6 +111,9 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         self.assertIn("stepSession.fromPrewarm", pipe)
         self.assertIn("tryRedialFreshPrewarmSession(", pipe)
         self.assertIn("evictPrewarmedBucket(", pipe)
+        self.assertIn("tracked.writingUpstream = true;", pipe)
+        self.assertIn("tracked.writingUpstream = false;", pipe)
+        self.assertIn("session.forcePatchDc", pipe)
         self.assertIn("lastTxAtMs", dpi)
         self.assertIn("void setUpstream(", dpi)
         self.assertIn("probeClientClosedQuick(", dpi)
@@ -125,12 +135,25 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
     def test_ws_bridge_native_keepalive_wrap_fix_and_prewarm_safety(self):
         ws = read_text(CORE / "ColgramTelegramWsBridge.java")
         self.assertIn("volatile boolean fromPrewarm = false;", ws)
+        self.assertIn("volatile boolean forcePatchDc = false;", ws)
+        self.assertIn("static final int MAX_PACKET_BYTES = 16 * 1024 * 1024;", ws)
+        self.assertNotIn("MAX_OUTBOUND_FRAME_BYTES", ws)
+        send_bin = extract_method(ws, "private void sendBinaryInternal(byte[] buf, int off, int len, boolean flush)")
+        self.assertIn("if (len > MAX_PACKET_BYTES)", send_bin)
+        self.assertIn("writeFrameLocked(0x82, buf, off, len, flush);", send_bin)
+        self.assertNotIn("0x80 : 0x00", send_bin)
         self.assertIn("PREWARM_MAX_PER_BUCKET = 3;", ws)
         self.assertIn("PREWARM_MEDIA_MAX_PER_BUCKET = 4;", ws)
         self.assertIn("DEFAULT_EDGE_DEPRIORITIZE_TTL_MS = 8_000L;", ws)
-        self.assertIn("DC135_DEAD_COOLDOWN_MS = 12_000L;", ws)
-        self.assertIn("DC135_WIFI_CONNECT_TIMEOUT_MS = 1200;", ws)
-        self.assertIn("DC135_CELLULAR_CONNECT_TIMEOUT_MS = 1600;", ws)
+        self.assertIn("DC135_DEAD_COOLDOWN_MS = 2_000L;", ws)
+        self.assertIn("DC135_MAX_BACKOFF_MS = 4_000L;", ws)
+        self.assertIn("DC135_WIFI_CONNECT_TIMEOUT_MS = 700;", ws)
+        self.assertIn("DC135_CELLULAR_CONNECT_TIMEOUT_MS = 1000;", ws)
+        dial_fresh = extract_method(ws, "private static WsSession dialFreshInternal(")
+        self.assertIn("Math.min(4, fastCands.size())", dial_fresh)
+        self.assertIn("if (tried >= 1 || System.currentTimeMillis() + 600L >= deadlineMs) break;", dial_fresh)
+        self.assertIn("public static Obfuscated2FrameSplitter create(byte[] initBuf, int initLen, int dcId,\n"
+                      "                                                      boolean forcePatchDc)", ws)
         self.assertIn("PREWARM_TTL_MS = 38_000L;", ws)
         self.assertIn("PREWARM_REFRESH_MS = 28_000L;", ws)
         self.assertIn("maintainForegroundPrewarmIfNeeded(", ws)
@@ -168,6 +191,7 @@ class CoreBypassAndBackgroundContractsTest(unittest.TestCase):
         )
         self.assertIn("if (!includeIpv6 && ip.indexOf(':') >= 0) continue;", build_cands)
         self.assertIn("if (!includeIpv6 && secIp.indexOf(':') >= 0) continue;", build_cands)
+        self.assertNotIn('contains("-1.")', build_cands)
 
         wrap = extract_method(ws, "private static Socket wrapSocketForMode(")
         self.assertIn("if (base instanceof ColgramNativeDesync.NativeSocket && isNativeFragMode(fragMode))", wrap)
@@ -354,8 +378,10 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             self.assertIn("ColgramForegroundService.start(applicationContext)", al)
             self.assertIn("colgramLastCapRefreshMs", al)
             self.assertLess(al.index("ColgramUiBridge.install(this)"), al.index("ColgramHookHandler.init(applicationContext)"))
+            self.assertIn("if (level >= TRIM_MEMORY_COMPLETE || level == TRIM_MEMORY_RUNNING_CRITICAL)", al)
+            self.assertNotIn("TRIM_MEMORY_RUNNING_MODERATE", al)
 
-            cm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[2])
+            cm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[2]).replace("\r\n", "\n")
             self.assertEqual(cm.count("public static void colgramResetProxySignature()"), 1)
             self.assertEqual(cm.count("public static String colgramGetLastProxySignature()"), 1)
             self.assertEqual(cm.count("TL_contacts_sponsoredPeersEmpty"), 1)
@@ -364,22 +390,56 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             doh_task = extract_method(cm, "private static class ResolveHostByNameTask")
             self.assertEqual(doh_task.count("ColgramDohResolver.resolve("), 1)
             self.assertEqual(doh_task.count("ColgramDohResolver.resolveOrSystem("), 1)
-            self.assertIn("TLRPC.TL_inputMediaGame", extract_method(cm, "private static boolean colgramIsDirectSendResponseSafe("))
+            self.assertNotIn("colgramIsDirectSendResponseSafe", cm)
+            online_trig = extract_method(cm, "private static boolean colgramIsOnlineTriggeringRequest(")
+            self.assertIn("TL_messages_sendMedia", online_trig)
+            self.assertIn("TL_messages_sendMultiMedia", online_trig)
+            instant_send = extract_method(cm, "private static boolean colgramIsInstantSendRequest(")
+            self.assertNotIn("TL_messages_sendMedia", instant_send)
+            self.assertNotIn("TL_messages_sendMultiMedia", instant_send)
+            self.assertNotIn("TL_messages_uploadMedia", instant_send)
+            self.assertIn(
+                "org.colgram.core.ColgramHookHandler.canAutoRestartDpiBypass()\n"
+                "                        && !org.colgram.core.ColgramDpiBypass.isBound()",
+                cm,
+            )
+            self.assertIn(
+                '        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {\n'
+                '            installer = "com.android.vending";\n'
+                '        }\n'
+                '        if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {\n'
+                '            installer = "com.android.vending";\n'
+                '            packageId = "org.telegram.messenger";',
+                cm,
+            )
+            self.assertIn("if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) return 0;", cm)
+            self.assertIn(
+                'if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {\n'
+                '            native_receivedIntegrityCheckClassic(',
+                cm,
+            )
             self.assertIn("colgramShouldDropFirewallRequest", cm)
             self.assertIn("isAllowingSpamMentionClear()", cm)
-            self.assertIn('packageId = "org.telegram.messenger";', cm)
 
             mc = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[3])
             self.assertIn("AndroidUtilities.runOnUIThread(() -> colgramDialogsRetryPending.put(folderId, false));", mc)
             self.assertIn("colgramDialogsRetryPending.put(folderId, true);", mc)
             self.assertIn("NotificationCenter.didUpdateConnectionState", mc)
             self.assertIn("if (false && collectDeviceStats && !loggedDeviceStats)", mc)
+            self.assertGreaterEqual(mc.count('"BOT_METHOD_INVALID".equals(error.text)'), 3)
+            self.assertGreaterEqual(mc.count("NotificationCenter.loadingMessagesFailed"), 6)
 
             mdc = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[4])
             self.assertIn("reactionsFallbackActive", mdc)
             self.assertIn("enabledReactionsList.isEmpty() || reactionsFallbackActive", mdc)
             self.assertIn("item.static_icon == null", mdc)
             self.assertIn("reaction.activate_animation != null", mdc)
+            self.assertIn("colgramReactionsRetryAttempt", mdc)
+            self.assertIn("colgramReactionsRetryRunnable", mdc)
+            self.assertIn("1500L", mdc)
+            self.assertIn("3000L", mdc)
+            self.assertIn("8000L", mdc)
+            self.assertIn("20000L", mdc)
 
             rb = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[5])
             self.assertIn("Emoji.getEmojiDrawable(visibleReaction.emojicon)", rb)
@@ -389,16 +449,22 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             self.assertIn("req.cdn_supported = !org.colgram.core.ColgramDpiBypass.isBound();", flo)
             self.assertIn('error.text.startsWith("CDN_")', flo)
             self.assertIn("requestedBytesCount = Math.max(downloadedBytes, requestedBytesCount - requestInfo.chunkSize);", flo)
+            self.assertIn("maxDownloadRequests = 4;", flo)
+            self.assertIn("maxDownloadRequestsBig = 4;", flo)
+            self.assertIn("maxDownloadRequestsAnimation = 4;", flo)
+            self.assertIn("totalBytesCount >= 1024 * 128 ? 1024 * 64 : 1024 * 32", flo)
 
             fl = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[7])
             self.assertIn("operation.totalBytesCount > 2 * 1024 * 1024 || isStory", fl)
             load_int_idx = fl.rfind("private FileLoadOperation loadFileInternal(")
             load_int = extract_method(fl[load_int_idx:], "private FileLoadOperation loadFileInternal(")
             self.assertNotIn("priority = PRIORITY_HIGH;", load_int)
-            self.assertIn("priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX", load_int)
+            self.assertEqual(load_int.count("if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_NORMAL_UP)"), 2)
 
             fpq = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[8])
-            self.assertIn("type == TYPE_LARGE ? 3 : 12", fpq)
+            self.assertIn("PRIORITY_VALUE_NORMAL_UP = PRIORITY_VALUE_NORMAL + 1;", fpq)
+            self.assertIn("type == TYPE_LARGE ? 3 : 6", fpq)
+            self.assertIn("? 8 : 20", fpq)
 
             sm = read_text(tmp_path / TRACK_A_TELEGRAM_RELS[9])
             self.assertIn("connectionsManager.colgramIsRawDisconnected()", sm)
@@ -411,9 +477,15 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
             self.assertIn("colgramLottiePrecacheLockFor(", il)
             self.assertIn("int fitzModifier, boolean isSingleChannel", il)
             self.assertNotIn("int[] fitzModifier", il)
+            self.assertIn("boolean unlimited = true;", il)
+            self.assertIn("int lottieCacheSize = 512 * 512 * 2 * 4 * 5;", il)
+            self.assertNotIn("ColgramConfig.isUnlimitedMemoryEnabled()", il)
 
             chat_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
             self.assertIn("ColgramPremiumConfig.isBlockSponsoredAdsEnabled()", chat_src)
+            self.assertNotIn("scheduledLoadIndex", chat_src)
+            self.assertNotIn("waitingForLoad.remove(scheduledLoadIndex)", chat_src)
+            self.assertIn("colgramParticipantsChatId", chat_src)
             self.assertIn("350", chat_src)
 
             va_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/video/VideoAds.java")
@@ -421,6 +493,12 @@ class BypassBgPatchesDryRunTest(unittest.TestCase):
 
             ae_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/Components/AnimatedEmojiDrawable.java")
             self.assertIn("loadFromServerIds.size() > 100", ae_src)
+            self.assertNotIn("doOnIdle", ae_src)
+            self.assertIn("50L", ae_src)
+            self.assertIn("2500L", ae_src)
+            self.assertIn("6000L", ae_src)
+            self.assertIn("colgramRetryCounts", ae_src)
+            self.assertIn("colgramEnsureConnObserver", ae_src)
 
             ext_ds_src = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/secretmedia/ExtendedDefaultDataSource.java")
             self.assertNotIn("Mode.DIRECT", ext_ds_src)
@@ -513,9 +591,9 @@ public class ImageLoader {
             self.assertEqual(ap.PATCH_MISSES, [])
 
             cm_pass1 = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java")
-            direct_safe = extract_method(cm_pass1, "private static boolean colgramIsDirectSendResponseSafe(")
-            self.assertIn("TLRPC.TL_inputMediaGame", direct_safe)
+            self.assertNotIn("colgramIsDirectSendResponseSafe", cm_pass1)
             self.assertIn("colgramNeedConnCheck = colgramIsRawDisconnected();", cm_pass1)
+            self.assertIn("ColgramHookHandler.canAutoRestartDpiBypass()", cm_pass1)
 
             sm_pass1 = read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java")
             prep_pass1 = extract_method(sm_pass1, "private void colgramPrepareInstantSend()")
@@ -545,6 +623,192 @@ public class ImageLoader {
                 read_text(tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java"),
                 sm_pass1,
             )
+
+    def test_bypass_bg_patches_converge_two_pass_from_010_and_apply_patches_baseline(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import bypass_bg_patches
+
+        ap_spec = importlib.util.spec_from_file_location("apply_patches_010_baseline", ROOT / "scripts/apply-patches.py")
+        ap = importlib.util.module_from_spec(ap_spec)
+        ap_spec.loader.exec_module(ap)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for rel in TRACK_A_TELEGRAM_RELS:
+                dst = tmp_path / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / "Telegram-Src" / rel, dst)
+
+            # Reset FileLoadOperation.java to apply-patches.py perf #1 (isAvatarOrSmall) + cdn_supported=true baseline
+            flo_path = tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/FileLoadOperation.java"
+            flo_src = read_text(flo_path).replace("\r\n", "\n")
+            flo_new_params = """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+                || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || location instanceof TLRPC.TL_inputStickerSetThumb
+                || location instanceof TLRPC.TL_inputPhotoFileLocation
+                || totalBytesCount <= 0
+                || totalBytesCount < 256 * 1024;
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 128 ? 1024 * 64 : 1024 * 32) : 1024 * 128;
+            downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;
+            maxDownloadRequests = 4;
+            maxDownloadRequestsBig = 4;
+            maxDownloadRequestsAnimation = 4;"""
+            flo_old_params = """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+                || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || location instanceof TLRPC.TL_inputStickerSetThumb
+                || location instanceof TLRPC.TL_inputPhotoFileLocation
+                || totalBytesCount <= 0
+                || totalBytesCount < 256 * 1024;
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 32 ? 1024 * 64 : 1024 * 32) : 1024 * 128;
+            downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;
+            maxDownloadRequests = 6;
+            maxDownloadRequestsBig = 6;
+            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);"""
+            flo_010_params = """        boolean isAvatarOrSmall = location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || (totalBytesCount > 0 && totalBytesCount <= 256 * 1024);
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = (isAvatarOrSmall && (totalBytesCount <= 0 || totalBytesCount > 64 * 1024))
+                    || totalBytesCount >= 256 * 1024 ? 1024 * 128 : 1024 * 64;
+            downloadChunkSizeBig = 1024 * 512;
+            maxDownloadRequests = 12;
+            maxDownloadRequestsBig = 12;
+            maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 12);"""
+            matched_flo = flo_new_params if flo_new_params in flo_src else flo_old_params
+            self.assertIn(matched_flo, flo_src)
+            flo_src = flo_src.replace(matched_flo, flo_010_params, 1)
+            flo_src = flo_src.replace("req.cdn_supported = !org.colgram.core.ColgramDpiBypass.isBound();", "req.cdn_supported = true;", 1)
+            flo_path.write_text(flo_src, encoding="utf-8", newline="\n")
+
+            # Reset FileLoaderPriorityQueue.java to pre-PRIORITY_VALUE_NORMAL_UP / 20ms checkDelayMs / 8:24 cap
+            fpq_path = tmp_path / "TMessagesProj/src/main/java/org/telegram/messenger/FileLoaderPriorityQueue.java"
+            fpq_src = read_text(fpq_path).replace("\r\n", "\n")
+            fpq_src = fpq_src.replace(
+                "    public final static int PRIORITY_VALUE_NORMAL_UP = PRIORITY_VALUE_NORMAL + 1;\n",
+                "",
+                1,
+            ).replace(
+                "        long checkDelayMs = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled() ? 8 : 20;\n"
+                "        workerQueue.postRunnable(checkOperationsRunnable, checkDelayMs);",
+                "        workerQueue.postRunnable(checkOperationsRunnable, 20);",
+                1,
+            ).replace(
+                "        long checkDelayMs = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled() ? 1 : 20;\n"
+                "        workerQueue.postRunnable(checkOperationsRunnable, checkDelayMs);",
+                "        workerQueue.postRunnable(checkOperationsRunnable, 20);",
+                1,
+            ).replace("max = Math.max(max, type == TYPE_LARGE ? 3 : 6);", "max = Math.max(max, type == TYPE_LARGE ? 8 : 24);", 1).replace("max = Math.max(max, type == TYPE_LARGE ? 3 : 12);", "max = Math.max(max, type == TYPE_LARGE ? 8 : 24);", 1)
+            fpq_path.write_text(fpq_src, encoding="utf-8", newline="\n")
+
+            # Reset AnimatedEmojiDrawable.java to fresh 010-consolidated baseline (doOnIdle present, no >100 chunking)
+            ae_path = tmp_path / "TMessagesProj/src/main/java/org/telegram/ui/Components/AnimatedEmojiDrawable.java"
+            ae_src = read_text(ae_path).replace("\r\n", "\n")
+            ae_010_full = """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
+            if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
+                processDocumentsAndLoadMore(documents, loadFromServerIds);
+            } else {
+                NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> processDocumentsAndLoadMore(documents, loadFromServerIds)));
+            }
+        }
+
+        private void loadFromServer(ArrayList<Long> loadFromServerIds) {
+            if (loadFromServerIds.isEmpty()) {
+                return;
+            }
+            TLRPC.User colgramSelf = org.telegram.messenger.UserConfig.getInstance(currentAccount).getCurrentUser();
+            if (colgramSelf != null && colgramSelf.bot) {
+                org.colgram.core.ColgramBotSync.fetchCustomEmojiForBot(
+                        org.telegram.messenger.ApplicationLoader.applicationContext,
+                        currentAccount,
+                        new ArrayList<>(loadFromServerIds),
+                        objects -> NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> {
+                            if (objects != null && !objects.isEmpty()) {
+                                putToStorage(objects);
+                                processDocuments(objects);
+                            } else if (loadingDocuments != null) {
+                                for (int i = 0; i < loadFromServerIds.size(); i++) {
+                                    loadingDocuments.remove(loadFromServerIds.get(i));
+                                }
+                            }
+                        })));
+                return;
+            }
+            final TLRPC.TL_messages_getCustomEmojiDocuments req = new TLRPC.TL_messages_getCustomEmojiDocuments();
+            req.document_id = loadFromServerIds;
+            ConnectionsManager.getInstance(currentAccount).sendRequest(req, (res, err) -> NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> {
+                HashSet<Long> loadedFromServer = new HashSet<>(loadFromServerIds);
+                if (res instanceof Vector) {
+                    ArrayList<Object> objects = ((Vector) res).objects;
+                    putToStorage(objects);
+                    processDocuments(objects);
+                    for (int i = 0; i < objects.size(); i++) {
+                        if (objects.get(i) instanceof TLRPC.Document) {
+                            TLRPC.Document document = (TLRPC.Document) objects.get(i);
+                            loadedFromServer.remove(document.id);
+                        }
+                    }
+
+                    if (!loadedFromServer.isEmpty() && loadedFromServer.size() < loadFromServerIds.size()) {
+                        loadFromServer(new ArrayList<>(loadedFromServer));
+                    } else if (!loadedFromServer.isEmpty() && loadingDocuments != null) {
+                        for (Long missingId : loadedFromServer) {
+                            loadingDocuments.remove(missingId);
+                        }
+                    }
+                } else if (loadingDocuments != null) {
+                    for (int i = 0; i < loadFromServerIds.size(); i++) {
+                        loadingDocuments.remove(loadFromServerIds.get(i));
+                    }
+                }
+            })));
+        }
+
+"""
+            ae_start = ae_src.index("        private void processDatabaseResult(")
+            ae_end = ae_src.index("        private void putToStorage(")
+            ae_path.write_text(ae_src[:ae_start] + ae_010_full + ae_src[ae_end:], encoding="utf-8", newline="\n")
+
+            # Reset ConnectionsManager.java native_init cloak block to apply-patches.py baseline
+            cm_path = tmp_path / "TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java"
+            cm_src = read_text(cm_path).replace("\r\n", "\n")
+            cm_cloak_max = """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+        }
+        if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+            installer = "com.android.vending";
+            packageId = "org.telegram.messenger";
+            if (!enablePushConnection) {
+                regId = "";
+            }
+            cFingerprint = "";
+            timezoneOffset = 0;
+        }"""
+            cm_cloak_cur = """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+            packageId = "org.telegram.messenger";
+            if (!enablePushConnection) {
+                regId = "";
+            }
+            cFingerprint = "";
+            timezoneOffset = 0;
+        }"""
+            cm_cloak_010 = """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+        }"""
+            matched_cm = cm_cloak_max if cm_cloak_max in cm_src else cm_cloak_cur
+            self.assertIn(matched_cm, cm_src)
+            cm_path.write_text(cm_src.replace(matched_cm, cm_cloak_010, 1), encoding="utf-8", newline="\n")
+
+            ap.PATCH_MISSES.clear()
+            bypass_bg_patches.apply(str(tmp_path), ap.patch_file, ap._patch_file_eol)
+            self.assertEqual(ap.PATCH_MISSES, [])
+
+            snap1 = {rel: read_text(tmp_path / rel) for rel in TRACK_A_TELEGRAM_RELS}
+            bypass_bg_patches.apply(str(tmp_path), ap.patch_file, ap._patch_file_eol)
+            self.assertEqual(ap.PATCH_MISSES, [])
+            for rel in TRACK_A_TELEGRAM_RELS:
+                self.assertEqual(read_text(tmp_path / rel), snap1[rel], f"Pass 2 drifted on {rel}")
 
 
 if __name__ == "__main__":

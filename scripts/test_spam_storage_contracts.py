@@ -162,6 +162,12 @@ class SpamStorageContractsTest(unittest.TestCase):
             self.assertIn("ColgramPremiumConfig.isBlockSponsoredAdsEnabled()", dl_text)
             self.assertIn("ColgramFileSafetyPolicy.shouldBlockAutoDownload", dl_text)
             self.assertIn("getFileLoader().loadFile(document, downloadObject.parent, FileLoader.PRIORITY_LOW, downloadObject.secret ? 2 : 0, true);", dl_text)
+            self.assertNotIn("Math.min(600,", dl_text)
+            self.assertIn("AndroidUtilities.getPhotoSize()", dl_text)
+            self.assertNotIn("!org.colgram.core.ColgramShieldConfig.isMalwareDownloadShieldEnabled()", dl_text)
+            blocked_slice = dl_text.split("private boolean isColgramAutoDownloadBlocked(", 1)[1].split("public boolean canDownloadMedia(", 1)[0]
+            self.assertNotIn("TYPE_STORY", blocked_slice)
+            self.assertNotIn("TL_messageMediaStory", blocked_slice)
 
             fl_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java"].decode("utf-8")
             self.assertNotIn("document != null && priority <= PRIORITY_LOW", fl_text)
@@ -171,7 +177,12 @@ class SpamStorageContractsTest(unittest.TestCase):
             fl_internal = fl_text.split("private FileLoadOperation loadFileInternal(", 1)[1].split("FileLoadOperation operation = loadOperationPaths.get(", 1)[0]
             self.assertIn("final boolean isAutoDownload", fl_internal)
             self.assertIn("if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {", fl_internal)
-            self.assertIn("priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX", fl_text.split("private FileLoadOperation loadFileInternal(", 1)[1].split("\n    public static boolean canSaveAsFile(", 1)[0])
+            src_fl_text = _read(os.path.join(TG_SRC, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java"))
+            fl_load_internal_full = fl_text.split("private FileLoadOperation loadFileInternal(", 1)[1].split("\n    public static boolean canSaveAsFile(", 1)[0]
+            if "PRIORITY_VALUE_NORMAL_UP" in src_fl_text:
+                self.assertIn("priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_NORMAL_UP", fl_load_internal_full)
+            else:
+                self.assertIn("priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX", fl_load_internal_full)
             self.assertLess(
                 fl_internal.index("if (isAutoDownload && isColgramAutoDownloadBlocked(document)) {"),
                 fl_internal.index("loadOperationPathsUI.put("),
@@ -202,6 +213,8 @@ class SpamStorageContractsTest(unittest.TestCase):
 
             au_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java"].decode("utf-8")
             self.assertIn("String colgramDocName = FileLoader.getDocumentFileName(document);", au_text)
+            self.assertIn("ColgramStorageSandbox.getCacheRootDir(", au_text)
+            self.assertIn("ColgramStorageSandbox.getSandboxRootDir(", au_text)
 
             mo_text = pass1["TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java"].decode("utf-8")
             self.assertIn("public boolean colgramLayoutCollapsed;", mo_text)
@@ -263,6 +276,20 @@ class SpamStorageContractsTest(unittest.TestCase):
         self.assertIn("markup.rows == null", br_src)
         self.assertIn("collectOwnUsernames(", br_src)
         self.assertIn("cc.isContact(userId)", br_src)
+        intercept_body = br_src.split("public static boolean interceptIncomingSpamPing(", 1)[1].split("private static void captureShadowMessageFromTL(", 1)[0]
+        self.assertIn("if (msg.post) return false;", intercept_body)
+        self.assertIn("ChatObject.isChannelAndNotMegaGroup(chat)", intercept_body)
+        self.assertIn("if (!isPing) return false;", intercept_body)
+        self.assertIn("86400", intercept_body)
+        storage_block_body = br_src.split("public static boolean isStorageAutoDownloadBlocked(", 1)[1]
+        self.assertNotIn("TL_messageMediaStory", storage_block_body)
+
+        cfg_src = _read(os.path.join(CORE_DIR, "ColgramConfig.java"))
+        self.assertIn("colgram_pre_v4_unlimited_optin", cfg_src)
+        self.assertIn("wasPreV4UnlimitedOptIn()", cfg_src)
+        self.assertIn("ColgramConfig.wasPreV4UnlimitedOptIn()", sc_src)
+        self.assertIn("isUiEssentialCacheAsset(", ce_src)
+        self.assertIn("1.15d", ce_src)
 
 
 if __name__ == "__main__":

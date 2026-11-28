@@ -4,12 +4,10 @@ import static org.telegram.messenger.AndroidUtilities.dp;
 
 import android.app.Activity;
 import android.content.Context;
-import android.graphics.Color;
 import android.graphics.PorterDuff;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.TextUtils;
-import android.util.Pair;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -22,71 +20,38 @@ import android.widget.TextView;
 
 import org.colgram.core.ColgramBuildFlags;
 import org.telegram.messenger.AndroidUtilities;
-import org.telegram.messenger.ChatObject;
 import org.telegram.messenger.ContactsController;
-import org.telegram.messenger.ImageLocation;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.R;
-import org.telegram.messenger.UserObject;
 import org.telegram.tgnet.ConnectionsManager;
-import org.telegram.tgnet.TLObject;
 import org.telegram.tgnet.TLRPC;
-import org.telegram.tgnet.Vector;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.BottomSheet;
 import org.telegram.ui.ActionBar.Theme;
-import org.telegram.ui.Components.AvatarDrawable;
-import org.telegram.ui.Components.BackupImageView;
+import org.telegram.ui.Components.Bulletin;
+import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.MessagePrivateSeenView;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 
 /**
- * ColgramMessageSeenSheet — Mobile equivalent of Telegram Desktop's right-click "Seen by" viewer
- * for photos, videos, documents/media files, voice messages, and video circles (кружки).
- * Accessible from ChatActivity ActionMode (long-press any media/кружок -> 👁), PhotoViewer ⋮ menu,
- * and ChatActivity's message menu.
+ * Thin Aero modal wrapper over ColgramReadReceiptsHelper + native MessageSeenView.UserCell rows.
+ * Used where Telegram provides no native swipeback popup (ActionMode eye icon & PhotoViewer menu),
+ * guaranteeing identical eligibility, counts, viewers, badges, and DM error handling.
  */
 public final class ColgramMessageSeenSheet {
 
     private ColgramMessageSeenSheet() {}
 
     public static boolean canCheckSeen(int currentAccount, MessageObject message, TLRPC.Chat chat, TLRPC.User user) {
-        if (message == null || message.messageOwner == null) return false;
-        if (!message.isOutOwner() || !message.isSent() || message.isEditing()
-                || message.isSending() || message.isSendError() || message.getId() <= 0) {
-            return false;
-        }
-        if (message.isEphemeral() || message.isSecretMedia()) return false;
-        if (message.messageOwner.action instanceof TLRPC.TL_messageActionChatJoinedByRequest) return false;
-
-        if (chat != null) {
-            // Groups & supergroups (not broadcast channels / monoforums)
-            if (ChatObject.isChannel(chat) && !ChatObject.isMegagroup(chat)) return false;
-            if (ChatObject.isMonoForum(chat)) return false;
-            return true;
-        }
-        if (user != null) {
-            return !UserObject.isUserSelf(user)
-                    && !UserObject.isReplyUser(user)
-                    && !UserObject.isAnonymous(user)
-                    && !user.bot
-                    && !UserObject.isService(user.id);
-        }
-        return false;
+        return ColgramReadReceiptsHelper.canShowReadReceipts(currentAccount, message, chat, user);
     }
 
     public static boolean canCheckSeenForMessage(int currentAccount, MessageObject message) {
-        if (message == null) return false;
-        long dialogId = message.getDialogId();
-        MessagesController mc = MessagesController.getInstance(currentAccount);
-        TLRPC.Chat chat = dialogId < 0 ? mc.getChat(-dialogId) : null;
-        TLRPC.User user = dialogId > 0 ? mc.getUser(dialogId) : null;
-        return canCheckSeen(currentAccount, message, chat, user);
+        return ColgramReadReceiptsHelper.canShowReadReceiptsForMessage(currentAccount, message);
     }
 
     public static void showFromPhotoViewer(
@@ -127,7 +92,8 @@ public final class ColgramMessageSeenSheet {
             TLRPC.User user,
             Theme.ResourcesProvider resourcesProvider
     ) {
-        if (act == null || act.isFinishing() || act.isDestroyed() || message == null || !canCheckSeen(currentAccount, message, chat, user)) {
+        if (act == null || act.isFinishing() || act.isDestroyed() || message == null
+                || !canCheckSeen(currentAccount, message, chat, user)) {
             return;
         }
         final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
@@ -148,7 +114,6 @@ public final class ColgramMessageSeenSheet {
         LinearLayout root = ColgramUiKit.makeSheetRoot(act, pal);
         ColgramAeroStyler.applyFlagshipSheetChrome(sheet, root, pal);
 
-        // Header row
         LinearLayout header = new LinearLayout(act);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -182,7 +147,12 @@ public final class ColgramMessageSeenSheet {
         titleCol.addView(titleTv);
 
         final TextView subTv = new TextView(act);
-        subTv.setText(chat != null ? chat.title : ContactsController.formatName(user));
+        String peerName = chat != null ? chat.title : ContactsController.formatName(user);
+        int reactTotal = countMessageReactions(message);
+        if (reactTotal > 0) {
+            peerName = peerName + " · " + LocaleController.formatPluralString("ReactionsCount", reactTotal);
+        }
+        subTv.setText(peerName);
         subTv.setTextColor(cTextSecondary);
         subTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
         subTv.setMaxLines(1);
@@ -191,42 +161,14 @@ public final class ColgramMessageSeenSheet {
         header.addView(titleCol, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
         root.addView(header, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 14));
 
-        // Private 1-on-1 chat path: show native MessagePrivateSeenView inside our glass card
-        if (chat == null) {
-            LinearLayout card = new LinearLayout(act);
-            card.setOrientation(LinearLayout.VERTICAL);
-            card.setPadding(dp(10), dp(10), dp(10), dp(10));
-            GradientDrawable cBg = new GradientDrawable();
-            cBg.setColor(cCard);
-            cBg.setCornerRadius(dp(16));
-            cBg.setStroke(dp(1), cBorder);
-            card.setBackground(cBg);
+        final int[] reqIds = new int[]{0};
 
-            MessagePrivateSeenView privateSeen = new MessagePrivateSeenView(
-                    act,
-                    MessagePrivateSeenView.TYPE_SEEN,
-                    message,
-                    sheet::dismiss,
-                    resourcesProvider
-            );
-            card.addView(privateSeen, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));
-            root.addView(card, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-            sheet.setCustomView(root);
-            if (ColgramBuildFlags.KOLITI_ENABLED) {
-                ColgramGlobalOrbController.pushModalSuppression();
-                sheet.setOnDismissListener(d -> ColgramGlobalOrbController.popModalSuppression());
-            }
-            try {
-                sheet.show();
-            } catch (Throwable ignored) {
-                if (ColgramBuildFlags.KOLITI_ENABLED) {
-                    ColgramGlobalOrbController.popModalSuppression();
-                }
-            }
+        if (chat == null) {
+            showPrivateSheet(act, sheet, root, reqIds, currentAccount, message, cTextPrimary, cTextSecondary,
+                    cCard, cBorder, cAccent, resourcesProvider);
             return;
         }
 
-        // Group / Supergroup path: live TL_messages_getMessageReadParticipants
         final LinearLayout listContainer = new LinearLayout(act);
         listContainer.setOrientation(LinearLayout.VERTICAL);
         listContainer.setPadding(dp(8), dp(8), dp(8), dp(8));
@@ -236,19 +178,7 @@ public final class ColgramMessageSeenSheet {
         cardBg.setStroke(dp(1), cBorder);
         listContainer.setBackground(cardBg);
 
-        LinearLayout loadingRow = new LinearLayout(act);
-        loadingRow.setOrientation(LinearLayout.HORIZONTAL);
-        loadingRow.setGravity(Gravity.CENTER);
-        loadingRow.setPadding(dp(12), dp(18), dp(12), dp(18));
-        ProgressBar pb = new ProgressBar(act);
-        pb.setIndeterminate(true);
-        loadingRow.addView(pb, LayoutHelper.createLinear(22, 22, 0, 0, 10, 0));
-        TextView loadTv = new TextView(act);
-        loadTv.setText("Загружаю список просмотров…");
-        loadTv.setTextColor(cTextSecondary);
-        loadTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
-        loadingRow.addView(loadTv);
-        listContainer.addView(loadingRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        addLoadingRow(act, listContainer, cTextSecondary, "Загружаю список просмотров…");
 
         final int maxH = Math.min(dp(380), (int) (AndroidUtilities.displaySize.y * 0.52f));
         ScrollView scroll = new ScrollView(act) {
@@ -268,7 +198,168 @@ public final class ColgramMessageSeenSheet {
             bottomMargin = dp(4);
         }});
 
-        final int[] reqIds = new int[]{0, 0};
+        presentModalSheet(sheet, root, currentAccount, reqIds);
+
+        final int totalReactions = reactTotal;
+        reqIds[0] = ColgramReadReceiptsHelper.loadGroupReadParticipants(currentAccount, message, chat, false, res -> {
+            reqIds[0] = 0;
+            if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
+            if (res == null || res.errorText != null) {
+                String msgText;
+                if (res != null && res.errorText != null && res.errorText.contains("MESSAGE_ID_INVALID")) {
+                    msgText = "Список просмотров недоступен для этого сообщения.";
+                } else {
+                    msgText = "Пока никто не посмотрел или список просмотров недоступен в этом чате.";
+                }
+                renderEmpty(act, listContainer, msgText, cTextSecondary);
+                return;
+            }
+            ArrayList<ColgramReadReceiptsHelper.ViewerEntry> entries = res.viewers;
+            if (entries.isEmpty()) {
+                renderEmpty(act, listContainer,
+                        LocaleController.getString(R.string.NobodyViewed),
+                        cTextSecondary);
+                String zeroSub = chat.title + " • " + LocaleController.formatPluralString(
+                        isPlayedMedia ? "MessagePlayed" : "MessageSeen", 0);
+                if (totalReactions > 0) {
+                    zeroSub += " · " + LocaleController.formatPluralString("ReactionsCount", totalReactions);
+                }
+                subTv.setText(zeroSub);
+                return;
+            }
+
+            String seenSummary = chat.title + " • " + LocaleController.formatPluralString(
+                    isPlayedMedia ? "MessagePlayed" : "MessageSeen", entries.size());
+            if (totalReactions > 0) {
+                seenSummary += " · " + LocaleController.formatPluralString("ReactionsCount", totalReactions);
+            }
+            subTv.setText(seenSummary);
+
+            listContainer.removeAllViews();
+            for (int i = 0; i < entries.size(); i++) {
+                ColgramReadReceiptsHelper.ViewerEntry entry = entries.get(i);
+                MessageSeenView.UserCell row = new MessageSeenView.UserCell(act);
+                row.setBackground(Theme.createRadSelectorDrawable(Theme.getColor(Theme.key_listSelector, resourcesProvider), dp(12), dp(12)));
+                row.setUser(entry.obj, entry.date, false);
+                if (row.nameView != null) {
+                    row.nameView.setTextColor(cTextPrimary);
+                }
+                if (row.readView != null) {
+                    row.readView.setTextColor(cTextSecondary);
+                }
+                final long peerId = entry.peerId;
+                row.setOnClickListener(v -> {
+                    if (parentFragment == null || parentFragment.isFinishing() || parentFragment.getParentLayout() == null) {
+                        return;
+                    }
+                    sheet.dismiss();
+                    Bundle args = new Bundle();
+                    if (peerId > 0) {
+                        args.putLong("user_id", peerId);
+                    } else if (peerId < 0) {
+                        args.putLong("chat_id", -peerId);
+                    } else {
+                        return;
+                    }
+                    parentFragment.presentFragment(new ProfileActivity(args));
+                });
+                listContainer.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50));
+                if (i < entries.size() - 1) {
+                    View div = new View(act);
+                    div.setBackgroundColor(cBorder);
+                    listContainer.addView(div, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 1, 56, 0, 10, 0));
+                }
+            }
+        });
+    }
+
+    private static void showPrivateSheet(
+            Activity act,
+            BottomSheet sheet,
+            LinearLayout root,
+            int[] reqIds,
+            int currentAccount,
+            MessageObject message,
+            int cTextPrimary,
+            int cTextSecondary,
+            int cCard,
+            int cBorder,
+            int cAccent,
+            Theme.ResourcesProvider resourcesProvider) {
+        final LinearLayout card = new LinearLayout(act);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
+        GradientDrawable cBg = new GradientDrawable();
+        cBg.setColor(cCard);
+        cBg.setCornerRadius(dp(16));
+        cBg.setStroke(dp(1), cBorder);
+        card.setBackground(cBg);
+
+        final ProgressBar pb = new ProgressBar(act);
+        pb.setIndeterminate(true);
+        card.addView(pb, LayoutHelper.createLinear(20, 20, 0, 0, 10, 0));
+
+        final TextView statusTv = new TextView(act);
+        statusTv.setText("Загружаю статус прочтения…");
+        statusTv.setTextColor(cTextSecondary);
+        statusTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14f);
+        card.addView(statusTv, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
+
+        final TextView badgeTv = new TextView(act);
+        badgeTv.setVisibility(View.GONE);
+        badgeTv.setTextColor(cAccent);
+        badgeTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
+        badgeTv.setTypeface(AndroidUtilities.bold());
+        badgeTv.setPadding(dp(10), dp(4), dp(10), dp(4));
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setCornerRadius(dp(12));
+        badgeBg.setColor(Theme.multAlpha(cAccent, 0.14f));
+        badgeTv.setBackground(badgeBg);
+        card.addView(badgeTv, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, 8, 0, 0, 0));
+
+        root.addView(card, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        presentModalSheet(sheet, root, currentAccount, reqIds);
+
+        Runnable[] fetch = new Runnable[1];
+        fetch[0] = () -> reqIds[0] = ColgramReadReceiptsHelper.loadPrivateReadDate(
+                currentAccount,
+                message.getDialogId(),
+                message.getId(),
+                false,
+                res -> {
+                    reqIds[0] = 0;
+                    if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
+                    pb.setVisibility(View.GONE);
+                    String text = ColgramReadReceiptsHelper.formatPrivateStatusText(res);
+                    statusTv.setText(text);
+                    statusTv.setTextColor(res != null && res.status == ColgramReadReceiptsHelper.PrivateSeenResult.STATUS_OK
+                            ? cTextPrimary : cTextSecondary);
+                    if (res != null && res.status == ColgramReadReceiptsHelper.PrivateSeenResult.STATUS_YOUR_PRIVACY_RESTRICTED) {
+                        badgeTv.setText(LocaleController.getString(R.string.PmReadShowWhen));
+                        badgeTv.setVisibility(View.VISIBLE);
+                        card.setOnClickListener(v -> MessagePrivateSeenView.showSheet(
+                                act, currentAccount, message.getDialogId(), false,
+                                sheet::dismiss,
+                                () -> {
+                                    ColgramReadReceiptsHelper.invalidateMessage(currentAccount, message.getDialogId(), message.getId());
+                                    pb.setVisibility(View.VISIBLE);
+                                    badgeTv.setVisibility(View.GONE);
+                                    fetch[0].run();
+                                },
+                                resourcesProvider));
+                    } else {
+                        badgeTv.setVisibility(View.GONE);
+                        card.setOnClickListener(null);
+                        if (res != null && res.status == ColgramReadReceiptsHelper.PrivateSeenResult.STATUS_ERROR && res.rawError != null) {
+                            BulletinFactory.of(Bulletin.BulletinWindow.make(act), resourcesProvider).showForError(res.rawError);
+                        }
+                    }
+                });
+        fetch[0].run();
+    }
+
+    private static void presentModalSheet(BottomSheet sheet, LinearLayout root, int currentAccount, int[] reqIds) {
         sheet.setCustomView(root);
         if (ColgramBuildFlags.KOLITI_ENABLED) {
             ColgramGlobalOrbController.pushModalSuppression();
@@ -277,14 +368,9 @@ public final class ColgramMessageSeenSheet {
             if (ColgramBuildFlags.KOLITI_ENABLED) {
                 ColgramGlobalOrbController.popModalSuppression();
             }
-            ConnectionsManager cm = ConnectionsManager.getInstance(currentAccount);
-            if (reqIds[0] != 0) {
-                cm.cancelRequest(reqIds[0], true);
+            if (reqIds != null && reqIds[0] != 0) {
+                ConnectionsManager.getInstance(currentAccount).cancelRequest(reqIds[0], true);
                 reqIds[0] = 0;
-            }
-            if (reqIds[1] != 0) {
-                cm.cancelRequest(reqIds[1], true);
-                reqIds[1] = 0;
             }
         });
         try {
@@ -293,117 +379,39 @@ public final class ColgramMessageSeenSheet {
             if (ColgramBuildFlags.KOLITI_ENABLED) {
                 ColgramGlobalOrbController.popModalSuppression();
             }
-            return;
         }
+    }
 
-        final MessagesController mc = MessagesController.getInstance(currentAccount);
-        TLRPC.TL_messages_getMessageReadParticipants req = new TLRPC.TL_messages_getMessageReadParticipants();
-        req.msg_id = message.getId();
-        req.peer = mc.getInputPeer(message.getDialogId());
-        final long fromId = message.messageOwner.from_id != null ? message.messageOwner.from_id.user_id : 0L;
-
-        reqIds[0] = ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
-            reqIds[0] = 0;
-            if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
-            if (error != null || !(response instanceof Vector)) {
-                String msgText;
-                if (error != null && error.text != null && error.text.contains("MESSAGE_ID_INVALID")) {
-                    msgText = "Список просмотров недоступен для этого сообщения (возможно, прошло более 7 дней или в чате более 100 участников).";
-                } else {
-                    msgText = "Пока никто не посмотрел или список просмотров недоступен в этом чате.";
-                }
-                renderEmpty(act, listContainer, msgText, cTextSecondary);
-                return;
+    private static int countMessageReactions(MessageObject message) {
+        if (message == null || message.messageOwner == null
+                || message.messageOwner.reactions == null
+                || message.messageOwner.reactions.results == null) {
+            return 0;
+        }
+        int total = 0;
+        for (int i = 0; i < message.messageOwner.reactions.results.size(); i++) {
+            TLRPC.ReactionCount rc = message.messageOwner.reactions.results.get(i);
+            if (rc != null && rc.count > 0) {
+                total += rc.count;
             }
+        }
+        return total;
+    }
 
-            Vector vector = (Vector) response;
-            final ArrayList<Pair<Long, Integer>> allPeers = new ArrayList<>();
-            final HashMap<Long, TLObject> localMap = new HashMap<>();
-            boolean needFetchUsers = false;
-
-            for (int i = 0, n = vector.objects.size(); i < n; i++) {
-                Object o = vector.objects.get(i);
-                long peerId = 0L;
-                int date = 0;
-                if (o instanceof TLRPC.TL_readParticipantDate) {
-                    peerId = ((TLRPC.TL_readParticipantDate) o).user_id;
-                    date = ((TLRPC.TL_readParticipantDate) o).date;
-                } else if (o instanceof Long) {
-                    peerId = (Long) o;
-                }
-                if (peerId == 0L || peerId == fromId) continue;
-                allPeers.add(new Pair<>(peerId, date));
-                TLObject cached = peerId > 0 ? mc.getUser(peerId) : mc.getChat(-peerId);
-                if (cached != null) {
-                    localMap.put(peerId, cached);
-                } else {
-                    needFetchUsers = true;
-                }
-            }
-
-            if (allPeers.isEmpty()) {
-                renderEmpty(act, listContainer,
-                        isPlayedMedia ? "Пока никто не посмотрел / не прослушал." : "Пока никто из участников не посмотрел.",
-                        cTextSecondary);
-                subTv.setText(chat.title + " • 0 просмотров");
-                return;
-            }
-
-            Runnable renderList = () -> {
-                if (sheet.isDismissed()) return;
-                subTv.setText(chat.title + " • " + LocaleController.formatPluralString(
-                        isPlayedMedia ? "MessagePlayed" : "MessageSeen", allPeers.size()));
-                listContainer.removeAllViews();
-                for (int i = 0; i < allPeers.size(); i++) {
-                    Pair<Long, Integer> pair = allPeers.get(i);
-                    TLObject obj = localMap.get(pair.first);
-                    addViewerRow(act, parentFragment, sheet, currentAccount, listContainer, obj, pair.first, pair.second,
-                            cTextPrimary, cTextSecondary, cBorder, i < allPeers.size() - 1);
-                }
-            };
-
-            if (!needFetchUsers) {
-                renderList.run();
-                return;
-            }
-
-            if (ChatObject.isChannel(chat)) {
-                TLRPC.TL_channels_getParticipants uReq = new TLRPC.TL_channels_getParticipants();
-                uReq.limit = Math.max(100, mc.chatReadMarkSizeThreshold);
-                uReq.offset = 0;
-                uReq.filter = new TLRPC.TL_channelParticipantsRecent();
-                uReq.channel = mc.getInputChannel(chat.id);
-                reqIds[1] = ConnectionsManager.getInstance(currentAccount).sendRequest(uReq, (r1, e1) -> AndroidUtilities.runOnUIThread(() -> {
-                    reqIds[1] = 0;
-                    if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
-                    if (r1 instanceof TLRPC.TL_channels_channelParticipants) {
-                        TLRPC.TL_channels_channelParticipants cp = (TLRPC.TL_channels_channelParticipants) r1;
-                        for (int i = 0; i < cp.users.size(); i++) {
-                            TLRPC.User u = cp.users.get(i);
-                            mc.putUser(u, false);
-                            localMap.put(u.id, u);
-                        }
-                    }
-                    renderList.run();
-                }));
-            } else {
-                TLRPC.TL_messages_getFullChat uReq = new TLRPC.TL_messages_getFullChat();
-                uReq.chat_id = chat.id;
-                reqIds[1] = ConnectionsManager.getInstance(currentAccount).sendRequest(uReq, (r1, e1) -> AndroidUtilities.runOnUIThread(() -> {
-                    reqIds[1] = 0;
-                    if (sheet.isDismissed() || act.isFinishing() || act.isDestroyed()) return;
-                    if (r1 instanceof TLRPC.TL_messages_chatFull) {
-                        TLRPC.TL_messages_chatFull cf = (TLRPC.TL_messages_chatFull) r1;
-                        for (int i = 0; i < cf.users.size(); i++) {
-                            TLRPC.User u = cf.users.get(i);
-                            mc.putUser(u, false);
-                            localMap.put(u.id, u);
-                        }
-                    }
-                    renderList.run();
-                }));
-            }
-        }));
+    private static void addLoadingRow(Context ctx, LinearLayout container, int color, String text) {
+        LinearLayout loadingRow = new LinearLayout(ctx);
+        loadingRow.setOrientation(LinearLayout.HORIZONTAL);
+        loadingRow.setGravity(Gravity.CENTER);
+        loadingRow.setPadding(dp(12), dp(18), dp(12), dp(18));
+        ProgressBar pb = new ProgressBar(ctx);
+        pb.setIndeterminate(true);
+        loadingRow.addView(pb, LayoutHelper.createLinear(22, 22, 0, 0, 10, 0));
+        TextView loadTv = new TextView(ctx);
+        loadTv.setText(text);
+        loadTv.setTextColor(color);
+        loadTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f);
+        loadingRow.addView(loadTv);
+        container.addView(loadingRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
     }
 
     private static void renderEmpty(Context ctx, LinearLayout container, String msg, int color) {
@@ -415,82 +423,5 @@ public final class ColgramMessageSeenSheet {
         tv.setGravity(Gravity.CENTER);
         tv.setPadding(dp(14), dp(20), dp(14), dp(20));
         container.addView(tv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-    }
-
-    private static void addViewerRow(
-            Activity act,
-            BaseFragment parentFragment,
-            BottomSheet sheet,
-            int currentAccount,
-            LinearLayout container,
-            TLObject obj,
-            long peerId,
-            int readDate,
-            int cTextPrimary,
-            int cTextSecondary,
-            int cBorder,
-            boolean withDivider
-    ) {
-        LinearLayout row = new LinearLayout(act);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(10), dp(9), dp(10), dp(9));
-        row.setBackground(Theme.createRadSelectorDrawable(Theme.getColor(Theme.key_listSelector), dp(12), dp(12)));
-
-        BackupImageView avatar = new BackupImageView(act);
-        avatar.setRoundRadius(dp(19));
-        AvatarDrawable avDr = new AvatarDrawable();
-        if (obj != null) {
-            avDr.setInfo(currentAccount, obj);
-            ImageLocation loc = ImageLocation.getForUserOrChat(currentAccount, obj, ImageLocation.TYPE_SMALL);
-            avatar.setImage(loc, "50_50", avDr, obj);
-        } else {
-            avDr.setInfo(peerId, "ID " + peerId, "");
-            avatar.setImageDrawable(avDr);
-        }
-        row.addView(avatar, LayoutHelper.createLinear(38, 38, 0, 0, 12, 0));
-
-        LinearLayout info = new LinearLayout(act);
-        info.setOrientation(LinearLayout.VERTICAL);
-        TextView nameTv = new TextView(act);
-        nameTv.setText(obj != null ? ContactsController.formatName(obj) : ("Пользователь #" + peerId));
-        nameTv.setTextColor(cTextPrimary);
-        nameTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.5f);
-        nameTv.setTypeface(AndroidUtilities.bold());
-        nameTv.setMaxLines(1);
-        nameTv.setEllipsize(TextUtils.TruncateAt.END);
-        info.addView(nameTv);
-
-        if (readDate > 0) {
-            TextView dateTv = new TextView(act);
-            dateTv.setText("✓✓ " + LocaleController.formatSeenDate(readDate));
-            dateTv.setTextColor(cTextSecondary);
-            dateTv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f);
-            info.addView(dateTv, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
-        }
-        row.addView(info, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
-
-        row.setOnClickListener(v -> {
-            if (parentFragment == null || parentFragment.isFinishing() || parentFragment.getParentLayout() == null) return;
-            sheet.dismiss();
-            Bundle args = new Bundle();
-            if (obj instanceof TLRPC.User) {
-                args.putLong("user_id", ((TLRPC.User) obj).id);
-            } else if (obj instanceof TLRPC.Chat) {
-                args.putLong("chat_id", ((TLRPC.Chat) obj).id);
-            } else if (peerId > 0) {
-                args.putLong("user_id", peerId);
-            } else {
-                return;
-            }
-            parentFragment.presentFragment(new ProfileActivity(args));
-        });
-
-        container.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-        if (withDivider) {
-            View div = new View(act);
-            div.setBackgroundColor(cBorder);
-            container.addView(div, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 1, 60, 0, 10, 0));
-        }
     }
 }

@@ -51,15 +51,7 @@ public final class ColgramShieldConfig {
             if (prefs != null) return;
             Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
             SharedPreferences sp = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            // Preserve ci183 explicit Unlimited Memory opt-in across upgrade to ci190 hard-cap defaults.
-            if (!sp.contains(KEY_STORAGE_CAP_ENABLED)) {
-                try {
-                    ColgramConfig.init(appCtx);
-                    if (ColgramConfig.isUnlimitedMemoryEnabled()) {
-                        sp.edit().putBoolean(KEY_STORAGE_CAP_ENABLED, false).apply();
-                    }
-                } catch (Throwable ignored) {}
-            }
+            applyStorageCapMigration(appCtx, sp);
             prefs = sp;
             loadAll(sp);
             if (prefChangeListener == null) {
@@ -263,6 +255,27 @@ public final class ColgramShieldConfig {
         if (sp != null) {
             sp.edit().putBoolean(KEY_AUTOCLEAR_SERVER_MENTIONS, v).apply();
         }
+    }
+
+    /** Preserves ci183 explicit Unlimited Memory opt-in across upgrade to v4 hard-cap defaults. */
+    public static void applyStorageCapMigration(Context appCtx, SharedPreferences sp) {
+        if (sp == null || sp.contains(KEY_STORAGE_CAP_ENABLED)) return;
+        try {
+            if (appCtx != null) {
+                ColgramConfig.init(appCtx);
+            }
+            if (ColgramConfig.wasPreV4UnlimitedOptIn() || ColgramConfig.isUnlimitedMemoryEnabled()) {
+                sp.edit().putBoolean(KEY_STORAGE_CAP_ENABLED, false).apply();
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** Pure-JVM test helper executing storage cap upgrade migration and loading volatile caches. */
+    public static void initForTest(SharedPreferences sp) {
+        if (sp == null) return;
+        applyStorageCapMigration(null, sp);
+        prefs = sp;
+        loadAll(sp);
     }
 
     /** Resets volatile defaults for isolated JVM unit tests. */

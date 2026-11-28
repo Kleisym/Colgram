@@ -55,6 +55,9 @@ public final class ColgramStorageCapEnforcer {
     public static final int BATTERY_PHASE_B_MAX_FILES = 8;
     public static final int CHARGER_PHASE_B_MAX_FILES = 80;
     public static final long BATTERY_PHASE_B_YIELD_MS = 25L;
+    public static final long UI_CACHE_ASSET_MAX_BYTES = 128L * 1024L;
+    public static final long UI_AVATAR_CACHE_MAX_BYTES = 64L * 1024L;
+    public static final double PHASE_C_EMERGENCY_CAP_MULTIPLIER = 1.15d;
 
     public static final class EnforcementReport {
         public long bytesBefore;
@@ -86,12 +89,14 @@ public final class ColgramStorageCapEnforcer {
         final long size;
         final long lruTimestamp;
         final boolean isHog;
+        final boolean isUiAsset;
 
         EvictCandidate(File file, long size, long lruTimestamp) {
             this.file = file;
             this.size = size;
             this.lruTimestamp = lruTimestamp;
             this.isHog = size >= CACHE_HOG_THRESHOLD_BYTES;
+            this.isUiAsset = isUiEssentialCacheAsset(file);
         }
     }
 
@@ -411,7 +416,7 @@ public final class ColgramStorageCapEnforcer {
         // Phase C (Tier 0 + 2): Smart dehydration stub catalog + Hard LRU eviction down to <= 75% cap
         long afterAB = computeManagedBytes(safeRoots, filesDir, safeActive) + computeDirBytes(shadowPreviewsDir);
         if (evictEnabled && capBytes > 0L && afterAB > targetBytes) {
-            long freed = runPhaseCEviction(safeRoots, afterAB - targetBytes, safeActive, nowMs, report);
+            long freed = runPhaseCEviction(safeRoots, afterAB - targetBytes, afterAB, capBytes, safeActive, nowMs, report);
             report.phaseCEvictedBytes += freed;
         }
 
@@ -785,19 +790,29 @@ public final class ColgramStorageCapEnforcer {
 
     private static long runPhaseCEviction(List<File> roots,
                                           long bytesToFree,
+                                          long currentTotalBytes,
+                                          long capBytes,
                                           Set<String> activePaths,
                                           long nowMs,
                                           EnforcementReport report) {
         if (bytesToFree <= 0L) return 0L;
+        long emergencyCeilingBytes = capBytes > 0L
+                ? (long) (capBytes * PHASE_C_EMERGENCY_CAP_MULTIPLIER)
+                : Long.MAX_VALUE;
+        boolean allowEmergencyUiEviction = capBytes > 0L && currentTotalBytes > emergencyCeilingBytes;
         List<EvictCandidate> candidates = new ArrayList<>();
         Set<String> seenPaths = new HashSet<>();
         for (File root : roots) {
-            collectEvictCandidates(root, 0, activePaths, nowMs, seenPaths, candidates);
+            collectEvictCandidates(root, 0, activePaths, nowMs, allowEmergencyUiEviction, seenPaths, candidates);
         }
-        // Prioritize large >10 MB cache hogs first, then ascending LRU timestamp
+        // Always evict non-UI cache files first (large >10 MB hogs, then LRU), preserving small
+        // avatars/custom emojis/stickers unless hard emergency ceiling (>115% cap) remains breached.
         Collections.sort(candidates, new Comparator<EvictCandidate>() {
             @Override
             public int compare(EvictCandidate a, EvictCandidate b) {
+                if (a.isUiAsset != b.isUiAsset) {
+                    return a.isUiAsset ? 1 : -1;
+                }
                 if (a.isHog != b.isHog) {
                     return a.isHog ? -1 : 1;
                 }
@@ -808,8 +823,19 @@ public final class ColgramStorageCapEnforcer {
         });
 
         long freed = 0L;
+        boolean enteredEmergencyUiPass = false;
         for (EvictCandidate c : candidates) {
             if (freed >= bytesToFree) break;
+            if (c.isUiAsset) {
+                if (!allowEmergencyUiEviction) continue;
+                long remaining = currentTotalBytes - freed;
+                if (!enteredEmergencyUiPass) {
+                    if (remaining <= emergencyCeilingBytes) break;
+                    enteredEmergencyUiPass = true;
+                } else if (remaining <= capBytes) {
+                    break;
+                }
+            }
             if (!c.file.isFile() || ColgramStorageOptimizer.isPathActive(c.file, activePaths)) continue;
             long len = c.file.length();
             if (len <= 0L) continue;
@@ -825,7 +851,8 @@ public final class ColgramStorageCapEnforcer {
     }
 
     private static void collectEvictCandidates(File dir, int depth, Set<String> activePaths,
-                                               long nowMs, Set<String> seenPaths, List<EvictCandidate> out) {
+                                               long nowMs, boolean allowEmergencyUiEviction,
+                                               Set<String> seenPaths, List<EvictCandidate> out) {
         if (dir == null || !dir.isDirectory() || depth > 5) return;
         if (isProtectedDirectory(dir, depth)) return;
         File[] children = dir.listFiles();
@@ -833,9 +860,10 @@ public final class ColgramStorageCapEnforcer {
         for (File child : children) {
             if (child == null) continue;
             if (child.isDirectory()) {
-                collectEvictCandidates(child, depth + 1, activePaths, nowMs, seenPaths, out);
+                collectEvictCandidates(child, depth + 1, activePaths, nowMs, allowEmergencyUiEviction, seenPaths, out);
             } else {
                 if (isProtectedFile(child, activePaths, nowMs, true)) continue;
+                if (!allowEmergencyUiEviction && isUiEssentialCacheAsset(child)) continue;
                 String norm = ColgramStorageIndex.normalizePath(child);
                 if (!seenPaths.add(norm)) continue;
                 long len = child.length();
@@ -846,6 +874,22 @@ public final class ColgramStorageCapEnforcer {
                 out.add(new EvictCandidate(child, len, lru));
             }
         }
+    }
+
+    /** Protects small custom emojis/stickers (.tgs/.webp <= 128 KB) and Cache avatars/thumbs (.jpg <= 64 KB) from churn. */
+    public static boolean isUiEssentialCacheAsset(File file) {
+        if (file == null || !file.isFile()) return false;
+        long len = file.length();
+        if (len <= 0L) return false;
+        String lowerName = file.getName().toLowerCase(Locale.ROOT);
+        if ((lowerName.endsWith(".tgs") || lowerName.endsWith(".webp")) && len <= UI_CACHE_ASSET_MAX_BYTES) {
+            return true;
+        }
+        if ((lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) && len <= UI_AVATAR_CACHE_MAX_BYTES) {
+            String normLower = ColgramStorageIndex.normalizePath(file).toLowerCase(Locale.ROOT);
+            return normLower.contains("/cache/");
+        }
+        return false;
     }
 
     /** Strictly protects user vaults, models, DBs, keys, wallpapers, active files, and <5 min files. */

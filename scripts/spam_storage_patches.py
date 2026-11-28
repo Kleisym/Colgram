@@ -356,27 +356,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         download_ctrl,
         [
-            """    public boolean canDownloadMedia(MessageObject messageObject) {
-        if (messageObject.type == MessageObject.TYPE_STORY) {
-            if (!SharedConfig.isAutoplayVideo()) return false;
-            TLRPC.TL_messageMediaStory mediaStory = (TLRPC.TL_messageMediaStory) MessageObject.getMedia(messageObject);
-            TL_stories.StoryItem storyItem = mediaStory.storyItem;
-            if (storyItem == null || storyItem.media == null || storyItem.media.document == null || !storyItem.isPublic) {
-                return false;
-            }
-            return true;
-        }
-        if (messageObject.sponsoredMedia != null) {
-            return true;
-        }
-        if (messageObject.isHiddenSensitive())
-            return false;
-        return canDownloadMediaInternal(messageObject) == 1;
-    }
-
-    public boolean canDownloadMedia(int type, long size) {"""
-        ],
-        """    private boolean isColgramAutoDownloadSizeOrPolicyBlocked(String fileName, String mimeType, long size) {
+            """    private boolean isColgramAutoDownloadSizeOrPolicyBlocked(String fileName, String mimeType, long size) {
         org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
         boolean isWifi = ApplicationLoader.getAutodownloadNetworkType() == StatsController.TYPE_WIFI;
         long capBytes = org.colgram.core.ColgramShieldConfig.isStorageCapEnabled()
@@ -415,6 +395,89 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 && ((media instanceof TLRPC.TL_messageMediaStory) || (message.media instanceof TLRPC.TL_messageMediaStory))) {
             return true;
         }
+        TLRPC.Document doc = media != null ? media.document : MessageObject.getDocument(message);
+        String name = doc != null ? FileLoader.getDocumentFileName(doc) : null;
+        String mime = doc != null ? doc.mime_type : null;
+        long sz = media != null ? MessageObject.getMediaSize(media) : MessageObject.getMessageSize(message);
+        return isColgramAutoDownloadSizeOrPolicyBlocked(name, mime, sz);
+    }
+
+    public boolean canDownloadMedia(MessageObject messageObject) {
+        if (isColgramAutoDownloadBlocked(messageObject, -1L)) {
+            return false;
+        }
+        if (messageObject.type == MessageObject.TYPE_STORY) {
+            if (!SharedConfig.isAutoplayVideo()) return false;
+            TLRPC.TL_messageMediaStory mediaStory = (TLRPC.TL_messageMediaStory) MessageObject.getMedia(messageObject);
+            TL_stories.StoryItem storyItem = mediaStory.storyItem;
+            if (storyItem == null || storyItem.media == null || storyItem.media.document == null || !storyItem.isPublic) {
+                return false;
+            }
+            return true;
+        }
+        if (messageObject.sponsoredMedia != null) {
+            return !org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled();
+        }
+        if (messageObject.isHiddenSensitive())
+            return false;
+        return canDownloadMediaInternal(messageObject) == 1;
+    }
+
+    public boolean canDownloadMedia(int type, long size) {
+        if (isColgramAutoDownloadSizeOrPolicyBlocked(null, null, size)) {
+            return false;
+        }""",
+            """    public boolean canDownloadMedia(MessageObject messageObject) {
+        if (messageObject.type == MessageObject.TYPE_STORY) {
+            if (!SharedConfig.isAutoplayVideo()) return false;
+            TLRPC.TL_messageMediaStory mediaStory = (TLRPC.TL_messageMediaStory) MessageObject.getMedia(messageObject);
+            TL_stories.StoryItem storyItem = mediaStory.storyItem;
+            if (storyItem == null || storyItem.media == null || storyItem.media.document == null || !storyItem.isPublic) {
+                return false;
+            }
+            return true;
+        }
+        if (messageObject.sponsoredMedia != null) {
+            return true;
+        }
+        if (messageObject.isHiddenSensitive())
+            return false;
+        return canDownloadMediaInternal(messageObject) == 1;
+    }
+
+    public boolean canDownloadMedia(int type, long size) {"""
+        ],
+        """    private boolean isColgramAutoDownloadSizeOrPolicyBlocked(String fileName, String mimeType, long size) {
+        org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+        boolean isWifi = ApplicationLoader.getAutodownloadNetworkType() == StatsController.TYPE_WIFI;
+        long capBytes = org.colgram.core.ColgramShieldConfig.isStorageCapEnabled()
+                ? org.colgram.core.ColgramShieldConfig.getStorageHardCapBytes() : 0L;
+        return org.colgram.core.ColgramFileSafetyPolicy.shouldBlockAutoDownload(
+                fileName, mimeType, size, isWifi, capBytes);
+    }
+
+    private boolean isColgramAutoDownloadBlocked(MessageObject messageObject, long overrideSize) {
+        if (messageObject == null) {
+            return true;
+        }
+        org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
+        if (messageObject.sponsoredMedia != null
+                && (org.colgram.core.ColgramShieldConfig.isMalwareDownloadShieldEnabled()
+                        || org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled())) {
+            return true;
+        }
+        TLRPC.Document doc = messageObject.getDocument();
+        String name = doc != null ? FileLoader.getDocumentFileName(doc) : null;
+        String mime = doc != null ? doc.mime_type : null;
+        long sz = overrideSize >= 0L ? overrideSize : (doc != null ? doc.size : MessageObject.getMessageSize(messageObject.messageOwner));
+        return isColgramAutoDownloadSizeOrPolicyBlocked(name, mime, sz);
+    }
+
+    private boolean isColgramRawMessageBlocked(TLRPC.Message message, TLRPC.MessageMedia media) {
+        if (message == null) {
+            return true;
+        }
+        org.colgram.core.ColgramShieldConfig.init(ApplicationLoader.applicationContext);
         TLRPC.Document doc = media != null ? media.document : MessageObject.getDocument(message);
         String name = doc != null ? FileLoader.getDocumentFileName(doc) : null;
         String mime = doc != null ? doc.mime_type : null;
@@ -536,12 +599,28 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         download_ctrl,
         [
-            """        if (isVideo && preset.preloadVideo && size > maxSize && maxSize > 2 * 1024 * 1024) {
+            """        long size;
+        if (message.highestQuality != null) {
+            size = message.highestQuality.document.size;
+        } else if (message.thumbQuality != null) {
+            size = message.thumbQuality.document.size;
+        } else {
+            size = MessageObject.getMessageSize(msg);
+        }
+        if (isVideo && preset.preloadVideo && !org.colgram.core.ColgramShieldConfig.isMalwareDownloadShieldEnabled() && size > maxSize && maxSize > 2 * 1024 * 1024) {
             return (mask & type) != 0 ? 2 : 0;"""
         ],
-        """        if (isVideo && preset.preloadVideo && !org.colgram.core.ColgramShieldConfig.isMalwareDownloadShieldEnabled() && size > maxSize && maxSize > 2 * 1024 * 1024) {
+        """        long size;
+        if (message.highestQuality != null) {
+            size = message.highestQuality.document.size;
+        } else if (message.thumbQuality != null) {
+            size = message.thumbQuality.document.size;
+        } else {
+            size = MessageObject.getMessageSize(msg);
+        }
+        if (isVideo && preset.preloadVideo && size > maxSize && maxSize > 2 * 1024 * 1024) {
             return (mask & type) != 0 ? 2 : 0;""",
-        "DownloadController.java disable preloadVideo when shield enabled",
+        "DownloadController.java preserve preset.preloadVideo when shield enabled",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -577,15 +656,6 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         [
             """            if (downloadObject.object instanceof TLRPC.Document) {
                 TLRPC.Document document = (TLRPC.Document) downloadObject.object;
-                path = FileLoader.getAttachFileName(document);
-            } else if (downloadObject.object instanceof TLRPC.Photo) {
-                TLRPC.Photo photo = (TLRPC.Photo) downloadObject.object;
-                photoSize = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, AndroidUtilities.getPhotoSize());
-                path = FileLoader.getAttachFileName(photoSize);
-            }"""
-        ],
-        """            if (downloadObject.object instanceof TLRPC.Document) {
-                TLRPC.Document document = (TLRPC.Document) downloadObject.object;
                 if (isColgramAutoDownloadSizeOrPolicyBlocked(FileLoader.getDocumentFileName(document), document.mime_type, document.size)) {
                     continue;
                 }
@@ -598,7 +668,27 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 photoSize = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, photoTargetSize);
                 path = FileLoader.getAttachFileName(photoSize);
             }""",
-        "DownloadController.java processDownloadObjects shield + metered medium photo cap",
+            """            if (downloadObject.object instanceof TLRPC.Document) {
+                TLRPC.Document document = (TLRPC.Document) downloadObject.object;
+                path = FileLoader.getAttachFileName(document);
+            } else if (downloadObject.object instanceof TLRPC.Photo) {
+                TLRPC.Photo photo = (TLRPC.Photo) downloadObject.object;
+                photoSize = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, AndroidUtilities.getPhotoSize());
+                path = FileLoader.getAttachFileName(photoSize);
+            }""",
+        ],
+        """            if (downloadObject.object instanceof TLRPC.Document) {
+                TLRPC.Document document = (TLRPC.Document) downloadObject.object;
+                if (isColgramAutoDownloadSizeOrPolicyBlocked(FileLoader.getDocumentFileName(document), document.mime_type, document.size)) {
+                    continue;
+                }
+                path = FileLoader.getAttachFileName(document);
+            } else if (downloadObject.object instanceof TLRPC.Photo) {
+                TLRPC.Photo photo = (TLRPC.Photo) downloadObject.object;
+                photoSize = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, AndroidUtilities.getPhotoSize());
+                path = FileLoader.getAttachFileName(photoSize);
+            }""",
+        "DownloadController.java processDownloadObjects shield + full photo size",
     )
 
     _patch_eol_variants(
@@ -1373,9 +1463,55 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
     )
 
     # 8. AndroidUtilities.java:
+    #    - Whitelist canonical ColgramStorageSandbox cache & sandbox roots in isInternalUri
     #    - Intercept dangerous/huge file opening via Contract D ColgramUiKit.showMalwareWarningSheet (openForView + openDocument)
     android_utils = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "AndroidUtilities.java"
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        android_utils,
+        [
+            """                if (!safeCustom.isEmpty() && !".".equals(safeCustom)) {
+                    String canonicalSandbox = new File(filesDir, safeCustom).getCanonicalPath();
+                    if (!canonicalSandbox.equals(filesDir.getCanonicalPath())
+                            && pathString.startsWith(canonicalSandbox + File.separator)) {
+                        return false;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return pathString.toLowerCase().contains("/data/data/" + ApplicationLoader.applicationContext.getPackageName());"""
+        ],
+        """                if (!safeCustom.isEmpty() && !".".equals(safeCustom)) {
+                    String canonicalSandbox = new File(filesDir, safeCustom).getCanonicalPath();
+                    if (!canonicalSandbox.equals(filesDir.getCanonicalPath())
+                            && pathString.startsWith(canonicalSandbox + File.separator)) {
+                        return false;
+                    }
+                }
+            }
+            File colgramSandboxRoot = org.colgram.core.ColgramStorageSandbox.getSandboxRootDir(ApplicationLoader.applicationContext);
+            if (colgramSandboxRoot != null) {
+                String canonicalSandboxRoot = colgramSandboxRoot.getCanonicalPath();
+                if ((filesDir == null || !canonicalSandboxRoot.equals(filesDir.getCanonicalPath()))
+                        && (pathString.equals(canonicalSandboxRoot) || pathString.startsWith(canonicalSandboxRoot + File.separator))) {
+                    return false;
+                }
+            }
+            File colgramCacheRoot = org.colgram.core.ColgramStorageSandbox.getCacheRootDir(ApplicationLoader.applicationContext);
+            if (colgramCacheRoot != null) {
+                String canonicalCacheRoot = colgramCacheRoot.getCanonicalPath();
+                if ((filesDir == null || !canonicalCacheRoot.equals(filesDir.getCanonicalPath()))
+                        && (pathString.equals(canonicalCacheRoot) || pathString.startsWith(canonicalCacheRoot + File.separator))) {
+                    return false;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return pathString.toLowerCase().contains("/data/data/" + ApplicationLoader.applicationContext.getPackageName());""",
+        "AndroidUtilities.java whitelist canonical sandbox and cache roots in isInternalUri",
     )
     _patch_eol_variants(
         eol_patch_fn,

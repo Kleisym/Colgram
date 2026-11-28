@@ -503,18 +503,6 @@ def inject_hooks(repo_path):
         "MessagesController Ghost Read Task Suppression"
     )
 
-    # 6e. MessagesController.java -> Keep the local unread counter honest in ghost mode.
-    #
-    # markDialogAsRead's early `return` above bypasses the notification/badge refresh
-    # further down. Push a dialogsNeedReload so the UI reflects the cleared counter rather
-    # than showing a stale badge until the next full reload.
-    patch_file(
-        messages_controller,
-        "org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);\n        boolean createReadTask;",
-        "org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);\n        getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);\n        boolean createReadTask;",
-        "MessagesController Ghost Read Refresh Dialogs"
-    )
-
     patch_file(
         messages_controller,
         "public boolean sendTyping(long dialogId, long threadMsgId, int action, int classGuid) {",
@@ -2980,7 +2968,7 @@ def inject_hooks(repo_path):
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         ui_dest_dir = os.path.join(repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui")
         os.makedirs(ui_dest_dir, exist_ok=True)
-        for name in ["ColgramUiKit.java", "ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java", "ColgramPremiumActivity.java", "ColgramSavedTagsBarView.java"]:
+        for name in ["ColgramUiKit.java", "ColgramMenuChrome.java", "ColgramConfettiView.java", "ColgramColaSlideView.java", "ColgramEasterEggs.java", "ColgramAeroStyler.java", "ColgramGlobalOrbController.java", "ColgramAiOrbView.java", "ColgramAiChatBridge.java", "ColgramAiSheet.java", "ColgramAiActivity.java", "ColgramSettingsActivity.java", "ColgramDefenderActivity.java", "ColgramCallRoutes.java", "ColgramBrowserRoutes.java", "ColgramPluginsActivity.java", "ColgramTempMailActivity.java", "ColgramVersionsActivity.java", "ColgramEditHistorySheet.java", "ColgramAntiSpamActivity.java", "ColgramFloatWindowManager.java", "ColgramFilesActivity.java", "ColgramAutoReplyActivity.java", "ColgramAccountSwitcherHelper.java", "ColgramVideoWallpaperView.java", "ColgramDesignStudioActivity.java", "ColgramGlobalSearchView.java", "ColgramQuickBarView.java", "ColgramMessageSeenSheet.java", "ColgramPremiumActivity.java", "ColgramNativeTagsBridge.java", "ColgramReadReceiptsHelper.java"]:
             src_t = os.path.join(template_dir, name)
             dst_t = os.path.join(ui_dest_dir, name)
             if os.path.exists(src_t):
@@ -8244,7 +8232,8 @@ def sync_colgram_extra_templates_and_assets(repo_path, root_dir, koliti_enabled=
         "ColgramSubscriptionControls.java",
         "ColgramBottomBarConfig.java",
         "ColgramPremiumActivity.java",
-        "ColgramSavedTagsBarView.java",
+        "ColgramNativeTagsBridge.java",
+        "ColgramReadReceiptsHelper.java",
     ):
         src = os.path.join(template_dir, name)
         if os.path.isfile(src):
@@ -8863,7 +8852,7 @@ def _patch_file_eol(filepath, target, replacement, description=""):
     target_norm = target.replace("\r\n", "\n")
     repl_norm = replacement.replace("\r\n", "\n")
 
-    if repl_norm in content:
+    if repl_norm and repl_norm in content:
         return True
 
     if target_norm in content:
@@ -9597,27 +9586,6 @@ _PERFORMANCE_PATCH_SPECS = [
             '                    if (colgramWipe) {\n'
             '                        getMessagesStorage().markMessagesAsDeleted(dialogId, freshKeep, true, false, 0, topicId);\n'
             '                    }\n'
-        ),
-    ),
-    (
-        'TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java',
-        'MessagesController.java perf #3',
-        (
-            '        // read on this device, and skip only the outgoing ReadTask that would tell the\n'
-            '        // server (and therefore the sender) that we read it.\n'
-            '        final boolean colgramGhostRead = org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);\n'
-            '        getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);\n'
-            '        boolean createReadTask;\n'
-            '\n'
-            '        if (threadId != 0) {\n'
-        ),
-        (
-            '        // read on this device, and skip only the outgoing ReadTask that would tell the\n'
-            '        // server (and therefore the sender) that we read it.\n'
-            '        final boolean colgramGhostRead = org.colgram.core.ColgramHookHandler.shouldPreventReadReceipt(dialogId);\n'
-            '        boolean createReadTask;\n'
-            '\n'
-            '        if (threadId != 0) {\n'
         ),
     ),
     (
@@ -14427,6 +14395,7 @@ _SUPERSEDED_PERF_MARKERS = {
     "ImageLoader.java perf #15": "boolean isCustomEmojiLoad =",
     "Theme.java perf #11": "if (provider == null || provider.colgramDelegatesToGlobalTheme())",
     "Theme.java perf #12": "boolean colgramNeedsGuard = !provider.colgramReturnsGuardedColor();",
+    "FileLoaderPriorityQueue.java perf #1": "PRIORITY_VALUE_NORMAL_UP",
 }
 
 _SUPERSEDED_NETWORK_MARKERS = {
@@ -14442,6 +14411,7 @@ _SUPERSEDED_TURBO_MARKERS = {
     "ConnectionsManager.java turbo #2": "private static boolean colgramIsInstantSendRequest(TLObject object)",
     "ConnectionsManager.java turbo #4": "colgramNeedConnCheck",
     "SendMessagesHelper.java turbo #27": "colgramIsRawDisconnected()",
+    "FileLoader.java turbo #1": "PRIORITY_VALUE_NORMAL_UP",
 }
 
 _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
@@ -14453,6 +14423,7 @@ _SUPERSEDED_ATTACH_SPOOF_MARKERS = {
     "DeleteMessagesBottomSheet.java wire colgramDeleteMessages in proceed": "SendMessagesHelper.colgramCancelMessageTransfers(currentAccount,",
     "AlertsCreator.java permanent local delete checkbox UI": 'CheckBoxCell purgeCell = new CheckBoxCell(activity, 1, resourcesProvider);',
     "MessagesController.java alreadyDeletedPurge full DB purge": "if (colgramHasPositivePurge)",
+    "AndroidUtilities.java safe colgram_inbox/sharing/sandbox exemption in isInternalUri": "// Allow user-selected external attachments staged safely in Colgram's inbox or sharing dir",
 }
 
 
@@ -18098,6 +18069,8 @@ def main():
         inject_spam_storage_patches(target_repo, patch_file, _patch_file_eol)
     from ui_premium_patches import apply as inject_ui_premium_patches
     inject_ui_premium_patches(target_repo, patch_file, _patch_file_eol, koliti_enabled)
+    from read_symbiosis_patches import apply as inject_read_symbiosis_patches
+    inject_read_symbiosis_patches(target_repo, patch_file, _patch_file_eol)
     from koliti_split_patches import apply as inject_koliti_split_patches
     inject_koliti_split_patches(target_repo, patch_file, _patch_file_eol, koliti_enabled)
     normalize_variant_manifests(target_repo)

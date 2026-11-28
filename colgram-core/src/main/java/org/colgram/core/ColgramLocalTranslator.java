@@ -141,7 +141,7 @@ public final class ColgramLocalTranslator {
             } catch (Throwable ignored) {}
 
             String raw = fetchViaProxyOrDirect(urlStr, proxy, rateLimited);
-            if (raw == null && proxy != null && !ColgramConfig.isStrictProxySecurityEnabled()) {
+            if (raw == null && proxy != null && shouldAllowNoProxyFallback()) {
                 raw = fetchViaProxyOrDirect(urlStr, Proxy.NO_PROXY, rateLimited);
             }
             if (raw == null) {
@@ -157,6 +157,16 @@ public final class ColgramLocalTranslator {
         }
     }
 
+    static boolean shouldAllowNoProxyFallback() {
+        return !ColgramConfig.isStrictProxySecurityEnabled()
+                && !ColgramConfig.isMaxAnonymityEnabled();
+    }
+
+    static boolean shouldFailClosedWhenUnpinned(InetAddress via, Proxy effectiveProxy) {
+        boolean socks = effectiveProxy != null && effectiveProxy.type() == Proxy.Type.SOCKS;
+        return via == null && !socks && !shouldAllowNoProxyFallback();
+    }
+
     private static String fetchViaProxyOrDirect(String urlStr, Proxy proxy, boolean[] rateLimited) {
         HttpURLConnection conn = null;
         try {
@@ -170,6 +180,9 @@ public final class ColgramLocalTranslator {
                 } catch (Throwable ignored) {}
                 if (via != null || effectiveProxy.type() == Proxy.Type.SOCKS) {
                     conn = ColgramPinnedConnection.create((HttpsURLConnection) conn, url, via, effectiveProxy);
+                } else if (shouldFailClosedWhenUnpinned(via, effectiveProxy)) {
+                    conn.disconnect();
+                    return null;
                 }
             }
             conn.setRequestMethod("GET");

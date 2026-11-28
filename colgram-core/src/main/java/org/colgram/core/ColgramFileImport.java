@@ -277,36 +277,62 @@ public final class ColgramFileImport {
             }
         }
 
-        IMPORT_EXECUTOR.execute(() -> {
-            activeImportSession.set(session);
-            final List<String> results = new ArrayList<>();
+        // Synchronously acquire only lightweight AFDs on caller thread while transient grants
+        // are active; zero ContentResolver.query or disk I/O before entering IMPORT_EXECUTOR.
+        final List<AssetFileDescriptor> preopenedAfds = new ArrayList<>(uris.size());
+        for (int i = 0; i < uris.size(); i++) {
+            AssetFileDescriptor afd = null;
             try {
-                File inboxDir = ensureInboxDir(appCtx);
-                pruneStaleTemps(inboxDir);
-                int total = uris.size();
-                for (int i = 0; i < total; i++) {
-                    if (session.cancelled.get()) {
-                        break;
-                    }
-                    StagedUri staged = openStagedUriSync(appCtx, cr, uris.get(i));
-                    try {
+                afd = cr.openAssetFileDescriptor(uris.get(i), "r");
+            } catch (Throwable ignored) {
+                afd = null;
+            }
+            preopenedAfds.add(afd);
+        }
+
+        boolean scheduled = false;
+        try {
+            IMPORT_EXECUTOR.execute(() -> {
+                activeImportSession.set(session);
+                final List<String> results = new ArrayList<>();
+                try {
+                    File inboxDir = ensureInboxDir(appCtx);
+                    pruneStaleTemps(inboxDir);
+                    int total = uris.size();
+                    for (int i = 0; i < total; i++) {
+                        AssetFileDescriptor preopened = preopenedAfds.get(i);
+                        preopenedAfds.set(i, null);
                         if (session.cancelled.get()) {
+                            closeAfdQuietly(preopened);
                             break;
                         }
-                        String path = copyStagedToSandbox(appCtx, cr, inboxDir, staged, i, total, session);
-                        if (path != null && !path.isEmpty()) {
-                            results.add(path);
+                        StagedUri staged = openStagedUriSync(appCtx, cr, uris.get(i), preopened);
+                        try {
+                            if (session.cancelled.get()) {
+                                break;
+                            }
+                            String path = copyStagedToSandbox(appCtx, cr, inboxDir, staged, i, total, session);
+                            if (path != null && !path.isEmpty()) {
+                                results.add(path);
+                            }
+                        } finally {
+                            staged.closeQuietly();
                         }
-                    } finally {
-                        staged.closeQuietly();
                     }
+                } catch (Throwable ignored) {
+                } finally {
+                    closeAllAfdsQuietly(preopenedAfds);
+                    activeImportSession.compareAndSet(session, null);
+                    deliverResult(session.callback, results);
                 }
-            } catch (Throwable ignored) {
-            } finally {
-                activeImportSession.compareAndSet(session, null);
-                deliverResult(session.callback, results);
+            });
+            scheduled = true;
+        } finally {
+            if (!scheduled) {
+                closeAllAfdsQuietly(preopenedAfds);
+                deliverResult(session.callback, new ArrayList<String>());
             }
-        });
+        }
         return true;
     }
 
@@ -342,6 +368,45 @@ public final class ColgramFileImport {
         return candidate.delete();
     }
 
+    private static StagedUri openStagedUriSync(Context context, ContentResolver cr, Uri uri,
+                                               AssetFileDescriptor preopened) {
+        if (preopened == null) {
+            return openStagedUriSync(context, cr, uri);
+        }
+        String name = resolveDisplayName(cr, uri);
+        long knownSize = queryUriSize(cr, uri);
+        if (knownSize <= 0L) {
+            try {
+                long afdLen = preopened.getLength();
+                if (afdLen > 0L) {
+                    knownSize = afdLen;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return new StagedUri(uri, preopened, name, knownSize);
+    }
+
+    private static void closeAfdQuietly(AssetFileDescriptor afd) {
+        if (afd != null) {
+            try {
+                afd.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void closeAllAfdsQuietly(List<AssetFileDescriptor> afds) {
+        if (afds == null) {
+            return;
+        }
+        for (int i = 0; i < afds.size(); i++) {
+            AssetFileDescriptor afd = afds.get(i);
+            afds.set(i, null);
+            closeAfdQuietly(afd);
+        }
+    }
+
     private static StagedUri openStagedUriSync(Context context, ContentResolver cr, Uri uri) {
         String name = resolveDisplayName(cr, uri);
         long knownSize = queryUriSize(cr, uri);
@@ -357,9 +422,12 @@ public final class ColgramFileImport {
             }
         }
         if (knownSize <= 0L && afd != null) {
-            long afdLen = afd.getLength();
-            if (afdLen > 0L) {
-                knownSize = afdLen;
+            try {
+                long afdLen = afd.getLength();
+                if (afdLen > 0L) {
+                    knownSize = afdLen;
+                }
+            } catch (Throwable ignored) {
             }
         }
         if ((name == null || name.isEmpty() || "attachment.bin".equals(name)) && afd != null) {
@@ -590,7 +658,11 @@ public final class ColgramFileImport {
             name = "attachment_" + System.currentTimeMillis();
         }
         if (!name.contains(".")) {
-            String mime = cr.getType(uri);
+            String mime = null;
+            try {
+                mime = cr.getType(uri);
+            } catch (Throwable ignored) {
+            }
             if (mime != null) {
                 String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime);
                 if (ext != null && !ext.isEmpty()) {

@@ -52,7 +52,6 @@ import androidx.recyclerview.widget.RecyclerView;
 import org.colgram.core.ColgramConfig;
 import org.colgram.core.ColgramDpiBypass;
 import org.colgram.core.ColgramPolymorphicStealth;
-import org.colgram.core.ColgramSavedTagsStore;
 import org.colgram.core.ColgramTelegramWsBridge;
 import org.colgram.core.ColgramUiBridge;
 import org.telegram.messenger.AndroidUtilities;
@@ -1104,116 +1103,6 @@ public final class ColgramUiKit {
         root.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
         presentBottomSheet(act, sheet);
-    }
-
-    public static BottomSheet showEmojiTagPickerSheet(
-            Activity act,
-            Theme.ResourcesProvider rp,
-            int currentAccount,
-            int messageId,
-            Runnable onChanged) {
-        if (!isValidActivity(act) || messageId <= 0) return null;
-        final ColgramAeroStyler.Palette pal = ColgramAeroStyler.Palette.resolve();
-        final LinearLayout root = makeSheetRoot(act, pal);
-        root.addView(makeSheetHeader(
-                act, pal,
-                R.drawable.msg_reactions, pal.accentPrimary,
-                "Теги в Избранном",
-                "Локальные теги хранятся в устройстве и фильтруют сообщения мгновенно",
-                null
-        ), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        final LinearLayout grid = new LinearLayout(act);
-        grid.setOrientation(LinearLayout.VERTICAL);
-        final List<ColgramSavedTagsStore.TagPreset> presets = ColgramSavedTagsStore.DEFAULT_PRESETS;
-        final Runnable[] rebuildGrid = new Runnable[1];
-        rebuildGrid[0] = () -> {
-            grid.removeAllViews();
-            int cols = 3;
-            LinearLayout row = null;
-            for (int i = 0; i < presets.size(); i++) {
-                if (i % cols == 0) {
-                    row = new LinearLayout(act);
-                    row.setOrientation(LinearLayout.HORIZONTAL);
-                    grid.addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
-                }
-                final ColgramSavedTagsStore.TagPreset preset = presets.get(i);
-                boolean active = ColgramSavedTagsStore.hasTag(currentAccount, messageId, preset.emoji);
-                TextView chip = new TextView(act);
-                chip.setText(preset.emoji + " " + preset.label);
-                chip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
-                chip.setTypeface(active ? AndroidUtilities.bold() : Typeface.DEFAULT);
-                chip.setSingleLine(true);
-                chip.setEllipsize(TextUtils.TruncateAt.END);
-                chip.setGravity(Gravity.CENTER);
-                chip.setPadding(dp(8), dp(9), dp(8), dp(9));
-                int bg = active ? withAlpha(pal.accentPrimary, pal.dark ? 0x2E : 0x18) : pal.cardSurface;
-                int stroke = active ? pal.accentPrimary : pal.borderSubtle;
-                chip.setTextColor(active ? pal.accentPrimary : pal.textPrimary);
-                ColgramMenuChrome.attachTactileFeedback(chip, INNER_CARD_RADIUS_DP, bg, stroke,
-                        withAlpha(pal.accentPrimary, 0x24));
-                chip.setOnClickListener(v -> {
-                    ColgramSavedTagsStore.toggleTag(act, currentAccount, messageId, preset.emoji, preset.label);
-                    rebuildGrid[0].run();
-                    if (onChanged != null) onChanged.run();
-                });
-                row.addView(chip, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f,
-                        0, 0, (i % cols == cols - 1) ? 0 : 8, 0));
-            }
-            if (row != null && presets.size() % cols != 0) {
-                int missing = cols - (presets.size() % cols);
-                for (int m = 0; m < missing; m++) {
-                    View spacer = new View(act);
-                    row.addView(spacer, LayoutHelper.createLinear(0, 1, 1f, 0, 0, m == missing - 1 ? 0 : 8, 0));
-                }
-            }
-        };
-        rebuildGrid[0].run();
-
-        MaxHeightScrollView scroll = new MaxHeightScrollView(act);
-        scroll.addView(grid);
-        root.addView(scroll, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 12));
-
-        final BottomSheet sheet = createFlagshipSheet(act, rp, false, false, root);
-        LinearLayout btnRow = new LinearLayout(act);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-
-        TextView customBtn = makeCtaButton(act, "Свой тег", pal.cardSurface, pal.textPrimary, true, pal.borderSubtle);
-        customBtn.setOnClickListener(v -> {
-            sheet.dismiss();
-            showInputSheet(act, rp, R.drawable.msg_reactions,
-                    "Свой эмодзи-тег", "Введите эмодзи (например 🚀 или 🔖)",
-                    "🚀", "", InputType.TYPE_CLASS_TEXT, false, false, true, "Добавить",
-                    val -> {
-                        String trimmed = val == null ? "" : val.trim();
-                        if (!trimmed.isEmpty()) {
-                            ColgramSavedTagsStore.addTag(act, currentAccount, messageId, trimmed, "");
-                            if (onChanged != null) onChanged.run();
-                        }
-                    }, null, null);
-        });
-
-        List<String> existing = ColgramSavedTagsStore.getTags(currentAccount, messageId);
-        if (!existing.isEmpty()) {
-            TextView clearBtn = makeCtaButton(act, "Сбросить", pal.cardSurface, pal.semanticCrimson, true,
-                    withAlpha(pal.semanticCrimson, 0x45));
-            clearBtn.setOnClickListener(v -> {
-                ColgramSavedTagsStore.clearMessageTags(act, currentAccount, messageId);
-                sheet.dismiss();
-                if (onChanged != null) onChanged.run();
-            });
-            btnRow.addView(clearBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 0.9f, 0, 0, 8, 0));
-        }
-        btnRow.addView(customBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f, 0, 0, 8, 0));
-
-        TextView doneBtn = makeCtaButton(act, LocaleController.getString(R.string.Done),
-                pal.accentPrimary, 0xFFFFFFFF, false, 0);
-        doneBtn.setOnClickListener(v -> sheet.dismiss());
-        btnRow.addView(doneBtn, LayoutHelper.createLinear(0, CTA_HEIGHT_DP, 1f));
-        root.addView(btnRow, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-
-        presentBottomSheet(act, sheet);
-        return sheet;
     }
 
     private static void presentBottomSheet(Activity act, BottomSheet sheet) {

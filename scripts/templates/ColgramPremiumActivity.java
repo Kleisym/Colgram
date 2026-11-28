@@ -176,8 +176,12 @@ public class ColgramPremiumActivity extends BaseFragment {
             boolean next = !ColgramPremiumConfig.isSavedTagsEnabled();
             ColgramPremiumConfig.setSavedTagsEnabled(next);
             if (view instanceof TextCheckCell) ((TextCheckCell) view).setChecked(next);
+            NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.savedReactionTagsUpdate, 0L);
+            if (next) {
+                MessagesController.getInstance(currentAccount).getSavedReactionTags(0L, true);
+            }
             ColgramUiKit.showNotice(this, R.drawable.msg_reactions,
-                    next ? "Эмодзи-теги в Избранном включены" : "Эмодзи-теги скрыты", false);
+                    next ? "Нативные теги в Избранном включены" : "Теги в Избранном отключены", false);
         } else if (position == savedTagsExportRow) {
             if (act == null) return;
             String json = ColgramSavedTagsStore.exportJson(currentAccount);
@@ -199,6 +203,11 @@ public class ColgramPremiumActivity extends BaseFragment {
                     false, false, false, "Импортировать",
                     val -> {
                         int imported = ColgramSavedTagsStore.importJson(act, currentAccount, val);
+                        if (imported > 0) {
+                            NotificationCenter.getInstance(currentAccount).postNotificationName(
+                                    NotificationCenter.savedReactionTagsUpdate, 0L);
+                            MessagesController.getInstance(currentAccount).getSavedReactionTags(0L, true);
+                        }
                         updateRows();
                         ColgramUiKit.showNotice(this, R.drawable.msg_check_s,
                                 imported > 0 ? ("Импортировано тегов: " + imported) : "Новых тегов не найдено",
@@ -472,8 +481,8 @@ public class ColgramPremiumActivity extends BaseFragment {
                 TextCheckCell tc = (TextCheckCell) holder.itemView;
                 if (position == savedTagsToggleRow) {
                     ColgramMenuChrome.applyCheckIcon(tc, ColgramMenuChrome.COLOR_VIOLET, R.drawable.msg_reactions);
-                    tc.setTextAndValueAndCheck("Эмодзи-теги в Избранном",
-                            "Локальная панель фильтров, бейджи и быстрый переход по тегам",
+                    tc.setTextAndValueAndCheck("Нативные теги в Избранном",
+                            "Родные теги Telegram под сообщениями, фильтр в поиске и свои названия",
                             ColgramPremiumConfig.isSavedTagsEnabled(), true, divider);
                 } else if (position == blockAdsRow) {
                     ColgramMenuChrome.applyCheckIcon(tc, ColgramMenuChrome.COLOR_CRIMSON, R.drawable.msg_block);

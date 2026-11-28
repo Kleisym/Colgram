@@ -270,9 +270,19 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             }, NotificationCenter.screenStateChanged);""",
         "ApplicationLoader.java gate screenStateChanged network refresh on foreground",
     )
+    _patch_eol_variants(
+        eol_patch_fn,
+        app_loader,
+        [
+            "            if (level >= TRIM_MEMORY_UI_HIDDEN || (!org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled() && level >= TRIM_MEMORY_RUNNING_MODERATE)) {",
+            "            if (level >= TRIM_MEMORY_UI_HIDDEN || level >= TRIM_MEMORY_RUNNING_MODERATE) {",
+        ],
+        "            if (level >= TRIM_MEMORY_COMPLETE || level == TRIM_MEMORY_RUNNING_CRITICAL) {",
+        "ApplicationLoader.java clear ImageLoader memory only on RUNNING_CRITICAL / COMPLETE",
+    )
 
     # 3. ConnectionsManager.java: expose colgramResetProxySignature(), volatile state fields,
-    #    direct instant-send dispatch, and non-blocking checkConnection offload.
+    #    direct instant-send dispatch (excluding heavy media/upload RPCs), and non-blocking checkConnection offload.
     conn_mgr = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "tgnet", "ConnectionsManager.java"
     )
@@ -325,51 +335,40 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         conn_mgr,
         [
-            """    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
-        final int requestToken = lastRequestToken.getAndIncrement();
-        Utilities.stageQueue.postRunnable(() -> {
-            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
-        });
-        return requestToken;
-    }""",
-            """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
-        return object instanceof TLRPC.TL_messages_sendMessage
-                || object instanceof TLRPC.TL_messages_sendMedia
-                || object instanceof TLRPC.TL_messages_sendMultiMedia;
-    }
-
-    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
-        final int requestToken = lastRequestToken.getAndIncrement();
-        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
-            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
-            return requestToken;
-        }
-        Utilities.stageQueue.postRunnable(() -> {
-            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
-        });
-        return requestToken;
-    }""",
-            """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
-        if (object instanceof TLRPC.TL_messages_sendMedia) {
-            return !(((TLRPC.TL_messages_sendMedia) object).media instanceof TLRPC.TL_inputMediaGame);
-        }
-        return object instanceof TLRPC.TL_messages_sendMessage
-                || object instanceof TLRPC.TL_messages_sendMultiMedia;
-    }
-
-    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
-        final int requestToken = lastRequestToken.getAndIncrement();
-        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
-            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
-            return requestToken;
-        }
-        Utilities.stageQueue.postRunnable(() -> {
-            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
-        });
-        return requestToken;
+            """    private static boolean colgramIsInstantSendRequest(TLObject object) {
+        return colgramIsOnlineTriggeringRequest(object)
+                || object instanceof TLRPC.TL_messages_addPollAnswer
+                || object instanceof TLRPC.TL_messages_deletePollAnswer
+                || object instanceof TLRPC.TL_messages_toggleTodoCompleted
+                || object instanceof TLRPC.TL_messages_getBotCallbackAnswer
+                || object instanceof TLRPC.TL_messages_uploadMedia;
     }""",
         ],
-        """    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+        """    private static boolean colgramIsInstantSendRequest(TLObject object) {
+        return object instanceof TLRPC.TL_messages_sendMessage
+                || object instanceof TLRPC.TL_messages_forwardMessages
+                || object instanceof TLRPC.TL_messages_editMessage
+                || object instanceof TLRPC.TL_messages_sendReaction
+                || object instanceof TLRPC.TL_messages_sendInlineBotResult
+                || object instanceof TLRPC.TL_messages_sendVote
+                || object instanceof TLRPC.TL_messages_addPollAnswer
+                || object instanceof TLRPC.TL_messages_deletePollAnswer
+                || object instanceof TLRPC.TL_messages_toggleTodoCompleted
+                || object instanceof TLRPC.TL_messages_getBotCallbackAnswer;
+    }""",
+        "ConnectionsManager.java remove heavy media and upload RPCs from colgramIsInstantSendRequest",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        conn_mgr,
+        [
+            """    public int sendRequestSync(final TLObject object, final RequestDelegate onComplete, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        sendRequestInternal(object, onComplete, null, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        return requestToken;
+    }
+
+    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
         if (object instanceof TLRPC.TL_messages_sendMedia) {
             return !(((TLRPC.TL_messages_sendMedia) object).media instanceof TLRPC.TL_inputMediaGame);
         }
@@ -394,7 +393,92 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         });
         return requestToken;
     }""",
-        "ConnectionsManager.java bypass stageQueue on outbound instant send requests and propagate Contract A read exemption",
+            """    public int sendRequestSync(final TLObject object, final RequestDelegate onComplete, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        sendRequestInternal(object, onComplete, null, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        return requestToken;
+    }
+
+    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+        return object instanceof TLRPC.TL_messages_sendMessage
+                || object instanceof TLRPC.TL_messages_sendMedia
+                || object instanceof TLRPC.TL_messages_sendMultiMedia;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            return requestToken;
+        }
+        Utilities.stageQueue.postRunnable(() -> {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        });
+        return requestToken;
+    }""",
+            """    public int sendRequestSync(final TLObject object, final RequestDelegate onComplete, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        sendRequestInternal(object, onComplete, null, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        return requestToken;
+    }
+
+    private static boolean colgramIsDirectSendResponseSafe(TLObject object) {
+        if (object instanceof TLRPC.TL_messages_sendMedia) {
+            return !(((TLRPC.TL_messages_sendMedia) object).media instanceof TLRPC.TL_inputMediaGame);
+        }
+        return object instanceof TLRPC.TL_messages_sendMessage
+                || object instanceof TLRPC.TL_messages_sendMultiMedia;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            return requestToken;
+        }
+        Utilities.stageQueue.postRunnable(() -> {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        });
+        return requestToken;
+    }""",
+            """    public int sendRequestSync(final TLObject object, final RequestDelegate onComplete, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        sendRequestInternal(object, onComplete, null, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        return requestToken;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        Utilities.stageQueue.postRunnable(() -> {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        });
+        return requestToken;
+    }""",
+        ],
+        """    public int sendRequestSync(final TLObject object, final RequestDelegate onComplete, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        sendRequestInternal(object, onComplete, null, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+        return requestToken;
+    }
+
+    public int sendRequest(final TLObject object, final RequestDelegate onComplete, final RequestDelegateTimestamp onCompleteTimestamp, final QuickAckDelegate onQuickAck, final WriteToSocketDelegate onWriteToSocket, final int flags, final int datacenterId, final int connectionType, final boolean immediate) {
+        final int requestToken = lastRequestToken.getAndIncrement();
+        if (!ColgramGuestProxyService.inProbeProcess() && colgramIsInstantSendRequest(object)) {
+            sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            return requestToken;
+        }
+        final boolean colgramAllowSpamMentionClear = org.colgram.core.ColgramGhostMode.isAllowingSpamMentionClear();
+        Utilities.stageQueue.postRunnable(() -> {
+            if (colgramAllowSpamMentionClear) {
+                org.colgram.core.ColgramGhostMode.runAllowingSpamMentionClear(() ->
+                        sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken));
+            } else {
+                sendRequestInternal(object, onComplete, onCompleteTimestamp, onQuickAck, onWriteToSocket, flags, datacenterId, connectionType, immediate, requestToken);
+            }
+        });
+        return requestToken;
+    }""",
+        "ConnectionsManager.java strip colgramIsDirectSendResponseSafe, bypass stageQueue on instant text sends, and propagate Contract A read exemption",
     )
     if os.path.isfile(conn_mgr):
         with open(conn_mgr, "r", encoding="utf-8", errors="ignore") as _cm_f:
@@ -551,18 +635,31 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         conn_mgr,
         [
-            """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            """        if (packageId == null) {
+            packageId = "";
+        }
+
+        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
             installer = "com.android.vending";
-        }""",
-            """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+        }
+        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();""",
+            """        if (packageId == null) {
+            packageId = "";
+        }
+
+        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
             installer = "com.android.vending";
             packageId = "org.telegram.messenger";
             regId = "";
             cFingerprint = "";
             timezoneOffset = 0;
-        }""",
-        ],
-        """        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+        }
+        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();""",
+            """        if (packageId == null) {
+            packageId = "";
+        }
+
+        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
             installer = "com.android.vending";
             packageId = "org.telegram.messenger";
             if (!enablePushConnection) {
@@ -570,8 +667,27 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             }
             cFingerprint = "";
             timezoneOffset = 0;
-        }""",
-        "ConnectionsManager.java full native_init parameter cloaking",
+        }
+        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();""",
+        ],
+        """        if (packageId == null) {
+            packageId = "";
+        }
+
+        if (org.colgram.core.ColgramConfig.isCloakEnabled()) {
+            installer = "com.android.vending";
+        }
+        if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+            installer = "com.android.vending";
+            packageId = "org.telegram.messenger";
+            if (!enablePushConnection) {
+                regId = "";
+            }
+            cFingerprint = "";
+            timezoneOffset = 0;
+        }
+        boolean effectivePush = enablePushConnection || org.colgram.core.ColgramConfig.isAlwaysBackgroundEnabled();""",
+        "ConnectionsManager.java restore safe installer-only default cloak and gate max-anonymity native_init overrides",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -580,14 +696,19 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             """    public static int getInitFlags() {
         if (ColgramGuestProxyService.inProbeProcess()) return 0;
         int flags = 0;
-        EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);"""
-        ],
-        """    public static int getInitFlags() {
+        EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);""",
+            """    public static int getInitFlags() {
         if (ColgramGuestProxyService.inProbeProcess()) return 0;
         if (org.colgram.core.ColgramConfig.isCloakEnabled()) return 0;
         int flags = 0;
         EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);""",
-        "ConnectionsManager.java skip EmuDetector when cloaked",
+        ],
+        """    public static int getInitFlags() {
+        if (ColgramGuestProxyService.inProbeProcess()) return 0;
+        if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) return 0;
+        int flags = 0;
+        EmuDetector detector = EmuDetector.with(ApplicationLoader.applicationContext);""",
+        "ConnectionsManager.java skip EmuDetector only under max-anonymity",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -726,16 +847,23 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         [
             """    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
         if (ColgramGuestProxyService.inProbeProcess()) return;
-        AndroidUtilities.runOnUIThread(() -> {"""
-        ],
-        """    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
+        AndroidUtilities.runOnUIThread(() -> {""",
+            """    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
         if (ColgramGuestProxyService.inProbeProcess()) return;
         if (org.colgram.core.ColgramConfig.isCloakEnabled() || org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
             native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, "PLAYINTEGRITY_FAILED_EXCEPTION_UNAVAILABLE");
             return;
         }
         AndroidUtilities.runOnUIThread(() -> {""",
-        "ConnectionsManager.java stub Play Integrity when cloaked",
+        ],
+        """    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
+        if (ColgramGuestProxyService.inProbeProcess()) return;
+        if (org.colgram.core.ColgramConfig.isMaxAnonymityEnabled()) {
+            native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, "PLAYINTEGRITY_FAILED_EXCEPTION_UNAVAILABLE");
+            return;
+        }
+        AndroidUtilities.runOnUIThread(() -> {""",
+        "ConnectionsManager.java stub Play Integrity only under max-anonymity",
     )
     _patch_eol_variants(
         eol_patch_fn,
@@ -761,11 +889,13 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         }""",
         "ConnectionsManager.java keep pre-send instant wake non-blocking",
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         conn_mgr,
-        """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
+        [
+            """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
         } catch (Exception e) {""",
-        """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
+            """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
             if (colgramInstantWake) {
                 final boolean colgramNeedConnCheck = colgramIsRawDisconnected();
                 final boolean colgramNeedBypassWake = !org.colgram.core.ColgramDpiBypass.isBound()
@@ -784,29 +914,33 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 }
             }
         } catch (Exception e) {""",
-        "ConnectionsManager.java offload checkConnection and bypass restart after native_sendRequest",
+        ],
+        """            native_sendRequest(currentAccount, buffer.address, flags, datacenterId, connectionType, immediate, requestToken);
+            if (colgramInstantWake) {
+                final boolean colgramNeedConnCheck = colgramIsRawDisconnected();
+                final boolean colgramNeedBypassWake = org.colgram.core.ColgramHookHandler.canAutoRestartDpiBypass()
+                        && !org.colgram.core.ColgramDpiBypass.isBound();
+                if (colgramNeedConnCheck || colgramNeedBypassWake) {
+                    Utilities.globalQueue.postRunnable(() -> {
+                        if (colgramNeedConnCheck) {
+                            checkConnection();
+                        }
+                        if (colgramNeedBypassWake) {
+                            try {
+                                org.colgram.core.ColgramDpiBypass.restartIfDead();
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {""",
+        "ConnectionsManager.java offload checkConnection and bypass restart guarded by canAutoRestartDpiBypass",
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         conn_mgr,
-        """                    final TLObject finalResponse = resp;
-                    final TLRPC.TL_error finalError = error;
-                    Utilities.stageQueue.postRunnable(() -> {
-                        if (onComplete != null) {
-                            onComplete.run(finalResponse, finalError);
-                        } else if (onCompleteTimestamp != null) {
-                            onCompleteTimestamp.run(finalResponse, finalError, timestamp);
-                        } else if (finalResponse instanceof TLRPC.Updates) {
-                            KeepAliveJob.finishJob();
-                            AccountInstance.getInstance(currentAccount).getMessagesController().processUpdates((TLRPC.Updates) finalResponse, false);
-                        }
-                        if (finalResponse != null) {
-                            finalResponse.freeResources();
-                        }
-                        if (colgramTriggersOnline && finalError == null && org.colgram.core.ColgramHookHandler.shouldStayOffline()) {
-                            AccountInstance.getInstance(currentAccount).getMessagesController().scheduleGhostOfflineAfterActivity();
-                        }
-                    });""",
-        """                    final TLObject finalResponse = resp;
+        [
+            """                    final TLObject finalResponse = resp;
                     final TLRPC.TL_error finalError = error;
                     if (finalError == null && onComplete != null && colgramIsDirectSendResponseSafe(object)) {
                         onComplete.run(finalResponse, null);
@@ -831,7 +965,26 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                             }
                         });
                     }""",
-        "ConnectionsManager.java bypass stageQueue on inbound send response completion",
+        ],
+        """                    final TLObject finalResponse = resp;
+                    final TLRPC.TL_error finalError = error;
+                    Utilities.stageQueue.postRunnable(() -> {
+                        if (onComplete != null) {
+                            onComplete.run(finalResponse, finalError);
+                        } else if (onCompleteTimestamp != null) {
+                            onCompleteTimestamp.run(finalResponse, finalError, timestamp);
+                        } else if (finalResponse instanceof TLRPC.Updates) {
+                            KeepAliveJob.finishJob();
+                            AccountInstance.getInstance(currentAccount).getMessagesController().processUpdates((TLRPC.Updates) finalResponse, false);
+                        }
+                        if (finalResponse != null) {
+                            finalResponse.freeResources();
+                        }
+                        if (colgramTriggersOnline && finalError == null && org.colgram.core.ColgramHookHandler.shouldStayOffline()) {
+                            AccountInstance.getInstance(currentAccount).getMessagesController().scheduleGhostOfflineAfterActivity();
+                        }
+                    });""",
+        "ConnectionsManager.java dispatch all inbound responses via stageQueue and always call freeResources",
     )
     eol_patch_fn(
         conn_mgr,
@@ -985,20 +1138,182 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 }""",
         "MessagesController.java replace dialogsEndReached on error with colgramDialogsRetryPending",
     )
+    _patch_eol_variants(
+        eol_patch_fn,
+        msgs_ctrl,
+        [
+            """            if (mode == ChatActivity.MODE_WELCOME_MESSAGES) {
+                TL_ephemeral.TL_getWelcomeMessages req = new TL_ephemeral.TL_getWelcomeMessages();
+                req.peer = getInputPeer(dialogId);
+                req.hash = hash;
+                final int reqId = getConnectionsManager().sendRequestTyped(req, (res, error) -> {
+                    if (res != null) {
+                        if (res instanceof TL_ephemeral.TL_welcomeMessagesNotModified) {
+                            return;
+                        }
 
-    # 5. MediaDataController.java: keep fallback reactions in-memory only, retry on connect, guard SQLite & preloads.
+                        final TLRPC.TL_messages_messages result = new TLRPC.TL_messages_messages();
+                        for (TL_ephemeral.EphemeralMessage message : res.messages) {
+                            result.messages.add(EphemeralMessagesHelper.convertEphemeralToFakeDefault(message));
+                        }
+                        processLoadedMessages(result, result.messages.size(), dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, false, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    } else if (error != null) {
+                        processLoadedMessages(new TLRPC.TL_messages_messages(), 0, dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, true, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    }
+                });""",
+        ],
+        """            if (mode == ChatActivity.MODE_WELCOME_MESSAGES) {
+                TL_ephemeral.TL_getWelcomeMessages req = new TL_ephemeral.TL_getWelcomeMessages();
+                req.peer = getInputPeer(dialogId);
+                req.hash = hash;
+                final int reqId = getConnectionsManager().sendRequestTyped(req, (res, error) -> {
+                    if (res != null) {
+                        if (res instanceof TL_ephemeral.TL_welcomeMessagesNotModified) {
+                            return;
+                        }
+
+                        final TLRPC.TL_messages_messages result = new TLRPC.TL_messages_messages();
+                        for (TL_ephemeral.EphemeralMessage message : res.messages) {
+                            result.messages.add(EphemeralMessagesHelper.convertEphemeralToFakeDefault(message));
+                        }
+                        processLoadedMessages(result, result.messages.size(), dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, false, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    } else if (error != null) {
+                        if ("BOT_METHOD_INVALID".equals(error.text)) {
+                            processLoadedMessages(new TLRPC.TL_messages_messages(), 0, dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, true, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                        } else {
+                            AndroidUtilities.runOnUIThread(() -> getNotificationCenter().postNotificationName(NotificationCenter.loadingMessagesFailed, classGuid, req, error));
+                        }
+                    }
+                });""",
+        "MessagesController.java gate MODE_WELCOME_MESSAGES empty isEnd on BOT_METHOD_INVALID",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        msgs_ctrl,
+        [
+            """            } else if (mode == ChatActivity.MODE_QUICK_REPLIES) {
+                TLRPC.TL_messages_getQuickReplyMessages req = new TLRPC.TL_messages_getQuickReplyMessages();
+                req.shortcut_id = (int) threadMessageId;
+                req.hash = hash;
+                int reqId = getConnectionsManager().sendRequest(req, (response, error) -> {
+                    if (response != null) {
+                        TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
+                        if (res instanceof TLRPC.TL_messages_messagesNotModified) {
+                            return;
+                        }
+                        processLoadedMessages(res, res.messages.size(), dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, false, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    } else if (error != null) {
+                        processLoadedMessages(new TLRPC.TL_messages_messages(), 0, dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, true, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    }
+                });""",
+        ],
+        """            } else if (mode == ChatActivity.MODE_QUICK_REPLIES) {
+                TLRPC.TL_messages_getQuickReplyMessages req = new TLRPC.TL_messages_getQuickReplyMessages();
+                req.shortcut_id = (int) threadMessageId;
+                req.hash = hash;
+                int reqId = getConnectionsManager().sendRequest(req, (response, error) -> {
+                    if (response != null) {
+                        TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
+                        if (res instanceof TLRPC.TL_messages_messagesNotModified) {
+                            return;
+                        }
+                        processLoadedMessages(res, res.messages.size(), dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, false, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    } else if (error != null) {
+                        if ("BOT_METHOD_INVALID".equals(error.text)) {
+                            processLoadedMessages(new TLRPC.TL_messages_messages(), 0, dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, true, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                        } else {
+                            AndroidUtilities.runOnUIThread(() -> getNotificationCenter().postNotificationName(NotificationCenter.loadingMessagesFailed, classGuid, req, error));
+                        }
+                    }
+                });""",
+        "MessagesController.java gate MODE_QUICK_REPLIES empty isEnd on BOT_METHOD_INVALID",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        msgs_ctrl,
+        [
+            """            } else if (mode == ChatActivity.MODE_SCHEDULED) {
+                final TLRPC.TL_messages_getScheduledHistory req = new TLRPC.TL_messages_getScheduledHistory();
+                req.peer = getInputPeer(dialogId);
+                req.hash = hash;
+                int reqId = getConnectionsManager().sendRequest(req, (response, error) -> {
+                    if (response != null) {
+                        TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
+                        if (res instanceof TLRPC.TL_messages_messagesNotModified) {
+                            return;
+                        }
+                        int mid = max_id;
+                        if (offset_date != 0 && !res.messages.isEmpty()) {
+                            mid = res.messages.get(res.messages.size() - 1).id;
+                            for (int a = res.messages.size() - 1; a >= 0; a--) {
+                                TLRPC.Message message = res.messages.get(a);
+                                if (message.date > offset_date) {
+                                    mid = message.id;
+                                    break;
+                                }
+                            }
+                        }
+                        processLoadedMessages(res, res.messages.size(), dialogId, mergeDialogId, count, mid, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, false, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    } else if (error != null) {
+                        processLoadedMessages(new TLRPC.TL_messages_messages(), 0, dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, true, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    }
+                });""",
+        ],
+        """            } else if (mode == ChatActivity.MODE_SCHEDULED) {
+                final TLRPC.TL_messages_getScheduledHistory req = new TLRPC.TL_messages_getScheduledHistory();
+                req.peer = getInputPeer(dialogId);
+                req.hash = hash;
+                int reqId = getConnectionsManager().sendRequest(req, (response, error) -> {
+                    if (response != null) {
+                        TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
+                        if (res instanceof TLRPC.TL_messages_messagesNotModified) {
+                            return;
+                        }
+                        int mid = max_id;
+                        if (offset_date != 0 && !res.messages.isEmpty()) {
+                            mid = res.messages.get(res.messages.size() - 1).id;
+                            for (int a = res.messages.size() - 1; a >= 0; a--) {
+                                TLRPC.Message message = res.messages.get(a);
+                                if (message.date > offset_date) {
+                                    mid = message.id;
+                                    break;
+                                }
+                            }
+                        }
+                        processLoadedMessages(res, res.messages.size(), dialogId, mergeDialogId, count, mid, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, false, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                    } else if (error != null) {
+                        if ("BOT_METHOD_INVALID".equals(error.text)) {
+                            processLoadedMessages(new TLRPC.TL_messages_messages(), 0, dialogId, mergeDialogId, count, max_id, offset_date, false, classGuid, first_unread, last_message_id, unread_count, last_date, load_type, true, mode, threadMessageId, loadIndex, queryFromServer, mentionsCount, processMessages, isTopic, null);
+                        } else {
+                            AndroidUtilities.runOnUIThread(() -> getNotificationCenter().postNotificationName(NotificationCenter.loadingMessagesFailed, classGuid, req, error));
+                        }
+                    }
+                });""",
+        "MessagesController.java gate MODE_SCHEDULED empty isEnd on BOT_METHOD_INVALID",
+    )
+
+    # 5. MediaDataController.java: keep fallback reactions in-memory only, retry with bounded backoff, guard SQLite & preloads.
     media_dc = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MediaDataController.java"
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         media_dc,
-        """    private int reactionsUpdateDate;
-    private boolean reactionsCacheGenerated;""",
-        """    private int reactionsUpdateDate;
+        [
+            """    private int reactionsUpdateDate;
     private boolean reactionsCacheGenerated;
     private boolean reactionsFallbackActive;
     private NotificationCenter.NotificationCenterDelegate colgramReactionsConnObserver;""",
-        "MediaDataController.java add reactionsFallbackActive fields",
+            """    private int reactionsUpdateDate;
+    private boolean reactionsCacheGenerated;""",
+        ],
+        """    private int reactionsUpdateDate;
+    private boolean reactionsCacheGenerated;
+    private boolean reactionsFallbackActive;
+    private NotificationCenter.NotificationCenterDelegate colgramReactionsConnObserver;
+    private int colgramReactionsRetryAttempt;
+    private Runnable colgramReactionsRetryRunnable;""",
+        "MediaDataController.java add reactionsFallbackActive and bounded retry fields",
     )
     if os.path.exists(media_dc):
         with open(media_dc, "r", encoding="utf-8", errors="ignore") as _mdc_f:
@@ -1026,22 +1341,11 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 } else {""",
                 "MediaDataController.java re-arm reactions observer if reconnect retry fails",
             )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         media_dc,
-        """            TLRPC.TL_messages_getAvailableReactions req = new TLRPC.TL_messages_getAvailableReactions();
-            req.hash = lastHash != null ? lastHash : reactionsUpdateHash;
-            getConnectionsManager().sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
-                int date = (int) (System.currentTimeMillis() / 1000);
-                if (response instanceof TLRPC.TL_messages_availableReactionsNotModified) {
-                    processLoadedReactions(null, 0, date, false);
-                } else if (response instanceof TLRPC.TL_messages_availableReactions) {
-                    TLRPC.TL_messages_availableReactions r = (TLRPC.TL_messages_availableReactions) response;
-                    processLoadedReactions(r.reactions, r.hash, date, false);
-                } else if (enabledReactionsList.isEmpty()) {
-                    processLoadedReactions(buildDefaultFallbackReactions(), 0, date, false);
-                }
-            }));""",
-        """            TLRPC.TL_messages_getAvailableReactions req = new TLRPC.TL_messages_getAvailableReactions();
+        [
+            """            TLRPC.TL_messages_getAvailableReactions req = new TLRPC.TL_messages_getAvailableReactions();
             req.hash = reactionsFallbackActive ? 0 : (lastHash != null ? lastHash : reactionsUpdateHash);
             getConnectionsManager().sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
                 int date = (int) (System.currentTimeMillis() / 1000);
@@ -1068,11 +1372,57 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     isLoadingReactions = false;
                 }
             }));""",
-        "MediaDataController.java avoid caching fallback reactions and retry on connect",
+            """            TLRPC.TL_messages_getAvailableReactions req = new TLRPC.TL_messages_getAvailableReactions();
+            req.hash = lastHash != null ? lastHash : reactionsUpdateHash;
+            getConnectionsManager().sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+                int date = (int) (System.currentTimeMillis() / 1000);
+                if (response instanceof TLRPC.TL_messages_availableReactionsNotModified) {
+                    processLoadedReactions(null, 0, date, false);
+                } else if (response instanceof TLRPC.TL_messages_availableReactions) {
+                    TLRPC.TL_messages_availableReactions r = (TLRPC.TL_messages_availableReactions) response;
+                    processLoadedReactions(r.reactions, r.hash, date, false);
+                } else if (enabledReactionsList.isEmpty()) {
+                    processLoadedReactions(buildDefaultFallbackReactions(), 0, date, false);
+                }
+            }));""",
+        ],
+        """            TLRPC.TL_messages_getAvailableReactions req = new TLRPC.TL_messages_getAvailableReactions();
+            req.hash = reactionsFallbackActive ? 0 : (lastHash != null ? lastHash : reactionsUpdateHash);
+            getConnectionsManager().sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+                int date = (int) (System.currentTimeMillis() / 1000);
+                if (response instanceof TLRPC.TL_messages_availableReactionsNotModified) {
+                    if (reactionsFallbackActive) {
+                        reactionsFallbackActive = false;
+                        loadReactions(false, 0);
+                    } else {
+                        colgramReactionsRetryAttempt = 0;
+                        processLoadedReactions(null, 0, date, false);
+                    }
+                } else if (response instanceof TLRPC.TL_messages_availableReactions) {
+                    reactionsFallbackActive = false;
+                    colgramReactionsRetryAttempt = 0;
+                    colgramDetachReactionsConnectionObserver();
+                    TLRPC.TL_messages_availableReactions r = (TLRPC.TL_messages_availableReactions) response;
+                    processLoadedReactions(r.reactions, r.hash, date, false);
+                } else if (enabledReactionsList.isEmpty() || reactionsFallbackActive) {
+                    reactionsFallbackActive = true;
+                    isLoadingReactions = false;
+                    if (enabledReactionsList.isEmpty()) {
+                        colgramApplyFallbackReactionsInMemory(buildDefaultFallbackReactions());
+                    }
+                    colgramEnsureReactionsConnectionObserver();
+                } else {
+                    isLoadingReactions = false;
+                }
+            }));""",
+        "MediaDataController.java avoid caching fallback reactions and retry with backoff",
     )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         media_dc,
-        """    private List<TLRPC.TL_availableReaction> buildDefaultFallbackReactions() {""",
+        [
+            """    private List<TLRPC.TL_availableReaction> buildDefaultFallbackReactions() {""",
+        ],
         """    private void colgramApplyFallbackReactionsInMemory(List<TLRPC.TL_availableReaction> fallback) {
         if (fallback == null) return;
         reactionsList.clear();
@@ -1103,6 +1453,20 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             };
             getNotificationCenter().addObserver(colgramReactionsConnObserver, NotificationCenter.didUpdateConnectionState);
         }
+        if (reactionsFallbackActive && colgramReactionsRetryAttempt < 5 && colgramReactionsRetryRunnable == null) {
+            final int attempt = colgramReactionsRetryAttempt;
+            final long delayMs = (getConnectionsManager().getConnectionState() == ConnectionsManager.ConnectionStateConnected)
+                    ? 1500L
+                    : (attempt <= 0 ? 3000L : (attempt == 1 ? 8000L : 20000L));
+            colgramReactionsRetryAttempt = attempt + 1;
+            colgramReactionsRetryRunnable = () -> {
+                colgramReactionsRetryRunnable = null;
+                if (reactionsFallbackActive && !isLoadingReactions) {
+                    loadReactions(false, 0);
+                }
+            };
+            AndroidUtilities.runOnUIThread(colgramReactionsRetryRunnable, delayMs);
+        }
     }
 
     private void colgramDetachReactionsConnectionObserver() {
@@ -1110,10 +1474,81 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             getNotificationCenter().removeObserver(colgramReactionsConnObserver, NotificationCenter.didUpdateConnectionState);
             colgramReactionsConnObserver = null;
         }
+        if (colgramReactionsRetryRunnable != null) {
+            AndroidUtilities.cancelRunOnUIThread(colgramReactionsRetryRunnable);
+            colgramReactionsRetryRunnable = null;
+        }
     }
 
     private List<TLRPC.TL_availableReaction> buildDefaultFallbackReactions() {""",
-        "MediaDataController.java add fallback & reconnect helpers",
+        "MediaDataController.java add fallback & bounded exponential retry helpers",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        media_dc,
+        [
+            """    private void colgramEnsureReactionsConnectionObserver() {
+        if (colgramReactionsConnObserver == null) {
+            colgramReactionsConnObserver = (id, account, args) -> {
+                if (id == NotificationCenter.didUpdateConnectionState
+                        && getConnectionsManager().getConnectionState() == ConnectionsManager.ConnectionStateConnected) {
+                    colgramDetachReactionsConnectionObserver();
+                    if (reactionsFallbackActive && !isLoadingReactions) {
+                        loadReactions(false, 0);
+                    }
+                }
+            };
+            getNotificationCenter().addObserver(colgramReactionsConnObserver, NotificationCenter.didUpdateConnectionState);
+        }
+    }
+
+    private void colgramDetachReactionsConnectionObserver() {
+        if (colgramReactionsConnObserver != null) {
+            getNotificationCenter().removeObserver(colgramReactionsConnObserver, NotificationCenter.didUpdateConnectionState);
+            colgramReactionsConnObserver = null;
+        }
+    }""",
+        ],
+        """    private void colgramEnsureReactionsConnectionObserver() {
+        if (colgramReactionsConnObserver == null) {
+            colgramReactionsConnObserver = (id, account, args) -> {
+                if (id == NotificationCenter.didUpdateConnectionState
+                        && getConnectionsManager().getConnectionState() == ConnectionsManager.ConnectionStateConnected) {
+                    colgramDetachReactionsConnectionObserver();
+                    if (reactionsFallbackActive && !isLoadingReactions) {
+                        loadReactions(false, 0);
+                    }
+                }
+            };
+            getNotificationCenter().addObserver(colgramReactionsConnObserver, NotificationCenter.didUpdateConnectionState);
+        }
+        if (reactionsFallbackActive && colgramReactionsRetryAttempt < 5 && colgramReactionsRetryRunnable == null) {
+            final int attempt = colgramReactionsRetryAttempt;
+            final long delayMs = (getConnectionsManager().getConnectionState() == ConnectionsManager.ConnectionStateConnected)
+                    ? 1500L
+                    : (attempt <= 0 ? 3000L : (attempt == 1 ? 8000L : 20000L));
+            colgramReactionsRetryAttempt = attempt + 1;
+            colgramReactionsRetryRunnable = () -> {
+                colgramReactionsRetryRunnable = null;
+                if (reactionsFallbackActive && !isLoadingReactions) {
+                    loadReactions(false, 0);
+                }
+            };
+            AndroidUtilities.runOnUIThread(colgramReactionsRetryRunnable, delayMs);
+        }
+    }
+
+    private void colgramDetachReactionsConnectionObserver() {
+        if (colgramReactionsConnObserver != null) {
+            getNotificationCenter().removeObserver(colgramReactionsConnObserver, NotificationCenter.didUpdateConnectionState);
+            colgramReactionsConnObserver = null;
+        }
+        if (colgramReactionsRetryRunnable != null) {
+            AndroidUtilities.cancelRunOnUIThread(colgramReactionsRetryRunnable);
+            colgramReactionsRetryRunnable = null;
+        }
+    }""",
+        "MediaDataController.java upgrade reactions observer with bounded exponential retry",
     )
     eol_patch_fn(
         media_dc,
@@ -1278,8 +1713,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             maxDownloadRequests = 4;
             maxDownloadRequestsBig = 4;
             maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);""",
-        ],
-        """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+            """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
                 || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
                 || location instanceof TLRPC.TL_inputStickerSetThumb
                 || location instanceof TLRPC.TL_inputPhotoFileLocation
@@ -1291,7 +1725,20 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
             maxDownloadRequests = 6;
             maxDownloadRequestsBig = 6;
             maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);""",
-        "FileLoadOperation.java safe chunk sizes (64KB >=32KB) and upgraded request caps (6/6/6)",
+        ],
+        """        boolean isSmallOrThumbOrAvatar = !allowDisordererFileSave
+                || location instanceof TLRPC.TL_inputPeerPhotoFileLocation
+                || location instanceof TLRPC.TL_inputStickerSetThumb
+                || location instanceof TLRPC.TL_inputPhotoFileLocation
+                || totalBytesCount <= 0
+                || totalBytesCount < 256 * 1024;
+        if (boost && !forceSmallChunk) {
+            downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 128 ? 1024 * 64 : 1024 * 32) : 1024 * 128;
+            downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;
+            maxDownloadRequests = 4;
+            maxDownloadRequestsBig = 4;
+            maxDownloadRequestsAnimation = 4;""",
+        "FileLoadOperation.java 32KB small-file chunks (<128KB) and safe 4/4/4 request caps",
     )
     eol_patch_fn(
         file_load_op,
@@ -1344,7 +1791,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "FileLoadOperation.java CDN reupload fallback to origin DC",
     )
 
-    # 8. FileLoader.java: stop blanket priority = PRIORITY_HIGH and setForceRequest(true) on every small load.
+    # 8. FileLoader.java: stop blanket priority = PRIORITY_HIGH and gate setForceRequest(true) on PRIORITY_VALUE_NORMAL_UP.
     file_loader = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoader.java"
     )
@@ -1373,21 +1820,53 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         priority = getPriorityValue(priority);""",
             "FileLoader.java stop blanket PRIORITY_HIGH",
         )
-    eol_patch_fn(
+    _patch_eol_variants(
+        eol_patch_fn,
         file_loader,
-        """        if (operation != null) {
-            if (cacheType != 10 && operation.isPreloadVideoOperation()) {
-                operation.setIsPreloadVideoOperation(false);
-            }
-            operation.setForceRequest(priority > 0);""",
-        """        if (operation != null) {
+        [
+            """        if (operation != null) {
             if (cacheType != 10 && operation.isPreloadVideoOperation()) {
                 operation.setIsPreloadVideoOperation(false);
             }
             if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX) {
                 operation.setForceRequest(true);
             }""",
-        "FileLoader.java gate setForceRequest on PRIORITY_VALUE_MAX",
+            """        if (operation != null) {
+            if (cacheType != 10 && operation.isPreloadVideoOperation()) {
+                operation.setIsPreloadVideoOperation(false);
+            }
+            operation.setForceRequest(priority > 0);""",
+        ],
+        """        if (operation != null) {
+            if (cacheType != 10 && operation.isPreloadVideoOperation()) {
+                operation.setIsPreloadVideoOperation(false);
+            }
+            if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_NORMAL_UP) {
+                operation.setForceRequest(true);
+            }""",
+        "FileLoader.java gate queued setForceRequest on PRIORITY_VALUE_NORMAL_UP",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        file_loader,
+        [
+            """        loadOperationPaths.put(finalFileName, operation);
+        operation.setPriority(priority);
+        if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX) {
+            operation.setForceRequest(true);
+        }
+        if (stream == null) {""",
+            """        loadOperationPaths.put(finalFileName, operation);
+        operation.setPriority(priority);
+        if (stream == null) {""",
+        ],
+        """        loadOperationPaths.put(finalFileName, operation);
+        operation.setPriority(priority);
+        if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_NORMAL_UP) {
+            operation.setForceRequest(true);
+        }
+        if (stream == null) {""",
+        "FileLoader.java restore setForceRequest(true) on new PRIORITY_VALUE_NORMAL_UP ops",
     )
     eol_patch_fn(
         file_loader,
@@ -1396,7 +1875,7 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         "FileLoader.java split smallFilesQueue vs largeFilesQueue at 2MB for instant avatars",
     )
 
-    # 9. FileLoaderPriorityQueue.java: instant avatar/sticker concurrent ops (large=3, small=12).
+    # 9. FileLoaderPriorityQueue.java: add PRIORITY_VALUE_NORMAL_UP, checkDelayMs=8, safe cap (3/6).
     prio_queue = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "FileLoaderPriorityQueue.java"
     )
@@ -1404,11 +1883,37 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         prio_queue,
         [
-            "            max = Math.max(max, type == TYPE_LARGE ? 3 : 6);",
+            """    public final static int PRIORITY_VALUE_MAX = (1 << 20);
+    public final static int PRIORITY_VALUE_NORMAL = (1 << 16);
+    public final static int PRIORITY_VALUE_LOW = 0;""",
+        ],
+        """    public final static int PRIORITY_VALUE_MAX = (1 << 20);
+    public final static int PRIORITY_VALUE_NORMAL = (1 << 16);
+    public final static int PRIORITY_VALUE_NORMAL_UP = PRIORITY_VALUE_NORMAL + 1;
+    public final static int PRIORITY_VALUE_LOW = 0;""",
+        "FileLoaderPriorityQueue.java define PRIORITY_VALUE_NORMAL_UP",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        prio_queue,
+        [
+            """        long checkDelayMs = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled() ? 1 : 20;
+        workerQueue.postRunnable(checkOperationsRunnable, checkDelayMs);""",
+            """        workerQueue.postRunnable(checkOperationsRunnable, 20);""",
+        ],
+        """        long checkDelayMs = org.colgram.core.ColgramDesignConfig.isDownloadSpeedBoostEnabled() ? 8 : 20;
+        workerQueue.postRunnable(checkOperationsRunnable, checkDelayMs);""",
+        "FileLoaderPriorityQueue.java cap boosted checkDelayMs at 8ms",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        prio_queue,
+        [
+            "            max = Math.max(max, type == TYPE_LARGE ? 3 : 12);",
             "            max = Math.max(max, type == TYPE_LARGE ? 8 : 24);",
         ],
-        "            max = Math.max(max, type == TYPE_LARGE ? 3 : 12);",
-        "FileLoaderPriorityQueue.java boost small queue concurrent operations (3/12)",
+        "            max = Math.max(max, type == TYPE_LARGE ? 3 : 6);",
+        "FileLoaderPriorityQueue.java cap boosted concurrent operations (3/6)",
     )
 
     # 10. ImageLoader.java: cacheOutQueue/cacheThumbOutQueue threads (3/2) + dedicated Lottie queue.
@@ -1638,7 +2143,33 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                 "ImageLoader.java keep avatars/custom emojis strictly above generic <=256KB message photos",
             )
 
-    # 11. AnimatedEmojiDrawable.java: remove doOnIdle on DB->server lookup and chunk <= 100 IDs.
+    if os.path.exists(image_loader):
+        with open(image_loader, "r", encoding="utf-8", errors="ignore") as _il_r_f:
+            _il_r_src = _il_r_f.read()
+        if "isUnlimitedMemoryEnabled" in _il_r_src:
+            _patch_eol_variants(
+                eol_patch_fn,
+                image_loader,
+                [
+                    "        boolean unlimited = org.colgram.core.ColgramConfig.isUnlimitedMemoryEnabled();",
+                ],
+                "        boolean unlimited = true;",
+                "ImageLoader.java decouple RAM memCache size from isUnlimitedMemoryEnabled",
+            )
+        if "lottieCacheSize =" in _il_r_src:
+            _patch_eol_variants(
+                eol_patch_fn,
+                image_loader,
+                [
+                    "        int lottieCacheSize = unlimited ? 512 * 512 * 2 * 4 * 5 : 512 * 512 * 2 * 4 * 2;",
+                    "        int lottieCacheSize = 512 * 512 * 2 * 4 * 2;",
+                ],
+                "        int lottieCacheSize = 512 * 512 * 2 * 4 * 5;",
+                "ImageLoader.java unconditionally enable 5-slot lottieMemCache",
+            )
+
+    # 11. AnimatedEmojiDrawable.java: remove doOnIdle on DB->server lookup & bot/RPC callbacks,
+    #     stagger > 100 ID chunks by 50ms, and add bounded retry + reconnect observer on transient errors.
     anim_emoji = os.path.join(
         repo_path,
         "TMessagesProj",
@@ -1655,20 +2186,126 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         eol_patch_fn,
         anim_emoji,
         [
-            """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
-            if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
-                processDocumentsAndLoadMore(documents, loadFromServerIds);
-            } else {
-                NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> processDocumentsAndLoadMore(documents, loadFromServerIds)));
+            """        private Runnable uiDbCallback;
+        private final int currentAccount;""",
+        ],
+        """        private Runnable uiDbCallback;
+        private final int currentAccount;
+        private HashMap<Long, Integer> colgramRetryCounts;
+        private HashSet<Long> colgramReconnectPendingIds;
+        private NotificationCenter.NotificationCenterDelegate colgramEmojiConnObserver;
+
+        private void colgramEnsureConnObserver() {
+            if (colgramEmojiConnObserver == null) {
+                colgramEmojiConnObserver = (id, account, args) -> {
+                    if (id == NotificationCenter.didUpdateConnectionState
+                            && ConnectionsManager.getInstance(currentAccount).getConnectionState()
+                            == ConnectionsManager.ConnectionStateConnected) {
+                        colgramDetachConnObserver();
+                        if (colgramReconnectPendingIds != null && !colgramReconnectPendingIds.isEmpty()) {
+                            ArrayList<Long> retryIds = new ArrayList<>(colgramReconnectPendingIds);
+                            colgramReconnectPendingIds.clear();
+                            loadFromServer(retryIds);
+                        }
+                    }
+                };
+                NotificationCenter.getInstance(currentAccount).addObserver(
+                        colgramEmojiConnObserver, NotificationCenter.didUpdateConnectionState);
             }
         }
 
-        private void loadFromServer(ArrayList<Long> loadFromServerIds) {
-            if (loadFromServerIds.isEmpty()) {
+        private void colgramDetachConnObserver() {
+            if (colgramEmojiConnObserver != null) {
+                NotificationCenter.getInstance(currentAccount).removeObserver(
+                        colgramEmojiConnObserver, NotificationCenter.didUpdateConnectionState);
+                colgramEmojiConnObserver = null;
+            }
+        }
+
+        private void colgramClearSuccessIds(ArrayList<Long> succeededIds) {
+            if (colgramRetryCounts != null) {
+                for (int i = 0; i < succeededIds.size(); i++) {
+                    colgramRetryCounts.remove(succeededIds.get(i));
+                }
+            }
+            if (colgramReconnectPendingIds != null) {
+                for (int i = 0; i < succeededIds.size(); i++) {
+                    colgramReconnectPendingIds.remove(succeededIds.get(i));
+                }
+                if (colgramReconnectPendingIds.isEmpty()) {
+                    colgramDetachConnObserver();
+                }
+            }
+        }
+
+        private void colgramScheduleRetryOrClear(ArrayList<Long> failedIds) {
+            if (failedIds == null || failedIds.isEmpty()) {
                 return;
-            }"""
-        ],
-        """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
+            }
+            if (colgramRetryCounts == null) {
+                colgramRetryCounts = new HashMap<>();
+            }
+            ArrayList<Long> retryNow = new ArrayList<>();
+            int maxAttempt = 0;
+            for (int i = 0; i < failedIds.size(); i++) {
+                Long docId = failedIds.get(i);
+                Integer prev = colgramRetryCounts.get(docId);
+                int attempt = prev != null ? prev : 0;
+                boolean stillWaiting = loadingDocuments != null && loadingDocuments.containsKey(docId);
+                if (stillWaiting && attempt < 3) {
+                    int nextAttempt = attempt + 1;
+                    colgramRetryCounts.put(docId, nextAttempt);
+                    if (nextAttempt > maxAttempt) {
+                        maxAttempt = nextAttempt;
+                    }
+                    retryNow.add(docId);
+                } else {
+                    colgramRetryCounts.remove(docId);
+                    if (colgramReconnectPendingIds != null) {
+                        colgramReconnectPendingIds.remove(docId);
+                    }
+                    if (loadingDocuments != null) {
+                        loadingDocuments.remove(docId);
+                    }
+                }
+            }
+            if (!retryNow.isEmpty()) {
+                if (ConnectionsManager.getInstance(currentAccount).getConnectionState()
+                        != ConnectionsManager.ConnectionStateConnected) {
+                    if (colgramReconnectPendingIds == null) {
+                        colgramReconnectPendingIds = new HashSet<>();
+                    }
+                    colgramReconnectPendingIds.addAll(retryNow);
+                    colgramEnsureConnObserver();
+                }
+                long delayMs = maxAttempt <= 1 ? 2500L : 6000L;
+                AndroidUtilities.runOnUIThread(() -> {
+                    ArrayList<Long> needed = new ArrayList<>();
+                    for (int i = 0; i < retryNow.size(); i++) {
+                        Long docId = retryNow.get(i);
+                        boolean cached;
+                        synchronized (this) {
+                            cached = emojiDocumentsCache != null && emojiDocumentsCache.containsKey(docId);
+                        }
+                        if (!cached && loadingDocuments != null && loadingDocuments.containsKey(docId)) {
+                            needed.add(docId);
+                        }
+                    }
+                    if (!needed.isEmpty()) {
+                        loadFromServer(needed);
+                    }
+                }, delayMs);
+            } else if (colgramReconnectPendingIds == null || colgramReconnectPendingIds.isEmpty()) {
+                colgramDetachConnObserver();
+            }
+        }""",
+        "AnimatedEmojiDrawable.java add bounded retry and reconnect observer fields",
+    )
+    _patch_eol_variants(
+        eol_patch_fn,
+        anim_emoji,
+        [
+            """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
             if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
                 processDocumentsAndLoadMore(documents, loadFromServerIds);
             } else {
@@ -1686,11 +2323,202 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     loadFromServer(new ArrayList<>(loadFromServerIds.subList(start, end)));
                 }
                 return;
-            }""",
-        "AnimatedEmojiDrawable.java remove doOnIdle delay and chunk server requests <= 100 IDs",
+            }
+            TLRPC.User colgramSelf = org.telegram.messenger.UserConfig.getInstance(currentAccount).getCurrentUser();
+            if (colgramSelf != null && colgramSelf.bot) {
+                org.colgram.core.ColgramBotSync.fetchCustomEmojiForBot(
+                        org.telegram.messenger.ApplicationLoader.applicationContext,
+                        currentAccount,
+                        new ArrayList<>(loadFromServerIds),
+                        objects -> NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> {
+                            if (objects != null && !objects.isEmpty()) {
+                                putToStorage(objects);
+                                processDocuments(objects);
+                            } else if (loadingDocuments != null) {
+                                for (int i = 0; i < loadFromServerIds.size(); i++) {
+                                    loadingDocuments.remove(loadFromServerIds.get(i));
+                                }
+                            }
+                        })));
+                return;
+            }
+            final TLRPC.TL_messages_getCustomEmojiDocuments req = new TLRPC.TL_messages_getCustomEmojiDocuments();
+            req.document_id = loadFromServerIds;
+            ConnectionsManager.getInstance(currentAccount).sendRequest(req, (res, err) -> NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> {
+                HashSet<Long> loadedFromServer = new HashSet<>(loadFromServerIds);
+                if (res instanceof Vector) {
+                    ArrayList<Object> objects = ((Vector) res).objects;
+                    putToStorage(objects);
+                    processDocuments(objects);
+                    for (int i = 0; i < objects.size(); i++) {
+                        if (objects.get(i) instanceof TLRPC.Document) {
+                            TLRPC.Document document = (TLRPC.Document) objects.get(i);
+                            loadedFromServer.remove(document.id);
+                        }
+                    }
+
+                    if (!loadedFromServer.isEmpty() && loadedFromServer.size() < loadFromServerIds.size()) {
+                        loadFromServer(new ArrayList<>(loadedFromServer));
+                    } else if (!loadedFromServer.isEmpty() && loadingDocuments != null) {
+                        for (Long missingId : loadedFromServer) {
+                            loadingDocuments.remove(missingId);
+                        }
+                    }
+                } else if (loadingDocuments != null) {
+                    for (int i = 0; i < loadFromServerIds.size(); i++) {
+                        loadingDocuments.remove(loadFromServerIds.get(i));
+                    }
+                }
+            })));
+        }""",
+            """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
+            if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
+                processDocumentsAndLoadMore(documents, loadFromServerIds);
+            } else {
+                NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> processDocumentsAndLoadMore(documents, loadFromServerIds)));
+            }
+        }
+
+        private void loadFromServer(ArrayList<Long> loadFromServerIds) {
+            if (loadFromServerIds.isEmpty()) {
+                return;
+            }
+            TLRPC.User colgramSelf = org.telegram.messenger.UserConfig.getInstance(currentAccount).getCurrentUser();
+            if (colgramSelf != null && colgramSelf.bot) {
+                org.colgram.core.ColgramBotSync.fetchCustomEmojiForBot(
+                        org.telegram.messenger.ApplicationLoader.applicationContext,
+                        currentAccount,
+                        new ArrayList<>(loadFromServerIds),
+                        objects -> NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> {
+                            if (objects != null && !objects.isEmpty()) {
+                                putToStorage(objects);
+                                processDocuments(objects);
+                            } else if (loadingDocuments != null) {
+                                for (int i = 0; i < loadFromServerIds.size(); i++) {
+                                    loadingDocuments.remove(loadFromServerIds.get(i));
+                                }
+                            }
+                        })));
+                return;
+            }
+            final TLRPC.TL_messages_getCustomEmojiDocuments req = new TLRPC.TL_messages_getCustomEmojiDocuments();
+            req.document_id = loadFromServerIds;
+            ConnectionsManager.getInstance(currentAccount).sendRequest(req, (res, err) -> NotificationCenter.getInstance(currentAccount).doOnIdle(() -> AndroidUtilities.runOnUIThread(() -> {
+                HashSet<Long> loadedFromServer = new HashSet<>(loadFromServerIds);
+                if (res instanceof Vector) {
+                    ArrayList<Object> objects = ((Vector) res).objects;
+                    putToStorage(objects);
+                    processDocuments(objects);
+                    for (int i = 0; i < objects.size(); i++) {
+                        if (objects.get(i) instanceof TLRPC.Document) {
+                            TLRPC.Document document = (TLRPC.Document) objects.get(i);
+                            loadedFromServer.remove(document.id);
+                        }
+                    }
+
+                    if (!loadedFromServer.isEmpty() && loadedFromServer.size() < loadFromServerIds.size()) {
+                        loadFromServer(new ArrayList<>(loadedFromServer));
+                    } else if (!loadedFromServer.isEmpty() && loadingDocuments != null) {
+                        for (Long missingId : loadedFromServer) {
+                            loadingDocuments.remove(missingId);
+                        }
+                    }
+                } else if (loadingDocuments != null) {
+                    for (int i = 0; i < loadFromServerIds.size(); i++) {
+                        loadingDocuments.remove(loadFromServerIds.get(i));
+                    }
+                }
+            })));
+        }""",
+        ],
+        """        private void processDatabaseResult(ArrayList<Object> documents, HashSet<Long> loadFromServerIds) {
+            if (Thread.currentThread() == Looper.getMainLooper().getThread()) {
+                processDocumentsAndLoadMore(documents, loadFromServerIds);
+            } else {
+                AndroidUtilities.runOnUIThread(() -> processDocumentsAndLoadMore(documents, loadFromServerIds));
+            }
+        }
+
+        private void loadFromServer(ArrayList<Long> loadFromServerIds) {
+            if (loadFromServerIds.isEmpty()) {
+                return;
+            }
+            if (loadFromServerIds.size() > 100) {
+                for (int start = 0; start < loadFromServerIds.size(); start += 100) {
+                    int end = Math.min(loadFromServerIds.size(), start + 100);
+                    final ArrayList<Long> chunk = new ArrayList<>(loadFromServerIds.subList(start, end));
+                    if (start == 0) {
+                        loadFromServer(chunk);
+                    } else {
+                        AndroidUtilities.runOnUIThread(() -> loadFromServer(chunk), (start / 100L) * 50L);
+                    }
+                }
+                return;
+            }
+            TLRPC.User colgramSelf = org.telegram.messenger.UserConfig.getInstance(currentAccount).getCurrentUser();
+            if (colgramSelf != null && colgramSelf.bot) {
+                org.colgram.core.ColgramBotSync.fetchCustomEmojiForBot(
+                        org.telegram.messenger.ApplicationLoader.applicationContext,
+                        currentAccount,
+                        new ArrayList<>(loadFromServerIds),
+                        objects -> AndroidUtilities.runOnUIThread(() -> {
+                            if (objects != null && !objects.isEmpty()) {
+                                ArrayList<Long> loadedIds = new ArrayList<>();
+                                for (int i = 0; i < objects.size(); i++) {
+                                    if (objects.get(i) instanceof TLRPC.Document) {
+                                        loadedIds.add(((TLRPC.Document) objects.get(i)).id);
+                                    }
+                                }
+                                colgramClearSuccessIds(loadedIds);
+                                putToStorage(objects);
+                                processDocuments(objects);
+                            } else {
+                                colgramScheduleRetryOrClear(loadFromServerIds);
+                            }
+                        }));
+                return;
+            }
+            final TLRPC.TL_messages_getCustomEmojiDocuments req = new TLRPC.TL_messages_getCustomEmojiDocuments();
+            req.document_id = loadFromServerIds;
+            ConnectionsManager.getInstance(currentAccount).sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {
+                HashSet<Long> loadedFromServer = new HashSet<>(loadFromServerIds);
+                if (res instanceof Vector) {
+                    ArrayList<Object> objects = ((Vector) res).objects;
+                    ArrayList<Long> succeededIds = new ArrayList<>();
+                    for (int i = 0; i < objects.size(); i++) {
+                        if (objects.get(i) instanceof TLRPC.Document) {
+                            TLRPC.Document document = (TLRPC.Document) objects.get(i);
+                            loadedFromServer.remove(document.id);
+                            succeededIds.add(document.id);
+                        }
+                    }
+                    colgramClearSuccessIds(succeededIds);
+                    putToStorage(objects);
+                    processDocuments(objects);
+
+                    if (!loadedFromServer.isEmpty() && loadedFromServer.size() < loadFromServerIds.size()) {
+                        loadFromServer(new ArrayList<>(loadedFromServer));
+                    } else if (!loadedFromServer.isEmpty() && loadingDocuments != null) {
+                        for (Long missingId : loadedFromServer) {
+                            loadingDocuments.remove(missingId);
+                        }
+                    }
+                } else {
+                    boolean nonTransient = err != null && "BOT_METHOD_INVALID".equals(err.text);
+                    if (!nonTransient) {
+                        colgramScheduleRetryOrClear(loadFromServerIds);
+                    } else if (loadingDocuments != null) {
+                        for (int i = 0; i < loadFromServerIds.size(); i++) {
+                            loadingDocuments.remove(loadFromServerIds.get(i));
+                        }
+                    }
+                }
+            }));
+        }""",
+        "AnimatedEmojiDrawable.java remove doOnIdle delay, stagger >100 chunks 50ms, and add bounded retry",
     )
 
-    # 12. ChatActivity.java: defer participants & scheduled checks by 350ms, block sponsored reads.
+    # 12. ChatActivity.java: restore immediate MODE_SCHEDULED probe, keep participants 350ms deferral, block sponsored reads.
     chat_act = os.path.join(
         repo_path, "TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java"
     )
@@ -1699,11 +2527,6 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
         chat_act,
         [
             """            if ((chatMode == 0 || chatMode == MODE_SAVED && getSavedDialogId() == getUserConfig().getClientUserId()) && (!isThreadChat() || isTopic)) {
-                waitingForLoad.add(lastLoadIndex);
-                getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 1, 0, 0, true, 0, classGuid, 2, 0, MODE_SCHEDULED, chatMode == MODE_SAVED ? 0 : threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
-            }"""
-        ],
-        """            if ((chatMode == 0 || chatMode == MODE_SAVED && getSavedDialogId() == getUserConfig().getClientUserId()) && (!isThreadChat() || isTopic)) {
                 final int scheduledLoadIndex = lastLoadIndex++;
                 waitingForLoad.add(scheduledLoadIndex);
                 AndroidUtilities.runOnUIThread(() -> {
@@ -1714,7 +2537,12 @@ def apply(repo_path: str, patch_file_fn, eol_patch_fn) -> None:
                     getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 1, 0, 0, true, 0, classGuid, 2, 0, MODE_SCHEDULED, chatMode == MODE_SAVED ? 0 : threadMessageId, replyMaxReadId, scheduledLoadIndex, isTopic);
                 }, 350);
             }""",
-        "ChatActivity.java defer MODE_SCHEDULED probe by 350ms",
+        ],
+        """            if ((chatMode == 0 || chatMode == MODE_SAVED && getSavedDialogId() == getUserConfig().getClientUserId()) && (!isThreadChat() || isTopic)) {
+                waitingForLoad.add(lastLoadIndex);
+                getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 1, 0, 0, true, 0, classGuid, 2, 0, MODE_SCHEDULED, chatMode == MODE_SAVED ? 0 : threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
+            }""",
+        "ChatActivity.java restore immediate MODE_SCHEDULED loadMessages probe",
     )
     _patch_eol_variants(
         eol_patch_fn,

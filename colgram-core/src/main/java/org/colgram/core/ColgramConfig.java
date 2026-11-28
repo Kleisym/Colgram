@@ -150,6 +150,7 @@ public class ColgramConfig {
     private static volatile String colemailerState = "";
     private static volatile boolean unlimitedMemoryConfigured = false;
     private static volatile boolean unlimitedMemoryEnabled = false;
+    private static volatile boolean preV4UnlimitedOptIn = false;
     private static volatile boolean autoCompressStorageEnabled = true;
     private static volatile boolean alwaysBackgroundEnabled = true;
     private static volatile long lastAutoUpdateCheckMs = 0L;
@@ -184,52 +185,7 @@ public class ColgramConfig {
     public static void init(Context context) {
         if (prefs == null && context != null) {
             SharedPreferences sp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            // Upgrade defaults once so anti-delete self-preserve & auto-compress storage are ON by default.
-            if (!sp.getBoolean("colgram_defaults_v3_migrated", false)) {
-                sp.edit()
-                        .putBoolean(KEY_ANTI_DELETE_ENABLED, true)
-                        .putBoolean(KEY_ANTI_DELETE_SELF, true)
-                        .putBoolean(KEY_ANTI_DELETE_WIPE, false)
-                        .putBoolean(KEY_ANTI_DELETE_HIGHLIGHT, true)
-                        .putBoolean(KEY_UNLIMITED_MEMORY, false)
-                        .putBoolean("auto_compress_storage_enabled", true)
-                        .putBoolean("colgram_defaults_v3_migrated", true)
-                        .apply();
-            }
-            // Enforce capped cache default once so existing installs stop growing storage unboundedly.
-            if (!sp.getBoolean("colgram_defaults_v4_cap_migrated", false)) {
-                sp.edit()
-                        .putBoolean(KEY_UNLIMITED_MEMORY, false)
-                        .putBoolean("auto_compress_storage_enabled", true)
-                        .putBoolean("colgram_defaults_v4_cap_migrated", true)
-                        .apply();
-            }
-            // One-time safety migration: lead auto-forwarding to Saved Messages must be strictly opt-in
-            // so messages from other chats are NEVER silently forwarded into Saved Messages by default.
-            if (!sp.getBoolean("colgram_save_leads_optin_v1", false)) {
-                sp.edit()
-                        .putBoolean(KEY_COLEMAILER_SAVE_LEADS, false)
-                        .putBoolean("colgram_save_leads_optin_v1", true)
-                        .apply();
-            }
-            if (!sp.getBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, false)) {
-                int cur = sp.getInt(KEY_LIVE_WALLPAPER_STYLE, ColgramLiveWallpaper.STYLE_AURORA);
-                if (cur == ColgramLiveWallpaper.STYLE_OFF) {
-                    cur = ColgramLiveWallpaper.STYLE_AURORA;
-                }
-                sp.edit()
-                        .putInt(KEY_LIVE_WALLPAPER_STYLE, cur)
-                        .putBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, true)
-                        .apply();
-            }
-            if (!sp.getBoolean(KEY_CLOAK_REINIT_MIGRATED, false)) {
-                int nextBump = sp.getInt(KEY_CLOAK_INIT_BUMP, 0) + 1;
-                if (nextBump > 90000) nextBump = 1;
-                sp.edit()
-                        .putInt(KEY_CLOAK_INIT_BUMP, nextBump)
-                        .putBoolean(KEY_CLOAK_REINIT_MIGRATED, true)
-                        .apply();
-            }
+            applyStartupMigrations(sp);
             prefs = sp;
             loadAllCachedPrefs(sp);
             if (prefChangeListener == null) {
@@ -251,6 +207,79 @@ public class ColgramConfig {
             ColgramMasqueNative.setProbeContext(context.getApplicationContext());
             ColgramDesignConfig.init(context.getApplicationContext());
         }
+    }
+
+    /** Executes one-time preference migrations safely before cached reads or dependent configs run. */
+    public static void applyStartupMigrations(SharedPreferences sp) {
+        if (sp == null) return;
+        // Upgrade defaults once so anti-delete self-preserve & auto-compress storage are ON by default.
+        if (!sp.getBoolean("colgram_defaults_v3_migrated", false)) {
+            SharedPreferences.Editor v3Ed = sp.edit()
+                    .putBoolean(KEY_ANTI_DELETE_ENABLED, true)
+                    .putBoolean(KEY_ANTI_DELETE_SELF, true)
+                    .putBoolean(KEY_ANTI_DELETE_WIPE, false)
+                    .putBoolean(KEY_ANTI_DELETE_HIGHLIGHT, true)
+                    .putBoolean("auto_compress_storage_enabled", true)
+                    .putBoolean("colgram_defaults_v3_migrated", true);
+            if (!sp.contains(KEY_UNLIMITED_MEMORY)) {
+                v3Ed.putBoolean(KEY_UNLIMITED_MEMORY, false);
+            }
+            v3Ed.apply();
+        }
+        // Record any pre-v4 Unlimited Memory opt-in BEFORE applying v4 hard-cap defaults so upgrades preserve it.
+        if (!sp.getBoolean("colgram_defaults_v4_cap_migrated", false)) {
+            boolean prevUnlimited = sp.contains(KEY_UNLIMITED_MEMORY)
+                    && sp.getBoolean(KEY_UNLIMITED_MEMORY, false);
+            sp.edit()
+                    .putBoolean(KEY_PRE_V4_UNLIMITED_OPTIN, prevUnlimited)
+                    .putBoolean(KEY_UNLIMITED_MEMORY, prevUnlimited)
+                    .putBoolean("auto_compress_storage_enabled", true)
+                    .putBoolean("colgram_defaults_v4_cap_migrated", true)
+                    .apply();
+        }
+        // One-time safety migration: lead auto-forwarding to Saved Messages must be strictly opt-in
+        // so messages from other chats are NEVER silently forwarded into Saved Messages by default.
+        if (!sp.getBoolean("colgram_save_leads_optin_v1", false)) {
+            sp.edit()
+                    .putBoolean(KEY_COLEMAILER_SAVE_LEADS, false)
+                    .putBoolean("colgram_save_leads_optin_v1", true)
+                    .apply();
+        }
+        if (!sp.getBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, false)) {
+            int cur = sp.getInt(KEY_LIVE_WALLPAPER_STYLE, ColgramLiveWallpaper.STYLE_AURORA);
+            if (cur == ColgramLiveWallpaper.STYLE_OFF) {
+                cur = ColgramLiveWallpaper.STYLE_AURORA;
+            }
+            sp.edit()
+                    .putInt(KEY_LIVE_WALLPAPER_STYLE, cur)
+                    .putBoolean(KEY_LIVE_WALLPAPER_WAVES_MIGRATED, true)
+                    .apply();
+        }
+        if (!sp.getBoolean(KEY_CLOAK_REINIT_MIGRATED, false)) {
+            int nextBump = sp.getInt(KEY_CLOAK_INIT_BUMP, 0) + 1;
+            if (nextBump > 90000) nextBump = 1;
+            sp.edit()
+                    .putInt(KEY_CLOAK_INIT_BUMP, nextBump)
+                    .putBoolean(KEY_CLOAK_REINIT_MIGRATED, true)
+                    .apply();
+        }
+    }
+
+    /** Pure-JVM test helper executing startup migrations and loading volatile caches from a SharedPreferences double. */
+    public static void migrateAndLoadForTest(SharedPreferences sp) {
+        if (sp == null) return;
+        applyStartupMigrations(sp);
+        prefs = sp;
+        loadAllCachedPrefs(sp);
+    }
+
+    /** Resets volatile test state for isolated JVM migration tests. */
+    public static void resetForTest() {
+        prefs = null;
+        unlimitedMemoryConfigured = false;
+        unlimitedMemoryEnabled = false;
+        preV4UnlimitedOptIn = false;
+        autoCompressStorageEnabled = true;
     }
 
     private static void loadAllCachedPrefs(SharedPreferences p) {
@@ -329,6 +358,7 @@ public class ColgramConfig {
         colemailerState = p.getString(KEY_COLEMAILER_STATE, "");
         unlimitedMemoryConfigured = p.contains(KEY_UNLIMITED_MEMORY);
         unlimitedMemoryEnabled = p.getBoolean(KEY_UNLIMITED_MEMORY, false);
+        preV4UnlimitedOptIn = p.getBoolean(KEY_PRE_V4_UNLIMITED_OPTIN, false);
         autoCompressStorageEnabled = p.getBoolean("auto_compress_storage_enabled", true);
         alwaysBackgroundEnabled = p.getBoolean(KEY_ALWAYS_BACKGROUND, true);
         lastAutoUpdateCheckMs = p.getLong(KEY_LAST_UPDATE_CHECK_MS, 0L);
@@ -431,6 +461,9 @@ public class ColgramConfig {
             case KEY_UNLIMITED_MEMORY:
                 unlimitedMemoryConfigured = p.contains(KEY_UNLIMITED_MEMORY);
                 unlimitedMemoryEnabled = p.getBoolean(KEY_UNLIMITED_MEMORY, false);
+                break;
+            case KEY_PRE_V4_UNLIMITED_OPTIN:
+                preV4UnlimitedOptIn = p.getBoolean(KEY_PRE_V4_UNLIMITED_OPTIN, false);
                 break;
             case "auto_compress_storage_enabled":
                 autoCompressStorageEnabled = p.getBoolean("auto_compress_storage_enabled", true);
@@ -1176,6 +1209,7 @@ public class ColgramConfig {
 
     // --- Unlimited memory ---
     private static final String KEY_UNLIMITED_MEMORY = "unlimited_memory_enabled";
+    private static final String KEY_PRE_V4_UNLIMITED_OPTIN = "colgram_pre_v4_unlimited_optin";
 
     // --- Built-in spam guard & Colemailer suite ---
     private static final String KEY_SPAM_GUARD = "spam_guard_enabled";
@@ -1620,6 +1654,10 @@ public class ColgramConfig {
 
     public static boolean isUnlimitedMemoryEnabled() {
         return unlimitedMemoryEnabled;
+    }
+
+    public static boolean wasPreV4UnlimitedOptIn() {
+        return preV4UnlimitedOptIn;
     }
 
     public static void setUnlimitedMemoryEnabled(boolean enabled) {

@@ -63,9 +63,10 @@ class UiPremiumContractsTests(unittest.TestCase):
             "public static void showHudBanner(",
             "public static ProgressHudHandle showProgressHud(",
             "public static void showMalwareWarningSheet(",
-            "public static BottomSheet showEmojiTagPickerSheet(",
         ):
             self.assertIn(token, uikit)
+        self.assertNotIn("showEmojiTagPickerSheet(", uikit)
+        self.assertNotIn("ColgramSavedTagsStore", uikit)
         # No BlurMaskFilter/RenderEffect API calls or Koliti compile dependency inside shared UIKit
         self.assertNotIn("new BlurMaskFilter", uikit)
         self.assertNotIn("BlurMaskFilter(", uikit)
@@ -108,10 +109,13 @@ class UiPremiumContractsTests(unittest.TestCase):
             self.assertNotIn("Toast.makeText(", txt, f"{name} must use ColgramUiKit HUD instead of Toast.makeText")
             self.assertNotIn('"Colgram-Android"', txt, f"{name} must not leak Colgram-Android User-Agent")
 
-        # Saved Tags bar & Premium Activity register cleanly in apply-patches.py
+        # Native Saved Tags Bridge, Read Receipts Helper & Premium Activity register cleanly; legacy bar deleted
+        self.assertFalse((TEMPLATES / "ColgramSavedTagsBarView.java").exists())
         ap = (SCRIPTS / "apply-patches.py").read_text(encoding="utf-8")
         self.assertGreaterEqual(ap.count('"ColgramPremiumActivity.java"'), 2)
-        self.assertGreaterEqual(ap.count('"ColgramSavedTagsBarView.java"'), 2)
+        self.assertGreaterEqual(ap.count('"ColgramNativeTagsBridge.java"'), 2)
+        self.assertGreaterEqual(ap.count('"ColgramReadReceiptsHelper.java"'), 2)
+        self.assertEqual(ap.count("ColgramSavedTagsBarView.java"), 0)
         self.assertIn("from ui_premium_patches import apply as inject_ui_premium_patches", ap)
 
         # Progress HUD wired into ChatAttachAlert replacing percentage Toasts (fully qualified for Components package)
@@ -396,12 +400,121 @@ class UiPremiumContractsTests(unittest.TestCase):
             (msg / "MessagesController.java").write_text(
                 "    public boolean isChatNoForwards(TLRPC.Chat chat) {\n        if (chat == null) {\n            return false;\n        }\n    }\n"
                 "    public boolean isUserNoForwards(TLRPC.UserFull userFull) {\n        if (userFull == null) {\n            return false;\n        }\n    }\n"
-                "    public SponsoredMessagesInfo getSponsoredMessages(long dialogId) {\n        SponsoredMessagesInfo info = sponsoredMessages.get(dialogId);\n    }\n",
+                "    public SponsoredMessagesInfo getSponsoredMessages(long dialogId) {\n        SponsoredMessagesInfo info = sponsoredMessages.get(dialogId);\n    }\n"
+                "        for (int a = 0; a < messagesRes.messages.size(); a++) {\n"
+                "            final TLRPC.Message message = messagesRes.messages.get(a);\n"
+                "            message.dialog_id = dialogId;\n"
+                "        }\n"
+                "    public String getSavedTagName(ReactionsLayoutInBubble.VisibleReaction reaction) {\n"
+                "        if (reactionTags == null) {\n"
+                "            return null;\n"
+                "        }\n"
+                "        return null;\n"
+                "    }\n"
+                "    public int getSavedTagCount(long topic_id, ReactionsLayoutInBubble.VisibleReaction reaction) {\n"
+                "        if (reactionTags == null) {\n"
+                "            return 0;\n"
+                "        }\n"
+                "        TLRPC.TL_messages_savedReactionsTags tags = reactionTags.get(topic_id);\n"
+                "        if (tags == null) return 0;\n"
+                "        for (int i = 0; i < tags.tags.size(); ++i) {\n"
+                "            if (reaction.isSame(tags.tags.get(i).reaction)) {\n"
+                "                return tags.tags.get(i).count;\n"
+                "            }\n"
+                "        }\n"
+                "        return 0;\n"
+                "    }\n"
+                "    public String getSavedTagName(TLRPC.Reaction reaction) {\n"
+                "        if (reactionTags == null) {\n"
+                "            return null;\n"
+                "        }\n"
+                "        return null;\n"
+                "    }\n"
+                "    public void renameSavedReactionTag(ReactionsLayoutInBubble.VisibleReaction reaction, String name) {\n"
+                "        if (reactionTags == null) {\n"
+                "            return;\n"
+                "        }\n"
+                "        if (changed) {\n"
+                "            if (!TextUtils.isEmpty(name)) {\n"
+                "                tag.title = name;\n"
+                "            }\n"
+                "            tag.count = 1;\n"
+                "            tags.tags.add(tag);\n"
+                "            changed = true;\n"
+                "        }\n"
+                "        if (changed) {\n"
+                "            TLRPC.TL_messages_updateSavedReactionTag req = new TLRPC.TL_messages_updateSavedReactionTag();\n"
+                "            req.reaction = reaction.toTLReaction();\n"
+                "            if (!TextUtils.isEmpty(name)) {\n"
+                "                req.flags |= 1;\n"
+                "                req.title = name;\n"
+                "            }\n"
+                "            getConnectionsManager().sendRequest(req, null);\n"
+                "        }\n"
+                "    }\n"
+                "    public TLRPC.TL_messages_savedReactionsTags getSavedReactionTags(long topic_id, boolean force) {\n"
+                "        if (loadingReactionTags != null && loadingReactionTags.contains(topic_id) && !force) {\n"
+                "            if (reactionTags == null) return null;\n"
+                "            return reactionTags.get(topic_id);\n"
+                "        }\n"
+                "                if (finalResult instanceof TLRPC.TL_messages_savedReactionsTags) {\n"
+                "                    reactionTags.put(topic_id, (TLRPC.TL_messages_savedReactionsTags) finalResult);\n"
+                "                    getNotificationCenter().postNotificationName(NotificationCenter.savedReactionTagsUpdate, topic_id);\n"
+                "                }\n\n"
+                "                TLRPC.TL_messages_getSavedReactionTags req = new TLRPC.TL_messages_getSavedReactionTags();\n"
+                "                if (finalResult instanceof TLRPC.TL_messages_savedReactionsTags) {\n"
+                "                    req.hash = finalResult.hash;\n"
+                "                }\n"
+                "                if (topic_id != 0) {\n"
+                "                    req.flags |= 1;\n"
+                "                    req.peer = getInputPeer(topic_id);\n"
+                "                }\n"
+                "                getConnectionsManager().sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {\n"
+                "                    if (res instanceof TLRPC.TL_messages_savedReactionsTags) {\n"
+                "                        TLRPC.TL_messages_savedReactionsTags tags = (TLRPC.TL_messages_savedReactionsTags) res;\n"
+                "                        reactionTags.put(topic_id, tags);\n"
+                "                        getNotificationCenter().postNotificationName(NotificationCenter.savedReactionTagsUpdate, topic_id);\n"
+                "                        saveSavedReactionsTags(topic_id, tags);\n"
+                "                    } else if (res instanceof TLRPC.TL_messages_savedReactionsTagsNotModified && finalResult == null && req.hash == 0) {\n"
+                "                        TLRPC.TL_messages_savedReactionsTags emptyTags = new TLRPC.TL_messages_savedReactionsTags();\n"
+                "                        reactionTags.put(topic_id, emptyTags);\n"
+                "                        getNotificationCenter().postNotificationName(NotificationCenter.savedReactionTagsUpdate, topic_id);\n"
+                "                        saveSavedReactionsTags(topic_id, emptyTags);\n"
+                "                    }\n"
+                "                }));\n"
+                "    }\n",
                 encoding="utf-8",
             )
             (adap / "DialogsSearchAdapter.java").write_text(
                 "if (query == null || query.length() < 4 || UserConfig.getInstance(currentAccount).isPremium() && MessagesController.getInstance(currentAccount).isSponsoredDisabled()) {}\n",
                 encoding="utf-8",
+            )
+            _chat_native_tag_gates = (
+                "\tprivate boolean isSupportedTags() {\n"
+                "\t\treturn getUserConfig().getClientUserId() == getDialogId() && !getMessagesController().getSavedMessagesController().unsupported && getUserConfig().isPremium();\n"
+                "\t}\n"
+                "            if (getUserConfig().isPremium()) {\n"
+                "                savedMessagesTagHint = new HintView2(context, HintView2.DIRECTION_BOTTOM);\n"
+                "            }\n"
+                "        actionMode.setItemVisibility(tag_message, getUserConfig().isPremium() ? View.VISIBLE : View.GONE);\n"
+                "        if (getDialogId() != getUserConfig().getClientUserId() || !getUserConfig().isPremium()) return;\n"
+                "                if (getDialogId() == getUserConfig().getClientUserId() && !getUserConfig().isPremium()) {\n"
+                "                }\n"
+                "                    tagItem.setVisibility(getUserConfig().isPremium() && (canTag));\n"
+                "                if (tags) {\n"
+                "                    reactionsLayout.setHint(getUserConfig().isPremium() ? LocaleController.getString(R.string.SavedTagReactionsHint2) : AndroidUtilities.replaceSingleTag(\"a\", () -> {}));\n"
+                "                }\n"
+                "                if (isReactionsAvailable && (!tags || !getMessagesController().premiumFeaturesBlocked())) {\n"
+                "                }\n"
+                "        if (SharedConfig.multipleReactionsPromoShowed || cell == null || visibleReaction == null || getUserConfig().isPremium()) {\n"
+                "        }\n"
+                "        if (getDialogId() == getUserConfig().getClientUserId() && !getUserConfig().isPremium() && primaryMessage.messageOwner != null && (primaryMessage.messageOwner.reactions == null || (primaryMessage.messageOwner.reactions.reactions_as_tags || primaryMessage.messageOwner.reactions.results.isEmpty()))) {\n"
+                "        }\n"
+                "        if (getUserConfig().getClientUserId() == getDialogId() && messageObject.areTags() && !getUserConfig().isPremium()) {\n"
+                "        }\n"
+                "                if (getUserConfig().isPremium()) {\n"
+                "                    ActionBarMenuSubItem editTag = new ActionBarMenuSubItem(getParentActivity(), false, false);\n"
+                "                }\n"
             )
             (ui / "ChatActivity.java").write_text(
                 "    private AnimatedTextView searchOtherButton;\n"
@@ -419,7 +532,7 @@ class UiPremiumContractsTests(unittest.TestCase):
                 "            return;\n"
                 "        }\n"
                 "        MessageObject obj = chatAdapter != null && chatAdapter.isFiltered ? filteredMessagesDict.get(mid) :  messagesDict[loadIndex].get(mid);\n"
-                "        if (chatAdapter.isFiltered && !messageObject.hasReaction(searchingReaction)) {\n"
+                "                        if (chatAdapter.isFiltered && !messageObject.hasReaction(searchingReaction)) {\n"
                 "        if (sponsoredMessagesAdded || chatMode != 0 || !ChatObject.isChannel(currentChat) && !UserObject.isBot(currentUser) || !forwardEndReached[0] || getUserConfig().isPremium() && getMessagesController().isSponsoredDisabled() || isReport()) {\n"
                 "                if (canForward) {\n"
                 "                    items.add(LocaleController.getString(R.string.Forward));\n"
@@ -430,7 +543,167 @@ class UiPremiumContractsTests(unittest.TestCase):
                 "        @Override\n"
                 "        public boolean canPerformActions() {\n"
                 "            String reactionString = getMediaDataController().getDoubleTapReaction();\n"
-                '            if (reactionString.startsWith("animated_")) {\n',
+                '            if (reactionString.startsWith("animated_")) {\n'
+                + _chat_native_tag_gates,
+                encoding="utf-8",
+            )
+            (comps / "SearchTagsList.java").write_text(
+                "            if (!UserConfig.getInstance(currentAccount).isPremium()) {\n"
+                "                new PremiumFeatureBottomSheet(fragment, PremiumPreviewFragment.PREMIUM_FEATURE_SAVED_TAGS, true).show();\n"
+                "                return;\n"
+                "            }\n"
+                "            if (position < 0 || position >= items.size() || !UserConfig.getInstance(currentAccount).isPremium())\n"
+                "                return false;\n"
+                "            if (!UserConfig.getInstance(currentAccount).isPremium()) {\n"
+                "                new PremiumFeatureBottomSheet(fragment, PremiumPreviewFragment.PREMIUM_FEATURE_SAVED_TAGS, true).show();\n"
+                "                return true;\n"
+                "            }\n"
+                "        if (shownPremiumLayout = !UserConfig.getInstance(currentAccount).isPremium()) {\n"
+                "            createPremiumLayout();\n"
+                "            if (!notify) {\n"
+                "                premiumLayout.setVisibility(View.VISIBLE);\n"
+                "                premiumLayout.setAlpha(0f);\n"
+                "                premiumLayout.animate().alpha(1f).start();\n"
+                "            }\n"
+                "        } else if (premiumLayout != null) {\n"
+                "            if (notify) {\n"
+                "                premiumLayout.animate().alpha(0f).withEndAction(() -> {\n"
+                "                    premiumLayout.setVisibility(View.GONE);\n"
+                "                }).start();\n"
+                "            } else {\n"
+                "                premiumLayout.setAlpha(1f);\n"
+                "                premiumLayout.setVisibility(View.VISIBLE);\n"
+                "            }\n"
+                "        }\n",
+                encoding="utf-8",
+            )
+            (comps / "ReactionsContainerLayout.java").write_text(
+                "        if (type == TYPE_TAGS) {\n"
+                "            allReactionsAvailable = UserConfig.getInstance(currentAccount).isPremium();\n"
+                "            fillRecentReactionsList(visibleReactions);\n"
+                "        }\n"
+                "        if (type == TYPE_TAGS && !UserConfig.getInstance(currentAccount).isPremium()) {\n"
+                "            showExpandableReactions = false;\n"
+                "        }\n"
+                "        if (type != TYPE_TAGS || UserConfig.getInstance(currentAccount).isPremium()) {\n"
+                "        }\n"
+                "        if (UserConfig.getInstance(currentAccount).isPremium()) {\n"
+                "            return;\n"
+                "        }\n"
+                "        try {\n"
+                "            for (int i = 0; i < reactions.size(); i++) {\n"
+                "                if (reactions.get(i).premium) {\n"
+                "                }\n"
+                "            }\n"
+                "        } catch (Exception ignored) {}\n"
+                "            final boolean userIsPremium = UserConfig.getInstance(currentAccount).isPremium();\n"
+                "            isLocked = type == TYPE_TAGS && !userIsPremium || type == TYPE_MESSAGE_EFFECTS && react.premium && !userIsPremium;\n",
+                encoding="utf-8",
+            )
+            (comps / "SharedMediaLayout.java").write_text(
+                "                        searchItemIcon.setIcon(hasFilters() && profileActivity.getUserConfig().isPremium() ? R.drawable.navbar_search_tag : R.drawable.outline_header_search, notify);\n"
+                "                    updateMessages(true);\n"
+                "                    AndroidUtilities.runOnUIThread(request, 540);\n"
+                "                }, false);\n",
+                encoding="utf-8",
+            )
+            (msg / "MessageObject.java").write_text(
+                "        int maxReactionsCount = MessagesController.getInstance(currentAccount).getMaxUserReactionsCount();\n",
+                encoding="utf-8",
+            )
+            (msg / "MessagesStorage.java").write_text(
+                "                        res.messages.add(message);\n\n"
+                "                        addUsersAndChatsFromMessage(message, usersToLoad, chatsToLoad, animatedEmojiToLoad);\n"
+                "                    for (int a = 0; a < count; a++) {\n"
+                "                        TLRPC.Message message = messages.messages.get(a);\n"
+                "                        if (lastMessageId == null && message != null || lastMessageId != null && lastMessageId < message.id) {\n"
+                "                        }\n"
+                "                    }\n"
+                "            if (getUserConfig().getClientUserId() == dialogId) {\n"
+                '                database.executeFast(String.format(Locale.US, "DELETE FROM tag_message_id WHERE mid IN(%s)", TextUtils.join(",", messages))).stepThis().dispose();\n'
+                "            }\n"
+                "                ArrayList<MessageObject> messageObjects = new ArrayList<>();\n"
+                "                while (cursor.next()) {\n"
+                "                    long group_id = cursor.longValue(2);\n"
+                "                    if (group_id != 0 && includeGroups) {\n"
+                '                        cursor_groups = database.queryFinalized("SELECT data, replydata, group_id FROM messages_v2 WHERE uid = ? AND group_id = ? ORDER BY mid DESC", selfId, group_id);\n'
+                "                        ArrayList<MessageObject> groupmessages = new ArrayList<>();\n"
+                "                        while (cursor_groups.next()) {\n"
+                "                            NativeByteBuffer data = cursor_groups.byteBufferValue(0);\n"
+                "                            TLRPC.Message groupmessage = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);\n"
+                "                            groupmessage.readAttachPath(data, selfId);\n"
+                "                            data.reuse();\n"
+                "                            addUsersAndChatsFromMessage(groupmessage, usersToLoad, chatsToLoad, animatedEmojiToLoad);\n"
+                "                            MessageObject messageObject = new MessageObject(currentAccount, groupmessage, null, null, null, null, null, true, true, 0, false, false, true);\n"
+                "                            if (groupmessage.reactions != null) {\n"
+                "                                messageObject.isPrimaryGroupMessage = true;\n"
+                "                            }\n"
+                "                            groupmessages.add(messageObject);\n"
+                "                        }\n"
+                "                        cursor_groups.dispose();\n"
+                "                        messageObjects.addAll(groupmessages);\n"
+                "                    } else {\n"
+                "                        NativeByteBuffer data = cursor.byteBufferValue(0);\n"
+                "                        if (data == null) continue;\n"
+                "                        TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);\n"
+                "                        if (message != null) {\n"
+                "                            message.readAttachPath(data, selfId);\n"
+                "                            data.reuse();\n"
+                "                            addUsersAndChatsFromMessage(message, usersToLoad, chatsToLoad, animatedEmojiToLoad);\n"
+                "                            if (message.reply_to != null && (message.reply_to.reply_to_msg_id != 0 || message.reply_to.reply_to_random_id != 0)) {\n"
+                "                                if (!cursor.isNull(1)) {\n"
+                "                                    data = cursor.byteBufferValue(1);\n"
+                "                                    if (data != null) {\n"
+                "                                        message.replyMessage = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);\n"
+                "                                        message.replyMessage.readAttachPath(data, selfId);\n"
+                "                                        data.reuse();\n"
+                "                                        if (message.replyMessage != null) {\n"
+                "                                            addUsersAndChatsFromMessage(message.replyMessage, usersToLoad, chatsToLoad, animatedEmojiToLoad);\n"
+                "                                        }\n"
+                "                                    }\n"
+                "                                }\n"
+                "                            }\n"
+                "                            MessageObject messageObject = new MessageObject(currentAccount, message, null, null, null, null, null, true, true, 0, false, false, true);\n"
+                "                            messageObjects.add(messageObject);\n"
+                "                        }\n"
+                "                    }\n"
+                "                }\n"
+                "                cursor.dispose();\n"
+                "                if (dialogId == selfId && pastReactions != null) {\n"
+                "                    onReactionsUpdate(topicId, pastReactions, reactions);\n"
+                "                }\n"
+                "    private void onReactionsUpdate(long topic_id, TLRPC.TL_messageReactions a, TLRPC.TL_messageReactions b) {\n"
+                "        if (a == null || a.results == null || a != null && a.results != null && a.results.isEmpty() && b != null && b.results.isEmpty()) {\n"
+                "            return;\n"
+                "        }\n"
+                "        AndroidUtilities.runOnUIThread(() -> {\n"
+                "            LongSparseArray<ReactionsLayoutInBubble.VisibleReaction> oldTags = new LongSparseArray<>();\n"
+                "            LongSparseArray<ReactionsLayoutInBubble.VisibleReaction> newTags = new LongSparseArray<>();\n"
+                "            if (a != null && a.results != null && a.reactions_as_tags) {\n"
+                "                for (int i = 0; i < a.results.size(); ++i) {\n"
+                "                    ReactionsLayoutInBubble.VisibleReaction reaction = ReactionsLayoutInBubble.VisibleReaction.fromTL(a.results.get(i).reaction);\n"
+                "                    oldTags.put(reaction.hash, reaction);\n"
+                "                }\n"
+                "            }\n"
+                "            if (b != null && b.results != null && b.reactions_as_tags) {\n"
+                "                for (int i = 0; i < b.results.size(); ++i) {\n"
+                "                    ReactionsLayoutInBubble.VisibleReaction reaction = ReactionsLayoutInBubble.VisibleReaction.fromTL(b.results.get(i).reaction);\n"
+                "                    newTags.put(reaction.hash, reaction);\n"
+                "                }\n"
+                "            }\n"
+                "        });\n"
+                "    }\n",
+                encoding="utf-8",
+            )
+            (msg / "SendMessagesHelper.java").write_text(
+                "        TLRPC.User colgramBotSelf = getUserConfig().getCurrentUser();\n"
+                "            if (response != null) {\n"
+                "                getMessagesController().processUpdates((TLRPC.Updates) response, false);\n"
+                "                if (callback != null) {\n"
+                "                    AndroidUtilities.runOnUIThread(callback);\n"
+                "                }\n"
+                '            } else if (error != null && error.text != null && error.text.contains("BOT_METHOD_INVALID")) {\n'
+                "            }\n",
                 encoding="utf-8",
             )
             (cells / "ChatMessageCell.java").write_text(
@@ -527,13 +800,37 @@ class UiPremiumContractsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (msg / "MediaDataController.java").write_text(
-                "    public String getDoubleTapReaction() {\n        if (doubleTapReaction != null) {\n",
+                "    public String getDoubleTapReaction() {\n        if (doubleTapReaction != null) {\n        }\n    }\n"
+                "    public int getSearchCount() {\n"
+                "        if (searchServerResultMessages.isEmpty()) {\n"
+                "            return Math.max(Math.max(messagesSearchCount[0] + messagesSearchCount[1], messagesLocalSearchCount), searchServerResultMessages.size());\n"
+                "        }\n"
+                "        return Math.max(messagesSearchCount[0] + messagesSearchCount[1], searchServerResultMessages.size());\n"
+                "    }\n"
+                "            getMessagesStorage().searchSavedByTag(reaction.toTLReaction(), lastReplyMessageId, query, 300, searchLocalResultMessages == null ? 0 : searchLocalResultMessages.size(), (messages, users, chats, emojis) -> {\n"
+                "                if (currentReqId == lastReqId) {\n"
+                "                    loadedPredirectedSearchLocal = messages.size() == predictedCount;\n"
+                "                    loadingSearchLocal = false;\n"
+                "                    getMessagesController().putUsers(users, true);\n"
+                "                    getMessagesController().putChats(chats, true);\n"
+                "                    AnimatedEmojiDrawable.getDocumentFetcher(currentAccount).processDocuments(emojis);\n"
+                "                    searchLocalResultMessages = messages;\n"
+                "                    updateSearchResults();\n"
+                "                    getNotificationCenter().postNotificationName(NotificationCenter.chatSearchResultsAvailable, guid, 0, getMask(), dialogId, lastReturnedNum, getSearchCount(), true);\n"
+                "                }\n"
+                "            }, true);\n"
+                "        }\n"
+                "                            if (searchServerResultMessages.isEmpty()) {\n"
+                "                                getNotificationCenter().postNotificationName(NotificationCenter.chatSearchResultsAvailable, guid, 0, getMask(), (long) 0, 0, 0, jumpToMessage);\n"
+                "                            }\n",
                 encoding="utf-8",
             )
 
             def _apply_eol(path, old, new, label):
                 txt = Path(path).read_text(encoding="utf-8")
-                if new in txt:
+                if new and new in txt:
+                    return True
+                if not new and old not in txt:
                     return True
                 self.assertIn(old, txt, f"Missing target for {label} in {Path(path).name}")
                 Path(path).write_text(txt.replace(old, new, 1), encoding="utf-8")
@@ -549,14 +846,26 @@ class UiPremiumContractsTests(unittest.TestCase):
             upp.apply(str(repo), _noop_patch, _apply_eol, koliti_enabled=False)
             snap1 = {p.name: p.read_text(encoding="utf-8") for p in repo.rglob("*.java")}
 
-            # Verify key Track 3 hotfix invariants in snap1
+            # Verify Track 3 & Native Saved Tags Symbiosis invariants in snap1
             self.assertIn("colgramCurDoubleTap != null", snap1["ReactionsDoubleTapManageActivity.java"])
             self.assertIn("if (TextUtils.isEmpty(reactionString))", snap1["ChatActivity.java"])
-            self.assertIn("filteredMessagesDict.put(m.getId(), m);", snap1["ChatActivity.java"])
-            self.assertIn("chatAdapter.filteredEndReached = true;", snap1["ChatActivity.java"])
-            self.assertIn("!colgramSavedTagFiltered && searchingReaction != null", snap1["ChatActivity.java"])
+            self.assertIn("if (chatAdapter.isFiltered && searchingReaction != null && !messageObject.hasReaction(searchingReaction)) {", snap1["ChatActivity.java"])
+            self.assertNotIn("ColgramSavedTagsBarView", snap1["ChatActivity.java"])
+            self.assertNotIn("colgramDrawSavedTagPills", snap1["ChatMessageCell.java"])
             self.assertIn("fromMyName = true;", snap1["ChatActivity.java"])
-            self.assertIn("float maxRight = Math.max(minLeft + dp(24), getMeasuredWidth() - dp(12));", snap1["ChatMessageCell.java"])
+            self.assertIn("!getMessagesController().getSavedMessagesController().unsupported && (getUserConfig().isPremium() || org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled())", snap1["ChatActivity.java"])
+            self.assertIn("actionMode.setItemVisibility(tag_message, (getUserConfig().isPremium() || org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()) ? View.VISIBLE : View.GONE);", snap1["ChatActivity.java"])
+            self.assertIn("shownPremiumLayout = (!UserConfig.getInstance(currentAccount).isPremium() && !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled())", snap1["SearchTagsList.java"])
+            self.assertIn("colgramTagsUnlocked", snap1["ReactionsContainerLayout.java"])
+            self.assertIn("profileActivity.getUserConfig().isPremium() || org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()", snap1["SharedMediaLayout.java"])
+            self.assertIn("Math.max(3, MessagesController.getInstance(currentAccount).reactionsUserMaxPremium)", snap1["MessageObject.java"])
+            self.assertIn("ColgramNativeTagsBridge.mergeIntoMessage(currentAccount, dialogId, message);", snap1["MessagesStorage.java"])
+            self.assertIn("ColgramSavedTagsStore.pruneDeletedMessages(", snap1["MessagesStorage.java"])
+            self.assertIn("mergeLocalTagIdsIntoSearch(", snap1["MessagesStorage.java"])
+            self.assertIn("ColgramNativeTagsBridge.mergeIntoSavedReactionTags(", snap1["MessagesController.java"])
+            self.assertIn("ColgramSavedTagsStore.setTagLabel(", snap1["MessagesController.java"])
+            self.assertIn("ColgramNativeTagsBridge.handleLocalSavedReaction(", snap1["SendMessagesHelper.java"])
+            self.assertIn("colgramLocalTagOnly", snap1["MediaDataController.java"])
             self.assertIn("else if (filterTabsView.hasTab(defFid))", snap1["DialogsActivity.java"])
             self.assertIn("AndroidUtilities.dp(padding)", snap1["TextCheckCell.java"])
             self.assertIn("contrastInkOn(color)", snap1["TextSettingsCell.java"])
@@ -570,7 +879,7 @@ class UiPremiumContractsTests(unittest.TestCase):
             snap2 = {p.name: p.read_text(encoding="utf-8") for p in repo.rglob("*.java")}
             self.assertEqual(snap1, snap2)
 
-            # Verify legacy v1 (already-patched 010-consolidated style) upgrades cleanly without duplicating anchors
+            # Verify legacy v1/v2 duplicate Saved Tags code upgrades & strips cleanly without duplicating anchors
             with tempfile.TemporaryDirectory() as ltmp:
                 lrepo = Path(ltmp) / "Telegram-Src"
                 for src in repo.rglob("*.java"):
@@ -585,17 +894,51 @@ class UiPremiumContractsTests(unittest.TestCase):
                     "    private ColgramSavedTagsBarView colgramSavedTagsBar;\n"
                     "    private String colgramActiveSavedTagEmoji;\n"
                     "    private boolean colgramSavedTagFiltered;\n"
+                    "    private org.colgram.core.ColgramSavedTagsStore.ChangeListener colgramSavedTagsListener;\n"
                     "    public final static int OPTION_COPY = 3;\n"
                     "    public final static int OPTION_COLGRAM_SAVED_TAG = 9992;\n"
+                    "        if (colgramSavedTagsListener != null) {\n"
+                    "            org.colgram.core.ColgramSavedTagsStore.removeListener(colgramSavedTagsListener);\n"
+                    "            colgramSavedTagsListener = null;\n"
+                    "        }\n"
                     "        if (starReactionsOverlay != null) {\n"
                     "            starReactionsOverlay.setMessageCell(null);\n"
                     "            AndroidUtilities.removeFromParent(starReactionsOverlay);\n"
                     "            starReactionsOverlay = null;\n"
                     "        }\n"
                     "    }\n"
+                    "        contentView.addView(topPanelLayout, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP));\n"
+                    "        if (dialog_id == getUserConfig().getClientUserId() && org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()) {\n"
+                    "            colgramSavedTagsBar = new ColgramSavedTagsBarView(context, currentAccount);\n"
+                    "            colgramSavedTagsBar.setCallback(new ColgramSavedTagsBarView.Callback() {\n"
+                    "                @Override\n"
+                    "                public void onFilterChanged(String activeEmojiOrNull, java.util.List<Integer> matchingMsgIds) {\n"
+                    "                    colgramApplySavedTagFilter(activeEmojiOrNull, matchingMsgIds);\n"
+                    "                }\n"
+                    "                @Override\n"
+                    "                public void onJumpToMessage(int msgId) {\n"
+                    "                    scrollToMessageId(msgId, 0, true, 0, true, 0);\n"
+                    "                }\n"
+                    "                @Override\n"
+                    "                public void onAddTagClicked() {\n"
+                    "                    ColgramUiKit.showNotice(ChatActivity.this, R.drawable.msg_reactions,\n"
+                    '                            "Удерживайте сообщение -> «Тег (эмодзи)» для разметки", false);\n'
+                    "                }\n"
+                    "            });\n"
                     "            topPanelLayout.addView(colgramSavedTagsBar, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 44));\n"
                     "            topPanelLayout.setPriority(colgramSavedTagsBar, 8);\n"
                     "            topPanelLayout.setViewVisible(colgramSavedTagsBar, true, false);\n"
+                    "            colgramSavedTagsListener = acc -> {\n"
+                    "                if (acc == currentAccount) {\n"
+                    "                    AndroidUtilities.runOnUIThread(() -> {\n"
+                    "                        if (isFinishing()) return;\n"
+                    "                        if (colgramSavedTagsBar != null) colgramSavedTagsBar.rebuild();\n"
+                    "                        if (chatAdapter != null) chatAdapter.notifyDataSetChanged();\n"
+                    "                        if (chatListView != null) chatListView.requestLayout();\n"
+                    "                    });\n"
+                    "                }\n"
+                    "            };\n"
+                    "            org.colgram.core.ColgramSavedTagsStore.addListener(colgramSavedTagsListener);\n"
                     "        }\n\n"
                     "        contentView.addView(actionBar);\n"
                     "    private void colgramApplySavedTagFilter(String emoji, java.util.List<Integer> matchingIds) {\n"
@@ -607,7 +950,11 @@ class UiPremiumContractsTests(unittest.TestCase):
                     "            if (colgramSavedTagFiltered) {\n"
                     "                colgramSavedTagFiltered = false;\n"
                     "                chatAdapter.isFiltered = false;\n"
+                    "                chatAdapter.filteredEndReached = false;\n"
                     "                chatAdapter.filteredMessages.clear();\n"
+                    "                if (filteredMessagesDict != null) {\n"
+                    "                    filteredMessagesDict.clear();\n"
+                    "                }\n"
                     "                updateVisibleRows();\n"
                     "                chatAdapter.notifyDataSetChanged();\n"
                     "            }\n"
@@ -618,16 +965,24 @@ class UiPremiumContractsTests(unittest.TestCase):
                     "        if (matchingIds != null) {\n"
                     "            idSet.addAll(matchingIds);\n"
                     "        }\n"
+                    "        if (filteredMessagesDict == null) {\n"
+                    "            filteredMessagesDict = new LongSparseArray<>();\n"
+                    "        } else {\n"
+                    "            filteredMessagesDict.clear();\n"
+                    "        }\n"
                     "        chatAdapter.filteredMessages.clear();\n"
                     "        for (int i = 0; i < messages.size(); i++) {\n"
                     "            MessageObject m = messages.get(i);\n"
                     "            if (m != null && !m.isDateObject && idSet.contains(m.getId())) {\n"
                     "                chatAdapter.filteredMessages.add(m);\n"
+                    "                filteredMessagesDict.put(m.getId(), m);\n"
                     "            }\n"
                     "        }\n"
                     "        if (chatAdapter.filteredMessages.isEmpty() && matchingIds != null && !matchingIds.isEmpty()) {\n"
                     "            colgramSavedTagFiltered = false;\n"
                     "            chatAdapter.isFiltered = false;\n"
+                    "            chatAdapter.filteredEndReached = false;\n"
+                    "            filteredMessagesDict.clear();\n"
                     "            updateVisibleRows();\n"
                     "            chatAdapter.notifyDataSetChanged();\n"
                     "            scrollToMessageId(matchingIds.get(0), 0, true, 0, true, 0);\n"
@@ -635,27 +990,106 @@ class UiPremiumContractsTests(unittest.TestCase):
                     "        }\n"
                     "        colgramSavedTagFiltered = true;\n"
                     "        chatAdapter.isFiltered = true;\n"
+                    "        chatAdapter.filteredEndReached = true;\n"
                     "        updateVisibleRows();\n"
                     "        chatAdapter.notifyDataSetChanged();\n"
-                    "    }\n"
+                    "    }\n\n"
                     "        if (org.colgram.core.ColgramPremiumConfig.isBypassNoForwardsEnabled() && !fromMyName) { fromMyName = true; }\n"
                     "        MessageObject obj = chatAdapter != null && chatAdapter.isFiltered ? filteredMessagesDict.get(mid) :  messagesDict[loadIndex].get(mid);\n"
-                    "        if (chatAdapter.isFiltered && !messageObject.hasReaction(searchingReaction)) {\n"
+                    "                        if (chatAdapter.isFiltered && !colgramSavedTagFiltered && searchingReaction != null && !messageObject.hasReaction(searchingReaction)) {\n"
                     "        if (sponsoredMessagesAdded || org.colgram.core.ColgramPremiumConfig.isBlockSponsoredAdsEnabled() || getUserConfig().isPremium()) {}\n"
+                    "                if (dialog_id == getUserConfig().getClientUserId() && org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled() && selectedObject.getId() > 0 && !selectedObject.isSponsored()) {\n"
+                    '                    items.add("Тег (эмодзи)");\n'
                     "                    options.add(OPTION_COLGRAM_SAVED_TAG);\n"
-                    "            case OPTION_COLGRAM_SAVED_TAG:\n"
+                    "                    icons.add(R.drawable.msg_reactions);\n"
+                    "                }\n"
+                    "            case OPTION_COLGRAM_SAVED_TAG: {\n"
+                    "                final MessageObject tagTarget = selectedObject;\n"
+                    "                selectedObject = null;\n"
+                    "                selectedObjectToEditCaption = null;\n"
+                    "                selectedObjectGroup = null;\n"
+                    "                if (tagTarget != null && getParentActivity() != null && tagTarget.getId() > 0) {\n"
+                    "                    ColgramUiKit.showEmojiTagPickerSheet(\n"
+                    "                            getParentActivity(), themeDelegate, currentAccount, tagTarget.getId(),\n"
+                    "                            () -> {\n"
                     "                                if (colgramSavedTagsBar != null) colgramSavedTagsBar.rebuild();\n"
-                    "                                if (chatListView != null) chatListView.invalidateViews();\n"
-                    "        public void didPressColgramSavedTag() {}\n"
+                    "                                updateVisibleRows();\n"
+                    "                                if (chatAdapter != null) chatAdapter.notifyDataSetChanged();\n"
+                    "                                if (chatListView != null) chatListView.requestLayout();\n"
+                    "                            }\n"
+                    "                    );\n"
+                    "                }\n"
+                    "                return;\n"
+                    "            }\n"
+                    "        @Override\n"
+                    "        public void didPressColgramSavedTag(ChatMessageCell cell, String emoji) {\n"
+                    "            if (colgramSavedTagsBar != null && emoji != null && !emoji.isEmpty()) {\n"
+                    "                colgramSavedTagsBar.activateEmojiFilter(emoji);\n"
+                    "            }\n"
+                    "        }\n\n"
                     "            String reactionString = getMediaDataController().getDoubleTapReaction();\n"
-                    '            if (reactionString.startsWith("animated_")) {\n',
+                    '            if (reactionString.startsWith("animated_")) {\n'
+                    + _chat_native_tag_gates,
                     encoding="utf-8",
                 )
                 (lcells / "ChatMessageCell.java").write_text(
-                    "    void didPressColgramSavedTag(ChatMessageCell cell, String emoji) {}\n"
-                    "    colgramCheckSavedTagTouch(event);\n"
-                    "    // colgram-saved-tag-pills-v1\n"
+                    "\n\n        default void didPressColgramSavedTag(ChatMessageCell cell, String emoji) {\n"
+                    "        }\n"
+                    "        if (colgramCheckSavedTagTouch(event)) {\n"
+                    "            return true;\n"
+                    "        }\n"
+                    "        // colgram-saved-tag-pills-v1\n"
+                    "        resultHeight += colgramSavedTagExtraHeight();\n"
+                    "\n\n    private final java.util.ArrayList<android.graphics.RectF> colgramTagHitRects = new java.util.ArrayList<>(4);\n"
+                    "    private final java.util.ArrayList<String> colgramTagHitEmojis = new java.util.ArrayList<>(4);\n"
+                    "    private Paint colgramTagBgPaint;\n"
+                    "    private android.text.TextPaint colgramTagTextPaint;\n\n"
+                    "    private int colgramSavedTagExtraHeight() {\n"
+                    "        if (currentMessageObject == null\n"
+                    "                || !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()\n"
+                    "                || currentMessageObject.getDialogId() != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
+                    "            return 0;\n"
+                    "        }\n"
+                    "        java.util.List<String> tags = org.colgram.core.ColgramSavedTagsStore.getTags(currentAccount, currentMessageObject.getId());\n"
+                    "        return tags.isEmpty() ? 0 : dp(26);\n"
+                    "    }\n\n"
+                    "    private boolean colgramCheckSavedTagTouch(MotionEvent event) {\n"
+                    "        if (colgramTagHitRects.isEmpty() || delegate == null) return false;\n"
+                    "        int act = event.getAction();\n"
+                    "        if (act != MotionEvent.ACTION_DOWN && act != MotionEvent.ACTION_UP) return false;\n"
+                    "        float ex = getEventX(event);\n"
+                    "        float ey = getEventY(event);\n"
+                    "        for (int i = 0; i < colgramTagHitRects.size(); i++) {\n"
+                    "            if (colgramTagHitRects.get(i).contains(ex, ey)) {\n"
+                    "                if (act == MotionEvent.ACTION_UP && i < colgramTagHitEmojis.size()) {\n"
+                    "                    playSoundEffect(android.view.SoundEffectConstants.CLICK);\n"
+                    "                    delegate.didPressColgramSavedTag(this, colgramTagHitEmojis.get(i));\n"
+                    "                }\n"
+                    "                return true;\n"
+                    "            }\n"
+                    "        }\n"
+                    "        return false;\n"
+                    "    }\n\n"
                     "    private void colgramDrawSavedTagPills(Canvas canvas) {\n"
+                    "        colgramTagHitRects.clear();\n"
+                    "        colgramTagHitEmojis.clear();\n"
+                    "        if (currentMessageObject == null\n"
+                    "                || !org.colgram.core.ColgramPremiumConfig.isSavedTagsEnabled()\n"
+                    "                || currentMessageObject.getDialogId() != UserConfig.getInstance(currentAccount).getClientUserId()) {\n"
+                    "            return;\n"
+                    "        }\n"
+                    "        java.util.List<String> tags = org.colgram.core.ColgramSavedTagsStore.getTags(currentAccount, currentMessageObject.getId());\n"
+                    "        if (tags.isEmpty()) return;\n"
+                    "        if (colgramTagBgPaint == null) {\n"
+                    "            colgramTagBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);\n"
+                    "        }\n"
+                    "        if (colgramTagTextPaint == null) {\n"
+                    "            colgramTagTextPaint = new android.text.TextPaint(Paint.ANTI_ALIAS_FLAG);\n"
+                    "            colgramTagTextPaint.setTextSize(dp(12));\n"
+                    "        }\n"
+                    "        int accent = Theme.getColor(Theme.key_chat_inTimeText, resourcesProvider);\n"
+                    "        colgramTagBgPaint.setColor(androidx.core.graphics.ColorUtils.setAlphaComponent(accent, 42));\n"
+                    "        colgramTagTextPaint.setColor(Theme.getColor(Theme.key_chat_messageTextIn, resourcesProvider));\n"
                     "        int maxShow = Math.min(3, tags.size());\n"
                     "        float h = dp(20);\n"
                     "        float yTop = Math.max(dp(4), getMeasuredHeight() - dp(23));\n"
@@ -697,9 +1131,16 @@ class UiPremiumContractsTests(unittest.TestCase):
                 upp.apply(str(lrepo), _noop_patch, _apply_eol, koliti_enabled=False)
                 lsnap1 = {p.name: p.read_text(encoding="utf-8") for p in lrepo.rglob("*.java")}
                 self.assertEqual(lsnap1["ChatActivity.java"].count("private AnimatedTextView searchOtherButton;"), 1)
-                self.assertEqual(lsnap1["ChatActivity.java"].count("colgramSavedTagsListener;"), 1)
-                self.assertEqual(lsnap1["ChatActivity.java"].count("addListener(colgramSavedTagsListener)"), 1)
-                self.assertEqual(lsnap1["ChatMessageCell.java"].count("private void colgramDrawSavedTagPills("), 1)
+                self.assertEqual(lsnap1["ChatActivity.java"].count("colgramSavedTagsBar"), 0)
+                self.assertEqual(lsnap1["ChatActivity.java"].count("colgramSavedTagsListener"), 0)
+                self.assertEqual(lsnap1["ChatActivity.java"].count("colgramApplySavedTagFilter"), 0)
+                self.assertEqual(lsnap1["ChatActivity.java"].count("OPTION_COLGRAM_SAVED_TAG"), 0)
+                self.assertEqual(lsnap1["ChatActivity.java"].count("didPressColgramSavedTag"), 0)
+                self.assertEqual(lsnap1["ChatActivity.java"].count("colgramSavedTagFiltered"), 0)
+                self.assertEqual(lsnap1["ChatMessageCell.java"].count("colgramDrawSavedTagPills"), 0)
+                self.assertEqual(lsnap1["ChatMessageCell.java"].count("colgramSavedTagExtraHeight"), 0)
+                self.assertEqual(lsnap1["ChatMessageCell.java"].count("colgramCheckSavedTagTouch"), 0)
+                self.assertEqual(lsnap1["ChatMessageCell.java"].count("didPressColgramSavedTag"), 0)
                 self.assertEqual(lsnap1["DialogsActivity.java"].count("else if (filterTabsView.hasTab(defFid))"), 1)
                 upp.apply(str(lrepo), _noop_patch, _apply_eol, koliti_enabled=False)
                 lsnap2 = {p.name: p.read_text(encoding="utf-8") for p in lrepo.rglob("*.java")}

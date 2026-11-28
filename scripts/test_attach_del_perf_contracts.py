@@ -73,8 +73,15 @@ class TrackBContractsTest(unittest.TestCase):
         self.assertIn('getFilesDir(), "colgram_inbox"', fi.split("cleanupRejectedStagedFile(", 1)[1].split("openStagedUriSync", 1)[0])
         import_async_slice = fi.split("private static boolean importUrisAsync(", 1)[1].split("public static String copyToSandbox(", 1)[0]
         self.assertIn("IMPORT_EXECUTOR.execute(() -> {", import_async_slice)
-        self.assertIn("openStagedUriSync(", import_async_slice.split("IMPORT_EXECUTOR.execute(() -> {", 1)[1])
-        self.assertNotIn("openStagedUriSync(", import_async_slice.split("IMPORT_EXECUTOR.execute(() -> {", 1)[0])
+        pre_exec, post_exec = import_async_slice.split("IMPORT_EXECUTOR.execute(() -> {", 1)
+        self.assertIn("cr.openAssetFileDescriptor(", pre_exec)
+        self.assertNotIn("openStagedUriSync(", pre_exec)
+        self.assertNotIn("queryUriSize(", pre_exec)
+        self.assertNotIn("resolveDisplayName(", pre_exec)
+        self.assertNotIn("ensureInboxDir(", pre_exec)
+        self.assertIn("openStagedUriSync(", post_exec)
+        self.assertIn("closeAllAfdsQuietly(preopenedAfds)", post_exec)
+        self.assertIn("closeAllAfdsQuietly(preopenedAfds)", import_async_slice.split("scheduled = true;", 1)[1])
 
         um = read_text("colgram-core/src/main/java/org/colgram/core/ColgramUnlimitedMemory.java")
         self.assertIn('appCtx.getExternalFilesDir("colgram_inbox")', um)

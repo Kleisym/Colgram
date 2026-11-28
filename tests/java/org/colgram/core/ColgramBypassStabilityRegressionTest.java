@@ -29,6 +29,11 @@ public final class ColgramBypassStabilityRegressionTest {
         testDefaultEdgeDeprioritizeTtlCapped();
         testRestartIfDeadClearsStoppedExplicitlyAndMainDcRx();
         testColgramPinnedConnectionContract();
+        testSendBinaryLargeSingleFrameAndPacketLimit();
+        testForcePatchDcOverridesCollidingObfuscated2Header();
+        testWritingUpstreamProtectsUploadWithStaleLastTxUntilHardCap();
+        testMediaLastWorkingEndpointReusedWithoutDashOneHost();
+        testDc135AndWifiMediaWsFastPathDecision();
         System.out.println("ColgramBypassStabilityRegressionTest PASSED");
     }
 
@@ -649,11 +654,19 @@ public final class ColgramBypassStabilityRegressionTest {
 
             java.lang.reflect.Field dc135CdField = ColgramTelegramWsBridge.class.getDeclaredField("DC135_DEAD_COOLDOWN_MS");
             dc135CdField.setAccessible(true);
-            check(dc135CdField.getLong(null) == 12_000L, "DC135_DEAD_COOLDOWN_MS must be 12_000L");
+            check(dc135CdField.getLong(null) == 2_000L, "DC135_DEAD_COOLDOWN_MS must be 2_000L");
 
             java.lang.reflect.Field dc135MaxField = ColgramTelegramWsBridge.class.getDeclaredField("DC135_MAX_BACKOFF_MS");
             dc135MaxField.setAccessible(true);
-            check(dc135MaxField.getLong(null) == 30_000L, "DC135_MAX_BACKOFF_MS must be 30_000L");
+            check(dc135MaxField.getLong(null) == 4_000L, "DC135_MAX_BACKOFF_MS must be 4_000L");
+
+            java.lang.reflect.Field dc135WifiField = ColgramTelegramWsBridge.class.getDeclaredField("DC135_WIFI_CONNECT_TIMEOUT_MS");
+            dc135WifiField.setAccessible(true);
+            check(dc135WifiField.getInt(null) == 700, "DC135_WIFI_CONNECT_TIMEOUT_MS must be 700");
+
+            java.lang.reflect.Field dc135CellField = ColgramTelegramWsBridge.class.getDeclaredField("DC135_CELLULAR_CONNECT_TIMEOUT_MS");
+            dc135CellField.setAccessible(true);
+            check(dc135CellField.getInt(null) == 1000, "DC135_CELLULAR_CONNECT_TIMEOUT_MS must be 1000");
         } finally {
             ColgramTelegramWsBridge.clearCooldowns();
         }
@@ -733,6 +746,157 @@ public final class ColgramBypassStabilityRegressionTest {
         check(socksPinned != socksOrig, "SOCKS proxy with null address must wrap SSF/verifier without error");
         check("example.com".equals(socksPinned.getURL().getHost()),
                 "SOCKS pin must keep domain host intact for remote proxy resolution");
+    }
+
+    private static void verifySingleUnfragmentedWsBinaryFrame(int payloadLen) throws Exception {
+        java.io.ByteArrayOutputStream wireOut = new java.io.ByteArrayOutputStream();
+        ColgramTelegramWsBridge.WsSession session = new ColgramTelegramWsBridge.WsSession(
+                2, -2, "149.154.167.220", "kws2-1.web.telegram.org", null,
+                new java.io.ByteArrayInputStream(new byte[0]), wireOut);
+        byte[] payload = new byte[payloadLen];
+        for (int i = 0; i < payloadLen; i++) {
+            payload[i] = (byte) ((i * 31 + 7) & 0xff);
+        }
+        session.sendBinary(payload, 0, payloadLen);
+        byte[] wire = wireOut.toByteArray();
+        check(wire.length == 14 + payloadLen,
+                "single unfragmented RFC 6455 frame length mismatch: got=" + wire.length + " expected=" + (14 + payloadLen));
+        check((wire[0] & 0xff) == 0x82,
+                "first byte must be 0x82 (FIN=1, opcode=0x2), got=0x" + Integer.toHexString(wire[0] & 0xff));
+        check((wire[1] & 0xff) == (0x80 | 127),
+                "second byte must be MASK=1 + len=127, got=0x" + Integer.toHexString(wire[1] & 0xff));
+        long encodedLen = 0L;
+        for (int i = 2; i < 10; i++) {
+            encodedLen = (encodedLen << 8) | (wire[i] & 0xffL);
+        }
+        check(encodedLen == payloadLen, "64-bit extended length mismatch: got=" + encodedLen + " expected=" + payloadLen);
+        for (int i = 0; i < payloadLen; i++) {
+            byte unmasked = (byte) (wire[14 + i] ^ wire[10 + (i & 3)]);
+            if (unmasked != payload[i]) {
+                throw new AssertionError("payload corruption at offset " + i + " for len=" + payloadLen);
+            }
+        }
+        // Subsequent small packet shrinks oversized writeScratch back to 8 KB
+        session.sendBinary(new byte[]{1, 2, 3, 4}, 0, 4);
+        java.lang.reflect.Field scratchField = ColgramTelegramWsBridge.WsSession.class.getDeclaredField("writeScratch");
+        scratchField.setAccessible(true);
+        byte[] scratch = (byte[]) scratchField.get(session);
+        check(scratch.length <= 8192, "writeScratch must shrink back to <= 8192 after small packet, got=" + scratch.length);
+    }
+
+    private static void testSendBinaryLargeSingleFrameAndPacketLimit() throws Exception {
+        verifySingleUnfragmentedWsBinaryFrame(131_124);
+        verifySingleUnfragmentedWsBinaryFrame(524_340);
+
+        java.io.ByteArrayOutputStream wireOut = new java.io.ByteArrayOutputStream();
+        ColgramTelegramWsBridge.WsSession session = new ColgramTelegramWsBridge.WsSession(
+                2, -2, "149.154.167.220", "kws2-1.web.telegram.org", null,
+                new java.io.ByteArrayInputStream(new byte[0]), wireOut);
+        boolean threw = false;
+        try {
+            session.sendBinary(new byte[1], 0, ColgramTelegramWsBridge.MAX_PACKET_BYTES + 1);
+        } catch (java.io.IOException expected) {
+            threw = true;
+        }
+        check(threw, "sendBinary must reject len > MAX_PACKET_BYTES");
+    }
+
+    private static byte[] buildObfuscated2HeaderWithDc(short rawDcInHeader, byte protoByte) throws Exception {
+        byte[] hdr = new byte[64];
+        for (int i = 8; i < 56; i++) {
+            hdr[i] = (byte) ((i * 19 + 3) & 0xff);
+        }
+        byte[] key = java.util.Arrays.copyOfRange(hdr, 8, 40);
+        byte[] iv = java.util.Arrays.copyOfRange(hdr, 40, 56);
+        javax.crypto.Cipher ctr = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding");
+        ctr.init(javax.crypto.Cipher.ENCRYPT_MODE,
+                new javax.crypto.spec.SecretKeySpec(key, "AES"),
+                new javax.crypto.spec.IvParameterSpec(iv));
+        byte[] ks = ctr.update(new byte[64]);
+        for (int i = 56; i < 60; i++) {
+            hdr[i] = (byte) ((protoByte & 0xff) ^ (ks[i] & 0xff));
+        }
+        hdr[60] = (byte) ((rawDcInHeader & 0xff) ^ (ks[60] & 0xff));
+        hdr[61] = (byte) (((rawDcInHeader >> 8) & 0xff) ^ (ks[61] & 0xff));
+        return hdr;
+    }
+
+    private static void testForcePatchDcOverridesCollidingObfuscated2Header() throws Exception {
+        // Simulate local tgnet random [60..61] bytes accidentally matching valid DC 4 instead of target media DC -2
+        byte[] initKeep = buildObfuscated2HeaderWithDc((short) 4, (byte) 0xef);
+        ColgramTelegramWsBridge.Obfuscated2FrameSplitter sKeep =
+                ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(initKeep, 64, -2, false);
+        check(sKeep != null && sKeep.rawDcId() == 4
+                        && ColgramTelegramWsBridge.extractRawDcFromObfuscated2(initKeep, 64) == 4,
+                "forcePatchDc=false must preserve existing valid DC 4");
+
+        byte[] initPatch = buildObfuscated2HeaderWithDc((short) 4, (byte) 0xef);
+        ColgramTelegramWsBridge.Obfuscated2FrameSplitter sForce =
+                ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(initPatch, 64, -2, true);
+        check(sForce != null && sForce.rawDcId() == -2
+                        && ColgramTelegramWsBridge.extractRawDcFromObfuscated2(initPatch, 64) == -2,
+                "forcePatchDc=true must unconditionally overwrite [60..61] with target signed DC -2");
+    }
+
+    private static void testWritingUpstreamProtectsUploadWithStaleLastTxUntilHardCap() throws Exception {
+        ColgramDpiBypass.closeAllActiveSessions();
+        List<Socket> toClose = new ArrayList<>();
+        try {
+            Socket client = new Socket();
+            Socket upstream = new Socket();
+            toClose.add(client);
+            toClose.add(upstream);
+
+            ColgramDpiBypass.ActiveSession s =
+                    ColgramDpiBypass.registerActiveSessionAt(client, upstream, true, false, 10_000L);
+            s.onClientTx(10_000L);
+            s.writingUpstream = true;
+
+            // Even with lastTxAtMs 35s stale (> 12s maxPendingReplyMs), writingUpstream protects up to 60s
+            int reapedMid = ColgramDpiBypass.reapStaleSessionsAt(45_000L, 12_000L, 0L);
+            check(reapedMid == 0, "writingUpstream=true must protect live upload before 60s cap, got=" + reapedMid);
+            check(!client.isClosed() && !upstream.isClosed(), "protected upload sockets must remain open");
+
+            // At 60s unreplied hard ceiling, reaper MUST still reclaim stuck upload
+            int reapedCap = ColgramDpiBypass.reapStaleSessionsAt(70_000L, 12_000L, 0L);
+            check(reapedCap == 1, "writingUpstream=true must still reap at 60s hard ceiling, got=" + reapedCap);
+            check(client.isClosed() && upstream.isClosed(), "reaped upload sockets must close at 60s cap");
+        } finally {
+            ColgramDpiBypass.closeAllActiveSessions();
+            for (Socket sock : toClose) {
+                try { sock.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private static void testMediaLastWorkingEndpointReusedWithoutDashOneHost() {
+        ColgramTelegramWsBridge.EdgeEndpoint proven =
+                new ColgramTelegramWsBridge.EdgeEndpoint("149.154.167.220", "kws2.web.telegram.org");
+        List<ColgramTelegramWsBridge.EdgeEndpoint> cands =
+                ColgramTelegramWsBridge.buildCandidateEndpoints(
+                        2, proven, java.util.Collections.emptyMap(), java.util.Collections.emptySet(), true, false);
+        check(!cands.isEmpty() && proven.key().equals(cands.get(0).key()),
+                "proven working media lastWorking must be reused even when SNI host omits -1.");
+    }
+
+    private static void testDc135AndWifiMediaWsFastPathDecision() {
+        // DC1/DC3/DC5 tries raw desync once before dcRawFailed > 0
+        check(!ColgramDpiBypass.shouldSkipRawForWs(false, true, true, false, false, false, true, 0, 0, false),
+                "DC1/3/5 initial attempt with rawFailed=0 should allow raw desync probe first");
+        // Once raw fails without reply on working network or cellular, DC1/3/5 switches to WSS fast-path
+        check(ColgramDpiBypass.shouldSkipDcBackoffSleep(true, true, true, false, false, 1, 0, false),
+                "DC1/3/5 after rawFailed>0 on working WS network must skip DC backoff sleep");
+        check(ColgramDpiBypass.shouldSkipRawForWs(false, true, true, false, false, false, true, 1, 0, false),
+                "DC1/3/5 after rawFailed>0 on working WS network must switch to WSS fast-path");
+        check(ColgramDpiBypass.shouldSkipDcBackoffSleep(true, true, false, false, false, 1, 0, true),
+                "DC1/3/5 after rawFailed>0 on cellular must skip DC backoff sleep");
+        check(ColgramDpiBypass.shouldSkipRawForWs(false, true, true, false, false, false, false, 1, 0, true),
+                "DC1/3/5 after rawFailed>0 on cellular must switch to WSS fast-path");
+        // Wi-Fi media DCs (DC2/DC4) fast-path onto WSS once network WSS has worked & 0 raw replies
+        check(ColgramDpiBypass.shouldSkipDcBackoffSleep(true, false, true, false, false, 0, 0, false),
+                "Wi-Fi media DC must skip DC backoff sleep once WSS has worked");
+        check(ColgramDpiBypass.shouldSkipRawForWs(false, true, false, false, false, false, true, 0, 0, false),
+                "Wi-Fi media DC must use WSS fast-path once WSS has worked and rawReplied==0");
     }
 
     private static void check(boolean cond, String msg) {

@@ -335,6 +335,7 @@ public class ColgramDpiBypass {
         volatile long lastTxAtMs;
         volatile long lastRxAtMs;
         volatile long pendingReplySinceMs;
+        volatile boolean writingUpstream;
         private final java.util.concurrent.atomic.AtomicBoolean closed =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
 
@@ -408,7 +409,8 @@ public class ColgramDpiBypass {
 
     private static int sessionEvictTier(ActiveSession s, long nowMs) {
         if (s.client == null || s.client.isClosed()) return 3;
-        if (s.pendingReplySinceMs > 0L
+        if (!s.writingUpstream
+                && s.pendingReplySinceMs > 0L
                 && (nowMs - s.pendingReplySinceMs) >= 15_000L
                 && (nowMs - s.lastTxAtMs) >= 15_000L) {
             return 2;
@@ -465,10 +467,12 @@ public class ColgramDpiBypass {
         for (ActiveSession s : ACTIVE_SESSIONS) {
             if (s == null) continue;
             boolean deadClient = s.client != null && s.client.isClosed();
+            boolean activeUploadWindow = s.writingUpstream
+                    || (nowMs - s.lastTxAtMs) < maxPendingReplyMs;
             boolean pendingStall = maxPendingReplyMs > 0L
                     && s.pendingReplySinceMs > 0L
                     && (nowMs - s.pendingReplySinceMs) >= maxPendingReplyMs
-                    && ((nowMs - s.lastTxAtMs) >= maxPendingReplyMs
+                    && (!activeUploadWindow
                             || (nowMs - s.pendingReplySinceMs) >= Math.max(maxPendingReplyMs, MAX_ACTIVE_UPLOAD_UNREPLIED_MS));
             boolean idleExpired = maxIdleMs > 0L
                     && (nowMs - s.lastRxAtMs) >= maxIdleMs;
@@ -1774,24 +1778,20 @@ public class ColgramDpiBypass {
             boolean wsEdgeHost = "149.154.167.220".equals(destHost);
             boolean wsCapableDest = isWsCapableForSession(call != null, call != null && call.systemWide, wsEdgeHost)
                     && ColgramTelegramWsBridge.supports(destHost, destPort);
-            boolean skipDcBackoffSleep = wsCapableDest
-                    && (!isDc135 && ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
-                            || dcWsPreferred.get(dcBucket) != 0
-                            || inheritedGenericWs);
-            // Allow DC1/DC3/DC5 raw TCP desync & Layer-2 L3 fallback even when DC2 WSS works so
-            // channels hosted on DC1/DC3/DC5 stay reachable and fast.
-            boolean skipRawForWs = (call == null) && wsCapableDest && (
-                    dcWsPreferred.get(dcBucket) != 0
-                            || inheritedGenericWs
-                            || (!isDc135 && (!isMedia || cellularNetwork)
-                                    && !overlayActive
-                                    && ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
-                                    && dcRawReplied.get(dcBucket) == 0)
-                            || (!isDc135 && dcRawReplied.get(dcBucket) == 0
-                                    && dcRawFailed.get(dcBucket) > 0
-                                    && (overlayActive
-                                            || ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork()
-                                            || cellularNetwork)));
+            boolean wsWorked = ColgramTelegramWsBridge.hasWorkedOnCurrentNetwork();
+            int rawFailed = dcRawFailed.get(dcBucket);
+            int rawReplied = dcRawReplied.get(dcBucket);
+            boolean skipDcBackoffSleep = shouldSkipDcBackoffSleep(
+                    wsCapableDest, isDc135, wsWorked,
+                    dcWsPreferred.get(dcBucket) != 0, inheritedGenericWs,
+                    rawFailed, rawReplied, cellularNetwork);
+            // Allow DC1/DC3/DC5 one initial raw TCP desync attempt when raw has not failed yet,
+            // then switch to WSS fast-path once raw fails without a reply; allow Wi-Fi media DCs
+            // on working networks straight onto WSS.
+            boolean skipRawForWs = shouldSkipRawForWs(
+                    call != null, wsCapableDest, isDc135,
+                    dcWsPreferred.get(dcBucket) != 0, inheritedGenericWs,
+                    overlayActive, wsWorked, rawFailed, rawReplied, cellularNetwork);
             boolean viaL3Relay = false;
             boolean wsViaL3Relay = false;
             boolean triedL3Race = false;
@@ -2014,6 +2014,7 @@ public class ColgramDpiBypass {
                 out.flush();
                 client.setSoTimeout(0);
                 if (call == null) relayedConnections.incrementAndGet();
+                wsSession.forcePatchDc = (call == null && !wsEdgeHost && signedDc != 0);
                 pipeOverWebSocket(client, wsSession, call, generation, wsViaL3Relay);
                 handedOff = true;
                 return;
@@ -2382,6 +2383,27 @@ public class ColgramDpiBypass {
 
     static boolean isWsCapableForSession(boolean isCallTunnel, boolean systemWide, boolean wsEdgeHost) {
         return !isCallTunnel || (systemWide && !wsEdgeHost);
+    }
+
+    static boolean shouldSkipDcBackoffSleep(boolean wsCapableDest, boolean isDc135, boolean wsWorked,
+                                            boolean wsPreferred, boolean inheritedGenericWs,
+                                            int rawFailed, int rawReplied, boolean cellularNetwork) {
+        return wsCapableDest && (
+                (!isDc135 && wsWorked)
+                        || wsPreferred
+                        || inheritedGenericWs
+                        || (rawFailed > 0 && rawReplied == 0 && (wsWorked || cellularNetwork)));
+    }
+
+    static boolean shouldSkipRawForWs(boolean isCallTunnel, boolean wsCapableDest, boolean isDc135,
+                                      boolean wsPreferred, boolean inheritedGenericWs,
+                                      boolean overlayActive, boolean wsWorked,
+                                      int rawFailed, int rawReplied, boolean cellularNetwork) {
+        return !isCallTunnel && wsCapableDest && (
+                wsPreferred
+                        || inheritedGenericWs
+                        || (!isDc135 && !overlayActive && wsWorked && rawReplied == 0)
+                        || (rawReplied == 0 && rawFailed > 0 && (overlayActive || wsWorked || cellularNetwork)));
     }
 
     static boolean isOverlayVpnActive() {
@@ -4571,7 +4593,13 @@ public class ColgramDpiBypass {
                 buffer = borrowRelayBuffer();
                 int len;
                 while ((len = cin.read(buffer)) != -1) {
-                    splitter.feedToSession(buffer, 0, len, session);
+                    tracked.onClientTx(safeElapsedRealtime());
+                    tracked.writingUpstream = true;
+                    try {
+                        splitter.feedToSession(buffer, 0, len, session);
+                    } finally {
+                        tracked.writingUpstream = false;
+                    }
                     tracked.onClientTx(safeElapsedRealtime());
                     if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(len);
                 }
@@ -4631,7 +4659,7 @@ public class ColgramDpiBypass {
     }
 
     private static ColgramTelegramWsBridge.WsSession tryRedialFreshPrewarmSession(
-            Socket client, long generation, int targetDc,
+            Socket client, long generation, int targetDc, boolean forcePatchDc,
             ColgramDohResolver.SocketProtector protector,
             ColgramNativeDesync.FdProtector fdProtector,
             Object sendLock,
@@ -4646,6 +4674,7 @@ public class ColgramDpiBypass {
         ColgramTelegramWsBridge.WsSession fresh =
                 ColgramTelegramWsBridge.dialFreshForDc(targetDc, protector, fdProtector);
         if (fresh == null) return null;
+        fresh.forcePatchDc = forcePatchDc;
         synchronized (sendLock) {
             if (extraClientBytesSent.get() || !isCurrentListener(generation) || client.isClosed()) {
                 closeQuietly(fresh);
@@ -4653,7 +4682,8 @@ public class ColgramDpiBypass {
             }
             byte[] replayInit = java.util.Arrays.copyOf(initCopy, initCopyLen);
             ColgramTelegramWsBridge.Obfuscated2FrameSplitter freshSplitter =
-                    ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(replayInit, initCopyLen, targetDc);
+                    ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
+                            replayInit, initCopyLen, targetDc, forcePatchDc);
             if (freshSplitter == null) {
                 closeQuietly(fresh);
                 return null;
@@ -4768,7 +4798,9 @@ public class ColgramDpiBypass {
                 }
                 ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter =
                         ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
-                                initBuf, initLen, session.rawDcId != 0 ? session.rawDcId : session.dcId);
+                                initBuf, initLen,
+                                session.rawDcId != 0 ? session.rawDcId : session.dcId,
+                                session.forcePatchDc);
                 if (splitter == null) {
                     clientClosedFirst.set(true);
                     safeLogW("WS_C2S_BAD_HDR dc=" + session.dcId + " initLen=" + initLen);
@@ -4778,7 +4810,13 @@ public class ColgramDpiBypass {
                 synchronized (sendLock) {
                     splitterRef.set(splitter);
                     try {
-                        splitter.feedInitAndTailToSession(initBuf, initLen, activeSessionRef.get());
+                        tracked.onClientTx(safeElapsedRealtime());
+                        tracked.writingUpstream = true;
+                        try {
+                            splitter.feedInitAndTailToSession(initBuf, initLen, activeSessionRef.get());
+                        } finally {
+                            tracked.writingUpstream = false;
+                        }
                         tracked.onClientTx(safeElapsedRealtime());
                         clientSentInit.set(true);
                     } catch (Throwable initErr) {
@@ -4809,10 +4847,16 @@ public class ColgramDpiBypass {
                                 } else {
                                     ColgramTelegramWsBridge.deprioritizeEndpoint(failedSess);
                                 }
-                                fresh = tryRedialFreshPrewarmSession(
-                                        client, generation, targetDc, retryProt, retryFdProt,
-                                        sendLock, extraClientBytesSent, initBuf, initLen,
-                                        activeSessionRef, splitterRef);
+                                tracked.onClientTx(safeElapsedRealtime());
+                                tracked.writingUpstream = true;
+                                try {
+                                    fresh = tryRedialFreshPrewarmSession(
+                                            client, generation, targetDc, failedSess.forcePatchDc,
+                                            retryProt, retryFdProt, sendLock, extraClientBytesSent,
+                                            initBuf, initLen, activeSessionRef, splitterRef);
+                                } finally {
+                                    tracked.writingUpstream = false;
+                                }
                                 if (fresh != null) {
                                     tracked.setUpstream(fresh);
                                     tracked.onClientTx(safeElapsedRealtime());
@@ -4858,6 +4902,8 @@ public class ColgramDpiBypass {
                             safeLogD("WS_C2S_EOF dc=" + session.dcId);
                             break;
                         }
+                        tracked.onClientTx(safeElapsedRealtime());
+                        tracked.writingUpstream = true;
                         try {
                             synchronized (sendLock) {
                                 extraClientBytesSent.set(true);
@@ -4870,6 +4916,8 @@ public class ColgramDpiBypass {
                                 clientClosedFirst.set(true);
                             }
                             throw writeErr;
+                        } finally {
+                            tracked.writingUpstream = false;
                         }
                         tracked.onClientTx(safeElapsedRealtime());
                         if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(len);
@@ -4972,11 +5020,17 @@ public class ColgramDpiBypass {
                                 if (claimed) {
                                     ColgramTelegramWsBridge.WsSession fresh = null;
                                     try {
-                                        fresh = tryRedialFreshPrewarmSession(
-                                                client, generation, targetDc, retryProt, retryFdProt,
-                                                sendLock, extraClientBytesSent,
-                                                initCopyRef.get(), initCopyLenRef.get(),
-                                                activeSessionRef, splitterRef);
+                                        tracked.onClientTx(safeElapsedRealtime());
+                                        tracked.writingUpstream = true;
+                                        try {
+                                            fresh = tryRedialFreshPrewarmSession(
+                                                    client, generation, targetDc, stepSession.forcePatchDc,
+                                                    retryProt, retryFdProt, sendLock, extraClientBytesSent,
+                                                    initCopyRef.get(), initCopyLenRef.get(),
+                                                    activeSessionRef, splitterRef);
+                                        } finally {
+                                            tracked.writingUpstream = false;
+                                        }
                                     } finally {
                                         synchronized (failoverMonitor) {
                                             failoverInProgress[0] = false;
@@ -4986,6 +5040,7 @@ public class ColgramDpiBypass {
                                     }
                                     if (fresh != null) {
                                         tracked.setUpstream(fresh);
+                                        tracked.onClientTx(safeElapsedRealtime());
                                         curSession = fresh;
                                         continue;
                                     }
@@ -5021,11 +5076,17 @@ public class ColgramDpiBypass {
                             if (claimed) {
                                 ColgramTelegramWsBridge.WsSession fresh = null;
                                 try {
-                                    fresh = tryRedialFreshPrewarmSession(
-                                            client, generation, targetDc, retryProt, retryFdProt,
-                                            sendLock, extraClientBytesSent,
-                                            initCopyRef.get(), initCopyLenRef.get(),
-                                            activeSessionRef, splitterRef);
+                                    tracked.onClientTx(safeElapsedRealtime());
+                                    tracked.writingUpstream = true;
+                                    try {
+                                        fresh = tryRedialFreshPrewarmSession(
+                                                client, generation, targetDc, stepSession.forcePatchDc,
+                                                retryProt, retryFdProt, sendLock, extraClientBytesSent,
+                                                initCopyRef.get(), initCopyLenRef.get(),
+                                                activeSessionRef, splitterRef);
+                                    } finally {
+                                        tracked.writingUpstream = false;
+                                    }
                                 } finally {
                                     synchronized (failoverMonitor) {
                                         failoverInProgress[0] = false;
@@ -5035,6 +5096,7 @@ public class ColgramDpiBypass {
                                 }
                                 if (fresh != null) {
                                     tracked.setUpstream(fresh);
+                                    tracked.onClientTx(safeElapsedRealtime());
                                     curSession = fresh;
                                     continue;
                                 }
@@ -5760,13 +5822,21 @@ public class ColgramDpiBypass {
                     if (activeWs != null) {
                         c2sAttachedHandoff = true;
                         if (!appendedToReplay) {
-                            ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter = wsSplitterRef.get();
-                            if (splitter != null) {
-                                splitter.feedToSession(buffer, 0, len, activeWs);
-                            } else {
-                                activeWs.sendBinary(buffer, 0, len);
-                            }
                             ActiveSession t = trackedRef.get();
+                            if (t != null) {
+                                t.onClientTx(safeElapsedRealtime());
+                                t.writingUpstream = true;
+                            }
+                            try {
+                                ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter = wsSplitterRef.get();
+                                if (splitter != null) {
+                                    splitter.feedToSession(buffer, 0, len, activeWs);
+                                } else {
+                                    activeWs.sendBinary(buffer, 0, len);
+                                }
+                            } finally {
+                                if (t != null) t.writingUpstream = false;
+                            }
                             if (t != null) t.onClientTx(safeElapsedRealtime());
                             if (isCurrentListener(generation)) toTargetBytes.addAndGet(len);
                         }
@@ -5800,12 +5870,22 @@ public class ColgramDpiBypass {
                             c2sAttachedHandoff = true;
                             if (!appendedToReplay) {
                                 if (activeWs != null) {
-                                    ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter = wsSplitterRef.get();
-                                    if (splitter != null) {
-                                        splitter.feedToSession(buffer, 0, len, activeWs);
-                                    } else {
-                                        activeWs.sendBinary(buffer, 0, len);
+                                    ActiveSession t = trackedRef.get();
+                                    if (t != null) {
+                                        t.onClientTx(safeElapsedRealtime());
+                                        t.writingUpstream = true;
                                     }
+                                    try {
+                                        ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter = wsSplitterRef.get();
+                                        if (splitter != null) {
+                                            splitter.feedToSession(buffer, 0, len, activeWs);
+                                        } else {
+                                            activeWs.sendBinary(buffer, 0, len);
+                                        }
+                                    } finally {
+                                        if (t != null) t.writingUpstream = false;
+                                    }
+                                    if (t != null) t.onClientTx(safeElapsedRealtime());
                                     if (isCurrentListener(generation)) toTargetBytes.addAndGet(len);
                                 } else {
                                     OutputStream l3Out = activeL3.getOutputStream();
@@ -5983,11 +6063,14 @@ public class ColgramDpiBypass {
                                             destHost, destPort, sysVpn::protect, sysVpn::protect, mediaDc)
                                     : ColgramTelegramWsBridge.dial(destHost, destPort, mediaDc);
                         }
+                        int targetSignedDc = ColgramTelegramDcAddresses.signedDcIdFor(destHost);
+                        boolean forcePatch = (call == null && !"149.154.167.220".equals(destHost) && targetSignedDc != 0);
+                        if (ws != null) ws.forcePatchDc = forcePatch;
                         int hdrDc = ws == null ? 0
                                 : (validRawDc ? rawDc : (ws.rawDcId != 0 ? ws.rawDcId : (mediaDc ? -ws.dcId : ws.dcId)));
                         ColgramTelegramWsBridge.Obfuscated2FrameSplitter splitter =
                                 ws == null ? null : ColgramTelegramWsBridge.Obfuscated2FrameSplitter.create(
-                                        replayBytes, replayBytes.length, hdrDc);
+                                        replayBytes, replayBytes.length, hdrDc, forcePatch);
                         if (ws != null && splitter != null && !clientSideClosed.get()) {
                             if (startEpoch == currentNetworkEpoch()) {
                                 int wsBucket = dcBucketForSignedDc(ws.rawDcId != 0 ? ws.rawDcId : ws.dcId);
@@ -5997,7 +6080,17 @@ public class ColgramDpiBypass {
                                 onDirectLayer1Success();
                             }
                             wsSplitterRef.set(splitter);
-                            splitter.feedInitAndTailToSession(replayBytes, replayBytes.length, ws);
+                            ActiveSession t = trackedRef.get();
+                            if (t != null) {
+                                t.onClientTx(safeElapsedRealtime());
+                                t.writingUpstream = true;
+                            }
+                            try {
+                                splitter.feedInitAndTailToSession(replayBytes, replayBytes.length, ws);
+                            } finally {
+                                if (t != null) t.writingUpstream = false;
+                            }
+                            if (t != null) t.onClientTx(safeElapsedRealtime());
                             if (call == null && isCurrentListener(generation)) toTargetBytes.addAndGet(replayBytes.length);
                             synchronized (handoffLock) {
                                 wsPublished = !clientSideClosed.get();

@@ -187,7 +187,7 @@ public final class ColgramTelegramWsBridge {
     private static final long BURST_FAILURE_WINDOW_MS = 800L;
     private static final long DEPRIORITIZE_TTL_MS = 45_000L;
     private static final long DEFAULT_EDGE_DEPRIORITIZE_TTL_MS = 8_000L;
-    private static final int MAX_OUTBOUND_FRAME_BYTES = 65500;
+    static final int MAX_PACKET_BYTES = 16 * 1024 * 1024;
 
     private static ExecutorService createWsDaemonPool(int maxThreads, final String prefix,
                                                       final String errLabel, final int androidPriority) {
@@ -292,10 +292,10 @@ public final class ColgramTelegramWsBridge {
     static final int PREWARM_MEDIA_MAX_PER_BUCKET = 4;
     static final long PREWARM_TTL_MS = 38_000L;
     static final long PREWARM_REFRESH_MS = 28_000L;
-    private static final long DC135_DEAD_COOLDOWN_MS = 12_000L;
-    private static final long DC135_MAX_BACKOFF_MS = 30_000L;
-    private static final int DC135_WIFI_CONNECT_TIMEOUT_MS = 1200;
-    private static final int DC135_CELLULAR_CONNECT_TIMEOUT_MS = 1600;
+    private static final long DC135_DEAD_COOLDOWN_MS = 2_000L;
+    private static final long DC135_MAX_BACKOFF_MS = 4_000L;
+    private static final int DC135_WIFI_CONNECT_TIMEOUT_MS = 700;
+    private static final int DC135_CELLULAR_CONNECT_TIMEOUT_MS = 1000;
     private static final byte[] EMPTY_BYTES = new byte[0];
     private static final int[] PREWARM_TARGET_DCS = {2, 4, -2, -4};
     private static final ExecutorService PREWARM_POOL = createWsDaemonPool(
@@ -395,6 +395,7 @@ public final class ColgramTelegramWsBridge {
         private byte[] writeScratch = new byte[4096];
         private final AtomicBoolean closed = new AtomicBoolean(false);
         volatile boolean fromPrewarm = false;
+        volatile boolean forcePatchDc = false;
 
         WsSession(int dcId, String edgeIp, String sniHost, Socket socket,
                   InputStream in, OutputStream out) {
@@ -439,19 +440,11 @@ public final class ColgramTelegramWsBridge {
 
         private void sendBinaryInternal(byte[] buf, int off, int len, boolean flush) throws IOException {
             if (len <= 0) return;
+            if (len > MAX_PACKET_BYTES) {
+                throw new IOException("WebSocket packet exceeds MAX_PACKET_BYTES: " + len);
+            }
             synchronized (writeLock) {
-                int pos = off;
-                int remaining = len;
-                boolean first = true;
-                while (remaining > 0) {
-                    int chunk = Math.min(remaining, MAX_OUTBOUND_FRAME_BYTES);
-                    boolean last = (chunk == remaining);
-                    int headerByte = (last ? 0x80 : 0x00) | (first ? 0x02 : 0x00);
-                    writeFrameLocked(headerByte, buf, pos, chunk, flush && last);
-                    first = false;
-                    pos += chunk;
-                    remaining -= chunk;
-                }
+                writeFrameLocked(0x82, buf, off, len, flush);
             }
         }
 
@@ -1226,8 +1219,8 @@ public final class ColgramTelegramWsBridge {
                 fastMode = FRAG_SPOOF_SNI_PLAIN;
             }
             int fastTimeout = cellularNetwork ? DC135_CELLULAR_CONNECT_TIMEOUT_MS : DC135_WIFI_CONNECT_TIMEOUT_MS;
-            List<EdgeEndpoint> top2 = fastCands.size() > 2 ? fastCands.subList(0, 2) : fastCands;
-            DialedTcp tcp = connectEdgeRace(top2, protector, fdProtector, fastMode, fastTimeout);
+            List<EdgeEndpoint> topCands = fastCands.subList(0, Math.min(4, fastCands.size()));
+            DialedTcp tcp = connectEdgeRace(topCands, protector, fdProtector, fastMode, fastTimeout);
             if (tcp != null) {
                 HandshakeResult res = tryHandshake(tcp, normDc, media, fastMode, forPrewarm);
                 if (res.session != null) {
@@ -1242,9 +1235,9 @@ public final class ColgramTelegramWsBridge {
                     int[] fallbacks = fallbackFragModes(fastMode, canNative);
                     int tried = 0;
                     for (int altMode : fallbacks) {
-                        if (tried >= 2 || System.currentTimeMillis() + 600L >= deadlineMs) break;
+                        if (tried >= 1 || System.currentTimeMillis() + 600L >= deadlineMs) break;
                         tried++;
-                        DialedTcp altTcp = connectEdgeRace(top2, protector, fdProtector, altMode, fastTimeout);
+                        DialedTcp altTcp = connectEdgeRace(topCands, protector, fdProtector, altMode, fastTimeout);
                         if (altTcp == null) break;
                         HandshakeResult altRes = tryHandshake(altTcp, normDc, media, altMode, forPrewarm);
                         if (altRes.session != null) {
@@ -1864,7 +1857,6 @@ public final class ColgramTelegramWsBridge {
      * verbatim.
      */
     public static final class Obfuscated2FrameSplitter {
-        private static final int MAX_PACKET_BYTES = 16 * 1024 * 1024;
         private static final int RESET_BUFFER_THRESHOLD = 65536;
 
         private final int proto;
@@ -1903,10 +1895,16 @@ public final class ColgramTelegramWsBridge {
         }
 
         public static Obfuscated2FrameSplitter create(byte[] initBuf, int initLen, int dcId) {
-            return initAndPatch(initBuf, initLen, dcId);
+            return create(initBuf, initLen, dcId, false);
         }
 
-        private static Obfuscated2FrameSplitter initAndPatch(byte[] data, int length, int dcId) {
+        public static Obfuscated2FrameSplitter create(byte[] initBuf, int initLen, int dcId,
+                                                      boolean forcePatchDc) {
+            return initAndPatch(initBuf, initLen, dcId, forcePatchDc);
+        }
+
+        private static Obfuscated2FrameSplitter initAndPatch(byte[] data, int length, int dcId,
+                                                             boolean forcePatchDc) {
             if (data == null || length < 64 || normalizeDcId(dcId) <= 0) return null;
             try {
                 byte[] key = new byte[32];
@@ -1926,7 +1924,7 @@ public final class ColgramTelegramWsBridge {
                 int existingRawDc = (short) (((data[60] ^ ks[60]) & 0xff)
                         | (((data[61] ^ ks[61]) & 0xff) << 8));
                 int effectiveRawDc = existingRawDc;
-                if (normalizeDcId(existingRawDc) <= 0) {
+                if ((forcePatchDc && normalizeDcId(dcId) > 0) || normalizeDcId(existingRawDc) <= 0) {
                     data[60] = (byte) ((dcId & 0xff) ^ (ks[60] & 0xff));
                     data[61] = (byte) (((dcId >> 8) & 0xff) ^ (ks[61] & 0xff));
                     effectiveRawDc = (short) dcId;
@@ -2137,7 +2135,7 @@ public final class ColgramTelegramWsBridge {
      * Existing valid positive or media DC ids (`-2`, `-4`, `10002`, `-10004`) are preserved verbatim.
      */
     public static boolean patchObfuscated2Header(byte[] data, int length, int dcId) {
-        return Obfuscated2FrameSplitter.initAndPatch(data, length, dcId) != null;
+        return Obfuscated2FrameSplitter.initAndPatch(data, length, dcId, false) != null;
     }
 
     private static void tuneConnectedSocket(Socket s) {
@@ -2555,7 +2553,6 @@ public final class ColgramTelegramWsBridge {
                 && !"149.154.167.99".equals(lastWorking.ip)
                 && !skipped.contains(lastWorking.key())
                 && isDcHostMatch(lastWorking.sniHost, normDc)
-                && (!media || lastWorking.sniHost.toLowerCase(Locale.US).contains("-1."))
                 && !(DEFAULT_EDGE_IP.equals(lastWorking.ip) && !isSharedEdgeSniForDc(lastWorking.sniHost, normDc))) {
             ordered.put(lastWorking.key(), lastWorking);
         }

@@ -48,6 +48,8 @@ public final class ColgramSpamGuard {
 
     private static final Pattern INVISIBLE_RE = Pattern.compile(
             "[\\u200b\\u200e\\u200f\\u2060-\\u2064\\u2066-\\u206f\\ufeff\\u180e\\u3164\\u115f\\u1160\\u2800]");
+    private static final Pattern STRICT_GHOST_RE = Pattern.compile(
+            "[\\u200b\\u2060-\\u2064\\u180e\\u3164\\u115f\\u1160]");
 
     private static final long WINDOW_MS = 10 * 60 * 1000L;
 
@@ -529,11 +531,11 @@ public final class ColgramSpamGuard {
                     Collections.singletonList("hidden_mention_without_username_or_reply"),
                     combined.flags, combined.normalized);
         }
-        if (viaBot) {
+        if (viaBot && isPing) {
             return new SpamReport(100, true, true, true, false, false, "sent_via_inline_bot",
                     Collections.singletonList("inline_bot"), combined.flags, combined.normalized);
         }
-        if (hasInvisibleGhostChars(text)) {
+        if (STRICT_GHOST_RE.matcher(text).find() || (isPing && hasInvisibleGhostChars(text))) {
             return new SpamReport(100, true, true, true, false, false, "invisible_ghost_ping",
                     Collections.singletonList("zero_width_ghost_chars"), combined.flags, combined.normalized);
         }
@@ -641,11 +643,16 @@ public final class ColgramSpamGuard {
         if (hasSellerAsk) { score += 55; factors.add("seller_ask(+55)"); }
 
         boolean commercialCore = topicPoints > 0 || hasSaleVerb || hasSellerAsk || adPromoPhrase || explicitAd;
+        boolean adIntent = explicitAd || adPromoPhrase || hasSaleVerb || hasSellerAsk
+                || (hasDmCta && commercialCore) || hasEmojiRouting || hasTextRouting
+                || hasPrivateLink || hasInlineUrlButtons || strongTopic || topics.size() >= 2;
+        boolean formatSignalEligible = adIntent || isPing || !foreignHandles.isEmpty()
+                || !combined.flags.isEmpty() || priceCount > 0;
         if (hasEmojiRouting) { score += 30; factors.add("emoji_contact_routing(+30)"); }
         else if (hasTextRouting) { score += 25; factors.add("text_seller_routing(+25)"); }
         if (hasDmCta && commercialCore) { score += 20; factors.add("dm_call_to_action(+20)"); }
 
-        if (hasLinks) {
+        if (hasLinks && (hasPrivateLink || adIntent || isPing || !foreignHandles.isEmpty() || hasInlineUrlButtons)) {
             int lp = hasPrivateLink ? 25 : 10;
             score += lp;
             factors.add("promo_links(+" + lp + ")");
@@ -692,31 +699,32 @@ public final class ColgramSpamGuard {
             if (BANNER_RE.matcher(line).find()) banner++;
             if (CATALOG_BULLET_RE.matcher(line).find()) bullets++;
         }
-        if (banner > 0) {
+        if (banner > 0 && formatSignalEligible) {
             int bp = banner == 1 ? 15 : 25;
             score += bp;
             factors.add("banner_emojis(+" + bp + ")");
         }
-        if (bullets > 0) {
+        if (bullets > 0 && formatSignalEligible) {
             int blp = bullets == 1 ? 10 : 25;
             score += blp;
             factors.add("bullet_points(+" + blp + ")");
         }
-        if (lines.size() >= 4) { score += 15; factors.add("multiblock_layout(+15)"); }
+        if (lines.size() >= 4 && formatSignalEligible) { score += 15; factors.add("multiblock_layout(+15)"); }
         if (hasSaleVerb && ASSET_SPEC_RE.matcher(prose).find()) {
             score += 15;
             factors.add("asset_specifiers(+15)");
         }
-        if (customEmojiCount >= 3) {
+        if (customEmojiCount >= 3 && (adIntent || (isPing && (commercialCore || !foreignHandles.isEmpty())))) {
             score += 20;
             factors.add("custom_emoji_wall_" + customEmojiCount + "(+20)");
         }
-        if (hasUrlEntity && (commercialCore || hasDmCta || customEmojiCount >= 2 || text.length() > 220)) {
+        if (hasUrlEntity && (adIntent || (isPing && (commercialCore || (hasDmCta && commercialCore) || customEmojiCount >= 2 || text.length() > 220)))) {
             score += 20;
             factors.add("embedded_url_entity(+20)");
         }
-        if (text.length() > 220 && (commercialCore || hasLinks || hasUrlEntity || !foreignHandles.isEmpty()
-                || customEmojiCount >= 3 || priceCount > 0 || catalogueRows >= 2 || bullets >= 2)) {
+        if (text.length() > 220 && (adIntent || (isPing && (commercialCore || hasLinks || hasUrlEntity
+                || !foreignHandles.isEmpty() || customEmojiCount >= 3 || priceCount > 0
+                || catalogueRows >= 2 || bullets >= 2)))) {
             score += 40;
             factors.add("long_ad_wall(+40)");
         }

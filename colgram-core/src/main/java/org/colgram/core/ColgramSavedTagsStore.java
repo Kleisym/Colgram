@@ -9,6 +9,7 @@ import android.database.sqlite.SQLiteOpenHelper;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -18,14 +19,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Standalone SQLite store (colgram_saved_tags.db) for local emoji tags in Saved Messages.
- * Maintains an O(1) per-account in-memory cache so ChatMessageCell rendering never hits disk,
- * and falls back seamlessly to pure-JVM in-memory storage when Context is absent in unit tests.
+ * Standalone SQLite store (colgram_saved_tags.db) for local Saved Messages tags.
+ * Supports both Unicode emojis and custom emojis ("doc:" + documentId), topic_id,
+ * and explicit user-defined tag labels without auto-seeding default labels.
  */
 public final class ColgramSavedTagsStore {
 
     private static final String DB_NAME = "colgram_saved_tags.db";
-    private static final int DB_VERSION = 1;
+    private static final int DB_VERSION = 2;
+    private static final int MAX_UNICODE_KEY_LEN = 64;
+    private static final int MAX_DOC_KEY_LEN = 40;
 
     public static final class TagPreset {
         public final String emoji;
@@ -39,12 +42,18 @@ public final class ColgramSavedTagsStore {
 
     public static final class TagEntry {
         public final int msgId;
+        public final long topicId;
         public final String emoji;
         public final String label;
         public final long updatedAt;
 
         public TagEntry(int msgId, String emoji, String label, long updatedAt) {
+            this(msgId, 0L, emoji, label, updatedAt);
+        }
+
+        public TagEntry(int msgId, long topicId, String emoji, String label, long updatedAt) {
             this.msgId = msgId;
+            this.topicId = topicId;
             this.emoji = emoji;
             this.label = label == null ? "" : label;
             this.updatedAt = updatedAt;
@@ -70,7 +79,6 @@ public final class ColgramSavedTagsStore {
     }
 
     public static final List<TagPreset> DEFAULT_PRESETS;
-    private static final Map<String, String> DEFAULT_LABELS = new LinkedHashMap<>();
 
     static {
         List<TagPreset> list = new ArrayList<>();
@@ -99,9 +107,6 @@ public final class ColgramSavedTagsStore {
         list.add(new TagPreset("\uD83D\uDD12", "Сейф"));
         list.add(new TagPreset("\u26A1", "Быстро"));
         DEFAULT_PRESETS = Collections.unmodifiableList(list);
-        for (TagPreset p : list) {
-            DEFAULT_LABELS.put(p.emoji, p.label);
-        }
     }
 
     private static final ExecutorService DB_EXEC = Executors.newSingleThreadExecutor(r -> {
@@ -146,6 +151,7 @@ public final class ColgramSavedTagsStore {
             db.execSQL("CREATE TABLE IF NOT EXISTS saved_tags ("
                     + "account INTEGER NOT NULL,"
                     + "msg_id INTEGER NOT NULL,"
+                    + "topic_id INTEGER NOT NULL DEFAULT 0,"
                     + "emoji TEXT NOT NULL,"
                     + "label TEXT NOT NULL DEFAULT '',"
                     + "updated_at INTEGER NOT NULL,"
@@ -153,10 +159,23 @@ public final class ColgramSavedTagsStore {
                     + ")");
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_saved_tags_acc_emoji "
                     + "ON saved_tags(account, emoji, msg_id DESC)");
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_saved_tags_acc_topic_emoji "
+                    + "ON saved_tags(account, topic_id, emoji, msg_id DESC)");
+            db.execSQL("CREATE TABLE IF NOT EXISTS saved_tag_labels ("
+                    + "account INTEGER NOT NULL,"
+                    + "emoji_key TEXT NOT NULL,"
+                    + "label TEXT NOT NULL,"
+                    + "PRIMARY KEY(account, emoji_key)"
+                    + ")");
         }
 
         @Override
         public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+            if (oldVersion < 2) {
+                try {
+                    db.execSQL("ALTER TABLE saved_tags ADD COLUMN topic_id INTEGER NOT NULL DEFAULT 0");
+                } catch (Throwable ignored) {}
+            }
             onCreate(db);
         }
     }
@@ -184,19 +203,34 @@ public final class ColgramSavedTagsStore {
 
     private static void loadAllFromDb(DbHelper helper) {
         if (helper == null) return;
-        Cursor c = null;
+        Cursor labelsCursor = null;
+        Cursor tagsCursor = null;
         try {
             SQLiteDatabase db = helper.getReadableDatabase();
-            c = db.rawQuery("SELECT account, msg_id, emoji, label, updated_at FROM saved_tags ORDER BY updated_at ASC", null);
             Set<Integer> accounts = ConcurrentHashMap.newKeySet();
-            while (c != null && c.moveToNext()) {
-                int acc = c.getInt(0);
-                int msgId = c.getInt(1);
-                String emoji = c.getString(2);
-                String label = c.getString(3);
-                long updatedAt = c.getLong(4);
-                if (msgId > 0 && emoji != null && !emoji.isEmpty()) {
-                    putInCache(acc, msgId, emoji, label, updatedAt);
+            labelsCursor = db.rawQuery("SELECT account, emoji_key, label FROM saved_tag_labels", null);
+            while (labelsCursor != null && labelsCursor.moveToNext()) {
+                int acc = labelsCursor.getInt(0);
+                String key = normalizeEmojiKey(labelsCursor.getString(1));
+                String lbl = labelsCursor.getString(2);
+                String trimmed = lbl == null ? "" : lbl.trim();
+                if (!key.isEmpty() && !trimmed.isEmpty()) {
+                    CUSTOM_LABELS.computeIfAbsent(acc, k -> new ConcurrentHashMap<>()).putIfAbsent(key, trimmed);
+                    accounts.add(acc);
+                }
+            }
+            tagsCursor = db.rawQuery(
+                    "SELECT account, msg_id, topic_id, emoji, label, updated_at FROM saved_tags ORDER BY updated_at ASC",
+                    null);
+            while (tagsCursor != null && tagsCursor.moveToNext()) {
+                int acc = tagsCursor.getInt(0);
+                int msgId = tagsCursor.getInt(1);
+                long topicId = tagsCursor.getLong(2);
+                String emoji = normalizeEmojiKey(tagsCursor.getString(3));
+                long updatedAt = tagsCursor.getLong(5);
+                if (msgId > 0 && !emoji.isEmpty()) {
+                    // Preserve only explicit user-renamed labels stored in saved_tag_labels; never resurrect v1 preset labels.
+                    putInCacheIfAbsent(acc, msgId, topicId, emoji, getTagLabel(acc, emoji), updatedAt);
                     accounts.add(acc);
                 }
             }
@@ -205,8 +239,11 @@ public final class ColgramSavedTagsStore {
             }
         } catch (Throwable ignored) {
         } finally {
-            if (c != null) {
-                try { c.close(); } catch (Throwable ignored) {}
+            if (labelsCursor != null) {
+                try { labelsCursor.close(); } catch (Throwable ignored) {}
+            }
+            if (tagsCursor != null) {
+                try { tagsCursor.close(); } catch (Throwable ignored) {}
             }
         }
     }
@@ -235,13 +272,35 @@ public final class ColgramSavedTagsStore {
         return CACHE.computeIfAbsent(account, k -> new ConcurrentHashMap<>());
     }
 
-    private static String normalizeEmoji(String raw) {
+    public static String normalizeEmojiKey(String raw) {
         if (raw == null) return "";
         String t = raw.trim();
-        if (t.length() > 16) {
-            t = t.substring(0, 16);
+        if (t.isEmpty()) return "";
+        if (t.startsWith("doc:")) {
+            String rest = t.substring(4);
+            if (rest.isEmpty() || rest.length() > MAX_DOC_KEY_LEN - 4) {
+                return "";
+            }
+            for (int i = 0; i < rest.length(); i++) {
+                char c = rest.charAt(i);
+                if (!(i == 0 && c == '-') && (c < '0' || c > '9')) {
+                    return "";
+                }
+            }
+            return t;
+        }
+        if (t.length() > MAX_UNICODE_KEY_LEN) {
+            int cut = MAX_UNICODE_KEY_LEN;
+            if (Character.isHighSurrogate(t.charAt(cut - 1))) {
+                cut--;
+            }
+            t = t.substring(0, cut);
         }
         return t;
+    }
+
+    private static String normalizeEmoji(String raw) {
+        return normalizeEmojiKey(raw);
     }
 
     private static String resolveLabel(int account, String emoji, String explicitLabel) {
@@ -251,13 +310,35 @@ public final class ColgramSavedTagsStore {
         ConcurrentHashMap<String, String> custom = CUSTOM_LABELS.get(account);
         if (custom != null) {
             String prev = custom.get(emoji);
-            if (prev != null && !prev.isEmpty()) return prev;
+            if (prev != null && !prev.isEmpty()) {
+                return prev;
+            }
         }
-        String def = DEFAULT_LABELS.get(emoji);
-        return def != null ? def : "";
+        return "";
     }
 
-    private static void putInCache(int account, int msgId, String emoji, String label, long updatedAt) {
+    private static void putInCacheIfAbsent(int account, int msgId, long topicId, String emoji, String label, long updatedAt) {
+        ConcurrentHashMap<Integer, List<TagEntry>> map = accountMap(account);
+        synchronized (map) {
+            List<TagEntry> current = map.get(msgId);
+            if (current != null) {
+                for (TagEntry e : current) {
+                    if (e.emoji.equals(emoji)) {
+                        return;
+                    }
+                }
+            }
+            List<TagEntry> next = new ArrayList<>(current == null ? 2 : current.size() + 1);
+            if (current != null) {
+                next.addAll(current);
+            }
+            String resolvedLabel = resolveLabel(account, emoji, label);
+            next.add(new TagEntry(msgId, topicId, emoji, resolvedLabel, updatedAt));
+            map.put(msgId, Collections.unmodifiableList(next));
+        }
+    }
+
+    private static void putInCache(int account, int msgId, long topicId, String emoji, String label, long updatedAt) {
         ConcurrentHashMap<Integer, List<TagEntry>> map = accountMap(account);
         synchronized (map) {
             List<TagEntry> current = map.get(msgId);
@@ -270,12 +351,16 @@ public final class ColgramSavedTagsStore {
                 }
             }
             String resolvedLabel = resolveLabel(account, emoji, label);
-            if (!resolvedLabel.isEmpty()) {
+            if (explicitNotEmpty(label)) {
                 CUSTOM_LABELS.computeIfAbsent(account, k -> new ConcurrentHashMap<>()).put(emoji, resolvedLabel);
             }
-            next.add(new TagEntry(msgId, emoji, resolvedLabel, updatedAt));
+            next.add(new TagEntry(msgId, topicId, emoji, resolvedLabel, updatedAt));
             map.put(msgId, Collections.unmodifiableList(next));
         }
+    }
+
+    private static boolean explicitNotEmpty(String s) {
+        return s != null && !s.trim().isEmpty();
     }
 
     private static boolean removeFromCache(int account, int msgId, String emoji) {
@@ -316,6 +401,14 @@ public final class ColgramSavedTagsStore {
         return out;
     }
 
+    public static List<TagEntry> getEntries(int account, int msgId) {
+        if (msgId <= 0) return Collections.emptyList();
+        ConcurrentHashMap<Integer, List<TagEntry>> map = CACHE.get(account);
+        if (map == null) return Collections.emptyList();
+        List<TagEntry> entries = map.get(msgId);
+        return entries == null ? Collections.emptyList() : entries;
+    }
+
     public static boolean hasTag(int account, int msgId, String emoji) {
         String norm = normalizeEmoji(emoji);
         if (msgId <= 0 || norm.isEmpty()) return false;
@@ -327,6 +420,143 @@ public final class ColgramSavedTagsStore {
             if (e.emoji.equals(norm)) return true;
         }
         return false;
+    }
+
+    public static void setMessageTags(Context ctx, int account, int msgId, long topicId, List<String> keys) {
+        if (msgId <= 0) return;
+        ensureDbSync(ctx);
+        Set<String> dedup = new LinkedHashSet<>();
+        if (keys != null) {
+            for (String raw : keys) {
+                String k = normalizeEmojiKey(raw);
+                if (!k.isEmpty()) {
+                    dedup.add(k);
+                }
+            }
+        }
+        long now = System.currentTimeMillis();
+        ConcurrentHashMap<Integer, List<TagEntry>> map = accountMap(account);
+        final List<TagEntry> newEntries = new ArrayList<>(dedup.size());
+        synchronized (map) {
+            List<TagEntry> existing = map.get(msgId);
+            for (String key : dedup) {
+                long ts = now;
+                if (existing != null) {
+                    for (TagEntry prev : existing) {
+                        if (prev.emoji.equals(key)) {
+                            ts = prev.updatedAt;
+                            break;
+                        }
+                    }
+                }
+                newEntries.add(new TagEntry(msgId, topicId, key, getTagLabel(account, key), ts));
+            }
+            if (newEntries.isEmpty()) {
+                map.remove(msgId);
+            } else {
+                map.put(msgId, Collections.unmodifiableList(newEntries));
+            }
+        }
+        notifyListeners(account);
+        final DbHelper helper = dbHelper;
+        if (helper != null) {
+            final List<TagEntry> snapshot = new ArrayList<>(newEntries);
+            DB_EXEC.execute(() -> {
+                SQLiteDatabase db = null;
+                try {
+                    db = helper.getWritableDatabase();
+                    db.beginTransaction();
+                    db.delete("saved_tags", "account=? AND msg_id=?",
+                            new String[]{String.valueOf(account), String.valueOf(msgId)});
+                    for (TagEntry e : snapshot) {
+                        ContentValues cv = new ContentValues();
+                        cv.put("account", account);
+                        cv.put("msg_id", msgId);
+                        cv.put("topic_id", e.topicId);
+                        cv.put("emoji", e.emoji);
+                        cv.put("label", e.label);
+                        cv.put("updated_at", e.updatedAt);
+                        db.insertWithOnConflict("saved_tags", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+                    }
+                    db.setTransactionSuccessful();
+                } catch (Throwable ignored) {
+                } finally {
+                    if (db != null) {
+                        try {
+                            db.endTransaction();
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            });
+        }
+    }
+
+    public static void setTagLabel(Context ctx, int account, String key, String label) {
+        String norm = normalizeEmojiKey(key);
+        if (norm.isEmpty()) return;
+        ensureDbSync(ctx);
+        String trimmed = label == null ? "" : label.trim();
+        ConcurrentHashMap<String, String> labelsMap =
+                CUSTOM_LABELS.computeIfAbsent(account, k -> new ConcurrentHashMap<>());
+        if (trimmed.isEmpty()) {
+            labelsMap.remove(norm);
+        } else {
+            labelsMap.put(norm, trimmed);
+        }
+        ConcurrentHashMap<Integer, List<TagEntry>> map = CACHE.get(account);
+        if (map != null) {
+            synchronized (map) {
+                for (Map.Entry<Integer, List<TagEntry>> entry : map.entrySet()) {
+                    List<TagEntry> list = entry.getValue();
+                    if (list == null || list.isEmpty()) continue;
+                    boolean changed = false;
+                    List<TagEntry> updated = new ArrayList<>(list.size());
+                    for (TagEntry t : list) {
+                        if (t.emoji.equals(norm) && !trimmed.equals(t.label)) {
+                            updated.add(new TagEntry(t.msgId, t.topicId, t.emoji, trimmed, t.updatedAt));
+                            changed = true;
+                        } else {
+                            updated.add(t);
+                        }
+                    }
+                    if (changed) {
+                        entry.setValue(Collections.unmodifiableList(updated));
+                    }
+                }
+            }
+        }
+        notifyListeners(account);
+        final DbHelper helper = dbHelper;
+        if (helper != null) {
+            DB_EXEC.execute(() -> {
+                try {
+                    SQLiteDatabase db = helper.getWritableDatabase();
+                    if (trimmed.isEmpty()) {
+                        db.delete("saved_tag_labels", "account=? AND emoji_key=?",
+                                new String[]{String.valueOf(account), norm});
+                    } else {
+                        ContentValues lv = new ContentValues();
+                        lv.put("account", account);
+                        lv.put("emoji_key", norm);
+                        lv.put("label", trimmed);
+                        db.insertWithOnConflict("saved_tag_labels", null, lv, SQLiteDatabase.CONFLICT_REPLACE);
+                    }
+                    ContentValues tv = new ContentValues();
+                    tv.put("label", trimmed);
+                    db.update("saved_tags", tv, "account=? AND emoji=?",
+                            new String[]{String.valueOf(account), norm});
+                } catch (Throwable ignored) {}
+            });
+        }
+    }
+
+    public static String getTagLabel(int account, String key) {
+        String norm = normalizeEmojiKey(key);
+        if (norm.isEmpty()) return "";
+        ConcurrentHashMap<String, String> custom = CUSTOM_LABELS.get(account);
+        if (custom == null) return "";
+        String lbl = custom.get(norm);
+        return lbl == null ? "" : lbl;
     }
 
     public static boolean toggleTag(Context ctx, int account, int msgId, String emoji, String label) {
@@ -342,25 +572,38 @@ public final class ColgramSavedTagsStore {
     }
 
     public static void addTag(Context ctx, int account, int msgId, String emoji, String label) {
+        addTag(ctx, account, msgId, 0L, emoji, label);
+    }
+
+    public static void addTag(Context ctx, int account, int msgId, long topicId, String emoji, String label) {
         String norm = normalizeEmoji(emoji);
         if (msgId <= 0 || norm.isEmpty()) return;
         ensureDbSync(ctx);
         long now = System.currentTimeMillis();
         String resolved = resolveLabel(account, norm, label);
-        putInCache(account, msgId, norm, resolved, now);
+        putInCache(account, msgId, topicId, norm, resolved, now);
         notifyListeners(account);
         final DbHelper helper = dbHelper;
         if (helper != null) {
+            final boolean persistLabel = explicitNotEmpty(label);
             DB_EXEC.execute(() -> {
                 try {
                     SQLiteDatabase db = helper.getWritableDatabase();
                     ContentValues cv = new ContentValues();
                     cv.put("account", account);
                     cv.put("msg_id", msgId);
+                    cv.put("topic_id", topicId);
                     cv.put("emoji", norm);
                     cv.put("label", resolved);
                     cv.put("updated_at", now);
                     db.insertWithOnConflict("saved_tags", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+                    if (persistLabel) {
+                        ContentValues lv = new ContentValues();
+                        lv.put("account", account);
+                        lv.put("emoji_key", norm);
+                        lv.put("label", resolved);
+                        db.insertWithOnConflict("saved_tag_labels", null, lv, SQLiteDatabase.CONFLICT_REPLACE);
+                    }
                 } catch (Throwable ignored) {}
             });
         }
@@ -388,22 +631,48 @@ public final class ColgramSavedTagsStore {
 
     public static void clearMessageTags(Context ctx, int account, int msgId) {
         if (msgId <= 0) return;
+        pruneDeletedMessages(ctx, account, Collections.singletonList(msgId));
+    }
+
+    public static void pruneDeletedMessages(Context ctx, int account, List<Integer> msgIds) {
+        if (msgIds == null || msgIds.isEmpty()) return;
         ensureDbSync(ctx);
+        List<Integer> validIds = new ArrayList<>(msgIds.size());
         ConcurrentHashMap<Integer, List<TagEntry>> map = CACHE.get(account);
-        if (map != null) {
-            synchronized (map) {
-                map.remove(msgId);
+        boolean changed = false;
+        for (Integer id : msgIds) {
+            if (id != null && id > 0) {
+                validIds.add(id);
+                if (map != null && map.remove(id) != null) {
+                    changed = true;
+                }
             }
         }
-        notifyListeners(account);
+        if (validIds.isEmpty()) return;
+        if (changed) {
+            notifyListeners(account);
+        }
         final DbHelper helper = dbHelper;
         if (helper != null) {
             DB_EXEC.execute(() -> {
+                SQLiteDatabase db = null;
                 try {
-                    SQLiteDatabase db = helper.getWritableDatabase();
-                    db.delete("saved_tags", "account=? AND msg_id=?",
-                            new String[]{String.valueOf(account), String.valueOf(msgId)});
-                } catch (Throwable ignored) {}
+                    db = helper.getWritableDatabase();
+                    db.beginTransaction();
+                    String accStr = String.valueOf(account);
+                    for (int id : validIds) {
+                        db.delete("saved_tags", "account=? AND msg_id=?",
+                                new String[]{accStr, String.valueOf(id)});
+                    }
+                    db.setTransactionSuccessful();
+                } catch (Throwable ignored) {
+                } finally {
+                    if (db != null) {
+                        try {
+                            db.endTransaction();
+                        } catch (Throwable ignored) {}
+                    }
+                }
             });
         }
     }
@@ -414,12 +683,14 @@ public final class ColgramSavedTagsStore {
     }
 
     public static String getLabelForEmoji(int account, String emoji) {
-        String norm = normalizeEmoji(emoji);
-        if (norm.isEmpty()) return "";
-        return resolveLabel(account, norm, null);
+        return getTagLabel(account, emoji);
     }
 
     public static List<TagCount> getTagCounts(int account) {
+        return getTagCounts(account, 0L);
+    }
+
+    public static List<TagCount> getTagCounts(int account, long topicId) {
         ConcurrentHashMap<Integer, List<TagEntry>> map = CACHE.get(account);
         if (map == null || map.isEmpty()) return Collections.emptyList();
         Map<String, int[]> counts = new LinkedHashMap<>();
@@ -428,19 +699,26 @@ public final class ColgramSavedTagsStore {
         synchronized (map) {
             for (List<TagEntry> list : map.values()) {
                 for (TagEntry e : list) {
+                    if (topicId != 0L && e.topicId != topicId) {
+                        continue;
+                    }
                     int[] c = counts.get(e.emoji);
                     if (c == null) {
                         counts.put(e.emoji, new int[]{1});
                         latest.put(e.emoji, e.updatedAt);
-                        labels.put(e.emoji, e.label);
+                        String customLbl = getTagLabel(account, e.emoji);
+                        labels.put(e.emoji, !customLbl.isEmpty() ? customLbl : e.label);
                     } else {
                         c[0]++;
                         Long prevTs = latest.get(e.emoji);
                         if (prevTs == null || e.updatedAt > prevTs) {
                             latest.put(e.emoji, e.updatedAt);
-                            if (!e.label.isEmpty()) {
-                                labels.put(e.emoji, e.label);
-                            }
+                        }
+                        String customLbl = getTagLabel(account, e.emoji);
+                        if (!customLbl.isEmpty()) {
+                            labels.put(e.emoji, customLbl);
+                        } else if (!e.label.isEmpty() && labels.get(e.emoji).isEmpty()) {
+                            labels.put(e.emoji, e.label);
                         }
                     }
                 }
@@ -460,22 +738,25 @@ public final class ColgramSavedTagsStore {
     }
 
     public static List<Integer> getTaggedMessageIds(int account, String emoji) {
+        return getTaggedMessageIds(account, 0L, emoji);
+    }
+
+    public static List<Integer> getTaggedMessageIds(int account, long topicId, String emoji) {
         String norm = normalizeEmoji(emoji);
         ConcurrentHashMap<Integer, List<TagEntry>> map = CACHE.get(account);
         if (map == null || map.isEmpty()) return Collections.emptyList();
         List<Integer> ids = new ArrayList<>();
         synchronized (map) {
             for (Map.Entry<Integer, List<TagEntry>> entry : map.entrySet()) {
-                if (norm.isEmpty()) {
-                    if (!entry.getValue().isEmpty()) {
-                        ids.add(entry.getKey());
+                List<TagEntry> list = entry.getValue();
+                if (list == null || list.isEmpty()) continue;
+                for (TagEntry t : list) {
+                    if (topicId != 0L && t.topicId != topicId) {
+                        continue;
                     }
-                } else {
-                    for (TagEntry t : entry.getValue()) {
-                        if (t.emoji.equals(norm)) {
-                            ids.add(entry.getKey());
-                            break;
-                        }
+                    if (norm.isEmpty() || t.emoji.equals(norm)) {
+                        ids.add(entry.getKey());
+                        break;
                     }
                 }
             }
@@ -499,9 +780,12 @@ public final class ColgramSavedTagsStore {
                     for (TagEntry e : entries) {
                         if (!first) sb.append(',');
                         first = false;
+                        String customLbl = getTagLabel(account, e.emoji);
+                        String outLabel = !customLbl.isEmpty() ? customLbl : e.label;
                         sb.append("{\"msgId\":").append(e.msgId)
+                                .append(",\"topicId\":").append(e.topicId)
                                 .append(",\"emoji\":\"").append(escapeJson(e.emoji))
-                                .append("\",\"label\":\"").append(escapeJson(e.label))
+                                .append("\",\"label\":\"").append(escapeJson(outLabel))
                                 .append("\",\"updatedAt\":").append(e.updatedAt).append('}');
                     }
                 }
@@ -524,11 +808,14 @@ public final class ColgramSavedTagsStore {
             if (objEnd < 0) break;
             String obj = json.substring(objStart + 1, objEnd);
             int msgId = parseJsonInt(obj, "msgId", 0);
+            long topicId = parseJsonLong(obj, "topicId", 0L);
             String emoji = normalizeEmoji(parseJsonString(obj, "emoji"));
             String label = parseJsonString(obj, "label");
             if (msgId > 0 && !emoji.isEmpty()) {
-                addTag(ctx, account, msgId, emoji, label);
+                addTag(ctx, account, msgId, topicId, emoji, label);
                 imported++;
+            } else if (!emoji.isEmpty() && explicitNotEmpty(label)) {
+                setTagLabel(ctx, account, emoji, label);
             }
             pos = objEnd + 1;
         }
@@ -590,6 +877,14 @@ public final class ColgramSavedTagsStore {
     }
 
     private static int parseJsonInt(String obj, String key, int defVal) {
+        long val = parseJsonLong(obj, key, defVal);
+        if (val < Integer.MIN_VALUE || val > Integer.MAX_VALUE) {
+            return defVal;
+        }
+        return (int) val;
+    }
+
+    private static long parseJsonLong(String obj, String key, long defVal) {
         String pat = "\"" + key + "\"";
         int idx = obj.indexOf(pat);
         if (idx < 0) return defVal;
@@ -600,9 +895,9 @@ public final class ColgramSavedTagsStore {
         int start = i;
         if (i < obj.length() && obj.charAt(i) == '-') i++;
         while (i < obj.length() && Character.isDigit(obj.charAt(i))) i++;
-        if (i == start) return defVal;
+        if (i == start || (i == start + 1 && obj.charAt(start) == '-')) return defVal;
         try {
-            return Integer.parseInt(obj.substring(start, i));
+            return Long.parseLong(obj.substring(start, i));
         } catch (Throwable t) {
             return defVal;
         }

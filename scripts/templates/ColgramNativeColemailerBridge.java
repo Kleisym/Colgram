@@ -925,9 +925,22 @@ public final class ColgramNativeColemailerBridge {
                 return true;
             }
             if (!ColgramConfig.isSpamGuardEnabled()) return false;
+            if (msg.post) return false;
 
             boolean isGroup = dialogId < 0L;
+            if (isGroup) {
+                MessagesController mc = MessagesController.getInstance(account);
+                TLRPC.Chat chat = mc != null ? mc.getChat(-dialogId) : null;
+                if (chat != null && ChatObject.isChannelAndNotMegaGroup(chat)) {
+                    return false;
+                }
+            }
             if (!isGroup && !msg.mentioned) return false;
+
+            int nowSec = (int) (System.currentTimeMillis() / 1000L);
+            if (msg.date > 0 && (nowSec - msg.date) > 86400 && !msg.mentioned) {
+                return false;
+            }
 
             String text = msg.message == null ? "" : msg.message;
             List<ColgramSpamGuard.MentionTarget> targets = extractMentionTargets(msg);
@@ -935,6 +948,7 @@ public final class ColgramNativeColemailerBridge {
             List<String> own = ownLabels(account);
             String pingKind = classifyMessagePing(account, msg, selfId, ownUname, own, targets);
             boolean isPing = msg.mentioned || pingKind != null;
+            if (!isPing) return false;
             boolean hiddenEntity = ColgramSpamGuard.hasHiddenOrMassMentionEntity(text, targets);
             boolean viaBot = msg.via_bot_id != 0;
             boolean visualMedia = isVisualMedia(msg);
@@ -1337,6 +1351,7 @@ public final class ColgramNativeColemailerBridge {
 
         // 1-on-1 private DMs and pure broadcast channels are NEVER touched by automatic
         // group spam deletion, auto-read, or Saved Messages lead forwarding.
+        if (msg.post) return;
         boolean isGroup = dialogId < 0;
         if (!isGroup) return;
         MessagesController mc = MessagesController.getInstance(account);
@@ -1966,9 +1981,6 @@ public final class ColgramNativeColemailerBridge {
             if (!ColgramShieldConfig.isMalwareDownloadShieldEnabled()
                     && !ColgramShieldConfig.isStorageCapEnabled()) {
                 return false;
-            }
-            if (msg.media instanceof TLRPC.TL_messageMediaStory) {
-                return ColgramShieldConfig.isMalwareDownloadShieldEnabled();
             }
             TLRPC.Document doc = MessageObject.getDocument(msg);
             if (doc == null) return false;

@@ -140,14 +140,14 @@ public final class ColgramDohResolver {
      * Mullvad 194.242.2.2 timeout, Yandex 77.88.8.8:443 HTTP/2-only) are excluded.
      */
     private static final Endpoint[] ENDPOINTS = {
-            // Wave 1 triplet: Cloudflare + AdGuard + ControlD (non-RU encrypted HTTP/1.1 DoH)
+            // Wave 1 triplet: Cloudflare + AdGuard + Comss (diverse providers; max-anonymity strips RU Comss automatically)
             new Endpoint("1.1.1.1", "cloudflare-dns.com", "cloudflare-dns.com", 443, false, true, "cloudflare"),
             new Endpoint("94.140.14.14", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
+            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
+            // Wave 2 triplet: ControlD + Google + DNS.SB
             new Endpoint("76.76.2.0", "freedns.controld.com", "freedns.controld.com", 443, false, false, "controld"),
-            // Wave 2 triplet: Google + DNS.SB + Comss RU (keeps RU-reachable encrypted DoH in Wave 2 unless max-anonymity strips RU)
             new Endpoint("8.8.8.8", "dns.google", "dns.google", 443, false, true, "google"),
             new Endpoint("45.11.45.11", "doh.dns.sb", "doh.dns.sb", 443, false, true, "dnssb"),
-            new Endpoint("141.133.184.24", "dns.comss.one", "dns.comss.one", 443, false, true, "comss"),
             // Wave 3 triplet: AdGuard backup + Google backup + Cloudflare backup
             new Endpoint("94.140.15.15", "dns.adguard-dns.com", "dns.adguard-dns.com", 443, false, false, "adguard"),
             new Endpoint("8.8.4.4", "dns.google", "dns.google", 443, false, true, "google"),

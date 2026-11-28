@@ -209,11 +209,11 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         self.assertIn("TLRPC.TL_inputPhotoFileLocation", update_params)
         self.assertIn("!allowDisordererFileSave", update_params)
         self.assertIn("totalBytesCount < 256 * 1024", update_params)
-        self.assertIn("downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 32 ? 1024 * 64 : 1024 * 32) : 1024 * 128;", update_params)
+        self.assertIn("downloadChunkSize = isSmallOrThumbOrAvatar ? (totalBytesCount >= 1024 * 128 ? 1024 * 64 : 1024 * 32) : 1024 * 128;", update_params)
         self.assertIn("downloadChunkSizeBig = totalBytesCount >= 1024 * 1024 ? 1024 * 512 : 1024 * 128;", update_params)
-        self.assertIn("maxDownloadRequests = 6;", update_params)
-        self.assertIn("maxDownloadRequestsBig = 6;", update_params)
-        self.assertIn("maxDownloadRequestsAnimation = Math.max(maxDownloadRequestsAnimation, 6);", update_params)
+        self.assertIn("maxDownloadRequests = 4;", update_params)
+        self.assertIn("maxDownloadRequestsBig = 4;", update_params)
+        self.assertIn("maxDownloadRequestsAnimation = 4;", update_params)
         self.assertNotIn("maxDownloadRequests = boost ? 6 : 8;", update_params)
         # Prebuilt libtmessages.49.so uses DOWNLOAD_CONNECTIONS_COUNT == 2
         self.assertNotIn("waitingDownloadSize = new int[4]", flo)
@@ -224,7 +224,7 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         load_int = extract_method(fl, "private FileLoadOperation loadFileInternal(")
         self.assertNotIn("priority = PRIORITY_HIGH;", load_int)
         self.assertNotIn("operation.setForceRequest(priority > 0);", load_int)
-        self.assertIn("if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_MAX)", load_int)
+        self.assertIn("if (priority >= FileLoaderPriorityQueue.PRIORITY_VALUE_NORMAL_UP)", load_int)
         self.assertIn("operation.setForceRequest(true);", load_int)
 
         ir = read_text(MSG / "ImageReceiver.java")
@@ -238,8 +238,8 @@ class MediaPriorityAndSandboxContractsTest(unittest.TestCase):
         self.assertIn("return FileLoader.PRIORITY_HIGH;", get_prio)
 
         fpq = read_text(MSG / "FileLoaderPriorityQueue.java")
-        self.assertIn("type == TYPE_LARGE ? 3 : 12", fpq)
-        self.assertIn("isDownloadSpeedBoostEnabled() ? 1 : 20", fpq)
+        self.assertIn("type == TYPE_LARGE ? 3 : 6", fpq)
+        self.assertIn("isDownloadSpeedBoostEnabled() ? 8 : 20", fpq)
 
     def test_image_loader_parallel_decode_and_http_concurrency(self):
         il = read_text(MSG / "ImageLoader.java")
